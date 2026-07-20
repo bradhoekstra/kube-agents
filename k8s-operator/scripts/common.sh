@@ -136,7 +136,7 @@ init_var() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "gemini" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "anthropic" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if [[ ! "$MODEL_PROVIDER" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]; then
@@ -149,7 +149,7 @@ init_var_model_provider() {
       DEFAULT_MODEL="gpt-5.4"
       ;;
     anthropic)
-      DEFAULT_MODEL="claude-sonnet-4-5-20250929"
+      DEFAULT_MODEL="claude-opus-4-8"
       ;;
     *)
       DEFAULT_MODEL="gemini-3.5-flash"
