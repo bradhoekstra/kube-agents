@@ -175,7 +175,7 @@ get_platform_agent_roles() {
     "roles/mcp.toolUser"
   )
 
-  case "${PLATFORM_AGENT_PERMISSION_SET:-gke-admin}" in
+  case "${PLATFORM_AGENT_PERMISSION_SET:-read-only}" in
     read-only)
       echo "${read_only_roles[*]}"
       ;;

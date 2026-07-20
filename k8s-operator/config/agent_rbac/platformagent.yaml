@@ -14,7 +14,7 @@ rules:
   # Allow managing GKE Cluster Custom Resources (for KCC-native GKE provisioning)
   - apiGroups: ["container.cnrm.cloud.google.com"]
     resources: ["containerclusters"]
-    verbs: ["get", "list", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch"]
   - apiGroups: [""]
     resources:
       - pods
@@ -36,7 +36,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["kubeagents.x-k8s.io"]
     resources: ["*"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
