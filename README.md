@@ -4,11 +4,15 @@ The k8s agentic harness will fundamentally redefine the DevOps presentation laye
 
 ## Key Components
 
-### 1. Platform Agent (`platform`)
+### 1. Chat Agent (`agents/chat/`, the `default` profile)
 
-The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycle. It is the operator-deployed gateway pod and the single chat entrypoint into the harness.
+The single conversational front door to the harness. It is the `default` Hermes profile — the only one that receives chat ingress. It analyzes each message, discovers which specialist agents are available and what each is responsible for (via the `router` tools `list_agents` / `ask_agent`), delegates the request to the right specialist, and relays the response. It holds **no** infrastructure tools of its own — the front door can route, not mutate. Unlike the specialists (which coordinate pointer-only), the Chat Agent may pass full context to a specialist and relay its real response.
 
-### 2. Cluster Agent (`agents/cluster/`)
+### 2. Platform Agent (`platform`)
+
+The master custodian and agent architect configured with an architectural persona (`SOUL.md`). It manages multi-tenancy governance, RBAC boundaries, and GKE infrastructure lifecycle, and owns the GitOps write path. It runs as the `platform` Hermes profile (scaffolded at pod startup) in the operator-deployed gateway pod; it no longer receives chat directly — the Chat Agent routes work to it.
+
+### 3. Cluster Agent (`agents/cluster/`)
 
 A focused, single-cluster SRE persona for read-only runtime operations and deep workload debugging. It is **not** deployed by the operator or represented by a CRD. Instead, it is a **Hermes profile** — an isolated agent instance with its own persona, scoped toolset, and home directory — that the Platform Agent **creates dynamically inside its own pod**, one per managed GKE cluster, persisting on the data PVC until that cluster is deleted.
 

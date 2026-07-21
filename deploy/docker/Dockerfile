@@ -96,49 +96,70 @@ CMD ["hermes", "gateway", "run"]
 
 
 
-# --- PLATFORM AGENT TARGET ---
+# --- AGENT GATEWAY TARGET ---
+# One image, one pod, multiple co-located Hermes profiles sharing one PVC:
+#   - `default`   = Chat Agent (the front door; receives chat ingress) — synced
+#                   from /opt/defaults into $HERMES_HOME at startup.
+#   - `platform`  = Platform Agent specialist — scaffolded at startup from
+#                   /opt/platform-template (see docker-entrypoint.sh).
+#   - `cluster-*` = per-cluster read-only agents — scaffolded at runtime from
+#                   /opt/cluster-template (see scripts/cluster_agent_profile.py).
 FROM agent-base AS platform
 
-# Setup platform specific defaults from consolidated configs
-COPY agents/platform/cron/ /opt/defaults/cron/
-COPY --chown=hermes:hermes agents/platform/defaults/ /opt/defaults/
+# --- Chat Agent (the `default` profile) ---
+# Chat ingress plugins/hooks (session_store, session_otel_bridge, tool_call_audit,
+# chat_message_audit) live with the front door that handles ingress.
+COPY --chown=hermes:hermes agents/chat/defaults/ /opt/defaults/
+COPY agents/chat/SOUL.md /opt/defaults/SOUL.md
+COPY agents/chat/AGENTS.md /opt/defaults/AGENTS.md
+# Self-contained Chat Agent config: overwrite (NOT merge) the shared-defaults
+# config so the front door stays minimal (router tools only, no cloud/write tools).
+COPY agents/chat/config.yaml /opt/defaults/config.yaml
+
+# --- Shared scripts (reachable by every profile at $HERMES_HOME/scripts) ---
+# Executable scripts are shared, not per-profile: the router (Chat Agent) and the
+# platform/cluster tooling all resolve under $HERMES_HOME/scripts.
+COPY agents/chat/scripts/ /opt/defaults/scripts/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
-COPY agents/platform/governance/ /opt/defaults/governance/
-COPY agents/platform/SOUL.md /opt/defaults/SOUL.md
-COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 
-# Copy platform skills
-COPY agents/platform/skills/ /opt/hermes/skills/
+# --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
+COPY --chown=hermes:hermes agents/platform/SOUL.md /opt/platform-template/SOUL.md
+COPY --chown=hermes:hermes agents/platform/AGENTS.md /opt/platform-template/AGENTS.md
+COPY --chown=hermes:hermes agents/platform/CAPABILITIES.md /opt/platform-template/CAPABILITIES.md
+COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
+COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
+COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
 
-# Copy the Cluster Agent profile TEMPLATE (persona, config, skills). This is a
-# template the Platform Agent scaffolds into per-cluster Hermes profiles at
-# runtime (see scripts/cluster_agent_profile.py) — NOT active platform skills,
-# so it is intentionally kept out of /opt/hermes/skills/.
+# Platform config is self-contained (scaffold does not merge again): build it by
+# merging the shared defaults base with the platform overrides and bake it into
+# the template. This reproduces the exact config the platform ran with as the
+# former default profile.
+COPY deploy/shared/defaults/config.yaml /tmp/platform-base-config.yaml
+COPY agents/platform/config.yaml /tmp/platform-overlay-config.yaml
+COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
+RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml && \
+    cp /tmp/platform-base-config.yaml /opt/platform-template/config.yaml && \
+    rm -f /tmp/merge_configs.py /tmp/platform-base-config.yaml /tmp/platform-overlay-config.yaml
+
+# Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
+# into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Copy platform plugins
+# Shared plugins available to all profiles (memory backend used by the Chat Agent).
 COPY agents/platform/plugins/ /opt/hermes/plugins/
 
-# Copy platform defaults configuration as temp file
-COPY agents/platform/config.yaml /tmp/platform-config.yaml
-
-# Copy config merge helper script
-COPY deploy/docker/merge_configs.py /tmp/merge_configs.py
-
-# Dynamically merge config.yamls using helper script
-RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yaml /tmp/platform-config.yaml && \
-    rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
-
 # Normalize ownership and permissions at the end of build
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template /opt/platform-template && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
-    find /opt/hermes/skills -type d -exec chmod 755 {} + && \
-    find /opt/hermes/skills -type f -exec chmod 644 {} + && \
+    find /opt/hermes/skills -type d -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/hermes/skills -type f -exec chmod 644 {} + 2>/dev/null && \
     find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
     find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
     find /opt/cluster-template -type d -exec chmod 755 {} + && \
     find /opt/cluster-template -type f -exec chmod 644 {} + && \
+    find /opt/platform-template -type d -exec chmod 755 {} + && \
+    find /opt/platform-template -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
-    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/platform-template -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null && \
     find /opt/cluster-template -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true

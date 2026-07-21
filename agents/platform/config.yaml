@@ -41,9 +41,11 @@ memory:
   user_profile_enabled: false
   provider: multiuser_memory
 
+# The Platform Agent is no longer the chat ingress (the Chat Agent / `default`
+# profile owns that), so the session_store / session_otel_bridge ingress plugins
+# move to the Chat Agent. Keep otel for observability parity and tool_call_audit
+# to audit this privileged specialist's tool calls.
 plugins:
   enabled:
     - hermes_otel
-    - session_store
-    - session_otel_bridge
     - tool_call_audit

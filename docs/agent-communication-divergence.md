@@ -2,12 +2,18 @@
 
 **Reference design:** [`docs/designs/agent-communication.md`](https://github.com/bradhoekstra/kube-agents/blob/feat/mvp/docs/designs/agent-communication.md) (branch `feat/mvp`).
 
-This note records where the current two-persona implementation on this branch **intentionally differs** from that design. The divergence was accepted knowingly for the MVP; this document is the checklist for realigning later.
+This note records where the current implementation on this branch **intentionally differs** from that design. The divergence was accepted knowingly for the MVP; this document is the checklist for realigning later.
+
+## Front-door split (Chat Agent)
+
+The harness now has a dedicated **front door**. The `default` Hermes profile is a thin **Chat Agent** (`agents/chat/`) that receives all chat ingress, discovers the available specialist agents and their responsibilities (via the `router` MCP tools `list_agents` / `ask_agent`), delegates the request, and relays the response. Today's Platform Agent is demoted to a named `platform` profile scaffolded at pod startup (`deploy/shared/docker-entrypoint.sh` + `scripts/profile_scaffold.py`) from `agents/platform/`. The pod/Deployment/CR names are unchanged.
+
+Coordination rule: the Chat Agent is **exempt** from the pointer-only rule — as the conversational relay it passes full context to specialists and relays their real responses. The pointer-only rule still governs all specialist-to-specialist (Platform ↔ Cluster) coordination. This front-door split is **not** part of the reference design doc; it is a deliberate addition for cleaner role separation and is tracked here.
 
 ## What already aligns
 
-- **Persona split & topology:** Platform Agent = the `default` Hermes profile (user-facing); Cluster Agent = one Hermes profile **per managed cluster**, co-located in the same pod, scaffolded from `agents/cluster/`.
-- **No agent-to-agent prompting:** personas never call each other directly; they coordinate only through shared state.
+- **Persona split & topology:** a Chat Agent front door (`default` profile) routes to a Platform Agent (`platform` profile) and per-cluster Cluster Agents, all co-located in the same pod on one PVC, each scaffolded from its template (`agents/chat/`, `agents/platform/`, `agents/cluster/`).
+- **No specialist-to-specialist prompting:** the Platform and Cluster specialists never call each other directly; they coordinate only through shared state (the Chat Agent front door is the sole, deliberate exception).
 - **Read-only / declarative posture:** the Cluster Agent diagnoses and proposes; the Platform Agent owns the GitOps write path (`submit-suggestion`). No imperative cluster mutation.
 - **Co-located MVP on one shared PVC.**
 

@@ -24,6 +24,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from profile_scaffold import ensure_profile, overlay_template
+
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
@@ -66,46 +68,20 @@ def profile_home(name: str) -> Path:
     return PROFILES_BASE / name
 
 
-def _overlay_template(home: Path) -> None:
-    """Copy the Cluster Agent template onto the profile home (overwrites)."""
-    for item_name in OVERLAY_ITEMS:
-        src = TEMPLATE_DIR / item_name
-        if not src.exists():
-            continue
-        dest = home / item_name
-        if src.is_dir():
-            shutil.copytree(src, dest, dirs_exist_ok=True)
-        else:
-            shutil.copy2(src, dest)
-    # Bring in shared plugins (otel, etc.) for observability parity.
-    if SHARED_PLUGINS_DIR.is_dir():
-        shutil.copytree(SHARED_PLUGINS_DIR, home / "plugins", dirs_exist_ok=True)
-
-
 def cmd_create(args: argparse.Namespace) -> None:
     for field, value in (("project", args.project), ("cluster", args.cluster), ("location", args.location)):
         _validate(value, field)
     name = profile_name(args.project, args.cluster, args.location)
-    home = profile_home(name)
 
     if not TEMPLATE_DIR.is_dir():
         raise SystemExit(f"ERROR: cluster template dir not found: {TEMPLATE_DIR}")
 
-    # 1. Register the profile with Hermes (idempotent: skip if its home already exists).
-    if not home.exists():
-        description = f"Read-only Cluster Agent for GKE cluster {args.cluster} ({args.project}/{args.location})."
-        try:
-            subprocess.run(
-                ["hermes", "profile", "create", name, "--no-skills", "--description", description],
-                check=True, capture_output=True, text=True, timeout=60, env=_run_env(),
-            )
-        except subprocess.CalledProcessError as e:
-            raise SystemExit(f"ERROR: 'hermes profile create {name}' failed: {e.stderr.strip() or e.stdout.strip()}")
-    if not home.is_dir():
-        raise SystemExit(f"ERROR: expected profile home not found after create: {home}")
+    # 1. Register the profile with Hermes (idempotent) via the shared scaffold helper.
+    description = f"Read-only Cluster Agent for GKE cluster {args.cluster} ({args.project}/{args.location})."
+    home = ensure_profile(name, description, HERMES_HOME)
 
-    # 2. Overlay the Cluster Agent persona, scoped config, and skills.
-    _overlay_template(home)
+    # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
+    overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)
 
     # 3. Pin a kubeconfig scoped to the target cluster.
     kubeconfig = home / "kubeconfig.yaml"

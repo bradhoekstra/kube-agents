@@ -27,6 +27,28 @@ if [ -d "/opt/defaults" ]; then
     cp -ru /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || cp -rp /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || true
 fi
 
+# 2.5 Scaffold the Platform Agent specialist profile (idempotent).
+# The `default` profile is the front-door Chat Agent (synced above). Today's
+# Platform Agent runs as a separate named `platform` profile so the Chat Agent
+# can route to it. Its persona/config/skills are baked at /opt/platform-template;
+# executable scripts stay in the shared $TARGET_DIR/scripts and are not overlaid.
+PLATFORM_TEMPLATE="/opt/platform-template"
+if [ -d "$PLATFORM_TEMPLATE" ] && [ ! -d "$TARGET_DIR/profiles/platform" ] && [ -f "$TARGET_DIR/scripts/profile_scaffold.py" ]; then
+    PLATFORM_DESC="Platform Agent: fleet-wide GKE architecture, cluster lifecycle/provisioning, multi-tenancy, and the GitOps write path (Pull Requests). Owns per-cluster agent lifecycle."
+    HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$TARGET_DIR/scripts/profile_scaffold.py" \
+        --name platform \
+        --template "$PLATFORM_TEMPLATE" \
+        --plugins /opt/defaults/plugins \
+        --description "$PLATFORM_DESC" || echo "WARN: platform profile scaffold failed; continuing" >&2
+fi
+# Point the platform profile's home-relative `scripts/` at the shared scripts dir
+# (executable scripts are shared across profiles, not copied per-profile). Self-heal
+# on every start. Cluster agents use absolute /opt/data/scripts paths and need no link.
+if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$TARGET_DIR/scripts" ]; then
+    ln -sfn "$TARGET_DIR/scripts" "$TARGET_DIR/profiles/platform/scripts" 2>/dev/null || true
+fi
+
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
 if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true

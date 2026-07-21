@@ -33,10 +33,15 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ## Agents in `kube-agents`
 
+### Chat Agent (`agents/chat/`, the `default` profile)
+
+- **Role:** The single conversational front door to the harness, and the delegator/router.
+- **Scope:** The `default` [Hermes Profile](#hermes-profile) — the only profile that receives chat ingress. It analyzes each message, discovers which specialist agents exist and what each is responsible for (via the `router` MCP tools `list_agents` / `ask_agent`), delegates the request to the right specialist, and relays the response for the best user experience. It holds **no** infrastructure tools of its own (no GKE, provisioning, or GitOps write path) — the front door can route, not mutate. Unlike the specialists, it is **exempt** from the pointer-only [Work Item](#work-item-shared-state) rule: it passes full context to specialists and relays their real responses.
+
 ### Platform Agent (`platform`)
 
-- **Role:** Architectural custodian and agent orchestrator.
-- **Scope:** Configured with an architectural persona (`SOUL.md`). It manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation. It is the operator-deployed gateway pod and owns the GitOps write path; it delegates single-cluster runtime debugging to Cluster Agents.
+- **Role:** Architectural custodian and fleet orchestrator; the privileged doer behind the Chat Agent.
+- **Scope:** A named [Hermes Profile](#hermes-profile) (`platform`) scaffolded at pod startup from the `agents/platform/` template. Configured with an architectural persona (`SOUL.md`), it manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation, and owns the GitOps write path. It no longer receives chat directly — the Chat Agent routes work to it — and it delegates single-cluster runtime debugging to Cluster Agents (pointer-only). It runs in the operator-deployed gateway pod and shares that pod's identity.
 
 ### Cluster Agent (`agents/cluster/`)
 
@@ -49,7 +54,7 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ### Hermes Profile
 
-- **Definition:** A native Hermes feature (`hermes profile` / `hermes -p <name>`) that provides multiple isolated Hermes instances, each with its own config, sessions, skills, and home directory. Multiple profiles run concurrently within a single gateway process/pod. In `kube-agents`, each [Cluster Agent](#cluster-agent-agentscluster) is materialized as a Hermes profile scaffolded from the `agents/cluster/` template.
+- **Definition:** A native Hermes feature (`hermes profile` / `hermes -p <name>`) that provides multiple isolated Hermes instances, each with its own config, sessions, skills, and home directory. Multiple profiles run concurrently within a single gateway process/pod. In `kube-agents`, the `default` profile is the [Chat Agent](#chat-agent-agentschat-the-default-profile) (front door), the `platform` profile is the [Platform Agent](#platform-agent-platform) (scaffolded at startup from `agents/platform/`), and each [Cluster Agent](#cluster-agent-agentscluster) is a profile scaffolded at runtime from `agents/cluster/`. Executable scripts are shared across profiles at `$HERMES_HOME/scripts`; persona, config, and skills are per-profile.
 
 ---
 
@@ -57,4 +62,5 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ### Work Item (Shared State)
 
-- **Definition:** The unit of coordination between personas. Personas never pass task context or results directly to one another; they exchange a work item in a shared store (`agents/platform/scripts/worklog.py`) — a pluggable interface with a local-file backend (on the shared PVC) as the default and a documented GitHub-issue/PR backend seam. A requester writes the request to a work item and invokes the worker with only a pointer ("Please work on work item `<id>`"); the worker reads the request, does the work, and writes its findings back to the same work item. This keeps invocation messages to imperative pointers and makes the coordination auditable and backend-agnostic.
+- **Definition:** The unit of coordination between **specialist** personas (Platform ↔ Cluster). Specialists never pass task context or results directly to one another; they exchange a work item in a shared store (`agents/platform/scripts/worklog.py`) — a pluggable interface with a local-file backend (on the shared PVC) as the default and a documented GitHub-issue/PR backend seam. A requester writes the request to a work item and invokes the worker with only a pointer ("Please work on work item `<id>`"); the worker reads the request, does the work, and writes its findings back to the same work item. This keeps invocation messages to imperative pointers and makes the coordination auditable and backend-agnostic.
+- **Exception — the Chat Agent:** The [Chat Agent](#chat-agent-agentschat-the-default-profile) is deliberately exempt from the pointer-only rule. As the conversational relay it passes full context to a specialist (via the `router` `ask_agent` tool) and relays the specialist's real response back to the user. The pointer-only rule still governs all specialist-to-specialist coordination.
