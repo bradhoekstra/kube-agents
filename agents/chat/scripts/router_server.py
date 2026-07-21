@@ -133,6 +133,10 @@ def ask_agent(
 
     Returns the specialist's response so you can relay it to the user. Use list_agents first to
     choose the right target. Do not route to 'default' (that is you).
+
+    Transparency: when you relay this response, make it clear to the user WHICH agent handled the
+    request — begin your reply with an attribution line naming `target_agent` (see your SOUL.md
+    relay format). Never present a delegated answer as if you produced it yourself.
     """
     name = (target_agent or "").strip()
     if not name or not re.match(r"^[a-zA-Z0-9._-]+$", name) or len(name) > MAX_NAME_LEN:
