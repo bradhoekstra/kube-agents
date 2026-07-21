@@ -60,7 +60,12 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 
 ## Coordination
 
-### Work Item (Shared State)
+### Kanban Task (Delegation)
 
-- **Definition:** The unit of coordination between **specialist** personas (Platform ↔ Cluster). Specialists never pass task context or results directly to one another; they exchange a work item in a shared store (`agents/platform/scripts/worklog.py`) — a pluggable interface with a local-file backend (on the shared PVC) as the default and a documented GitHub-issue/PR backend seam. A requester writes the request to a work item and invokes the worker with only a pointer ("Please work on work item `<id>`"); the worker reads the request, does the work, and writes its findings back to the same work item. This keeps invocation messages to imperative pointers and makes the coordination auditable and backend-agnostic.
+- **Definition:** The unit of task coordination between personas. Personas never pass task context or results directly to one another; they exchange a **kanban task (card)** on the shared board (`<HERMES_HOME-root>/kanban.db`). The Platform Agent (orchestrator) creates a card with `kanban_create(assignee="<cluster-profile>", body=...)`; the gateway's kanban **dispatcher** auto-spawns the assigned Cluster Agent as a worker (`hermes -p <cluster> chat -q "work kanban task <id>"`), which reads the card with `kanban_show`, does read-only work, and reports a structured handoff via `kanban_complete(summary=..., metadata={...})`. Parent/child links give fan-out/fan-in (a platform-assigned child card runs after its per-cluster parents complete, with their `metadata` in its context). Completions are pushed back to the originating chat (auto-subscribe). This keeps invocation to a pointer, makes coordination auditable, and gives claim/lease safety.
 - **Exception — the Chat Agent:** The [Chat Agent](#chat-agent-agentschat-the-default-profile) is deliberately exempt from the pointer-only rule. As the conversational relay it passes full context to a specialist (via the `router` `ask_agent` tool) and relays the specialist's real response back to the user. The pointer-only rule still governs all specialist-to-specialist coordination.
+- **Note:** This replaced the earlier bespoke `worklog.py` shared-file store. Continuous *status* (not tasks) uses the separate [handover](#handover) channel.
+
+### Handover
+
+- **Definition:** The continuous cluster→platform **status** channel (distinct from kanban task delegation). Cluster Agents publish typed records (`health`, `utilization`, …) via the `write_handover` tool to fixed files at `/opt/data/fleet/clusters/<cluster>/<location>/<type>.json`; the Platform Agent reads them with plain file tools, honoring each record's `expires_at` for staleness.

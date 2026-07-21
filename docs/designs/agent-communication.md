@@ -40,7 +40,7 @@ Cluster subagents continuously produce structured **status records** (health, ut
 ### 2.2 Location
 
 ```
-/opt/data/fleet/clusters/<cluster-id>/<type>.json
+/opt/data/fleet/clusters/<cluster>/<location>/<type>.json
 ```
 
 `/opt/data/fleet` is a **fixed absolute path**, shared by every agent in the pod.

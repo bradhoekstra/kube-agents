@@ -2,9 +2,9 @@
 # cluster_agent_profile.py - Manage per-cluster Cluster Agent Hermes profiles.
 #
 # The Platform Agent runs this from its terminal to dynamically create, delete,
-# list, and invoke the Cluster Agent profile for a specific GKE cluster, inside
-# its own pod. One profile per managed cluster; it persists until the cluster is
-# deleted.
+# list, and resolve the name of the Cluster Agent profile for a specific GKE
+# cluster, inside its own pod. One profile per managed cluster; it persists until
+# the cluster is deleted.
 #
 # Mechanism (verified against the shipped Hermes CLI):
 #   - `hermes profile create <name>` registers an isolated profile and stores its
@@ -13,7 +13,8 @@
 #   - We then overlay the baked Cluster Agent template (/opt/cluster-template/:
 #     SOUL.md, AGENTS.md, config.yaml, skills/) onto that home, pin a kubeconfig
 #     scoped to the target cluster, and write the cluster identity into USER.md.
-#   - Delegation is a one-shot profile call: `hermes -p <name> -z "<task>"`.
+#   - Delegation runs on the shared kanban board (assignee = the profile name);
+#     this script only manages profile lifecycle + name resolution, not dispatch.
 
 import argparse
 import hashlib
@@ -68,6 +69,24 @@ def profile_home(name: str) -> Path:
     return PROFILES_BASE / name
 
 
+def _inject_cluster_identity(home: Path, project: str, cluster: str, location: str) -> None:
+    """Write a machine-readable cluster_identity block into the profile's config.yaml.
+
+    The handover plugin reads this via `cfg_get(config, "cluster_identity", ...)` to stamp
+    cluster/location onto every handover record — robust vs the sanitized/hashed profile
+    name. (Re-dumping drops the template's comments in this per-profile copy, which is fine.)
+    """
+    import yaml  # lazy: only needed on the scaffold path, keeps the module importable without pyyaml
+
+    config_path = home / "config.yaml"
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        data = {}
+    data["cluster_identity"] = {"project": project, "cluster": cluster, "location": location}
+    config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
 def cmd_create(args: argparse.Namespace) -> None:
     for field, value in (("project", args.project), ("cluster", args.cluster), ("location", args.location)):
         _validate(value, field)
@@ -82,6 +101,10 @@ def cmd_create(args: argparse.Namespace) -> None:
 
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
     overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)
+
+    # 2b. Stamp this cluster's identity into the profile config so the handover
+    #     tool can read it (cfg_get) — never derived from the sanitized profile name.
+    _inject_cluster_identity(home, args.project, args.cluster, args.location)
 
     # 3. Pin a kubeconfig scoped to the target cluster.
     kubeconfig = home / "kubeconfig.yaml"
@@ -134,49 +157,36 @@ def cmd_list(_args: argparse.Namespace) -> None:
             print(name)
 
 
-def cmd_invoke(args: argparse.Namespace) -> None:
-    """One-shot delegation to a cluster's profile.
+def cmd_name(args: argparse.Namespace) -> None:
+    """Print the canonical profile name for a cluster — used as the kanban `assignee`.
 
-    Personas never exchange context directly: we pass ONLY a pointer to a shared
-    work item. The Cluster Agent reads the request from the work-item store, does
-    the work, and writes its findings back there (see the worklog.py shared state
-    and the cluster-agent-lifecycle skill). Its chat reply is just an ack.
+    Delegation runs on the kanban board: the Platform Agent creates a card with
+    `assignee=<this name>`, and the gateway's kanban dispatcher spawns the profile
+    as a worker (`hermes -p <name> chat -q "work kanban task <id>"`). This is a pure,
+    deterministic lookup (no side effects), so the assignee can be resolved anytime.
     """
-    name = profile_name(args.project, args.cluster, args.location)
-    home = profile_home(name)
-    if not home.is_dir():
-        raise SystemExit(f"ERROR: profile '{name}' does not exist. Run 'create' first.")
-    pointer = f"Please work on work item {args.work_item}."
-    env = _run_env({"KUBECONFIG": str(home / "kubeconfig.yaml")})
-    result = subprocess.run(
-        ["hermes", "-p", name, "-z", pointer],
-        capture_output=True, text=True, env=env,
-    )
-    sys.stdout.write(result.stdout)
-    if result.returncode != 0:
-        sys.stderr.write(result.stderr)
-        sys.exit(result.returncode)
+    print(profile_name(args.project, args.cluster, args.location))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Manage per-cluster Cluster Agent Hermes profiles.")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    for name in ("create", "delete", "invoke"):
-        sp = sub.add_parser(name, help=f"{name} a cluster profile")
+    help_text = {
+        "create": "Create (scaffold) a cluster profile",
+        "delete": "Delete a cluster profile",
+        "name": "Print the canonical profile name (kanban assignee) for a cluster",
+    }
+    for cmdname in ("create", "delete", "name"):
+        sp = sub.add_parser(cmdname, help=help_text[cmdname])
         sp.add_argument("--project", required=True)
         sp.add_argument("--cluster", required=True)
         sp.add_argument("--location", required=True)
-        if name == "invoke":
-            sp.add_argument(
-                "--work-item", dest="work_item", required=True,
-                help="ID of the shared work item to delegate (from worklog.py). Only a pointer is sent — never context.",
-            )
 
     sub.add_parser("list", help="List existing cluster profiles")
 
     args = parser.parse_args()
-    handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "invoke": cmd_invoke}
+    handlers = {"create": cmd_create, "delete": cmd_delete, "list": cmd_list, "name": cmd_name}
     handlers[args.command](args)
 
 

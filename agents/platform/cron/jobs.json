@@ -120,6 +120,21 @@
       "skills": ["github-issue-resolver"],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "fleet-status-refresh",
+      "name": "Fleet Status Refresh",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 10,
+        "display": "every 10m"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "fleet_status_refresh.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }

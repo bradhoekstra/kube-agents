@@ -22,45 +22,59 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \
 
 This scaffolds the profile home on the persistent data PVC, pins a kubeconfig scoped to that cluster, writes the cluster identity into the profile's `USER.md`, and registers the profile. It is **idempotent** — safe to re-run. It prints the profile name.
 
-## How to delegate a debugging / runtime-ops task (shared state only)
+## How to delegate a debugging / runtime-ops task (kanban board)
 
 For any request that concerns runtime behavior of workloads on a **single, specific** cluster (crash loops, OOMs, scheduling failures, mount errors, connectivity, autoscaling, storage, observability gaps), delegate to that cluster's Cluster Agent instead of investigating yourself.
 
-**Personas never pass context directly.** You coordinate through a shared work item and invoke with a pointer only.
+**Personas never pass context directly.** Delegation runs on the shared **kanban board**: you create a card assigned to the cluster's profile; the gateway's kanban dispatcher **auto-spawns** the Cluster Agent to work it; it reports a structured result on the card. You do **not** invoke the agent yourself.
 
-1. **Write the request to shared state** — create a work item assigned to the cluster:
+1. **Resolve the cluster's profile name** (the kanban `assignee`):
 
    ```bash
-   python3 /opt/data/scripts/worklog.py create \
-     --requester platform --assignee cluster \
-     --title "<short title>" \
-     --request "<full request: namespace/workload, symptom, time window>" \
+   python3 /opt/data/scripts/cluster_agent_profile.py name \
      --project "<project>" --cluster "<cluster>" --location "<location>"
    ```
 
-   This prints a work item `<id>`. (For a long request, use `--request-file <path>` or `--request-file -` for stdin.)
+2. **Create the card** with the request in the body:
 
-2. **Invoke with a pointer only** — the Cluster Agent receives nothing but _"Please work on work item `<id>`."_:
-
-   ```bash
-   python3 /opt/data/scripts/cluster_agent_profile.py invoke \
-     --project "<project>" --cluster "<cluster>" --location "<location>" \
-     --work-item "<id>"
+   ```
+   kanban_create(
+     assignee="<profile-name>",
+     title="<short title>",
+     body="<full request: namespace/workload, symptom, time window>"
+   )
    ```
 
-3. **Read results from shared state** — when the call returns, read the work item back; the Cluster Agent has written its RCA and any proposed patch there (its chat reply is only an ack):
+   The dispatcher spawns the Cluster Agent (`hermes -p <profile> chat -q "work kanban task <id>"`) automatically; it reads the card, does read-only diagnostics, and calls `kanban_complete(summary=..., metadata={...})`.
 
-   ```bash
-   python3 /opt/data/scripts/worklog.py show "<id>"
-   ```
+3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA and any proposed patch are in the card's `metadata`, not the worker's chat reply.
+
+**Multi-cluster (fan-out / fan-in):** create one card per cluster (parents), plus a card **assigned to yourself** with `parents=[<parent ids>]` (the fan-in child). Once all parents complete, the dispatcher spawns you on the child card, whose context includes every parent's `metadata`. See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
 
 ## Acting on the result
 
-The Cluster Agent is **read-only** and does not open Pull Requests. After reading the work item:
+The Cluster Agent is **read-only** and does not open Pull Requests. After reading the completed card:
 
-1. Review the RCA and proposed manifest patch recorded in the work item.
+1. Review the RCA and proposed manifest patch in the card's `metadata`.
 2. If a change is warranted, **you** open (or update) the Pull Request via the `submit-suggestion` skill — you own the GitOps write path. Reconcile against any existing branch/PR for the same workload before creating a new one.
 3. Report the outcome to the user as a clean SRE status update.
+
+## Consuming continuous handover status (no delegation)
+
+Independently of on-demand kanban tasks, each Cluster Agent publishes structured status to a shared **fleet handover** area, refreshed periodically by the `fleet-status-refresh` cron job (which invokes every cluster profile to publish via its `write_handover` tool). You read this **directly** — it is the primary, always-available signal for fleet-level reasoning; no kanban card or invocation is needed.
+
+- **Discover & read** with plain file tools:
+
+  ```bash
+  ls /opt/data/fleet/clusters/*/*/           # discover clusters/locations/types
+  cat /opt/data/fleet/clusters/<cluster>/<location>/health.json
+  cat /opt/data/fleet/clusters/<cluster>/<location>/utilization.json
+  ```
+
+- **Envelope:** `{schema_version, cluster, location, type, generated_at, expires_at, payload}` — the typed status is in `payload` (`health`, `utilization`, and more as they land).
+- **Staleness:** ignore any record whose `expires_at` is in the past — treat it as stale, not current truth.
+
+Use this ambient status to decide *whether* a deep dive is needed; when it is, run the delegation loop above for that one cluster.
 
 ## When to delete a profile
 

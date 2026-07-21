@@ -36,6 +36,15 @@ platform_toolsets:
     - mcp-developer_knowledge
     - mcp-gke
 
+# Top-level `toolsets` gates the kanban orchestrator surface: the kanban tools
+# live in the core pool (surfaced via hermes-cli/hermes-api-server), and their
+# check_fn requires "kanban" here for a non-worker (orchestrator) profile. This
+# lets the Platform Agent create/route kanban cards for delegation. (Workers get
+# the kanban tools automatically via HERMES_KANBAN_TASK.) It does not restrict
+# any other tools.
+toolsets:
+  - kanban
+
 memory:
   memory_enabled: false
   user_profile_enabled: false

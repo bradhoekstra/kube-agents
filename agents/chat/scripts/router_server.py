@@ -7,15 +7,15 @@
 # relay the response back to the user.
 #
 # Coordination model: unlike the platform<->cluster coordination (pointer-only
-# via worklog.py, where personas never exchange context directly), the Chat
+# via the kanban board, where personas never exchange context directly), the Chat
 # Agent is intentionally EXEMPT from the pointer-only rule. It is the
 # conversational relay, not a peer specialist, so it passes full context in and
 # returns the specialist's real response out.
 #
 # Transport: in-pod, local profile invocation (`hermes -p <name> -z ...`), the
-# same reliable mechanism used by cluster_agent_profile.py. This reaches a
-# specific profile in this pod, unlike the HTTP call_agent path which only
-# reaches one gateway's default profile.
+# same reliable mechanism the fleet status refresh cron uses to reach cluster
+# profiles. This reaches a specific profile in this pod, unlike the HTTP
+# call_agent path which only reaches one gateway's default profile.
 
 import os
 import re

@@ -149,17 +149,23 @@ kubectl get networkpolicies -n <workload_namespace> -o yaml
 
 ---
 
-### Step 5: Record RCA & Proposed Correction in the Shared Work Item
+### Step 5: Record RCA & Proposed Correction on the Kanban Task
 
-As a Cluster Agent you operate under a strict **read-only** boundary: **do not apply patches directly to the cluster, and do not open Pull Requests yourself.** The GitOps write path (`submit-suggestion`) is owned exclusively by the Platform Agent. You also **never pass context back through your chat reply** — you communicate only through the shared work item you were pointed at.
+As a Cluster Agent you operate under a strict **read-only** boundary: **do not apply patches directly to the cluster, and do not open Pull Requests yourself.** The GitOps write path (`submit-suggestion`) is owned exclusively by the Platform Agent. You also **never pass context back through your chat reply** — you communicate only through the kanban task you were spawned on.
 
 1. Synthesize the root cause analysis (e.g. _"payment-api is failing with exit code 137 because its memory limit is set to 256Mi while actual usage spiked to 270Mi"_), grounded in the exact diagnostic evidence you collected.
 2. Generate the corrected YAML manifest patch (e.g. increase memory limits, add missing Secret mounts, or add tolerations for Spot nodes).
-3. **Write** both the RCA and the proposed patch back to the shared work item, then mark it done:
+3. **Complete the task with a structured handoff** — put the RCA and proposed patch in `metadata`:
 
-   ```bash
-   python3 /opt/data/scripts/worklog.py update "<id>" --author cluster --status done \
-     --findings-file <rca.md> --patch-file <patch.yaml>
+   ```
+   kanban_complete(
+     summary="<concise root cause>",
+     metadata={
+       "root_cause": "...",
+       "evidence": ["<quoted event/log/spec excerpts>"],
+       "proposed_patch": "<YAML>"
+     }
+   )
    ```
 
-   (Use `--findings`/`--patch` for short inline text, or `-` to read from stdin.) Your final chat reply is only a brief acknowledgement — never the RCA or patch. The Platform Agent reads the work item and decides whether to open/update a Pull Request via `submit-suggestion`; do not duplicate an existing PR.
+   (If you cannot proceed — missing input, ambiguous scope — call `kanban_block(kind="needs_input", ...)` instead.) Your final chat reply is only a brief acknowledgement — never the RCA or patch. The Platform Agent reads the completed card and decides whether to open/update a Pull Request via `submit-suggestion`; do not duplicate an existing PR.
