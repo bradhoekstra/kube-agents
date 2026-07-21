@@ -27,6 +27,18 @@ if [ -d "/opt/defaults" ]; then
     cp -ru /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || cp -rp /opt/defaults/. "$TARGET_DIR/" 2>/dev/null || true
 fi
 
+# 2a. Force-sync the image-managed default-profile files so they ALWAYS track the
+# image, not the persistent PVC. The update-only copy above (cp -u) can skip
+# config.yaml: step 3 below rewrites config.yaml on every start (to enable otel),
+# bumping its mtime, so on the next image roll cp -u sees the PVC copy as "newer"
+# and never overwrites it — leaving a stale toolset/persona config live. These
+# files are image-owned (not runtime state), so overwrite them unconditionally.
+if [ -d "/opt/defaults" ]; then
+    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
+        [ -f "/opt/defaults/$f" ] && cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
+    done
+fi
+
 # 2.5 Scaffold the Platform Agent specialist profile (idempotent).
 # The `default` profile is the front-door Chat Agent (synced above). Today's
 # Platform Agent runs as a separate named `platform` profile so the Chat Agent
