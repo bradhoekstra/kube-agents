@@ -86,6 +86,20 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "backend: ddgs") {
 		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
 	}
+	// The default profile is the router-only Chat Agent front door.
+	if !strings.Contains(yamlContent, "mcp-router") {
+		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "disabled_toolsets:") {
+		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
+	}
+	// The front door must NOT hold privileged/runtime tools — those live in the
+	// separate platform/cluster profiles, not the default (chat) profile.
+	for _, forbidden := range []string{"platform_control", "agent_common", "hermes-api-server", "hermes-cli"} {
+		if strings.Contains(yamlContent, forbidden) {
+			t.Errorf("default (chat) profile must not contain %q, got:\n%s", forbidden, yamlContent)
+		}
+	}
 }
 
 func TestBuildConfigMap_MemoryConfig(t *testing.T) {

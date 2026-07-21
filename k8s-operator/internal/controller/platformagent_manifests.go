@@ -101,7 +101,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		} `json:"terminal"`
 		MCPServers       map[string]any      `json:"mcp_servers,omitempty"`
 		PlatformToolsets map[string][]string `json:"platform_toolsets,omitempty"`
-		Approvals        struct {
+		Agent            struct {
+			DisabledToolsets []string `json:"disabled_toolsets,omitempty"`
+		} `json:"agent,omitempty"`
+		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
 		} `json:"approvals,omitempty"`
 		Web struct {
@@ -137,38 +140,40 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.Terminal.Backend = "local"
 	cfg.Terminal.Cwd = cwd
 
-	// MCP Servers & Toolsets configuration
+	// MCP Servers & Toolsets configuration.
+	//
+	// The `default` profile is the front-door Chat Agent: its ONLY job is to
+	// analyze a message, choose the best specialist, delegate, and proxy the
+	// chat session. It therefore gets ONLY the router MCP (list_agents /
+	// ask_agent) and NO runtime tools of its own. The privileged Platform Agent
+	// and read-only Cluster Agents run as separate Hermes profiles (scaffolded
+	// from the image), each with their own config; those are not rendered here.
 	cfg.MCPServers = map[string]any{
-		"platform_control": map[string]any{
-			"command":         "/opt/hermes/.venv/bin/python3",
-			"args":            []string{"/opt/data/scripts/platform_mcp_server.py"},
-			"connect_timeout": 120,
-			"timeout":         300,
+		"router": map[string]any{
+			"command": "/opt/hermes/.venv/bin/python3",
+			"args":    []string{"/opt/data/scripts/router_server.py"},
 			"env": map[string]string{
-				"KUBERNETES_SERVICE_HOST":       "${KUBERNETES_SERVICE_HOST}",
-				"KUBERNETES_SERVICE_PORT":       "${KUBERNETES_SERVICE_PORT}",
-				"HERMES_HOME":                   "${HERMES_HOME}",
-				"GOOGLE_CHAT_PROJECT_ID":        "${GOOGLE_CHAT_PROJECT_ID}",
-				"GOOGLE_CHAT_SUBSCRIPTION_NAME": "${GOOGLE_CHAT_SUBSCRIPTION_NAME}",
-				"API_SERVER_KEY":                "${API_SERVER_KEY}",
+				"HERMES_HOME": "${HERMES_HOME}",
 			},
 		},
-		"agent_common": map[string]any{
-			"command": "/opt/hermes/.venv/bin/python3",
-			"args":    []string{"/opt/data/scripts/agent_common_server.py"},
-		},
-		"developer_knowledge": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://developerknowledge.googleapis.com/mcp"},
-		},
-		"gke": map[string]any{
-			"command": "node",
-			"args":    []string{"/opt/mcp-remote/dist/proxy.js", "https://container.googleapis.com/mcp"},
-		},
 	}
+	// Router-only toolset for every platform key the gateway may resolve under,
+	// including `google_chat` (the real chat-ingress key).
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":        {"hermes-cli", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
-		"api_server": {"hermes-api-server", "mcp-agent_common", "mcp-platform_control", "mcp-developer_knowledge", "mcp-gke"},
+		"cli":         {"mcp-router"},
+		"api_server":  {"mcp-router"},
+		"google_chat": {"mcp-router"},
+	}
+	// Defense in depth: disabled_toolsets is applied last by Hermes for EVERY
+	// platform key, so even if a base bundle is ever reintroduced the front door
+	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,
+	// code-exec, delegate_task, etc.). Only the mcp-router passthrough survives.
+	cfg.Agent.DisabledToolsets = []string{
+		"terminal", "file", "skills", "code_execution", "delegation",
+		"browser", "computer_use", "cronjob", "web", "search", "x_search",
+		"vision", "video", "image_gen", "video_gen", "tts", "todo", "memory",
+		"session_search", "project", "homeassistant", "kanban", "discord",
+		"discord_admin", "spotify",
 	}
 
 	// Execution & Display UX configuration
