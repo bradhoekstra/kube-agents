@@ -9,17 +9,26 @@
 # from shared defaults. The whole point of the Chat Agent is a minimal, low-
 # privilege front door, so its config must be self-contained.
 #
-# TOOL LOCKDOWN — the Chat Agent's ONLY job is to analyze a message, choose the
-# best specialist, delegate, and proxy the chat session. It must have NO access
-# to gcloud/kubectl/terminal/files/skills/code-exec/etc. Two layers enforce this:
-#   1. `platform_toolsets` lists ONLY `mcp-router` (no `hermes-cli`/
-#      `hermes-api-server` base bundles, which would otherwise grant terminal,
-#      file read/write, skills, execute_code, and delegate_task).
-#   2. `agent.disabled_toolsets` is a denylist applied LAST inside Hermes'
-#      toolset resolver for EVERY platform key (including `google_chat`, the key
-#      real chat ingress resolves under — not `api_server`). This is the
-#      authoritative backstop: even if a base bundle is ever reintroduced, these
-#      toolsets are stripped. Only the `mcp-router` MCP passthrough survives.
+# NOTE: This file mirrors what the operator renders into the platform-agent-config
+# ConfigMap (k8s-operator renderConfigYAML), which is mounted over
+# /opt/data/config.yaml and is the AUTHORITATIVE config at runtime. Keep the two
+# in sync; the operator's version wins on the deployed default profile.
+#
+# TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
+# specialist, delegate, and proxy the chat session. It has NO runtime tools of its
+# own (no gcloud/kubectl/terminal/files/skills/code-exec). Its delegation surface:
+#   - `mcp-router` (ask_agent/list_agents): synchronous, for quick read-only lookups.
+#   - `kanban`: async delegation for long/multi-step/mutating work — Hermes auto-
+#     subscribes this chat thread and posts the specialist's progress back to it,
+#     with no 300s blocking timeout.
+# Enforcement layers:
+#   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` (no `hermes-cli`/
+#      `hermes-api-server` base bundles, which would grant terminal/file/exec).
+#   2. `toolsets` (top-level) also lists `kanban` — a SECOND gate the kanban tools'
+#      check_fn reads to expose the orchestrator surface (kanban_create/list/…).
+#   3. `agent.disabled_toolsets` is a denylist applied LAST for EVERY platform key
+#      (incl. `google_chat`, the real ingress key). It strips everything except the
+#      delegation surface, even if a base bundle is ever reintroduced.
 
 model:
   provider: custom
@@ -47,15 +56,30 @@ mcp_servers:
 platform_toolsets:
   cli:
     - mcp-router
+    - kanban
   api_server:
     - mcp-router
+    - kanban
   # Real Google Chat ingress resolves under the `google_chat` platform key; pin
-  # it to router-only too so it never falls back to the full default bundle.
+  # it to the delegation surface too so it never falls back to a full base bundle.
   google_chat:
     - mcp-router
+    - kanban
+
+# Second gate for the kanban orchestrator surface (kanban_create/list/…): the
+# kanban tools' check_fn reads this top-level key, distinct from platform_toolsets.
+toolsets:
+  - kanban
+
+# Kanban chat-transparency machinery (both default True upstream; pinned so a
+# future default change can't silently disable delegated-progress in chat).
+kanban:
+  dispatch_in_gateway: true
+  auto_subscribe_on_create: true
 
 # Denylist applied last for every platform key — the authoritative guarantee that
-# the front door cannot touch the system. Everything except the router MCP is off.
+# the front door cannot touch the system. Everything except the delegation
+# surface (mcp-router + kanban) is off.
 agent:
   disabled_toolsets:
     - terminal        # shell / gcloud / kubectl / command execution + process mgmt
@@ -79,7 +103,6 @@ agent:
     - session_search
     - project
     - homeassistant
-    - kanban
     - discord
     - discord_admin
     - spotify

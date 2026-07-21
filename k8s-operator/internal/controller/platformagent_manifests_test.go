@@ -86,9 +86,19 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "backend: ddgs") {
 		t.Errorf("expected config to contain web backend: ddgs, got:\n%s", yamlContent)
 	}
-	// The default profile is the router-only Chat Agent front door.
+	// The default profile is the Chat Agent front door: router MCP (sync) + kanban
+	// (async delegation with chat progress). Both are its delegation surface.
 	if !strings.Contains(yamlContent, "mcp-router") {
 		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "kanban") {
+		t.Errorf("expected default profile to enable the kanban toolset, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "dispatch_in_gateway: true") {
+		t.Errorf("expected kanban dispatch_in_gateway pinned on, got:\n%s", yamlContent)
+	}
+	if !strings.Contains(yamlContent, "auto_subscribe_on_create: true") {
+		t.Errorf("expected kanban auto_subscribe_on_create pinned on, got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "disabled_toolsets:") {
 		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)

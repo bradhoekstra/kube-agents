@@ -101,9 +101,17 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		} `json:"terminal"`
 		MCPServers       map[string]any      `json:"mcp_servers,omitempty"`
 		PlatformToolsets map[string][]string `json:"platform_toolsets,omitempty"`
-		Agent            struct {
+		// Top-level toolsets: read by the kanban tools' check_fn to expose the
+		// orchestrator surface (kanban_create/list/…) to the front door. This is
+		// a SEPARATE gate from platform_toolsets — both must include `kanban`.
+		Toolsets []string `json:"toolsets,omitempty"`
+		Agent    struct {
 			DisabledToolsets []string `json:"disabled_toolsets,omitempty"`
 		} `json:"agent,omitempty"`
+		Kanban struct {
+			DispatchInGateway     bool `json:"dispatch_in_gateway"`
+			AutoSubscribeOnCreate bool `json:"auto_subscribe_on_create"`
+		} `json:"kanban,omitempty"`
 		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
 		} `json:"approvals,omitempty"`
@@ -142,12 +150,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 
 	// MCP Servers & Toolsets configuration.
 	//
-	// The `default` profile is the front-door Chat Agent: its ONLY job is to
-	// analyze a message, choose the best specialist, delegate, and proxy the
-	// chat session. It therefore gets ONLY the router MCP (list_agents /
-	// ask_agent) and NO runtime tools of its own. The privileged Platform Agent
-	// and read-only Cluster Agents run as separate Hermes profiles (scaffolded
-	// from the image), each with their own config; those are not rendered here.
+	// The `default` profile is the front-door Chat Agent: its job is to analyze a
+	// message, choose the best specialist, delegate, and proxy the chat session.
+	// It gets NO runtime tools of its own (no terminal/gcloud/kubectl/files/etc.).
+	// Its delegation surface is two things:
+	//   - `router` MCP (ask_agent/list_agents): synchronous, for quick read-only
+	//     lookups where an inline answer is best.
+	//   - `kanban`: async delegation for long-running / multi-step / mutating work
+	//     (e.g. cluster creation). Hermes auto-subscribes this chat thread and
+	//     posts the specialist's lifecycle/progress back to it, and there is no
+	//     300s blocking timeout. The dispatcher/notifier run in this gateway.
+	// The privileged Platform Agent and read-only Cluster Agents run as separate
+	// Hermes profiles (scaffolded from the image) with their own configs.
 	cfg.MCPServers = map[string]any{
 		"router": map[string]any{
 			"command": "/opt/hermes/.venv/bin/python3",
@@ -157,22 +171,30 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			},
 		},
 	}
-	// Router-only toolset for every platform key the gateway may resolve under,
-	// including `google_chat` (the real chat-ingress key).
+	// Delegation toolset (router MCP + kanban) for every platform key the gateway
+	// may resolve under, including `google_chat` (the real chat-ingress key).
 	cfg.PlatformToolsets = map[string][]string{
-		"cli":         {"mcp-router"},
-		"api_server":  {"mcp-router"},
-		"google_chat": {"mcp-router"},
+		"cli":         {"mcp-router", "kanban"},
+		"api_server":  {"mcp-router", "kanban"},
+		"google_chat": {"mcp-router", "kanban"},
 	}
+	// Second gate for the kanban orchestrator surface: the kanban tools' check_fn
+	// reads this top-level `toolsets` key (distinct from platform_toolsets above).
+	cfg.Toolsets = []string{"kanban"}
+	// Pin the chat-transparency machinery on (both default True upstream, pinned
+	// so a future default change can't silently disable delegated-progress).
+	cfg.Kanban.DispatchInGateway = true
+	cfg.Kanban.AutoSubscribeOnCreate = true
 	// Defense in depth: disabled_toolsets is applied last by Hermes for EVERY
 	// platform key, so even if a base bundle is ever reintroduced the front door
 	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,
-	// code-exec, delegate_task, etc.). Only the mcp-router passthrough survives.
+	// code-exec, delegate_task, etc.). `kanban` is intentionally NOT disabled —
+	// it is the delegation surface. Only mcp-router + kanban survive.
 	cfg.Agent.DisabledToolsets = []string{
 		"terminal", "file", "skills", "code_execution", "delegation",
 		"browser", "computer_use", "cronjob", "web", "search", "x_search",
 		"vision", "video", "image_gen", "video_gen", "tts", "todo", "memory",
-		"session_search", "project", "homeassistant", "kanban", "discord",
+		"session_search", "project", "homeassistant", "discord",
 		"discord_admin", "spotify",
 	}
 

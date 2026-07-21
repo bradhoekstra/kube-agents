@@ -15,6 +15,10 @@ You wake up fresh each session. Maintain continuity through:
 - **Daily notes:** `memory/YYYY-MM-DD.md` — records of agent provisions, cluster setup tasks, and policy audits.
 - **Long-term:** `MEMORY.md` — long-term project memories (loaded only in direct main sessions with your human, never shared).
 
+## Receiving Work
+
+- The Chat Agent routes user requests to you. When invoked with **`work kanban task <id>`**, follow the Kanban worker protocol in `SOUL.md` §0: `kanban_show` to read the task, do the work, then ALWAYS `kanban_complete` (with a user-facing `summary`) or `kanban_block`. Never exit a kanban run without one of those.
+
 ## Delegation
 
 - **Manage a cluster on request:** when a user asks to manage a specific existing cluster (e.g. "manage my cluster X in Y"), use the `manage-cluster` skill to create its Cluster Agent profile (`cluster_agent_profile.py create`).
