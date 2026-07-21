@@ -110,6 +110,12 @@ COPY agents/platform/AGENTS.md /opt/defaults/AGENTS.md
 # Copy platform skills
 COPY agents/platform/skills/ /opt/hermes/skills/
 
+# Copy the Cluster Agent profile TEMPLATE (persona, config, skills). This is a
+# template the Platform Agent scaffolds into per-cluster Hermes profiles at
+# runtime (see scripts/cluster_agent_profile.py) — NOT active platform skills,
+# so it is intentionally kept out of /opt/hermes/skills/.
+COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
+
 # Copy platform plugins
 COPY agents/platform/plugins/ /opt/hermes/plugins/
 
@@ -124,12 +130,15 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/merge_configs.py /opt/defaults/config.yam
     rm -f /tmp/merge_configs.py /tmp/platform-config.yaml
 
 # Normalize ownership and permissions at the end of build
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins && \
+RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/cluster-template && \
     find /opt/defaults -type d -exec chmod 755 {} + && \
     find /opt/defaults -type f -exec chmod 644 {} + && \
     find /opt/hermes/skills -type d -exec chmod 755 {} + && \
     find /opt/hermes/skills -type f -exec chmod 644 {} + && \
     find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
     find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
+    find /opt/cluster-template -type d -exec chmod 755 {} + && \
+    find /opt/cluster-template -type f -exec chmod 644 {} + && \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
-    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
+    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null && \
+    find /opt/cluster-template -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
