@@ -36,4 +36,25 @@ This glossary defines key terms and concepts related to the Kubernetes Agentic H
 ### Platform Agent (`platform`)
 
 - **Role:** Architectural custodian and agent orchestrator.
-- **Scope:** Configured with an architectural persona (`SOUL.md`). It manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation.
+- **Scope:** Configured with an architectural persona (`SOUL.md`). It manages multi-tenancy boundaries, fleet-wide governance, and RBAC isolation. It is the operator-deployed gateway pod and owns the GitOps write path; it delegates single-cluster runtime debugging to Cluster Agents.
+
+### Cluster Agent (`agents/cluster/`)
+
+- **Role:** Single-cluster SRE operator for read-only runtime operations and workload root-cause analysis.
+- **Scope:** A per-cluster [Hermes Profile](#hermes-profile) that the Platform Agent creates dynamically inside its own pod (one per managed GKE cluster, persistent until the cluster is deleted). It is scoped to one cluster by persona, toolset, and a pinned `KUBECONFIG`, and shares the Platform Agent pod's identity. It is strictly read-only: it returns an RCA and any proposed manifest patch to the Platform Agent rather than mutating the cluster or opening Pull Requests. It is not represented by the operator or a CRD.
+
+---
+
+## Hermes Runtime Concepts
+
+### Hermes Profile
+
+- **Definition:** A native Hermes feature (`hermes profile` / `hermes -p <name>`) that provides multiple isolated Hermes instances, each with its own config, sessions, skills, and home directory. Multiple profiles run concurrently within a single gateway process/pod. In `kube-agents`, each [Cluster Agent](#cluster-agent-agentscluster) is materialized as a Hermes profile scaffolded from the `agents/cluster/` template.
+
+---
+
+## Coordination
+
+### Work Item (Shared State)
+
+- **Definition:** The unit of coordination between personas. Personas never pass task context or results directly to one another; they exchange a work item in a shared store (`agents/platform/scripts/worklog.py`) — a pluggable interface with a local-file backend (on the shared PVC) as the default and a documented GitHub-issue/PR backend seam. A requester writes the request to a work item and invokes the worker with only a pointer ("Please work on work item `<id>`"); the worker reads the request, does the work, and writes its findings back to the same work item. This keeps invocation messages to imperative pointers and makes the coordination auditable and backend-agnostic.

@@ -177,3 +177,12 @@ _Note: High cost and strict quota requirements._
 **Model**: "Here is the configuration I will use:
 [JSON view]
 Do you want to proceed?"
+
+## After Creation: Provision the Cluster Agent
+
+Once the cluster is successfully created and reachable, create its dedicated **Cluster Agent** profile so runtime debugging for this cluster can be delegated later. Use the [cluster-agent-lifecycle](../cluster-agent-lifecycle/SKILL.md) skill:
+
+```bash
+python3 /opt/data/scripts/cluster_agent_profile.py create \
+  --project "<project>" --cluster "<cluster>" --location "<location>"
+```

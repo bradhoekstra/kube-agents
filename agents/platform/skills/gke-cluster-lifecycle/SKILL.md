@@ -59,5 +59,16 @@ For high-risk upgrades, you can create a new node pool (Green) with the new vers
 
 1. **Use Release Channels**: Always enroll production clusters in a release channel (preferably `Stable` or `Regular`).
 2. **Configure Surge Upgrades**: Use `max-surge-upgrade` to ensure availability during upgrades.
-3. **Use Maintenance Windows**: Configure maintenance windows to ensure upgrades only happen during off-peak hours (see [gke-reliability](../gke-reliability/SKILL.md)).
+3. **Use Maintenance Windows**: Configure maintenance windows to ensure upgrades only happen during off-peak hours (reliability is the Cluster Agent's `gke-reliability` domain).
 4. **Test in Non-Prod**: Always test upgrades in a staging environment before applying them to production.
+
+## Cluster Agent Profile Teardown
+
+When a cluster is decommissioned/deleted, also remove its dedicated **Cluster Agent** profile (created at onboarding). Use the [cluster-agent-lifecycle](../cluster-agent-lifecycle/SKILL.md) skill:
+
+```bash
+python3 /opt/data/scripts/cluster_agent_profile.py delete \
+  --project "<project>" --cluster "<cluster>" --location "<location>"
+```
+
+Do not delete a Cluster Agent profile while its cluster still exists.
