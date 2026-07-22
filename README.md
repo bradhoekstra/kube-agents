@@ -6,7 +6,7 @@ The k8s agentic harness will fundamentally redefine the DevOps presentation laye
 
 ### 1. Chat Agent (`agents/chat/`, the `default` profile)
 
-The single conversational front door to the harness. It is the `default` Hermes profile — the only one that receives chat ingress. It analyzes each message, discovers which specialist agents are available and what each is responsible for (via the `router` tools `list_agents` / `ask_agent`), delegates the request to the right specialist, and relays the response. It holds **no** infrastructure tools of its own — the front door can route, not mutate. Unlike the specialists (which coordinate pointer-only), the Chat Agent may pass full context to a specialist and relay its real response.
+The single conversational front door to the harness. It is the `default` Hermes profile — the only one that receives chat ingress. It analyzes each message, discovers which specialist agents are available and what each is responsible for (via the `router` tool `list_agents`), delegates the request to the right specialist over the asynchronous kanban board (`kanban_create`), and relays the progress and result back into the thread. It holds **no** infrastructure tools of its own — the front door can route, not mutate. Unlike the specialists (which coordinate pointer-only), the Chat Agent may pass full context to a specialist (in the kanban task `body`) and relay its real response.
 
 ### 2. Platform Agent (`platform`)
 

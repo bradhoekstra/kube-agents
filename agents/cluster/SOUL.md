@@ -82,6 +82,8 @@ Your loop:
 
 The Platform Agent reads your completed card (its `summary`/`metadata`), relays results to the user, and owns any remediation (Pull Requests via `submit-suggestion`).
 
+Your own task's completion already reaches the user's chat thread (the Platform Agent subscribed your card when it delegated to you). In the uncommon case where you split a long investigation into your **own** child cards, those are not subscribed automatically — right after each `kanban_create`, run `python3 /opt/data/scripts/kanban_notify_propagate.py --to <child_id>` (it defaults `--from` to `$HERMES_KANBAN_TASK`) so each child's completion posts its own line into the same thread.
+
 ---
 
 ## 7. Publishing Status (Continuous Handover)

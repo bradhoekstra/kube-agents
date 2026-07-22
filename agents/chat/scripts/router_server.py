@@ -1,31 +1,24 @@
 #!/usr/bin/env python3
-# router_server.py - Chat Agent routing MCP server.
+# router_server.py - Chat Agent discovery MCP server.
 #
-# Exposes discovery + relay tools so the front-door Chat Agent (the `default`
-# profile) can learn which specialist Hermes profiles exist, what each is
-# responsible for, delegate a fully-contextualized request to one of them, and
-# relay the response back to the user.
+# Exposes a single discovery tool so the front-door Chat Agent (the `default`
+# profile) can learn which specialist Hermes profiles exist and what each is
+# responsible for. The Chat Agent uses this to pick the right `assignee` before
+# it delegates work.
 #
-# Coordination model: unlike the platform<->cluster coordination (pointer-only
-# via the kanban board, where personas never exchange context directly), the Chat
-# Agent is intentionally EXEMPT from the pointer-only rule. It is the
-# conversational relay, not a peer specialist, so it passes full context in and
-# returns the specialist's real response out.
-#
-# Transport: in-pod, local profile invocation (`hermes -p <name> -z ...`), the
-# same reliable mechanism the fleet status refresh cron uses to reach cluster
-# profiles. This reaches a specific profile in this pod, unlike the HTTP
-# call_agent path which only reaches one gateway's default profile.
+# Delegation itself does NOT happen here: the Chat Agent delegates exclusively
+# via the asynchronous kanban board (`kanban_create`), so the user sees live,
+# non-blocking progress in the thread. This module used to also expose a
+# synchronous `ask_agent` relay (`hermes -p <name> -z ...`); that path blocked
+# for up to 5 minutes with no visible progress and was removed in favor of the
+# kanban-only model. `list_agents` remains because choosing an assignee still
+# requires an up-to-date roster of the dynamic specialist set.
 
 import os
-import re
-import subprocess
 import sys
 
 from pathlib import Path
-from typing import Annotated
 
-from pydantic import Field
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("Chat Router")
@@ -35,18 +28,10 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 PROFILES_BASE = HERMES_HOME / "profiles"
 # The front door itself; never a valid delegation target.
 SELF_PROFILE = "default"
-MAX_NAME_LEN = 63
-# Match the platform_control / call_agent 5-minute ceiling for long reasoning loops.
-INVOKE_TIMEOUT = int(os.environ.get("ROUTER_INVOKE_TIMEOUT", "300"))
 
 
 def log(msg: str) -> None:
     print(f"[ROUTER-MCP] {msg}", file=sys.stderr)
-
-
-def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Env for subprocesses: HOME -> /tmp (writable creds) and HERMES_HOME pinned."""
-    return {**os.environ, "HOME": "/tmp", "HERMES_HOME": str(HERMES_HOME), **(extra or {})}
 
 
 def _summarize_soul(home: Path) -> str:
@@ -109,70 +94,6 @@ def list_agents() -> str:
     return "\n".join(
         f"- {a['name']}: {a['responsibilities'] or '(no description provided)'}" for a in agents
     )
-
-
-@mcp.tool()
-def ask_agent(
-    target_agent: Annotated[
-        str,
-        Field(
-            description="Name of the specialist agent to delegate to, exactly as returned by "
-            "list_agents (e.g. 'platform' or a 'cluster-...' profile). Must not be 'default'."
-        ),
-    ],
-    query: Annotated[
-        str,
-        Field(
-            description="The fully self-contained request to send. Include ALL context the agent "
-            "needs (the user's intent plus relevant details from the conversation) — unlike "
-            "inter-specialist coordination, you may and should pass full context here."
-        ),
-    ],
-) -> str:
-    """Delegate a fully-contextualized request to a specialist agent and return its response.
-
-    Returns the specialist's response so you can relay it to the user. Use list_agents first to
-    choose the right target. Do not route to 'default' (that is you).
-
-    Transparency: when you relay this response, make it clear to the user WHICH agent handled the
-    request — begin your reply with an attribution line naming `target_agent` (see your SOUL.md
-    relay format). Never present a delegated answer as if you produced it yourself.
-    """
-    name = (target_agent or "").strip()
-    if not name or not re.match(r"^[a-zA-Z0-9._-]+$", name) or len(name) > MAX_NAME_LEN:
-        return f"ERROR: invalid target agent name: {target_agent!r}"
-    if name == SELF_PROFILE:
-        return (
-            "ERROR: refusing to route to 'default' (that is you, the Chat Agent). "
-            "Choose a specialist agent from list_agents."
-        )
-
-    home = PROFILES_BASE / name
-    if not home.is_dir():
-        return f"ERROR: agent '{name}' does not exist. Call list_agents to see available agents."
-
-    env = _run_env()
-    # A cluster profile pins its own KUBECONFIG in its home; honor it if present.
-    kubeconfig = home / "kubeconfig.yaml"
-    if kubeconfig.is_file():
-        env["KUBECONFIG"] = str(kubeconfig)
-
-    log(f"Delegating to profile '{name}' (query {len(query)} chars).")
-    try:
-        result = subprocess.run(
-            ["hermes", "-p", name, "-z", query],
-            capture_output=True, text=True, env=env, timeout=INVOKE_TIMEOUT,
-        )
-    except subprocess.TimeoutExpired:
-        return f"ERROR: agent '{name}' timed out after {INVOKE_TIMEOUT}s."
-    except Exception as e:  # noqa: BLE001 - surface any invocation failure to the model
-        return f"ERROR: failed to invoke agent '{name}': {e}"
-
-    out = (result.stdout or "").strip()
-    if result.returncode != 0:
-        err = (result.stderr or "").strip()
-        return f"ERROR: agent '{name}' exited {result.returncode}: {err or out or '(no output)'}"
-    return out or "(agent returned no output)"
 
 
 if __name__ == "__main__":

@@ -17,10 +17,13 @@
 # TOOL LOCKDOWN — the Chat Agent's job is to analyze a message, choose the best
 # specialist, delegate, and proxy the chat session. It has NO runtime tools of its
 # own (no gcloud/kubectl/terminal/files/skills/code-exec). Its delegation surface:
-#   - `mcp-router` (ask_agent/list_agents): synchronous, for quick read-only lookups.
-#   - `kanban`: async delegation for long/multi-step/mutating work — Hermes auto-
-#     subscribes this chat thread and posts the specialist's progress back to it,
-#     with no 300s blocking timeout.
+#   - `mcp-router` (list_agents): discovery only — lists the dynamic specialist
+#     roster so the Chat Agent can pick the right kanban `assignee`. (The old
+#     synchronous `ask_agent` relay was removed: it blocked up to 300s with no
+#     visible progress. All delegation is now kanban-only.)
+#   - `kanban`: async delegation for ALL substantive work — Hermes auto-subscribes
+#     this chat thread and posts the specialist's progress back to it as each step
+#     completes, with no blocking timeout.
 # Enforcement layers:
 #   1. `platform_toolsets` lists ONLY `mcp-router` + `kanban` (no `hermes-cli`/
 #      `hermes-api-server` base bundles, which would grant terminal/file/exec).

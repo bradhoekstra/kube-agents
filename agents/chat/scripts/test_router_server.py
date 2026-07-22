@@ -67,22 +67,21 @@ class TestDiscovery(unittest.TestCase):
             self.assertIn("No specialist agents", router.list_agents())
 
 
-class TestAskAgentGuards(unittest.TestCase):
-    """ask_agent must reject bad targets before ever invoking hermes."""
+class TestKanbanOnly(unittest.TestCase):
+    """The router is discovery-only: the synchronous ask_agent relay is gone.
 
-    def test_refuses_default(self):
-        result = router.ask_agent("default", "do something")
-        self.assertIn("refusing to route to 'default'", result)
+    Delegation happens exclusively via the asynchronous kanban board so the user
+    sees non-blocking progress in the thread; the router only advertises the
+    dynamic specialist roster used to pick an assignee.
+    """
 
-    def test_rejects_invalid_name(self):
-        for bad in ("", "has space", "../escape", "a/b"):
-            self.assertTrue(router.ask_agent(bad, "q").startswith("ERROR: invalid target"))
+    def test_ask_agent_removed(self):
+        self.assertFalse(hasattr(router, "ask_agent"))
 
-    def test_missing_profile(self):
-        with TemporaryDirectory() as tmp:
-            router.PROFILES_BASE = Path(tmp) / "profiles"
-            (router.PROFILES_BASE).mkdir()
-            self.assertIn("does not exist", router.ask_agent("platform", "q"))
+    def test_no_blocking_subprocess_machinery(self):
+        # These only existed to support the removed synchronous relay.
+        self.assertFalse(hasattr(router, "INVOKE_TIMEOUT"))
+        self.assertFalse(hasattr(router, "_run_env"))
 
 
 if __name__ == "__main__":

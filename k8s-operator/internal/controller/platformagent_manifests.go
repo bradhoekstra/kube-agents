@@ -154,12 +154,15 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// message, choose the best specialist, delegate, and proxy the chat session.
 	// It gets NO runtime tools of its own (no terminal/gcloud/kubectl/files/etc.).
 	// Its delegation surface is two things:
-	//   - `router` MCP (ask_agent/list_agents): synchronous, for quick read-only
-	//     lookups where an inline answer is best.
-	//   - `kanban`: async delegation for long-running / multi-step / mutating work
-	//     (e.g. cluster creation). Hermes auto-subscribes this chat thread and
-	//     posts the specialist's lifecycle/progress back to it, and there is no
-	//     300s blocking timeout. The dispatcher/notifier run in this gateway.
+	//   - `router` MCP (list_agents): discovery only — lists the dynamic specialist
+	//     roster so the Chat Agent can pick the right kanban `assignee`. (The old
+	//     synchronous `ask_agent` relay was removed; it blocked up to 300s with no
+	//     visible progress. All delegation is kanban-only now.)
+	//   - `kanban`: async delegation for ALL substantive work (quick lookups and
+	//     long/multi-step/mutating jobs alike). Hermes auto-subscribes this chat
+	//     thread and posts the specialist's lifecycle/progress back to it as each
+	//     step completes, with no blocking timeout. The dispatcher/notifier run in
+	//     this gateway.
 	// The privileged Platform Agent and read-only Cluster Agents run as separate
 	// Hermes profiles (scaffolded from the image) with their own configs.
 	cfg.MCPServers = map[string]any{
