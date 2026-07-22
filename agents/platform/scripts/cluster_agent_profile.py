@@ -87,6 +87,24 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
     config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
 
 
+def _pin_kubeconfig_env(home: Path, kubeconfig: Path) -> None:
+    """Pin KUBECONFIG for the dispatcher-spawned worker via the profile's ``.env``.
+
+    A worker launched as ``hermes -p <name>`` rewrites HERMES_HOME to this profile
+    home and loads ``<home>/.env`` at startup (Hermes ``get_env_path()`` ==
+    ``get_hermes_home()/".env"``), so this is what actually exports KUBECONFIG on
+    the dispatch path — the gateway's spawn env never sets it. Without it a
+    dispatched Cluster Agent runs kubectl against the wrong/absent cluster.
+
+    Idempotent: rewrites the ``KUBECONFIG`` line in place and preserves any other
+    lines already present in ``.env``.
+    """
+    env_path = home / ".env"
+    existing = env_path.read_text(encoding="utf-8") if env_path.exists() else ""
+    kept = [ln for ln in existing.splitlines(keepends=True) if not ln.startswith("KUBECONFIG=")]
+    env_path.write_text("".join(kept) + f"KUBECONFIG={kubeconfig}\n", encoding="utf-8")
+
+
 def cmd_create(args: argparse.Namespace) -> None:
     for field, value in (("project", args.project), ("cluster", args.cluster), ("location", args.location)):
         _validate(value, field)
@@ -121,6 +139,9 @@ def cmd_create(args: argparse.Namespace) -> None:
         raise SystemExit(f"ERROR: failed to fetch credentials for '{args.cluster}': {e.stderr.strip()}")
     except subprocess.TimeoutExpired:
         raise SystemExit(f"ERROR: timed out fetching credentials for '{args.cluster}'.")
+
+    # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
+    _pin_kubeconfig_env(home, kubeconfig)
 
     # 4. Write the fixed cluster identity into USER.md.
     (home / "USER.md").write_text(

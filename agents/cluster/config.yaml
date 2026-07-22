@@ -10,8 +10,10 @@
 #   - The `platform_control` (provisioning/Config-Connector) and `agent_common`
 #     (A2A) MCP servers are intentionally omitted — a Cluster Agent diagnoses,
 #     it does not provision or delegate.
-#   - KUBECONFIG is pinned to the target cluster at scaffold time (see the
-#     `env:` block below, templated by cluster_agent_profile.py).
+#   - KUBECONFIG is pinned to the target cluster at scaffold time by
+#     cluster_agent_profile.py, which writes `KUBECONFIG=<home>/kubeconfig.yaml`
+#     into the profile's `.env`. A dispatcher-spawned worker (`hermes -p <name>`)
+#     loads that `.env` on startup, so kubectl targets this cluster.
 
 model:
   provider: custom

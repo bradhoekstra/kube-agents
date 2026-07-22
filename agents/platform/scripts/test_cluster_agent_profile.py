@@ -7,6 +7,7 @@ profile_name is a pure, deterministic function; the module imports without pyyam
 """
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -53,6 +54,25 @@ class ProfileNameTest(unittest.TestCase):
             cap.profile_name("proj", long_cluster, "loc"),
             cap.profile_name("proj", long_cluster, "loc"),
         )
+
+
+class PinKubeconfigEnvTest(unittest.TestCase):
+    def test_writes_kubeconfig_line(self):
+        home = Path(tempfile.mkdtemp())
+        kubeconfig = home / "kubeconfig.yaml"
+        cap._pin_kubeconfig_env(home, kubeconfig)
+        self.assertEqual((home / ".env").read_text(), f"KUBECONFIG={kubeconfig}\n")
+
+    def test_idempotent_and_preserves_other_lines(self):
+        home = Path(tempfile.mkdtemp())
+        kubeconfig = home / "kubeconfig.yaml"
+        (home / ".env").write_text("FOO=bar\nKUBECONFIG=/stale/path\n")
+        cap._pin_kubeconfig_env(home, kubeconfig)
+        cap._pin_kubeconfig_env(home, kubeconfig)  # second run must not duplicate
+        text = (home / ".env").read_text()
+        self.assertEqual(text.count("KUBECONFIG="), 1)
+        self.assertIn("FOO=bar\n", text)
+        self.assertIn(f"KUBECONFIG={kubeconfig}\n", text)
 
 
 if __name__ == "__main__":
