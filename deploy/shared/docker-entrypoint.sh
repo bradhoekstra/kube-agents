@@ -61,6 +61,28 @@ if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$TARGET_DIR/scripts" ]; then
     ln -sfn "$TARGET_DIR/scripts" "$TARGET_DIR/profiles/platform/scripts" 2>/dev/null || true
 fi
 
+# 2.6 Force-sync the image-managed persona files of the specialist profiles so
+# they ALWAYS track the image, not the persistent PVC — the same guarantee step
+# 2a gives the default profile. The scaffold in 2.5 only runs when a profile is
+# ABSENT, so without this an existing platform/cluster profile on the PVC keeps
+# stale SOUL.md/AGENTS.md after an image roll. These persona docs are image-owned
+# (not runtime state); per-profile runtime files (USER.md, the identity-stamped
+# cluster config.yaml, memory/) are deliberately left untouched.
+if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
+    for f in SOUL.md AGENTS.md CAPABILITIES.md; do
+        [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
+    done
+fi
+CLUSTER_TEMPLATE="/opt/cluster-template"
+if [ -d "$CLUSTER_TEMPLATE" ]; then
+    for d in "$TARGET_DIR"/profiles/cluster-*; do
+        [ -d "$d" ] || continue
+        for f in SOUL.md AGENTS.md; do
+            [ -f "$CLUSTER_TEMPLATE/$f" ] && cp -f "$CLUSTER_TEMPLATE/$f" "$d/$f" 2>/dev/null || true
+        done
+    done
+fi
+
 # 3. Enable OpenTelemetry plugin in active config.yaml (if writable)
 if [ -f "$TARGET_DIR/config.yaml" ] && [ -w "$TARGET_DIR/config.yaml" ]; then
     "$INSTALL_DIR/.venv/bin/python3" -c "import sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; enabled = c.setdefault('plugins', {}).setdefault('enabled', []); 'hermes_otel' not in enabled and enabled.append('hermes_otel'); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/config.yaml" 2>/dev/null || true
