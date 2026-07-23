@@ -162,7 +162,7 @@ def main() -> int:
         ok, msg = _run("delete", project_, cluster, location)
         print(f"  - PRUNE  {cluster}/{location} ({name}): {'OK' if ok else 'FAILED — ' + msg}")
 
-    for _project, cluster, location in keep:
+    for _proj, cluster, location in keep:
         print(f"  = KEEP   {cluster}/{location}")
 
     return 0  # resilient: never fail the cron on a transient error
