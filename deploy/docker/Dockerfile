@@ -73,6 +73,7 @@ RUN git clone https://github.com/bradhoekstra/mcp-remote.git /opt/mcp-remote && 
 RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 COPY --chown=hermes:hermes docs/glossary.md /opt/defaults/docs/
+COPY --chown=hermes:hermes docs/gcp-console-links.md /opt/defaults/docs/
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults

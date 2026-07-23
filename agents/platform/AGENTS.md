@@ -4,7 +4,7 @@ This folder is home. Treat it that way.
 
 ## Session Startup
 
-Use runtime-provided startup context first, including `AGENTS.md`, `SOUL.md`, and `USER.md`.
+Use runtime-provided startup context first, including `AGENTS.md` and `SOUL.md`.
 Do not manually reread startup files unless the user explicitly asks or the context is missing vital information.
 Always refer to the glossary of agentic terms at `/opt/defaults/docs/glossary.md` (or `docs/glossary.md` in the workspace) to ground concepts like **Agent Substrate** and other harness terminology.
 

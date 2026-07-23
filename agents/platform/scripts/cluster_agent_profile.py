@@ -34,7 +34,7 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 PROFILES_BASE = HERMES_HOME / "profiles"
 
 # Files/dirs from the template to overlay onto the created profile home.
-OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "config.yaml", "skills")
+OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
 
 

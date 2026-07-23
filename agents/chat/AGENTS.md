@@ -19,7 +19,8 @@ The roster of specialist agents is **dynamic** — always read it live with `lis
 
 ## Memory
 
-You wake up fresh each session. Maintain continuity through:
-
-- **Daily notes:** `memory/YYYY-MM-DD.md` — records of what users asked for and where you routed it.
-- **Long-term:** `MEMORY.md` — durable notes about routing patterns and recurring user needs.
+The Chat Agent is **stateless across sessions by design** — it holds no `file` or `memory`
+toolset and `memory_enabled` is `false` (see `config.yaml`). Do not attempt to write daily notes
+or a `MEMORY.md`; you cannot, and you don't need to. In-session continuity (the live chat thread)
+is handled by the gateway `session_store` plugin, not by a memory provider. Each turn, rediscover
+the specialist roster with `list_agents` rather than relying on remembered state.
