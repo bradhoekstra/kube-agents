@@ -29,11 +29,22 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
 
    This scaffolds the Cluster Agent profile home on the data PVC, pins a read-only `KUBECONFIG` to that cluster, stamps its `cluster_identity` into the profile config, and prints the profile name. It is idempotent — re-managing an already-managed cluster is a safe no-op.
 
-4. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent, is delegable (kanban).
+4. **Label the cluster** so the reconcile loop (`reconcile_cluster_agents.py`) treats it as the source of truth for "should have an agent":
+
+   ```bash
+   gcloud container clusters update "<cluster>" --location "<location>" --project "<project>" \
+     --update-labels managed-by-kube-agents=true
+   ```
+
+5. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent, is delegable (kanban), and is tracked by the reconcile loop.
 
 ## Stop managing
 
-To **unmanage** a cluster, delete its profile (see the `cluster-agent-lifecycle` skill): `cluster_agent_profile.py delete --project … --cluster … --location …`. Only do this when the user asks to stop managing (or the cluster is being torn down); it removes the profile home.
+To **unmanage** a cluster, either:
+- **Remove the label** — `gcloud container clusters update <cluster> --location <location> --project <project> --remove-labels managed-by-kube-agents`; the `reconcile-cluster-agents` cron will prune the profile on its next run (it deletes profiles whose cluster is gone or unlabeled). This is the preferred, declarative-ish path.
+- Or delete the profile immediately (see the `cluster-agent-lifecycle` skill): `cluster_agent_profile.py delete --project … --cluster … --location …`.
+
+Only do this when the user asks to stop managing (or the cluster is being torn down).
 
 ## Notes
 

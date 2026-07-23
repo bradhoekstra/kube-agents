@@ -122,6 +122,21 @@
       ],
       "enabled": true,
       "deliver": "all"
+    },
+    {
+      "id": "reconcile-cluster-agents",
+      "name": "Reconcile Cluster Agents",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 15,
+        "display": "every 15m"
+      },
+      "prompt": "",
+      "no_agent": true,
+      "script": "reconcile_cluster_agents.py",
+      "skills": [],
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }
