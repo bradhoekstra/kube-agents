@@ -136,16 +136,21 @@ def _pin_kubeconfig_env(home: Path, kubeconfig: Path) -> None:
     env_path.write_text("".join(kept) + f"KUBECONFIG={kubeconfig}\n", encoding="utf-8")
 
 
-def cmd_create(args: argparse.Namespace) -> None:
-    for field, value in (("project", args.project), ("cluster", args.cluster), ("location", args.location)):
+def create_profile(project: str, cluster: str, location: str) -> str:
+    """Scaffold (idempotently) a Cluster Agent profile for a GKE cluster; return its name.
+
+    Shared by the ``create`` CLI subcommand and the reconcile engine. Raises SystemExit on a
+    hard failure (missing template, credential fetch failure).
+    """
+    for field, value in (("project", project), ("cluster", cluster), ("location", location)):
         _validate(value, field)
-    name = profile_name(args.project, args.cluster, args.location)
+    name = profile_name(project, cluster, location)
 
     if not TEMPLATE_DIR.is_dir():
         raise SystemExit(f"ERROR: cluster template dir not found: {TEMPLATE_DIR}")
 
     # 1. Register the profile with Hermes (idempotent) via the shared scaffold helper.
-    description = f"Read-only Cluster Agent for GKE cluster {args.cluster} ({args.project}/{args.location})."
+    description = f"Read-only Cluster Agent for GKE cluster {cluster} ({project}/{location})."
     home = ensure_profile(name, description, HERMES_HOME)
 
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
@@ -153,7 +158,7 @@ def cmd_create(args: argparse.Namespace) -> None:
 
     # 2b. Stamp this cluster's identity into the profile config as structured identity
     #     metadata — never derived from the sanitized profile name.
-    _inject_cluster_identity(home, args.project, args.cluster, args.location)
+    _inject_cluster_identity(home, project, cluster, location)
 
     # 3. Pin a kubeconfig scoped to the target cluster.
     kubeconfig = home / "kubeconfig.yaml"
@@ -161,15 +166,15 @@ def cmd_create(args: argparse.Namespace) -> None:
     try:
         subprocess.run(
             [
-                "gcloud", "container", "clusters", "get-credentials", args.cluster,
-                f"--location={args.location}", f"--project={args.project}",
+                "gcloud", "container", "clusters", "get-credentials", cluster,
+                f"--location={location}", f"--project={project}",
             ],
             check=True, capture_output=True, text=True, timeout=60, env=env,
         )
     except subprocess.CalledProcessError as e:
-        raise SystemExit(f"ERROR: failed to fetch credentials for '{args.cluster}': {e.stderr.strip()}")
+        raise SystemExit(f"ERROR: failed to fetch credentials for '{cluster}': {e.stderr.strip()}")
     except subprocess.TimeoutExpired:
-        raise SystemExit(f"ERROR: timed out fetching credentials for '{args.cluster}'.")
+        raise SystemExit(f"ERROR: timed out fetching credentials for '{cluster}'.")
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)
@@ -178,14 +183,17 @@ def cmd_create(args: argparse.Namespace) -> None:
     (home / "USER.md").write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
-        f"- project: {args.project}\n"
-        f"- cluster: {args.cluster}\n"
-        f"- location: {args.location}\n\n"
+        f"- project: {project}\n"
+        f"- cluster: {cluster}\n"
+        f"- location: {location}\n\n"
         f"KUBECONFIG: {kubeconfig}\n",
         encoding="utf-8",
     )
+    return name
 
-    print(name)
+
+def cmd_create(args: argparse.Namespace) -> None:
+    print(create_profile(args.project, args.cluster, args.location))
 
 
 def delete_profile(name: str) -> None:

@@ -187,6 +187,6 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \
   --project "<project>" --cluster "<cluster>" --location "<location>"
 ```
 
-This gives the new cluster an agent immediately. (The `reconcile-cluster-agents` cron would
+This gives the new cluster an agent immediately. (The `cluster-agent-reconcile` cron would
 also pick it up on its next run — it manages every cluster in the project except the
 management cluster — so no labeling is required.)

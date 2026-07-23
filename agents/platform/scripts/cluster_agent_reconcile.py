@@ -1,33 +1,40 @@
 #!/usr/bin/env python3
-# cluster_agent_reconcile.py - Prune orphaned Cluster Agent profiles.
+# cluster_agent_reconcile.py - Reconcile Cluster Agent profiles with the live GKE fleet.
 #
-# Cluster Agents are Hermes profiles on the data PVC ($HERMES_HOME/profiles/<name>),
-# one per managed GKE cluster, each stamped with a `cluster_identity` block in its
-# config.yaml. They are created/deleted when the Platform Agent follows the
-# onboarding/teardown skills — but a cluster deleted out-of-band (gcloud, a removed
-# Config Connector CR, ...) leaves its profile orphaned forever.
+# Cluster Agents are Hermes profiles on the data PVC ($HERMES_HOME/profiles/<name>), one per
+# managed GKE cluster, each stamped with a `cluster_identity` block in its config.yaml.
 #
-# This deterministic engine closes that loop. Per run it enumerates the managed
-# profiles, resolves each one's target cluster from its `cluster_identity`, and
-# deletes the profile IFF its GKE cluster is *definitively* gone (a NotFound/404
-# from `gcloud container clusters describe`). Every other error path — auth,
-# network, timeout, quota, an unreadable identity — is treated as "unknown" and
-# the profile is left untouched: we never delete on ambiguity.
+# Policy: **every cluster in the project gets a Cluster Agent profile, EXCEPT the management
+# cluster where kube-agents itself runs** (and any names in RECONCILE_EXCLUDE). Per run this
+# deterministic engine:
+#   • CREATE — scaffolds a profile for every project cluster that doesn't have one yet;
+#   • PRUNE  — deletes a profile whose cluster is *definitively* gone (a NotFound/404 from
+#     `gcloud container clusters describe`), or whose cluster is the management/excluded one
+#     (it must not carry a profile). Any other error path — auth, network, timeout, quota, an
+#     unreadable identity — is treated as "unknown" and the profile is left untouched: we never
+#     delete on ambiguity.
 #
-# It runs as a `no_agent` cron job on the profile the gateway actually ticks (the
-# `default`/chat profile — see docs/designs/fleet-handover-retirement.md §4).
-# Scripts and the profiles PVC are shared pod-wide, so it operates on every
-# profile regardless of which profile ticks it. It is resilient (always exit 0)
-# and posts a Google Chat summary only when it actually prunes something.
+# The management cluster is identified by **self-identity, not by name**: the pod asks the GKE
+# metadata server which cluster its node belongs to (instance/attributes/cluster-name +
+# cluster-location), so it works no matter what the customer named the cluster. If self-identity
+# or the project can't be resolved, the CREATE direction is skipped for that run (prune-only
+# degradation) so we never accidentally create a profile for the management cluster.
+#
+# It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
+# profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
+# shared pod-wide, so it operates on every profile regardless of which profile ticks it. It is
+# resilient (always exit 0) and posts a Google Chat summary only when it created or pruned.
 
 import argparse
 import json
 import os
 import subprocess
 import sys
+import urllib.request
 
 from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
+    create_profile,
     delete_profile,
     list_profiles,
     profile_home,
@@ -35,6 +42,8 @@ from cluster_agent_profile import (
 )
 
 DESCRIBE_TIMEOUT_SECONDS = 30
+_MD_BASE = "http://metadata.google.internal/computeMetadata/v1/"
+EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") if c}
 
 
 def log(msg: str) -> None:
@@ -46,12 +55,61 @@ def _run_env() -> dict[str, str]:
     return {**os.environ, "HOME": "/tmp"}
 
 
+def _metadata(path: str):
+    """Read a GKE/GCE metadata value, or None if unavailable."""
+    try:
+        req = urllib.request.Request(_MD_BASE + path, headers={"Metadata-Flavor": "Google"})
+        return urllib.request.urlopen(req, timeout=5).read().decode().strip()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _project() -> str | None:
+    p = os.environ.get("RECONCILE_PROJECT") or _metadata("project/project-id")
+    if p:
+        return p
+    try:
+        r = subprocess.run(["gcloud", "config", "get-value", "project"],
+                           capture_output=True, text=True, timeout=30, env=_run_env())
+        return r.stdout.strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _self_cluster():
+    """(name, location) of the management cluster this pod runs on, or None if unknown."""
+    name = _metadata("instance/attributes/cluster-name")
+    location = _metadata("instance/attributes/cluster-location")
+    if name and location:
+        return (name, location)
+    return None
+
+
+def _all_clusters(project: str) -> list:
+    """Every cluster in the project as (project, name, location) tuples."""
+    try:
+        r = subprocess.run(
+            ["gcloud", "container", "clusters", "list", "--project", project,
+             "--format=value(name,location)"],
+            capture_output=True, text=True, timeout=120, env=_run_env(),
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"listing clusters in {project} failed (skipping create this run): {e}")
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2:
+            out.append((project, parts[0], parts[1]))
+    return out
+
+
 def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
     """Return True if the GKE cluster exists, False if it definitively does not, None if unknown.
 
-    Mirrors platform_mcp_server.verify_gke_cluster's classification: a NotFound/404
-    is the *only* signal that authorizes deletion. Any other failure (auth, network,
-    timeout, quota) returns None so the caller leaves the profile in place.
+    Mirrors platform_mcp_server.verify_gke_cluster's classification: a NotFound/404 is the *only*
+    signal that authorizes deletion. Any other failure (auth, network, timeout, quota) returns
+    None so the caller leaves the profile in place.
     """
     cmd = [
         "gcloud", "container", "clusters", "describe", cluster,
@@ -78,26 +136,68 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
 
 
 def reconcile(dry_run: bool = False) -> dict:
-    """Prune Cluster Agent profiles whose GKE cluster is definitively gone.
+    """Reconcile Cluster Agent profiles with the project's clusters (create + prune).
 
-    Returns a structured report dict with the profile names in each outcome bucket.
-    Isolated per-profile: one bad profile never aborts the sweep.
+    Returns a structured report dict with the profile names/clusters in each outcome bucket.
+    Isolated per-item: one bad profile/cluster never aborts the sweep.
     """
     report: dict[str, list] = {
-        "pruned": [],            # orphan removed (or would be, under --dry-run)
-        "kept": [],              # cluster still exists
+        "created": [],           # profile scaffolded for a cluster that lacked one
+        "pruned": [],            # profile removed (cluster gone, or management/excluded)
+        "kept": [],              # cluster still exists and should be managed
         "skipped_no_identity": [],  # config.yaml lacked a usable cluster_identity
         "skipped_error": [],     # liveness check was inconclusive (auth/network/etc.)
     }
 
     profiles = list_profiles()
-    log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
+    identities = {name: read_cluster_identity(profile_home(name)) for name in profiles}
+    existing_keys = {
+        (i["project"], i["cluster"], i["location"]) for i in identities.values() if i
+    }
 
+    # --- CREATE: ensure every project cluster (except the management/self cluster and
+    #     RECONCILE_EXCLUDE names) has a profile. Requires self-identification + a project.
+    me = _self_cluster()
+    project = _project() if me else None
+    if me and project:
+        self_name, _self_loc = me
+        exclude_names = {self_name} | EXTRA_EXCLUDE
+        for (proj, cluster, location) in sorted(_all_clusters(project)):
+            if cluster in exclude_names or (proj, cluster, location) in existing_keys:
+                continue
+            if dry_run:
+                log(f"{cluster} ({proj}/{location}) has no profile — WOULD create (dry-run).")
+                report["created"].append(f"{cluster}/{location}")
+                continue
+            try:
+                name = create_profile(proj, cluster, location)
+                log(f"created profile {name} for {cluster} ({proj}/{location}).")
+                report["created"].append(name)
+            except (SystemExit, Exception) as e:  # noqa: BLE001 - one failure never aborts the sweep
+                log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
+    else:
+        self_name, exclude_names = None, set()
+        log("could not self-identify the management cluster / project via the metadata server "
+            "— skipping the CREATE direction this run (prune-only).")
+
+    # --- PRUNE: remove profiles whose cluster is gone, or whose cluster is the management/
+    #     excluded one (which must not carry a profile).
+    log(f"Reconciling {len(profiles)} managed profile(s){' (dry-run)' if dry_run else ''}.")
     for name in profiles:
-        identity = read_cluster_identity(profile_home(name))
+        identity = identities[name]
         if identity is None:
             log(f"{name}: no readable cluster_identity — skipping (never delete unverifiable profiles).")
             report["skipped_no_identity"].append(name)
+            continue
+
+        # Policy prune: the management/excluded cluster must not carry a profile.
+        if self_name is not None and identity["cluster"] in exclude_names:
+            if dry_run:
+                log(f"{name}: {identity['cluster']} is the management/excluded cluster — WOULD prune (dry-run).")
+            else:
+                log(f"{name}: {identity['cluster']} is the management/excluded cluster — pruning.")
+                delete_profile(name)
+            report["pruned"].append(name)
             continue
 
         exists = _cluster_exists(**identity)
@@ -122,12 +222,19 @@ def reconcile(dry_run: bool = False) -> dict:
 
 
 def _format_notification(report: dict) -> str:
-    lines = [f"🧹 *Cluster Agent reconcile* — pruned {len(report['pruned'])} orphaned profile(s):"]
-    for name in report["pruned"]:
-        lines.append(f"  • `{name}` (GKE cluster no longer exists)")
-    if report["skipped_error"]:
+    created = report.get("created", [])
+    pruned = report.get("pruned", [])
+    lines = ["🔧 *Cluster Agent reconcile*"]
+    if created:
+        lines.append(f"  ➕ created {len(created)} profile(s): "
+                     + ", ".join(f"`{n}`" for n in created))
+    if pruned:
+        lines.append(f"  🧹 pruned {len(pruned)} profile(s):")
+        for name in pruned:
+            lines.append(f"     • `{name}` (cluster gone or unmanaged)")
+    if report.get("skipped_error"):
         lines.append(
-            f"⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
+            f"  ⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
             f"(left untouched): {', '.join(f'`{n}`' for n in report['skipped_error'])}."
         )
     return "\n".join(lines)
@@ -146,11 +253,12 @@ def _notify(message: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Prune Cluster Agent profiles whose GKE cluster no longer exists."
+        description="Reconcile Cluster Agent profiles with the project's GKE clusters "
+                    "(create for all clusters except the management cluster; prune orphans)."
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Report what would be pruned without deleting anything or notifying.",
+        help="Report what would be created/pruned without changing anything or notifying.",
     )
     args = parser.parse_args()
 
@@ -161,8 +269,11 @@ def main() -> None:
         return
 
     log(
-        "Done: pruned={pruned} kept={kept} no_identity={skipped_no_identity} "
-        "unknown={skipped_error}.".format(**{k: len(v) for k, v in report.items()})
+        "Done: created={} pruned={} kept={} no_identity={} unknown={}.".format(
+            len(report.get("created", [])), len(report.get("pruned", [])),
+            len(report.get("kept", [])), len(report.get("skipped_no_identity", [])),
+            len(report.get("skipped_error", [])),
+        )
     )
 
     if args.dry_run:
@@ -170,7 +281,7 @@ def main() -> None:
         return
 
     # Notify only when there's something actionable to report (avoid idle hourly noise).
-    if report["pruned"]:
+    if report.get("created") or report.get("pruned"):
         _notify(_format_notification(report))
 
 
