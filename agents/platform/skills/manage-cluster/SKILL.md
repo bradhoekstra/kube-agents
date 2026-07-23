@@ -5,7 +5,7 @@ description: Bring an existing GKE cluster under management on user request (e.g
 
 # Manage Cluster Skill
 
-When a user asks you to **manage** (onboard / start watching) a specific existing GKE cluster — e.g. _"manage my cluster `payments-prod` in `us-central1`"_ — bring it under management by creating its **Cluster Agent profile**. After this, the cluster gets a per-cluster agent, is delegable via the kanban board, and starts publishing status through the handover channel.
+When a user asks you to **manage** (onboard / start watching) a specific existing GKE cluster — e.g. _"manage my cluster `payments-prod` in `us-central1`"_ — bring it under management by creating its **Cluster Agent profile**. After this, the cluster gets a per-cluster agent and is delegable via the kanban board.
 
 This is the explicit, user-driven counterpart to onboarding-time creation (`gke-cluster-creator`). It is safe to run repeatedly (idempotent).
 
@@ -27,17 +27,9 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
      --project "<project>" --cluster "<cluster>" --location "<location>"
    ```
 
-   This scaffolds the Cluster Agent profile home on the data PVC, pins a read-only `KUBECONFIG` to that cluster, stamps its `cluster_identity` into the profile config (used by `write_handover`), and prints the profile name. It is idempotent — re-managing an already-managed cluster is a safe no-op.
+   This scaffolds the Cluster Agent profile home on the data PVC, pins a read-only `KUBECONFIG` to that cluster, stamps its `cluster_identity` into the profile config, and prints the profile name. It is idempotent — re-managing an already-managed cluster is a safe no-op.
 
-4. **(Optional) Populate status immediately.** Otherwise the `fleet-status-refresh` cron picks the new profile up on its next tick (≤10m) and publishes `health`/`utilization`. For immediate status, trigger a one-shot publish for just this cluster:
-
-   ```bash
-   KUBECONFIG="/opt/data/profiles/$(python3 /opt/data/scripts/cluster_agent_profile.py name --project '<project>' --cluster '<cluster>' --location '<location>')/kubeconfig.yaml" \
-     hermes -p "$(python3 /opt/data/scripts/cluster_agent_profile.py name --project '<project>' --cluster '<cluster>' --location '<location>')" \
-     -z "Publish your current health and utilization status via write_handover. Use the publish-status skill."
-   ```
-
-5. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent, is delegable (kanban), and status will appear under `/opt/data/fleet/clusters/<cluster>/<location>/`.
+4. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent, is delegable (kanban).
 
 ## Stop managing
 

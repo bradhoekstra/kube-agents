@@ -1,5 +1,7 @@
 # Agent Communication Design — kube-agents
 
+> **STATUS — handover RETIRED (2026-07-23).** The file-based handover channel described as the "primary channel" below is retired; this document is preserved as the design of record for restoring it (see `docs/designs/fleet-handover-retirement.md`). The **kanban delegation** design (optional task delegation) remains active.
+
 **Status:** Draft for review
 **Scope:** How the Platform Agent and per-cluster subagents exchange information.
 **Primary topic:** structured, file-based handover. **Secondary:** optional task delegation via the Hermes kanban board.

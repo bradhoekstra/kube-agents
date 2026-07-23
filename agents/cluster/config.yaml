@@ -19,7 +19,7 @@ model:
   provider: custom
   model: model-default
   default: model-default
-  base_url: http://litellm.agent-system.svc.cluster.local/v1
+  base_url: http://litellm.kubeagents-system.svc.cluster.local/v1
   api_key: none
 
 # MCP Servers configuration. Read-only diagnostics surface only.
@@ -42,12 +42,10 @@ platform_toolsets:
     - hermes-cli
     - mcp-developer_knowledge
     - mcp-gke
-    - handover
   api_server:
     - hermes-api-server
     - mcp-developer_knowledge
     - mcp-gke
-    - handover
 
 memory:
   memory_enabled: false
@@ -61,4 +59,3 @@ web:
 plugins:
   enabled:
     - hermes_otel
-    - handover

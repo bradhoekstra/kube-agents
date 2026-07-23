@@ -72,9 +72,11 @@ def profile_home(name: str) -> Path:
 def _inject_cluster_identity(home: Path, project: str, cluster: str, location: str) -> None:
     """Write a machine-readable cluster_identity block into the profile's config.yaml.
 
-    The handover plugin reads this via `cfg_get(config, "cluster_identity", ...)` to stamp
-    cluster/location onto every handover record — robust vs the sanitized/hashed profile
-    name. (Re-dumping drops the template's comments in this per-profile copy, which is fine.)
+    Records the target project/cluster/location as structured identity metadata — robust
+    vs the sanitized/hashed profile name. (Re-dumping drops the template's comments in this
+    per-profile copy, which is fine.) Kept intentionally after the fleet-handover retirement:
+    it is cheap identity metadata and is what a restored `write_handover` producer would read
+    (see docs/designs/fleet-handover-retirement.md).
     """
     import yaml  # lazy: only needed on the scaffold path, keeps the module importable without pyyaml
 
@@ -120,8 +122,8 @@ def cmd_create(args: argparse.Namespace) -> None:
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
     overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)
 
-    # 2b. Stamp this cluster's identity into the profile config so the handover
-    #     tool can read it (cfg_get) — never derived from the sanitized profile name.
+    # 2b. Stamp this cluster's identity into the profile config as structured identity
+    #     metadata — never derived from the sanitized profile name.
     _inject_cluster_identity(home, args.project, args.cluster, args.location)
 
     # 3. Pin a kubeconfig scoped to the target cluster.

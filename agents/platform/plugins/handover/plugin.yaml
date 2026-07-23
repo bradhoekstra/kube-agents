@@ -1,4 +1,0 @@
-name: handover
-version: 0.1.0
-description: "Cluster-agent status handover: a write_handover tool that publishes typed status records (health, utilization, ...) to the shared fleet directory for the Platform Agent to read."
-kind: standalone

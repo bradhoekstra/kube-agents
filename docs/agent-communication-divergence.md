@@ -1,5 +1,7 @@
 # Agent Communication — Divergence from the Design Doc
 
+> **RETIRED (2026-07-23):** the file-based handover channel (`/opt/data/fleet`) has been retired — it was not load-bearing at current fleet scale. See `docs/designs/fleet-handover-retirement.md` for the rationale and a restore guide. The **kanban delegation** parts below remain active.
+
 **Reference design:** [`docs/designs/agent-communication.md`](https://github.com/bradhoekstra/kube-agents/blob/feat/mvp/docs/designs/agent-communication.md) (branch `feat/mvp`).
 
 This note records where the current implementation on this branch **intentionally differs** from that design. The divergence was accepted knowingly for the MVP; this document is the checklist for realigning later.

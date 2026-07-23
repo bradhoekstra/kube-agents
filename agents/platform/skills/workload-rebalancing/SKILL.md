@@ -5,7 +5,7 @@ description: Orchestrate cross-cluster workload rebalancing using the kanban boa
 
 # Workload Rebalancing Skill (validation-then-declare)
 
-When the continuous handover status (`/opt/data/fleet/clusters/*/*/utilization.json`) shows a cluster **overutilized / under pressure** and another with **headroom**, you may relocate a workload. You act as an **orchestrator**: cluster agents *validate* feasibility (read-only); **you** *declare* the change as a single GitOps PR; **KCC** reconciles the actual move. Never issue imperative start/stop.
+When live cluster utilization — checked via the read-only `gke` MCP / `kubectl top` on each cluster — shows a cluster **overutilized / under pressure** and another with **headroom**, you may relocate a workload. You act as an **orchestrator**: cluster agents *validate* feasibility (read-only); **you** *declare* the change as a single GitOps PR; **KCC** reconciles the actual move. Never issue imperative start/stop.
 
 ## When to use vs. do-it-yourself
 

@@ -59,23 +59,6 @@ The Cluster Agent is **read-only** and does not open Pull Requests. After readin
 2. If a change is warranted, **you** open (or update) the Pull Request via the `submit-suggestion` skill — you own the GitOps write path. Reconcile against any existing branch/PR for the same workload before creating a new one.
 3. Report the outcome to the user as a clean SRE status update.
 
-## Consuming continuous handover status (no delegation)
-
-Independently of on-demand kanban tasks, each Cluster Agent publishes structured status to a shared **fleet handover** area, refreshed periodically by the `fleet-status-refresh` cron job (which invokes every cluster profile to publish via its `write_handover` tool). You read this **directly** — it is the primary, always-available signal for fleet-level reasoning; no kanban card or invocation is needed.
-
-- **Discover & read** with plain file tools:
-
-  ```bash
-  ls /opt/data/fleet/clusters/*/*/           # discover clusters/locations/types
-  cat /opt/data/fleet/clusters/<cluster>/<location>/health.json
-  cat /opt/data/fleet/clusters/<cluster>/<location>/utilization.json
-  ```
-
-- **Envelope:** `{schema_version, cluster, location, type, generated_at, expires_at, payload}` — the typed status is in `payload` (`health`, `utilization`, and more as they land).
-- **Staleness:** ignore any record whose `expires_at` is in the past — treat it as stale, not current truth.
-
-Use this ambient status to decide *whether* a deep dive is needed; when it is, run the delegation loop above for that one cluster.
-
 ## When to delete a profile
 
 Delete the Cluster Agent profile as part of **cluster teardown** (see `gke-cluster-lifecycle`), after the cluster itself is removed:
