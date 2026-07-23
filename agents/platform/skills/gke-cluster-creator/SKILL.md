@@ -187,12 +187,6 @@ python3 /opt/data/scripts/cluster_agent_profile.py create \
   --project "<project>" --cluster "<cluster>" --location "<location>"
 ```
 
-Also **label the cluster** `managed-by-kube-agents=true` so the reconcile loop
-(`reconcile_cluster_agents.py`) tracks it. Prefer adding it declaratively to the
-`ContainerCluster` you submitted (`spec.resourceLabels: {managed-by-kube-agents: "true"}`);
-otherwise apply it directly:
-
-```bash
-gcloud container clusters update "<cluster>" --location "<location>" --project "<project>" \
-  --update-labels managed-by-kube-agents=true
-```
+This gives the new cluster an agent immediately. (The `reconcile-cluster-agents` cron would
+also pick it up on its next run — it manages every cluster in the project except the
+management cluster — so no labeling is required.)

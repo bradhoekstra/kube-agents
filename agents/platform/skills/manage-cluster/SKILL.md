@@ -29,22 +29,15 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
 
    This scaffolds the Cluster Agent profile home on the data PVC, pins a read-only `KUBECONFIG` to that cluster, stamps its `cluster_identity` into the profile config, and prints the profile name. It is idempotent — re-managing an already-managed cluster is a safe no-op.
 
-4. **Label the cluster** so the reconcile loop (`reconcile_cluster_agents.py`) treats it as the source of truth for "should have an agent":
+4. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent and is delegable (kanban).
 
-   ```bash
-   gcloud container clusters update "<cluster>" --location "<location>" --project "<project>" \
-     --update-labels managed-by-kube-agents=true
-   ```
-
-5. **Confirm to the user.** Report that `<cluster>` (`<project>/<location>`) is now managed: it has a Cluster Agent, is delegable (kanban), and is tracked by the reconcile loop.
+> This step gives the cluster an agent **immediately**. Even without it, the `reconcile-cluster-agents` cron automatically gives every cluster in the project (except the management cluster where kube-agents runs) an agent on its next run — this skill just does it now.
 
 ## Stop managing
 
-To **unmanage** a cluster, either:
-- **Remove the label** — `gcloud container clusters update <cluster> --location <location> --project <project> --remove-labels managed-by-kube-agents`; the `reconcile-cluster-agents` cron will prune the profile on its next run (it deletes profiles whose cluster is gone or unlabeled). This is the preferred, declarative-ish path.
-- Or delete the profile immediately (see the `cluster-agent-lifecycle` skill): `cluster_agent_profile.py delete --project … --cluster … --location …`.
-
-Only do this when the user asks to stop managing (or the cluster is being torn down).
+Because reconciliation manages **all** project clusters except the management cluster, deleting a still-existing cluster's profile alone won't stick — the next reconcile recreates it. To stop managing a cluster:
+- **Tear down the cluster** (see `gke-cluster-lifecycle`); reconcile prunes its profile automatically.
+- Or **exclude it**: add its name to the `reconcile-cluster-agents` cron's `RECONCILE_EXCLUDE`, then delete the profile with `cluster_agent_profile.py delete --project … --cluster … --location …`.
 
 ## Notes
 
