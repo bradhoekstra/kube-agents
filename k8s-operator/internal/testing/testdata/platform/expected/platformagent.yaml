@@ -110,6 +110,32 @@ status: {}
 apiVersion: v1
 data:
   config.yaml: |
+    agent:
+      disabled_toolsets:
+      - terminal
+      - file
+      - skills
+      - code_execution
+      - delegation
+      - browser
+      - computer_use
+      - cronjob
+      - web
+      - search
+      - x_search
+      - vision
+      - video
+      - image_gen
+      - video_gen
+      - tts
+      - todo
+      - memory
+      - session_search
+      - project
+      - homeassistant
+      - discord
+      - discord_admin
+      - spotify
     approvals:
       cron_mode: approve
     display:
@@ -120,34 +146,16 @@ data:
           long_running_notifications: true
           memory_notifications: "off"
           tool_progress: "off"
+    kanban:
+      auto_subscribe_on_create: true
+      dispatch_in_gateway: true
     mcp_servers:
-      agent_common:
+      router:
         args:
-        - /opt/data/scripts/agent_common_server.py
+        - /opt/data/scripts/router_server.py
         command: /opt/hermes/.venv/bin/python3
-      developer_knowledge:
-        args:
-        - /opt/mcp-remote/dist/proxy.js
-        - https://developerknowledge.googleapis.com/mcp
-        command: node
-      gke:
-        args:
-        - /opt/mcp-remote/dist/proxy.js
-        - https://container.googleapis.com/mcp
-        command: node
-      platform_control:
-        args:
-        - /opt/data/scripts/platform_mcp_server.py
-        command: /opt/hermes/.venv/bin/python3
-        connect_timeout: 120
         env:
-          API_SERVER_KEY: ${API_SERVER_KEY}
-          GOOGLE_CHAT_PROJECT_ID: ${GOOGLE_CHAT_PROJECT_ID}
-          GOOGLE_CHAT_SUBSCRIPTION_NAME: ${GOOGLE_CHAT_SUBSCRIPTION_NAME}
           HERMES_HOME: ${HERMES_HOME}
-          KUBERNETES_SERVICE_HOST: ${KUBERNETES_SERVICE_HOST}
-          KUBERNETES_SERVICE_PORT: ${KUBERNETES_SERVICE_PORT}
-        timeout: 300
     memory:
       memory_enabled: false
       provider: multiuser_memory
@@ -160,20 +168,18 @@ data:
       provider: custom
     platform_toolsets:
       api_server:
-      - hermes-api-server
-      - mcp-agent_common
-      - mcp-platform_control
-      - mcp-developer_knowledge
-      - mcp-gke
+      - mcp-router
+      - kanban
       cli:
-      - hermes-cli
-      - mcp-agent_common
-      - mcp-platform_control
-      - mcp-developer_knowledge
-      - mcp-gke
+      - mcp-router
+      - kanban
+      google_chat:
+      - mcp-router
+      - kanban
     platforms:
       google_chat:
         enabled: true
+        typing_status_text: Kage is thinking…
       slack:
         enabled: false
     plugins:
@@ -185,6 +191,8 @@ data:
     terminal:
       backend: local
       cwd: /opt/data
+    toolsets:
+    - kanban
     web:
       backend: ddgs
 kind: ConfigMap
@@ -300,7 +308,7 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: 268343ffef4f80b81b57e301ed60eff3d7f738da032b97d0644d60b15d88d3ad
+        kubeagents.x-k8s.io/config-hash: 081c0dcdcb4d3223384305177ceebf499bfa89613942d34ce6c4599e33830db7
         kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
         kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
       creationTimestamp: null

@@ -110,6 +110,15 @@ agent:
     - discord_admin
     - spotify
 
+# Google Chat ingress presentation. The platform itself is enabled/seeded from
+# env at runtime; this block only overrides the adapter's default "thinking"
+# marker card text ("Hermes is thinking…") with our product name. Kept in sync
+# with the operator's renderConfigYAML, which is authoritative on the deployed
+# default profile.
+platforms:
+  google_chat:
+    typing_status_text: "Kage is thinking…"
+
 # No long-term memory: the front door only routes and proxies the live session
 # (in-session continuity is handled by the gateway, not the memory provider).
 memory:
