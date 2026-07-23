@@ -127,9 +127,9 @@
       "id": "reconcile-cluster-agents",
       "name": "Reconcile Cluster Agents",
       "schedule": {
-        "kind": "interval",
-        "minutes": 15,
-        "display": "every 15m"
+        "kind": "cron",
+        "expr": "11 * * * *",
+        "display": "11 * * * *"
       },
       "prompt": "",
       "no_agent": true,
