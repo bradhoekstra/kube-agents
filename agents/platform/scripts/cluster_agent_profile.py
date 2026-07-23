@@ -37,6 +37,11 @@ PROFILES_BASE = HERMES_HOME / "profiles"
 OVERLAY_ITEMS = ("SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills")
 MAX_NAME_LEN = 63
 
+# Non-cluster profiles that live under $HERMES_HOME/profiles but are never
+# managed as Cluster Agents: the front-door router (`default`) and the Platform
+# Agent itself (`platform`). Reconciliation must never touch these.
+RESERVED_PROFILES = frozenset({"default", "platform"})
+
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-PROFILE] {msg}", file=sys.stderr)
@@ -87,6 +92,30 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
         data = {}
     data["cluster_identity"] = {"project": project, "cluster": cluster, "location": location}
     config_path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def read_cluster_identity(home: Path) -> dict[str, str] | None:
+    """Read the ``cluster_identity`` block written into a profile's ``config.yaml``.
+
+    Returns the ``{project, cluster, location}`` dict, or ``None`` if the config is
+    missing/unparseable or the block is absent/incomplete. This is the robust,
+    machine-readable inverse of :func:`_inject_cluster_identity` — reconciliation
+    reads it rather than trying to reverse the sanitized/hashed profile name.
+    """
+    import yaml  # lazy: keeps the module importable without pyyaml on pure-lookup paths
+
+    config_path = home / "config.yaml"
+    try:
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (FileNotFoundError, yaml.YAMLError):
+        return None
+    identity = data.get("cluster_identity")
+    if not isinstance(identity, dict):
+        return None
+    project, cluster, location = identity.get("project"), identity.get("cluster"), identity.get("location")
+    if not (project and cluster and location):
+        return None
+    return {"project": str(project), "cluster": str(cluster), "location": str(location)}
 
 
 def _pin_kubeconfig_env(home: Path, kubeconfig: Path) -> None:
@@ -159,8 +188,13 @@ def cmd_create(args: argparse.Namespace) -> None:
     print(name)
 
 
-def cmd_delete(args: argparse.Namespace) -> None:
-    name = profile_name(args.project, args.cluster, args.location)
+def delete_profile(name: str) -> None:
+    """Deregister a Hermes profile and remove its home directory.
+
+    Tolerant of an already-absent profile (the ``hermes profile delete`` failure is
+    logged, then the home is cleaned up regardless). Shared by the ``delete`` CLI
+    subcommand and the reconcile engine.
+    """
     home = profile_home(name)
     try:
         subprocess.run(
@@ -171,13 +205,26 @@ def cmd_delete(args: argparse.Namespace) -> None:
         log(f"'hermes profile delete {name}' failed (continuing to clean up home): {e}")
     if home.exists():
         shutil.rmtree(home, ignore_errors=True)
+
+
+def list_profiles() -> list[str]:
+    """Return sorted names of managed Cluster Agent profiles (excludes reserved profiles)."""
+    if not PROFILES_BASE.is_dir():
+        return []
+    return sorted(
+        p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name not in RESERVED_PROFILES
+    )
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    name = profile_name(args.project, args.cluster, args.location)
+    delete_profile(name)
     print(name)
 
 
 def cmd_list(_args: argparse.Namespace) -> None:
-    if PROFILES_BASE.is_dir():
-        for name in sorted(p.name for p in PROFILES_BASE.iterdir() if p.is_dir() and p.name != "default"):
-            print(name)
+    for name in list_profiles():
+        print(name)
 
 
 def cmd_name(args: argparse.Namespace) -> None:

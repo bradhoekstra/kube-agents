@@ -70,6 +70,27 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 
 This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
 
+## Automatic reconciliation (orphan pruning)
+
+Profiles are also pruned automatically. An hourly, deterministic `no_agent` cron job
+(`cluster-agent-reconcile`) runs `scripts/cluster_agent_reconcile.py`, which enumerates the managed
+Cluster Agent profiles, reads each one's `cluster_identity`, and **deletes any profile whose GKE
+cluster no longer exists**. This closes the loop when a cluster is deleted out-of-band (so its
+profile is never left orphaned pointing at a dead kubeconfig).
+
+It is conservative by design: a profile is removed **only** on a definitive GKE `NotFound`. Any
+inconclusive check (auth/network/timeout, or a missing `cluster_identity`) leaves the profile
+untouched. When it prunes anything it posts a Google Chat summary.
+
+To preview what would be pruned without deleting anything:
+
+```bash
+python3 /opt/data/scripts/cluster_agent_reconcile.py --dry-run
+```
+
+You still delete a profile explicitly during planned teardown (above) — reconciliation is the safety
+net, not the primary path.
+
 ## Listing profiles
 
 ```bash

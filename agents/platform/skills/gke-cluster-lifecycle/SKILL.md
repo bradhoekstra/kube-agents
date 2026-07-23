@@ -72,3 +72,5 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
 ```
 
 Do not delete a Cluster Agent profile while its cluster still exists.
+
+Deleting the profile here is the immediate, preferred path. As a backstop, the hourly `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone (see the [cluster-agent-lifecycle](../cluster-agent-lifecycle/SKILL.md) skill), so a profile missed during teardown is cleaned up on the next reconcile cycle.
