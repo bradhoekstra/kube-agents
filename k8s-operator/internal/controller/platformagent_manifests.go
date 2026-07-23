@@ -173,6 +173,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 		Platforms struct {
 			GoogleChat struct {
 				Enabled bool `json:"enabled"`
+				// Overrides the adapter's default "Hermes is thinking…" marker
+				// card text with our product name.
+				TypingStatusText string `json:"typing_status_text,omitempty"`
 			} `json:"google_chat"`
 			Slack struct {
 				Enabled bool `json:"enabled"`
@@ -293,6 +296,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// human turn — chat ingress lands here, not on the platform specialist.
 	cfg.Plugins.Enabled = []string{"hermes_otel", "session_store", "session_otel_bridge", "tool_call_audit", "incident_context", "bootstrap_onboarding"}
 	cfg.Display.Platforms = map[string]map[string]any{}
+	// Rebrand the Google Chat "thinking" marker card from the upstream default
+	// ("Hermes is thinking…") to our product name.
+	cfg.Platforms.GoogleChat.TypingStatusText = "Kage is thinking…"
 	// Per-user memory. The built-in MEMORY.md/USER.md store stays off; the
 	// multiuser_memory provider replaces it and keys each user's notes off the
 	// gateway identity (agent._user_id), writing to memories/users/<user>.md with a
