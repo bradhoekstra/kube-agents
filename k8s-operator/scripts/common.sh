@@ -149,7 +149,7 @@ init_var_model_provider() {
       DEFAULT_MODEL="gpt-5.4"
       ;;
     anthropic)
-      DEFAULT_MODEL="claude-opus-4-8"
+      DEFAULT_MODEL="claude-opus-5"
       ;;
     *)
       DEFAULT_MODEL="gemini-3.5-flash"
