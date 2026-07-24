@@ -21,8 +21,16 @@ import sys
 from pathlib import Path
 
 
-def log(msg: str) -> None:
-    print(f"[PROFILE-SCAFFOLD] {msg}", file=sys.stderr)
+def make_log(prefix: str):
+    """Build a stderr logger tagged with a component prefix (shared across the profile scripts)."""
+
+    def _log(msg: str) -> None:
+        print(f"[{prefix}] {msg}", file=sys.stderr)
+
+    return _log
+
+
+log = make_log("PROFILE-SCAFFOLD")
 
 
 def profiles_base(hermes_home: Path) -> Path:
@@ -30,9 +38,21 @@ def profiles_base(hermes_home: Path) -> Path:
     return hermes_home / "profiles"
 
 
-def _run_env(hermes_home: Path) -> dict[str, str]:
-    """Env for subprocesses: HOME -> /tmp (writable creds) and HERMES_HOME pinned."""
-    return {**os.environ, "HOME": "/tmp", "HERMES_HOME": str(hermes_home)}
+def run_env(hermes_home: Path | str | None = None, extra: dict[str, str] | None = None) -> dict[str, str]:
+    """Base env for Hermes/gcloud subprocesses (shared across the profile scripts).
+
+    Always redirects HOME -> /tmp: under RunAsNonRoot the real home is not writable
+    and gcloud/hermes must write credentials/state to the scratch disk. When
+    ``hermes_home`` is given it pins HERMES_HOME so the subprocess targets that data
+    root regardless of the caller's own (possibly rewritten) HERMES_HOME. ``extra``
+    overlays additional vars (e.g. KUBECONFIG).
+    """
+    env = {**os.environ, "HOME": "/tmp"}
+    if hermes_home is not None:
+        env["HERMES_HOME"] = str(hermes_home)
+    if extra:
+        env.update(extra)
+    return env
 
 
 def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
@@ -42,7 +62,7 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
         try:
             subprocess.run(
                 ["hermes", "profile", "create", name, "--no-skills", "--description", description],
-                check=True, capture_output=True, text=True, timeout=60, env=_run_env(hermes_home),
+                check=True, capture_output=True, text=True, timeout=60, env=run_env(hermes_home),
             )
         except subprocess.CalledProcessError as e:
             raise SystemExit(
