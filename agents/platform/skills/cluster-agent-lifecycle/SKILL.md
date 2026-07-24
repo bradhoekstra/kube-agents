@@ -13,7 +13,7 @@ The engine for all of this is the helper script `scripts/cluster_agent_profile.p
 
 ## When to create a profile
 
-Create the Cluster Agent profile as part of **cluster onboarding** — immediately after a cluster is successfully provisioned (see `gke-cluster-creator`) or when an existing cluster is first brought under management (see `gke-app-onboarding`).
+Create the Cluster Agent profile as part of **cluster onboarding** — immediately after a cluster is successfully provisioned (see `gke-cluster-creator`) or when an existing cluster is first brought under management (see `manage-cluster`). A managed cluster and its Cluster Agent profile are created together: never leave a managed cluster without a profile.
 
 ```bash
 python3 /opt/data/scripts/cluster_agent_profile.py create \
