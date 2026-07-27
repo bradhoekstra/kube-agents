@@ -181,10 +181,10 @@ MCP** (`container.googleapis.com`), **not** a `platform_mcp_server.py` function.
 - The Platform Agent detects and proposes a fix for an injected drift (RBAC/NetworkPolicy/version)
   without being prompted.
 - Every agent-driven mutation is attributable and auditable (see
-  `docs/designs/audit-logging-user-attribution.md`).
+  `docs/design/10-audit-logging-user-attribution.md`).
 
 _Two v1 SLIs, measured continuously from the audit log ([05](05-system-architecture.md) §5,
-`docs/designs/audit-logging-user-attribution.md`): **zero direct (non-GitOps) mutations** — alert on any
+`docs/design/10-audit-logging-user-attribution.md`): **zero direct (non-GitOps) mutations** — alert on any
 cluster/cloud write whose actor is an agent identity — and **zero cross-scope isolation escapes** — alert
 on any agent read or `SubjectAccessReview`-allow outside its tier scope. The rest are qualitative
 per-phase acceptance ([07](07-implementation-roadmap.md) §2)._

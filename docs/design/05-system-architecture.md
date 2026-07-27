@@ -170,7 +170,7 @@ agent + routing mode ([06](06-api-and-data-contracts.md) §2b). This is gateway�
   **`knowledge/` root** (decided — outside the paths the pipeline deploys, so it is never applied to a
   cluster; a dedicated repo stays optional for later, `06` §5).
 - **Observability (C12):** OTel → `gke-managed-otel` → Cloud Trace/Logging + Managed Prometheus;
-  carries requester/trace/session for attribution (`docs/designs/audit-logging-user-attribution.md`).
+  carries requester/trace/session for attribution (`docs/design/10-audit-logging-user-attribution.md`).
 - **v1 security SLIs (audit-log-derived):** two continuous alerts off Cloud Logging / Managed
   Prometheus — (1) **direct-mutation = 0** (fire on any cluster/cloud _write_ whose actor is an agent
   identity); (2) **cross-scope escape = 0** (fire on any agent read or `SubjectAccessReview`-allow

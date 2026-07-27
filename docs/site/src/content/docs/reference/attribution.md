@@ -5,7 +5,7 @@ sidebar:
   order: 5
 ---
 
-Every agent action can be traced back to a requester. The full design rationale is in [`docs/designs/audit-logging-user-attribution.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/audit-logging-user-attribution.md); this page is the operator-facing summary.
+Every agent action can be traced back to a requester. The full design rationale is in [`docs/design/10-audit-logging-user-attribution.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/design/10-audit-logging-user-attribution.md); this page is the operator-facing summary.
 
 ## The attribution contract
 
@@ -111,5 +111,5 @@ jsonPayload.session_id="20260702_153830_50074bf0"
 
 ## Where to go next
 
-- [`docs/designs/audit-logging-user-attribution.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/audit-logging-user-attribution.md) — full design.
+- [`docs/design/10-audit-logging-user-attribution.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/design/10-audit-logging-user-attribution.md) — full design.
 - [Concepts → Observability](/kube-agents/concepts/observability/) — telemetry export and Console link generation.

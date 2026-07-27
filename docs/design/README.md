@@ -46,25 +46,30 @@ The security model (03) makes these enforceable; the roadmap (07) proves them wi
 
 ## The design set
 
-Two tiers, meant to be read in order **01 → 08**:
+Three tiers. The first two are meant to be read in order, **01 → 08**:
 
 - **Foundational (north star) — 01–04:** _what_ we are building and _why_.
 - **Buildable (bridging) — 05–08:** _how_ it is assembled.
+- **Feature deep dives — 09–10:** one mechanism in depth. Read as needed, not in sequence.
 
-| #   | Document                                                       | Covers                                                                                                                                                                                                                                           |
-| --- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 01  | [Vision & scope](01-vision-scope.md)                           | Project goals, the "replace kubectl/gcloud/console with agents" thesis, in/out of scope, success criteria                                                                                                                                        |
-| 02  | [Agent personas](02-agent-personas.md)                         | The three-persona roster, roles and boundaries, cascading provisioning, read-only agents & indirect coordination, ChatOps addressing (3-mode routing: slash / handle / NL)                                                                       |
-| 03  | [Security model](03-security-model.md)                         | Trust boundaries, per-tier identity & least-privilege, downward attenuation, trusted-human access + the read-only ceiling, AI-agent threats, the security-review suite as a control                                                              |
-| 04  | [Workflow model](04-workflow-model.md)                         | The propose → review → reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, push triggers & heartbeat, the recovery ladder, failure isolation                                                                              |
-|     | _Foundational (north star) above · Buildable (bridging) below_ |                                                                                                                                                                                                                                                  |
-| 05  | [System architecture](05-system-architecture.md)               | Component inventory (incl. the ChatOps gateway & router), hub-and-spoke topology, data flows, shared services, networking, scale/NFR targets                                                                                                     |
-| 06  | [API & data contracts](06-api-and-data-contracts.md)           | The per-persona `Agent` CRD, the pre-created read-only identity contract, GitOps repo layout & IaC conventions (KCC or Terraform via customer CI/CD), OKF schema, the ChatOps routing contract, the review-gate contract, MCP tool changes       |
-| 07  | [Implementation roadmap](07-implementation-roadmap.md)         | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
-| 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)   | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
+| #   | Document                                                                 | Covers                                                                                                                                                                                                                                           |
+| --- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 01  | [Vision & scope](01-vision-scope.md)                                     | Project goals, the "replace kubectl/gcloud/console with agents" thesis, in/out of scope, success criteria                                                                                                                                        |
+| 02  | [Agent personas](02-agent-personas.md)                                   | The three-persona roster, roles and boundaries, cascading provisioning, read-only agents & indirect coordination, ChatOps addressing (3-mode routing: slash / handle / NL)                                                                       |
+| 03  | [Security model](03-security-model.md)                                   | Trust boundaries, per-tier identity & least-privilege, downward attenuation, trusted-human access + the read-only ceiling, AI-agent threats, the security-review suite as a control                                                              |
+| 04  | [Workflow model](04-workflow-model.md)                                   | The propose → review → reconcile loop, autonomy vs. mandatory gates, per-tier approval authority, push triggers & heartbeat, the recovery ladder, failure isolation                                                                              |
+|     | _Foundational (north star) above · Buildable (bridging) below_           |                                                                                                                                                                                                                                                  |
+| 05  | [System architecture](05-system-architecture.md)                         | Component inventory (incl. the ChatOps gateway & router), hub-and-spoke topology, data flows, shared services, networking, scale/NFR targets                                                                                                     |
+| 06  | [API & data contracts](06-api-and-data-contracts.md)                     | The per-persona `Agent` CRD, the pre-created read-only identity contract, GitOps repo layout & IaC conventions (KCC or Terraform via customer CI/CD), OKF schema, the ChatOps routing contract, the review-gate contract, MCP tool changes       |
+| 07  | [Implementation roadmap](07-implementation-roadmap.md)                   | The phased build (current → end state), per-phase acceptance criteria, the verification loop, the definition of done, and risks                                                                                                                  |
+| 08  | [Agent runtime & identity](08-agent-runtime-and-identity.md)             | The thin kube-agents controller (the extended `k8s-operator/`) reconciling each `Agent` CR (Hermes harness) into an isolated pod with a per-pod read-only Workload-Identity SA, on Scion's per-pod model; what is deferred as hardening, and why |
+|     | _Buildable (bridging) above · Feature deep dives below_                  |                                                                                                                                                                                                                                                  |
+| 09  | [Agent communication](09-agent-communication.md)                         | How the Platform Agent and per-cluster subagents exchange information: the structured file-based handover channel, optional task delegation over the Hermes kanban board, and the guardrails on both                                             |
+| 10  | [Audit logging & user attribution](10-audit-logging-user-attribution.md) | Carrying the authenticated requester and trace/session ID through the telemetry kube-agents already emits, so an action traces back to a human and not just the agent ServiceAccount                                                             |
 
-Each document opens with a **TL;DR** and carries a **Goals / Non-goals** section and a
-**Verification** section of concrete, mostly-runnable checks.
+Documents **01–08** each open with a **TL;DR** and carry a **Goals / Non-goals** section and a
+**Verification** section of concrete, mostly-runnable checks. The deep dives (09–10) follow their
+own shape.
 
 ---
 
@@ -114,7 +119,7 @@ values (project IDs, secrets). Derive these from the contracts in 06 and the rep
 - **Reference implementation stack** (Hermes on the controller; KCC or Terraform via customer CI/CD;
   OKF): [04-workflow-model.md](04-workflow-model.md) §1.1
 - **Glossary:** [gke-labs.github.io/kube-agents/reference/glossary](https://gke-labs.github.io/kube-agents/reference/glossary/)
-- **Detailed feature designs:** `docs/designs/` (e.g. `audit-logging-user-attribution.md`)
+- **Detailed feature designs:** [09](09-agent-communication.md) and [10](10-audit-logging-user-attribution.md) in the table above
 - **Contribution mechanics:** `AGENTS.md`
 - **Install prerequisites:** `INSTALL.md` — _predates the controller runtime; rewritten in roadmap
   Phase 1 ([07](07-implementation-roadmap.md))._

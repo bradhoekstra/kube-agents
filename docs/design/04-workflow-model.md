@@ -333,7 +333,7 @@ _Cluster admin asks their agent: "give team-payments a namespace with standard i
    enforced by the in-tree `ValidatingAdmissionPolicy` (the cross-object webhook is deferred,
    [03](03-security-model.md) §4).
 5. **Report & audit** — the agent reports outcome in human-readable form; trace/session/requester
-   are recorded ([03](03-security-model.md) §5, `docs/designs/audit-logging-user-attribution.md`).
+   are recorded ([03](03-security-model.md) §5, `docs/design/10-audit-logging-user-attribution.md`).
 
 Every step is declarative, reviewed, attributable, and revertible.
 

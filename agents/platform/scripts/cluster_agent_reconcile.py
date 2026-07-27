@@ -21,7 +21,7 @@
 # degradation) so we never accidentally create a profile for the management cluster.
 #
 # It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
-# profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
+# profile — see docs/design/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
 # shared pod-wide, so it operates on every profile regardless of which profile ticks it. It is
 # resilient (always exit 0) and posts a Google Chat summary only when it created or pruned.
 

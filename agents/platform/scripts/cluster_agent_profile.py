@@ -81,7 +81,7 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
     vs the sanitized/hashed profile name. (Re-dumping drops the template's comments in this
     per-profile copy, which is fine.) Kept intentionally after the fleet-handover retirement:
     it is cheap identity metadata and is what a restored `write_handover` producer would read
-    (see docs/designs/fleet-handover-retirement.md).
+    (see docs/design/fleet-handover-retirement.md).
     """
     import yaml  # lazy: only needed on the scaffold path, keeps the module importable without pyyaml
 

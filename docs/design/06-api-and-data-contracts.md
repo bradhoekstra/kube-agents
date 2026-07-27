@@ -158,7 +158,7 @@ Implements [03](03-security-model.md) §4a — for a human request, the agent's 
 
 **Requester identity propagation.** The agent's authenticated chat entrypoint establishes the human
 (Google/GCP identity; mapped K8s user + groups) and carries the principal on the session alongside the
-trace/session IDs (`docs/designs/audit-logging-user-attribution.md`) — in the hardening path this
+trace/session IDs (`docs/design/10-audit-logging-user-attribution.md`) — in the hardening path this
 moves to the gateway (`05` C14). Model output is never treated as an identity or authorization signal.
 
 **Kubernetes check — `SubjectAccessReview` (check-then-act, no impersonation):**
@@ -340,7 +340,7 @@ affinity** — a thread stays bound to the agent it was first routed to (§2b) u
 
 ## 8. Audit & attribution contract
 
-Reuse `docs/designs/audit-logging-user-attribution.md`: every agent action carries trace ID, Hermes
+Reuse `docs/design/10-audit-logging-user-attribution.md`: every agent action carries trace ID, Hermes
 session ID, and authenticated requester through OTel resource attributes and Cloud Logging.
 Chat-initiated actions additionally carry the **resolved agent** (`tier`, `scope`) and the **routing
 mode** (§2b). The merge/approver identity and PR URL are the durable attribution for any mutation.
