@@ -187,8 +187,17 @@ get_platform_agent_roles() {
         echo "${custom_roles_str//,/ }"
       fi
       ;;
-    gke-admin|*)
+    gke-admin)
       echo "${gke_admin_roles[*]}"
+      ;;
+    *)
+      # Fail closed. init_var_platform_agent_permission_set rejects unknown
+      # values, so reaching here means the script was invoked with the variable
+      # pre-set (CI, a sourced vars.sh, a typo'd export). Granting admin on an
+      # unrecognized value would make a typo an escalation; warn on stderr
+      # (never stdout — the caller captures it) and use the least-privilege set.
+      print_warning "Unrecognized PLATFORM_AGENT_PERMISSION_SET '${PLATFORM_AGENT_PERMISSION_SET}'; falling back to read-only." >&2
+      echo "${read_only_roles[*]}"
       ;;
   esac
 }
