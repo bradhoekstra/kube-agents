@@ -172,19 +172,23 @@ COPY agents/platform/plugins/ /opt/hermes/plugins/
 # is copied verbatim above; the platform overlay is merged into
 # /opt/platform-template/config.yaml instead (see the RUN block above).
 
-# Normalize ownership and permissions at the end of build
-RUN chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/platform-template && \
-    find /opt/defaults -type d -exec chmod 755 {} + && \
-    find /opt/defaults -type f -exec chmod 644 {} + && \
-    find /opt/hermes/skills -type d -exec chmod 755 {} + 2>/dev/null && \
-    find /opt/hermes/skills -type f -exec chmod 644 {} + 2>/dev/null && \
-    find /opt/hermes/plugins -type d -exec chmod 755 {} + && \
-    find /opt/hermes/plugins -type f -exec chmod 644 {} + && \
-    find /opt/platform-template -type d -exec chmod 755 {} + && \
-    find /opt/platform-template -type f -exec chmod 644 {} + && \
-    find /opt/defaults/scripts -type f -exec chmod 755 {} + 2>/dev/null && \
-    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null && \
-    find /opt/platform-template -path '*/scripts/*' -type f -exec chmod 755 {} + 2>/dev/null || true
+# Normalize ownership and permissions at the end of build.
+#
+# `set -eu` rather than an `&&` chain ending in `|| true`: that trailing `|| true`
+# bound to the WHOLE chain, so a failure in any early command short-circuited
+# every later chmod and still exited 0 — a build that silently shipped
+# unnormalized permissions. Each command must now fail the build loudly.
+# Every path below is guaranteed to exist at this point: /opt/hermes/skills and
+# /opt/hermes/plugins come from the base image, the rest are COPYed above.
+RUN set -eu; \
+    chown -R hermes:hermes /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/platform-template; \
+    for d in /opt/defaults /opt/hermes/skills /opt/hermes/plugins /opt/platform-template; do \
+        find "$d" -type d -exec chmod 755 {} + ; \
+        find "$d" -type f -exec chmod 644 {} + ; \
+    done; \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
+    find /opt/hermes/skills -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
+    find /opt/platform-template -path '*/scripts/*' -type f -exec chmod 755 {} +
 
 
 # --- CREDENTIAL PROXY TARGET ---

@@ -61,14 +61,26 @@ if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$TARGET_DIR/scripts" ]; then
     ln -sfn "$TARGET_DIR/scripts" "$TARGET_DIR/profiles/platform/scripts" 2>/dev/null || true
 fi
 
-# 2.6 Force-sync the image-managed persona files of the specialist profiles so
-# they ALWAYS track the image, not the persistent PVC — the same guarantee step
-# 2a gives the default profile. The scaffold in 2.5 only runs when a profile is
-# ABSENT, so without this an existing platform profile on the PVC keeps stale
-# SOUL.md/AGENTS.md after an image roll. These persona docs are image-owned (not
-# runtime state); per-profile runtime files (USER.md, memory/) are left untouched.
+# 2.6 Force-sync the image-managed persona and config files of the specialist
+# profiles so they ALWAYS track the image, not the persistent PVC — the same
+# guarantee step 2a gives the default profile. The scaffold in 2.5 only runs when
+# a profile is ABSENT, so without this an existing platform profile on the PVC
+# keeps a stale SOUL.md/AGENTS.md/config.yaml after an image roll.
+#
+# config.yaml is included because the platform profile's copy is entirely
+# image-owned: it is built at image build time by merging the shared defaults
+# with the platform overlay, `hermes profile create` does not emit one, and
+# nothing writes to profiles/*/config.yaml at runtime (step 3's otel injection
+# targets only the default profile — the platform template already enables
+# hermes_otel). Without this, an image that changes the platform's toolsets or
+# plugins would silently have no effect on any existing deployment.
+#
+# Profile identity is NOT at risk: `hermes profile create` records the name and
+# description in profiles/<name>/profile.yaml, a separate file that no template
+# ships, so it is never overwritten here. Per-profile runtime state (USER.md,
+# memory/, sessions/) is likewise left untouched.
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md; do
+    for f in config.yaml SOUL.md AGENTS.md CAPABILITIES.md; do
         [ -f "$PLATFORM_TEMPLATE/$f" ] && cp -f "$PLATFORM_TEMPLATE/$f" "$TARGET_DIR/profiles/platform/$f" 2>/dev/null || true
     done
 fi
