@@ -175,6 +175,12 @@ def create_profile(project: str, cluster: str, location: str) -> str:
         raise SystemExit(f"ERROR: failed to fetch credentials for '{cluster}': {e.stderr.strip()}")
     except subprocess.TimeoutExpired:
         raise SystemExit(f"ERROR: timed out fetching credentials for '{cluster}'.")
+    except OSError as e:
+        # `gcloud` not on PATH or not executable — raised before the process exists,
+        # so neither handler above sees it. Same failure mode the `hermes` invocation
+        # in profile_scaffold.ensure_profile guards against; keep it to one
+        # actionable line instead of a traceback in the container log.
+        raise SystemExit(f"ERROR: could not execute 'gcloud' to fetch credentials for '{cluster}': {e}")
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)
