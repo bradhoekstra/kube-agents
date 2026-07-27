@@ -220,7 +220,13 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	cfg.MCPServers = map[string]any{
 		"router": map[string]any{
 			"command": "/opt/hermes/.venv/bin/python3",
-			"args":    []string{"/opt/data/scripts/router_server.py"},
+			// Resolved against cwd, not hardcoded to /opt/data: the entrypoint copies
+			// /opt/defaults (which carries scripts/) into $PLATFORM_AGENT_HOME, and the
+			// operator sets that env from the same AgentHome that produced cwd. With a
+			// custom AgentHome the script is never at /opt/data/scripts, so a literal
+			// path would leave the router MCP dead and the Chat Agent unable to
+			// discover any specialist to delegate to.
+			"args": []string{path.Join(cwd, "scripts/router_server.py")},
 			"env": map[string]string{
 				"HERMES_HOME": "${HERMES_HOME}",
 			},

@@ -92,6 +92,16 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "mcp-router") {
 		t.Errorf("expected default profile to expose the router MCP, got:\n%s", yamlContent)
 	}
+	// The router script path must track AgentHome. The entrypoint copies
+	// /opt/defaults (carrying scripts/) into $PLATFORM_AGENT_HOME, which the
+	// operator sets from this same AgentHome — so under a custom home the script
+	// is not at /opt/data and a hardcoded path leaves the router MCP dead.
+	if !strings.Contains(yamlContent, "/custom/home/scripts/router_server.py") {
+		t.Errorf("expected router script resolved under AgentHome, got:\n%s", yamlContent)
+	}
+	if strings.Contains(yamlContent, "/opt/data/scripts/router_server.py") {
+		t.Errorf("router script path must not be hardcoded to /opt/data, got:\n%s", yamlContent)
+	}
 	if !strings.Contains(yamlContent, "kanban") {
 		t.Errorf("expected default profile to enable the kanban toolset, got:\n%s", yamlContent)
 	}
