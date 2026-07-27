@@ -388,3 +388,33 @@ The two validation cards are **parallel** (no ordering dependency — they're re
 6. **Read-only / declarative.** No imperative cluster mutation; emit KCC/GitOps PRs and let Config Connector reconcile.
 7. **Delegation is optional and transparent.** The platform decides when to delegate; delegated work is visible in chat.
 8. **Co-located MVP, one migration seam.** The write helper is the only place a future cross-pod transport changes; the reader contract is stable.
+
+---
+
+## 6. Open questions
+
+### 6.1 Resolving "my cluster" at the front door
+
+**Raised by** @dshnayder in review of [#439](https://github.com/gke-labs/kube-agents/pull/439#discussion_r3660282410): when a user says _"check the health of **my cluster**"_, it would be good if the very first agent — the Chat Agent front door — knew which cluster that means. Recorded here as a known gap; **not addressed in #439**.
+
+**Why it is hard today.** The Chat Agent is deliberately stateless. `agents/chat/config.yaml` denies the `file` and `memory` toolsets at three layers (`platform_toolsets`, top-level `toolsets`, and `agent.disabled_toolsets`) and sets `memory_enabled: false` / `user_profile_enabled: false`. So a deictic reference has to be resolved from the roster the front door already sees — and that roster carries almost no per-cluster signal:
+
+- **Names are lossy.** `profile_name()` (`agents/platform/scripts/cluster_agent_profile.py`) builds `cluster-{project}-{cluster}-{location}`, sanitizes it, and truncates past 63 characters with an 8-char sha1 suffix. Component boundaries are also ambiguous when a project or cluster name itself contains hyphens.
+- **Descriptions are identical.** Every Cluster Agent is scaffolded from the same `agents/cluster/CAPABILITIES.md`. The shared-role grouping in `list_agents` exists precisely because that string is the same for all of them.
+
+**Constraints on any fix.**
+
+1. Do not re-enable the `memory` or `file` toolset on the `default` profile — the lockdown is the point, and it is enforced in three places.
+2. Do not resolve it by asking the `platform` agent. The ask is specifically that the _first_ agent knows; a round trip defeats it.
+3. Do not fold cluster identity into the grouped role description. `list_agents` groups on that string; making it per-cluster-unique would restore the N× repetition the grouping removes. Identity belongs on the per-agent line _inside_ a group.
+4. Degrade, never raise. `list_agents` is the front door's only routing tool.
+
+**Sketched direction**, in increasing order of cost — each step is useful alone:
+
+| Step | Change                                                                                                                         | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 1    | Front-door rule: if exactly one `cluster-*` agent exists, "my cluster" means that one; otherwise ask once, listing candidates. | Prompt-only (`agents/chat/SOUL.md`), no new state. Removes the silent-wrong-cluster failure but does not resolve the reference.                                                                                                                                                                                                                                                                                                            |
+| 2    | Surface structured `{project, cluster, location}` per agent in `list_agents`.                                                  | Reuses `read_cluster_identity()` (`agents/platform/scripts/cluster_agent_profile.py`), already documented as the robust inverse of the sanitized/hashed name. The router can import it: the Dockerfile colocates `agents/chat/scripts/` and `agents/platform/scripts/` under `$HERMES_HOME/scripts`. Note that helper currently catches only `FileNotFoundError`/`yaml.YAMLError`, so it needs an `OSError` guard to satisfy constraint 4. |
+| 3    | A narrow per-user default-cluster preference, if step 2 proves insufficient.                                                   | A single scoped tool pair on the router rather than general memory, keyed on the `user_id` the `session_store` plugin already records. Preserves the lockdown's intent; would need the Chat Agent's `AGENTS.md` § Memory amended from "no state" to "no _free-form_ state". Open sub-questions: explicit vs. inferred default, and what `user_id` means in a group chat.                                                                   |
+
+Step 2 is the highest value per line and is probably enough for the literal ask.
