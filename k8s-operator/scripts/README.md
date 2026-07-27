@@ -41,7 +41,7 @@ When any script is run:
    - Enables GCP Service APIs (`container.googleapis.com` and `cloudresourcemanager.googleapis.com`).
    - Pre-provisions GCP Service Accounts (GSAs) for the Platform Agent and conditionally for the GitHub Token Minter.
    - Configures Workload Identity policy bindings mapping the Kubernetes SAs to the GCP GSAs.
-   - Grants GKE cluster management and monitoring permissions to the Platform Agent GSA based on the selected permission set (`read-only`, `gke-admin`, or `custom`, default: `gke-admin`).
+   - Grants GKE cluster management and monitoring permissions to the Platform Agent GSA based on the selected permission set (`read-only`, `gke-admin`, or `custom`, default: `read-only`).
    - Configures Workload Identity policy bindings and annotations for the GitHub Token Minter GSA/KSA if GitHub integration is configured.
 5. **[provision_05_gcp_gchat.sh](provision_05_gcp_gchat.sh)**
    - Enables GCP Service APIs (`pubsub.googleapis.com` and `chat.googleapis.com`).

@@ -35,13 +35,13 @@ The IAM side of the binding is pre-provisioned by [`provision_04_gcp_iam.sh`](ht
 
 | Permission set | `PLATFORM_AGENT_PERMISSION_SET` | Use it when                                                    |
 | -------------- | ------------------------------- | -------------------------------------------------------------- |
-| **gke-admin**  | `gke-admin` (default)           | The agent should manage GKE lifecycle and node pools directly. |
-| **read-only**  | `read-only`                     | Auditing / monitoring only — no GCP write capability.          |
+| **gke-admin**  | `gke-admin`                     | The agent should manage GKE lifecycle and node pools directly. |
+| **read-only**  | `read-only` (default)           | Auditing / monitoring only — no GCP write capability.          |
 | **custom**     | `custom`                        | You supply the exact roles via `PLATFORM_AGENT_CUSTOM_ROLES`.  |
 
 ### Roles per set
 
-The default **gke-admin** set binds:
+The **gke-admin** set binds:
 
 - `roles/container.clusterAdmin`, `roles/container.admin` — full GKE control.
 - `roles/monitoring.admin` — manage monitoring configuration.
@@ -50,7 +50,7 @@ The default **gke-admin** set binds:
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
 
-The **read-only** set swaps the admin roles for viewers:
+The default **read-only** set swaps the admin roles for viewers:
 
 - `roles/container.clusterViewer`, `roles/container.viewer` — read-only GKE.
 - `roles/monitoring.viewer`, `roles/logging.viewer` — read-only telemetry.
