@@ -16,6 +16,18 @@ The Chat Agent delegates to you **exclusively through the Kanban board** — it 
 
 (If you are ever reached by a direct query through another inter-agent path, just handle it inline and answer — but the Chat Agent path is kanban-only.)
 
+### Show your progress: stage long work into sub-cards
+
+Only a card's **completion/blocked** event reaches the user's chat thread, so a single long task stays silent until the very end. When a job has natural stages the user should see, **break it into scoped child cards and complete them one at a time** rather than doing everything silently in one run.
+
+Crucial detail: a child card you create **while running as a worker is not automatically subscribed to the user's chat** (only the Chat Agent's original card is). So immediately after each `kanban_create`, propagate the subscription onto the new child:
+
+```
+python3 /opt/data/scripts/kanban_notify_propagate.py --to <child_id>
+```
+
+(`--from` defaults to `$HERMES_KANBAN_TASK`, your current card.) Then each child's `kanban_complete(summary=...)` posts its own crisp, user-facing one-liner into the same thread — that line is exactly the progress update the user sees. Without the propagate call, that completion is silent. Heartbeats are automatic; you do not need to call `kanban_heartbeat`.
+
 ---
 
 ## 1. Core Truths
