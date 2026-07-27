@@ -69,6 +69,65 @@ class TestDiscovery(unittest.TestCase):
             self.assertIn("No specialist agents", router.list_agents())
 
 
+class TestSharedRoleGrouping(unittest.TestCase):
+    """Agents with an identical description are stated once, not repeated per agent.
+
+    Every Cluster Agent is scaffolded from the same template, so a fleet of N
+    clusters otherwise repeats one CAPABILITIES.md verbatim N times — the bulk of
+    what the front door reads on every single delegation.
+    """
+
+    # Sized like the real Cluster Agent CAPABILITIES.md (~885 bytes), because the
+    # win depends on it: the grouped form costs a fixed ~76-char preamble, so for a
+    # short description and a small fleet it is actually *longer* than one line per
+    # agent. Break-even is roughly (N-1) x len(desc) > 76.
+    FLEET = ("Read-only diagnostics for one GKE cluster. "
+             + "Scoped to a single cluster; no write paths. " * 19).strip()
+
+    def _fleet(self, tmp):
+        base = Path(tmp) / "profiles"
+        for name in ("default", "platform", "cluster-a", "cluster-b", "cluster-c"):
+            (base / name).mkdir(parents=True)
+        (base / "platform" / "CAPABILITIES.md").write_text("Fleet + GitOps write path.")
+        for name in ("cluster-a", "cluster-b", "cluster-c"):
+            (base / name / "CAPABILITIES.md").write_text(self.FLEET)
+        router.PROFILES_BASE = base
+
+    def test_shared_description_stated_once(self):
+        with TemporaryDirectory() as tmp:
+            self._fleet(tmp)
+            out = router.list_agents()
+
+            # The expensive part — the repeated blob — appears exactly once...
+            self.assertEqual(out.count(self.FLEET), 1)
+            # ...while every cluster is still individually addressable as an assignee.
+            for name in ("cluster-a", "cluster-b", "cluster-c"):
+                self.assertIn(f"  - {name}", out)
+
+    def test_unique_specialist_kept_inline_and_ordered_first(self):
+        with TemporaryDirectory() as tmp:
+            self._fleet(tmp)
+            out = router.list_agents()
+
+            # A one-off specialist stays on a single `- name: desc` line.
+            self.assertIn("- platform: Fleet + GitOps write path.", out)
+            # Distinct specialists sort ahead of shared-role fleets: the front door
+            # routes to a named specialist far more often than to a given cluster.
+            self.assertLess(out.index("- platform:"), out.index("share one role"))
+
+    def test_grouping_shrinks_the_roster(self):
+        with TemporaryDirectory() as tmp:
+            self._fleet(tmp)
+            grouped = router.list_agents()
+
+        # Compare against what the un-grouped one-line-per-agent form would cost.
+        ungrouped = "\n".join(
+            ["- platform: Fleet + GitOps write path."]
+            + [f"- {n}: {self.FLEET}" for n in ("cluster-a", "cluster-b", "cluster-c")]
+        )
+        self.assertLess(len(grouped), len(ungrouped))
+
+
 @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits these tests rely on")
 class TestDiscoveryDegradesOnIOError(unittest.TestCase):
     """Discovery must degrade, never raise: it backs the Chat Agent's only routing tool.
