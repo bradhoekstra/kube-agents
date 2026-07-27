@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+# router_server.py - Chat Agent discovery MCP server.
+#
+# Exposes a single discovery tool so the front-door Chat Agent (the `default`
+# profile) can learn which specialist Hermes profiles exist and what each is
+# responsible for. The Chat Agent uses this to pick the right `assignee` before
+# it delegates work.
+#
+# Delegation itself does NOT happen here: the Chat Agent delegates exclusively
+# via the asynchronous kanban board (`kanban_create`), so the user sees live,
+# non-blocking progress in the thread. This module used to also expose a
+# synchronous `ask_agent` relay (`hermes -p <name> -z ...`); that path blocked
+# for up to 5 minutes with no visible progress and was removed in favor of the
+# kanban-only model. `list_agents` remains because choosing an assignee still
+# requires an up-to-date roster of the dynamic specialist set.
+
+import os
+import sys
+
+from pathlib import Path
+
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("Chat Router")
+
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
+# Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
+PROFILES_BASE = HERMES_HOME / "profiles"
+# The front door itself; never a valid delegation target.
+SELF_PROFILE = "default"
+
+
+def log(msg: str) -> None:
+    print(f"[ROUTER-MCP] {msg}", file=sys.stderr)
+
+
+def _summarize_soul(home: Path) -> str:
+    """Fallback responsibilities: the first prose line of the profile's SOUL.md."""
+    soul = home / "SOUL.md"
+    if not soul.is_file():
+        return ""
+    try:
+        lines = soul.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in lines:
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("---"):
+            continue
+        return s
+    return ""
+
+
+def _responsibilities(home: Path) -> str:
+    """A one-shot description of what a profile is responsible for.
+
+    Prefers an explicit CAPABILITIES.md (the routing contract a specialist
+    advertises to the Chat Agent); falls back to the SOUL.md summary so a
+    profile is still discoverable even without a capabilities file.
+    """
+    cap = home / "CAPABILITIES.md"
+    if cap.is_file():
+        try:
+            text = cap.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            text = ""
+        if text:
+            return text
+    return _summarize_soul(home)
+
+
+def _discover() -> list[dict[str, str]]:
+    """Enumerate every routable specialist profile (all profiles except `default`)."""
+    agents: list[dict[str, str]] = []
+    if PROFILES_BASE.is_dir():
+        for p in sorted(PROFILES_BASE.iterdir()):
+            if not p.is_dir() or p.name == SELF_PROFILE:
+                continue
+            agents.append({"name": p.name, "responsibilities": _responsibilities(p)})
+    return agents
+
+
+@mcp.tool()
+def list_agents() -> str:
+    """Discover every specialist agent you can route to, and what each is responsible for.
+
+    Call this before delegating so you pick the right target. The registry is dynamic: newly
+    created agents (for example a per-cluster agent spun up when a cluster is onboarded) appear
+    here automatically. Returns one agent per line as `- <name>: <responsibilities>`.
+    """
+    agents = _discover()
+    if not agents:
+        return "No specialist agents are currently available to route to."
+    return "\n".join(
+        f"- {a['name']}: {a['responsibilities'] or '(no description provided)'}" for a in agents
+    )
+
+
+if __name__ == "__main__":
+    mcp.run()

@@ -51,7 +51,13 @@ Full setup options — from a one-command GKE provisioning pipeline to local Kin
 
 ## 📖 Overview
 
-At the heart of the harness is the **Platform Agent (`platform`)** — the master custodian and agent architect. It serves as the primary chat entrypoint into the entire harness, manages the GKE infrastructure lifecycle, establishes multi-tenancy boundaries, and enforces fleet-wide compliance.
+The harness runs two co-located Hermes profiles in a single operator-deployed pod, sharing one data PVC. Each is a distinct persona with its own toolset:
+
+**1. Chat Agent (`agents/chat/`, the `default` profile)** — the single conversational front door, and the only profile that receives chat ingress. It analyzes each message, discovers which specialists are available and what each is responsible for (via the `router` tool `list_agents`), delegates over the asynchronous kanban board (`kanban_create`), and relays progress and results back into the thread. It holds **no** infrastructure tools of its own: the front door can route, not mutate.
+
+**2. Platform Agent (`agents/platform/`, the `platform` profile)** — the master custodian and agent architect. It manages the GKE infrastructure lifecycle, establishes multi-tenancy boundaries, enforces fleet-wide compliance, and owns the GitOps write path. Scaffolded at pod startup; it no longer receives chat directly.
+
+**Specialists never prompt each other.** Coordination between specialists is pointer-only through shared state — a kanban card, never task details passed in a message. The Chat Agent is the sole deliberate exception: as the conversational relay it passes full context to a specialist and relays the real response.
 
 The Platform Agent is driven by:
 
@@ -59,7 +65,7 @@ The Platform Agent is driven by:
 - 📚 **Operational playbooks** — nine governance SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, lifecycle/deprecation management, and more.
 - 🛠️ **Specialized Skills** — 20 task-focused skills under [`agents/platform/skills/`](agents/platform/skills/), each a documented `SKILL.md` bundle: cluster creation from templates, app onboarding, workload troubleshooting, cost analysis via BigQuery, observability setup, autoscaling, backup & DR, and manifest generation, among others.
 
-The agent runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agent speaks to your clusters through structured tools rather than raw shell access.
+The agent runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agents speak to your clusters through structured tools rather than raw shell access.
 
 📗 **Full documentation** lives at [gke-labs.github.io/kube-agents](https://gke-labs.github.io/kube-agents/), including the [architecture](https://gke-labs.github.io/kube-agents/overview/architecture/), [concepts](https://gke-labs.github.io/kube-agents/concepts/), and a [complete skill catalog](https://gke-labs.github.io/kube-agents/skills/).
 

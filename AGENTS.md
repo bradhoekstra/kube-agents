@@ -7,7 +7,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 ## Repository Layout
 
 - `agents/`: Source of truth for agent blueprints (personas and skills).
-  - `platform/`: Configuration for the Platform Agent.
+  - `chat/`: The Chat Agent front door — the `default` Hermes profile that receives chat ingress and delegates to specialists.
+  - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
 - `.agents/skills/`: Repository-level security review skills.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Design docs and the documentation site (`docs/site/`).
@@ -27,7 +28,7 @@ To use these agents:
 
 ## Skills Guidelines
 
-- Skills are located under `agents/platform/skills/`.
+- Skills are located under `agents/platform/skills/`. The Chat Agent front door holds no skills — it routes.
 - Each skill directory must contain a `SKILL.md` file providing instructions for that specific skill.
 - When adding new skills, ensure they follow the existing structure and are clearly documented to be understood by AI agents.
 
