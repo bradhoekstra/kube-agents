@@ -86,14 +86,16 @@ All writes funnel through a single tool (registered only for cluster-subagent pr
 - **Handler behavior:**
   1. Derive `cluster` and `location` from the **profile identity** (bound once at `register()` via `ctx.profile_name` / config), so they are **not** an argument. A subagent therefore _cannot_ write another cluster's record.
   2. Build the envelope (`generated_at = now`, `expires_at = now + ttl`).
-  3. **Atomic write** (temp file + `fsync` + `os.replace`) to `/opt/data/fleet/clusters/<cluster>/<location>/<type>.json`. Atomicity is load-bearing: it guarantees the platform's plain reads never observe a torn/half-written file.
+  3. **Atomic write** (temp file + `fsync` + `os.replace`) to `/opt/data/fleet/clusters/<cluster>/<location>/<type>.json`. Atomicity is load-bearing: it guarantees the platform's plain reads never observe a torn/half-written file. The temp file **must be created in the destination directory**, not in `/tmp`: `os.replace` is only atomic within a single filesystem, and `/opt/data` is a PVC while `/tmp` is usually a separate `tmpfs` — renaming across that boundary fails with `EXDEV` (invalid cross-device link).
   4. Return a short JSON result string.
 
 **One shared write helper.** The tool handler and any deterministic `no_agent` cron scripts call the **same** small helper:
 
 ```python
-handover.write(cluster, location, type, payload, ttl_seconds=None)
+handover.write(cluster, location, record_type, payload, ttl_seconds=None)
 ```
+
+The parameter is `record_type`, not `type`, so the helper does not shadow the Python built-in. The tool argument and the envelope field stay named `type` — those are the agent-facing and on-disk contracts; only the Python signature is renamed.
 
 This single-sources the envelope, path resolution, and atomicity, so the tool path and the script path can never drift. It is a concrete helper — **not** a generic pluggable interface (that abstraction is intentionally omitted while co-located; see §2.8).
 
@@ -252,7 +254,7 @@ The MVP starts with `health` and `utilization`; the others are added as their CU
 
 ### 2.7 Concurrency, atomicity, retention
 
-- **Atomic writes** (temp + `fsync` + `os.replace`) — no torn reads, crash-safe (matches the `multiuser_memory` / `save_job_output` recipe).
+- **Atomic writes** (same-directory temp + `fsync` + `os.replace`) — no torn reads, crash-safe (matches the `multiuser_memory` / `save_job_output` recipe).
 - **Latest-wins** — each `(cluster, location, type)` is a single file, overwritten each cycle. No history in the handover layer (history lives in cron output / logs if needed).
 - **Staleness** — readers honor `expires_at`; producers set a `ttl_seconds` sized to their scan cadence (e.g. a 5-minute health scan → `ttl ≈ 15m`).
 - **Concurrent writers within a profile** — the persistent cron context and any transient worker share the profile; if both could write the same handover file, wrap the helper's write in an `flock` (the `_jobs_lock` pattern). Low risk (distinct types, low cadence) but cheap to harden.
