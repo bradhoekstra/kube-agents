@@ -86,14 +86,34 @@ def list_agents() -> str:
 
     Call this before delegating so you pick the right target. The registry is dynamic: newly
     created agents (for example a per-cluster agent spun up when a cluster is onboarded) appear
-    here automatically. Returns one agent per line as `- <name>: <responsibilities>`.
+    here automatically.
+
+    Agents sharing an identical role description (every Cluster Agent is scaffolded from the
+    same template) are grouped so the description is stated once instead of repeated verbatim
+    per agent. Assignee names are always listed individually.
     """
     agents = _discover()
     if not agents:
         return "No specialist agents are currently available to route to."
-    return "\n".join(
-        f"- {a['name']}: {a['responsibilities'] or '(no description provided)'}" for a in agents
-    )
+
+    groups: dict[str, list[str]] = {}
+    for a in agents:
+        desc = a["responsibilities"] or "(no description provided)"
+        groups.setdefault(desc, []).append(a["name"])
+
+    # Distinct specialists first, then the shared-role fleets — the front door routes to a
+    # named specialist far more often than to a specific cluster.
+    blocks: list[str] = []
+    for desc, names in sorted(groups.items(), key=lambda kv: len(kv[1])):
+        if len(names) == 1:
+            blocks.append(f"- {names[0]}: {desc}")
+            continue
+        listed = "\n".join(f"  - {n}" for n in names)
+        blocks.append(
+            f"The following {len(names)} agents share one role — pick the one whose cluster "
+            f"you need:\n{listed}\n  Shared role: {desc}"
+        )
+    return "\n\n".join(blocks)
 
 
 if __name__ == "__main__":
