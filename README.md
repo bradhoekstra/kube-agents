@@ -51,19 +51,21 @@ Full setup options — from a one-command GKE provisioning pipeline to local Kin
 
 ## 📖 Overview
 
-The harness runs two co-located Hermes profiles in a single operator-deployed pod, sharing one data PVC. Each is a distinct persona with its own toolset:
+The harness runs three co-located Hermes profiles in a single operator-deployed pod, sharing one data PVC. Each is a distinct persona with its own toolset:
 
 **1. Chat Agent (`agents/chat/`, the `default` profile)** — the single conversational front door, and the only profile that receives chat ingress. It analyzes each message, discovers which specialists are available and what each is responsible for (via the `router` tool `list_agents`), delegates over the asynchronous kanban board (`kanban_create`), and relays progress and results back into the thread. It holds **no** infrastructure tools of its own: the front door can route, not mutate.
 
 **2. Platform Agent (`agents/platform/`, the `platform` profile)** — the master custodian and agent architect. It manages the GKE infrastructure lifecycle, establishes multi-tenancy boundaries, enforces fleet-wide compliance, and owns the GitOps write path. Scaffolded at pod startup; it no longer receives chat directly.
 
-**Specialists never prompt each other.** Coordination between specialists is pointer-only through shared state — a kanban card, never task details passed in a message. The Chat Agent is the sole deliberate exception: as the conversational relay it passes full context to a specialist and relays the real response.
+**3. Cluster Agent (`agents/cluster/`)** — a focused, single-cluster SRE persona for runtime operations and deep workload debugging. It is **not** deployed by the operator or represented by a CRD. `agents/cluster/` is a profile _template_ baked into the image; the Platform Agent scaffolds it into a live per-cluster profile with a pinned `KUBECONFIG`, one per managed cluster, persisting on the PVC until that cluster is deleted. Its access to the managed cluster is read-only — it diagnoses and proposes; the Platform Agent owns any write.
+
+**Specialists never prompt each other.** Platform ↔ Cluster coordination is pointer-only through shared state — a kanban card, never task details passed in a message. The Chat Agent is the sole deliberate exception: as the conversational relay it passes full context to a specialist and relays the real response.
 
 The Platform Agent is driven by:
 
 - 🧬 **An architectural persona** — [`agents/platform/SOUL.md`](agents/platform/SOUL.md) defines its identity, its _Automation First_ rule (no manual cluster mutations; all changes flow through declarative, PR-based workflows), and its _Least Privilege_ constraint (read-only fleet visibility; every infrastructure change is proposed as a pull request, never applied directly).
 - 📚 **Operational playbooks** — nine governance SOPs in [`agents/platform/governance/`](agents/platform/governance/) covering blueprint sync, compliance audits, cost analysis, capacity orchestration, security patch orchestration, lifecycle/deprecation management, and more.
-- 🛠️ **Specialized Skills** — 20 task-focused skills under [`agents/platform/skills/`](agents/platform/skills/), each a documented `SKILL.md` bundle: cluster creation from templates, app onboarding, workload troubleshooting, cost analysis via BigQuery, observability setup, autoscaling, backup & DR, and manifest generation, among others.
+- 🛠️ **Specialized Skills** — 17 task-focused skills under [`agents/platform/skills/`](agents/platform/skills/), each a documented `SKILL.md` bundle: cluster creation from templates, app onboarding, cost analysis via BigQuery, capacity rebalancing, and manifest generation, among others. Single-cluster runtime debugging skills live with the Cluster Agent in [`agents/cluster/skills/`](agents/cluster/skills/).
 
 The agent runtime is built on the Hermes agent framework and wires in MCP servers for platform control and GKE's hosted MCP endpoint, so the agents speak to your clusters through structured tools rather than raw shell access.
 
