@@ -109,8 +109,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 			DisabledToolsets []string `json:"disabled_toolsets,omitempty"`
 		} `json:"agent,omitempty"`
 		Kanban struct {
-			DispatchInGateway     bool `json:"dispatch_in_gateway"`
-			AutoSubscribeOnCreate bool `json:"auto_subscribe_on_create"`
+			DispatchInGateway       bool `json:"dispatch_in_gateway"`
+			AutoSubscribeOnCreate   bool `json:"auto_subscribe_on_create"`
+			DispatchIntervalSeconds int  `json:"dispatch_interval_seconds"`
 		} `json:"kanban,omitempty"`
 		Approvals struct {
 			CronMode string `json:"cron_mode,omitempty"`
@@ -191,6 +192,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent) string {
 	// so a future default change can't silently disable delegated-progress).
 	cfg.Kanban.DispatchInGateway = true
 	cfg.Kanban.AutoSubscribeOnCreate = true
+	// Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
+	// dead wait to every delegation before the worker was even claimed. 5s matches
+	// the notifier watcher's cadence and makes delegation feel immediate.
+	cfg.Kanban.DispatchIntervalSeconds = 5
 	// Defense in depth: disabled_toolsets is applied last by Hermes for EVERY
 	// platform key, so even if a base bundle is ever reintroduced the front door
 	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,

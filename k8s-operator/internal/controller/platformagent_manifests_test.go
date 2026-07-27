@@ -100,6 +100,9 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "auto_subscribe_on_create: true") {
 		t.Errorf("expected kanban auto_subscribe_on_create pinned on, got:\n%s", yamlContent)
 	}
+	if !strings.Contains(yamlContent, "dispatch_interval_seconds: 5") {
+		t.Errorf("expected kanban dispatch_interval_seconds pinned to 5, got:\n%s", yamlContent)
+	}
 	if !strings.Contains(yamlContent, "disabled_toolsets:") {
 		t.Errorf("expected default profile to disable runtime toolsets, got:\n%s", yamlContent)
 	}

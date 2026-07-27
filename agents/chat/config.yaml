@@ -79,6 +79,9 @@ toolsets:
 kanban:
   dispatch_in_gateway: true
   auto_subscribe_on_create: true
+  # Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
+  # dead wait to every delegation before the worker was claimed.
+  dispatch_interval_seconds: 5
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation
