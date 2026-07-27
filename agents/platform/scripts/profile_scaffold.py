@@ -68,6 +68,14 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
             raise SystemExit(
                 f"ERROR: 'hermes profile create {name}' failed: {e.stderr.strip() or e.stdout.strip()}"
             )
+        except subprocess.TimeoutExpired:
+            raise SystemExit(f"ERROR: 'hermes profile create {name}' timed out after 60s")
+        except OSError as e:
+            # `hermes` not on PATH or not executable. The entrypoint calls this
+            # script with `|| echo WARN ...`, so an uncaught traceback here is
+            # noise in the container log rather than a clear cause; SystemExit
+            # keeps the failure to one actionable line.
+            raise SystemExit(f"ERROR: could not execute 'hermes' to create profile {name}: {e}")
     if not home.is_dir():
         raise SystemExit(f"ERROR: expected profile home not found after create: {home}")
     return home

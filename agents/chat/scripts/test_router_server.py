@@ -1,7 +1,9 @@
 import importlib
+import os
 import sys
 import types
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -64,6 +66,58 @@ class TestDiscovery(unittest.TestCase):
     def test_empty_when_no_specialists(self):
         with TemporaryDirectory() as tmp:
             self._with_profiles(tmp, ["default"])
+            self.assertIn("No specialist agents", router.list_agents())
+
+
+@unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits these tests rely on")
+class TestDiscoveryDegradesOnIOError(unittest.TestCase):
+    """Discovery must degrade, never raise: it backs the Chat Agent's only routing tool.
+
+    pathlib swallows only ENOENT/ENOTDIR/EBADF/ELOOP, so `is_dir()`/`is_file()`/
+    `iterdir()` on the shared PVC raise PermissionError (EACCES) for real. An
+    unguarded raise here turns every routing attempt into a traceback.
+    """
+
+    @contextmanager
+    def _locked(self, path):
+        """Make `path` unreadable, restoring the mode so TemporaryDirectory can clean up."""
+        original = path.stat().st_mode
+        path.chmod(0o000)
+        try:
+            yield
+        finally:
+            path.chmod(original)
+
+    def test_unreadable_profile_costs_only_that_agent(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            for name in ("default", "platform", "broken"):
+                (base / name).mkdir(parents=True)
+            (base / "platform" / "CAPABILITIES.md").write_text("Fleet + GitOps write path.")
+            router.PROFILES_BASE = base
+
+            with self._locked(base / "broken"):
+                out = router.list_agents()
+
+            # The healthy specialist still routes; the unreadable one is listed
+            # without a description rather than taking down the whole roster.
+            self.assertIn("- platform: Fleet + GitOps write path.", out)
+            self.assertIn("- broken: (no description provided)", out)
+
+    def test_unreadable_profiles_base_returns_empty_roster(self):
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            (base / "platform").mkdir(parents=True)
+            router.PROFILES_BASE = base
+
+            with self._locked(base):
+                out = router.list_agents()
+
+            self.assertIn("No specialist agents", out)
+
+    def test_missing_profiles_base_returns_empty_roster(self):
+        with TemporaryDirectory() as tmp:
+            router.PROFILES_BASE = Path(tmp) / "does-not-exist"
             self.assertIn("No specialist agents", router.list_agents())
 
 

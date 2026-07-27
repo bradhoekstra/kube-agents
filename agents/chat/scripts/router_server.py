@@ -37,9 +37,11 @@ def log(msg: str) -> None:
 def _summarize_soul(home: Path) -> str:
     """Fallback responsibilities: the first prose line of the profile's SOUL.md."""
     soul = home / "SOUL.md"
-    if not soul.is_file():
-        return ""
+    # is_file() is inside the try: pathlib only swallows ENOENT/ENOTDIR/EBADF/ELOOP,
+    # so a stat() that fails with EACCES or EIO on the shared PVC raises here too.
     try:
+        if not soul.is_file():
+            return ""
         lines = soul.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return ""
@@ -59,24 +61,36 @@ def _responsibilities(home: Path) -> str:
     profile is still discoverable even without a capabilities file.
     """
     cap = home / "CAPABILITIES.md"
-    if cap.is_file():
-        try:
-            text = cap.read_text(encoding="utf-8", errors="replace").strip()
-        except OSError:
-            text = ""
-        if text:
-            return text
+    try:
+        text = cap.read_text(encoding="utf-8", errors="replace").strip() if cap.is_file() else ""
+    except OSError:
+        text = ""
+    if text:
+        return text
     return _summarize_soul(home)
 
 
 def _discover() -> list[dict[str, str]]:
-    """Enumerate every routable specialist profile (all profiles except `default`)."""
+    """Enumerate every routable specialist profile (all profiles except `default`).
+
+    Degrades rather than raises. This backs the Chat Agent's only discovery tool,
+    and the profiles live on a shared PVC, so an I/O or permission fault must not
+    turn routing into a traceback. Errors are isolated per profile: one unreadable
+    directory costs that one agent, not the whole roster.
+    """
     agents: list[dict[str, str]] = []
-    if PROFILES_BASE.is_dir():
-        for p in sorted(PROFILES_BASE.iterdir()):
+    try:
+        entries = sorted(PROFILES_BASE.iterdir()) if PROFILES_BASE.is_dir() else []
+    except OSError as e:
+        log(f"cannot list profiles at {PROFILES_BASE}: {e}")
+        return agents
+    for p in entries:
+        try:
             if not p.is_dir() or p.name == SELF_PROFILE:
                 continue
             agents.append({"name": p.name, "responsibilities": _responsibilities(p)})
+        except OSError as e:
+            log(f"skipping unreadable profile {p.name}: {e}")
     return agents
 
 
