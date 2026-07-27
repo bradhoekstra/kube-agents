@@ -139,6 +139,25 @@ class TestPropagate(unittest.TestCase):
             for c in prop._COPY_COLUMNS:
                 self.assertIn(c, cols)
 
+    def test_connect_sets_one_unambiguous_busy_timeout(self):
+        # The busy timeout must come from exactly one place. Setting `timeout=` on
+        # connect() AND a `PRAGMA busy_timeout` silently resolves to whichever ran
+        # last, so the source can advertise a wait the connection does not honor.
+        with TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kanban.db")
+            _make_db(db)
+            conn = prop._connect(db)
+            try:
+                self.assertEqual(
+                    conn.execute("PRAGMA busy_timeout").fetchone()[0], 10_000
+                )
+                # journal_mode is the gateway's to choose; this helper must not force it.
+                self.assertEqual(
+                    conn.execute("PRAGMA journal_mode").fetchone()[0], "delete"
+                )
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

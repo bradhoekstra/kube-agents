@@ -47,10 +47,15 @@ def log(msg: str) -> None:
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
+    # `timeout=` IS the busy timeout (Python calls sqlite3_busy_timeout with it), so
+    # it is the only knob set here — a `PRAGMA busy_timeout` would silently override
+    # it and leave two different values in the source. Waiting matters: the gateway
+    # and CLI write this same board, and a propagation lost to a busy DB costs the
+    # user progress updates for that sub-step, which is the whole point of the
+    # script. Deliberately no `PRAGMA journal_mode` — cooperate with the WAL store
+    # the gateway/CLI already set up; never force it.
     conn = sqlite3.connect(db_path, timeout=10)
     conn.row_factory = sqlite3.Row
-    # Cooperate with the WAL store the gateway/CLI use; never force journal_mode.
-    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
@@ -90,12 +95,11 @@ def propagate(db_path: str, parent_id: str, child_id: str) -> int:
         placeholders = ", ".join(["?"] * (len(_COPY_COLUMNS) + 3))
         insert_cols = "task_id, " + cols + ", created_at, last_event_id"
         with conn:  # single transaction; commits on success, rolls back on error
-            for r in rows:
-                conn.execute(
-                    f"INSERT OR IGNORE INTO kanban_notify_subs ({insert_cols}) "
-                    f"VALUES ({placeholders})",
-                    (child_id, *[r[c] for c in _COPY_COLUMNS], now, 0),
-                )
+            conn.executemany(
+                f"INSERT OR IGNORE INTO kanban_notify_subs ({insert_cols}) "
+                f"VALUES ({placeholders})",
+                [(child_id, *[r[c] for c in _COPY_COLUMNS], now, 0) for r in rows],
+            )
         # Report the child's resulting subscription count (idempotent: a re-run
         # leaves this unchanged rather than double-counting).
         written = conn.execute(
