@@ -128,6 +128,60 @@ class CreateDirectionTest(unittest.TestCase):
         self.assertEqual(created, ["keep"])  # skipme excluded via RECONCILE_EXCLUDE
 
 
+class AllClustersTest(unittest.TestCase):
+    """A failed `gcloud list` must be loud and must not look like an empty project."""
+
+    def test_parses_name_and_location(self):
+        done = subprocess.CompletedProcess([], 0, stdout="a us-central1\nb europe-west1\n")
+        with mock.patch.object(rec.subprocess, "run", return_value=done):
+            self.assertEqual(
+                rec._all_clusters("p"),
+                [("p", "a", "us-central1"), ("p", "b", "europe-west1")],
+            )
+
+    def test_gcloud_failure_is_logged_with_stderr_not_silently_empty(self):
+        # Without check=True this path returns a 0-length stdout and no log at all,
+        # which the CREATE pass cannot tell apart from "the project has no clusters".
+        err = subprocess.CalledProcessError(
+            1, ["gcloud"], stderr="ERROR: (gcloud) Reauthentication required."
+        )
+        with mock.patch.object(rec.subprocess, "run", side_effect=err), \
+             mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._all_clusters("p"), [])
+        self.assertIn("Reauthentication required", " ".join(str(c) for c in logged.call_args_list))
+
+    def test_uses_check_true_so_nonzero_exit_cannot_pass_silently(self):
+        seen = {}
+        with mock.patch.object(rec.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, stdout="")
+            rec._all_clusters("p")
+            seen = run.call_args.kwargs
+        self.assertTrue(seen.get("check"), "gcloud list must run with check=True")
+
+    def test_timeout_degrades_to_empty_and_logs(self):
+        with mock.patch.object(rec.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired(["gcloud"], 120)), \
+             mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._all_clusters("p"), [])
+        self.assertTrue(logged.called)
+
+
+class MetadataTest(unittest.TestCase):
+    def test_response_is_closed(self):
+        # urlopen's response holds a socket; on a cron tick, leaking one per call
+        # leaks one per tick. It must be context-managed.
+        resp = mock.MagicMock()
+        resp.read.return_value = b"  my-project\n"
+        resp.__enter__.return_value = resp
+        with mock.patch.object(rec.urllib.request, "urlopen", return_value=resp):
+            self.assertEqual(rec._metadata("project/project-id"), "my-project")
+        resp.__exit__.assert_called_once()
+
+    def test_unreachable_metadata_returns_none(self):
+        with mock.patch.object(rec.urllib.request, "urlopen", side_effect=OSError("no route")):
+            self.assertIsNone(rec._metadata("project/project-id"))
+
+
 class ListProfilesReservedTest(unittest.TestCase):
     def test_reserved_profiles_excluded(self):
         base = Path(tempfile.mkdtemp()) / "profiles"

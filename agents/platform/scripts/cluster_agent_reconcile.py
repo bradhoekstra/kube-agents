@@ -59,7 +59,10 @@ def _metadata(path: str):
     """Read a GKE/GCE metadata value, or None if unavailable."""
     try:
         req = urllib.request.Request(_MD_BASE + path, headers={"Metadata-Flavor": "Google"})
-        return urllib.request.urlopen(req, timeout=5).read().decode().strip()
+        # Context-managed: this runs on a cron tick, so a socket left to the garbage
+        # collector is a socket leaked once per tick, forever.
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.read().decode().strip()
     except Exception:  # noqa: BLE001
         return None
 
@@ -86,14 +89,29 @@ def _self_cluster():
 
 
 def _all_clusters(project: str) -> list:
-    """Every cluster in the project as (project, name, location) tuples."""
+    """Every cluster in the project as (project, name, location) tuples.
+
+    `check=True` matters: without it a failed `gcloud` (expired auth, no network,
+    revoked permission) returns a non-zero exit with empty stdout, which parses to
+    an empty list and is indistinguishable from "this project has no clusters".
+    The CREATE pass would then do nothing, silently, on every tick. Raising turns
+    that into the log line below. Returning [] is still the right degradation —
+    PRUNE runs off `_cluster_exists`, not this list, so a bad list can never
+    delete anything.
+    """
     try:
         r = subprocess.run(
             ["gcloud", "container", "clusters", "list", "--project", project,
              "--format=value(name,location)"],
-            capture_output=True, text=True, timeout=120, env=_run_env(),
+            capture_output=True, text=True, check=True, timeout=120, env=_run_env(),
         )
-    except Exception as e:  # noqa: BLE001
+    except subprocess.CalledProcessError as e:
+        # CalledProcessError stringifies to just the exit status; gcloud puts the
+        # actual reason on stderr, which is the only part worth reading.
+        log(f"listing clusters in {project} failed (skipping create this run): "
+            f"{(e.stderr or '').strip() or e}")
+        return []
+    except Exception as e:  # noqa: BLE001 - timeout, gcloud missing, OSError
         log(f"listing clusters in {project} failed (skipping create this run): {e}")
         return []
     out = []
