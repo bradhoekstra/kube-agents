@@ -19,9 +19,9 @@ dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
 (`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
 templates, agent config — not documentation; they are out of the map's scope
-and `docs-check-map` exempts them. The tree
-carries no per-directory counts: only numbers a machine checks belong in this
-file, and the mechanically checked counts live in the inventory rows below.
+and `docs-check-map` exempts them. The tree carries no per-directory counts:
+only numbers a machine checks belong in this file, and the mechanically
+checked counts live in the inventory rows below.
 
 ```text
 kube-agents/

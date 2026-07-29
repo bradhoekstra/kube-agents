@@ -10,7 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Chat Agent front door — the `default` Hermes profile that receives chat ingress and delegates to specialists.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
-- `.agents/skills/`: Repository-level security review skills.
+- `.agents/skills/`: Repository-level review skills (security audits, docs-drift, skill quality) — run against pull requests and clusters, not shipped in the agent images.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
