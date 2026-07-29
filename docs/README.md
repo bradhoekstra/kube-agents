@@ -17,9 +17,9 @@ editing any doc.
 The repository tracks **139** `.md`/`.mdx` documents outside the root-level
 dot-directories — `docs-check-map` verifies this total against `git ls-files`
 and fails CI when it drifts. Dot-directories at the repository root
-(`.agents/`, `.github/`, `.gemini/`, `.claude/`) hold tooling — review
-skills, PR templates, style guides, agent config — not documentation; they
-are out of the map's scope and `docs-check-map` exempts them. The tree
+(`.agents/`, `.github/`, `.claude/`) hold tooling — review skills, PR
+templates, agent config — not documentation; they are out of the map's scope
+and `docs-check-map` exempts them. The tree
 carries no per-directory counts: only numbers a machine checks belong in this
 file, and the mechanically checked counts live in the inventory rows below.
 
@@ -93,7 +93,7 @@ CI enforcement: `make docs-check` runs the same checks as
   path in the inventory's path column must exist, the document total stated
   in section 1 must match `git ls-files`, and a collapsed family row's
   `(N …)` count must match the number of files its glob matches. Root-level
-  dot-directories (`.agents/`, `.github/`, `.gemini/`, `.claude/`, …) are
+  dot-directories (`.agents/`, `.github/`, `.claude/`, …) are
   tooling, not docs: the map does not inventory them and the check does not
   require them — the map and the check share one scope. A dot-directory
   nested inside a documented area (`examples/gitops-repo/.github/`) is
