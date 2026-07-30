@@ -1,6 +1,7 @@
 name: Auto Request Review
 
 on:
+  # zizmor: ignore[dangerous-triggers] - requesting a reviewer needs pull-requests: write, which pull_request cannot grant on fork PRs; no checkout, no other secrets
   pull_request_target:
     types: [opened, ready_for_review, reopened]
 
