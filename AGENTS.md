@@ -80,6 +80,12 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 - Maintain the structure and intent of the agent configuration files.
 - Use Conventional Commits for commit messages.
 - Push PR branches to a fork, not to the upstream repository.
+- **Pin GitHub Actions to a full commit SHA.** Every third-party `uses:` in
+  `.github/workflows/` must reference a 40-character commit SHA with the human-readable
+  version in a trailing comment (`uses: actions/checkout@3d3c42e… # v7.0.1`). Mutable tags
+  (`@v4`, `@main`) are not permitted — a retagged release would silently change what CI runs.
+  Local reusable workflows (`uses: ./.github/workflows/…`) are exempt. Dependabot updates the
+  SHA and the comment together.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
