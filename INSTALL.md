@@ -269,7 +269,7 @@ export KMS_KEY_VERSION="your-kms-key-version"
 export GITHUB_ORG="your-github-org"
 export GITHUB_REPO="your-github-repo"
 export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
-export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+export GITHUB_MINTER_GSA_NAME="kubeagents-token-minter-gsa"
 export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
 make deploy-github
 ```
