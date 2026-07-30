@@ -54,5 +54,7 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign the image
+        env:
+          CONTROLLER_DIGEST: ${{ steps.build-controller.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/k8s-operator@${{ steps.build-controller.outputs.digest }}"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/k8s-operator@$CONTROLLER_DIGEST"

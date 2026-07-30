@@ -47,13 +47,17 @@ jobs:
 
       - name: Determine target deployments
         id: set-targets
+        env:
+          FORCE_DEPLOY: ${{ inputs.force_deploy }}
+          FILTER_LITELLM: ${{ steps.filter.outputs.litellm }}
+          FILTER_GITHUB: ${{ steps.filter.outputs.github }}
         run: |
-          if [ "${{ inputs.force_deploy }}" = "true" ]; then
+          if [ "$FORCE_DEPLOY" = "true" ]; then
             echo "litellm=true" >> "$GITHUB_OUTPUT"
             echo "github=true" >> "$GITHUB_OUTPUT"
           else
-            echo "litellm=${{ steps.filter.outputs.litellm }}" >> "$GITHUB_OUTPUT"
-            echo "github=${{ steps.filter.outputs.github }}" >> "$GITHUB_OUTPUT"
+            echo "litellm=$FILTER_LITELLM" >> "$GITHUB_OUTPUT"
+            echo "github=$FILTER_GITHUB" >> "$GITHUB_OUTPUT"
           fi
 
   provision-secrets:
@@ -164,12 +168,12 @@ jobs:
       - name: Verify LiteLLM Deployment Rollout
         run: |
           echo "Waiting for rollout of LiteLLM deployment..."
-          if ! kubectl rollout status deployment/litellm -n ${{ env.NAMESPACE }} --timeout=180s; then
+          if ! kubectl rollout status deployment/litellm -n "$NAMESPACE" --timeout=180s; then
             echo "::error::Rollout failed! Printing debug logs..."
-            kubectl describe deployment/litellm -n ${{ env.NAMESPACE }} || true
-            kubectl get pods -n ${{ env.NAMESPACE }} -l app=litellm || true
-            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=litellm || true
-            kubectl logs -n ${{ env.NAMESPACE }} -l app=litellm --all-containers --tail=50 || true
+            kubectl describe deployment/litellm -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l app=litellm || true
+            kubectl describe pods -n "$NAMESPACE" -l app=litellm || true
+            kubectl logs -n "$NAMESPACE" -l app=litellm --all-containers --tail=50 || true
             exit 1
           fi
 
@@ -277,11 +281,11 @@ jobs:
       - name: Verify GitHub Token Minter Deployment Rollout
         run: |
           echo "Waiting for rollout of github-token-minter deployment..."
-          if ! kubectl rollout status deployment/github-token-minter -n ${{ env.NAMESPACE }} --timeout=180s; then
+          if ! kubectl rollout status deployment/github-token-minter -n "$NAMESPACE" --timeout=180s; then
             echo "::error::Rollout failed! Printing debug logs..."
-            kubectl describe deployment/github-token-minter -n ${{ env.NAMESPACE }} || true
-            kubectl get pods -n ${{ env.NAMESPACE }} -l app=github-token-minter || true
-            kubectl describe pods -n ${{ env.NAMESPACE }} -l app=github-token-minter || true
-            kubectl logs -n ${{ env.NAMESPACE }} -l app=github-token-minter --all-containers --tail=50 || true
+            kubectl describe deployment/github-token-minter -n "$NAMESPACE" || true
+            kubectl get pods -n "$NAMESPACE" -l app=github-token-minter || true
+            kubectl describe pods -n "$NAMESPACE" -l app=github-token-minter || true
+            kubectl logs -n "$NAMESPACE" -l app=github-token-minter --all-containers --tail=50 || true
             exit 1
           fi

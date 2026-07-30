@@ -77,7 +77,11 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign the images
+        env:
+          PLATFORM_DIGEST: ${{ steps.build-platform.outputs.digest }}
+          REPLAY_PROXY_DIGEST: ${{ steps.build-replay-proxy.outputs.digest }}
+          CREDENTIAL_PROXY_DIGEST: ${{ steps.build-credential-proxy.outputs.digest }}
         run: |
-          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent@${{ steps.build-platform.outputs.digest }}"
-          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/replay-proxy@${{ steps.build-replay-proxy.outputs.digest }}"
-          cosign sign --yes "ghcr.io/${{ env.IMAGE_REPOSITORY }}/credential-proxy@${{ steps.build-credential-proxy.outputs.digest }}"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/platform-agent@$PLATFORM_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/replay-proxy@$REPLAY_PROXY_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
