@@ -310,6 +310,38 @@ class SlackRelayPatchTest(unittest.TestCase):
         self.assertEqual(dict(result.data), {"ok": True, "team_id": "T123"})
         self.assertEqual(getattr(result, "headers", None), {"x-oauth-scopes": "chat:write"})
 
+    def test_the_team_bolt_resolved_wins_over_the_joined_token(self):
+        """Across workspaces the token lists every team, so it cannot be split.
+
+        connect() joins one "relay:<teamId>" per authenticated workspace into
+        config.token. Deriving team_id from that yields "T1,relay:T2" for the
+        first team and relays every call to the wrong workspace. Bolt resolves
+        the team from the inbound event and passes it per request; prefer it.
+        """
+        self._create_adapter()
+        patched = self.bolt_async_app.AsyncWebClient
+
+        client = patched(token="relay:T1,relay:T2", team_id="T2")
+        self.assertEqual("T2", client.team_id)
+
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return FakeHTTPResponse({"response": {"ok": True}})
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            asyncio.run(client.api_call("auth.test"))
+
+        self.assertEqual("T2", captured["payload"]["teamId"])
+
+    def test_a_single_workspace_token_still_yields_its_team(self):
+        """With no team_id from bolt, the placeholder token remains the source."""
+        self._create_adapter()
+        patched = self.bolt_async_app.AsyncWebClient
+
+        self.assertEqual("T1", patched(token="relay:T1").team_id)
+
     def test_connect_waits_for_relay_readiness(self):
         adapter = self._create_adapter()
         attempts = {"count": 0}
