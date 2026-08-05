@@ -52,17 +52,20 @@ spec:
             matchLabels:
               kubernetes.io/metadata.name: gke-managed-otel
   ingress:
+    # Numeric rather than the "http" port name: named-port support in
+    # NetworkPolicy varies by CNI dataplane, and a rule that fails to match
+    # here fails closed.
     - from:
         - podSelector: {}
       ports:
-        - port: 4000
+        - port: 8080
           protocol: TCP
     - from:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: gke-gmp-system
       ports:
-        - port: 4000
+        - port: 8080
           protocol: TCP
   podSelector:
     matchLabels:

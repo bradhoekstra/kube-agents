@@ -127,6 +127,7 @@ identifier appears, add its source here.
 | Registry prefix default (`REGISTRY_PREFIX`)                          | `k8s-operator/scripts/common.sh`                                                       |
 | GitOps clone layout (`/opt/data/gitops/...`) and leases              | `agents/platform/scripts/gitops_workspace.py`                                          |
 | Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml`                                                       |
+| LiteLLM gateway listen port (`--port`, `containerPort`)              | `k8s-operator/config/integrations/litellm/base/deployment.yaml`                        |
 | Terraform module defaults (GSA/KSA/namespace, role set, channel)     | `terraform/modules/*/variables.tf`                                                     |
 
 ## 3. Documentation eras and status

@@ -30,7 +30,7 @@ spec:
       containers:
         - name: litellm-container
           image: ghcr.io/berriai/litellm:v1.92.0
-          args: ["--config", "/app/config.yaml"]
+          args: ["--config", "/app/config.yaml", "--port", "8080"]
           env:
             - name: CHATGPT_TOKEN_DIR
               value: "/data/litellm/chatgpt"
@@ -45,7 +45,8 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: litellm
           ports:
-            - containerPort: 4000
+            - containerPort: 8080
+              name: http
           volumeMounts:
             - name: config-volume
               mountPath: /app/config.yaml

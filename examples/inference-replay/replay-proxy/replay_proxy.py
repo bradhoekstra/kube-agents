@@ -11,6 +11,9 @@ import httpx
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("replay-proxy-v1")
 
+# Local-dev fallback only; in-cluster the Deployment sets INFERENCE_URL to the
+# litellm-gateway Service. Point this at whatever local port you forward the
+# gateway to -- it must not be 8080, which this proxy binds itself.
 INFERENCE_URL = os.environ.get("INFERENCE_URL", "http://localhost:4000")
 CACHE_FILE = os.environ.get("CACHE_FILE", "/data/replay_cache.json")
 MODE_FILE = os.environ.get("MODE_FILE", "/etc/replay/mode")

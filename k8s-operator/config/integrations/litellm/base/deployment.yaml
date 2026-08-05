@@ -20,7 +20,9 @@ spec:
       containers:
         - name: litellm-container
           image: ghcr.io/berriai/litellm:v1.92.0
-          args: ["--config", "/app/config.yaml"]
+          # --port is explicit: LiteLLM's own default is 4000, so the port only
+          # moves if the flag says so — containerPort alone would not bind it.
+          args: ["--config", "/app/config.yaml", "--port", "8080"]
           resources:
             requests:
               cpu: "100m"
@@ -58,7 +60,10 @@ spec:
             - name: OTEL_SERVICE_NAME
               value: litellm
           ports:
-            - containerPort: 4000
+            # Named so service.yaml and podmonitoring.yaml reference the name,
+            # not a second copy of the number.
+            - containerPort: 8080
+              name: http
           volumeMounts:
             - name: config-volume
               mountPath: /app/config.yaml
