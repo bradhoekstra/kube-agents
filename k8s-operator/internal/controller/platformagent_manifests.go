@@ -1809,6 +1809,9 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 		name += "-credential-proxy"
 	}
 	if suffix == "" {
+		// The sidecar tag must follow the agent image, which on this path is
+		// untagged or digest-pinned without a tag field — i.e. effectively
+		// "latest", not the build-injected default version.
 		suffix = ":latest"
 	}
 	return prefix + name + suffix
