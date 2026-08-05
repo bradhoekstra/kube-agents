@@ -16,18 +16,29 @@ kubectl get all,configmap,pvc,serviceaccount,secret -A \
 
 ## The label contract
 
-Four of the six recommended labels are set. `component` and `version` are deliberately absent:
-there is no build-time version to report, and image references may carry a digest whose `@` and
-`:` are not legal in a label value.
+Every install path sets `name`, `instance`, `part-of`, and `managed-by`:
 
-| Source                                                  | `name`                 | `instance`                    | `part-of`     | `managed-by`               |
-| ------------------------------------------------------- | ---------------------- | ----------------------------- | ------------- | -------------------------- |
-| PlatformAgent controller output (per CR)                | `platform-agent`       | `<namespace>-<agent name>`    | `kube-agents` | `platformagent-controller` |
-| Operator install (`k8s-operator/config/`)               | `kube-agents-operator` | `kube-agents-operator`        | `kube-agents` | `kustomize`                |
-| LiteLLM integration                                     | `litellm`              | `litellm`                     | `kube-agents` | `kustomize`                |
-| GitHub token minter                                     | `github-token-minter`  | `github-token-minter`         | `kube-agents` | `kustomize`                |
-| Inference replay                                        | `inference-replay`     | `inference-replay`            | `kube-agents` | `kustomize`                |
-| Provisioned Secrets (`provision_07_gcp_k8s_secrets.sh`) | `platform-agent`       | `${NAMESPACE}-platform-agent` | `kube-agents` | `provisioner`              |
+| Source                                                  | `name`                                              | `instance`                    | `part-of`     | `managed-by`               |
+| ------------------------------------------------------- | --------------------------------------------------- | ----------------------------- | ------------- | -------------------------- |
+| PlatformAgent controller output (per CR)                | `platform-agent`                                    | `<namespace>-<agent name>`    | `kube-agents` | `platformagent-controller` |
+| Operator install (`k8s-operator/config/`)               | `kube-agents-operator`                              | `kube-agents-operator`        | `kube-agents` | `kustomize`                |
+| Helm chart (`charts/kube-agents/`)                      | `kube-agents`, `kube-agents-operator`, or `litellm` | `<release name>`              | `kube-agents` | `Helm`                     |
+| LiteLLM integration                                     | `litellm`                                           | `litellm`                     | `kube-agents` | `kustomize`                |
+| GitHub token minter                                     | `github-token-minter`                               | `github-token-minter`         | `kube-agents` | `kustomize`                |
+| Inference replay                                        | `inference-replay`                                  | `inference-replay`            | `kube-agents` | `kustomize`                |
+| Provisioned Secrets (`provision_07_gcp_k8s_secrets.sh`) | `platform-agent`                                    | `${NAMESPACE}-platform-agent` | `kube-agents` | `provisioner`              |
+
+`component` is set by nothing: the object's own `name` already says what it is, and a second
+key that has to stay consistent with the first is a key that eventually disagrees with it.
+
+`version` is set only by the Helm chart, which fills it from `Chart.AppVersion` — a chart release
+is pinned to exactly one application release, so there is a correct value to write. See
+[Release versioning](/kube-agents/deploy/release-versioning/). No other path sets it. The
+controller writes objects whose version is whatever image the CR asked for, and an image reference
+may carry a digest, whose `@` and `:` are not legal in a label value; the kustomizations and the
+provisioner have no build identity to report at all. A `version` label that is present on some of
+the footprint and absent from the rest is worse than one that is consistently absent, so select on
+image references, not on this label, when you need to know what is actually running.
 
 `instance` carries the namespace for controller-created objects because the controller also
 writes cluster-scoped ClusterRoles and ClusterRoleBindings, where a bare CR name is ambiguous
@@ -45,6 +56,12 @@ infrastructure, and do not get these labels. Those carry the
 `kubeagents.x-k8s.io/requested-by` annotation instead — see
 [User attribution](/kube-agents/reference/attribution/) for why per-requester identity belongs in
 an annotation rather than a label.
+
+CRDs installed by the Helm chart are also unlabelled. Helm applies everything in a chart's `crds/`
+directory verbatim and never renders it as a template, and those files are byte-for-byte copies of
+`k8s-operator/config/crd/bases/` enforced by `make chart-check`, so there is nowhere to put the
+labels. Installing the CRDs through `k8s-operator/config/crd/` instead does label them — that
+kustomization sets the four keys itself.
 
 ## Upgrade notes
 
