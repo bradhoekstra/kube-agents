@@ -102,8 +102,8 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 
 ## Automated Review After Opening a Pull Request
 
-Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that drives
-Claude Code over the branch diff. It only comments — it never pushes commits and never merges.
+Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that runs a
+coding agent over the branch diff. It only comments — it never pushes commits and never merges.
 Opening a pull request is therefore not the end of the task.
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
