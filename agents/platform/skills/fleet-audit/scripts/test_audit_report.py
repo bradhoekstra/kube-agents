@@ -4458,7 +4458,11 @@ class TestRedaction(unittest.TestCase):
             'token: "ghs_liveLiveLiveLiveLive"',
             "  api_key = AKIAIOSFODNN7EXAMPLE",
             "client-key-data: LS0tLS1CRUdJTiBSU0E=",
-            "- authorization: Basic Zm9vOmJhcg==",
+            # Deliberately not a `user:pass` base64 payload — decodes to
+            # "not-a-real-credential" — so secret scanners do not flag the
+            # fixture. The redactor keys off the field name and `Basic` prefix,
+            # never the payload's contents.
+            "- authorization: Basic bm90LWEtcmVhbC1jcmVkZW50aWFs",
         ):
             with self.subTest(line=line):
                 out = audit_report.redact_secrets(line)
