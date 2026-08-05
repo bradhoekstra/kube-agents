@@ -20,4 +20,4 @@ jobs:
     with:
       target_environment: "staging"
       force_deploy: true
-      checkout_sha: ${{ github.sha }}
+      checkout_ref: ${{ github.ref }}
