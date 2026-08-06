@@ -75,7 +75,7 @@ All submissions, including from project members, require review through GitHub p
 
 ### Automated review
 
-Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above.
+Every pull request is also reviewed by [`kube-agents-bot`](https://github.com/bradhoekstra/kube-agents-bot), a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. Its own repository is the source of truth for how it behaves.
 
 - **It starts on its own** when a pull request is `opened`, `reopened`, or marked ready for review. It typically posts a couple of minutes later.
 - **Pushing more commits does not re-trigger it.** To ask for a fresh review of the current commit, comment `/review` on a line of its own. Owners, members, and collaborators can trigger it.

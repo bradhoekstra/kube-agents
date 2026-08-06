@@ -95,6 +95,10 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
   map coverage), while the skill also verifies that doc prose still matches the source.
+- **Expect an automated review after opening a PR.** Opening the pull request starts
+  `kube-agents-bot`; see
+  [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
+  for what it does and what you are expected to do with its findings.
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
   - **Formatting:** Run `npx prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `npx prettier --check .` (note: this may check files outside your PR scope).
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build -f deploy/docker/Dockerfile --target platform .`).
@@ -102,9 +106,12 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 
 ## Automated Review After Opening a Pull Request
 
-Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that runs a
+Every pull request here is reviewed automatically by
+[`kube-agents-bot`](https://github.com/bradhoekstra/kube-agents-bot), a GitHub App that runs a
 coding agent over the branch diff. It only comments — it never pushes commits and never merges.
-Opening a pull request is therefore not the end of the task.
+Opening a pull request is therefore not the end of the task. The bot's own repository is the source
+of truth for its behaviour; what follows is the contract as it stands, and the place to check when
+the bot does something this section does not describe.
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review** — an active branch would otherwise pay for a re-read on every push. To get a
@@ -124,14 +131,23 @@ and **offer to wait for it** instead of reporting the work as finished. If the u
 until the review appears:
 
 ```bash
-# Has the bot reviewed yet? (gh reports the login without the [bot] suffix)
-gh pr view <number> --json reviews \
-  --jq '.reviews[] | select(.author.login == "kube-agents-bot") | .body'
+# Both commands name gke-labs/kube-agents explicitly: PR branches live on forks,
+# but the review lives on the upstream pull request.
 
-# The inline findings, with the comment ids needed to reply
-gh api repos/gke-labs/kube-agents/pulls/<number>/comments \
+# Has the bot reviewed yet? Takes the LAST bot review and prints its timestamp
+# first: after a /review the earlier review is still there, and reading it back
+# looks exactly like the new one having landed. No output = no review yet.
+# (gh reports the login without the [bot] suffix; the REST API below adds it.)
+gh pr view <number> --repo gke-labs/kube-agents --json reviews \
+  --jq '[.reviews[] | select(.author.login == "kube-agents-bot")] | last | select(.)
+        | "\(.submittedAt)\n\(.body)"'
+
+# The inline findings, with the comment ids needed to reply. --paginate matters:
+# the default page holds 30 comments and a truncated list still looks complete.
+# .line is null once a finding's line falls out of the diff, hence the fallback.
+gh api repos/gke-labs/kube-agents/pulls/<number>/comments --paginate \
   --jq '.[] | select(.user.login == "kube-agents-bot[bot]")
-        | "\(.path):\(.line) [id \(.id)]\n\(.body)\n"'
+        | "\(.path):\(.line // .original_line) [id \(.id)]\n\(.body)\n"'
 ```
 
 Then work the findings **with** the user rather than acting on them unilaterally: summarise each
