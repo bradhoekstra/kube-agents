@@ -106,12 +106,11 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 
 ## Automated Review After Opening a Pull Request
 
-Every pull request here is reviewed automatically by
-[`kube-agents-bot`](https://github.com/bradhoekstra/kube-agents-bot), a GitHub App that runs a
+Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that runs a
 coding agent over the branch diff. It only comments — it never pushes commits and never merges.
-Opening a pull request is therefore not the end of the task. The bot's own repository is the source
-of truth for its behaviour; what follows is the contract as it stands, and the place to check when
-the bot does something this section does not describe.
+Opening a pull request is therefore not the end of the task. The bot introduces itself in a comment
+on every pull request it picks up, and that comment states its current contract; if it disagrees
+with what follows, believe the comment and fix this section.
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review** — an active branch would otherwise pay for a re-read on every push. To get a
