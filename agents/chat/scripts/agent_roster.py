@@ -32,6 +32,13 @@ PROFILES_BASE = HERMES_HOME / "profiles"
 SELF_PROFILE = "default"
 
 EMPTY_ROSTER = "No specialist agents are currently available to route to."
+# Discovery failed. Deliberately not EMPTY_ROSTER: an unreadable profiles
+# directory must not be reported to the Chat Agent as an empty fleet.
+UNKNOWN_ROSTER = (
+    "The specialist roster could not be read right now. Do not conclude that no "
+    "agents exist; retry, and say so plainly if it keeps failing."
+)
+NO_DESCRIPTION = "(no description provided)"
 
 
 def log(msg: str) -> None:
@@ -74,11 +81,16 @@ def _responsibilities(home: Path) -> str:
     return _summarize_soul(home)
 
 
-def discover(base: Path | None = None) -> list[dict[str, str]]:
+def discover(base: Path | None = None) -> list[dict[str, str]] | None:
     """Enumerate every routable specialist profile (all profiles except `default`).
 
     Degrades rather than raises. Errors are isolated per profile: one unreadable
     directory costs that one agent, not the whole roster.
+
+    Returns ``None`` — distinct from ``[]`` — when the profiles directory itself
+    could not be listed. "I could not read the fleet" and "there is no fleet"
+    are different answers: the second is a fact the Chat Agent should act on,
+    the first must not be reported as one.
 
     ``base`` defaults to the module-level ``PROFILES_BASE`` at call time rather
     than at import time, so a caller (or a test) that rebinds ``PROFILES_BASE``
@@ -90,7 +102,7 @@ def discover(base: Path | None = None) -> list[dict[str, str]]:
         entries = sorted(root.iterdir()) if root.is_dir() else []
     except OSError as e:
         log(f"cannot list profiles at {root}: {e}")
-        return agents
+        return None
     for p in entries:
         try:
             if not p.is_dir() or p.name == SELF_PROFILE:
@@ -101,8 +113,8 @@ def discover(base: Path | None = None) -> list[dict[str, str]]:
     return agents
 
 
-def format_roster(agents: list[dict[str, str]]) -> str:
-    """Render the roster the Chat Agent reads.
+def format_roster(agents: list[dict[str, str]] | None) -> str | None:
+    """Render the roster the Chat Agent reads, or ``None`` if it is unknowable.
 
     Agents sharing an identical role description are grouped so the description
     is stated once instead of repeated verbatim per agent — every Cluster Agent
@@ -110,17 +122,31 @@ def format_roster(agents: list[dict[str, str]]) -> str:
     be thirty copies of one paragraph. Assignee names are always listed
     individually, because the name is the part the caller has to get exactly
     right.
+
+    ``None`` in (discovery failed) is ``None`` out; callers decide how to say
+    "unknown", which is not the same thing as ``EMPTY_ROSTER``.
     """
+    if agents is None:
+        return None
     if not agents:
         return EMPTY_ROSTER
 
     groups: dict[str, list[str]] = {}
+    # A missing description is an absence, not a shared role: grouping on the
+    # placeholder would announce unrelated profiles as one interchangeable
+    # fleet, and the "pick the one whose cluster you need" preamble would be a
+    # lie about agents nothing is known of. Each gets its own line.
+    undescribed: list[str] = []
     for a in agents:
-        desc = a["responsibilities"] or "(no description provided)"
-        groups.setdefault(desc, []).append(a["name"])
+        desc = a["responsibilities"]
+        if desc:
+            groups.setdefault(desc, []).append(a["name"])
+        else:
+            undescribed.append(a["name"])
 
     # Distinct specialists first, then the shared-role fleets — the front door routes to a
-    # named specialist far more often than to a specific cluster.
+    # named specialist far more often than to a specific cluster. The undescribed trail
+    # both: they are the least useful entries to route from.
     blocks: list[str] = []
     for desc, names in sorted(groups.items(), key=lambda kv: len(kv[1])):
         if len(names) == 1:
@@ -131,9 +157,14 @@ def format_roster(agents: list[dict[str, str]]) -> str:
             f"The following {len(names)} agents share one role — pick the one whose cluster "
             f"you need:\n{listed}\n  Shared role: {desc}"
         )
+    blocks.extend(f"- {name}: {NO_DESCRIPTION}" for name in undescribed)
     return "\n\n".join(blocks)
 
 
-def render(base: Path | None = None) -> str:
-    """Discover and format in one call — what both consumers actually want."""
+def render(base: Path | None = None) -> str | None:
+    """Discover and format in one call — what both consumers actually want.
+
+    ``None`` means the roster could not be read at all. Both consumers treat
+    that as "say nothing about the fleet" rather than "the fleet is empty".
+    """
     return format_roster(discover(base))

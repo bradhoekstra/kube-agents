@@ -91,7 +91,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_progress_lines.py /opt/herme
     grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q '_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")' /opt/hermes/gateway/kanban_watchers.py && \
-    /opt/hermes/.venv/bin/python3 -c "import ast, pathlib; ast.parse(pathlib.Path('/opt/hermes/gateway/kanban_watchers.py').read_text())" && \
+    /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 from gateway.kanban_progress_lines import progress_note; \
 exit(1) if progress_note(None) or progress_note({}) or progress_note({'note': '  '}) else None; \
@@ -175,20 +175,30 @@ RUN apt-get purge -y git && apt-get autoremove -y && \
 # `import run_agent` alone, base image vs this one, both read-only: 3.0s → 1.0s.
 # The bytecode costs ~170MB of image.
 #
-# This must run AFTER every patch above: compileall stamps each .pyc with its
-# source's mtime and size, so bytecode written before a patch would simply be
-# discarded at import and we would be back to compiling on every start.
+# This must run AFTER every patch this stage applies to /opt/hermes: compileall
+# stamps each .pyc with its source's mtime and size, so bytecode written before a
+# patch would simply be discarded at import and we would be back to compiling on
+# every start. Python that later stages add — `agents/platform/plugins/` in the
+# `platform` stage, and everything the entrypoint syncs into $HERMES_HOME on the
+# writable PVC — is not covered here; it is a few small modules against the
+# ~9,500 compiled below, so it is left for a follow-up rather than a second pass.
 #
 # compileall exits non-zero if ANY file fails to parse, and site-packages ships
 # deliberately-unparseable test fixtures, so its status is not a useful signal —
-# the two checks after it are. The stdlib is compiled too: 199 of the modules a
+# the three checks after it are. The stdlib is compiled too: 199 of the modules a
 # worker loads live there and Debian's python3-minimal ships them uncompiled.
 # The stdlib path is asked of the interpreter rather than written out, so a base
-# image on a new Python still gets compiled instead of quietly skipped.
+# image on a new Python still gets compiled instead of quietly skipped — and
+# because `|| true` would swallow a bad path just as happily as a bad fixture,
+# the directory is checked before the run and its .pyc counted after it (602 in
+# the image today). Without that, a sysconfig change would silently cost every
+# worker the stdlib half of this win.
 RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfig.get_paths()["stdlib"])')" && \
-    /opt/hermes/.venv/bin/python3 -m compileall -q -j 0 /opt/hermes "$STDLIB" || true; \
+    [ -d "$STDLIB" ] && \
+    { /opt/hermes/.venv/bin/python3 -m compileall -q -j 0 /opt/hermes "$STDLIB" || true; } && \
     ls /opt/hermes/__pycache__/run_agent.*.pyc >/dev/null && \
-    [ "$(find /opt/hermes -name '*.pyc' | head -5000 | wc -l)" -ge 5000 ]
+    [ "$(find /opt/hermes -name '*.pyc' | head -5000 | wc -l)" -ge 5000 ] && \
+    [ "$(find "$STDLIB" -name '*.pyc' | head -500 | wc -l)" -ge 500 ]
 
 # 5.8. Copy custom agent startup script
 COPY deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint

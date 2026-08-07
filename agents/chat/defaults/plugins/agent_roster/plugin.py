@@ -43,9 +43,13 @@ def _load_roster_module() -> Optional[ModuleType]:
         return _roster_module
     for base in _scripts_dirs():
         path = base / _SCRIPT_NAME
-        if not path.is_file():
-            continue
         try:
+            # is_file() is inside the try on purpose: the scripts directory is on
+            # the shared PVC, and pathlib only swallows ENOENT/ENOTDIR/EBADF/ELOOP
+            # — a stat() that fails with EACCES or EIO raises for real, and this
+            # runs ahead of every turn on the front door.
+            if not path.is_file():
+                continue
             spec = importlib.util.spec_from_file_location(_MODULE_NAME, path)
             if spec is None or spec.loader is None:
                 continue
@@ -86,6 +90,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     except Exception as e:
         logger.warning("Could not render the agent roster: %s", e)
         return None
+    # render() returns None when discovery itself failed. Inject nothing: the
+    # model then falls back to `list_agents`, which is the pre-injection
+    # behaviour. Injecting "no specialist agents are available" instead would
+    # state a fault as a fact and stop the front door routing at all.
     if not roster:
         return None
     return {"context": f"\n\n{_HEADER}\n{roster}\n\n{_FOOTER}\n"}

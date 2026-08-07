@@ -9,6 +9,7 @@ render the same fleet the same way, and a stub here would let them drift
 silently.
 """
 
+import os
 import shutil
 import sys
 import tempfile
@@ -116,10 +117,37 @@ class InjectionTest(unittest.TestCase):
         with mock.patch.object(plugin._roster_module, "render", side_effect=OSError("PVC gone")):
             self.assertIsNone(plugin.handle_pre_llm_call())
 
-    def test_an_unreadable_profiles_dir_does_not_raise(self):
+    def test_a_missing_profiles_dir_still_reports_an_empty_fleet(self):
         # agent_roster degrades internally; assert the plugin does not undo that.
+        # An absent directory is a knowable fact — there is nobody to route to.
         shutil.rmtree(self.profiles)
         self.assertIn("No specialist agents", plugin.handle_pre_llm_call()["context"])
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits this test relies on")
+    def test_an_unreadable_profiles_dir_injects_nothing(self):
+        # Not the same as an empty one. Announcing "no specialist agents are
+        # available" on an I/O fault would stop the front door routing at all;
+        # injecting nothing leaves it exactly where it was before this plugin —
+        # able to reach for `list_agents`.
+        self._profile("platform", "Fleet work.")
+        self.profiles.chmod(0o000)
+        try:
+            self.assertIsNone(plugin.handle_pre_llm_call())
+        finally:
+            self.profiles.chmod(0o755)
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits this test relies on")
+    def test_an_unreadable_scripts_dir_is_silent_not_fatal(self):
+        # pathlib swallows ENOENT but not EACCES, so even the is_file() probe for
+        # the roster module can raise on the shared PVC. This hook runs ahead of
+        # every user turn: a raise here is a Chat Agent that cannot answer at all.
+        scripts = self.data_dir / "scripts"
+        scripts.chmod(0o000)
+        try:
+            with mock.patch.object(plugin, "_FALLBACK_SCRIPTS_DIR", scripts):
+                self.assertIsNone(plugin.handle_pre_llm_call())
+        finally:
+            scripts.chmod(0o755)
 
 
 class RegistrationTest(unittest.TestCase):

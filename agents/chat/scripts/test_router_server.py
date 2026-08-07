@@ -4,6 +4,7 @@ import types
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 # Add the directory containing router_server.py to sys.path so it can be imported.
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
@@ -67,6 +68,15 @@ class TestListAgentsDelegates(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             agent_roster.PROFILES_BASE = Path(tmp) / "does-not-exist"
             self.assertIn("No specialist agents", router.list_agents())
+
+    def test_an_unreadable_roster_says_so_rather_than_claiming_none(self):
+        # render() answers None when discovery itself failed. A tool has to
+        # return a string, and "no specialist agents" is the one string it must
+        # not be: the front door would stop routing on an I/O fault.
+        with mock.patch.object(agent_roster, "render", return_value=None):
+            out = router.list_agents()
+        self.assertEqual(out, agent_roster.UNKNOWN_ROSTER)
+        self.assertNotIn("No specialist agents", out)
 
 
 class TestKanbanOnly(unittest.TestCase):

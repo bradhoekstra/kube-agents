@@ -117,6 +117,22 @@ class TestSharedRoleGrouping(unittest.TestCase):
         )
         self.assertLess(len(grouped), len(ungrouped))
 
+    def test_undescribed_agents_are_not_a_shared_role(self):
+        # Two profiles nothing is known about have no role in common. Grouping on
+        # the placeholder would file them under "pick the one whose cluster you
+        # need" — a claim about interchangeability the roster has no basis for.
+        with TemporaryDirectory() as tmp:
+            base = Path(tmp) / "profiles"
+            for name in ("default", "mystery-a", "mystery-b"):
+                (base / name).mkdir(parents=True)
+            agent_roster.PROFILES_BASE = base
+
+            out = agent_roster.render()
+
+            self.assertIn("- mystery-a: (no description provided)", out)
+            self.assertIn("- mystery-b: (no description provided)", out)
+            self.assertNotIn("share one role", out)
+
 
 @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits these tests rely on")
 class TestDiscoveryDegradesOnIOError(unittest.TestCase):
@@ -154,18 +170,22 @@ class TestDiscoveryDegradesOnIOError(unittest.TestCase):
             self.assertIn("- platform: Fleet + GitOps write path.", out)
             self.assertIn("- broken: (no description provided)", out)
 
-    def test_unreadable_profiles_base_returns_empty_roster(self):
+    def test_unreadable_profiles_base_is_unknown_not_empty(self):
+        # "I could not read the fleet" must never be rendered as "there is no
+        # fleet": the front door would stop routing and tell the user there is
+        # nobody to route to. render() returns None so the injecting plugin says
+        # nothing and the model falls back to `list_agents`.
         with TemporaryDirectory() as tmp:
             base = Path(tmp) / "profiles"
             (base / "platform").mkdir(parents=True)
             agent_roster.PROFILES_BASE = base
 
             with self._locked(base):
-                out = agent_roster.render()
-
-            self.assertIn("No specialist agents", out)
+                self.assertIsNone(agent_roster.render())
 
     def test_missing_profiles_base_returns_empty_roster(self):
+        # A directory that is absent, unlike one that cannot be read, is a fact:
+        # pathlib's is_dir() swallows ENOENT, so this is a genuinely empty fleet.
         with TemporaryDirectory() as tmp:
             agent_roster.PROFILES_BASE = Path(tmp) / "does-not-exist"
             self.assertIn("No specialist agents", agent_roster.render())

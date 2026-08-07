@@ -15,7 +15,6 @@ Why the patch exists is documented in the module docstring of
 
 from __future__ import annotations
 
-import ast
 import sys
 from pathlib import Path
 
@@ -160,7 +159,11 @@ def apply(root: Path) -> None:
             source = source.replace(anchor, replacement)
         source += append
         try:
-            ast.parse(source)
+            # compile(), not ast.parse(): the inserted branch ends in a `continue`,
+            # and ast.parse accepts a `continue` outside a loop — only the compile
+            # step rejects it. A misplaced insertion would otherwise reach the
+            # image and fail at import, in the gateway, at runtime.
+            compile(source, str(relative), "exec")
         except SyntaxError as e:
             raise SystemExit(
                 f"kanban_progress_lines patch: {relative} no longer parses "

@@ -44,7 +44,11 @@ def list_agents() -> str:
     same template) are grouped so the description is stated once instead of repeated verbatim
     per agent. Assignee names are always listed individually.
     """
-    return agent_roster.render()
+    # A tool has to answer with a string, so an unreadable roster (render() -> None)
+    # is spelled out rather than collapsed into "no agents exist". The injecting
+    # plugin has the better option there and simply stays quiet.
+    roster = agent_roster.render()
+    return agent_roster.UNKNOWN_ROSTER if roster is None else roster
 
 
 if __name__ == "__main__":
