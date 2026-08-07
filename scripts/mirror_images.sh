@@ -76,6 +76,15 @@ case "$MIRROR_PREFIX" in
     exit 1
     ;;
 esac
+# The same rule for the third-party prefix, which is a separate input whenever
+# it is not just defaulting to MIRROR_PREFIX: a scheme here would be caught by
+# crane at copy time instead, halfway through the mirror.
+case "$MIRROR_THIRD_PARTY_PREFIX" in
+  *"://"*)
+    echo "❌ MIRROR_THIRD_PARTY_PREFIX must be a bare registry path without a scheme (got '${MIRROR_THIRD_PARTY_PREFIX}')." >&2
+    exit 1
+    ;;
+esac
 MIRROR_PREFIX="${MIRROR_PREFIX%/}"
 MIRROR_THIRD_PARTY_PREFIX="${MIRROR_THIRD_PARTY_PREFIX%/}"
 

@@ -440,6 +440,7 @@ init_var_image_tag() {
 
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
+  local env_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
@@ -458,6 +459,13 @@ load_state() {
   if [ -n "$env_registry_prefix" ] && [ -n "${REGISTRY_PREFIX:-}" ] \
     && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
     print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
+  fi
+  # And the same for the third-party prefix, which is the one an operator is
+  # most likely to export on a re-run after pointing cert-manager and
+  # fluent-bit at a different mirror.
+  if [ -n "$env_third_party_prefix" ] && [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ] \
+    && [ "$env_third_party_prefix" != "$THIRD_PARTY_REGISTRY_PREFIX" ]; then
+    print_warning "Ignoring exported THIRD_PARTY_REGISTRY_PREFIX='${env_third_party_prefix}': the saved value '${THIRD_PARTY_REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} to change it."
   fi
   init_var_image_tag
   init_var_registry_prefix

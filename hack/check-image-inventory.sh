@@ -43,6 +43,13 @@ pin_of() {
   jq -r --arg n "$1" '.images[] | select(.name == $n) | .tag' "$INVENTORY"
 }
 
+# The pin for a repository, or empty when the inventory carries no fixed tag
+# for it — first-party images are tagPolicy "release" and take the tag of
+# whatever release is being installed, so there is nothing to compare against.
+pin_of_repo() {
+  jq -r --arg r "$1" '.images[] | select(.repository == $r) | .tag // empty' "$INVENTORY"
+}
+
 repo_of() {
   jq -r --arg n "$1" '.images[] | select(.name == $n) | .repository' "$INVENTORY"
 }
@@ -131,23 +138,62 @@ REQUIRED_VALUES=(
 # Every image the chart renders, from `image:` fields and from the operator's
 # *_IMAGE env vars — the latter are what the operator later stamps onto agent
 # pods, so leaving them public half-mirrors the install.
+#
+# A render failure is fatal rather than an empty list: the loops below iterate
+# this output, and "no images" reads exactly like "no images to object to".
 chart_images() {
-  helm template test-release charts/kube-agents "${REQUIRED_VALUES[@]}" "$@" |
-    sed -n -e 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p' \
-      -e 's/^[[:space:]]*value:[[:space:]]*"\([^"]*\/[^"]*:[^"]*\)"[[:space:]]*$/\1/p' |
+  local rendered
+  rendered="$(helm template test-release charts/kube-agents "${REQUIRED_VALUES[@]}" "$@")" || {
+    echo "ERROR: 'helm template' failed for the chart${*:+ with $*} — see the error above." >&2
+    return 1
+  }
+  sed -n -e 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p' \
+    -e 's/^[[:space:]]*value:[[:space:]]*"\([^"]*\/[^"]*:[^"]*\)"[[:space:]]*$/\1/p' <<<"$rendered" |
     sort -u
 }
 
-# 3a. Default install: every rendered image must be in the inventory, so the
-#     mirror built from it is complete.
+# Split a reference into repository and tag. The digest, if any, goes first;
+# the tag is then the part after a colon in the final path segment, so a
+# registry port (host:5000/name) is not mistaken for one.
+split_ref() {
+  local ref=${1%%@*}
+  case "${ref##*/}" in
+  *:*)
+    ref_repo="${ref%:*}"
+    ref_tag="${ref##*:}"
+    ;;
+  *)
+    ref_repo="$ref"
+    ref_tag=""
+    ;;
+  esac
+}
+
+default_images="$(chart_images)" || exit 1
+[ -n "$default_images" ] || {
+  echo "ERROR: the chart rendered no image references at all — the extraction patterns in chart_images no longer match the manifests, so checks 3a and 3b are inspecting nothing." >&2
+  exit 1
+}
+mirrored_images="$(chart_images --set "global.imageRegistry=$MIRROR")" || exit 1
+
+# 3a. Default install: every rendered image must be in the inventory, at the
+#     pin the inventory carries, so the mirror built from it is complete and
+#     the tags it holds are the tags the install asks for. Matching on the
+#     repository alone would pass through failure mode #1 — the chart on
+#     LiteLLM v1.92.0 while the inventory says v1.95.0 is one entry, one
+#     repository, and an ImagePullBackOff.
 inventory_repos="$(jq -r '.images[].repository' "$INVENTORY" | sort -u)"
 while read -r image; do
   [ -n "$image" ] || continue
-  repo="${image%%:*}"
-  repo="${repo%%@*}"
-  grep -qxF "$repo" <<<"$inventory_repos" ||
+  split_ref "$image"
+  grep -qxF "$ref_repo" <<<"$inventory_repos" || {
     fail "the chart renders '$image', which has no entry in $INVENTORY — 'make mirror-images' would not copy it."
-done < <(chart_images)
+    continue
+  }
+  want_tag="$(pin_of_repo "$ref_repo")"
+  [ -z "$want_tag" ] || [ "$ref_tag" = "$want_tag" ] ||
+    fail "the chart renders '$image', but $INVENTORY pins '$ref_repo' at '$want_tag' — 'make mirror-images' would copy '$want_tag' and the install would ask for '$ref_tag'."
+done <<<"$default_images"
 
 # 3b. Mirrored install: nothing may be left on a public registry. This is the
 #     chart-side equivalent of TestNoPublicRegistryWhenMirrored in the
@@ -158,7 +204,28 @@ while read -r image; do
   "$MIRROR"/*) ;;
   *) fail "with global.imageRegistry set, the chart still renders '$image' outside the mirror." ;;
   esac
-done < <(chart_images --set "global.imageRegistry=$MIRROR")
+done <<<"$mirrored_images"
+
+# ---------------------------------------------------------------------------
+# 4. The example manifests. They are applied by hand rather than rendered by
+#    the chart, so nothing above sees them — and two of them hard-code the
+#    LiteLLM tag. A pin raised in images.json and the chart but not here is
+#    failure mode #1 again, in the copy people paste from. Images an example
+#    brings along itself (its demo workload, a vLLM server) are not in the
+#    inventory and are left alone.
+# ---------------------------------------------------------------------------
+example_refs="$(grep -rnE '^[[:space:]]*-?[[:space:]]*image:[[:space:]]*[^$"'"'"' ]+[[:space:]]*$' examples --include='*.yaml' --include='*.yml' |
+  sed -E 's/^([^:]+):([0-9]+):[[:space:]]*-?[[:space:]]*image:[[:space:]]*/\1\t\2\t/' || true)"
+[ -n "$example_refs" ] ||
+  fail "no image references found under examples/ — the extraction pattern in check 4 no longer matches, so the example pins are unchecked."
+while IFS=$'\t' read -r file line image; do
+  [ -n "${image:-}" ] || continue
+  split_ref "$image"
+  want_tag="$(pin_of_repo "$ref_repo")"
+  [ -n "$want_tag" ] || continue
+  [ "$ref_tag" = "$want_tag" ] ||
+    fail "${file}:${line} pins '$image', but $INVENTORY has '$want_tag' for '$ref_repo' — the mirror is populated from the inventory, so this example asks for a tag that was never copied."
+done <<<"$example_refs"
 
 if [ "$status" -eq 0 ]; then
   echo "Image inventory check passed: $INVENTORY matches every pin, and the chart mirrors cleanly."

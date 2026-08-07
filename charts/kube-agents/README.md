@@ -71,8 +71,15 @@ helm install kube-agents ./charts/kube-agents \
   --set global.imageRegistry=registry.example.com/kube-agents \
   --set platformAgent.harness.clusterName=my-cluster \
   --set platformAgent.harness.location=us-central1 \
-  --set platformAgent.harness.projectId=my-gcp-project
+  --set platformAgent.harness.projectId=my-gcp-project \
+  --set operator.image.tag=latest \
+  --set platformAgent.deployment.image.tag=latest
 ```
+
+This example installs from a checkout, so the two tag overrides above still
+apply — and they have to name the tag the mirror was populated with, which is
+whatever `IMAGE_TAG` `make mirror-images` copied (`latest` by default). From a
+published chart, drop them and let `appVersion` pick the release.
 
 `global.imageRegistry` rewrites each image onto the prefix keeping the trailing
 name only, matching the flat layout `mirror-images` writes. Set
