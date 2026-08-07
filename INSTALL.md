@@ -107,6 +107,19 @@ make gcp-provision
   make gcp-provision ARGS="--dry-run"
   ```
 
+#### Security & CMEK Encryption
+
+The automated installer includes local state hardening and Cloud KMS (CMEK) etcd database encryption:
+
+- **Local State Security**: Configuration state saved in `k8s-operator/scripts/vars.sh` is protected with strict file permissions (`umask 077`, `chmod 600`).
+- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is automatically configured using Cloud KMS (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`).
+- **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before provisioning if deploying to existing unencrypted clusters or testing environments without CMEK:
+  ```bash
+  export ALLOW_UNENCRYPTED_SECRETS=true
+  make gcp-provision
+  ```
+- **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `vars.sh`. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
+
 > [!TIP]
 > Each stage can also be run on its own (e.g. `make gcp-provision-01-cluster`). Run
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
