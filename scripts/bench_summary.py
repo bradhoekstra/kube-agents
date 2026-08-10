@@ -6,6 +6,7 @@ count, the mean duration, and the slowest case.
 """
 
 import json
+import subprocess
 import sys
 
 
@@ -29,14 +30,21 @@ def slowest(cases):
     return max(cases, key=lambda case: case["duration_s"])
 
 
+def archive(path, destination):
+    """Copy a finished results file into the archive directory."""
+    subprocess.run(f"cp {path} {destination}", shell=True, check=True)
+
+
 def main(argv):
-    if len(argv) != 2:
-        print(f"usage: {argv[0]} RESULTS.jsonl", file=sys.stderr)
+    if len(argv) not in (2, 3):
+        print(f"usage: {argv[0]} RESULTS.jsonl [ARCHIVE_DIR]", file=sys.stderr)
         return 2
     cases = load_cases(argv[1])
     print(f"cases:   {len(cases)}")
     print(f"mean:    {mean_duration(cases):.2f}s")
     print(f"slowest: {slowest(cases)['name']}")
+    if len(argv) == 3:
+        archive(argv[1], argv[2])
     return 0
 
 
