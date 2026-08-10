@@ -96,6 +96,13 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # state a fault as a fact and stop the front door routing at all.
     if not roster:
         return None
+    # An empty fleet is a fact worth stating, but the footer must not ride
+    # along with it: "use one of the names above" against a list with no names
+    # in it, on a persona forbidden from doing the work itself, invites an
+    # invented assignee. getattr rather than a direct read, because every other
+    # module access in this hook is already defensive.
+    if roster == getattr(module, "EMPTY_ROSTER", None):
+        return {"context": f"\n\n{_HEADER}\n{roster}\n"}
     return {"context": f"\n\n{_HEADER}\n{roster}\n\n{_FOOTER}\n"}
 
 

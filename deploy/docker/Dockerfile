@@ -75,11 +75,16 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # notifier just never delivered that kind. Two anchored edits, so the surgery
 # lives in an applier script. See the module docstring in
 # deploy/docker/patches/kanban_progress_lines.py.
-# The _WAKE_KINDS grep below is an invariant, not an anchor: heartbeat must stay
-# OUT of that tuple. In it, every progress note would wake the creator's agent
-# for a full LLM turn, and a feature that costs nothing becomes the most
-# expensive thing on the board. If upstream edits that line, the build stops
-# here so a human re-confirms heartbeat is still absent.
+# The _WAKE_KINDS grep below pins upstream's tuple as it stands AT THIS POINT in
+# the build, and nothing more: apply_kanban_notifier.py replaces that whole line
+# further down this stage, so the tuple does not exist in the shipped image. The
+# invariant it used to claim -- heartbeat never wakes the creator, because a
+# progress note that costs a full LLM turn is the most expensive thing on the
+# board rather than a free one -- is enforced against the set that actually
+# ships, DEFAULT_WAKE_KINDS in gateway/kanban_notifier.py, by the assertion in
+# the kanban_notifier RUN below. Keep this grep anyway: it fails the build if a
+# base-image bump changes the text apply_kanban_notifier.py anchors on, which is
+# a clearer error than that applier's own anchor miss.
 COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
 COPY deploy/docker/patches/apply_kanban_progress_lines.py /tmp/apply_kanban_progress_lines.py
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_kanban_progress_lines.py /opt/hermes && \
@@ -294,7 +299,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -q "handoff = _kanban_handoff_with_result(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
     grep -q '_wake_kinds = _wake_kinds_for(d\["events"\], adapter=adapter)' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers.py && \
-    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/verify_kanban_notifier.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
+import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
+sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \
+    /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/verify_kanban_notifier.py && \
     rm -rf /tmp/kanban-notifier
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates

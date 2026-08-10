@@ -123,6 +123,19 @@ class InjectionTest(unittest.TestCase):
         shutil.rmtree(self.profiles)
         self.assertIn("No specialist agents", plugin.handle_pre_llm_call()["context"])
 
+    def test_an_empty_fleet_is_stated_without_the_pick_a_name_footer(self):
+        # The footer points at "the names above". With no names above it, the
+        # instruction can only be satisfied by inventing one.
+        shutil.rmtree(self.profiles)
+        context = plugin.handle_pre_llm_call()["context"]
+        self.assertIn("No specialist agents", context)
+        self.assertNotIn("verbatim as the `assignee`", context)
+
+    def test_a_populated_fleet_keeps_the_footer(self):
+        self._profile("default")
+        self._profile("platform", "Fleet work.")
+        self.assertIn("verbatim as the `assignee`", plugin.handle_pre_llm_call()["context"])
+
     @unittest.skipIf(os.geteuid() == 0, "root bypasses the mode bits this test relies on")
     def test_an_unreadable_profiles_dir_injects_nothing(self):
         # Not the same as an empty one. Announcing "no specialist agents are

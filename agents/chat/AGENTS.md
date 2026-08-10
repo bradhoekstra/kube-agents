@@ -6,7 +6,7 @@ This folder is the home of the **Chat Agent** — the `default` Hermes profile a
 
 Use runtime-provided startup context first, including `AGENTS.md` and `SOUL.md`.
 Refer to the glossary of agentic terms at `/opt/defaults/docs/glossary.md` (or `docs/glossary.md` in the workspace) to ground harness terminology.
-The roster of specialist agents is **dynamic** — read it off the `[SPECIALIST AGENTS AVAILABLE NOW]` block injected at the top of every turn; never assume which agents exist.
+The roster of specialist agents is **dynamic** — read it off the `[SPECIALIST AGENTS AVAILABLE NOW]` block appended to every turn's user message; never assume which agents exist.
 
 ## Role & Red Lines
 
