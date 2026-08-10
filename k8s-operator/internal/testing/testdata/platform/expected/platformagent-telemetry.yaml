@@ -555,10 +555,10 @@ spec:
   template:
     metadata:
       annotations:
-        kubeagents.x-k8s.io/config-hash: fff685f46be77b2e136806220db6dff17c663aee1077db530ad287ff9a158c14
-        kubeagents.x-k8s.io/fluent-bit-config-hash: 50923ab88e1741b0729c37837bc1c3869161e3161402494a4ee64cda3a2cfab3
-        kubeagents.x-k8s.io/proxy-policy-hash: db64678068cfed7481ee3b503145c688a2b49257e8e534565333c172185a750d
-        kubeagents.x-k8s.io/settings-config-hash: 9db5b5cb5fb8ec46b1a0572ef34ef27e0ed44dc1f787a4a76bdd75f43934c8b9
+        kubeagents.x-k8s.io/config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/fluent-bit-config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/proxy-policy-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/settings-config-hash: <SHA256_FOR_TESTS>
       creationTimestamp: null
       labels:
         app: platformagent-gateway
