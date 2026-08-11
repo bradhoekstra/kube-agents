@@ -101,7 +101,10 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   exercised against a real, running kube-agents installation — see [INSTALL.md](INSTALL.md) if
   you do not have one. Green unit tests and a clean `make docs-check` are necessary, not
   sufficient: they cannot tell you whether the operator reconciled the change or the agent pod
-  picked it up.
+  picked it up. This bullet is the canonical statement of the requirement; the site's
+  [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
+  this list first, then reconcile them to it.
   - **Name the install and what you observed.** Cluster, image tag, operator version; what you
     did; and the result at each layer the change claims to touch — the CR `.status`, the
     Deployment env, the file or process inside the pod.
