@@ -127,6 +127,13 @@ The registry is configurable at three layers, from broadest to most specific:
    registry _after_ a first run requires editing the saved `REGISTRY_PREFIX` and `*_IMAGE`
    values in `vars.sh` (saved state wins over a new export); the scripts warn when an export
    is ignored or a saved image no longer matches the effective prefix.
+
+   `IMAGE_TAG` is per-run and is deliberately not saved to `vars.sh`, so the `*_IMAGE`
+   variables normally hold a bare repository path. `provision_03` attaches the current
+   `IMAGE_TAG` to any of them that names neither a tag nor a digest; set one explicitly
+   (`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:v1.4.0`) to pin a
+   reference independently of `IMAGE_TAG`.
+
 2. **Operator environment** — the controller manager reads three optional env vars (see the
    commented block in `k8s-operator/config/manager/manager.yaml`):
    - `PLATFORM_AGENT_IMAGE` — default agent image when a `PlatformAgent` CR omits

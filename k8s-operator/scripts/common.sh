@@ -261,6 +261,30 @@ warn_on_registry_prefix_mismatch() {
   esac
 }
 
+# Attach IMAGE_TAG to an image reference that carries neither a tag nor a
+# digest. The saved *_IMAGE values are deliberately bare repository paths:
+# IMAGE_TAG is scoped to one pipeline run and is never persisted to vars.sh
+# (see init_var_image_tag), so the tag has to be re-attached where the
+# reference is used. Handing a bare path to Kubernetes resolves it to
+# ':latest', which the provisioner never builds or pushes.
+# A reference that already names a tag or digest is returned untouched, so
+# this is safe to apply to a user-supplied override.
+qualify_image_ref() {
+  local ref="$1"
+  local tag="${2:-${IMAGE_TAG:-}}"
+  # Only the final path segment can hold the tag — a registry host may carry
+  # a port, as in 'registry.example.com:5000/kube-agents/platform-agent'.
+  case "${ref##*/}" in
+    *:* | *@*) ;;
+    *)
+      if [ -n "$tag" ]; then
+        ref="${ref}:${tag}"
+      fi
+      ;;
+  esac
+  echo "$ref"
+}
+
 # Cloud KMS has no zonal locations, so a zonal cluster's REGION (eg.
 # "us-central1-c") is not a valid key location. REGION doubles as the cluster
 # location, which for a zonal cluster must stay the zone, so KMS needs its own

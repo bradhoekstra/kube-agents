@@ -102,8 +102,10 @@ verify_operator() {
 execute_operator() {
   print_info "Installing Custom Resource Definitions (CRDs)..."
   make -C "$OPERATOR_DIR" install || return 1
-  print_info "Deploying Operator Controller Manager (${OPERATOR_IMAGE}:${IMAGE_TAG}) to the GKE cluster..."
-  make -C "$OPERATOR_DIR" deploy IMG="${IMG:-${OPERATOR_IMAGE}:${IMAGE_TAG}}" || return 1
+  local operator_image_ref
+  operator_image_ref="$(qualify_image_ref "$OPERATOR_IMAGE")"
+  print_info "Deploying Operator Controller Manager (${operator_image_ref}) to the GKE cluster..."
+  make -C "$OPERATOR_DIR" deploy IMG="${IMG:-$operator_image_ref}" || return 1
 
   # Propagate image overrides to the operator so PlatformAgent CRs created
   # without an explicit spec.deployment.image also pull from the custom
@@ -111,24 +113,25 @@ execute_operator() {
   # Precedence: explicit PLATFORM_AGENT_IMAGE > custom AGENT_IMAGE > custom
   # REGISTRY_PREFIX. Nothing is set for a default install so the operator's
   # compiled-in default stays authoritative.
+  #
+  # Every reference goes through qualify_image_ref: the saved *_IMAGE values
+  # are bare repository paths (IMAGE_TAG is per-run and never persisted), and
+  # an untagged value reaches the operator as ':latest', which no step of this
+  # provisioner pushes. FLUENT_BIT_IMAGE is exempt — it names an upstream
+  # fluent/fluent-bit release whose tag has nothing to do with IMAGE_TAG.
   local env_overrides=()
   if [ -n "${PLATFORM_AGENT_IMAGE:-}" ]; then
-    env_overrides+=("PLATFORM_AGENT_IMAGE=${PLATFORM_AGENT_IMAGE}")
+    env_overrides+=("PLATFORM_AGENT_IMAGE=$(qualify_image_ref "$PLATFORM_AGENT_IMAGE")")
   elif [ -n "${AGENT_IMAGE:-}" ] && [ "${AGENT_IMAGE}" != "$(registry_prefix)/platform-agent" ]; then
     # A custom AGENT_IMAGE feeds the CR rendered in provision_08; mirror it to
     # the operator so hand-written CRs that omit spec.deployment.image pull
-    # from the same place. Only append IMAGE_TAG when the value is bare.
-    local agent_image_ref="${AGENT_IMAGE}"
-    case "${agent_image_ref##*/}" in
-      *:* | *@*) ;;
-      *) agent_image_ref="${agent_image_ref}:${IMAGE_TAG}" ;;
-    esac
-    env_overrides+=("PLATFORM_AGENT_IMAGE=${agent_image_ref}")
+    # from the same place.
+    env_overrides+=("PLATFORM_AGENT_IMAGE=$(qualify_image_ref "$AGENT_IMAGE")")
   elif [ "$(registry_prefix)" != "$DEFAULT_REGISTRY_PREFIX" ]; then
-    env_overrides+=("PLATFORM_AGENT_IMAGE=$(registry_prefix)/platform-agent:${IMAGE_TAG}")
+    env_overrides+=("PLATFORM_AGENT_IMAGE=$(qualify_image_ref "$(registry_prefix)/platform-agent")")
   fi
   if [ -n "${CREDENTIAL_PROXY_IMAGE:-}" ]; then
-    env_overrides+=("CREDENTIAL_PROXY_IMAGE=${CREDENTIAL_PROXY_IMAGE}")
+    env_overrides+=("CREDENTIAL_PROXY_IMAGE=$(qualify_image_ref "$CREDENTIAL_PROXY_IMAGE")")
   fi
   if [ -n "${FLUENT_BIT_IMAGE:-}" ]; then
     env_overrides+=("FLUENT_BIT_IMAGE=${FLUENT_BIT_IMAGE}")

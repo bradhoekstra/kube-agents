@@ -60,9 +60,12 @@ scripts warn when an export is ignored or a saved image no longer matches the pr
 
 `IMAGE_TAG` is the deliberate exception to `vars.sh` reuse: tags change between deploys, so
 `provision.sh` asks for it once per pipeline run (or takes an exported `IMAGE_TAG`) and shares
-it with every step without saving it. Step 03 also forwards
+it with every step without saving it. The saved `*_IMAGE` values are therefore bare
+repository paths. Step 03 also forwards
 `PLATFORM_AGENT_IMAGE`, `CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE` overrides to the
-operator Deployment. See the docs site's
+operator Deployment, attaching the current `IMAGE_TAG` to any kube-agents reference that names
+neither a tag nor a digest (`FLUENT_BIT_IMAGE` is left alone — it names an upstream release).
+See the docs site's
 [Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for the list of
 images to mirror and override precedence.
 

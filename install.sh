@@ -1436,10 +1436,13 @@ main() {
   write_state_var "$vars_file" USER_PROFILE_ENABLED "false"
   write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
+  # Bare repository paths on purpose: IMAGE_TAG is scoped to a single pipeline
+  # run and is never persisted here, so the consuming step attaches it with
+  # qualify_image_ref. The replay proxy has no entry — provision_11 derives
+  # REPLAY_IMAGE from REGISTRY_PREFIX itself.
   write_state_var "$vars_file" OPERATOR_IMAGE "${registry_prefix}/k8s-operator"
   write_state_var "$vars_file" PLATFORM_AGENT_IMAGE "${registry_prefix}/platform-agent"
   write_state_var "$vars_file" CREDENTIAL_PROXY_IMAGE "${registry_prefix}/credential-proxy"
-  write_state_var "$vars_file" REPLAY_PROXY_IMAGE "${registry_prefix}/replay-proxy"
   write_state_var "$vars_file" INFERENCE_REPLAY_ENABLED "false"
   write_state_var "$vars_file" NO_CONFIRM "1"
   chmod 600 "$vars_file"
