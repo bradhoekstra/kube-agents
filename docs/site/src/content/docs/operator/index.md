@@ -5,7 +5,7 @@ sidebar:
   order: 0
 ---
 
-The `k8s-operator` is a Kubernetes controller that turns a `PlatformAgent` custom resource into a running Platform Agent Deployment plus everything it needs — Service, ServiceAccount, RBAC, PersistentVolumeClaims, and ConfigMaps for the agent config and logging. It also runs mutating (defaulting) and validating admission webhooks for the `PlatformAgent` type.
+The `k8s-operator` is a Kubernetes controller that turns a `PlatformAgent` custom resource into a running Platform Agent Deployment plus everything it needs — Service, ServiceAccount, RBAC, PersistentVolumeClaims, and ConfigMaps for the agent config and logging. It also runs mutating (defaulting) and validating admission webhooks for the `PlatformAgent` type (see [Admission webhooks](#admission-webhooks)).
 
 Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator). Full README: [`k8s-operator/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/README.md).
 
@@ -80,6 +80,40 @@ proxy only bootstraps a kubectl context when it has the complete triple; leave a
 `kubectl` call the agent makes resolves to `localhost:8080` instead of a cluster.
 
 Full walkthroughs: [PlatformAgent CRD](/kube-agents/operator/platformagent-crd/) and [AgentPlugin CRD](/kube-agents/operator/agentplugin-crd/).
+
+## Admission webhooks
+
+The manager serves a mutating (defaulting) and a validating webhook for `PlatformAgent`, both
+registered with `failurePolicy: Fail`. They are part of Kustomize installs only — Helm chart installs
+run with `ENABLE_WEBHOOKS=false` (see the [chart README](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md)).
+
+**The webhook server listens on port `10250`, not Kubebuilder's usual `9443`.** GKE creates one
+firewall rule from the control plane to the nodes, and it permits only `tcp:443` and `tcp:10250`. The
+API server dials the endpoint pod IP on the Service's `targetPort`, so on a private cluster a webhook
+on any other port is unreachable until someone adds a VPC firewall rule for it — per cluster, by
+hand. Serving on 10250 lands inside the rule GKE already made. It does not collide with the kubelet,
+which binds 10250 on the node IP in a different network namespace.
+
+The port is set in three places that must agree, and `TestWebhookPortsMatchDefault` fails the build
+if they drift: the `--webhook-port` flag default (`DefaultPort` in
+`internal/webhook/platformagent_webhook.go`), the manager `containerPort`, and the Service
+`targetPort`. Clusters where 10250 is not the reachable port can override the flag; the Service
+`port` stays `443` either way, since that is what the `*WebhookConfiguration` `clientConfig` resolves
+to rather than what crosses the network.
+
+**If the API server cannot reach the webhook**, `failurePolicy: Fail` means every `PlatformAgent`
+create, update, and delete fails with a timeout — including the edits you would use to fix it. Errors
+read `context deadline exceeded` or `failed calling webhook`. To recover, and to roll back a bad
+webhook deployment:
+
+```bash
+kubectl delete validatingwebhookconfiguration kubeagents-validating-webhook-configuration
+kubectl delete mutatingwebhookconfiguration kubeagents-mutating-webhook-configuration
+kubectl -n kubeagents-system set env deploy/kubeagents-controller-manager ENABLE_WEBHOOKS=false
+```
+
+That leaves the cluster with the same validation coverage a chart install has. Re-apply with
+`make deploy` once the cause is fixed.
 
 ## Related resources
 

@@ -64,6 +64,7 @@ func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
 	var webhookCertPath, webhookCertName, webhookCertKey string
+	var webhookPort int
 	var enableLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
@@ -83,6 +84,13 @@ func main() {
 	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
 	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
 	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
+	flag.IntVar(&webhookPort, "webhook-port", agentwebhook.DefaultPort,
+		"The port the webhook server binds to. Defaults to 10250 because GKE's automatic "+
+			"control-plane-to-node firewall rule only permits tcp:443 and tcp:10250; on a private "+
+			"cluster the API server cannot reach a webhook on any other port without a manual VPC "+
+			"firewall rule, and failurePolicy=Fail then blocks all PlatformAgent writes. The "+
+			"kubelet's 10250 is bound on the node IP in a different network namespace, so there is "+
+			"no conflict. Override this on clusters where 10250 is not the reachable port.")
 	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
@@ -118,6 +126,7 @@ func main() {
 		webhookTLSOpts := tlsOpts
 		webhookServerOptions := webhook.Options{
 			TLSOpts: webhookTLSOpts,
+			Port:    webhookPort,
 		}
 
 		if len(webhookCertPath) > 0 {
