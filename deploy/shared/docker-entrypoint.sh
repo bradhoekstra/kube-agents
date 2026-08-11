@@ -644,10 +644,28 @@ fi
 # image does not ship enabled, the operator overlay in step 2.7 is the mechanism, and it is
 # one that works on the path this ran on.
 
-# 4. Inject dynamic OpenTelemetry service name (if writable)
-if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
-    "$INSTALL_DIR/.venv/bin/python3" -c "import sys, os, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; svc = os.getenv('OTEL_SERVICE_NAME'); attrs = c.setdefault('resource_attributes', {}); attrs.update({'service.name': svc}) if svc else attrs.pop('service.name', None); p.write_text(yaml.safe_dump(c))" "$TARGET_DIR/plugins/hermes_otel/config.yaml" 2>/dev/null || true
+# 4. Point the hermes_otel plugin at the resolved collector and stamp the service name.
+#
+# Both values come from the operator's env. The endpoint matters because hermes_otel does
+# NOT read OTEL_EXPORTER_OTLP_ENDPOINT — its backend URL is baked into the image, so
+# without this sweep a customer-configured collector would show up in the pod env and in
+# .status.telemetry while every span still went to the GKE managed collector.
+#
+# Every profile carries its own copy of the plugin config (profile_scaffold copytrees
+# /opt/defaults/plugins), so otel_config sweeps them all, deriving each from the pristine
+# image copy. Profiles scaffolded later — the cluster agents — are handled by
+# cluster_agent_profile.py at onboarding time. Never fatal: see otel_config.py.
+if [ -f "$TARGET_DIR/scripts/otel_config.py" ]; then
+    PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" "$TARGET_DIR/scripts/otel_config.py" \
+        --hermes-home "$TARGET_DIR" \
+        --service-name "${OTEL_SERVICE_NAME:-}" \
+        --endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
+        --defaults-plugins /opt/defaults/plugins \
+        || echo "WARN: could not update the OpenTelemetry plugin config; traces may go to the image default" >&2
+fi
 
+# 4a. Compat symlink, unchanged.
+if [ -f "$TARGET_DIR/plugins/hermes_otel/config.yaml" ] && [ -w "$TARGET_DIR/plugins/hermes_otel/config.yaml" ]; then
     # hermes-otel resolves config below ~/.hermes even when HERMES_HOME points
     # elsewhere. Expose the generated config at both locations.
     OTEL_CONFIG="$TARGET_DIR/plugins/hermes_otel/config.yaml"
