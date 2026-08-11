@@ -11,6 +11,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="${SCRIPT_DIR}/charts/workload-bundle"
 
+# gke_dns_endpoint_flag: the clusters main.tf creates enable external DNS access,
+# so both the credential fetch and the copy-paste hints below must name it.
+# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+source "${SCRIPT_DIR}/../../scripts/gke_dns_endpoint.sh"
+
 # ANSI Colors
 C_CYAN='\033[96m'
 C_GREEN='\033[92m'
@@ -77,7 +82,10 @@ deploy_to_cluster() {
   log_info "------------------------------------------------------------"
 
   log_info "Configuring kubectl credentials..."
-  gcloud container clusters get-credentials "${c_name}" --region "${c_loc}" --project "${p_id}"
+  # Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+  # shellcheck disable=SC2046
+  gcloud container clusters get-credentials "${c_name}" --region "${c_loc}" --project "${p_id}" \
+    $(gke_dns_endpoint_flag "${c_name}" "${c_loc}" "${p_id}")
 
   log_info "Deploying workload bundle via Helm to namespace '${NAMESPACE}'..."
   helm upgrade --install workload-bundle "$CHART_DIR" \
@@ -110,10 +118,14 @@ done <<< "$STANDARD_CLUSTERS_LIST"
 
 log_success "All deployments complete across all configured clusters!"
 
+# The hints below are meant to be pasted verbatim, so they carry the same flag
+# the deploy used. Resolved per cluster rather than hard-coded: main.tf enables
+# external DNS access on new clusters, but a staging cluster created before that
+# still has to be reached over its IP endpoint.
 while IFS='|' read -r c_name c_loc t_shape _; do
   if [ -n "$c_name" ]; then
     log_info "To monitor traffic simulator logs on Autopilot cluster ${c_name}, switch context and run:"
-    log_info "  gcloud container clusters get-credentials ${c_name} --region ${c_loc} --project ${PROJECT_ID}"
+    log_info "  gcloud container clusters get-credentials ${c_name} --region ${c_loc} --project ${PROJECT_ID} $(gke_dns_endpoint_flag "${c_name}" "${c_loc}" "${PROJECT_ID}")"
     log_info "  kubectl logs -n ${NAMESPACE} -l app=traffic-simulator --tail=50 -f"
   fi
 done <<< "$AUTOPILOT_CLUSTERS_LIST"
@@ -121,7 +133,7 @@ done <<< "$AUTOPILOT_CLUSTERS_LIST"
 while IFS='|' read -r c_name c_loc _; do
   if [ -n "$c_name" ]; then
     log_info "To monitor traffic simulator logs on Standard cluster ${c_name}, switch context and run:"
-    log_info "  gcloud container clusters get-credentials ${c_name} --region ${c_loc} --project ${PROJECT_ID}"
+    log_info "  gcloud container clusters get-credentials ${c_name} --region ${c_loc} --project ${PROJECT_ID} $(gke_dns_endpoint_flag "${c_name}" "${c_loc}" "${PROJECT_ID}")"
     log_info "  kubectl logs -n ${NAMESPACE} -l app=traffic-simulator --tail=50 -f"
   fi
 done <<< "$STANDARD_CLUSTERS_LIST"

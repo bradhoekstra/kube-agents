@@ -13,6 +13,11 @@ fi
 # load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
+# gke_dns_endpoint_flag, shared with hack/ci-env.sh and scripts/release/common.sh.
+# Resolved from BASH_SOURCE rather than SCRIPT_DIR, which callers override.
+# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
+
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 # Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
 # is routinely redirected — install.sh tees it to a log, CI captures it — and
@@ -505,7 +510,14 @@ cluster_exists() {
 
 connect_cluster() {
   print_info "Fetching cluster credentials..."
-  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet
+  local dns_flag
+  dns_flag=$(gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID")
+  if [ -n "$dns_flag" ]; then
+    print_info "Cluster '$CLUSTER_NAME' publishes an external DNS endpoint; using it."
+  fi
+  # Unquoted on purpose: empty must contribute no argument at all.
+  # shellcheck disable=SC2086
+  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet $dns_flag
 }
 
 ensure_k8s_resource_exists() {

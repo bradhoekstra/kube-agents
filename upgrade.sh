@@ -328,7 +328,21 @@ main() {
   export REGION="$target_region"
 
   print_step "2. Connecting kubectl to GKE Cluster"
-  gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project"
+  # Taken from repo_dir rather than beside this script: upgrade.sh is also run
+  # piped from curl, where BASH_SOURCE names no directory to look in.
+  local dns_helper="${repo_dir}/k8s-operator/scripts/gke_dns_endpoint.sh"
+  local dns_flag=""
+  if [ -f "$dns_helper" ]; then
+    # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+    source "$dns_helper"
+    dns_flag=$(gke_dns_endpoint_flag "$target_cluster" "$target_region" "$target_project")
+    if [ -n "$dns_flag" ]; then
+      print_info "Cluster '${target_cluster}' publishes an external DNS endpoint; using it."
+    fi
+  fi
+  # Unquoted on purpose: empty must contribute no argument at all.
+  # shellcheck disable=SC2086
+  gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project" $dns_flag
 
   case "$PARAM_UPGRADE_MODE" in
     operator)

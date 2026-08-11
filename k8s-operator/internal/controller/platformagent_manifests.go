@@ -1735,8 +1735,28 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
 			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
+			// The GKE_DNS_FLAG step decides whether the harness cluster has to be
+			// reached over its DNS endpoint rather than its IP one. The reconciler
+			// cannot answer that when it renders the manifest — the answer is a
+			// property of the cluster, read at bootstrap time — so the describe is
+			// inlined here. agents/platform/scripts/gke_endpoint.py and
+			// k8s-operator/scripts/gke_dns_endpoint.sh implement the same predicate;
+			// keep all three in step.
+			//
+			// Deciding on the configuration rather than trying --dns-endpoint and
+			// falling back is deliberate: for a caller Google recognises as internal,
+			// gcloud downgrades the allowExternalTraffic rejection to a warning and
+			// still writes a kubeconfig naming the DNS endpoint, which then 403s on
+			// every request. A failed probe would look like success.
+			//
+			// The assignment is safe inside the && chain even when the cluster cannot
+			// be described: awk ends the pipeline, and it exits 0 on empty input, so
+			// an unreadable cluster yields an empty flag and the get-credentials that
+			// shipped before this existed. $GKE_DNS_FLAG is unquoted so that empty
+			// contributes no argument at all.
 			corev1.EnvVar{Name: "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", Value: `gcloud config set project "$GKE_PROJECT_ID" >/dev/null &&
-gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" &&
+GKE_DNS_FLAG="$(gcloud container clusters describe "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" --format='value(controlPlaneEndpointsConfig.dnsEndpointConfig.endpoint,controlPlaneEndpointsConfig.dnsEndpointConfig.allowExternalTraffic)' 2>/dev/null | awk -F'\t' '$1 != "" && $2 == "True" { print "--dns-endpoint" }')" &&
+gcloud container clusters get-credentials "$GKE_CLUSTER_NAME" --location "$GKE_LOCATION" --project "$GKE_PROJECT_ID" $GKE_DNS_FLAG &&
 kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null &&
 kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null`},
 		)

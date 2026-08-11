@@ -44,6 +44,18 @@ resource "google_container_cluster" "autopilot" {
     channel = var.release_channel
   }
 
+  # Publish the DNS-based control plane endpoint and let it serve traffic from
+  # outside the VPC. The Platform Agent reaches fleet clusters from wherever it
+  # runs, and a cluster with only an IP endpoint it cannot route to is
+  # unreachable. allow_external_traffic is the field the agent's detection reads
+  # before it passes `get-credentials --dns-endpoint`; see
+  # k8s-operator/scripts/gke_dns_endpoint.sh.
+  control_plane_endpoints_config {
+    dns_endpoint_config {
+      allow_external_traffic = true
+    }
+  }
+
   dynamic "database_encryption" {
     for_each = var.enable_database_encryption ? [1] : []
     content {

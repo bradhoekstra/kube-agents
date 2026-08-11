@@ -76,7 +76,10 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying PR #${PULL_NUMBER:-local}
 # ─── 3. Cluster Auth ──────────────────────────────────────────────────────────
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Authenticating to GKE Cluster ==="
-gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet
+# Unquoted on purpose: empty must contribute no argument. See gke_dns_endpoint.sh.
+# shellcheck disable=SC2046
+gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --project "$PROJECT_ID" --quiet \
+  $(gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID")
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────

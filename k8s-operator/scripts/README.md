@@ -123,6 +123,7 @@ Generated from each script's own comment banner.
 ### Auxiliary & Development Scripts
 
 - **[common.sh](common.sh)**: Shared utility functions, color output, logging, prompt helpers, and state management.
+- **[gke_dns_endpoint.sh](gke_dns_endpoint.sh)**: `gke_dns_endpoint_flag`, which decides whether a given cluster should be reached with `get-credentials --dns-endpoint`. Kept out of `common.sh` and free of its helpers so `hack/ci-env.sh`, `scripts/release/common.sh`, `upgrade.sh`, and the staging-workload scripts can source the one predicate without also taking on the state file. Emits nothing — leaving today's IP-endpoint command untouched — whenever the cluster has no externally reachable DNS endpoint, the describe call fails, or the local gcloud is too old for the flag.
 - **[platform-agent.yaml.template](platform-agent.yaml.template)**: Manifest template used by `provision_08_deploy_platform_agent.sh` to render the `PlatformAgent` Custom Resource.
 - **[print_instructions_gchat.sh](print_instructions_gchat.sh)**: Helper script that prints Google Chat integration post-provisioning instructions.
 - **[print_instructions_slack.sh](print_instructions_slack.sh)**: Helper script that prints Slack integration post-provisioning instructions.

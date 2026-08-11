@@ -158,6 +158,7 @@ execute_cluster() {
         --database-encryption-key="$kms_key_resource" \
         --addons=GcpFilestoreCsiDriver,BackupRestore \
         --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS \
+        --enable-dns-access \
         --project "$PROJECT_ID" \
         --quiet
   fi
