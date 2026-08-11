@@ -16,6 +16,13 @@ your current agreements or to sign a new one.
 This project follows
 [Google's Open Source Community Guidelines](https://opensource.google/conduct/).
 
+## Code reviews
+
+All submissions, including submissions by project members, require review. We use GitHub pull
+requests for this purpose. Consult
+[GitHub Help](https://docs.github.com/articles/about-pull-requests) for more information on using
+pull requests.
+
 ## Full contributing guide
 
 Everything else — PR hygiene, commit conventions, and the local validation commands CI enforces —
