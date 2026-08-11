@@ -128,6 +128,7 @@ identifier appears, add its source here.
 | --- | --- |
 | Service-account names, namespace, permission-set defaults | `k8s-operator/scripts/common.sh` |
 | Go toolchain version | `k8s-operator/go.mod` |
+| Minimum supported tool versions (`gcloud`) | `k8s-operator/scripts/min_versions.sh` |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
 | Cron job rosters and schedules | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |

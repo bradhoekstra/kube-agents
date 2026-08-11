@@ -13,6 +13,11 @@ fi
 # load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
+# Minimum tool versions. Sourced from the helper's own directory rather than
+# SCRIPT_DIR, which callers under scripts/dev/ override to point at themselves.
+# shellcheck source=k8s-operator/scripts/min_versions.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/min_versions.sh"
+
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
 # Empty unless stdout is a terminal and NO_COLOR is unset. This pipeline's output
 # is routinely redirected — install.sh tees it to a log, CI captures it — and

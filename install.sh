@@ -197,6 +197,20 @@ define_print_helpers() {
 }
 define_print_helpers
 
+# Minimum tool versions, shared with the provisioning scripts so the numbers
+# live in exactly one place. This installer is also downloaded and run on its
+# own, before any checkout exists, so the source is guarded: in that case the
+# workspace step clones the repository and provision_01 enforces the same
+# minimum a few steps later.
+_min_versions="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/k8s-operator/scripts/min_versions.sh"
+if [ -r "$_min_versions" ]; then
+  # shellcheck source=k8s-operator/scripts/min_versions.sh
+  source "$_min_versions"
+else
+  require_min_gcloud_version() { return 0; }
+fi
+unset _min_versions
+
 validate_immutable_ref() {
   local ref="${1:-}"
   if [ -z "$ref" ]; then
@@ -980,6 +994,7 @@ main() {
       auto_install_tool "$tool"
     fi
   done
+  require_min_gcloud_version || exit 1
 
   # 3. Provisioning Sources & Shared Defaults
   print_step "2. Setting up Workspace Repository"
