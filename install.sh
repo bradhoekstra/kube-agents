@@ -204,7 +204,9 @@ define_print_helpers
 # minimum a few steps later.
 _min_versions="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/k8s-operator/scripts/min_versions.sh"
 if [ -r "$_min_versions" ]; then
-  # shellcheck source=k8s-operator/scripts/min_versions.sh
+  # CI runs shellcheck without -x, so the source= hint alone still raises
+  # SC1091 for a file it was not handed as input.
+  # shellcheck source=k8s-operator/scripts/min_versions.sh disable=SC1091
   source "$_min_versions"
 else
   require_min_gcloud_version() { return 0; }
