@@ -73,14 +73,10 @@ Rules:
 - **Verify identifiers against source, not against other docs.** Service account names live in
   `k8s-operator/scripts/common.sh`, the Go version in `k8s-operator/go.mod`.
 - **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
-  Its tables are `<!-- prettier-ignore -->`d and padded with single spaces on purpose: prettier
-  aligns table columns to the widest cell, so a re-aligned table rewrites every row and collides
-  with every other open pull request that adds a row. Write rows in the compact
-  `| cell | cell |` form, never re-align, and never restate a count — the map states none, and
-  `docs-check-map` fails on a row that grows a double space. A file that lands inside a collapsed
-  family row's glob (a new skill, SOP, or reference) needs no map edit at all — run
-  `make docs-generate` instead, which re-snapshots `docs/family-roster.txt`. That roster is what
-  catches a family member being _deleted_, which no glob can see.
+  Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
+  from several branches every week, and a re-aligned table rewrites rows your PR did not author.
+  `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
+  family needs no map edit at all.
 
 Run `make docs-check` before pushing. It verifies generated regions are current, relative links
 resolve, identifiers match their source, and every Markdown document has an entry in the

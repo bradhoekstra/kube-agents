@@ -7,6 +7,11 @@ skill catalogue lives in each skill's frontmatter, and the provisioning steps
 live in the scripts themselves. Maintaining those tables by hand guarantees they
 drift. This script regenerates them from the source of truth instead.
 
+There are two kinds of target. Most are a *region* spliced into a hand-written
+document (``BLOCKS``). One is a *whole file* written verbatim from its
+generator (``FILES``): ``docs/family-roster.txt`` carries no markers, has no
+hand-written part, and is replaced in full on every run.
+
 Each generated region is delimited in its target file by::
 
     <!-- BEGIN GENERATED: <block-id> -->
@@ -17,11 +22,12 @@ or, in ``.mdx`` files (where MDX rejects HTML comments), by::
     {/* BEGIN GENERATED: <block-id> */}
     {/* END GENERATED: <block-id> */}
 
-Everything outside those markers is hand-written and is never touched.
+Everything outside those markers is hand-written and is never touched. A
+whole-file target has no such boundary — nothing in it is hand-written.
 
 Usage::
 
-    python3 scripts/generate_docs.py            # rewrite the generated regions
+    python3 scripts/generate_docs.py            # rewrite the generated targets
     python3 scripts/generate_docs.py --check    # exit 1 if anything is stale
 
 ``--check`` is what CI runs: if regenerating would change a file, the committed
@@ -316,21 +322,16 @@ def gen_family_roster() -> str:
     """Return the whole contents of the collapsed-family roster file.
 
     The globs are read out of the map's own inventory rather than listed here,
-    so a new family row is rostered the moment it is added and the roster can
-    never cover a different set of rows than ``check_docs_map.py`` honours.
+    so a new family row is rostered the moment it is added. The extraction is
+    ``check_docs_map.family_globs`` — the same reader the coverage check uses —
+    so the roster cannot cover a different set of rows than the checker
+    honours.
     """
     files = check_docs_map.tracked_docs()
     text = check_docs_map.MAP.read_text(encoding="utf-8")
 
-    globs: set[str] = set()
-    for row in check_docs_map.inventory_rows(text):
-        path_cell = row.strip("|").split("|")[0]
-        for token in check_docs_map.TOKEN_RE.findall(path_cell):
-            if "*" in token and check_docs_map.looks_like_doc_path(token):
-                globs.add(token)
-
     out = [line.rstrip() for line in ROSTER_HEADER.strip("\n").splitlines()]
-    for glob in sorted(globs):
+    for glob in sorted(check_docs_map.family_globs(text)):
         out.append("")
         out.append(glob)
         for member in sorted(check_docs_map.matches(glob, files)):
@@ -353,8 +354,11 @@ ROSTER_HEADER = """
 #
 # It lives outside the map on purpose. The map is this repository's most
 # merge-conflict-prone file and a family row deliberately characterises its
-# family rather than enumerating it; per-file churn belongs here, where a
-# conflict is resolved by re-running the generator rather than by hand.
+# family rather than enumerating it; per-file churn belongs here instead. A
+# sorted list still collides when two branches insert into the same gap, so
+# .gitattributes hands this file to git's union merge driver -- see the comment
+# there. Anything union merge gets wrong shows up as `make docs-check` failing
+# on a stale roster, and `make docs-generate` writes the correct file.
 """
 
 BLOCKS = {

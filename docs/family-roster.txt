@@ -12,8 +12,11 @@
 #
 # It lives outside the map on purpose. The map is this repository's most
 # merge-conflict-prone file and a family row deliberately characterises its
-# family rather than enumerating it; per-file churn belongs here, where a
-# conflict is resolved by re-running the generator rather than by hand.
+# family rather than enumerating it; per-file churn belongs here instead. A
+# sorted list still collides when two branches insert into the same gap, so
+# .gitattributes hands this file to git's union merge driver -- see the comment
+# there. Anything union merge gets wrong shows up as `make docs-check` failing
+# on a stale roster, and `make docs-generate` writes the correct file.
 
 agents/chat/defaults/onboarding/*.md
   agents/chat/defaults/onboarding/scan_completed.md

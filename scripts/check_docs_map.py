@@ -25,7 +25,10 @@ failure instead of a review-time hope. Three checks:
   that, and this check stops a hand edit (or an editor-on-save with a stale
   config) from re-introducing it. The map is edited from several branches every
   week: re-aligning a table rewrites bytes those branches also touch, and turns
-  a one-line insertion into a conflict on every open pull request.
+  a one-line insertion into a conflict on every open pull request. What is
+  matched is a run of spaces immediately before a ``|`` -- where prettier's
+  padding always lands -- so a double space inside a prose cell is not a
+  failure.
 
 Deliberately NOT checked: any *count*. The map used to state a repository
 document total and a per-family file count, and both were verified here. They
@@ -49,6 +52,7 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
@@ -67,9 +71,13 @@ SITE_PREFIX = "docs/site/src/content/docs/"
 # The map does not inventory itself; section 1 declares it ("this map").
 SELF = "docs/README.md"
 
-# Two consecutive spaces inside a table row are the signature of a
-# prettier-style column alignment; cells are single-space padded.
-ALIGNMENT_PADDING = "  "
+# The signature of a prettier-style column alignment. Prettier pads a cell out
+# to the width of the widest one in its column, and that padding run always
+# sits immediately before the next `|`. Matching the run *plus* the delimiter,
+# rather than two spaces anywhere, lets an honest double space inside prose
+# through -- the tables are prettier-ignored, so nothing would normalise it
+# away and the author would have no way to satisfy the check.
+ALIGNMENT_PADDING = "  |"
 
 
 def in_dot_dir(path: str) -> bool:
@@ -120,13 +128,39 @@ def realigned_rows(text: str) -> list[tuple[int, str]]:
     """Return (line number, row) for every table row that was column-aligned.
 
     Scans the whole map, not just the inventory: the identifier-sources table
-    in section 2 churns as hard as the inventory does.
+    in section 2 churns as hard as the inventory does. Rows are matched on the
+    stripped line, the same as ``inventory_rows`` -- an indented table (one
+    nested under a list item) is still a table prettier will re-align.
     """
-    return [
-        (number, line)
-        for number, line in enumerate(text.splitlines(), start=1)
-        if line.startswith("|") and ALIGNMENT_PADDING in line
-    ]
+    rows = []
+    for number, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if stripped.startswith("|") and ALIGNMENT_PADDING in stripped:
+            rows.append((number, stripped))
+    return rows
+
+
+def inventory_tokens(text: str) -> Iterator[tuple[int, str]]:
+    """Yield (cell index, path token) for every path-like token in the inventory.
+
+    One reader, two consumers: the coverage and existence checks in ``main``,
+    and the collapsed-family roster in ``generate_docs.py``. Sharing it is what
+    makes the roster's guarantee structural — a second extraction with its own
+    idea of where a glob may sit would let a row satisfy coverage from a cell
+    the roster never reads, and a deletion inside that family would then be
+    invisible to both checks.
+    """
+    for row in inventory_rows(text):
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        for cell_index, cell in enumerate(cells):
+            for token in TOKEN_RE.findall(cell):
+                if looks_like_doc_path(token):
+                    yield cell_index, token
+
+
+def family_globs(text: str) -> set[str]:
+    """Return every collapsed-family glob the coverage check honours."""
+    return {token for _, token in inventory_tokens(text) if "*" in token}
 
 
 def looks_like_doc_path(token: str) -> bool:
@@ -165,26 +199,18 @@ def main() -> int:
     total_actual = sum(1 for f in files if not in_dot_dir(f))
     files.discard(SELF)
     text = MAP.read_text(encoding="utf-8")
-    rows = inventory_rows(text)
 
     covered: set[str] = set()
     stale: list[tuple[str, str]] = []  # (row path-cell token, reason)
 
-    for row in rows:
-        cells = [c.strip() for c in row.strip("|").split("|")]
-        if not cells:
-            continue
-        # Coverage may come from a token in any cell of the row; existence is
-        # only enforced for the path column (the first cell), where every
-        # token is a deliberate path claim rather than prose.
-        for cell_index, cell in enumerate(cells):
-            for token in TOKEN_RE.findall(cell):
-                if not looks_like_doc_path(token):
-                    continue
-                hits = matches(token, files)
-                covered |= hits
-                if cell_index == 0 and not hits and token != SELF:
-                    stale.append((token, "matches no tracked .md/.mdx file"))
+    # Coverage may come from a token in any cell of the row; existence is only
+    # enforced for the path column (the first cell), where every token is a
+    # deliberate path claim rather than prose.
+    for cell_index, token in inventory_tokens(text):
+        hits = matches(token, files)
+        covered |= hits
+        if cell_index == 0 and not hits and token != SELF:
+            stale.append((token, "matches no tracked .md/.mdx file"))
 
     required = {f for f in files if not in_dot_dir(f)}
     missing = sorted(required - covered)
