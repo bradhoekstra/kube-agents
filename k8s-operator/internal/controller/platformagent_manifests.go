@@ -2638,6 +2638,14 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		"*.googleapis.com",
 		"accounts.google.com",
 		"*.gstatic.com",
+		// GKE DNS-based control plane endpoints. get-credentials prefers these
+		// over the IP endpoint wherever a cluster publishes one that accepts
+		// external traffic, so the kubeconfig names a Google frontend rather
+		// than an address in apiCIDRs. Without this the pod authenticates
+		// against the control plane it can no longer reach: rule 6 covers the
+		// IP endpoints only, and FQDN mode is exactly when the blanket
+		// 0.0.0.0/0:443 rule is withheld.
+		"*.gke.goog",
 		// Container & Artifact Registries (Plugin OCI images)
 		"gcr.io",
 		"*.gcr.io",

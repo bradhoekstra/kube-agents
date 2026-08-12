@@ -16,6 +16,12 @@ spec:
         - pattern: "*.googleapis.com"
         - pattern: "accounts.google.com"
         - pattern: "*.gstatic.com"
+        # GKE DNS-based control plane endpoints. get-credentials prefers these
+        # over the IP endpoint wherever a cluster publishes one that accepts
+        # external traffic, so the kubeconfig names a Google frontend rather
+        # than a control-plane IP, and the API-server egress rule does not
+        # cover it.
+        - pattern: "*.gke.goog"
         # Container & Artifact Registries (Plugin OCI images)
         - pattern: "gcr.io"
         - pattern: "*.gcr.io"
