@@ -28,6 +28,7 @@ import (
 	"regexp"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -1875,6 +1876,19 @@ func resolveHarnessClusterName(agent *agentv1alpha1.PlatformAgent) string {
 	return "platform-agent-host"
 }
 
+// eventWatcherEnabled reports whether the credential sidecar should start the
+// k8s-event-watcher. Absent means started: the watcher is how a fleet notices its
+// own incidents, so an install that never mentions the field must keep watching,
+// and only an explicit false turns it off. The CRD's own default=true covers the
+// case where the object is written without its `enabled` key; this covers the case
+// where the object is not written at all, which is every install today.
+func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if harness := agent.Spec.Harness; harness != nil && harness.EventWatcher != nil && harness.EventWatcher.Enabled != nil {
+		return *harness.EventWatcher.Enabled
+	}
+	return true
+}
+
 // buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
 // Its environment and volume mounts are intentionally disjoint from the agent
 // container even though both containers share a Pod network namespace.
@@ -1896,6 +1910,16 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	// describe loopback plumbing inside this container and live in the
 	// entrypoint.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
+	// The emergency stop from spec.harness.eventWatcher.enabled. Written on every
+	// reconcile rather than only when off, so the Deployment answers "is the
+	// watcher meant to be running?" without reading the CR — the pod stays Ready
+	// either way, so there is otherwise nothing to tell a deliberately silent
+	// install from a broken one. Appended after mergeCredentialProxyEnv like the
+	// cluster name above, so the name is reserved in that function's explicit
+	// list instead: an unreserved name appended here would not shadow a
+	// same-named entry in spec.deployment.env, it would sit beside it, and
+	// server-side apply refuses a duplicate key in `env`.
+	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
@@ -2049,6 +2073,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
+		// Both appended by buildCredentialProxySidecar after this merge runs,
+		// so neither is in `managed` above and neither reserves its own name.
+		// Without them here a same-named entry in spec.deployment.env is kept
+		// and the operator's is appended alongside it — two entries with one
+		// name. That is not last-wins: `containers[].env` is a listType=map,
+		// and server-side apply rejects the whole Deployment rather than
+		// resolving the duplicate, so the agent stops reconciling entirely.
+		"EVENT_WATCHER_CLUSTER_NAME",
+		"EVENT_WATCHER_ENABLED",
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {

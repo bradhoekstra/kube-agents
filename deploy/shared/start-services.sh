@@ -14,7 +14,9 @@
 # credentialed command, so their exit ends the container and Kubernetes
 # restarts it. The watcher is best-effort observability — losing it must not
 # take the credential path down with it, so it is supervised and restarted in
-# place instead.
+# place instead. It is also the only one of the three that can be switched off
+# deliberately: EVENT_WATCHER_ENABLED=false skips it entirely, which is the
+# emergency stop for an event storm. See event_watcher_disabled below.
 set -euo pipefail
 
 # Watcher restart policy. The watcher is retried in place rather than being
@@ -63,7 +65,45 @@ start_envoy() {
   envoy_pid=$!
 }
 
+# The emergency stop, written by the operator from the PlatformAgent's
+# spec.harness.eventWatcher.enabled. Unset means enabled, so that an install
+# whose operator predates the field keeps watching rather than going quiet on
+# upgrade.
+#
+# Only a recognised falsey value disables the watcher; anything else unrecognised
+# leaves it running and says so. Not for the CR path — `enabled` is a strict
+# boolean there and admission rejects anything else before it reaches this
+# script — but for the ways a value gets here without passing through the CRD: a
+# hand-edited Deployment during an incident, and a container image paired with
+# an operator that spells the value differently than this release expects.
+#
+# It fails towards watching because the two mistakes do not cost the same. A
+# value that stops event ingestion is invisible — the container stays Ready, the
+# log says nothing more, and the fleet simply never reports another incident —
+# while one that leaves the watcher running is obvious the moment the next event
+# arrives.
+event_watcher_disabled() {
+  case "${EVENT_WATCHER_ENABLED:-true}" in
+    [Ff][Aa][Ll][Ss][Ee] | 0 | [Nn][Oo] | [Oo][Ff][Ff]) return 0 ;;
+    [Tt][Rr][Uu][Ee] | 1 | [Yy][Ee][Ss] | [Oo][Nn]) return 1 ;;
+    *)
+      echo "start-services: EVENT_WATCHER_ENABLED=${EVENT_WATCHER_ENABLED:-} is not a recognised boolean; starting the k8s-event-watcher anyway. Use 'false' to disable it." >&2
+      return 1
+      ;;
+  esac
+}
+
 start_event_watcher() {
+  if event_watcher_disabled; then
+    # Loud, and worded so it cannot be mistaken for the ALERT lines below: those
+    # mean the watcher tried and failed, this one means somebody turned it off.
+    # The pod log is where a reader of the container finds that out — the
+    # readiness probe covers only the credential proxy, so a container with no
+    # watcher in it looks exactly like a healthy one from outside.
+    echo "start-services: k8s-event-watcher is DISABLED by configuration (EVENT_WATCHER_ENABLED=${EVENT_WATCHER_ENABLED:-}) — NO cluster events are being watched and no autonomous triage sessions will start. Set spec.harness.eventWatcher.enabled=true on the PlatformAgent to start watching again." >&2
+    return 0
+  fi
+
   # Flags are set here rather than passed as container arguments: they describe
   # how processes inside this container reach each other over loopback, which is
   # implementation detail rather than deployment configuration. The one value

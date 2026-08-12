@@ -792,6 +792,8 @@ spec:
               value: /opt/data
             - name: EVENT_WATCHER_CLUSTER_NAME
               value: cluster-a
+            - name: EVENT_WATCHER_ENABLED
+              value: "true"
           image: ghcr.io/gke-labs/kube-agents/credential-proxy:latest
           imagePullPolicy: Always
           name: envoy-credential-proxy

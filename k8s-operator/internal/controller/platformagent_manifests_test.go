@@ -3842,3 +3842,168 @@ func TestOtlpCollectorNamespace(t *testing.T) {
 		})
 	}
 }
+
+// agentWithEventWatcher builds a PlatformAgent whose harness names the emergency
+// stop explicitly. A nil `enabled` stands for the CR that writes the object but
+// not the key, which the CRD default covers rather than this code.
+func agentWithEventWatcher(enabled *bool) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: enabled}}
+	return a
+}
+
+// The default has to be "watching". Every install today omits the field, so a
+// resolver that read absence as off would silently end incident detection fleet-wide
+// on the upgrade that introduced it.
+func TestEventWatcherEnabledDefaultsOnWhenUnspecified(t *testing.T) {
+	noHarness := newTestPlatformAgent()
+	if !eventWatcherEnabled(noHarness) {
+		t.Error("an agent with no harness at all must still watch events")
+	}
+	if !eventWatcherEnabled(agentWithTuning(nil)) {
+		t.Error("a harness that says nothing about the watcher must still watch events")
+	}
+	if !eventWatcherEnabled(agentWithEventWatcher(nil)) {
+		t.Error("an eventWatcher block with no enabled key must still watch events")
+	}
+}
+
+func TestEventWatcherEnabledHonoursAnExplicitFalse(t *testing.T) {
+	if eventWatcherEnabled(agentWithEventWatcher(ptr.To(false))) {
+		t.Error("enabled: false must turn the watcher off")
+	}
+	if !eventWatcherEnabled(agentWithEventWatcher(ptr.To(true))) {
+		t.Error("enabled: true must leave the watcher on")
+	}
+}
+
+// The entrypoint reads EVENT_WATCHER_ENABLED; nothing else carries the decision
+// into the pod. The value is written on every reconcile rather than only when the
+// stop is pressed, so that a Deployment answers "is the watcher meant to be
+// running?" without anyone reading the CR — from outside the container a
+// deliberately silent install and a broken one look identical.
+func TestCredentialProxyCarriesTheEventWatcherSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  string
+	}{
+		{"unspecified", newTestPlatformAgent(), "true"},
+		{"explicitly on", agentWithEventWatcher(ptr.To(true)), "true"},
+		{"emergency stop", agentWithEventWatcher(ptr.To(false)), "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sidecar := buildCredentialProxySidecar(tc.agent, "/opt/data")
+			var found []corev1.EnvVar
+			for _, env := range sidecar.Env {
+				if env.Name == "EVENT_WATCHER_ENABLED" {
+					found = append(found, env)
+				}
+			}
+			if len(found) != 1 {
+				t.Fatalf("expected exactly one EVENT_WATCHER_ENABLED, got %#v", found)
+			}
+			if found[0].Value != tc.want {
+				t.Errorf("EVENT_WATCHER_ENABLED = %q, want %q", found[0].Value, tc.want)
+			}
+		})
+	}
+}
+
+// spec.deployment.env is merged into the sidecar's environment, and the name is not
+// in the reserved set. It does not need to be: the operator appends its own entry
+// afterwards, and Kubernetes resolves a duplicated name to the last one. Pinning it
+// because the guarantee lives in the ordering of two append calls, where a later
+// refactor could reasonably move one above the merge and hand the switch to whoever
+// can edit the CR's env list.
+// The switch is the operator's to set, so a same-named entry in
+// spec.deployment.env has to be dropped — not merely out-voted.
+//
+// Counting the entries is the whole point of this test. `containers[].env` is a
+// listType=map keyed on name, and the operator applies the Deployment with
+// server-side apply, which rejects a duplicate key outright rather than taking
+// the last one. So a merge that leaves two `EVENT_WATCHER_ENABLED` entries does
+// not quietly prefer the operator's value: it fails every reconcile from then
+// on, freezing the Deployment against this change and every later one. An
+// earlier version of this test read the last matching entry and passed while
+// exactly that was happening, which is why it asserts a count now.
+func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
+	for _, userValue := range []string{"false", "true", "wat"} {
+		t.Run(userValue, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_ENABLED", Value: userValue}},
+			}
+
+			var found []string
+			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+				if e.Name == "EVENT_WATCHER_ENABLED" {
+					found = append(found, e.Value)
+				}
+			}
+			if len(found) != 1 {
+				t.Fatalf("want exactly one EVENT_WATCHER_ENABLED entry, got %d (%q); server-side apply rejects a duplicate key in env", len(found), found)
+			}
+			if found[0] != "true" {
+				t.Errorf("the operator's value must win over spec.deployment.env, got %q", found[0])
+			}
+		})
+	}
+}
+
+// The same hole, on the variable next to it. EVENT_WATCHER_CLUSTER_NAME is
+// appended after the same merge and was unreserved for as long as it has
+// existed; it is pinned here so the two cannot drift apart again.
+func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: "not-the-operators-idea"}},
+	}
+
+	var found []string
+	for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_CLUSTER_NAME" {
+			found = append(found, e.Value)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_CLUSTER_NAME entry, got %d (%q)", len(found), found)
+	}
+	if found[0] == "not-the-operators-idea" {
+		t.Errorf("spec.deployment.env overrode the operator's cluster name, got %q", found[0])
+	}
+}
+
+// Turning the watcher off must not disturb the wiring around it. The volumes, the
+// token projection, and the kubeconfig path are shared with the credential proxy or
+// needed the moment the switch goes back on, so the stop is a decision about one
+// process rather than a teardown of the sidecar.
+func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
+	off := buildCredentialProxySidecar(agentWithEventWatcher(ptr.To(false)), "/opt/data")
+
+	var tokenMount, kubeconfigMount bool
+	for _, m := range off.VolumeMounts {
+		if m.Name == "event-watcher-ksa-token" && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" {
+			tokenMount = true
+		}
+		if m.Name == "event-watcher-kubeconfig" {
+			kubeconfigMount = true
+		}
+	}
+	if !tokenMount || !kubeconfigMount {
+		t.Errorf("disabling the watcher must not strip its mounts, got %#v", off.VolumeMounts)
+	}
+
+	var sawClusterName, sawSessionKey bool
+	for _, e := range off.Env {
+		if e.Name == "EVENT_WATCHER_CLUSTER_NAME" {
+			sawClusterName = true
+		}
+		if e.Name == "SESSION_KV_API_KEY" {
+			sawSessionKey = true
+		}
+	}
+	if !sawClusterName || !sawSessionKey {
+		t.Errorf("disabling the watcher must not strip its configuration, got %#v", off.Env)
+	}
+}

@@ -60,6 +60,18 @@ const (
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
+
+	// The condition reporting that cluster event ingestion has been switched off
+	// on the spec. It is written only in that state — see updateStatusReady.
+	eventWatcherConditionType  = "EventWatcher"
+	eventWatcherDisabledReason = "DisabledBySpec"
+	// Long, because the reader of `kubectl describe` is the person who has to
+	// decide whether this is still wanted. It has to say what stopped, that
+	// nothing will turn it back on, and how to turn it back on.
+	eventWatcherDisabledMessage = "Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. " +
+		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
+		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
+		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
 )
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
@@ -906,6 +918,25 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 	}
 
+	// Cluster event ingestion, reported only while it is switched off. A
+	// permanently-present condition would have to read True on every healthy
+	// install, and True here could only ever mean "the operator asked for a
+	// watcher" — it is not a liveness check, and a watcher that dies leaves the
+	// pod Ready with nothing to show for it. Claiming otherwise on every CR is
+	// worse than saying nothing, so the condition exists only in the state that
+	// is genuinely worth reporting: somebody pressed the emergency stop.
+	eventWatcherOn := eventWatcherEnabled(agent)
+	existingWatcherCond := meta.FindStatusCondition(agent.Status.Conditions, eventWatcherConditionType)
+	// Message is compared alongside Status and Reason, as the Ready and Degraded
+	// terms below do. Reason is a constant here, so the only way the text can
+	// differ is a release that rewords eventWatcherDisabledMessage — and that
+	// message is the recovery instruction a reader gets from `kubectl describe`.
+	// Leaving it out would freeze the previous release's wording on every
+	// install still holding the stop, since nothing else about them changes.
+	eventWatcherUnchanged := (eventWatcherOn && existingWatcherCond == nil) ||
+		(!eventWatcherOn && existingWatcherCond != nil && existingWatcherCond.Status == metav1.ConditionFalse &&
+			existingWatcherCond.Reason == eventWatcherDisabledReason && existingWatcherCond.Message == eventWatcherDisabledMessage)
+
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) ||
@@ -921,6 +952,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		degradedUnchanged &&
+		eventWatcherUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
 		return newPhase, nil
 	}
@@ -958,6 +990,18 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
 	} else {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, "Degraded")
+	}
+
+	if eventWatcherOn {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, eventWatcherConditionType)
+	} else {
+		meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+			Type:               eventWatcherConditionType,
+			Status:             metav1.ConditionFalse,
+			Reason:             eventWatcherDisabledReason,
+			Message:            eventWatcherDisabledMessage,
+			LastTransitionTime: now,
+		})
 	}
 
 	return newPhase, r.Status().Update(ctx, agent)

@@ -1145,6 +1145,205 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	}
 }
 
+// Pressing the emergency stop has to leave a mark somewhere a human looks. The pod
+// stays Ready with the watcher off, so `kubectl describe platformagent` is the only
+// place that can distinguish a fleet with no incidents from a fleet that stopped
+// looking, and an install left switched off is the failure this condition exists to
+// prevent.
+func TestPlatformAgentReconciler_Reconcile_EventWatcherDisabledCondition(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-off",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:    "test-project",
+				Location:     "us-central1",
+				ClusterName:  "test-cluster",
+				EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-off",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	// First adds the finalizer, second writes status.
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType)
+	if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != eventWatcherDisabledReason {
+		t.Fatalf("expected %s condition False/%s, got %v", eventWatcherConditionType, eventWatcherDisabledReason, cond)
+	}
+	// The message is what the operator reads at 3am, so it has to name the field
+	// rather than only the symptom — nothing else tells them how to undo this.
+	if !strings.Contains(cond.Message, "spec.harness.eventWatcher.enabled") {
+		t.Errorf("the condition must name the field that turns it back on, got %q", cond.Message)
+	}
+	// Deliberately off is not degraded. Flipping the phase would make the stop
+	// look like a fault and hide a real one behind it.
+	if updated.Status.Phase == "Degraded" {
+		t.Error("disabling the watcher is a decision, not a degradation")
+	}
+
+	// Turning it back on has to clear the condition. A stale one would report an
+	// install as blind while it is watching, which is the more dangerous of the
+	// two ways to be wrong.
+	updated.Spec.Harness.EventWatcher.Enabled = ptr.To(true)
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to re-enable the watcher: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after re-enable failed: %v", err)
+	}
+
+	restored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, restored); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(restored.Status.Conditions, eventWatcherConditionType); cond != nil {
+		t.Errorf("expected the %s condition to be removed once watching resumes, got %v", eventWatcherConditionType, cond)
+	}
+}
+
+// The condition must not exist on an install that never mentions the field, which
+// is every install today. A condition present on all of them says nothing, and
+// would train readers to ignore the one case it is meant to flag.
+func TestPlatformAgentReconciler_Reconcile_NoEventWatcherConditionByDefault(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-default",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-default",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType); cond != nil {
+		t.Errorf("expected no %s condition on a default install, got %v", eventWatcherConditionType, cond)
+	}
+}
+
+// A condition already carrying the right Status and Reason must still have its
+// text refreshed. The message is the recovery instruction — what a reader of
+// `kubectl describe` is told to do to undo the stop — so a release that rewords
+// it has to reach installs that are already stopped. Nothing else about such an
+// install changes between reconciles, so if the no-op comparison ignored the
+// message the old wording would be frozen there forever.
+func TestPlatformAgentReconciler_Reconcile_EventWatcherMessageIsRefreshed(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-watcher-stale",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:    "test-project",
+				Location:     "us-central1",
+				ClusterName:  "test-cluster",
+				EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)},
+			},
+		},
+		Status: agentv1alpha1.AgentStatus{
+			Conditions: []metav1.Condition{{
+				Type:               eventWatcherConditionType,
+				Status:             metav1.ConditionFalse,
+				Reason:             eventWatcherDisabledReason,
+				Message:            "wording from a previous release",
+				LastTransitionTime: metav1.Now(),
+			}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{
+		Name:      "test-agent-watcher-stale",
+		Namespace: "test-ns",
+	}}
+	ctx := context.Background()
+
+	for i := 1; i <= 2; i++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, eventWatcherConditionType)
+	if cond == nil {
+		t.Fatalf("expected the %s condition to survive, got none", eventWatcherConditionType)
+	}
+	if cond.Message != eventWatcherDisabledMessage {
+		t.Errorf("stale condition message was never refreshed:\n got: %q\nwant: %q", cond.Message, eventWatcherDisabledMessage)
+	}
+}
+
 func TestResolveAgentPlugins_OptInTargeting(t *testing.T) {
 	scheme := setupScheme()
 

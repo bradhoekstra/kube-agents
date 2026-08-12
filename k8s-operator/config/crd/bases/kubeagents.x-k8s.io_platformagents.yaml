@@ -8144,6 +8144,40 @@ spec:
                         ClusterName is the logical name of the cluster (either
                         where the agent is running or the target cluster).
                       type: string
+                    eventWatcher:
+                      description: |-
+                        EventWatcher configures cluster event ingestion — the k8s-event-watcher that
+                        turns cluster warnings into autonomous triage sessions. Its `enabled: false`
+                        is the emergency stop for an event storm.
+                      properties:
+                        enabled:
+                          default: true
+                          description: |-
+                            Enabled controls whether the watcher is started at all. Absent means started:
+                            the watcher is how a fleet notices its own incidents, so only an explicit
+                            false turns it off.
+
+                            This is an emergency stop, not a tuning knob. It exists for the case where
+                            events arrive faster than the agent can triage them — a fleet-wide rollout
+                            gone wrong, a node pool flapping — and the cheapest way to get the agent back
+                            is to cut the inflow rather than to chase the cards it has already been given.
+                            It is all-or-nothing across every watched cluster: the watcher's reason and
+                            namespace filters are fixed by the sidecar's entrypoint and not exposed here,
+                            so there is no way to silence one noisy namespace through this field.
+
+                            Three consequences to know before pressing it:
+
+                              - It rolls the pod. The value reaches the sidecar as an environment variable,
+                                so changing it rewrites the pod template. During a storm that restart is
+                                usually wanted anyway — it is also what ends the sessions already running.
+                              - It stops the inflow only. Kanban cards and sessions created from events
+                                already delivered keep running and still have to be dealt with on the board.
+                              - Nothing turns it back on. An install left with the watcher off has no
+                                incident detection at all while the container stays Ready, which is why the
+                                operator reports the off state as an `EventWatcher` condition on the CR
+                                instead of letting it sit unremarked in the spec.
+                          type: boolean
+                      type: object
                     hermes:
                       description:
                         Hermes configures the internal event-routing or agent

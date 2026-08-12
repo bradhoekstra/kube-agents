@@ -67,6 +67,25 @@ When executing the `k8s-event-watcher` service binary directly, the following co
 | `--daemon-url`          | `""` (required unless `--dry-run`)      | The central Platform Agent Host troubleshooting gateway endpoint. There is no default; startup fails without it.                                                                                                                                                                                                                             |
 | `--profiles-dir`        | `""` (single-cluster mode)              | Hermes profiles directory, normally `/opt/data/profiles`. Every Cluster Agent profile found is added to the watch set, using that profile's own `kubeconfig.yaml` and `cluster_identity`. Combines with `--in-cluster` / `--kubeconfig` to also watch one directly-reachable cluster; that combination requires `--cluster-name` to name it. |
 
+### Switching the Watcher Off in a Deployed Install
+
+None of the flags above reach a running pod: the entrypoint sets them, not the operator. The one
+setting that _is_ exposed on the `PlatformAgent` is whether the watcher runs at all —
+`spec.harness.eventWatcher.enabled: false` is the emergency stop for an event storm.
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
+  -p '{"spec":{"harness":{"eventWatcher":{"enabled":false}}}}'
+```
+
+The operator renders it as `EVENT_WATCHER_ENABLED` on the credential-proxy container, and
+`start_event_watcher` in `deploy/shared/start-services.sh` returns before launching anything when it
+reads false — so the watcher process and its supervising subshell never exist, and the pod rolls to
+apply the change. Unset means enabled. Because the
+container stays Ready either way, the off state is reported in two places: a line in the sidecar log
+and the `EventWatcher` condition on the CR. Full semantics, and what the stop does _not_ do, are on
+[PlatformAgent CRD → `spec.harness.eventWatcher`](../../../docs/site/src/content/docs/operator/platformagent-crd.md#specharnesseventwatcher).
+
 ### Running the Binary Directly
 
 Before running any of the verification options below, navigate to the watcher directory from the repository root and compile the Go binary:

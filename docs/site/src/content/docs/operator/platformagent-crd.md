@@ -52,6 +52,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                        |
 | `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`.                                                                                                  |
 | `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                           |
+| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                 |
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
@@ -62,6 +63,60 @@ authenticates to that same server, treats an empty `SESSION_KV_API_KEY` as fatal
 start — so no cluster events are watched at all, while the container stays Ready and the CR
 `.status` says nothing. An installation upgraded from before the key existed is the case that lands
 here; add the key to the agent Secret and restart the pod.
+
+### `spec.harness.eventWatcher`
+
+The `k8s-event-watcher` runs in the credential sidecar, streams warning events from every managed
+cluster, and posts each surviving incident to the pod-local Session KV server, which opens an
+autonomous triage session for it. `enabled: false` stops it from starting at all.
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
+  -p '{"spec":{"harness":{"eventWatcher":{"enabled":false}}}}'
+```
+
+The field has to exist in the installed CRD for that patch to mean anything, and
+[Helm installs CRDs on first install but never upgrades them](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md).
+A chart-upgraded install therefore needs the CRDs applied first — worth doing ahead of the incident
+rather than during it, since a client that does not send strict field validation gets the unknown
+field pruned and an emergency stop that reports success and does nothing.
+
+```bash
+kubectl apply --server-side -f k8s-operator/config/crd/bases/
+```
+
+`--server-side` is not optional here. Client-side apply stores the whole object in the
+`kubectl.kubernetes.io/last-applied-configuration` annotation, and this CRD is far past the 262144-byte
+annotation cap, so a plain `kubectl apply` fails with `metadata.annotations: Too long` and leaves the
+CRD unchanged. `make install` in `k8s-operator/` applies them the same way.
+
+**This is an emergency stop, not a tuning knob.** It exists for the case where events arrive faster
+than the agent can triage them — a fleet-wide rollout gone wrong, a node pool flapping — and the
+cheapest way to get the agent back is to cut the inflow rather than chase the cards it has already
+been handed. It is all-or-nothing across every watched cluster: the watcher's reason and namespace
+filters live in the sidecar's entrypoint and are not exposed on the CRD, so there is no way to
+silence one noisy namespace through this field. If the board is merely busy rather than swamped,
+[`tuning.maxInProgress`](#specharnesstuning) is the knob for that — it throttles how many cards run at
+once without losing the events.
+
+Three consequences before you press it:
+
+- **It rolls the pod.** The value reaches the sidecar as an environment variable, so changing it
+  rewrites the pod template. During a storm that restart is usually wanted anyway — it is also what
+  ends the sessions already running.
+- **It stops the inflow only.** Kanban cards and sessions created from events already delivered keep
+  running and still have to be dealt with on the board. It reclaims nothing either: the watcher's
+  kubeconfig, token projection, and mounts stay in place, and the sidecar keeps the memory request
+  sized for the informer and dedup caches it is no longer running.
+- **Nothing turns it back on.** An install left with the watcher off has no incident detection at
+  all, and the container stays Ready throughout — the readiness probe covers the credential proxy,
+  not the watcher. Two things say otherwise: a line in the sidecar log naming the consequence, and
+  the `EventWatcher` condition on the CR ([`status`](#status) below). Set `enabled: true`, or remove
+  the field, to start watching again.
+
+Unset means enabled. The watcher is how a fleet notices its own incidents, so an install that never
+mentions the field — which is every install today — keeps watching, and only an explicit `false`
+turns it off.
 
 ### `spec.harness.tuning`
 
@@ -208,6 +263,29 @@ The operator writes observed state to the `status` subresource:
 | `storageStatus.bound`            | bool   | Whether the primary PVC has been provisioned.                                                          |
 | `telemetry.otlpEndpoint`         | string | The OTLP collector the agent was wired to.                                                             |
 | `telemetry.otlpEndpointSource`   | string | Which rung of the ladder answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`. |
+
+Three condition types appear in `conditions`, and only the first is always present:
+
+| Type           | Written                                      | Meaning                                                                                                                      |
+| -------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on.                                       |
+| `Degraded`     | Only while degraded                          | Something in the spec cannot be honoured — today, `Reason: InvalidGitRepoURL`.                                               |
+| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent. |
+
+`EventWatcher` is absent on a healthy install rather than `True`, deliberately: the operator can say
+it asked for a watcher, but nothing here checks that one is alive, and a permanently-`True`
+condition would read as a health signal it is not. Disabling the watcher is also not a `Degraded`
+state — it is a decision somebody made, and `phase` stays `Ready`.
+
+```console
+$ kubectl describe platformagent platform-agent -n kubeagents-system
+...
+  Conditions:
+    Type:     EventWatcher
+    Status:   False
+    Reason:   DisabledBySpec
+    Message:  Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. …
+```
 
 ## How config reaches each profile
 
