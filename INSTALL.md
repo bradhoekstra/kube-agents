@@ -314,7 +314,32 @@ kubectl create secret generic platform-agent-secrets \
   --from-literal=GEMINI_API_KEY="your-gemini-api-key" \
   --from-literal=API_SERVER_KEY="your-api-server-key" \
   --from-literal=ANTHROPIC_API_KEY="your-anthropic-api-key" \
-  --from-literal=OPENAI_API_KEY="your-openai-api-key"
+  --from-literal=OPENAI_API_KEY="your-openai-api-key" \
+  --from-literal=SESSION_KV_API_KEY="$(openssl rand -hex 32)" \
+  --from-literal=SESSION_KV_SALT="$(openssl rand -hex 32)"
+```
+
+The last two are generated, not chosen: `SESSION_KV_API_KEY` is the bearer token
+for the pod-local Session KV server, and `SESSION_KV_SALT` is the HMAC salt that
+pseudonymises chat identities before they are written to disk. Keep the salt:
+rotating it re-anonymises every user, severing their past sessions from their
+future ones.
+
+Both are optional in the sense that the pod still starts without them, but
+`SESSION_KV_API_KEY` is not optional in practice: the in-pod `k8s-event-watcher`
+authenticates with it, treats an empty value as fatal, and exits on every start
+— so **no cluster events are watched at all**, in a container that stays Ready
+and a CR whose `.status` says nothing. The Session KV server also answers `503`
+to every request (losing chat-thread resolution and incident lookup), and
+identity pseudonyms stop being stable across pod restarts. If you are upgrading
+an installation that predates these keys, `upgrade.sh` adds them to the existing
+Secret before it rolls the agent; a Helm or Terraform install supplies them
+itself. To add them by hand:
+
+```bash
+kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
+  -p "{\"stringData\":{\"SESSION_KV_API_KEY\":\"$(openssl rand -hex 32)\",\"SESSION_KV_SALT\":\"$(openssl rand -hex 32)\"}}"
+kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
 ```
 
 ### Step 3: Build & Push the Operator Image
@@ -348,6 +373,8 @@ kubectl rollout status deployment -n kubeagents-system
 ### Step 5: Deploy Integrations (LiteLLM & GitHub)
 
 To optionally deploy the LiteLLM Gateway or GitHub Token Minter:
+
+`GITHUB_ORG` must be a GitHub **organization**. The Token Minter looks App installations up at `/orgs/{org}/installation`, which does not exist for personal accounts, so a user-owned GitOps repo deploys cleanly and then fails every token request with a 404. This manual path skips the provisioning scripts' preflight check — see [`k8s-operator/config/integrations/github/README.md`](k8s-operator/config/integrations/github/README.md).
 
 ```bash
 # Deploy LiteLLM Gateway

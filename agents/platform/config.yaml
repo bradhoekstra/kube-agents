@@ -35,6 +35,14 @@ mcp_servers:
       # for the agent to quote back on every call.
       GOOGLE_CHAT_HOME_CHANNEL: "${GOOGLE_CHAT_HOME_CHANNEL}"
       API_SERVER_KEY: "${API_SERVER_KEY}"
+      # The bearer token for the loopback Session KV server on 8699. The
+      # allowlist above is the whole environment this subprocess gets, so
+      # without this line send_notification cannot read chat_id/thread_id back
+      # (every alert-driven report loses its thread and falls back to the home
+      # channel) and never POSTs the incident report at all — both silently,
+      # since the 401 surfaces only as a stderr line. Not API_SERVER_KEY: that
+      # value is the loopback sentinel `cluster-internal-trusted`.
+      SESSION_KV_API_KEY: "${SESSION_KV_API_KEY}"
   gke:
     command: "node"
     args:
