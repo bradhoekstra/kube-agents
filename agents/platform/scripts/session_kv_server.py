@@ -156,6 +156,62 @@ def _purge_plaintext_identities(conn: sqlite3.Connection) -> None:
         logger.info(f"Purged plaintext identity fields from {purged} session metadata row(s)")
 
 
+def _alert_daily_limit(env_var: str, default: int) -> int:
+    """Read a per-day alert ceiling from the environment. 0 disables the cap."""
+    raw = os.getenv(env_var, "")
+    if raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.error(f"{env_var}={raw!r} is not an integer; falling back to {default}")
+        return default
+    # Negative is meaningless as a ceiling, and treating it as 0 makes "turn
+    # this off" forgiving of the two spellings an operator might reach for.
+    return max(value, 0)
+
+
+# Per-severity ceiling on alerts posted to chat in one UTC day. This bounds
+# volume, not redundancy: the dedup window in the event watcher is what stops
+# one failure being reported repeatedly, and this cap is the backstop for the
+# case that defeats it — many *distinct* failures at once, typically a node or
+# a namespace going down and taking a hundred unrelated pods with it.
+#
+# Suppression is deliberately invisible in chat. Announcing the ceiling would
+# spend a message to say no more messages are coming, which is self-defeating
+# when the point is a quieter channel. The trade-off is real and worth naming:
+# once the cap bites, a silent channel no longer distinguishes "nothing is
+# wrong" from "the budget is spent", so the accounting lives outside chat
+# instead. Every suppressed alert is counted per severity in `alert_quota`,
+# logged at WARNING with the workload that was dropped, and readable from
+# `GET /v1/alert-quota`. Anyone asking "did we miss something today" has an
+# answer; they just have to ask.
+#
+# Severities come from get_severity_details, and every one of them is capped.
+# Info is not a hypothetical: nothing between the kubelet and this function
+# filters on Event.Type. The watcher's filter matches reason, namespace and
+# repeat count only, and its informer runs without a field selector, so an
+# allowlisted reason arriving as `type: Normal` is forwarded like any other,
+# classified Info here, and — left out of this dict — would post to chat and
+# start an agent turn outside every ceiling. `BackOff` is on the watcher's
+# default reason list and the kubelet emits it as Normal for image-pull
+# back-off, which is exactly the storm the cap exists for.
+#
+# Covering all three also means the `.get(severity, 0)` default in
+# _claim_alert_quota is now reached only by a severity this module cannot
+# produce, rather than by a routine one.
+#
+# Counts are fleet-wide rather than per-cluster, matching the ceiling as
+# specified. The trade-off is that one collapsing cluster can exhaust the day's
+# budget for the others; `GET /v1/alert-quota` is where that shows up.
+ALERT_DAILY_LIMITS = {
+    "Critical": _alert_daily_limit("ALERT_DAILY_LIMIT_CRITICAL", 10),
+    "Warning": _alert_daily_limit("ALERT_DAILY_LIMIT_WARNING", 5),
+    # Capped, not exempt: see above — Normal-type events land here.
+    "Info": _alert_daily_limit("ALERT_DAILY_LIMIT_INFO", 5),
+}
+
+
 def init_db() -> None:
     db_dir = os.path.dirname(SESSION_KV_DB_PATH)
     if db_dir:
@@ -183,6 +239,25 @@ def init_db() -> None:
                 )
                 """
             )
+            # Today's alert budget per severity. In the database rather than in
+            # memory because this table's whole job is to survive a restart:
+            # the session server goes down with its container, and an in-memory
+            # counter would hand out a fresh day's quota every time it came
+            # back — turning a crash loop into an alert storm, which is exactly
+            # the condition the cap exists for. `day` is a UTC `YYYY-MM-DD`
+            # string so it sorts and compares as text against SQLite's own
+            # `date()`.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS alert_quota (
+                    day        TEXT NOT NULL,
+                    severity   TEXT NOT NULL,
+                    sent       INTEGER NOT NULL DEFAULT 0,
+                    suppressed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (day, severity)
+                )
+                """
+            )
             _purge_plaintext_identities(conn)
 
 
@@ -196,6 +271,10 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
         param = f"-{CLEANUP_TTL_DAYS} days"
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
+        # Spent quota is only meaningful for the day it belongs to; the history
+        # is kept the same 14 days as everything else so an operator asked
+        # "what did we drop last week" still has an answer.
+        conn.execute("DELETE FROM alert_quota WHERE day < date('now', ?)", (param,))
     except Exception as exc:
         logger.error(f"Failed to clean up old DB records: {exc}")
 
@@ -316,6 +395,63 @@ def _post_initial_alert(active_platform: str, alert_msg: str) -> str | None:
     return None
 
 
+def _claim_alert_quota(severity: str) -> tuple[bool, int]:
+    """Spend one of today's alerts for `severity`.
+
+    Returns `(allowed, suppressed_today)`. `allowed` is False once the day's
+    ceiling is spent; `suppressed_today` is the running count of alerts the cap
+    has dropped today, which the caller logs so the drop leaves a trace even
+    though nothing is posted to chat.
+
+    Fails open. A cap is a comfort feature and a database that cannot be
+    written is not a reason to withhold an incident from an on-call human, so
+    any error here lets the alert through and is logged.
+    """
+    limit = ALERT_DAILY_LIMITS.get(severity, 0)
+    if limit <= 0:
+        return True, 0
+
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        # isolation_level=None hands transaction control to us so the BEGIN
+        # IMMEDIATE below is the real thing rather than sqlite3's implicit
+        # deferred transaction.
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0, isolation_level=None)) as conn:
+            # IMMEDIATE takes the write lock before the read. A deferred
+            # transaction would let two alerts arriving together both read
+            # `sent` at limit-1 and both conclude they are within budget, which
+            # is the one bug a cap must not have.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO alert_quota (day, severity) VALUES (?, ?)",
+                    (day, severity),
+                )
+                sent, suppressed = conn.execute(
+                    "SELECT sent, suppressed FROM alert_quota WHERE day = ? AND severity = ?",
+                    (day, severity),
+                ).fetchone()
+                if sent < limit:
+                    conn.execute(
+                        "UPDATE alert_quota SET sent = sent + 1 WHERE day = ? AND severity = ?",
+                        (day, severity),
+                    )
+                    conn.execute("COMMIT")
+                    return True, suppressed
+                conn.execute(
+                    "UPDATE alert_quota SET suppressed = suppressed + 1 WHERE day = ? AND severity = ?",
+                    (day, severity),
+                )
+                conn.execute("COMMIT")
+                return False, suppressed + 1
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+    except Exception as exc:
+        logger.error(f"Alert quota check failed for severity {severity} (allowing the alert through): {exc}")
+        return True, 0
+
+
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
     """Save thread configurations in session_metadata SQLite table."""
     try:
@@ -363,7 +499,19 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
 
 
 def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
-    """Format a detailed Markdown diagnostic query for the Platform Agent."""
+    """Format a detailed Markdown diagnostic query for the Platform Agent.
+
+    The report template below is STANDARD markdown, and must stay that way.
+    Every chat platform's adapter translates the agent's markdown on the way
+    out; on Slack that is ``SlackAdapter.format_message``, which rewrites
+    ``**bold**`` to ``*bold*`` and ``[label](url)`` to ``<url|label>``. Writing
+    the template in the destination's own syntax does not skip that pass, it
+    feeds it: a pre-authored ``*Issue:*`` matches format_message's single-
+    asterisk ITALIC rule and every heading in the delivered report came out
+    italic instead of bold. Authoring in markdown also lets the Block Kit
+    renderer (``platforms.slack.extra.rich_blocks`` in agents/chat/config.yaml)
+    see the structure and emit real header, list and table blocks.
+    """
     event_reason = payload.get("reason") or "Unknown"
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
@@ -378,30 +526,30 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
         f"for the active session '{session_id}'.\n\n"
         f"**Event Details:**\n"
-        f"• *Resource:* {namespace}/{object_kind}/{object_name}\n"
-        f"• *Event Reason:* {event_reason}\n"
-        f"• *Warning Message:* {message}\n\n"
+        f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
+        f"- **Event Reason:** {event_reason}\n"
+        f"- **Warning Message:** {message}\n\n"
         f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
-        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ *Recommended: Option <letter>*' — the safest, most durable fix for the root cause "
+        f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
         f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
         f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this:\n\n"
-        f"📋 *Incident Triage*\n\n"
-        f"• *Issue:* <Short 1-sentence description of the problem>\n"
-        f"• *Root Cause:* <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
-        f"🛠️ *Proposed Fixes (GitOps):*\n"
-        f"*Option A (<Action Title>):* <1-sentence description of Option A GitOps fix>.\n"
-        f"*Option B (<Action Title>):* <1-sentence description of Option B GitOps fix>.\n"
-        f"✅ *Recommended: Option <letter>* — <1-sentence why this is the safer/better choice>.\n\n"
-        f"🔗 <https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}|GKE Workloads> | "
-        f"<https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query}|Cloud Logs>\n\n"
-        f"👉 *Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.*\n\n"
+        f"📋 **Incident Triage**\n\n"
+        f"- **Issue:** <Short 1-sentence description of the problem>\n"
+        f"- **Root Cause:** <Key constraint mismatch or log finding in 1-2 sentences>\n\n"
+        f"🛠️ **Proposed Fixes (GitOps):**\n\n"
+        f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
+        f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n\n"
+        f"✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n\n"
+        f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
+        f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
+        f"👉 **Reply 'apply' to open a GitOps Pull Request with the recommended fix, or name one directly with 'apply Option A' / 'apply Option B'.**\n\n"
         f"---"
         f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
         f"If the user replies to the thread with 'apply' or 'apply Option <letter>':\n"
-        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ *Recommended: Option <letter>*', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
+        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
         f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
         f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
     )
@@ -473,13 +621,38 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     event_type = payload.get("type") or "Warning"
 
     severity_emoji, severity_label = get_severity_details(event_type, event_reason)
+
+    # The daily ceiling is enforced here rather than at /sessions because
+    # severity is not known until the payload arrives, and here is the single
+    # point both the chat post and the agent turn pass through. The cost is a
+    # session row created for an alert that never posts; those age out under
+    # CLEANUP_TTL_DAYS like any other.
+    #
+    # The watcher is told this succeeded on purpose. A failure response would
+    # leave its dedup entry unbound and the same workload would be re-reported
+    # on the next sighting, so a suppressed alert would cost more API calls
+    # than a delivered one.
+    allowed, suppressed_today = _claim_alert_quota(severity_label)
+    if not allowed:
+        logger.warning(
+            f"Suppressed {severity_label} alert for {namespace}/{object_kind}/{object_name} "
+            f"({event_reason}): daily limit of {ALERT_DAILY_LIMITS[severity_label]} reached, "
+            f"{suppressed_today} suppressed today"
+        )
+        return {"status": "suppressed", "severity": severity_label, "suppressed_today": str(suppressed_today)}
+
     clean_name = clean_workload_name(object_kind, object_name)
     clean_reason = clean_reason_label(event_reason)
     clean_msg = clean_event_message(message)
 
-    # Construct a pretty notification alert
+    # Construct a pretty notification alert. Standard markdown, not Slack
+    # mrkdwn: SlackAdapter.format_message runs over everything on its way out,
+    # and it reads a single `*...*` as ITALIC. A label written `*Critical:*`
+    # therefore arrives italic, which is the opposite of the emphasis intended.
+    # `**Critical:**` is what becomes bold. (`_..._` is italic in both, so the
+    # second line needs no change.)
     alert_msg = (
-        f"{severity_emoji} *{severity_label}:* {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
+        f"{severity_emoji} **{severity_label}:** {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
         f"🌱 _Digging down to the root cause..._"
     )
     
@@ -565,6 +738,37 @@ def get_incident(chat_id: str, thread_id: str) -> Dict[str, str]:
     if not row:
         raise HTTPException(status_code=404, detail="no incident for thread")
     return {"chat_id": chat_id, "thread_id": thread_id, "report": row[0]}
+
+
+@app.get("/v1/alert-quota", dependencies=[Depends(verify_api_key)])
+def get_alert_quota(day: str = "") -> Dict[str, Any]:
+    """Report how much of the daily alert budget was spent, and what it dropped.
+
+    Suppression is silent in chat, so this is where an operator finds out
+    whether a quiet day was quiet because nothing broke or because the ceiling
+    was reached. Defaults to today (UTC); pass `day=YYYY-MM-DD` for history,
+    which reaches back CLEANUP_TTL_DAYS.
+    """
+    day = day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+        rows = conn.execute(
+            "SELECT severity, sent, suppressed FROM alert_quota WHERE day = ?",
+            (day,),
+        ).fetchall()
+
+    counts = {severity: {"sent": sent, "suppressed": suppressed} for severity, sent, suppressed in rows}
+    # Report every capped severity, including ones with no traffic today, so a
+    # missing key means "not capped" rather than "no alerts yet".
+    severities = {
+        severity: {
+            "limit": limit,
+            "sent": counts.get(severity, {}).get("sent", 0),
+            "suppressed": counts.get(severity, {}).get("suppressed", 0),
+        }
+        for severity, limit in ALERT_DAILY_LIMITS.items()
+        if limit > 0
+    }
+    return {"day": day, "severities": severities}
 
 
 init_db()

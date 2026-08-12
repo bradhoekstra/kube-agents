@@ -59,6 +59,7 @@ graph TD
     A --> K[provision_10_deploy_github_minter.sh]
     A --> L[provision_11_deploy_inference_replay.sh]
     A --> M[provision_12_gke_backup_plan.sh]
+    A --> N[provision_13_verify_agent_rollout.sh]
 ```
 
 Every step is documented once, in **[scripts/README.md](scripts/README.md)** — the canonical
@@ -173,7 +174,7 @@ make install
 ```
 
 > [!NOTE]
-> This command uses `controller-gen` to generate the CRD manifests from Go structs and applies them to the cluster via `kustomize`.
+> This applies the CRD manifests **as committed** in `config/crd/bases/`, via `kustomize`. It does not run `controller-gen`, so edits to the Go API types do not reach the cluster until you run `make manifests` and install again. How the build targets and CI keep generated output in sync is covered in the [operator development guide](../docs/site/src/content/docs/operator/development.md).
 
 ### Step 3: Run the Operator Locally
 
