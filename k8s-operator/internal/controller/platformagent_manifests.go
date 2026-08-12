@@ -2645,7 +2645,14 @@ func buildFQDNNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *unstructured.Un
 		// against the control plane it can no longer reach: rule 6 covers the
 		// IP endpoints only, and FQDN mode is exactly when the blanket
 		// 0.0.0.0/0:443 rule is withheld.
+		//
+		// A pattern wildcard spans one label and no dots, so the two-label
+		// form is what actually matches an endpoint: the hostname is
+		// <cluster-hash>-<project-number>.<region>.gke.goog. Every other
+		// wildcard in this list needs exactly one label, so nothing here
+		// exercises the deeper shape — see TestFQDNPatternList_MatchesRealHostnames.
 		"*.gke.goog",
+		"*.*.gke.goog",
 		// Container & Artifact Registries (Plugin OCI images)
 		"gcr.io",
 		"*.gcr.io",
