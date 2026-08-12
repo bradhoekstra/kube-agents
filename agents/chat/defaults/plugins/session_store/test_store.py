@@ -152,6 +152,28 @@ class TestWriteThrough(SaltedTestCase):
         with self.assertLogs(store.logger, level="ERROR"):
             store.write_session_metadata("sess-1", {"session_id": "sess-1"})
 
+    def test_a_written_session_reads_back(self):
+        log_event_to_db(_event(), None, _SessionStore())
+        data = store.session_metadata("sess-1")
+        self.assertEqual(data["session_id"], "sess-1")
+        self.assertEqual(data["chat_id"], "spaces/AAA")
+
+    def test_an_unknown_session_reads_back_as_none(self):
+        self.assertIsNone(store.session_metadata("no-such-session"))
+
+    def test_a_purge_removes_that_user_and_leaves_the_others(self):
+        log_event_to_db(_event(), None, _SessionStore("sess-alice"))
+        log_event_to_db(_event(user_id="bob@example.com"), None, _SessionStore("sess-bob"))
+
+        self.assertEqual(store.purge_sessions_for_user(EMAIL), 1)
+        self.assertIsNone(store.session_metadata("sess-alice"))
+        self.assertIsNotNone(store.session_metadata("sess-bob"))
+
+    def test_a_purge_of_an_empty_address_removes_nothing(self):
+        log_event_to_db(_event(), None, _SessionStore())
+        self.assertEqual(store.purge_sessions_for_user(""), 0)
+        self.assertIsNotNone(store.session_metadata("sess-1"))
+
     def test_an_empty_session_id_writes_nothing(self):
         # Not even the database file: the early return happens before the
         # connection is opened.

@@ -171,6 +171,40 @@ class SessionMetadataStore:
                         raise
 
     @classmethod
+    def read(cls, session_id: str) -> Optional[Dict[str, Any]]:
+        """The metadata stored for one session, or None if there is none."""
+        with cls._lock:
+            conn = cls.get_db_connection()
+            row = conn.execute(
+                f"SELECT metadata FROM session_metadata WHERE session_id = '{session_id}'"
+            ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
+
+    @classmethod
+    def purge_user(cls, user_email_hash: str) -> int:
+        """Delete every session belonging to one user, returning the row count.
+
+        The hash is the same one `SessionMetadata` stores, so a deletion request
+        can be served without the plaintext address ever reaching this process.
+        """
+        conn = cls.get_db_connection()
+        rows = conn.execute("SELECT session_id, metadata FROM session_metadata").fetchall()
+        doomed = [
+            session_id
+            for session_id, payload in rows
+            if json.loads(payload).get("user_email_hash") == user_email_hash
+        ]
+        with cls._lock:
+            conn.executemany(
+                "DELETE FROM session_metadata WHERE session_id = ?",
+                [(session_id,) for session_id in doomed],
+            )
+            conn.commit()
+        return len(doomed)
+
+    @classmethod
     def _open_connection(cls, db_path: str) -> sqlite3.Connection:
         db_dir = os.path.dirname(db_path)
         if db_dir:
@@ -207,6 +241,35 @@ def write_session_metadata(session_id: str, metadata: Dict[str, Any]) -> None:
             exc,
             exc_info=True,
         )
+
+
+def session_metadata(session_id: str) -> Optional[Dict[str, Any]]:
+    """Read one session's metadata for the admin console."""
+    if not session_id:
+        return None
+
+    try:
+        return SessionMetadataStore.read(session_id)
+    except Exception as exc:
+        logger.error(
+            "Failed to read session metadata for session %s: %s",
+            session_id,
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+def purge_sessions_for_user(user_email: str) -> int:
+    """Serve a deletion request for one address, returning the sessions removed."""
+    if not user_email:
+        return 0
+
+    try:
+        return SessionMetadataStore.purge_user(AuditRedactor.hmac_hash(user_email))
+    except Exception as exc:
+        logger.error("Failed to purge sessions: %s", exc, exc_info=True)
+        return 0
 
 
 def log_event_to_db(
