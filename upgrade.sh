@@ -333,7 +333,11 @@ main() {
   local dns_helper="${repo_dir}/k8s-operator/scripts/gke_dns_endpoint.sh"
   GKE_DNS_ENDPOINT_FLAG=""
   if [ -f "$dns_helper" ]; then
+    # source= points -x runs at the real file; disable=SC1091 covers the bare
+    # `shellcheck upgrade.sh` that CI runs, where the directive locates the file
+    # but following it still needs -x, so the info-level finding fails the job.
     # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+    # shellcheck disable=SC1091
     source "$dns_helper"
     gke_dns_endpoint_flag "$target_cluster" "$target_region" "$target_project"
     if [ -n "$GKE_DNS_ENDPOINT_FLAG" ]; then
