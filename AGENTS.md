@@ -61,7 +61,8 @@ Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
   catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`. Edit the source, then run `make docs-generate`.
+  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
+  then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -77,7 +78,9 @@ Rules:
   with every other open pull request that adds a row. Write rows in the compact
   `| cell | cell |` form, never re-align, and never restate a count — the map states none, and
   `docs-check-map` fails on a row that grows a double space. A file that lands inside a collapsed
-  family row's glob (a new skill, SOP, or reference) needs no map edit at all.
+  family row's glob (a new skill, SOP, or reference) needs no map edit at all — run
+  `make docs-generate` instead, which re-snapshots `docs/family-roster.txt`. That roster is what
+  catches a family member being _deleted_, which no glob can see.
 
 Run `make docs-check` before pushing. It verifies generated regions are current, relative links
 resolve, identifiers match their source, and every Markdown document has an entry in the

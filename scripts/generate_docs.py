@@ -39,6 +39,11 @@ import re
 import sys
 from pathlib import Path
 
+# The family roster is derived from the same inventory globs the map checker
+# reads, so the two cannot disagree about what a family contains. Both modules
+# live in scripts/, which is sys.path[0] when either is run as a script.
+import check_docs_map
+
 REPO = Path(__file__).resolve().parent.parent
 
 # Every cron job lives in the Chat Agent's roster, because the `default`
@@ -53,6 +58,7 @@ SCRIPTS_DIR = REPO / "k8s-operator/scripts"
 CRON_PAGE = REPO / "docs/site/src/content/docs/reference/cron-jobs.md"
 SKILLS_PAGE = REPO / "docs/site/src/content/docs/skills/index.mdx"
 SCRIPTS_PAGE = SCRIPTS_DIR / "README.md"
+ROSTER_FILE = REPO / "docs/family-roster.txt"
 
 GITHUB_BLOB = "https://github.com/gke-labs/kube-agents/blob/main"
 
@@ -306,10 +312,61 @@ def gen_provisioning_steps() -> str:
     return "\n".join(out).rstrip()
 
 
+def gen_family_roster() -> str:
+    """Return the whole contents of the collapsed-family roster file.
+
+    The globs are read out of the map's own inventory rather than listed here,
+    so a new family row is rostered the moment it is added and the roster can
+    never cover a different set of rows than ``check_docs_map.py`` honours.
+    """
+    files = check_docs_map.tracked_docs()
+    text = check_docs_map.MAP.read_text(encoding="utf-8")
+
+    globs: set[str] = set()
+    for row in check_docs_map.inventory_rows(text):
+        path_cell = row.strip("|").split("|")[0]
+        for token in check_docs_map.TOKEN_RE.findall(path_cell):
+            if "*" in token and check_docs_map.looks_like_doc_path(token):
+                globs.add(token)
+
+    out = [line.rstrip() for line in ROSTER_HEADER.strip("\n").splitlines()]
+    for glob in sorted(globs):
+        out.append("")
+        out.append(glob)
+        for member in sorted(check_docs_map.matches(glob, files)):
+            out.append(f"  {member}")
+    return "\n".join(out) + "\n"
+
+
+ROSTER_HEADER = """
+# Collapsed-family roster -- generated, do not edit by hand.
+# Regenerate with: make docs-generate
+#
+# The documentation map (docs/README.md, section 4) collapses uniform families
+# of documents into a single inventory row whose path cell is a glob. Neither
+# check in check_docs_map.py can see a file DELETED from inside such a family:
+# the glob still matches the survivors, so the map still reads true while it
+# silently describes a document that no longer exists. This file is the
+# snapshot that makes the deletion visible -- `make docs-check` fails until it
+# is regenerated, and the removed path then shows up as a line in the pull
+# request's diff for a reviewer to notice.
+#
+# It lives outside the map on purpose. The map is this repository's most
+# merge-conflict-prone file and a family row deliberately characterises its
+# family rather than enumerating it; per-file churn belongs here, where a
+# conflict is resolved by re-running the generator rather than by hand.
+"""
+
 BLOCKS = {
     "cron-jobs": (CRON_PAGE, gen_cron_jobs),
     "skill-catalog": (SKILLS_PAGE, gen_skill_catalog),
     "provisioning-steps": (SCRIPTS_PAGE, gen_provisioning_steps),
+}
+
+# Generated artifacts that are a whole file rather than a region inside a
+# hand-written document, written verbatim from their generator.
+FILES = {
+    "family-roster": (ROSTER_FILE, gen_family_roster),
 }
 
 
@@ -378,9 +435,18 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    stale: list[str] = []
+    # (path, full new contents, changed, block id) for both kinds of target.
+    targets: list[tuple[Path, str, bool, str]] = []
     for block_id, (path, generator) in BLOCKS.items():
         changed, new_text = splice(path, block_id, generator())
+        targets.append((path, new_text, changed, block_id))
+    for block_id, (path, generator) in FILES.items():
+        new_text = generator()
+        old_text = path.read_text(encoding="utf-8") if path.exists() else None
+        targets.append((path, new_text, new_text != old_text, block_id))
+
+    stale: list[str] = []
+    for path, new_text, changed, block_id in targets:
         rel = path.relative_to(REPO)
         if not changed:
             print(f"  ok       {rel} [{block_id}]")

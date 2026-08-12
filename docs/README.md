@@ -51,6 +51,8 @@ kube-agents/
 ├── charts/                                        canonical Helm charts (kube-agents)
 ├── docs/                                          human documentation
 │   ├── README.md                                  this map
+│   ├── family-roster.txt                          GENERATED snapshot of every
+│   │                                              collapsed family's members
 │   ├── architecture/                              END-STATE spec set 01–08 + README
 │   ├── designs/                                   per-feature design documents
 │   ├── contributing.md, security-requirements.md,
@@ -77,23 +79,26 @@ Which file owns which category of content is defined once, in the
 canonical-home table in [`AGENTS.md`](../AGENTS.md) — do not duplicate a fact
 outside its home; link to it.
 
-Three documents contain regions that are **generated, not hand-written**.
-`scripts/generate_docs.py` (run via `make docs-generate`) rewrites everything
-between the markers; everything outside them is hand-written. Never edit
-inside the markers — edit the source and regenerate.
+Four artifacts are **generated, not hand-written** — three regions inside
+hand-written documents, plus one whole file. `scripts/generate_docs.py` (run
+via `make docs-generate`) rewrites everything between the markers; everything
+outside them is hand-written. Never edit inside the markers — edit the source
+and regenerate.
 
 <!-- prettier-ignore -->
-| File with generated region | Block marker | Source of truth |
+| Generated file or region | Block marker | Source of truth |
 | --- | --- | --- |
 | `docs/site/src/content/docs/reference/cron-jobs.md` | `<!-- BEGIN GENERATED: cron-jobs -->` | `agents/chat/defaults/cron/jobs.json` |
 | `docs/site/src/content/docs/skills/index.mdx` | `{/* BEGIN GENERATED: skill-catalog */}` (MDX comment syntax) | `name`/`description` frontmatter of every `agents/platform/skills/*/SKILL.md` and `agents/cluster/skills/*/SKILL.md` |
 | `k8s-operator/scripts/README.md` | `<!-- BEGIN GENERATED: provisioning-steps -->` | The comment banner in each `k8s-operator/scripts/provision_*.sh` / `teardown_*.sh` script |
+| `docs/family-roster.txt` | whole file (`family-roster`) | The collapsed-family globs in this map's section 4, resolved against `git ls-files` |
 
 CI enforcement: `make docs-check` runs the same checks as
 `.github/workflows/docs-check.yml` —
 
 - `docs-check-generated` — `scripts/generate_docs.py --check`; fails if a
-  generated region no longer matches its source.
+  generated region or file no longer matches its source. This is what catches a
+  document deleted from inside a collapsed family row's glob (see section 5).
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
   resolve to **git-tracked** targets.
 - `docs-check-terminology` — `hack/check-docs-terminology.sh`; identifiers in
@@ -184,7 +189,9 @@ pull request:
 - **A family row characterises its family; it is not a roster.** Adding a skill,
   an SOP, or a reference under an existing glob needs no edit here at all — the
   glob already covers it. Edit the row only when the family's character
-  changes.
+  changes. The per-file enumeration lives in the generated
+  [`family-roster.txt`](family-roster.txt); run `make docs-generate` to refresh
+  it.
 
 ### Repository root and repo meta
 
@@ -344,7 +351,8 @@ only what the title does not say.
 - This file is **hand-maintained**. When a PR adds, moves, renames, or deletes
   a Markdown document that no existing glob covers, update the tree and the
   inventory row in the same PR. A file that lands inside a collapsed family
-  needs nothing here.
+  needs nothing here — only `make docs-generate`, which re-snapshots the
+  roster.
 - **The edit a PR makes here should be the rows it actually adds — nothing
   else.** No count to bump, no column to re-align: a document-adding PR's diff
   against this file is normally a single inserted line, which is what lets two
@@ -356,10 +364,16 @@ only what the title does not say.
   inventory's path column no longer exists, or when a table row has been
   re-padded. It deliberately checks no counts — see section 1. The prose
   summaries, key-topic cells, and the identifier-sources table have no
-  mechanical guard either; PR review (and the drift skill) is the only check on
-  their honesty. In particular, nothing catches a file deleted from inside a
-  collapsed family, so a PR that removes one should say whether the row still
-  describes what is left.
+  mechanical guard; PR review (and the drift skill) is the only check on their
+  honesty.
+- **A file deleted from inside a collapsed family is caught by
+  [`family-roster.txt`](family-roster.txt), not by this file.** A glob keeps
+  matching its survivors, so the inventory row still reads true after one of
+  its documents disappears. The roster is the snapshot that notices:
+  `docs-check-generated` fails until it is regenerated, and the removed path
+  then appears as a deleted line in the PR diff. A PR that removes a family
+  member runs `make docs-generate` and says whether the row still describes
+  what is left.
 - The `review-docs-drift` skill in `.agents/skills/` consults this map to find
   which docs a code change should have updated, and checks the map itself for
   staleness — keep the summaries honest. CI's docs-freshness workflow
