@@ -50,9 +50,15 @@ resource "google_container_cluster" "autopilot" {
   # unreachable. allow_external_traffic is the field the agent's detection reads
   # before it passes `get-credentials --dns-endpoint`; see
   # k8s-operator/scripts/gke_dns_endpoint.sh.
+  #
+  # Kept as a variable rather than a literal true so that turning it off is a
+  # change to the configuration. Set out-of-band it would be drift, and the next
+  # apply would silently re-publish an endpoint the operator had closed -- the
+  # DNS endpoint is governed by IAM alone, so neither the private endpoint nor
+  # master-authorized-networks would have been holding it shut in the meantime.
   control_plane_endpoints_config {
     dns_endpoint_config {
-      allow_external_traffic = true
+      allow_external_traffic = var.allow_external_dns_traffic
     }
   }
 
