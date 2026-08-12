@@ -59,8 +59,10 @@ which can still be set individually. Changing it after a first run requires edit
 scripts warn when an export is ignored or a saved image no longer matches the prefix.
 
 The images this project does not build — LiteLLM, fluent-bit, the GitHub token minter,
-cert-manager — follow `THIRD_PARTY_REGISTRY_PREFIX`, which defaults to `REGISTRY_PREFIX` once
-that has been moved off the public default. Their upstream references and pins are resolved from
+cert-manager — follow `THIRD_PARTY_REGISTRY_PREFIX`, which is independent of `REGISTRY_PREFIX`:
+neither implies the other, so a fully mirrored install exports both, and setting only the first
+leaves these four upstream (the scripts warn when they see that combination, since it is also
+what a half-mirrored install looks like). Their upstream references and pins are resolved from
 `images.json` at the repository root (hence the `jq` prerequisite on steps 03, 09, and 10), not
 duplicated here, so the mirror `make mirror-images` populated and the install cannot ask for
 different versions. `LITELLM_IMAGE` (step 09) and `GITHUB_MINTER_IMAGE` (step 10) override the

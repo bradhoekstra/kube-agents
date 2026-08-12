@@ -137,6 +137,23 @@ undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.
 # the replay proxy is built here and follows REGISTRY_PREFIX.
 require-var = @test -n "$${$(1)}" || { echo "$(1) is not set. Export it, or run $(2), which resolves it from $(3)." >&2; exit 1; }
 
+# The two third-party images default to their upstream pin straight from the
+# inventory, so the documented manual sequences (INSTALL.md Step 5, README
+# below) keep working without exporting anything. `?=` means an export still
+# wins, and the provisioning scripts — which are the mirrored path, and know
+# about THIRD_PARTY_REGISTRY_PREFIX — always export. Resolving here rather than
+# hardcoding keeps images.json the only place either pin is written; if jq is
+# missing or the entry is gone the variable stays empty and require-var reports
+# it by name.
+IMAGES_JSON ?= $(CURDIR)/../images.json
+image_from_inventory = $(shell jq -r --arg n "$(1)" '.images[] | select(.name == $$n) | "\(.repository):\(.tag)"' "$(IMAGES_JSON)" 2>/dev/null)
+LITELLM_IMAGE ?= $(call image_from_inventory,litellm)
+GITHUB_MINTER_IMAGE ?= $(call image_from_inventory,github-token-minter-server)
+# The recipes read these through the shell (envsubst and require-var both want
+# them in the environment), which a plain make variable would not reach.
+export LITELLM_IMAGE
+export GITHUB_MINTER_IMAGE
+
 .PHONY: deploy-litellm
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	$(call require-var,LITELLM_IMAGE,scripts/provision_09_deploy_litellm.sh,images.json)

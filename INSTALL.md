@@ -203,17 +203,24 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
   make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 
   export REGISTRY_PREFIX=registry.example.com/kube-agents
+  export THIRD_PARTY_REGISTRY_PREFIX=registry.example.com/kube-agents
   make gcp-provision
   ```
 
   `make mirror-images` reads `images.json` at the repository root — the inventory of every image
-  an install pulls — and copies each one, keeping the trailing image name only. The prefix then
-  replaces `ghcr.io/gke-labs/kube-agents` as the default for the operator, agent, and
-  replay-proxy images, and (because a single-prefix mirror is the common case) for the LiteLLM
-  gateway, the fluent-bit sidecar, the GitHub token minter, and the cert-manager images too. Set
-  `THIRD_PARTY_REGISTRY_PREFIX` as well if those live under a different path. The individual
-  `OPERATOR_IMAGE`, `AGENT_IMAGE`, `REPLAY_IMAGE`, `LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE`
-  variables still win.
+  an install pulls — and copies each one, keeping the trailing image name only.
+
+  The two prefixes are separate because the images fall into two groups. `REGISTRY_PREFIX`
+  replaces `ghcr.io/gke-labs/kube-agents` for the images this project builds — the operator, the
+  agent, and the replay proxy. `THIRD_PARTY_REGISTRY_PREFIX` covers the ones it does not: the
+  LiteLLM gateway, the fluent-bit sidecar, the GitHub token minter, and cert-manager. **Neither
+  implies the other**, so an install that mirrors everything sets both, as above; set only the
+  first and the third-party images are still pulled from their upstream registries (the scripts
+  warn when they detect that combination). The individual `OPERATOR_IMAGE`, `AGENT_IMAGE`,
+  `REPLAY_IMAGE`, `LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE` variables still win over both.
+
+  The Helm chart differs here, deliberately: `global.thirdPartyImageRegistry` defaults to
+  `global.imageRegistry`, because that value is new and carries no existing meaning to preserve.
 
   See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
   inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild

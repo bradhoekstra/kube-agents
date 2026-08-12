@@ -243,10 +243,10 @@ init_var_registry_prefix() {
   # prefix too, so the remaining steps and later re-runs reuse it.
   save_var "REGISTRY_PREFIX" "$REGISTRY_PREFIX"
 
-  # Deliberately not prompted for: a single-prefix mirror is the common case
-  # and third_party_registry_prefix already follows REGISTRY_PREFIX there. Only
-  # an install that separates the two needs this, so it is export-only —
-  # persisted like every other knob once it has been given.
+  # Deliberately not prompted for: leaving third-party images upstream is the
+  # supported default, so a prompt would ask every installer to answer a
+  # question only a mirrored install has. Export-only — persisted like every
+  # other knob once it has been given.
   if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
     case "$THIRD_PARTY_REGISTRY_PREFIX" in
       *"://"*)
@@ -256,14 +256,16 @@ init_var_registry_prefix() {
     esac
     save_var "THIRD_PARTY_REGISTRY_PREFIX" "$THIRD_PARTY_REGISTRY_PREFIX"
   fi
+
+  warn_unmirrored_third_party
 }
 
 # ─── Third-party images ───────────────────────────────────────────────────────
 # Images an install pulls that this project does not build: the LiteLLM
 # gateway, the fluent-bit logging sidecar, the GitHub token minter, and
 # cert-manager. A mirror commonly keeps those under a different path from the
-# kube-agents images, so they get their own prefix; with only REGISTRY_PREFIX
-# set they follow it.
+# kube-agents images, and an install may mirror one set without the other, so
+# they get their own prefix rather than sharing REGISTRY_PREFIX.
 #
 # Their upstream references and pins live in images.json at the repo root — the
 # same file `make mirror-images` copies from — so the pin the mirror was
@@ -273,17 +275,33 @@ init_var_registry_prefix() {
 IMAGES_JSON="${IMAGES_JSON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)/images.json}"
 
 # The prefix third-party images resolve under, or empty for "leave them
-# upstream". An explicit THIRD_PARTY_REGISTRY_PREFIX always wins; otherwise a
-# REGISTRY_PREFIX that has been moved off the public default carries them too,
-# since a single-prefix mirror is the common case. The public default itself
-# never does — ghcr.io/gke-labs/kube-agents does not host LiteLLM.
+# upstream". Set by THIRD_PARTY_REGISTRY_PREFIX and by nothing else.
+#
+# Deliberately not inherited from REGISTRY_PREFIX. That variable predates this
+# inventory and has always meant "the registry holding the images this project
+# builds"; a mirror populated to it holds those four and nothing more. Widening
+# it to cert-manager, LiteLLM, fluent-bit and the token minter would redirect an
+# existing install to references its mirror was never given — cert-manager first,
+# where the wait in execute_cert_manager times out on ImagePullBackOff with the
+# cluster already created. A single-prefix mirror is still one export away; it is
+# just no longer assumed. warn_unmirrored_third_party below says so at the point
+# the assumption used to fire.
 third_party_registry_prefix() {
   local prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
-  if [ -z "$prefix" ]; then
-    prefix="$(registry_prefix)"
-    [ "$prefix" = "$DEFAULT_REGISTRY_PREFIX" ] && prefix=""
-  fi
   echo "${prefix%/}"
+}
+
+# Warn once when a custom REGISTRY_PREFIX is set but third-party images are
+# still resolving upstream. That combination is legitimate — it is what every
+# pre-inventory install did — but it is also what a user who expected one
+# prefix to cover everything would see, and the symptom otherwise arrives much
+# later as a pull from a registry they thought they had left behind.
+warn_unmirrored_third_party() {
+  local prefix
+  prefix="$(registry_prefix)"
+  [ "$prefix" = "$DEFAULT_REGISTRY_PREFIX" ] && return 0
+  [ -n "$(third_party_registry_prefix)" ] && return 0
+  print_warning "REGISTRY_PREFIX is '${prefix}', but cert-manager, LiteLLM, fluent-bit and the GitHub token minter will still be pulled from their upstream registries. Export THIRD_PARTY_REGISTRY_PREFIX (commonly the same value) to mirror those too — see 'make mirror-images'."
 }
 
 # Resolve a third-party image by its images.json name: the upstream reference

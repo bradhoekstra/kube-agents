@@ -169,14 +169,24 @@ Destinations keep the trailing image name only, so
 
 ### 2. Point the install at it
 
-Pick the row for how you install; each sets both prefixes, with the third-party one defaulting to
-the first.
+Pick the row for how you install. Each has two prefixes: one for the images this project builds,
+one for the images it does not (LiteLLM, fluent-bit, the GitHub token minter, cert-manager).
 
-| Install path                      | Set                                                                 |
-| --------------------------------- | ------------------------------------------------------------------- |
-| Provisioning scripts              | `REGISTRY_PREFIX`, optionally `THIRD_PARTY_REGISTRY_PREFIX`         |
-| Helm chart                        | `global.imageRegistry`, optionally `global.thirdPartyImageRegistry` |
-| Terraform `examples/full-install` | `image_registry`, optionally `third_party_image_registry`           |
+| Install path                      | First-party            | Third party                      | If the second is unset              |
+| --------------------------------- | ---------------------- | -------------------------------- | ----------------------------------- |
+| Provisioning scripts              | `REGISTRY_PREFIX`      | `THIRD_PARTY_REGISTRY_PREFIX`    | those images stay upstream          |
+| Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | falls back to the first-party value |
+| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value |
+
+The last column is the one asymmetry in this page, and it is deliberate. `REGISTRY_PREFIX`
+shipped long before this inventory and has always meant "the registry holding the images this
+project builds" — a mirror populated against it holds those and nothing else, so inheriting it
+would send an existing install after cert-manager images its registry was never given, and
+provisioning would fail on ImagePullBackOff with the cluster already created. The chart and
+Terraform values are new in comparison and carry no such promise, so they take the safer default
+of covering everything. To mirror everything from the scripts, set both prefixes — usually to the
+same value. The scripts print a warning if `REGISTRY_PREFIX` is customised while the third-party
+one is not, because that is also what a half-mirrored install looks like.
 
 `REGISTRY_PREFIX` is persisted to the scripts' state file (`vars.sh`) like every other knob, so
 re-runs reuse it; the individual `OPERATOR_IMAGE`, `AGENT_IMAGE`, `REPLAY_IMAGE`,
