@@ -10,6 +10,7 @@ the cluster that proved passing the flag blindly yields a kubeconfig which 403s.
 
 import io
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -63,12 +64,13 @@ class FakeRunner:
         self.describe = describe
         self.help_text = help_text
         self.describe_exit = describe_exit
+        self.help_exit = 0
         self.calls: list[list[str]] = []
 
     def __call__(self, argv):
         self.calls.append(argv)
         if "--help" in argv:
-            return 0, self.help_text
+            return self.help_exit, ("" if self.help_exit else self.help_text)
         if "describe" in argv:
             if self.describe_exit != 0:
                 return self.describe_exit, ""
@@ -161,6 +163,44 @@ class GcloudSupportTest(unittest.TestCase):
             gke_endpoint.dns_endpoint_args("p", "c2", "us-central1", run=runner)
         self.assertEqual(len([c for c in runner.calls if "--help" in c]), 1)
 
+    def test_a_probe_that_could_not_run_is_retried_rather_than_memoised(self):
+        """Only gcloud's answer is worth keeping, never our failure to get one.
+
+        The credential proxy is a daemon. A probe that failed once — the fork
+        lost a race, the binary was mid-upgrade — cached as "unsupported" would
+        switch the endpoint detection off for the life of the pod.
+        """
+        attempts = []
+
+        def runner(argv):
+            if "--help" in argv:
+                attempts.append(argv)
+                if len(attempts) == 1:
+                    raise OSError("Resource temporarily unavailable")
+                return 0, HELP_WITH_FLAG
+            return 0, json.dumps(DNS_EXTERNAL)
+
+        gke_endpoint.reset_cache()
+        with redirect_stderr(io.StringIO()):
+            first = gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner)
+            second = gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner)
+        self.assertEqual(first, [])
+        self.assertEqual(second, ["--dns-endpoint"])
+        self.assertEqual(len(attempts), 2)
+
+    def test_a_probe_that_exits_nonzero_is_not_taken_as_unsupported(self):
+        runner = FakeRunner(DNS_EXTERNAL)
+        runner.help_exit = 1
+        gke_endpoint.reset_cache()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
+        runner.help_exit = 0
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
+                ["--dns-endpoint"],
+            )
+
 
 class CacheTest(unittest.TestCase):
     def test_same_cluster_is_described_once(self):
@@ -181,6 +221,33 @@ class CacheTest(unittest.TestCase):
             gke_endpoint.dns_endpoint_args("p", "c", "europe-west1", run=runner)
         self.assertEqual(len(runner.describe_calls), 2)
 
+    def test_a_failed_describe_is_retried_rather_than_cached(self):
+        """"Could not find out" must not be remembered as "no".
+
+        Caching it pinned a cluster to its IP endpoint for the life of the
+        process, so a describe that failed once — a transient API error, or a
+        request the credential proxy rejected before the profile's kubeconfig
+        existed — outlived its cause by the lifetime of the pod.
+        """
+        runner = FakeRunner(DNS_EXTERNAL, describe_exit=1)
+        gke_endpoint.reset_cache()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
+            runner.describe_exit = 0
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
+                ["--dns-endpoint"],
+            )
+        self.assertEqual(len(runner.describe_calls), 2)
+
+    def test_a_definite_no_is_still_cached(self):
+        runner = FakeRunner(DNS_INTERNAL_ONLY)
+        gke_endpoint.reset_cache()
+        with redirect_stderr(io.StringIO()):
+            gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner)
+            gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner)
+        self.assertEqual(len(runner.describe_calls), 1)
+
     def test_caller_cannot_mutate_the_cached_answer(self):
         runner = FakeRunner(DNS_EXTERNAL)
         gke_endpoint.reset_cache()
@@ -199,6 +266,55 @@ class DescribeCommandTest(unittest.TestCase):
         self.assertEqual(argv[:5], ["gcloud", "container", "clusters", "describe", "clus"])
         self.assertIn("--location=europe-west1", argv)
         self.assertIn("--project=proj", argv)
+
+
+class RunnerEnvironmentTest(unittest.TestCase):
+    """The default runner must not hand gcloud a KUBECONFIG.
+
+    In the agent container `gcloud` is the credential-proxy shim, and the shim
+    forwards `$KUBECONFIG` on every gcloud call. `describe` is not
+    `get-credentials`, so the proxy resolves that path through `_target_of`,
+    which stats the file and returns HTTP 400 when it is missing. Both callers
+    pass the kubeconfig their `get-credentials` is about to *create*, so it is
+    reliably missing — which made the describe fail every time and the whole
+    detection a constant "no flag" inside the pod.
+    """
+
+    def _env_seen_by_gcloud(self, passed_env):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs["env"])
+            return subprocess.CompletedProcess(argv, 0, stdout=HELP_WITH_FLAG, stderr="")
+
+        gke_endpoint.reset_cache()
+        original = gke_endpoint.subprocess.run
+        gke_endpoint.subprocess.run = fake_run
+        try:
+            with redirect_stderr(io.StringIO()):
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", env=passed_env)
+        finally:
+            gke_endpoint.subprocess.run = original
+        return seen
+
+    def test_kubeconfig_is_stripped_from_a_caller_supplied_env(self):
+        seen = self._env_seen_by_gcloud(
+            {"HOME": "/tmp", "KUBECONFIG": "/opt/data/home/does-not-exist-yet.yaml"}
+        )
+        self.assertNotIn("KUBECONFIG", seen)
+        self.assertEqual(seen.get("HOME"), "/tmp")
+
+    def test_kubeconfig_is_stripped_from_the_inherited_environment(self):
+        original = os.environ.get("KUBECONFIG")
+        os.environ["KUBECONFIG"] = "/nowhere/kubeconfig.yaml"
+        try:
+            seen = self._env_seen_by_gcloud(None)
+        finally:
+            if original is None:
+                del os.environ["KUBECONFIG"]
+            else:
+                os.environ["KUBECONFIG"] = original
+        self.assertNotIn("KUBECONFIG", seen)
 
 
 if __name__ == "__main__":

@@ -510,14 +510,13 @@ cluster_exists() {
 
 connect_cluster() {
   print_info "Fetching cluster credentials..."
-  local dns_flag
-  dns_flag=$(gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID")
-  if [ -n "$dns_flag" ]; then
+  gke_dns_endpoint_flag "$CLUSTER_NAME" "$REGION" "$PROJECT_ID"
+  if [ -n "$GKE_DNS_ENDPOINT_FLAG" ]; then
     print_info "Cluster '$CLUSTER_NAME' publishes an external DNS endpoint; using it."
   fi
   # Unquoted on purpose: empty must contribute no argument at all.
   # shellcheck disable=SC2086
-  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet $dns_flag
+  gcloud container clusters get-credentials "$CLUSTER_NAME" --location "$REGION" --project "$PROJECT_ID" --quiet $GKE_DNS_ENDPOINT_FLAG
 }
 
 ensure_k8s_resource_exists() {

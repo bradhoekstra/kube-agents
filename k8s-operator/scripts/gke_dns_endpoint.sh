@@ -48,15 +48,27 @@ gke_supports_dns_endpoint() {
 
 # gke_dns_endpoint_flag <cluster> <location> <project>
 #
-# Echoes "--dns-endpoint" when the cluster publishes a DNS endpoint that accepts
-# external traffic, and nothing otherwise. Callers splice the result in unquoted
-# so that the empty case contributes no argument at all.
+# Sets GKE_DNS_ENDPOINT_FLAG to "--dns-endpoint" when the cluster publishes a DNS
+# endpoint that accepts external traffic, and to the empty string otherwise.
+# Callers splice $GKE_DNS_ENDPOINT_FLAG in unquoted so that the empty case
+# contributes no argument at all.
+#
+# It assigns rather than echoing so that the memo above can work. Called as
+# `$(gke_dns_endpoint_flag ...)` the function runs in a subshell, which discards
+# every variable it sets, and each re-run pays gcloud's ~2s start-up for a help
+# text whose answer cannot have changed. Assigning keeps the function in the
+# caller's shell, so a script that connects to several clusters -- the staging
+# workload scripts loop over a map of them -- probes once rather than once per
+# cluster.
 #
 # Never fails the caller. A cluster that cannot be described -- no permission, no
 # network, a name that does not exist -- yields the empty string, which is the
 # command that ran before this helper existed. Reaching an ordinary public
 # cluster must not become contingent on an extra API call succeeding.
+#
+# shellcheck disable=SC2034  # GKE_DNS_ENDPOINT_FLAG is read by the callers, not here.
 gke_dns_endpoint_flag() {
+  GKE_DNS_ENDPOINT_FLAG=""
   local cluster=$1 location=$2 project=$3
   [ -n "$cluster" ] && [ -n "$location" ] && [ -n "$project" ] || return 0
   gke_supports_dns_endpoint || return 0
@@ -70,9 +82,19 @@ gke_dns_endpoint_flag() {
   fi
   # value() emits the two fields tab-separated, and renders the boolean as
   # True/False. A field GKE did not set comes back empty.
+  #
+  # A row with no separator at all is not the two-field answer that format asked
+  # for, so treat it as unknown. Without this the suffix expansion below returns
+  # the whole line when it finds no tab, and a lone "True" would read as both a
+  # non-empty endpoint and an allowExternalTraffic of True -- this predicate
+  # failing open, in the one file whose every other branch fails closed.
+  case $described in
+    *$'\t'*) ;;
+    *) return 0 ;;
+  esac
   endpoint=${described%%$'\t'*}
   external=${described#*$'\t'}
   if [ -n "$endpoint" ] && [ "$external" = "True" ]; then
-    echo "--dns-endpoint"
+    GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"
   fi
 }

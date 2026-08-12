@@ -42,6 +42,11 @@ DNS_ENDPOINT_FLAG = "--dns-endpoint"
 # process: a cluster's endpoint configuration is a day-0/day-2 setting, and the
 # installed gcloud cannot grow a flag while we run. Both caches are per-process,
 # so a restart re-reads them.
+#
+# Only answers gcloud actually gave are stored. A describe that failed, or a
+# help probe that could not run, is retried on the next call: the credential
+# proxy is a daemon, and "we could not find out" remembered as "no" would
+# outlive its cause by the lifetime of the pod.
 _endpoint_cache: dict[tuple[str, str, str], list[str]] = {}
 _support_cache: bool | None = None
 
@@ -54,6 +59,26 @@ def _log(message: str) -> None:
 
 
 def _default_runner(env: dict[str, str] | None, timeout: int) -> Runner:
+    """Run gcloud, deliberately without a KUBECONFIG.
+
+    Both commands this module runs — `clusters describe` and `get-credentials
+    --help` — talk to the GKE API and read no kubeconfig, so dropping the
+    variable costs nothing. It is dropped rather than merely unused because in
+    the agent container `gcloud` is the credential-proxy shim, which forwards
+    `$KUBECONFIG` on *every* gcloud call (`credential_proxy_client.py`,
+    `KUBECONFIG_AWARE`). `describe` is not `get-credentials`, so the proxy takes
+    its read path and resolves that path through `_target_of`, which stats the
+    file and rejects the request with HTTP 400 if it is not there.
+
+    Every caller here passes the kubeconfig that the `get-credentials` being
+    assembled is about to *create*, so it is reliably absent — forwarding it
+    turned the describe into a guaranteed 400 and the detection into a constant
+    "no flag". Callers may keep passing their own `env`; this strips the one key
+    that must not travel.
+    """
+    base = env if env is not None else {**os.environ, "HOME": "/tmp"}
+    scrubbed = {key: value for key, value in base.items() if key != "KUBECONFIG"}
+
     def run(argv: list[str]) -> tuple[int, str]:
         completed = subprocess.run(
             argv,
@@ -61,7 +86,7 @@ def _default_runner(env: dict[str, str] | None, timeout: int) -> Runner:
             text=True,
             timeout=timeout,
             check=False,
-            env=env if env is not None else {**os.environ, "HOME": "/tmp"},
+            env=scrubbed,
         )
         return completed.returncode, completed.stdout
     return run
@@ -87,11 +112,17 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
             ["gcloud", "container", "clusters", "get-credentials", "--help"]
         )
     except (OSError, subprocess.SubprocessError) as error:
+        # Not cached: this says the probe could not run, not that the flag is
+        # absent. A transient failure remembered here would disable the endpoint
+        # detection for the rest of a long-lived process.
         _log(f"could not probe gcloud for {DNS_ENDPOINT_FLAG} support ({error}); assuming absent")
-        _support_cache = False
         return False
 
-    _support_cache = exit_code == 0 and DNS_ENDPOINT_FLAG in stdout
+    if exit_code != 0:
+        _log(f"probing gcloud for {DNS_ENDPOINT_FLAG} support exited {exit_code}; assuming absent")
+        return False
+
+    _support_cache = DNS_ENDPOINT_FLAG in stdout
     if not _support_cache:
         _log(f"the installed gcloud does not offer {DNS_ENDPOINT_FLAG}; using the IP endpoint")
     return _support_cache
@@ -140,6 +171,10 @@ def dns_endpoint_args(
     older gcloud — falls back to the empty list, which is exactly the command
     every caller ran before this module existed. Reaching a perfectly ordinary
     public cluster must not become contingent on an extra API call succeeding.
+
+    `env` is used for the gcloud subprocess, minus `KUBECONFIG`, which is
+    dropped for the reason `_default_runner` explains. Pass `run` instead to
+    execute gcloud somewhere else entirely, as the credential proxy does.
     """
     if not (project and cluster and location):
         return []
@@ -149,21 +184,29 @@ def dns_endpoint_args(
         return list(_endpoint_cache[key])
 
     runner = run or _default_runner(env, _DESCRIBE_TIMEOUT_SECONDS)
-    decision: list[str] = []
 
-    if gcloud_supports_dns_endpoint(runner):
-        described = _describe(project, cluster, location, runner)
-        if described is not None:
-            dns = (
-                described.get("controlPlaneEndpointsConfig", {})
-                .get("dnsEndpointConfig", {})
-            )
-            # `allowExternalTraffic` absent is a no, not a maybe: clusters
-            # predating the DNS endpoint omit the whole block, and the flag
-            # fails against them.
-            if dns.get("endpoint") and dns.get("allowExternalTraffic") is True:
-                decision = [DNS_ENDPOINT_FLAG]
+    if not gcloud_supports_dns_endpoint(runner):
+        return []
 
+    described = _describe(project, cluster, location, runner)
+    if described is None:
+        # Only a definite answer is worth remembering. "We could not find out"
+        # cached as "no" outlives whatever caused it: the credential proxy is a
+        # daemon, so one failed describe would pin a cluster to its IP endpoint
+        # until the pod restarts, long after the describe would have succeeded.
+        return []
+
+    dns = (
+        described.get("controlPlaneEndpointsConfig", {})
+        .get("dnsEndpointConfig", {})
+    )
+    # `allowExternalTraffic` absent is a no, not a maybe: clusters predating the
+    # DNS endpoint omit the whole block, and the flag fails against them.
+    decision = (
+        [DNS_ENDPOINT_FLAG]
+        if dns.get("endpoint") and dns.get("allowExternalTraffic") is True
+        else []
+    )
     _endpoint_cache[key] = decision
     return list(decision)
 
