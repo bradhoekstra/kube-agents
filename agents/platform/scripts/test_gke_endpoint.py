@@ -14,7 +14,7 @@ import os
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stderr
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -81,6 +81,22 @@ class FakeRunner:
     @property
     def describe_calls(self):
         return [c for c in self.calls if "describe" in c]
+
+
+@contextmanager
+def expired_cache():
+    """Run with every memoised endpoint answer already past its window.
+
+    A zero TTL rather than a fake clock: the module reads `time.monotonic()`
+    directly, and the property under test is "an answer older than the window is
+    re-read", which a window of zero states without a second mechanism to trust.
+    """
+    original = gke_endpoint._ENDPOINT_TTL_SECONDS
+    gke_endpoint._ENDPOINT_TTL_SECONDS = 0.0
+    try:
+        yield
+    finally:
+        gke_endpoint._ENDPOINT_TTL_SECONDS = original
 
 
 def decide(runner, project="p", cluster="c", location="us-central1"):
@@ -240,13 +256,73 @@ class CacheTest(unittest.TestCase):
             )
         self.assertEqual(len(runner.describe_calls), 2)
 
-    def test_a_definite_no_is_still_cached(self):
+    def test_a_definite_no_is_cached_for_the_window(self):
         runner = FakeRunner(DNS_INTERNAL_ONLY)
         gke_endpoint.reset_cache()
         with redirect_stderr(io.StringIO()):
             gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner)
             gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner)
         self.assertEqual(len(runner.describe_calls), 1)
+
+    def test_the_answer_is_re_read_once_it_expires(self):
+        """The remedy this repository documents has to be able to take effect.
+
+        The `gke-networking` footer tells the agent to run `clusters update
+        --enable-dns-access` when a cluster's endpoint refuses external traffic,
+        and the MCP server and the credential proxy both outlive any number of
+        such changes. An answer kept for the life of the process would make the
+        remedy look like it did nothing.
+        """
+        runner = FakeRunner(DNS_INTERNAL_ONLY)
+        gke_endpoint.reset_cache()
+        with expired_cache(), redirect_stderr(io.StringIO()):
+            self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
+            runner.describe = DNS_EXTERNAL  # the operator ran --enable-dns-access
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
+                ["--dns-endpoint"],
+            )
+        self.assertEqual(len(runner.describe_calls), 2)
+
+    def test_the_reverse_change_is_picked_up_too(self):
+        # --no-enable-dns-access, the reversal. Keeping the flag past it means a
+        # kubeconfig whose every request comes back 403.
+        runner = FakeRunner(DNS_EXTERNAL)
+        gke_endpoint.reset_cache()
+        with expired_cache(), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
+                ["--dns-endpoint"],
+            )
+            runner.describe = DNS_INTERNAL_ONLY
+            self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
+
+    def test_a_failed_refresh_serves_the_answer_gcloud_last_gave(self):
+        """Expiry must not turn a transient error into a downgrade.
+
+        Falling back to `[]` here would be the failure mistaken for a
+        configuration: a cluster reachable only over its DNS endpoint would get
+        an IP-endpoint kubeconfig it cannot route to, because one describe
+        happened to fail after the window closed.
+        """
+        runner = FakeRunner(DNS_EXTERNAL)
+        gke_endpoint.reset_cache()
+        with expired_cache(), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
+                ["--dns-endpoint"],
+            )
+            runner.describe_exit = 1
+            self.assertEqual(
+                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner),
+                ["--dns-endpoint"],
+            )
+            # The stale entry keeps its timestamp, so the next call retries
+            # rather than waiting out a second window.
+            runner.describe_exit = 0
+            runner.describe = DNS_INTERNAL_ONLY
+            self.assertEqual(gke_endpoint.dns_endpoint_args("p", "c", "us-central1", run=runner), [])
+        self.assertEqual(len(runner.describe_calls), 3)
 
     def test_caller_cannot_mutate_the_cached_answer(self):
         runner = FakeRunner(DNS_EXTERNAL)

@@ -270,7 +270,11 @@ Consequences:
 - A cache miss costs one `get-credentials`, preceded by one
   `clusters describe` to decide whether the control plane should be reached
   over its DNS endpoint. The common paths warm the cache themselves, since
-  profile scaffolding and context switching both begin with that command.
+  profile scaffolding and context switching both begin with that command. That
+  describe is memoised per cluster for a minute rather than for the life of the
+  sidecar: the endpoint can be opened or closed on a running cluster, and the
+  proxy is a daemon that would otherwise keep acting on the configuration it
+  first saw.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the sidecar with

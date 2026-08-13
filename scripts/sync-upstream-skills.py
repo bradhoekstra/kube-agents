@@ -88,7 +88,8 @@ setting on.
 The Platform Agent's own tooling makes this decision per cluster in
 `/opt/data/scripts/gke_endpoint.py`, so `switch_kube_context` and the Cluster Agent profile
 scaffolding already pass the flag exactly when it applies; the check above is for the times you
-run `get-credentials` by hand.
+run `get-credentials` by hand. That decision is re-read about once a minute per cluster, so after
+enabling the setting, wait a moment before retrying rather than concluding it did not work.
 """,
 }
 

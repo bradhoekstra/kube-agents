@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from typing import Callable
 
 # (exit_code, stdout) — narrow enough that the credential proxy can satisfy it by
@@ -38,16 +39,33 @@ Runner = Callable[[list[str]], "tuple[int, str]"]
 
 DNS_ENDPOINT_FLAG = "--dns-endpoint"
 
-# gcloud is slow to start and neither answer changes within the life of a
-# process: a cluster's endpoint configuration is a day-0/day-2 setting, and the
-# installed gcloud cannot grow a flag while we run. Both caches are per-process,
-# so a restart re-reads them.
+# gcloud is slow to start, so both answers are memoised — but only one of them
+# keeps for the life of the process. The installed gcloud cannot grow a flag
+# while we run, so its answer is remembered outright.
+#
+# A cluster's endpoint configuration can change under us, and this repository
+# ships the instruction to change it: the `gke-networking` footer in
+# `scripts/sync-upstream-skills.py` tells the agent that `clusters update
+# --enable-dns-access` is the remedy for a closed endpoint, and the reverse is
+# `--no-enable-dns-access`. Two of the three callers are long-lived — the MCP
+# server and the credential proxy — so an answer kept for the life of the
+# process outlasts the setting it describes: the documented remedy would appear
+# to do nothing, and its reversal would keep the flag pointed at a control plane
+# that has started answering 403. The endpoint answer therefore expires. The
+# window is short enough that a change made by hand takes effect on the next
+# call or two, and long enough that a burst of tool calls against one cluster
+# still costs a single describe.
 #
 # Only answers gcloud actually gave are stored. A describe that failed, or a
 # help probe that could not run, is retried on the next call: the credential
 # proxy is a daemon, and "we could not find out" remembered as "no" would
-# outlive its cause by the lifetime of the pod.
-_endpoint_cache: dict[tuple[str, str, str], list[str]] = {}
+# outlive its cause by the lifetime of the pod. For the same reason an expired
+# entry whose refresh fails is served rather than discarded — it is still the
+# last thing gcloud said about that cluster, so a transient error cannot demote
+# a cluster that was reachable a minute ago to an IP endpoint it may not have.
+_ENDPOINT_TTL_SECONDS = 60.0
+# key -> (monotonic time the answer was read, decision)
+_endpoint_cache: dict[tuple[str, str, str], tuple[float, list[str]]] = {}
 _support_cache: bool | None = None
 
 _DESCRIBE_TIMEOUT_SECONDS = 30
@@ -172,6 +190,10 @@ def dns_endpoint_args(
     every caller ran before this module existed. Reaching a perfectly ordinary
     public cluster must not become contingent on an extra API call succeeding.
 
+    The answer is remembered per cluster for `_ENDPOINT_TTL_SECONDS` and then
+    re-read, so enabling or disabling the DNS endpoint on a live cluster takes
+    effect in a process that never restarts.
+
     `env` is used for the gcloud subprocess, minus `KUBECONFIG`, which is
     dropped for the reason `_default_runner` explains. Pass `run` instead to
     execute gcloud somewhere else entirely, as the credential proxy does.
@@ -180,8 +202,9 @@ def dns_endpoint_args(
         return []
 
     key = (project, cluster, location)
-    if key in _endpoint_cache:
-        return list(_endpoint_cache[key])
+    cached = _endpoint_cache.get(key)
+    if cached is not None and time.monotonic() - cached[0] < _ENDPOINT_TTL_SECONDS:
+        return list(cached[1])
 
     runner = run or _default_runner(env, _DESCRIBE_TIMEOUT_SECONDS)
 
@@ -194,7 +217,12 @@ def dns_endpoint_args(
         # cached as "no" outlives whatever caused it: the credential proxy is a
         # daemon, so one failed describe would pin a cluster to its IP endpoint
         # until the pod restarts, long after the describe would have succeeded.
-        return []
+        #
+        # A stale entry survives a failed refresh, timestamp untouched, so the
+        # next call retries rather than waiting out another window. Serving it
+        # beats falling back to "no": it is gcloud's own last answer, where "no"
+        # would be this failure mistaken for a configuration.
+        return list(cached[1]) if cached is not None else []
 
     dns = (
         described.get("controlPlaneEndpointsConfig", {})
@@ -207,7 +235,7 @@ def dns_endpoint_args(
         if dns.get("endpoint") and dns.get("allowExternalTraffic") is True
         else []
     )
-    _endpoint_cache[key] = decision
+    _endpoint_cache[key] = (time.monotonic(), decision)
     return list(decision)
 
 
