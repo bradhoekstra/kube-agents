@@ -99,6 +99,17 @@ agent fails every GCP call until an equivalent set exists). Deliberately no
 admin list is pre-staged in `terraform.tfvars.example` — widening access
 should be an explicit, reviewed choice.
 
+### Reaching the control plane (`allow_external_dns_traffic`)
+
+`allow_external_dns_traffic` (default `false`) is passed to the `gke-cluster`
+module and decides whether the cluster's DNS-based control plane endpoint
+serves traffic from outside the VPC. Set it to `true` for a cluster a Platform
+Agent running elsewhere has to reach; leave it alone for a cluster that should
+stay VPC-only. The default is `false` so that applying an existing root after
+upgrading does not publish an endpoint on a cluster that has none — see the
+[module README](../../modules/gke-cluster/README.md) for why that endpoint is
+not covered by master-authorized-networks.
+
 ### Google Chat and GitHub integrations
 
 With `enable_google_chat = true` the composition provisions the GCP backend

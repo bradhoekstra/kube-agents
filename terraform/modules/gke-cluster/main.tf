@@ -44,18 +44,26 @@ resource "google_container_cluster" "autopilot" {
     channel = var.release_channel
   }
 
-  # Publish the DNS-based control plane endpoint and let it serve traffic from
-  # outside the VPC. The Platform Agent reaches fleet clusters from wherever it
-  # runs, and a cluster with only an IP endpoint it cannot route to is
-  # unreachable. allow_external_traffic is the field the agent's detection reads
-  # before it passes `get-credentials --dns-endpoint`; see
+  # Whether the DNS-based control plane endpoint serves traffic from outside the
+  # VPC. The Platform Agent reaches fleet clusters from wherever it runs, and a
+  # cluster with only an IP endpoint it cannot route to is unreachable.
+  # allow_external_traffic is the field the agent's detection reads before it
+  # passes `get-credentials --dns-endpoint`; see
   # k8s-operator/scripts/gke_dns_endpoint.sh.
   #
-  # Kept as a variable rather than a literal true so that turning it off is a
-  # change to the configuration. Set out-of-band it would be drift, and the next
-  # apply would silently re-publish an endpoint the operator had closed -- the
-  # DNS endpoint is governed by IAM alone, so neither the private endpoint nor
-  # master-authorized-networks would have been holding it shut in the meantime.
+  # Defaults to false, matching GKE's own default and the value every cluster
+  # this module already manages is sitting at. The module did not set this block
+  # before, so defaulting to true would have made the next apply of an existing
+  # root publish an externally reachable control plane on a cluster whose
+  # operator never asked for one -- and this endpoint is governed by IAM alone,
+  # so neither the private endpoint nor master-authorized-networks would be
+  # holding it shut. Opting in is therefore a deliberate edit to the caller's
+  # configuration; the gcloud path (provision_01_gcp_cluster.sh) enables it on
+  # create only, for the same reason.
+  #
+  # Once set either way the field is Terraform-managed, so change it here rather
+  # than with `gcloud container clusters update`: out-of-band it is drift that
+  # the next apply reverts.
   control_plane_endpoints_config {
     dns_endpoint_config {
       allow_external_traffic = var.allow_external_dns_traffic

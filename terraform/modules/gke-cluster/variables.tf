@@ -25,9 +25,9 @@ variable "deletion_protection" {
 }
 
 variable "allow_external_dns_traffic" {
-  description = "Whether the DNS-based control plane endpoint serves traffic from outside the VPC. The Platform Agent's endpoint detection reads this field; set it false for a cluster that should only be reachable from inside the VPC, and the agent falls back to the IP endpoint on its own."
+  description = "Whether the DNS-based control plane endpoint serves traffic from outside the VPC. The Platform Agent's endpoint detection reads this field, and without it a cluster the agent cannot route to over its IP endpoint is unreachable. Defaults to false — GKE's own default, and the value every cluster this module already manages is at — so that upgrading the module does not publish an endpoint on an existing cluster; set it true for a cluster the agent must reach from outside the VPC."
   type        = bool
-  default     = true
+  default     = false
 }
 
 variable "release_channel" {

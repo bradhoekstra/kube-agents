@@ -26,6 +26,11 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # namespace           = "kubeagents-system"  # leave as-is: the agent's model
 #                                             # gateway endpoint is hard-wired
 #                                             # to kubeagents-system
+#
+# Publish the cluster's DNS-based control plane endpoint to traffic from
+# outside the VPC, for a cluster a Platform Agent running elsewhere has to
+# reach. Off by default; see the README before turning it on.
+# allow_external_dns_traffic = true
 
 # Optional Google Chat backend (Pub/Sub topic + subscription, Chat APIs);
 # the CR's googleChat integration is wired to the created topic/subscription
