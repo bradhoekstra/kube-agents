@@ -469,7 +469,7 @@ and what pull request sits on its branch. Nothing is stored between runs.
 | State                | Rendered as                           | Meaning                                    | What the harness does                                        |
 | -------------------- | ------------------------------------- | ------------------------------------------ | ------------------------------------------------------------ |
 | `open`               | `open`                                | Reproduces; no pull request                | Nothing, unless it qualifies for auto-promotion              |
-| `pr-open`            | `fix proposed`                        | Reproduces; a fix is open on its branch    | **Nothing.** The pull request is left alone                  |
+| `pr-open`            | `fix proposed`                        | Reproduces; a fix is open on its branch    | **Labels re-asserted.** The pull request itself is untouched |
 | `pr-merged-persists` | `⚠ fix merged, still reproduces`      | Reproduces; the fix **merged anyway**      | Comments once on the merged PR; never reopens it             |
 | `refused`            | `fix refused`                         | Reproduces; a **human closed** the fix     | Nothing. The close stands until someone says `/remediate`    |
 | `withdrawn`          | `fix withdrawn, awaiting re-proposal` | Reproduces; the **harness closed** the fix | Treats it as having no pull request — it is promotable again |
@@ -483,9 +483,13 @@ the ordinary, expected ending, so nothing extra is closed and nothing extra is s
 
 Three of the five are easy to misread:
 
-- **`pr-open` is not refreshed.** An open pull request is left exactly as it is, because a reviewer
-  may have pushed onto it and a nightly force-push would silently discard their work. The ledger
-  links it; the diff is whatever a human last made it.
+- **`pr-open` is not refreshed.** An open pull request's diff is left exactly as it is, because a
+  reviewer may have pushed onto it and a nightly force-push would silently discard their work. The
+  ledger links it; the diff is whatever a human last made it. Its **labels** are the single
+  exception, re-asserted on every run that finds it still open: they are the harness's own index of
+  what it still owns rather than anything a reviewer authored, and a stripped `agent:audit` or a
+  `severity:` frozen at what the group used to be loses the pull request from the views triage works
+  from. Labels only — no push, no rewritten body, so the promise above still holds.
 - **`refused` is a human decision, not a rejected command.** It means someone closed the remediation
   pull request without merging it. That is a considered "no", and the harness never overrules it by
   re-opening the same fix tomorrow morning.
@@ -518,9 +522,10 @@ to put in a diff otherwise. Two paths lead there:
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 
 - Accepted — one acknowledgement comment on the ledger naming each target and **what happened to
-  it**, never a count: the pull request URL, or "already open" and left untouched, or _superseded_
-  by a human close written after the request, or that publishing failed and the next run will retry.
-  "3 requests processed" is indistinguishable from "3 requests silently dropped".
+  it**, never a count: the pull request URL, or "already open" with its labels re-asserted and its
+  diff untouched, or _superseded_ by a human close written after the request, or that publishing
+  failed and the next run will retry. "3 requests processed" is indistinguishable from "3 requests
+  silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
   finding that is not in the current document, or one naming a non-`manifest` finding.
 - Refused **on syntax**, likewise once, because a command the parser will not honour is a person

@@ -7,7 +7,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 
 ## Local tooling
 
-- **Google Cloud SDK** (`gcloud`) — [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`.
+- **Google Cloud SDK** (`gcloud`) — **576.0.0 or newer**, [install](https://cloud.google.com/sdk/docs/install), authenticated: `gcloud auth login && gcloud auth application-default login`. Cluster creation enables Managed OpenTelemetry with `--managed-otel-scope`, which reached GA in gcloud 576.0.0 (2026-07-14); on an older SDK the flag exists only on the alpha and beta tracks and cluster creation fails. The installer checks this before it touches any cloud resource — `gcloud components update` if it complains.
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The provisioner points it at the GKE cluster it creates.
 - **Docker or Podman** — required by the operator dev workflow (`make docker-build`) if you rebuild images locally. Not required for a stock install.
 - **Bash 4+** — the provisioning scripts are bash.

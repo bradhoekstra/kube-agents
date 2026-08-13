@@ -4154,7 +4154,14 @@ def ensure_labels(repo: str, audit_id: str) -> None:
             # quiet day.
             STALE_CLOSED_LABEL,
             "C5DEF5",
-            "Closed by the audit because the finding stopped reproducing; re-opened as a fresh pull request if it returns",
+            # Keep this under GitHub's 100-character description limit. It was
+            # 108 for as long as this label existed, so `gh label create`
+            # returned HTTP 422 on every run, the label never came into being,
+            # and — because the close path runs `check=False` — every harness
+            # close landed unlabelled. That is the exact failure the comment
+            # above warns about, live the whole time. `test_label_descriptions
+            # _fit_github_s_limit` now fails before a reviewer has to notice.
+            "Closed by the audit because the finding stopped reproducing; re-opened fresh if it returns",
         ),
         ("severity:critical", "B60205", "Highest audit finding severity: critical"),
         ("severity:major", "D93F0B", "Highest audit finding severity: major"),
@@ -4487,6 +4494,119 @@ def snapshot_paths(root: Path, paths: list[str]) -> dict[str, bytes]:
     }
 
 
+def sync_remediation_labels(
+    repo: str, number: str, audit_id: str, highest: str
+) -> None:
+    """Re-assert the four labels on a remediation pull request that already exists.
+
+    `gh pr create` carries the labels for a *new* pull request, and until this
+    function nothing carried them for an existing one — a later run reads that
+    pull request, decides it is already open, and moves on without looking at
+    what its labels have become. They drift two ways.
+
+    A reviewer strips them while triaging — which is exactly what happened to
+    pull requests 34, 35 and 36 in the reference installation, and no later run
+    put them back, so three pull requests the audit still owned stopped
+    appearing under `agent:audit` for good. And `severity:` is recomputed from
+    the findings the group currently holds, so a finding that escalates from
+    minor to critical otherwise keeps the label it was opened with — the one
+    field triage sorts on, silently stale.
+
+    A second call rather than more flags on `open_remediation_pr`'s own
+    `gh pr edit`, and `check=False`, because a label is worth less than the body
+    it would otherwise take down with it: on a repository whose labels someone
+    deleted by hand, folding these into the first call would abort the entire
+    remediation half of the run. The `--remove-label` for the two severities
+    that do not apply resolves even when the pull request never carried them —
+    `ensure_labels` creates all three at the top of every path that reaches
+    here, and `gh` only objects to a label the *repository* does not have.
+
+    One `gh` call sets all six, so a single unresolvable name applies *none* of
+    them. That is the right trade against a partly-labelled pull request, but it
+    is only safe if it is audible: a silent no-op here looks exactly like a
+    refresh that had nothing to change, and the labelling gap this function
+    exists to close went unnoticed for months for want of a line in the log.
+    """
+    args = [
+        "pr",
+        "edit",
+        number,
+        "-R",
+        repo,
+        "--add-label",
+        "agent:audit",
+        "--add-label",
+        f"audit:{audit_id}",
+        "--add-label",
+        "audit:remediation",
+        "--add-label",
+        f"severity:{highest}",
+    ]
+    for severity in SEVERITIES:
+        if severity != highest:
+            args += ["--remove-label", f"severity:{severity}"]
+    res = gh(args, check=False)
+    if res.returncode != 0:
+        log(
+            f"#{number}: could not re-apply the audit labels "
+            f"(gh exited {res.returncode}): "
+            f"{(res.stderr or res.stdout or '').strip() or 'no output'}"
+        )
+
+
+def sync_open_remediation_labels(
+    repo: str,
+    audit_id: str,
+    findings: list[dict],
+    pr_by_finding: dict[str, dict | None],
+) -> None:
+    """Re-assert the labels on every open remediation pull request this run saw.
+
+    `sync_remediation_labels` on its own does not close the gap its docstring
+    describes, because its only caller cannot be reached with an open pull
+    request. `promotion_candidates` diverts a finding whose pull request is
+    OPEN into `already_open` and never promotes it, and
+    `reconcile_remediation_prs` hands every finding in a group the *same* pull
+    request — so a newly-appeared sibling finding cannot drag the group into
+    `open_remediation_pr` either. Both halves were measured against the
+    reference installation, not inferred: `/remediate` on the finding that owned
+    pull request 103 reported `already_open`, and so did a second finding added
+    to that same path.
+
+    Every open pull request the run reconciled, rather than only the ones a
+    `/remediate` named. `already_open` holds requested ids and nothing else, so
+    hanging this off it would repair a pull request only in the run where
+    somebody asked for it again — and the pull requests this exists for are
+    precisely the ones nobody is asking about. A stripped label has to heal on
+    the next scheduled audit or it does not heal.
+
+    Labels and nothing else: no force-push, no rewritten body. That is what
+    makes this safe from here. Leaving an open pull request alone is a
+    deliberate promise — a reviewer's commits stay where they are — and
+    re-labelling keeps it while still repairing the field triage sorts on. When
+    the labels are already right the call is a no-op, so a steady fleet pays one
+    `gh` call per open remediation pull request per run and changes nothing.
+
+    One call per pull request rather than per finding, since a group's findings
+    all resolve to the same one.
+    """
+    seen: set[str] = set()
+    for group in remediation_groups(findings):
+        ids = [str(finding.get("id", "")) for finding in group]
+        pr = next(
+            (pr_by_finding[fid] for fid in ids if pr_by_finding.get(fid)), None
+        )
+        if not pr or str(pr.get("state", "")).upper() != "OPEN":
+            continue
+        number = str(pr.get("number", "") or "")
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        counts = severity_counts(group)
+        highest = next((s for s in SEVERITIES if counts[s]), SEVERITIES[-1])
+        sync_remediation_labels(repo, number, audit_id, highest)
+
+
 def open_remediation_pr(
     repo: str,
     audit_id: str,
@@ -4557,11 +4677,12 @@ def open_remediation_pr(
     )
     try:
         if existing and str(existing.get("state", "")).upper() == "OPEN":
+            number = str(existing["number"])
             gh(
                 [
                     "pr",
                     "edit",
-                    str(existing["number"]),
+                    number,
                     "-R",
                     repo,
                     "--title",
@@ -4570,6 +4691,7 @@ def open_remediation_pr(
                     body_file,
                 ]
             )
+            sync_remediation_labels(repo, number, audit_id, highest)
             return str(existing.get("url") or "")
         res = gh(
             [
@@ -5279,7 +5401,8 @@ def _remediation_outcomes(
         elif fid in plan.already_open:
             outcomes[fid] = (
                 f"a pull request is already open — {url or 'see the table above'}; "
-                "it was left untouched rather than force-pushed over"
+                "its labels were re-asserted and its diff left untouched rather "
+                "than force-pushed over"
             )
         elif fid in plan.superseded:
             outcomes[fid] = (
@@ -5427,6 +5550,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             f"{fid} already has an open remediation pull request "
             f"({pr.get('url') or '#' + str(pr.get('number', '?'))}); not replacing it."
         )
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
     opened = _open_promoted_prs(
         repo,
         audit_id,
@@ -5665,6 +5789,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
+    sync_open_remediation_labels(repo, audit_id, findings, pr_by_finding)
     for fid in plan.superseded:
         pr = pr_by_finding.get(fid) or {}
         log(

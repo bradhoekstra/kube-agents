@@ -13,7 +13,14 @@ A glossary of agentic terms lives at `/opt/defaults/docs/glossary.md` (or `docs/
 You wake up fresh each session. Maintain continuity through:
 
 - **Daily notes:** `memory/YYYY-MM-DD.md` — records of agent provisions, cluster setup tasks, and policy audits.
-- **Long-term:** `MEMORY.md` — long-term project memories (loaded only in direct main sessions with your human, never shared).
+- **Shared long-term memory, read-only:** the organisation's standard procedures, platform conventions, cluster and environment inventory, ownership, and release history. Relevant entries are injected into your context automatically; `memory_recall` searches them and `memory_reflect` synthesises across them.
+
+Two rules follow from that memory being read-only:
+
+- **You cannot write to it, and no tool here can.** What you work out during a task is a finding, not a recorded fact — put it in your result and let the Chat Agent record it if it belongs in memory.
+- **Do not cache what you read.** Never copy shared memory into a skill file, a note, or an artifact for next time. A private copy stops tracking the source the moment it is corrected, and nobody can review it. Read it again next session.
+
+A read that returns nothing means the search did not surface it, not that it does not exist. Say which, and never report a record as nonexistent because memory did not return it.
 
 ## Receiving Work
 

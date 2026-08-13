@@ -4403,6 +4403,15 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.err = err.getvalue()
         return result
 
+    def flag_values(self, flag):
+        """Every value passed under `flag` across the run's `gh pr edit` calls."""
+        return {
+            arg
+            for call in self.harness.gh_calls("pr", "edit")
+            for i, arg in enumerate(call)
+            if i and call[i - 1] == flag
+        }
+
     def test_branch_commit_push_then_create_in_that_order(self):
         self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
         url = self.open_it()
@@ -4476,11 +4485,231 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.assertIn("8", edit)
         self.assertIn("--body-file", edit)
 
+    def test_refreshing_an_open_pr_re_applies_its_labels(self):
+        # Pull requests 34, 35 and 36 in the reference installation were
+        # labelled at creation and stripped by a reviewer, and no later run
+        # ever put them back — the refresh rewrote title and body only. A pull
+        # request the audit still owns has to keep saying so.
+        self.open_it(existing=pr(8, self.branch))
+        self.assertEqual(
+            self.flag_values("--add-label"),
+            {"agent:audit", f"audit:{AUDIT}", "audit:remediation", "severity:critical"},
+        )
+
+    def test_a_refresh_moves_the_severity_label_rather_than_adding_one(self):
+        # Severity is recomputed from the group every run. Leaving the old one
+        # on means a finding that escalated still sorts as what it used to be.
+        self.open_it(existing=pr(8, self.branch))
+        self.assertEqual(
+            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+        )
+
+    def test_the_body_edit_survives_a_label_failure(self):
+        # A repository whose labels someone deleted by hand must not abort the
+        # remediation half of the run. The label sync is a separate,
+        # non-checking call for exactly this.
+        self.harness.failures = {"--add-label agent:audit": 1}
+        url = self.open_it(existing=pr(8, self.branch))
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/8")
+
+    def test_a_label_failure_is_logged_rather_than_swallowed(self):
+        # All six labels move in one `gh` call, so one unresolvable name
+        # applies none of them. Swallowing that leaves a refresh that did
+        # nothing looking exactly like a refresh with nothing to do — which is
+        # how the gap this function closes survived unnoticed in the first
+        # place.
+        self.harness.failures = {"--add-label agent:audit": 1}
+        self.open_it(existing=pr(8, self.branch))
+        self.assertIn("could not re-apply the audit labels", self.err)
+        self.assertIn("simulated failure", self.err)
+
+    def test_a_newly_created_pr_is_not_double_labelled(self):
+        # `gh pr create --label` already carries them; a second round-trip per
+        # pull request would buy nothing.
+        self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/8\n"}
+        self.open_it()
+        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+
     def test_a_closed_pr_on_the_branch_is_replaced_not_reopened(self):
         self.harness.replies = {"pr create": "https://github.com/acme/fleet/pull/9\n"}
         self.open_it(existing=pr(8, self.branch, state="CLOSED"))
         self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+
+
+class TestOpenRefreshIsUnreachable(BaseTestCase):
+    """Why `sync_remediation_labels` alone could not have fixed anything.
+
+    Its only caller is the refresh branch of `open_remediation_pr`, which runs
+    when `existing` is OPEN — and nothing hands it an open pull request. These
+    two tests pin the reason down, so that a later change which *does* make the
+    branch reachable fails here rather than quietly leaving two callers doing
+    the same work.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # a and b share a remediation path, so they are one group on one branch
+        # and `reconcile_remediation_prs` gives them the same pull request.
+        self.findings = [make_finding(fid="a"), make_finding(fid="b")]
+        branch = audit_report.group_branch_for(AUDIT, self.findings)
+        self.by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, self.findings, [pr(9, branch)]
+        )
+
+    def test_a_requested_finding_whose_pr_is_open_is_never_promoted(self):
+        plan = audit_report.promotion_candidates(
+            self.findings, self.by_finding, ["a"], auto_promote=False
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.already_open, ["a"])
+
+    def test_a_sibling_cannot_drag_its_group_into_the_refresh_either(self):
+        # The tempting hole: `b` has no pull request of its own, so requesting
+        # it might promote the group and reach the refresh with `a`'s open pull
+        # request as `existing`. It cannot — `b` resolves to the same pull
+        # request as `a`. Measured live too: a second finding added to the path
+        # behind pull request 103 in the reference installation was reported
+        # `already_open`, and the pull request was never visited.
+        self.assertEqual(self.by_finding["b"]["number"], 9)
+        plan = audit_report.promotion_candidates(
+            self.findings, self.by_finding, ["b"], auto_promote=False
+        )
+        self.assertEqual(plan.promote, [])
+        self.assertEqual(plan.already_open, ["b"])
+
+    def test_auto_promotion_skips_it_as_well(self):
+        plan = audit_report.promotion_candidates(self.findings, self.by_finding)
+        self.assertEqual(plan.promote, [])
+
+
+class TestLabelDescriptions(HarnessTestCase):
+    """Every label `ensure_labels` creates has to be creatable.
+
+    GitHub caps a label description at 100 characters and answers `422` past
+    it. `gh label create` runs with `check=False`, so the failure is silent and
+    the label simply never exists — which for `audit:stale-closed` means every
+    harness close reads as a human rejection and no finding is re-proposed.
+    """
+
+    LIMIT = 100
+
+    def descriptions(self, audit_id):
+        # Sliced rather than reset: the recorder accumulates across the whole
+        # test and this helper is called once per audit stream.
+        before = len(self.harness.calls)
+        audit_report.ensure_labels("acme/fleet", audit_id)
+        calls = [
+            call
+            for call in self.harness.calls[before:]
+            if call[:3] == ["gh", "label", "create"]
+        ]
+        self.assertTrue(calls, "ensure_labels created no labels")
+        return {call[3]: call[call.index("--description") + 1] for call in calls}
+
+    def test_label_descriptions_fit_github_s_limit(self):
+        # Every stream, not just one: the per-audit description interpolates
+        # `audit_name`, so a future audit with a long title breaks only its own.
+        over = {
+            (audit_id, name): len(text)
+            for audit_id in audit_report.AUDITS
+            for name, text in self.descriptions(audit_id).items()
+            if len(text) > self.LIMIT
+        }
+        self.assertEqual(over, {}, f"descriptions over {self.LIMIT} characters")
+
+    def test_the_stale_closed_label_is_among_them(self):
+        # The guard above is only worth having while this label is in scope.
+        self.assertIn(
+            audit_report.STALE_CLOSED_LABEL, self.descriptions(AUDIT)
+        )
+
+
+class TestSyncOpenRemediationLabels(HarnessTestCase):
+    """Labels are re-asserted from the path that actually sees open PRs."""
+
+    def setUp(self):
+        super().setUp()
+        self.findings = [make_finding(fid="a")]
+        self.branch = audit_report.group_branch_for(AUDIT, self.findings)
+
+    def sync(self, findings=None, prs=None):
+        findings = self.findings if findings is None else findings
+        by_finding, _ = audit_report.reconcile_remediation_prs(
+            AUDIT, findings, prs if prs is not None else [pr(9, self.branch)]
+        )
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.sync_open_remediation_labels(
+                "acme/fleet", AUDIT, findings, by_finding
+            )
+        self.err = err.getvalue()
+
+    def flag_values(self, flag):
+        return {
+            arg
+            for call in self.harness.gh_calls("pr", "edit")
+            for i, arg in enumerate(call)
+            if i and call[i - 1] == flag
+        }
+
+    def test_an_open_pr_gets_its_labels_back(self):
+        self.sync()
+        self.assertEqual(
+            self.flag_values("--add-label"),
+            {"agent:audit", f"audit:{AUDIT}", "audit:remediation", "severity:critical"},
+        )
+        self.assertEqual(
+            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+        )
+
+    def test_nothing_but_labels_is_touched(self):
+        # The whole justification for doing this to a pull request the run has
+        # decided to leave alone: a reviewer's commits stay where they are.
+        # Anything that pushes or rewrites the body belongs in the promote path.
+        self.sync()
+        self.assertEqual([c for c in self.harness.calls if c[0] == "git"], [])
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        edit = self.harness.gh_calls("pr", "edit")[0]
+        self.assertNotIn("--body-file", edit)
+        self.assertNotIn("--title", edit)
+
+    def test_a_group_is_labelled_once_not_once_per_finding(self):
+        # Every finding in a group resolves to the same pull request. One `gh`
+        # call per finding would be N-1 pointless round trips and N-1 webhooks.
+        self.sync(findings=[make_finding(fid="a"), make_finding(fid="b")])
+        self.assertEqual(len(self.harness.gh_calls("pr", "edit")), 1)
+
+    def test_the_severity_is_recomputed_from_the_group(self):
+        # The escalation case: the pull request was opened when the group held
+        # only a minor finding, and a critical one has since joined it.
+        findings = [
+            make_finding(fid="a", severity="minor"),
+            make_finding(fid="b", severity="critical"),
+        ]
+        self.sync(findings=findings, prs=[pr(9, audit_report.group_branch_for(AUDIT, findings))])
+        self.assertIn("severity:critical", self.flag_values("--add-label"))
+        self.assertEqual(
+            self.flag_values("--remove-label"), {"severity:major", "severity:minor"}
+        )
+
+    def test_a_finding_with_no_pull_request_is_left_alone(self):
+        self.sync(prs=[])
+        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+
+    def test_a_closed_pull_request_is_left_alone(self):
+        # A closed pull request is a decision, not a labelling accident.
+        self.sync(prs=[pr(9, self.branch, state="CLOSED")])
+        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+
+    def test_a_merged_pull_request_is_left_alone(self):
+        self.sync(prs=[pr(9, self.branch, state="MERGED", merged_at="2026-01-01T00:00:00Z")])
+        self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
+
+    def test_a_label_failure_is_logged_rather_than_swallowed(self):
+        self.harness.failures = {"--add-label agent:audit": 1}
+        self.sync()
+        self.assertIn("could not re-apply the audit labels", self.err)
 
 
 class TestRemediationBaseBranch(HarnessTestCase):

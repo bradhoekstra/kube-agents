@@ -52,6 +52,7 @@ type flags struct {
 	dedupWindow       time.Duration
 	dedupPersist      string
 	unhealthyMinCount int
+	backoffMinCount   int
 	inCluster         bool
 	kubeconfig        string
 	profilesDir       string
@@ -85,6 +86,7 @@ func parseFlags(args []string) (*flags, error) {
 	fs.DurationVar(&f.dedupWindow, "dedup-window", 5*time.Minute, "Rolling window for (uid,reason) dedup.")
 	fs.StringVar(&f.dedupPersist, "dedup-persist", "", "Optional path to persist dedup cache across sidecar restart.")
 	fs.IntVar(&f.unhealthyMinCount, "unhealthy-min-count", 3, "Require this many consecutive Unhealthy events before firing.")
+	fs.IntVar(&f.backoffMinCount, "backoff-min-count", 3, "Require this many consecutive crash-loop (BackOff/CrashLoopBackOff) events before firing. Suppresses startup races that resolve on their own. 1 = fire on the first event. Image-pull back-off is not gated.")
 
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
@@ -552,7 +554,8 @@ func dedupPersistPath(base, cluster string) string {
 // Dispatch is the entry point that runs an event through filtering, deduplication, and HTTP injection.
 func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	d.metrics.eventsSeen.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason).Inc()
-	if !d.filter.Accept(ev) {
+	if gate := d.filter.Decide(ev); gate != gateAccepted {
+		d.metrics.eventsFiltered.WithLabelValues(ev.Cluster, ev.Project, ev.Location, string(gate)).Inc()
 		return
 	}
 	result := d.dedup.Observe(ev.Key, ev.Message, ev.LastSeen)
@@ -568,6 +571,11 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 	if d.mode == "per-incident" && !d.dryRun {
 		newSid, err := d.injector.CreateSession(ctx)
 		if err != nil {
+			// Roll back the entry Observe just wrote. Nobody was told
+			// about this failure, so the next sighting must be free to
+			// open the incident rather than be suppressed against an
+			// alert that never went out. See dedupCache.Forget.
+			d.dedup.Forget(ev.Key, ev.Message)
 			log.Printf("dispatcher: create session for %s/%s: %v", ev.Namespace, ev.Name, err)
 			d.metrics.sessionCreates.WithLabelValues(ev.Cluster, ev.Project, ev.Location, "error").Inc()
 			d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "session_create").Inc()
@@ -607,9 +615,28 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 			ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 		return
 	}
-	if err := d.injector.Inject(ctx, sid, payload); err != nil {
+	status, err := d.injector.Inject(ctx, sid, payload)
+	if err != nil {
+		// Same rollback as the CreateSession path above. A session may
+		// have been created for this attempt and is now orphaned; it
+		// ages out on the daemon's own TTL, and leaving the failure
+		// permanently unreportable would be the worse trade.
+		d.dedup.Forget(ev.Key, ev.Message)
 		log.Printf("dispatcher: inject for %s/%s (sid=%s): %v", ev.Namespace, ev.Name, sid, err)
 		d.metrics.injectErrors.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, "inject").Inc()
+		return
+	}
+	if status == injectStatusSuppressed {
+		// 2xx, and nobody was told: the daemon spent the day's ceiling
+		// for this severity and dropped the alert. Rolled back for the
+		// same reason as an error — the dedup entry exists to stop a
+		// second copy of a delivered alert, and nothing was delivered.
+		// The ceiling resets at 00:00 UTC while this entry would
+		// otherwise outlive the reset by most of a day.
+		d.dedup.Forget(ev.Key, ev.Message)
+		d.metrics.eventsQuotaSuppress.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
+		log.Printf("quota-suppressed %s pod=%s/%s (sid=%s) — daemon dropped the alert, incident reopened",
+			ev.Key.Reason, ev.Namespace, ev.Name, sid)
 		return
 	}
 	d.metrics.eventsInjected.WithLabelValues(ev.Cluster, ev.Project, ev.Location, ev.Key.Reason, ev.Namespace).Inc()
@@ -646,7 +673,7 @@ func realMain(argv []string) error {
 	}
 
 	// Build components.
-	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount)
+	filterCfg := newFilterConfig(splitCSV(f.reasons), splitCSV(f.namespaces), splitCSV(f.excludeNamespaces), f.unhealthyMinCount, f.backoffMinCount)
 	filter := newFilter(filterCfg)
 
 	m := newMetrics()

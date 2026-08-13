@@ -1014,6 +1014,12 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
+# The specialist's Hindsight connection file. Profile-scoped: a kanban worker
+# runs with HERMES_HOME pointed at profiles/platform, and the plugin resolves
+# $HERMES_HOME/hindsight/config.json, so the default profile's copy is not
+# visible from here. Image-owned and force-synced by the entrypoint, for the
+# reason in step 2a.
+COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hindsight/
 
 # Platform config is self-contained (scaffold does not merge again): build it by
 # merging the shared defaults base with the platform overrides and bake it into
@@ -1051,8 +1057,12 @@ assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r'
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
 
-# Shared plugins available to all profiles (memory backend used by the Chat Agent).
+# Plugins land in the shared plugin root regardless of which profile owns them —
+# /opt/hermes/plugins is the only path Hermes resolves them from. The source
+# directory records ownership: kube_agents_memory needs the user identity that
+# only chat ingress carries, so it lives with the Chat Agent.
 COPY agents/platform/plugins/ /opt/hermes/plugins/
+COPY agents/chat/plugins/ /opt/hermes/plugins/
 
 # NOTE: the platform overlay is no longer merged into /opt/defaults/config.yaml.
 # /opt/defaults now belongs to the Chat Agent (`default` profile) and its config

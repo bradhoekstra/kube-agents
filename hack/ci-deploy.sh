@@ -106,7 +106,7 @@ echo "✓ Provisioning scripts finished in $((SECONDS - STEP_START))s"
 # diagnostics), so this stays a single copy rather than a hand-rolled twin.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
-./k8s-operator/scripts/provision_13_verify_agent_rollout.sh --non-interactive
+./k8s-operator/scripts/provision_14_verify_agent_rollout.sh --non-interactive
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
 # ─── 7. Agent API Connectivity Verification ──────────────────────────────────

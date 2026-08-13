@@ -215,7 +215,7 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 		t.Errorf("expected config to contain user_profile_enabled: true, got:\n%s", yamlContent)
 	}
 	// Turning the built-in store on must put `memory` back in the denylist. The
-	// toolset name is listed only to pass the multiuser_memory injection gate;
+	// toolset name is listed only to pass the memory-provider injection gate;
 	// leaving it enabled alongside a live built-in store would hand the front
 	// door a second, unscoped read/write memory tool.
 	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
@@ -223,9 +223,31 @@ func TestBuildConfigMap_MemoryConfig(t *testing.T) {
 	}
 }
 
+// userProfileEnabled on its own is enough to make the built-in tool live: Hermes
+// builds the store when either flag is set and the tool has no per-target gate,
+// so USER.md alone still exposes a read/write surface over MEMORY.md too.
+func TestBuildConfigMap_UserProfileAloneClosesMemoryGate(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "profile-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Harness: &agentv1alpha1.HarnessSpec{
+				Memory: &agentv1alpha1.MemorySpec{
+					MemoryEnabled:      ptr.To(false),
+					UserProfileEnabled: ptr.To(true),
+				},
+			},
+		},
+	}
+
+	yamlContent := defaultProfileYAML(t, buildConfigMap(agent, nil))
+	if !slices.Contains(disabledToolsets(t, yamlContent), "memory") {
+		t.Errorf("expected `memory` in disabled_toolsets when only user_profile_enabled is true, got:\n%s", yamlContent)
+	}
+}
+
 // The default (no CR override) case: the built-in store stays off, so `memory`
 // must stay OUT of disabled_toolsets — otherwise the subtraction runs last, the
-// gate fails, and multiuser_memory loads but never reaches the model.
+// gate fails, and the memory provider loads but never reaches the model.
 func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "default-agent", Namespace: "test-ns"},
@@ -240,7 +262,7 @@ func TestBuildConfigMap_MemoryGateOpenByDefault(t *testing.T) {
 	}
 	if disabled := disabledToolsets(t, yamlContent); slices.Contains(disabled, "memory") {
 		t.Errorf("`memory` must not be in disabled_toolsets by default — the subtraction "+
-			"runs last and would silently kill multiuser_memory; got %v", disabled)
+			"runs last and would silently kill the memory provider; got %v", disabled)
 	}
 }
 
@@ -3273,7 +3295,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
 		pluginWithProfile("second", "platform", ""),
-	}, nil)
+	}, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3297,7 +3319,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\nlogging:\n  level: debug\napprovals:\n  cron_mode: approve\n"),
-	}, nil)
+	}, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3317,7 +3339,7 @@ func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\n"),
-	}, limits(8, 200))
+	}, limits(8, 200), nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3461,7 +3483,7 @@ func sortedStrings(t *testing.T, list []any) []string {
 }
 
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
-	if got := renderProfileOverlayYAML(nil, nil); got != "" {
+	if got := renderProfileOverlayYAML(nil, nil, nil); got != "" {
 		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
 	}
 }
@@ -3540,16 +3562,106 @@ func TestBuildConfigMapDataClusterTargetedPluginGetsItsOwnOverlay(t *testing.T) 
 	}
 }
 
+// With no targeted plugin and no tuning, the platform profile still gets an overlay —
+// it carries the memory provider, which follows the CR — but nothing else does, and
+// that overlay says nothing beyond the provider.
 func TestBuildConfigMapDataNoOverlayWithoutTargetedPlugins(t *testing.T) {
 	data := buildConfigMapData(newTestPlatformAgent(), []*agentv1alpha1.AgentPlugin{pluginWithProfile("adapter", "", "")})
 	for k := range data {
-		// The default profile's overlay is unconditional — it carries the whole
-		// rendered config, so its absence, not its presence, would be the bug.
-		if k == profileOverlayKey(defaultProfileName) {
+		// Two overlays are unconditional: the default profile's carries the whole
+		// rendered config, and the platform profile's carries the memory provider,
+		// so for either it is absence, not presence, that would be the bug.
+		if k == profileOverlayKey(defaultProfileName) || k == profileOverlayKey(platformProfileName) {
 			continue
 		}
 		if strings.HasPrefix(k, profileOverlayPrefix) || k == clusterProfileClassKey {
 			t.Errorf("unexpected overlay key %q when no plugin targets a profile and no tuning is set", k)
+		}
+	}
+
+	overlay, ok := data[profileOverlayKey(platformProfileName)]
+	if !ok {
+		t.Fatalf("the platform overlay must always be written, got keys %v", mapKeys(data))
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v", err)
+	}
+	if len(parsed) != 1 {
+		t.Errorf("platform overlay must carry memory alone here, got %v", parsed)
+	}
+	// The default provider is the per-user file store, which a specialist has no
+	// identity to key on, so the overlay blanks it — the key is still written, and
+	// writing it is the point: it overrides whatever the image baked in.
+	memory, _ := parsed["memory"].(map[string]any)
+	if fmt.Sprint(memory["provider"]) != "" {
+		t.Errorf("provider = %v, want %q", memory["provider"], "")
+	}
+}
+
+// The specialist profiles only get a provider that can be made read-only and scoped by
+// tag. A per-user file provider has no gateway identity to key on there, so the overlay
+// blanks it rather than passing it through — see memoryOverlay.
+func TestBuildConfigMapDataPlatformOverlayFollowsProvider(t *testing.T) {
+	for _, tc := range []struct{ provider, want string }{
+		{"", ""},
+		{"kube_agents_memory", kubeAgentsMemoryProvider},
+		{"hindsight", "hindsight"},
+		{"multiuser_memory", ""},
+		{"none", ""},
+		{"NONE", ""},
+	} {
+		agent := newTestPlatformAgent()
+		if agent.Spec.Harness == nil {
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+		}
+		agent.Spec.Harness.Memory = &agentv1alpha1.MemorySpec{Provider: tc.provider}
+
+		overlay := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+		var parsed map[string]any
+		if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
+			t.Fatalf("provider %q: unmarshal platform overlay: %v", tc.provider, err)
+		}
+		memory, _ := parsed["memory"].(map[string]any)
+		got := ""
+		if memory["provider"] != nil {
+			got = fmt.Sprint(memory["provider"])
+		}
+		if got != tc.want {
+			t.Errorf("provider %q: platform overlay provider = %q, want %q", tc.provider, got, tc.want)
+		}
+	}
+}
+
+// `none` is the only way to say "no external provider": an empty field takes the CRD
+// default, so the sentinel has to survive as far as the rendered config and become the
+// empty string Hermes itself uses.
+func TestRenderConfigYAMLProviderNoneMeansNoProvider(t *testing.T) {
+	for _, tc := range []struct{ provider, want string }{
+		{"", defaultMemoryProvider},
+		{"none", ""},
+		{"None", ""},
+		{"  none  ", ""},
+		{"multiuser_memory", "multiuser_memory"},
+		{"mem0", "mem0"},
+	} {
+		agent := newTestPlatformAgent()
+		if agent.Spec.Harness == nil {
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+		}
+		agent.Spec.Harness.Memory = &agentv1alpha1.MemorySpec{Provider: tc.provider}
+
+		var parsed map[string]any
+		if err := yaml.Unmarshal([]byte(renderConfigYAML(agent, nil)), &parsed); err != nil {
+			t.Fatalf("provider %q: unmarshal rendered YAML: %v", tc.provider, err)
+		}
+		memory, _ := parsed["memory"].(map[string]any)
+		got := ""
+		if memory["provider"] != nil {
+			got = fmt.Sprint(memory["provider"])
+		}
+		if got != tc.want {
+			t.Errorf("provider %q: rendered provider = %q, want %q", tc.provider, got, tc.want)
 		}
 	}
 }
@@ -3614,10 +3726,16 @@ func TestRenderConfigYAMLAppliesDefaultTuning(t *testing.T) {
 	if got := data[profileOverlayKey(defaultProfileName)]; !strings.Contains(got, "max_turns: 120") {
 		t.Errorf("tuning.default did not reach the default profile's overlay, got:\n%s", got)
 	}
-	for k := range data {
-		if strings.HasPrefix(k, profileOverlayPrefix) && k != profileOverlayKey(defaultProfileName) {
-			t.Errorf("tuning.default must not produce any other profile's overlay, got key %q", k)
+	for k, v := range data {
+		if !strings.HasPrefix(k, profileOverlayPrefix) || k == profileOverlayKey(defaultProfileName) {
+			continue
 		}
+		// The platform overlay is unconditional, but it carries the memory provider
+		// and nothing from tuning; only a max_turns leaking into it is a failure.
+		if k == profileOverlayKey(platformProfileName) && !strings.Contains(v, "max_turns") {
+			continue
+		}
+		t.Errorf("tuning.default must not produce any other profile's overlay, got key %q", k)
 	}
 }
 
@@ -3770,7 +3888,7 @@ approvals:
 		t.Errorf("targeted plugin's pubsub subscription must reach the DEFAULT profile, got %v", rendered["platforms"])
 	}
 	var overlay map[string]any
-	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil)), &overlay); err != nil {
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil, nil)), &overlay); err != nil {
 		t.Fatalf("unmarshal overlay: %v", err)
 	}
 	if _, ok := overlay["platforms"]; ok {
@@ -3888,5 +4006,170 @@ func TestOtlpCollectorNamespace(t *testing.T) {
 				t.Errorf("otlpCollectorNamespace(%q) = %q; want %q", tc.endpoint, got, tc.want)
 			}
 		})
+	}
+}
+
+// agentWithEventWatcher builds a PlatformAgent whose harness names the emergency
+// stop explicitly. A nil `enabled` stands for the CR that writes the object but
+// not the key, which the CRD default covers rather than this code.
+func agentWithEventWatcher(enabled *bool) *agentv1alpha1.PlatformAgent {
+	a := newTestPlatformAgent()
+	a.Spec.Harness = &agentv1alpha1.HarnessSpec{EventWatcher: &agentv1alpha1.EventWatcherSpec{Enabled: enabled}}
+	return a
+}
+
+// The default has to be "watching". Every install today omits the field, so a
+// resolver that read absence as off would silently end incident detection fleet-wide
+// on the upgrade that introduced it.
+func TestEventWatcherEnabledDefaultsOnWhenUnspecified(t *testing.T) {
+	noHarness := newTestPlatformAgent()
+	if !eventWatcherEnabled(noHarness) {
+		t.Error("an agent with no harness at all must still watch events")
+	}
+	if !eventWatcherEnabled(agentWithTuning(nil)) {
+		t.Error("a harness that says nothing about the watcher must still watch events")
+	}
+	if !eventWatcherEnabled(agentWithEventWatcher(nil)) {
+		t.Error("an eventWatcher block with no enabled key must still watch events")
+	}
+}
+
+func TestEventWatcherEnabledHonoursAnExplicitFalse(t *testing.T) {
+	if eventWatcherEnabled(agentWithEventWatcher(ptr.To(false))) {
+		t.Error("enabled: false must turn the watcher off")
+	}
+	if !eventWatcherEnabled(agentWithEventWatcher(ptr.To(true))) {
+		t.Error("enabled: true must leave the watcher on")
+	}
+}
+
+// The entrypoint reads EVENT_WATCHER_ENABLED; nothing else carries the decision
+// into the pod. The value is written on every reconcile rather than only when the
+// stop is pressed, so that a Deployment answers "is the watcher meant to be
+// running?" without anyone reading the CR — from outside the container a
+// deliberately silent install and a broken one look identical.
+func TestCredentialProxyCarriesTheEventWatcherSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  string
+	}{
+		{"unspecified", newTestPlatformAgent(), "true"},
+		{"explicitly on", agentWithEventWatcher(ptr.To(true)), "true"},
+		{"emergency stop", agentWithEventWatcher(ptr.To(false)), "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sidecar := buildCredentialProxySidecar(tc.agent, "/opt/data")
+			var found []corev1.EnvVar
+			for _, env := range sidecar.Env {
+				if env.Name == "EVENT_WATCHER_ENABLED" {
+					found = append(found, env)
+				}
+			}
+			if len(found) != 1 {
+				t.Fatalf("expected exactly one EVENT_WATCHER_ENABLED, got %#v", found)
+			}
+			if found[0].Value != tc.want {
+				t.Errorf("EVENT_WATCHER_ENABLED = %q, want %q", found[0].Value, tc.want)
+			}
+		})
+	}
+}
+
+// spec.deployment.env is merged into the sidecar's environment, and the name is not
+// in the reserved set. It does not need to be: the operator appends its own entry
+// afterwards, and Kubernetes resolves a duplicated name to the last one. Pinning it
+// because the guarantee lives in the ordering of two append calls, where a later
+// refactor could reasonably move one above the merge and hand the switch to whoever
+// can edit the CR's env list.
+// The switch is the operator's to set, so a same-named entry in
+// spec.deployment.env has to be dropped — not merely out-voted.
+//
+// Counting the entries is the whole point of this test. `containers[].env` is a
+// listType=map keyed on name, and the operator applies the Deployment with
+// server-side apply, which rejects a duplicate key outright rather than taking
+// the last one. So a merge that leaves two `EVENT_WATCHER_ENABLED` entries does
+// not quietly prefer the operator's value: it fails every reconcile from then
+// on, freezing the Deployment against this change and every later one. An
+// earlier version of this test read the last matching entry and passed while
+// exactly that was happening, which is why it asserts a count now.
+func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
+	for _, userValue := range []string{"false", "true", "wat"} {
+		t.Run(userValue, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_ENABLED", Value: userValue}},
+			}
+
+			var found []string
+			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+				if e.Name == "EVENT_WATCHER_ENABLED" {
+					found = append(found, e.Value)
+				}
+			}
+			if len(found) != 1 {
+				t.Fatalf("want exactly one EVENT_WATCHER_ENABLED entry, got %d (%q); server-side apply rejects a duplicate key in env", len(found), found)
+			}
+			if found[0] != "true" {
+				t.Errorf("the operator's value must win over spec.deployment.env, got %q", found[0])
+			}
+		})
+	}
+}
+
+// The same hole, on the variable next to it. EVENT_WATCHER_CLUSTER_NAME is
+// appended after the same merge and was unreserved for as long as it has
+// existed; it is pinned here so the two cannot drift apart again.
+func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: "not-the-operators-idea"}},
+	}
+
+	var found []string
+	for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_CLUSTER_NAME" {
+			found = append(found, e.Value)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_CLUSTER_NAME entry, got %d (%q)", len(found), found)
+	}
+	if found[0] == "not-the-operators-idea" {
+		t.Errorf("spec.deployment.env overrode the operator's cluster name, got %q", found[0])
+	}
+}
+
+// Turning the watcher off must not disturb the wiring around it. The volumes, the
+// token projection, and the kubeconfig path are shared with the credential proxy or
+// needed the moment the switch goes back on, so the stop is a decision about one
+// process rather than a teardown of the sidecar.
+func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
+	off := buildCredentialProxySidecar(agentWithEventWatcher(ptr.To(false)), "/opt/data")
+
+	var tokenMount, kubeconfigMount bool
+	for _, m := range off.VolumeMounts {
+		if m.Name == "event-watcher-ksa-token" && m.MountPath == "/var/run/secrets/kubernetes.io/serviceaccount" {
+			tokenMount = true
+		}
+		if m.Name == "event-watcher-kubeconfig" {
+			kubeconfigMount = true
+		}
+	}
+	if !tokenMount || !kubeconfigMount {
+		t.Errorf("disabling the watcher must not strip its mounts, got %#v", off.VolumeMounts)
+	}
+
+	var sawClusterName, sawSessionKey bool
+	for _, e := range off.Env {
+		if e.Name == "EVENT_WATCHER_CLUSTER_NAME" {
+			sawClusterName = true
+		}
+		if e.Name == "SESSION_KV_API_KEY" {
+			sawSessionKey = true
+		}
+	}
+	if !sawClusterName || !sawSessionKey {
+		t.Errorf("disabling the watcher must not strip its configuration, got %#v", off.Env)
 	}
 }

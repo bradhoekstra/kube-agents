@@ -270,9 +270,24 @@ fi
 # install id, saved slash-command preferences), so force-copying it discarded all of
 # that on every start. Step 2d rebuilds it instead, from the image template, the
 # operator's overlay and the runtime's own edits.
+#
+# hindsight/config.json is in this list because it was NOT, once: the memory
+# provider's connection config was hand-written onto the PVC and so survived
+# every roll carrying whichever design was current when it was last touched. It
+# kept pointing the single-bank provider at a bank name from the two-bank era —
+# invisible to any code review or manifest diff. It is image-owned because
+# nothing in it is per-install: the bank is a constant in the provider, and the
+# service address is not in this file at all — the operator derives it from the
+# agent's namespace and passes HINDSIGHT_API_URL, which the plugin reads only
+# when the file is silent. That is why no `api_url` key belongs here.
 if [ -d "/opt/defaults" ]; then
-    for f in SOUL.md AGENTS.md CAPABILITIES.md; do
-        [ -f "/opt/defaults/$f" ] && cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
+    for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json; do
+        if [ -f "/opt/defaults/$f" ]; then
+            # Nested paths need their parent: step 2's recursive copy creates it
+            # on a fresh PVC, but the force-sync must not depend on that.
+            mkdir -p "$(dirname "$TARGET_DIR/$f")" 2>/dev/null || true
+            cp -f "/opt/defaults/$f" "$TARGET_DIR/$f" 2>/dev/null || true
+        fi
     done
 fi
 
@@ -591,6 +606,15 @@ fi
 # and a worker picks it over the procedure that replaced it. Read the two
 # paragraphs together: this overlay refreshes what the image still ships, and
 # 2.6a is what makes what the image dropped actually go away.
+#
+# hindsight/ carries the memory provider's connection config. It is image-owned
+# for the same reason step 2a's copy is: a hand-edited copy left on the volume
+# silently outlives the design that wrote it. The platform profile needs its own
+# because a kanban worker runs with HERMES_HOME set to profiles/platform, and the
+# plugin resolves $HERMES_HOME/hindsight/config.json — the default profile's copy
+# is not on that path. It is named as a directory, not as hindsight/config.json:
+# --items joins the name onto the profile home and copy2 needs the parent to
+# exist, where a directory goes through copytree(dirs_exist_ok=True).
 # Gated on profile.yaml, not on the directory: a bare mount point is not a profile, and
 # dressing one in a persona and a config makes it indistinguishable from a real profile at
 # the next start — which is how a half-built profile used to become permanent.
@@ -613,7 +637,7 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         --name platform \
         --template "$PLATFORM_TEMPLATE" \
         --plugins /opt/defaults/plugins \
-        --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance" \
+        --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance hindsight" \
         --cron-retire "blueprint-sync policy-propagation global-capacity-orchestrator standardization-validator lifecycle-deprecation-manager" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
@@ -766,7 +790,7 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
         done
         sync_profile_skills "$CLUSTER_TEMPLATE" "$d"
         # Targeted self-heal: drop `memory.provider` from cluster configs already
-        # on the PVC. The template no longer sets it (multiuser_memory scopes by
+        # on the PVC. The template no longer sets it (per-user memory scopes by
         # gateway user identity, which a dispatcher-spawned worker never has), but
         # cluster config.yaml is NOT force-synced above — it is identity-stamped
         # with `cluster_identity`, the record cluster_agent_reconcile.py reads to
@@ -977,6 +1001,58 @@ fi
 # operator), which runs inside the workspace root before the proxy serves any
 # request. The k8s-event-watcher does not need a copy either: it runs inside the
 # credential-proxy container, not this one.
+
+# 5.6. Migrate any file-based memory store into Hindsight.
+#
+# A volume that predates the Hindsight provider still has its memory sitting in
+# Markdown. The new provider never reads those files, so without this the day the
+# image rolls is the day everything the agent had learned goes dark while staying
+# perfectly intact on disk — neither reachable nor gone, and nobody notices until
+# a question that used to work stops working.
+#
+# Backgrounded, because it waits on Hindsight and on LLM extraction and must not
+# hold up readiness; non-fatal, because a failed migration leaves every file
+# exactly where it was and the next start tries again. The script is idempotent
+# and exits immediately when there is nothing to move, which is every start after
+# the one that moved it. See the script's own docstring for how deletion is gated
+# on verification.
+#
+# Deliberately unlocked: two pods briefly sharing the volume during a rollout
+# could at worst retain an entry twice, which consolidation absorbs, whereas a
+# lock file outliving a SIGKILL would skip the migration permanently and
+# silently.
+#
+# Gated on the chosen provider, because this is the one step here that is not
+# reversible: it moves the Markdown into the provider and unlinks the original.
+# It used to be gated on hindsight/config.json existing, but that file is
+# image-owned and therefore always present, so an install that had deliberately
+# kept the file-based store still had it taken away. MEMORY_PROVIDER comes from
+# the operator (see buildDeployment); an empty value is a real answer — "no
+# provider" — while an *unset* one means an operator too old to send it, where
+# the old file-presence behaviour is the safe reading.
+memory_import_wanted() {
+    # ${VAR+x} is "x" when VAR is set to anything at all, including the empty
+    # string, and "" only when it is unset — which is the distinction that
+    # matters here and that a plain -z test would collapse.
+    if [ -z "${MEMORY_PROVIDER+x}" ]; then
+        [ -f "$TARGET_DIR/hindsight/config.json" ]
+        return
+    fi
+    case "$MEMORY_PROVIDER" in
+        kube_agents_memory | hindsight) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; then
+    echo "Checking for a file-based memory store to migrate..."
+    (
+        HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+            "$TARGET_DIR/scripts/memory_file_import.py" \
+            >>"$TARGET_DIR/logs/memory_file_import.log" 2>&1 \
+            || echo "WARN: file-memory migration did not complete; the store is untouched and the next start will retry (see logs/memory_file_import.log)" >&2
+    ) &
+fi
 
 # 6. Execute primary process from inside the shared workspace.
 #
