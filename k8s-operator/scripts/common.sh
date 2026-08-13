@@ -671,8 +671,8 @@ github_account_type() {
   fi
 
   # Organization is matched first so it wins even if the payload somehow carries
-  # both spellings. Both spacings are covered because the API is not guaranteed
-  # to keep pretty-printing, and no script here depends on jq.
+  # both spellings, and both spacings are covered because the API is not
+  # guaranteed to keep pretty-printing its JSON.
   case "$body" in
     *'"type": "Organization"'*|*'"type":"Organization"'*) echo "organization" ;;
     *'"type": "User"'*|*'"type":"User"'*) echo "user" ;;

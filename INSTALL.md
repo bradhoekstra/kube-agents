@@ -117,15 +117,16 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 Before beginning installation, ensure your environment meets the following requirements:
 
-| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                        |
-| :------------------------------ | :---------------------------------------------- | :------------------------- | :------------------------------------------------------------------------------------------------- |
-| **Go**                          | `1.25+`                                         | `go version`               | Required for building operator binaries and running tests.                                         |
-| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                               |
-| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                           |
-| **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate). |
-| **Google Cloud SDK (`gcloud`)** | Latest                                          | `gcloud version`           | Needed for GKE cluster access, IAM, and Artifact Registry.                                         |
-| **Helm**                        | `3.10+`                                         | `helm version`             | Used for installing cluster dependencies like `cert-manager`.                                      |
-| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by Makefile deployment targets for template substitution.                                     |
+| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                                           |
+| :------------------------------ | :---------------------------------------------- | :------------------------- | :-------------------------------------------------------------------------------------------------------------------- |
+| **Go**                          | `1.25+`                                         | `go version`               | Required for building operator binaries and running tests.                                                            |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                                                  |
+| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                                              |
+| **Kubernetes Cluster**          | `1.28+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                    |
+| **Google Cloud SDK (`gcloud`)** | Latest                                          | `gcloud version`           | Needed for GKE cluster access, IAM, and Artifact Registry.                                                            |
+| **Helm**                        | `3.10+`                                         | `helm version`             | Used for installing cluster dependencies like `cert-manager`.                                                         |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by Makefile deployment targets for template substitution.                                                        |
+| **`jq`**                        | `1.6+`                                          | `jq --version`             | Reads `images.json`; provisioning steps 03, 09, and 10 resolve image references and the cert-manager version from it. |
 
 ---
 
@@ -200,10 +201,17 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
   every image the install needs there first, then export `REGISTRY_PREFIX` before provisioning:
 
   ```bash
+  # The two targets live in different Makefiles, so each cd is load-bearing:
+  # mirror-images is a root-level target, gcp-provision an operator one.
+  REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+  cd "$REPO_ROOT"
   make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 
   export REGISTRY_PREFIX=registry.example.com/kube-agents
   export THIRD_PARTY_REGISTRY_PREFIX=registry.example.com/kube-agents
+
+  cd "$REPO_ROOT/k8s-operator"
   make gcp-provision
   ```
 

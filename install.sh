@@ -973,7 +973,11 @@ main() {
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"
-  for tool in git make gcloud kubectl gh helm; do
+  # jq is required from step 03 onward: the provisioning scripts read every
+  # third-party image reference, and the cert-manager version, out of
+  # images.json. Missing it fails at step 03 with the cluster already created,
+  # so it is checked here with the rest rather than discovered halfway through.
+  for tool in git make gcloud kubectl gh helm jq; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
