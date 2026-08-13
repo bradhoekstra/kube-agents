@@ -227,6 +227,43 @@ while IFS=$'\t' read -r file line image; do
     fail "${file}:${line} pins '$image', but $INVENTORY has '$want_tag' for '$ref_repo' — the mirror is populated from the inventory, so this example asks for a tag that was never copied."
 done <<<"$example_refs"
 
+# ---------------------------------------------------------------------------
+# 5. The kustomize integrations. `make deploy-litellm`, `deploy-github`,
+#    `deploy-hindsight` and `deploy-inference-replay` apply these directly, so
+#    the chart render in check 3 never sees them and neither does check 4.
+#    Every image here has to come from a variable the inventory owns: a literal
+#    reference is un-mirrorable — no deploy target can redirect it and
+#    `make mirror-images` was never told to copy it — so an approved-registry
+#    install pulls it from a public registry after the install reported success.
+#
+#    This is failure mode #2, and it arrived exactly this way: Hindsight landed
+#    with both of its images hard-coded, and every check above stayed green.
+# ---------------------------------------------------------------------------
+overrides="$(jq -r '.images[] | select(.override) | .override' "$INVENTORY" | sort -u)"
+integration_refs="$(grep -rnE '^[[:space:]]*image:[[:space:]]*\S+' k8s-operator/config/integrations \
+  --include='*.yaml' --include='*.yml' --include='*.yaml.template' |
+  sed -E 's/^([^:]+):([0-9]+):[[:space:]]*image:[[:space:]]*/\1\t\2\t/' || true)"
+[ -n "$integration_refs" ] ||
+  fail "no image references found under k8s-operator/config/integrations — the extraction pattern in check 5 no longer matches, so the integration manifests are unchecked."
+while IFS=$'\t' read -r file line image; do
+  [ -n "${image:-}" ] || continue
+  # The '${'*'}' pattern is deliberately unexpanded: it matches the literal
+  # characters "${…}" as they appear in the manifest, which is the point of the
+  # check. SC2016 reads that as an accident.
+  # shellcheck disable=SC2016
+  case "$image" in
+  '${'*'}')
+    var="${image#\$\{}"
+    var="${var%\}}"
+    grep -qxF "$var" <<<"$overrides" ||
+      fail "${file}:${line} substitutes \$$var, which is not the 'override' of any entry in $INVENTORY — nothing resolves it from the inventory, so a mirrored install cannot redirect it."
+    ;;
+  *)
+    fail "${file}:${line} hard-codes '$image'. Integration images must come from a \${VAR} that an $INVENTORY entry names in its 'override', or no deploy target can point them at a mirror."
+    ;;
+  esac
+done <<<"$integration_refs"
+
 if [ "$status" -eq 0 ]; then
   echo "Image inventory check passed: $INVENTORY matches every pin, and the chart mirrors cleanly."
 fi

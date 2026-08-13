@@ -285,7 +285,7 @@ IMAGES_JSON="${IMAGES_JSON:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/n
 # Deliberately not inherited from REGISTRY_PREFIX. That variable predates this
 # inventory and has always meant "the registry holding the images this project
 # builds"; a mirror populated to it holds those four and nothing more. Widening
-# it to cert-manager, LiteLLM, fluent-bit and the token minter would redirect an
+# it to cert-manager, LiteLLM, fluent-bit, the token minter and Hindsight would redirect an
 # existing install to references its mirror was never given — cert-manager first,
 # where the wait in execute_cert_manager times out on ImagePullBackOff with the
 # cluster already created. A single-prefix mirror is still one export away; it is
@@ -306,7 +306,7 @@ warn_unmirrored_third_party() {
   prefix="$(registry_prefix)"
   [ "$prefix" = "$DEFAULT_REGISTRY_PREFIX" ] && return 0
   [ -n "$(third_party_registry_prefix)" ] && return 0
-  print_warning "REGISTRY_PREFIX is '${prefix}', but cert-manager, LiteLLM, fluent-bit and the GitHub token minter will still be pulled from their upstream registries. Export THIRD_PARTY_REGISTRY_PREFIX (commonly the same value) to mirror those too — see 'make mirror-images'."
+  print_warning "REGISTRY_PREFIX is '${prefix}', but the third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter and Hindsight) will still be pulled from their upstream registries. Export THIRD_PARTY_REGISTRY_PREFIX (commonly the same value) to mirror those too — see 'make mirror-images'."
 }
 
 # Resolve a third-party image by its images.json name: the upstream reference
@@ -331,7 +331,14 @@ third_party_image() {
 
   prefix="$(third_party_registry_prefix)"
   if [ -n "$prefix" ]; then
-    echo "${prefix}/${name}:${tag}"
+    # A pin can carry a digest in the tag position ("0.8.6@sha256:..."), which
+    # names the upstream manifest. It cannot name the mirrored copy: you push
+    # to a tag, never to a digest, so scripts/mirror_images.sh writes
+    # "<prefix>/<name>:<tag>" with the digest stripped. Ask for the copy the
+    # same way it was pushed — keeping the digest here would work only when the
+    # mirror was populated with crane or skopeo, and resolve against nothing at
+    # all after the docker fallback the script warns about.
+    echo "${prefix}/${name}:${tag%%@*}"
   else
     echo "${repository}:${tag}"
   fi

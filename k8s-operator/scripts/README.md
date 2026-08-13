@@ -59,16 +59,22 @@ which can still be set individually. Changing it after a first run requires edit
 scripts warn when an export is ignored or a saved image no longer matches the prefix.
 
 The images this project does not build — LiteLLM, fluent-bit, the GitHub token minter,
-cert-manager — follow `THIRD_PARTY_REGISTRY_PREFIX`, which is independent of `REGISTRY_PREFIX`:
-neither implies the other, so a fully mirrored install exports both, and setting only the first
-leaves these four upstream (the scripts warn when they see that combination, since it is also
-what a half-mirrored install looks like). Their upstream references and pins are resolved from
-`images.json` at the repository root (hence the `jq` prerequisite on steps 03, 09, and 10), not
-duplicated here, so the mirror `make mirror-images` populated and the install cannot ask for
-different versions. `LITELLM_IMAGE` (step 09) and `GITHUB_MINTER_IMAGE` (step 10) override the
+cert-manager, Hindsight — follow `THIRD_PARTY_REGISTRY_PREFIX`, which is independent of
+`REGISTRY_PREFIX`: neither implies the other, so a fully mirrored install exports both, and
+setting only the first leaves them upstream (the scripts warn when they see that combination,
+since it is also what a half-mirrored install looks like). Their upstream references and pins
+are resolved from `images.json` at the repository root (hence the `jq` prerequisite on steps 03,
+09, 10, and 13), not duplicated here, so the mirror `make mirror-images` populated and the
+install cannot ask for different versions. `LITELLM_IMAGE` (step 09), `GITHUB_MINTER_IMAGE`
+(step 10), and `HINDSIGHT_API_IMAGE` / `HINDSIGHT_POSTGRES_IMAGE` (step 13) override the
 resolution for a single image. Unlike the kube-agents images, these are deliberately **not**
 persisted to `vars.sh`: a saved pin would be a second copy of a version `images.json` already
 owns, and would survive an upgrade that moved it.
+
+Two of these are pinned by digest as well as tag. The mirrored form drops the digest, because
+`make mirror-images` pushes to a tag and a digest names the upstream manifest, not the copy —
+so a mirrored install asks for `<prefix>/hindsight-api:0.8.6` while a default one gets the
+digest-pinned upstream reference.
 
 Two escape hatches cover cert-manager, the one step that applies a manifest this project does not
 own: `CERT_MANAGER_MANIFEST` replaces the upstream URL with a local or mirrored path, and

@@ -64,6 +64,24 @@
       "description": "Mints short-lived GitHub App tokens for the GitOps workflow."
     },
     {
+      "name": "hindsight-api",
+      "origin": "third-party",
+      "repository": "ghcr.io/vectorize-io/hindsight-api",
+      "tag": "0.8.6@sha256:3db1536d84a14a10afbd08cc8f82bf4eec03c123d950705226c999bea14ca0f0",
+      "override": "HINDSIGHT_API_IMAGE",
+      "pulledBy": "Provisioning step 13, when the memory provider uses Hindsight.",
+      "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
+    },
+    {
+      "name": "hindsight-postgresql",
+      "origin": "third-party",
+      "repository": "docker.io/ankane/pgvector",
+      "tag": "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8",
+      "override": "HINDSIGHT_POSTGRES_IMAGE",
+      "pulledBy": "Provisioning step 13, alongside the Hindsight API.",
+      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. Upstream publishes only a floating 'latest', so the digest is the real pin."
+    },
+    {
       "name": "cert-manager-controller",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-controller",
