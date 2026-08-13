@@ -1,4 +1,10 @@
-# Pull Request
+## Summary
+
+<!--
+One paragraph, in plain prose, explaining what this PR does — what a reviewer would
+want to know before reading the diff. Write it for a human, not as a bullet list or a
+restatement of the commit message.
+-->
 
 ## Why This Change
 
