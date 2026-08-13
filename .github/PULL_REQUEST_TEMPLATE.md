@@ -8,21 +8,19 @@ restatement of the commit message.
 
 ## Why This Change
 
-<!-- Explain the problem, motivation, or user need this PR addresses. -->
+<!--
+The problem, motivation, or user need this PR addresses, and what stays broken without
+it. Impact belongs here too — say it once, in the place that already explains why the
+problem is worth fixing.
+-->
 
 ## What Changed
 
-<!-- Summarize the important files, behavior, or workflow changes. -->
-
-**Files:**
-
-- `path/to/file`
-
-**Added/Changed/Fixed:**
-
--
-
-## Why This Matters
+<!--
+The important behaviour, interface, or workflow changes. GitHub's "Files changed" tab
+already lists every file, so name one only where the reviewer needs to know why that
+file matters.
+-->
 
 -
 
@@ -58,6 +56,10 @@ Full contract: AGENTS.md, "Pull Request Hygiene".
 
 -
 
----
+## Risk & Rollout
 
-<!-- Close with a short note on functional impact, risk, or rollout. -->
+<!--
+Blast radius, any new failure mode, how to revert, and anything that has to happen at
+merge time. A short paragraph. "Low risk, no runtime code paths touched" is a complete
+answer when it is true.
+-->
