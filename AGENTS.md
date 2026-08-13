@@ -35,6 +35,54 @@ To use these agents:
 1. Follow the instructions in [INSTALL.md](INSTALL.md) to set up and register the Platform Agent in your agent harness.
 2. Refer to the documentation site content in [docs/site/src/content/docs/](docs/site/src/content/docs/) for architecture, concepts, and operational guides.
 
+## Before Starting a Task
+
+Many people and agents work in this repository at once, so the first step of a non-trivial task
+is finding out whether someone is already doing it. Scan the open work and report what you find
+to the user **before** you write code. Skip the scan only when the user has already named the
+issue or pull request you are working on, or when the change is a one-liner they asked for
+directly.
+
+Branches live on forks, so name the upstream repository on every call:
+
+```bash
+# Open PRs, with the files each one touches. File overlap is the strongest duplicate
+# signal and one call gets it for every open PR.
+gh pr list --repo gke-labs/kube-agents --state open --limit 100 \
+  --json number,title,author,headRefName,isDraft,updatedAt,files
+
+# Open issues, and who has already claimed them.
+gh issue list --repo gke-labs/kube-agents --state open --limit 100 \
+  --json number,title,assignees,labels
+
+# Already tried? A closed pull request is a decision, not an absence.
+gh search prs --repo gke-labs/kube-agents --state closed --limit 20 '<keywords>'
+```
+
+Then report before you start:
+
+- **An open pull request touches your files or solves your problem.** Give the number, author,
+  and URL, and say how your task differs. Do not push to someone else's branch and do not open
+  a competing pull request without the user's go-ahead. Overlap alone is a merge-conflict
+  warning, not a stop sign — say which it is.
+- **An open issue describes the task and is unassigned.** Give the number and title, offer to
+  claim it, and say what you would comment. Assign or comment only after the user agrees:
+  `gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me`. `@me` is the account
+  whose token you hold — a person — so you are volunteering them, not yourself. Contributors
+  working from a fork without write access cannot self-assign; offer a comment instead.
+- **The issue is assigned to someone else.** Report it and ask before starting anything.
+- **Nothing matches.** Say so in one line and carry on.
+
+Carry the result into the pull request's **Context** section — `Closes #<number>`, or the
+related open pull request and how yours differs.
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) already reserves that
+section for it.
+
+This is not the `status:in-progress` claim in
+[`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md).
+That is the deployed Platform Agent claiming an issue on a user's repository at runtime. Here
+the assignee is the claim; do not apply `status:` labels to issues in this repository.
+
 ## Skills Guidelines
 
 - Skills are located under `agents/platform/skills/` (Platform Agent: provisioning, governance, cost, manifest generation, GitOps) and `agents/cluster/skills/` (Cluster Agent: single-cluster runtime debugging and operations).
