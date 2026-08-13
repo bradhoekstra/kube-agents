@@ -84,13 +84,20 @@ fine for evaluation; pin a `vX.Y.Z` release tag for production.
 ### Installing from a mirrored registry
 
 For a cluster that may only pull from an approved registry, copy the images
-there first — `make mirror-images MIRROR_PREFIX=<prefix>` from the repository
-root, driven by `images.json` — then set `image_registry` to the same prefix.
-It reaches the two images the chart never renders as well (the agent
-Deployment and the fluent-bit sidecar the operator resolves at reconcile
+there first — `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from
+the repository root, driven by `images.json` — then set `image_registry` to the
+same prefix. It reaches the two images the chart never renders as well (the
+agent Deployment and the fluent-bit sidecar the operator resolves at reconcile
 time); the [chart README](../../../charts/kube-agents/README.md) explains how.
 Add `third_party_image_registry` only if the mirror keeps LiteLLM and
 fluent-bit under a different path.
+
+`IMAGE_TAG` is not optional here. The four first-party images take whatever tag
+the mirror step was given (`latest` if it was given none), while Terraform asks
+for `image_tag` — so a mirror populated at `latest` against an `image_tag` of
+`v1.2.3` holds no reference the install will ever request. `terraform apply`
+reports success and the pods sit in ImagePullBackOff. Pass the same value to
+both.
 
 The mirror must be readable with the nodes' own credentials — an Artifact
 Registry in the same project is the simple case. No `imagePullSecrets` are
