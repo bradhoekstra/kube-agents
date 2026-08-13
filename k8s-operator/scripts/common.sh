@@ -13,8 +13,13 @@ fi
 # load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
+# Minimum tool versions. Sourced from the helper's own directory rather than
+# SCRIPT_DIR, which callers under scripts/dev/ override to point at themselves.
+# shellcheck source=k8s-operator/scripts/min_versions.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/min_versions.sh"
+
 # gke_dns_endpoint_flag, shared with hack/ci-env.sh and scripts/release/common.sh.
-# Resolved from BASH_SOURCE rather than SCRIPT_DIR, which callers override.
+# Resolved from BASH_SOURCE for the same reason as the line above.
 # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
 
@@ -215,7 +220,7 @@ default_model_for_provider() {
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|anthropic|chatgpt|openai)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|chatgpt|openai)$ ]]
 }
 
 # The GCP IAM role bundles provision_04_gcp_iam.sh knows how to grant. Kubernetes
@@ -283,11 +288,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, anthropic, chatgpt, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, chatgpt, openai)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, anthropic, chatgpt, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, chatgpt, openai."
     exit 1
   fi
 
@@ -295,6 +300,14 @@ init_var_model_provider() {
   DEFAULT_MODEL="$(default_model_for_provider "$MODEL_PROVIDER")"
 
   init_var "MODEL_DEFAULT_NAME" "$DEFAULT_MODEL" "Enter Model Default Name"
+
+  # Vertex has no API key; it needs a billing project and a serving location,
+  # which is not always the cluster's region — Model Garden serves each partner
+  # model from its own subset.
+  if [ "$MODEL_PROVIDER" = "vertex_ai" ]; then
+    init_var "VERTEX_PROJECT_ID" "${PROJECT_ID:-}" "Enter Vertex AI Project ID"
+    init_var "VERTEX_LOCATION" "${REGION:-$DEFAULT_REGION}" "Enter Vertex AI Location"
+  fi
 }
 
 init_var_platform_agent_permission_set() {
@@ -370,6 +383,8 @@ load_state() {
   export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
   export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
   export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+  export LITELLM_KSA_NAME="kubeagents-litellm"
+  export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
 }
 
 ensure_teardown_state() {
@@ -388,6 +403,8 @@ ensure_teardown_state() {
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
     export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
     export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+    export LITELLM_KSA_NAME="kubeagents-litellm"
+    export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
   else
     echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
@@ -440,6 +457,8 @@ ensure_teardown_state() {
     export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
     export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
     export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+    export LITELLM_KSA_NAME="kubeagents-litellm"
+    export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
   fi
 }
 
