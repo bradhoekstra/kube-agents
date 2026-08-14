@@ -266,7 +266,9 @@ Three things change while it is on:
   that command line for the process it supervises.
 - `profile-platform.overlay.yaml` gains what only the `default` profile's rendering carried before:
   the chat adapters, their display mode, the toolsets each chat platform key resolves, the ingress
-  plugins, and leader election.
+  plugins, leader election, and the `kanban` block. That last one follows the gateway for the same
+  reason leader election does — the dispatcher and the notifier run in the gateway process and read
+  their settings from its own home — so [`tuning.maxInProgress`](#specharnesstuning) keeps applying.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and rebuilds it
   with the same three-way merge the `default` profile gets, so `/sethome` and `monitoring.install_id`
   survive a restart — see [How config reaches each profile](#how-config-reaches-each-profile).
@@ -288,6 +290,15 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   ignored. Those requests now land on the Platform Agent rather than the Chat Agent.
 - The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
   shows that profile's sessions while the front door is the platform one.
+- **An [`AgentPlugin`](./agentplugin-crd.md) without a `spec.targetProfile` does not follow the
+  gateway.** All three halves of its wiring stay on the `default` profile: the image volume is
+  mounted at `$HERMES_HOME/plugins/<name>`, the name is added to that profile's `plugins.enabled`,
+  and a `platforms:` block in its `spec.config` is routed there as a gateway-level singleton. With
+  the flag on, the gateway is homed at `profiles/platform` and reads none of them, so the plugin is
+  neither loaded nor configured — silently, since nothing errors. The `pubsub-platform` adapter and
+  the `gke-stockout-investigator` alert route that depends on it are both affected. Setting
+  `spec.targetProfile: platform` moves the plugin and its `platform_toolsets` across, but not its
+  `platforms:` subtree, which is gateway-scoped and always rendered onto `default`.
 - Cluster profiles and their scaffolding are unaffected.
 
 ## `spec.deployment`

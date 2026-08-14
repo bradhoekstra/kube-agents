@@ -4326,7 +4326,7 @@ func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
 // written unconditionally and it would be easy to leave the keys in it.
 func TestPlatformFrontDoorOverlayIsEmptyWhenOff(t *testing.T) {
 	overlay := platformOverlay(t, frontDoorAgent("fd-off", 1, false))
-	for _, key := range []string{"platforms", "platform_toolsets", "display", "leader_election"} {
+	for _, key := range []string{"platforms", "platform_toolsets", "display", "leader_election", "kanban"} {
 		if _, present := overlay[key]; present {
 			t.Errorf("%s is rendered into the platform overlay with the flag off, so turning "+
 				"the flag off would not undo it:\n%v", key, overlay)
@@ -4357,6 +4357,89 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 		if !slices.Contains(enabled, want) {
 			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
 		}
+	}
+}
+
+// TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets guards the second half of the
+// clobber TestPlatformFrontDoorOverlayKeepsTargetedPlugins covers for plugins.enabled.
+//
+// `platform_toolsets` is allowlisted and not gateway-scoped, so a plugin targeting this
+// profile reaches the same merge — and mergeMaps only recurses into a nested map that
+// toStrMap recognises. Built as map[string][]string the front door's own subtree was
+// REPLACED rather than merged, and the symptom is not a missing key: the chat platforms fall
+// back to `hermes-google_chat`, which has no static TOOLSETS entry, so the front door answers
+// with no tools at all on an install where the flag had been working.
+func TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets(t *testing.T) {
+	agent := frontDoorAgent("fd-toolsets", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("pubsubtool", platformProfileName,
+			"platform_toolsets:\n  pubsub:\n    - kanban\n  google_chat:\n    - mcp-extra\n"),
+	})[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+
+	// The plugin's own key arrives, and the front door's survive alongside it.
+	if got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", "pubsub"})); !slices.Equal(got, []string{"kanban"}) {
+		t.Errorf("platform_toolsets.pubsub = %v, want the plugin's own list", got)
+	}
+	if got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", "slack"})); !slices.Equal(got, slices.Sorted(slices.Values(frontDoorToolsets))) {
+		t.Errorf("platform_toolsets.slack = %v, want the front door's toolsets left intact", got)
+	}
+
+	// Within a subtree the two sides union, which is the contract the AgentPlugin CRD page
+	// states: "list values are unioned with the operator's own entries rather than
+	// replacing them".
+	want := slices.Sorted(slices.Values(append(slices.Clone(frontDoorToolsets), "mcp-extra")))
+	if got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", "google_chat"})); !slices.Equal(got, want) {
+		t.Errorf("platform_toolsets.google_chat = %v, want %v", got, want)
+	}
+}
+
+// TestFrontDoorKanbanMatchesDefaultProfile is the drift guard kanbanOverlay names.
+//
+// The dispatcher and the notifier run in the gateway process and read `kanban` through
+// load_config(), which resolves from get_hermes_home() — so the block has to be on whichever
+// profile the gateway is homed at, and it has to say the same thing there. Neither
+// agents/platform/config.yaml nor deploy/shared/defaults/config.yaml declares the key, so a
+// block that fails to follow the gateway does not fall back to the default profile's: it
+// falls back to upstream, where dispatch is unbounded, the tick is 60s, and
+// spec.harness.tuning.maxInProgress silently stops meaning anything.
+func TestFrontDoorKanbanMatchesDefaultProfile(t *testing.T) {
+	agent := frontDoorAgent("fd-kanban", 1, true)
+	agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{MaxInProgress: ptr.To(7)}
+
+	data := buildConfigMapData(agent, nil)
+	var chat map[string]any
+	if err := yaml.Unmarshal([]byte(data[profileOverlayKey(defaultProfileName)]), &chat); err != nil {
+		t.Fatalf("unmarshal default overlay: %v", err)
+	}
+	var platform map[string]any
+	if err := yaml.Unmarshal([]byte(data[profileOverlayKey(platformProfileName)]), &platform); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v", err)
+	}
+
+	want, ok := chat["kanban"].(map[string]any)
+	if !ok {
+		t.Fatalf("the default profile no longer renders a kanban block; this test would pass "+
+			"against nothing:\n%v", chat)
+	}
+	got, ok := platform["kanban"].(map[string]any)
+	if !ok {
+		t.Fatalf("the front-door overlay carries no kanban block, so the dispatcher reverts to "+
+			"upstream's unbounded behaviour:\n%v", platform)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("kanban differs between the two profiles:\n  platform: %v\n  default:  %v", got, want)
+	}
+
+	// The CR field is the reason equality is not enough on its own: it is documented as
+	// "board-wide cap on concurrent kanban workers", and reaching only a profile the gateway
+	// is not homed at is the same as not reaching anything.
+	if got["max_in_progress"] != 7 {
+		t.Errorf("max_in_progress = %v, want spec.harness.tuning.maxInProgress (7) to reach the "+
+			"profile the gateway runs as", got["max_in_progress"])
 	}
 }
 

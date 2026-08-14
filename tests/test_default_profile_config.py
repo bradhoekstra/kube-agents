@@ -374,6 +374,88 @@ class RebuildTest(unittest.TestCase):
         self.assertEqual([], list(self.config.parent.glob("*.tmp")))
 
 
+class FrontDoorFlagCycleTest(unittest.TestCase):
+    """Turning spec.harness.experimental.platformFrontDoor off and on again.
+
+    The platform profile is the second caller of this script, and unlike the default
+    profile it has an OFF state: with the flag off, step 2.6 force-syncs config.yaml from
+    the image and step 2.6b does not run. That combination is what makes a leftover
+    baseline dangerous rather than inert — it is a record of a merge the force-sync has
+    since undone, and `_reconcile_list`'s `theirs == base` rule ("the baseline held still,
+    so the runtime's list wins outright") then reads the image's plugins.enabled as a
+    deliberate removal.
+
+    The entrypoint deletes the baseline on the off boot for exactly this reason; the two
+    cases below are the same second enable with and without that delete, so the test says
+    what the delete buys rather than only that it happened.
+    """
+
+    IMAGE = {"plugins": {"enabled": ["hermes_otel", "tool_call_audit", "incident_context"]}}
+    FRONT_DOOR_OVERLAY = {
+        "plugins": {
+            "enabled": [
+                "session_store",
+                "session_otel_bridge",
+                "bootstrap_onboarding",
+                "legacy_slash_commands",
+            ]
+        },
+        "platforms": {"google_chat": {"enabled": True}},
+    }
+
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.image = self.tmp / "platform-template" / "config.yaml"
+        self.overlay = self.tmp / "agent-config" / "profile-platform.overlay.yaml"
+        self.config = self.tmp / "data" / "profiles" / "platform" / "config.yaml"
+        self.baseline = self.config.with_name(".platform-config-baseline.yaml")
+        write(self.image, self.IMAGE)
+        write(self.overlay, self.FRONT_DOOR_OVERLAY)
+
+    def enable(self):
+        """One boot with the flag on: step 2.6 leaves config.yaml alone, 2.6b rebuilds."""
+        dpc.rebuild(self.config, self.image, [self.overlay], baseline_path=self.baseline)
+
+    def disable(self, discard_baseline):
+        """One boot with the flag off: step 2.6 force-syncs, 2.6b does not run."""
+        write(self.config, self.IMAGE)
+        if discard_baseline:
+            self.baseline.unlink(missing_ok=True)
+
+    def test_the_ingress_plugins_come_back_on_a_second_enable(self):
+        self.enable()
+        self.disable(discard_baseline=True)
+        self.enable()
+        self.assertEqual(
+            read(self.config)["plugins"]["enabled"],
+            self.IMAGE["plugins"]["enabled"] + self.FRONT_DOOR_OVERLAY["plugins"]["enabled"],
+            "the second enable must restore the ingress plugins; without them chat answers "
+            "and health checks stay green while sessions stop persisting, tracing stops, and "
+            "`/hermes …` stops being unwrapped",
+        )
+
+    def test_a_baseline_left_behind_is_what_loses_them(self):
+        # The failure the delete prevents, pinned so nobody restores the file "for
+        # symmetry" without seeing the cost.
+        self.enable()
+        self.disable(discard_baseline=False)
+        self.enable()
+        self.assertEqual(read(self.config)["plugins"]["enabled"], self.IMAGE["plugins"]["enabled"])
+
+    def test_runtime_state_still_survives_a_restart_with_the_flag_on(self):
+        # The delete must not reach the on path: the baseline is what tells `/sethome`'s
+        # home channel apart from a key the operator withdrew.
+        self.enable()
+        live = read(self.config)
+        live["platforms"]["google_chat"]["home_channel"] = "spaces/AAAA"
+        write(self.config, live)
+        self.enable()
+        self.assertEqual(
+            "spaces/AAAA", read(self.config)["platforms"]["google_chat"]["home_channel"]
+        )
+
+
 class ArgvUnionTest(unittest.TestCase):
     """`args` is the one list the image and the operator must not merely agree about.
 

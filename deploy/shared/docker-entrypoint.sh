@@ -650,6 +650,11 @@ platform_is_front_door() {
     [ "${HERMES_GATEWAY_PROFILE:-}" = "platform" ]
 }
 
+# Step 2.6b's record of what it last wrote. Named once because two steps act on it — 2.6b
+# writes it, and the force-sync path below deletes it — and a disagreement about the path
+# would leave a stale baseline behind exactly where it does damage.
+PLATFORM_CONFIG_BASELINE="$TARGET_DIR/profiles/platform/.platform-config-baseline.yaml"
+
 # The image-owned entries step 2.6 force-syncs into the platform profile.
 #
 # config.yaml is on the list only while the image owns it outright. At the front door
@@ -675,6 +680,37 @@ if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLA
         --cron-retire "blueprint-sync policy-propagation global-capacity-orchestrator standardization-validator lifecycle-deprecation-manager" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
+
+# Drop step 2.6b's baseline whenever the flag is off, which is the same condition that
+# just force-synced config.yaml above.
+#
+# The baseline is a record of what the file looked like when the operator last declared
+# it, and the force-sync changes the file out from under that record without telling it.
+# Left in place it is not inert on the boot the flag comes back: its presence is what
+# sends rebuild() down `reconcile(base, ours, theirs)` instead of `adopt()`, and on a
+# second enable the three inputs line up exactly wrong — `base` is the previous
+# on-period's merge, `theirs` recomputes to the same thing, and `ours` is whatever the
+# force-sync restored from the image. `_reconcile_list` reads `theirs == base` as "the
+# baseline held still, so the runtime's list wins outright" — the rule that keeps a
+# toolset switched off in the dashboard from being resurrected — and returns the image's
+# three plugins verbatim, silently dropping session_store, session_otel_bridge,
+# bootstrap_onboarding and legacy_slash_commands. Every other front-door key survives,
+# because it is absent from `ours` and absence keeps `theirs`, so chat answers and health
+# checks stay green while sessions stop persisting, tracing stops, and `/hermes …` stops
+# being unwrapped. The new baseline written at the end of that boot is the same one, so
+# the loss repeats on every later start.
+#
+# Removing it costs nothing: the force-sync has already discarded the runtime state the
+# baseline existed to carry, so `adopt()` on the next enable is both correct and the same
+# decision a fresh volume gets.
+#
+# A function so the test can call it, like the two predicates above; `rm -f` is the last
+# command either way, so the false branch cannot end the boot under `set -e`.
+discard_stale_front_door_baseline() {
+    platform_is_front_door || rm -f "$PLATFORM_CONFIG_BASELINE"
+}
+
+discard_stale_front_door_baseline
 
 # 2.6a Re-sync each specialist profile's skills from the image on every start.
 # Same reasoning as 2.6, applied to the directory that carries the agent's
@@ -870,8 +906,10 @@ fi
 # dashboard sidecar execs out at the step-1.5 gate — but the entrypoint also runs where
 # there is no operator, and the guard costs nothing.
 #
-# Flag off, this step does not run and step 2.6 force-syncs config.yaml as it always has;
-# the baseline file left behind is inert until the flag comes back.
+# Flag off, this step does not run and step 2.6 force-syncs config.yaml as it always has —
+# and deletes the baseline this step writes, because a record of a merge the force-sync has
+# since overwritten is worse than no record at all. The note beside that `rm` has the
+# failure it prevents.
 if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
     && [ -f "$DEFAULT_CONFIG_SCRIPT" ] && [ -f "$PLATFORM_TEMPLATE/config.yaml" ] \
     && [ -d "$TARGET_DIR/profiles/platform" ]; then
@@ -882,7 +920,7 @@ if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
         --config "$TARGET_DIR/profiles/platform/config.yaml" \
         --image "$PLATFORM_TEMPLATE/config.yaml" \
         --overlay "$OVERLAY_DIR/profile-platform.overlay.yaml" \
-        --baseline "$TARGET_DIR/profiles/platform/.platform-config-baseline.yaml" \
+        --baseline "$PLATFORM_CONFIG_BASELINE" \
         || echo "WARN: could not rebuild profiles/platform/config.yaml; the Platform Agent front door is running the previous file, so operator settings (platform adapters, chat toolsets, ingress plugins) may not have applied" >&2
 fi
 

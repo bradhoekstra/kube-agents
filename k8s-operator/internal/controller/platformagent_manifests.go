@@ -415,6 +415,74 @@ const defaultProfileName = "default"
 // recommendation.
 const defaultKanbanMaxInProgress = 2
 
+// kanbanDispatchIntervalSeconds is the dispatcher tick. Upstream defaults to 60s, which
+// added a 0-60s (median ~38s) dead wait to every delegation before the worker was even
+// claimed. 5s matches the notifier watcher's cadence and makes delegation feel immediate.
+const kanbanDispatchIntervalSeconds = 5
+
+// kanbanWakeOnEvents are the terminal events that wake the gateway for a follow-up turn.
+// Upstream wakes on all five and hardcodes the set; the image patches the key in
+// (deploy/docker/patches/kanban_notifier.py).
+//
+// `completed` is deliberately absent. By the time the notifier wakes anyone it has already
+// sent the worker's own status line and its full `result` to the thread, so the woken turn
+// re-reads the card and paraphrases a message the user is looking at — measured at 5.9s and
+// 32,460 input tokens on task t_c31a1f00, and a paraphrase of a verbatim answer can only
+// lose detail. The failure kinds stay: those deliver a bare status line, and the gateway has
+// to decide whether to retry, escalate, or explain.
+var kanbanWakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
+
+// resolveKanbanMaxInProgress is the live concurrency cap across the whole board (not a
+// per-tick spawn budget), from spec.harness.tuning.maxInProgress or the default.
+//
+// Dispatch concurrency defaults to a cap rather than to upstream's unbounded behaviour. A
+// kanban worker here is not a coroutine: it is a full `hermes -p <profile> ... kanban task`
+// process — measured at ~340 Mi resident once its MCP proxies are up, and alive for the
+// 8-14 minutes an incident triage took on the deployment where this was diagnosed.
+// Unbounded dispatch therefore spawns one such process per queued card, and a burst of
+// cluster events queues them faster than they retire.
+//
+// The failure that follows is silent by construction. The cgroup OOM killer takes a child
+// process, not PID 1, so there is no container restart, no Kubernetes event, and no
+// non-zero exit anywhere the operator can see — only `pid not alive` in the kanban ledger.
+// The dispatcher's own retry budget is 1, so the card is then stranded rather than
+// re-dispatched, and the work it stood for is simply never done.
+//
+// The cap is deliberately below what memory alone would allow. Model quota is the other
+// shared resource and it binds first for most deployments, so the default is chosen to be
+// safe on a small pod rather than optimal on a large one — a fleet with headroom raises it
+// on the CR, which still wins outright.
+func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
+	if limits := agentTuning(agent); limits != nil && limits.MaxInProgress != nil {
+		return *limits.MaxInProgress
+	}
+	return defaultKanbanMaxInProgress
+}
+
+// kanbanOverlay renders the `kanban` subtree for whichever profile the gateway runs as.
+//
+// The dispatcher and the notifier run inside the gateway process and read their settings
+// through hermes_cli.config.load_config(), which resolves from get_hermes_home() — so these
+// keys have to live on the profile the gateway is homed at, not on a profile that merely
+// exists. renderConfigYAML writes the same block for the default profile; frontDoorOverlay
+// carries it to the platform profile when the flag re-homes the gateway there, the same way
+// leader_election follows the gateway. TestFrontDoorKanbanMatchesDefaultProfile pins the two
+// renderings together.
+//
+// Neither agents/platform/config.yaml nor deploy/shared/defaults/config.yaml declares a
+// `kanban` key, so without this the front door silently reverts to upstream: unbounded
+// dispatch, a 60s tick, and `completed` back in the wake set, with
+// spec.harness.tuning.maxInProgress quietly having no effect at all.
+func kanbanOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
+	return map[string]any{
+		"dispatch_in_gateway":       true,
+		"auto_subscribe_on_create":  true,
+		"dispatch_interval_seconds": kanbanDispatchIntervalSeconds,
+		"wake_on_events":            slices.Clone(kanbanWakeOnEvents),
+		"max_in_progress":           resolveKanbanMaxInProgress(agent),
+	}
+}
+
 // clusterProfileClassKey is the ConfigMap key holding the overlay applied to EVERY
 // cluster-* profile.
 //
@@ -629,7 +697,16 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 		"extra":   map[string]any{"rich_blocks": true},
 	}
 	display := map[string]map[string]any{}
-	platformToolsets := map[string][]string{}
+	// map[string]any, not map[string][]string, and the type is load-bearing. This subtree
+	// is written before the targeted plugins' own config is merged over it, and mergeMaps
+	// recurses into a nested map only when toStrMap recognises it — which it does for
+	// map[string]any alone. As map[string][]string it fell through to a plain assignment,
+	// so a plugin targeting this profile with a `platform_toolsets:` block of its own
+	// REPLACED the chat keys instead of unioning with them, leaving the front door on the
+	// `hermes-google_chat` fallback with no static TOOLSETS entry and therefore no tools.
+	// That also broke the union contract the AgentPlugin CRD page states outright. The
+	// []string values below are fine: toSlice already handles them.
+	platformToolsets := map[string]any{}
 
 	if agent.Spec.Integration != nil {
 		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
@@ -657,6 +734,10 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 		},
 		"platform_toolsets": platformToolsets,
 		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
+		// The dispatcher and the notifier run in the gateway process and read this
+		// block from the gateway's own HERMES_HOME, so it follows the gateway here for
+		// the same reason leader_election does below. See kanbanOverlay.
+		"kanban": kanbanOverlay(agent),
 	}
 	if len(display) > 0 {
 		overlay["display"] = map[string]any{"platforms": display}
@@ -1077,49 +1158,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// Second gate for the kanban orchestrator surface: the kanban tools' check_fn
 	// reads this top-level `toolsets` key (distinct from platform_toolsets above).
 	cfg.Toolsets = []string{"kanban"}
-	// Pin the chat-transparency machinery on (both default True upstream, pinned
-	// so a future default change can't silently disable delegated-progress).
+	// Every value in this block is shared with frontDoorOverlay, which carries the same
+	// keys to the platform profile when the gateway is re-homed onto it. The reasoning
+	// behind each one lives on the declarations kanbanOverlay sits among, so the two
+	// profiles cannot be tuned apart by accident.
+	//
+	// The first two pin the chat-transparency machinery on (both default True upstream,
+	// pinned so a future default change can't silently disable delegated-progress).
 	cfg.Kanban.DispatchInGateway = true
 	cfg.Kanban.AutoSubscribeOnCreate = true
-	// Dispatcher tick. Upstream defaults to 60s, which added a 0-60s (median ~38s)
-	// dead wait to every delegation before the worker was even claimed. 5s matches
-	// the notifier watcher's cadence and makes delegation feel immediate.
-	cfg.Kanban.DispatchIntervalSeconds = 5
-	// Which terminal events wake the front door for a follow-up turn. Upstream
-	// wakes on all five and hardcodes the set; the image patches the key in
-	// (deploy/docker/patches/kanban_notifier.py).
-	//
-	// `completed` is deliberately absent. By the time the notifier wakes anyone
-	// it has already sent the worker's own status line and its full `result` to
-	// the thread, so the woken turn re-reads the card and paraphrases a message
-	// the user is looking at — measured at 5.9s and 32,460 input tokens on task
-	// t_c31a1f00, and a paraphrase of a verbatim answer can only lose detail.
-	// The failure kinds stay: those deliver a bare status line, and the front
-	// door has to decide whether to retry, escalate, or explain.
-	cfg.Kanban.WakeOnEvents = []string{"gave_up", "crashed", "timed_out", "blocked"}
-	// Dispatch concurrency defaults to a cap rather than to upstream's unbounded
-	// behaviour. A kanban worker here is not a coroutine: it is a full
-	// `hermes -p <profile> ... kanban task` process — measured at ~340 Mi resident once
-	// its MCP proxies are up, and alive for the 8-14 minutes an incident triage took on
-	// the deployment where this was diagnosed. Unbounded
-	// dispatch therefore spawns one such process per queued card, and a burst of
-	// cluster events queues them faster than they retire.
-	//
-	// The failure that follows is silent by construction. The cgroup OOM killer takes
-	// a child process, not PID 1, so there is no container restart, no Kubernetes
-	// event, and no non-zero exit anywhere the operator can see — only `pid not alive`
-	// in the kanban ledger. The dispatcher's own retry budget is 1, so the card is then
-	// stranded rather than re-dispatched, and the work it stood for is simply never
-	// done.
-	//
-	// The cap is deliberately below what memory alone would allow. Model quota is the
-	// other shared resource and it binds first for most deployments, so the default is
-	// chosen to be safe on a small pod rather than optimal on a large one — a fleet
-	// with headroom raises it on the CR, which still wins outright below.
-	cfg.Kanban.MaxInProgress = defaultKanbanMaxInProgress
-	if limits := agentTuning(agent); limits != nil && limits.MaxInProgress != nil {
-		cfg.Kanban.MaxInProgress = *limits.MaxInProgress
-	}
+	cfg.Kanban.DispatchIntervalSeconds = kanbanDispatchIntervalSeconds
+	cfg.Kanban.WakeOnEvents = slices.Clone(kanbanWakeOnEvents)
+	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
 	// Defense in depth: disabled_toolsets is applied last by Hermes for EVERY
 	// platform key, so even if a base bundle is ever reintroduced the front door
 	// still cannot touch the system (no terminal/gcloud/kubectl, files, skills,

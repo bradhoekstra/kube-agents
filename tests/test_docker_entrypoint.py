@@ -639,17 +639,19 @@ class SyncProfileSkillsTest(unittest.TestCase):
 
 
 class PlatformFrontDoorTest(unittest.TestCase):
-    """The three startup decisions that turn on spec.harness.experimental.platformFrontDoor.
+    """The four startup decisions that turn on spec.harness.experimental.platformFrontDoor.
 
     The operator renders that flag as HERMES_GATEWAY_PROFILE=platform on the gateway
     container, and the gateway then runs as the platform profile instead of the default
     one. That moves profiles/platform/config.yaml out of the image's ownership and into
     the agent's: `/sethome` persists the home channel into it and the monitoring policy
     mints monitoring.install_id there. Step 2.6 must stop force-syncing it, step 2.6b
-    rebuilds it by the three-way merge instead, and step 2.7 must leave it to 2.6b.
+    rebuilds it by the three-way merge instead, step 2.7 must leave it to 2.6b, and the
+    off path must discard 2.6b's baseline rather than leave a record of a merge the
+    force-sync has since undone.
 
-    All three ask the same predicate, so it is tested once and the two callers that
-    change behaviour are tested against it — the failure worth catching is the three
+    All four ask the same predicate, so it is tested once and the three callers that
+    change behaviour are tested against it — the failure worth catching is the four
     disagreeing, which is a config.yaml written twice per boot by two writers with
     different ideas of what was last applied.
 
@@ -658,12 +660,15 @@ class PlatformFrontDoorTest(unittest.TestCase):
     exist only inside the image.
     """
 
-    def _run(self, snippet, profile=None):
+    def _run(self, snippet, profile=None, baseline=None):
         """Run `snippet` under `set -e` with the front-door helpers in scope."""
         script = "set -e\n"
+        if baseline is not None:
+            script += f'PLATFORM_CONFIG_BASELINE="{baseline}"\n'
         for name in (
             "platform_is_front_door",
             "platform_sync_items",
+            "discard_stale_front_door_baseline",
             "overlay_owned_by_another_step",
         ):
             script += _extract_shell_function(name) + "\n"
@@ -743,6 +748,46 @@ class PlatformFrontDoorTest(unittest.TestCase):
                 f"HERMES_GATEWAY_PROFILE={profile!r}, profile {name!r}: "
                 f"step 2.7 {'skipped' if got else 'ran'}, expected the opposite",
             )
+
+    def test_the_off_path_discards_the_front_door_baseline(self):
+        """Both directions, because leaving the file behind is the silent one.
+
+        With the flag on the baseline is step 2.6b's own record and deleting it would
+        turn every restart into a first start, discarding `/sethome`'s home channel. With
+        it off, step 2.6 has just force-synced config.yaml from the image and the record
+        now describes a file that no longer exists — and on the next enable
+        `_reconcile_list` reads `theirs == base` as "the runtime's list wins", handing
+        back the image's plugins.enabled and dropping the four ingress plugins for good.
+        tests/test_default_profile_config.py walks that merge; this pins the `rm`.
+        """
+        for profile, want_kept in ((None, False), ("", False), ("default", False), ("platform", True)):
+            with tempfile.TemporaryDirectory() as tmp:
+                baseline = pathlib.Path(tmp) / ".platform-config-baseline.yaml"
+                baseline.write_text("plugins:\n  enabled: [session_store]\n")
+                proc = self._run(
+                    "discard_stale_front_door_baseline\n", profile=profile, baseline=baseline
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(
+                    baseline.exists(),
+                    want_kept,
+                    f"HERMES_GATEWAY_PROFILE={profile!r}: baseline "
+                    f"{'was deleted' if want_kept else 'survived the force-sync'}",
+                )
+
+    def test_discarding_a_baseline_that_is_not_there_is_not_a_failure(self):
+        """The overwhelmingly common case: an install that has never set the flag.
+
+        `rm -f` is the last command in the function, so its status is the function's, and
+        a missing file on every boot of every install must not end one under `set -e`.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(
+                "discard_stale_front_door_baseline\necho SURVIVED\n",
+                baseline=pathlib.Path(tmp) / "absent.yaml",
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("SURVIVED", proc.stdout)
 
     def test_the_predicate_survives_set_e_when_it_is_false(self):
         """The off path is every existing install, so a false return must not end the boot.
