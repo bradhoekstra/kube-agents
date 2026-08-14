@@ -252,7 +252,9 @@ has settled: a fresh review opens fresh threads, so resolving before it lands me
 
 Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
 the fix is on the pull request head and you can name the commit, or the finding is factually wrong
-and you have said why. Anything short of that stays open. A judgment call, a reviewer asking for
+and you have said why. Check that second one against the merge target as it stands now, not against
+your working copy — a finding that looks wrong because the file it cites does not say that is very
+often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment call, a reviewer asking for
 something you chose not to do, a rebuttal nobody has answered yet — reply and leave it to them.
 Resolving says the conversation is finished; it is not a way to end a disagreement.
 
