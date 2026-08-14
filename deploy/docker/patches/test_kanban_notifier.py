@@ -1103,10 +1103,12 @@ class GatewayKanbanWatchers:
                                 lines = payload_summary.strip().splitlines()
                                 h = lines[0][:200] if lines else payload_summary[:200]
                                 handoff = f"\\n{h}"
+                                wake_handoff = h
                             elif task and task.result:
                                 lines = task.result.strip().splitlines()
                                 r = lines[0][:160] if lines else task.result[:160]
                                 handoff = f"\\n{r}"
+                                wake_handoff = r
                             msg = (
                                 f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
                                 f" — {title}{handoff}"
@@ -1115,7 +1117,11 @@ class GatewayKanbanWatchers:
                             msg = "blocked"
                         await adapter.send(sub["chat_id"], msg)
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = (
+                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                            if wake_agent
+                            else set()
+                        )
                         if "completed" in _wake_kinds:
                             pass
             except Exception:
@@ -1157,9 +1163,14 @@ class ApplyTest(unittest.TestCase):
         patched = patch_tree(UPSTREAM_WATCHERS)
         # `adapter=adapter` is part of the assertion: the notifier must hand the
         # helper the adapter, or the non-push carve-out above never engages.
-        self.assertIn('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)', patched)
-        self.assertNotIn("_WAKE_KINDS = (", patched)
+        self.assertIn('_wake_kinds_for(d["events"], adapter=adapter)', patched)
+        self.assertNotIn('_WAKE_KINDS = ("completed"', patched)
         self.assertNotIn("in _WAKE_KINDS}", patched)
+        # Upstream's own per-subscription gate survives the replacement. Losing
+        # it would wake a mode="notify" subscriber this patch never had an
+        # opinion about.
+        self.assertIn("if wake_agent", patched)
+        self.assertIn("else set()", patched)
 
     def test_the_hook_lands_after_the_clip_and_before_the_message(self):
         # Ordering is the whole contract: the hook has to see the handoff the
@@ -1259,8 +1270,16 @@ LEGACY_CLIP = (
 )
 LEGACY_WAKE = (
     '                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")\n'
-    '                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}\n',
-    '                        _wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)\n',
+    '                        _wake_kinds = (\n'
+    '                            {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}\n'
+    '                            if wake_agent\n'
+    '                            else set()\n'
+    '                        )\n',
+    '                        _wake_kinds = (\n'
+    '                            _wake_kinds_for(d["events"], adapter=adapter)\n'
+    '                            if wake_agent\n'
+    '                            else set()\n'
+    '                        )\n',
 )
 LEGACY_DELIVERY = (
     '                            msg = (\n',
@@ -1339,7 +1358,14 @@ class LegacyEquivalenceTest(unittest.TestCase):
             patch_tree(UPSTREAM_WATCHERS), drop_marker_call=False
         ).splitlines()
         added = [line for line in merged if line not in legacy]
-        self.assertEqual(added, MARKER_CALL.splitlines())
+        # The marker call's closing `)` is not among them: since v2026.8.13 the
+        # wake-set assignment legacy also produces is a parenthesized
+        # conditional, so a bare `)` at that indent already appears in both.
+        # Membership, not identity, is what this comparison can see.
+        self.assertEqual(added, [
+            line for line in MARKER_CALL.splitlines() if line not in legacy
+        ])
+        self.assertIn("wake_configured=wake_agent,", "\n".join(added))
         # ...and nothing was removed, either.
         self.assertEqual([line for line in legacy if line not in merged], [])
 
@@ -1356,7 +1382,7 @@ class LegacyEquivalenceTest(unittest.TestCase):
         # It subtracts the wake set from what upstream would have woken for, so
         # it cannot run before `_wake_kinds` exists.
         patched = patch_tree(UPSTREAM_WATCHERS)
-        wake = patched.index('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)')
+        wake = patched.index('_wake_kinds_for(d["events"], adapter=adapter)')
         note = patched.index("_kanban_note_suppressed(\n")
         self.assertLess(wake, note)
 

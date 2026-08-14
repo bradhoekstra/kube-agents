@@ -584,21 +584,30 @@ class ApplierTest(unittest.TestCase):
         self.assertIn('"unknown", "skipped"}', health)
         self.assertIn("_normalize_skip_reason(record.get(\"skip_reason\"))", health)
 
-    def test_the_ledger_write_moves_out_of_the_running_lock(self):
-        """A SQLite write inside _running_lock would serialise the dispatch pass."""
+    def test_the_ledger_write_stays_out_of_the_running_lock(self):
+        """A SQLite write inside _running_lock would serialise the dispatch pass.
+
+        v2026.8.13 moved the lock inside ``try_register_running_job``, so this
+        patch no longer has to restructure the guard to get the write out of the
+        critical section — but the constraint is the same and the day upstream
+        inlines the guard again this has to fail rather than pass silently. So
+        it asserts the property — the lock is still encapsulated, and the write
+        happens after the call that holds it has returned — rather than the
+        restructuring it used to have to perform.
+        """
         apply_quietly(self.root)
         scheduler = self.read("cron/scheduler.py")
-        body = scheduler.split("with _running_lock:", 1)[1].split("if _already_running:", 1)
-        self.assertEqual(len(body), 2, "the guard was not restructured")
-        self.assertNotIn("record_skip", body[0])
-        self.assertIn("record_skip", body[1])
+        self.assertNotIn("with _running_lock:", scheduler)
+        guard = scheduler.split("if not try_register_running_job(job_id):", 1)
+        self.assertEqual(len(guard), 2, "the in-flight guard is not where it was")
+        self.assertIn("SKIP_ALREADY_RUNNING,", guard[1])
 
     def test_the_job_is_released_before_the_cross_process_skip_is_recorded(self):
         """Otherwise a slow ledger write leaves the job wedged in the running set."""
         apply_quietly(self.root)
         guard = self.read("cron/scheduler.py").split("_job_lock is None:", 1)[1]
         self.assertLess(
-            guard.index("_running_job_ids.discard(job_id)"),
+            guard.index("release_running_job(job_id)"),
             guard.index("SKIP_ALREADY_RUNNING_ELSEWHERE"),
         )
 

@@ -108,12 +108,18 @@ check(
 _src = open("gateway/channel_directory.py").read()
 check(
     "conversations.info is addressed to the channel",
-    "conversations_info(channel=_channel_id)" in _src,
+    "conversations_info(channel=base_id)" in _src,
 )
+# The old negative here was `conversations_info(channel=entry["id"])`, the shape
+# that caused the storm. v2026.8.13 stopped writing it — upstream groups by base
+# id itself now — so the check could no longer fail and proved nothing. What
+# upstream *can* still regress to is its own unfiltered work list, which would
+# reinstate the perpetual re-probe with every other anchor here intact.
 check(
-    "no caller still passes a directory entry id to conversations.info",
-    'conversations_info(channel=entry["id"])' not in _src,
-    "the composite <channel>:<thread> id is back",
+    "the work list is the capped, miss-cached one",
+    "unresolved = [ch for ch in channels" not in _src,
+    "upstream's unfiltered list is back; unresolvable channels would be "
+    "re-probed on every refresh forever",
 )
 
 # --- 2. The storm, replayed -------------------------------------------------

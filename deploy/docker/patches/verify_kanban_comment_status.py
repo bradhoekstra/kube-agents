@@ -9,7 +9,7 @@ incident: a card completed, its report delivered, its subscription torn down,
 and then a comment written to it.
 
 Not vacuous, and measured rather than asserted: run against the same image with
-the applier skipped, 17 of the 33 checks fail and the script exits 1, because
+the applier skipped, 16 of the 36 checks fail and the script exits 1, because
 upstream's ``_handle_comment`` returns ``{"ok", "task_id", "comment_id"}`` and
 nothing else. The checks that pass on an unpatched tree are the ones that are
 supposed to — they assert the patch did NOT change what upstream already
@@ -22,8 +22,10 @@ Usage::
 
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -254,22 +256,43 @@ check(
 )
 
 # --- 5. The set this patch is coupled to -------------------------------------
-# TERMINAL_STATUSES exists to mirror the notifier's own terminal test. If
-# upstream widens that test, a card can lose its subscription while this patch
-# still calls it deliverable, and the incident comes back on the new status.
+# TERMINAL_STATUSES used to be held equal to the notifier's own terminal test.
+# v2026.8.13 narrowed that test from {"done", "archived"} to {"archived"} —
+# ``done`` is reversible, so upstream keeps the subscription across it — and
+# equality stopped being the right relation. What still has to hold is
+# containment in one direction: a status the notifier unsubscribes on is a
+# status whose chat is gone, and calling such a card deliverable is the
+# 2026-08-08 incident on a new status. Upstream narrowing only leaves this
+# patch more conservative, which is deliberate and is asserted below.
 print("coupling to the notifier:")
 watchers = Path("gateway/kanban_watchers.py").read_text()
+_terminal = re.search(r"task_terminal = task and task\.status (==|in) (.+)", watchers)
+if _terminal is None:
+    notifier_terminal = None
+elif _terminal.group(1) == "==":
+    notifier_terminal = {ast.literal_eval(_terminal.group(2).strip())}
+else:
+    notifier_terminal = set(ast.literal_eval(_terminal.group(2).strip()))
 check(
-    "the notifier still unsubscribes on exactly {done, archived}",
-    'task.status in {"done", "archived"}' in watchers,
-    "gateway/kanban_watchers.py changed its terminal test — re-derive "
-    "TERMINAL_STATUSES in tools/kanban_comment_status.py",
+    "the notifier's terminal test was located",
+    notifier_terminal is not None,
+    "gateway/kanban_watchers.py no longer assigns task_terminal from "
+    "task.status — re-derive this check and TERMINAL_STATUSES with it",
 )
 check(
-    "and this patch's terminal set matches it",
-    kcs is not None and set(kcs.TERMINAL_STATUSES) == {"done", "archived"},
+    "every status the notifier unsubscribes on is one this patch calls dead",
+    kcs is not None
+    and notifier_terminal is not None
+    and notifier_terminal <= set(kcs.TERMINAL_STATUSES),
     "tools/kanban_comment_status.py is missing" if kcs is None
-    else f"got {sorted(kcs.TERMINAL_STATUSES)}",
+    else f"notifier unsubscribes on {sorted(notifier_terminal or ())}, "
+    f"this patch calls {sorted(kcs.TERMINAL_STATUSES)} dead",
+)
+check(
+    "and it still calls a done card dead, which upstream no longer does",
+    kcs is not None and "done" in kcs.TERMINAL_STATUSES,
+    "a done card has no scheduled worker whatever its subscription says; "
+    "reporting it as deliverable is the incident",
 )
 
 # --- 6. Fails toward upstream -------------------------------------------------

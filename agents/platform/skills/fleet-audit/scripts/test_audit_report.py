@@ -7888,8 +7888,9 @@ class TestDispatchAndHandover(unittest.TestCase):
         """On demand means trigger the job, never run the audit inline.
 
         `hermes cron run` marks the job due and the next tick runs it in its
-        own process; `cronjob(action='run')` executes it inside the calling
-        session, which is the one turn budget five audits used to share.
+        own process; `cronjob(action='run')` falls back to executing it inside
+        the calling session — which is the one turn budget five audits used to
+        share — wherever the runtime cannot take a detached result.
         """
         bullet = self.bullet("trigger the schedule, do not re-enact it")
         self.assertIn("hermes cron run", bullet)

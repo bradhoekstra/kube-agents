@@ -248,7 +248,17 @@ check(
 print("whitelist drift:")
 check(
     "the notifier calls the helper with the adapter",
-    '_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)' in NOTIFIER_SOURCE,
+    '_wake_kinds_for(d["events"], adapter=adapter)' in NOTIFIER_SOURCE,
+)
+# Upstream's own gate, kept verbatim by the patch. It answers a different
+# question than the narrowing does — "did this subscriber ask to be woken at
+# all" versus "is this kind worth a model turn" — and losing it would wake
+# notify-only subscribers on every terminal event without changing anything the
+# check above can see.
+check(
+    "and upstream's per-subscription wake gate still wraps it",
+    "if wake_agent" in NOTIFIER_SOURCE,
+    "delivery_mode=notify subscribers would be woken anyway",
 )
 check(
     "upstream's hardcoded tuple is gone",
@@ -408,7 +418,7 @@ check(
     "the marker is called with everything it names the card by",
     'self, d["events"], _wake_kinds, task, sub, board_slug,' in NOTIFIER_SOURCE,
 )
-_wake_at = NOTIFIER_SOURCE.find('_wake_kinds = _wake_kinds_for(d["events"], adapter=adapter)')
+_wake_at = NOTIFIER_SOURCE.find('_wake_kinds_for(d["events"], adapter=adapter)')
 _note_at = NOTIFIER_SOURCE.find("_kanban_note_suppressed(")
 # `if task_terminal:` guards this delivery's unsub. It is the tail of the same
 # block the marker sits in, and unlike `self._kanban_unsub` — which upstream

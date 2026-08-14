@@ -17,10 +17,16 @@ return value mentioned none of them:
 
 1. **A comment does not respawn a card.** ``task_runs`` for ``t_a8f58a2a`` still
    held only run 97, and no new card was created between 19:11 and 19:24.
-2. **The subscription was already gone.** ``gateway/kanban_watchers.py`` deletes
-   a card's ``kanban_notify_subs`` rows on the tick that carries its terminal
+2. **The subscription was already gone.** ``gateway/kanban_watchers.py`` deleted
+   a card's ``kanban_notify_subs`` rows on the tick that carried its terminal
    event (``task_terminal = task and task.status in {"done", "archived"}`` →
-   ``_kanban_unsub``), so nothing could fire for that card again.
+   ``_kanban_unsub``), so nothing could fire for that card again. As of Hermes
+   v2026.8.13 this leg no longer holds for ``done``: upstream narrowed the test
+   to ``task.status == "archived"`` on the grounds that ``done`` is reversible,
+   and added a periodic sweep for the rows that now survive it. Legs 1 and 3 are
+   untouched by that and are what the incident actually turned on — a surviving
+   subscription delivers nothing when nothing will ever complete again — so this
+   patch still treats ``done`` as undeliverable. See ``TERMINAL_STATUSES``.
 3. **Nobody ever re-read the comment.** Comments reach a worker two ways —
    ``build_worker_context`` folds them into the *next* worker's system prompt,
    and ``inject_new_comments_from_env`` (``run_agent.py``) steers them into a
@@ -127,12 +133,24 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-#: Statuses on which the gateway notifier tears a card's chat subscriptions
-#: down. Deliberately the same set as ``task_terminal`` in
-#: ``gateway/kanban_watchers.py`` — that comparison is what makes a card
-#: undeliverable, so this one has to track it. If upstream widens its set and
-#: this stays behind, ``verify_kanban_comment_status.py`` is where it shows up:
-#: it reads the notifier's own source and compares.
+#: Statuses on which a comment has no reader: no worker is scheduled to run the
+#: card, so neither ``build_worker_context`` nor ``inject_new_comments_from_env``
+#: will ever hand the text to one.
+#:
+#: This used to be defined as the notifier's own ``task_terminal`` set and was
+#: kept equal to it. v2026.8.13 narrowed that set to ``{"archived"}`` — ``done``
+#: is reversible, so upstream now keeps the subscription alive across it — and
+#: the two questions came apart. "Is the chat subscription gone" is upstream's;
+#: "will anything read this comment" is this one, and it is the one the returned
+#: fields answer. A ``done`` card keeps its subscription and still has no
+#: scheduled worker, so it stays here.
+#:
+#: The coupling that remains is one-directional and is what
+#: ``verify_kanban_comment_status.py`` asserts: every status the notifier
+#: unsubscribes on must be in this set. Upstream narrowing leaves this patch
+#: strictly more conservative, which is the safe direction; upstream *widening*
+#: past this set would mean calling a card deliverable after its chat was torn
+#: down, which is the incident again on a new status.
 TERMINAL_STATUSES = frozenset({"done", "archived"})
 
 #: The status on which a comment reaches the worker *now*, via

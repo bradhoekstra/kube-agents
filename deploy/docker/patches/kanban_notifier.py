@@ -918,6 +918,7 @@ def note_suppressed_completion(
     sub: object = None,
     board: object = "",
     now: Optional[float] = None,
+    wake_configured: bool = True,
 ) -> bool:
     """Record a terminal event that :func:`wake_kinds_for` chose not to wake for.
 
@@ -925,6 +926,16 @@ def note_suppressed_completion(
     is computed, on the path where every text ping for this delivery has
     already been sent — so "the result is in the thread", which is what the
     note asserts, is true by the time it is written.
+
+    ``wake_configured`` is the subscription's own answer to "should this ever
+    wake anybody" — upstream's ``delivery_mode`` gate, ``mode in ("notify+wake",
+    "wake")``. It is passed in rather than inferred because ``wake_kinds`` is
+    empty in both cases and they mean opposite things: this function's whole
+    claim is that *the narrowing* spent no model turn on a completion the
+    subscriber wanted woken for, and a ``notify``-only subscriber never wanted
+    one. Without the gate every completion on every notify-only card would stage
+    a note taking credit for a wake that was never going to happen. Defaults to
+    ``True`` so a caller that predates the mode keeps the old behaviour.
 
     Returns whether a note was staged; the notifier ignores it, but it makes
     the behaviour testable and gives the verifier something that a silent
@@ -939,6 +950,8 @@ def note_suppressed_completion(
     """
     task_id = ""
     try:
+        if not wake_configured:
+            return False
         task_id = _task_id(task, sub)
         kinds = suppressed_kinds(events, wake_kinds)
         if not kinds:

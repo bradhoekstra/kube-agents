@@ -268,28 +268,22 @@ SCHED_SHUTDOWN_GUARD_PATCHED = '''            if _interpreter_shutting_down():
                 return None
 '''
 
-# The ledger write is deliberately moved OUT of the _running_lock critical
-# section. That lock is held by every dispatching thread in the tick; a SQLite
-# write behind a 5s busy timeout inside it would serialise the whole dispatch
-# pass on the ledger.
-SCHED_RUNNING_GUARD = '''            with _running_lock:
-                if job_id in _running_job_ids:
-                    logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                    return None
-                _running_job_ids.add(job_id)
+# The ledger write has to stay OUT of the _running_lock critical section. That
+# lock is held by every dispatching thread in the tick; a SQLite write behind a
+# 5s busy timeout inside it would serialise the whole dispatch pass on the
+# ledger. This patch used to restructure an inline ``with _running_lock:`` block
+# to achieve that; v2026.8.13 moved the lock inside try_register_running_job(),
+# which has returned by the time control reaches the line below, so the write is
+# outside it for free. Keep the constraint in mind if upstream ever inlines the
+# guard again.
+SCHED_RUNNING_GUARD = '''            if not try_register_running_job(job_id):
+                logger.info("Job '%s' already running — skipping", job.get("name", job_id))
+                return None
 '''
 
-SCHED_RUNNING_GUARD_PATCHED = '''            with _running_lock:
-                _already_running = job_id in _running_job_ids
-                if not _already_running:
-                    _running_job_ids.add(job_id)
-            if _already_running:
+SCHED_RUNNING_GUARD_PATCHED = '''            if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                # kube-agents patch: recorded outside _running_lock on purpose
-                # — every dispatching thread in this tick takes that lock, and
-                # a ledger write behind a 5s busy timeout inside it would
-                # serialise the whole dispatch pass. See
-                # tools/cron_skip_ledger.py.
+                # kube-agents patch: see tools/cron_skip_ledger.py.
                 record_skip(
                     job_id,
                     source="builtin",
@@ -310,8 +304,7 @@ SCHED_JOB_LOCK_GUARD = '''            _job_lock = _job_locks.claim(job_id)
                     "Job '%s' already running in another process — skipping",
                     job.get("name", job_id),
                 )
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
+                release_running_job(job_id)
                 return None
 '''
 
@@ -321,8 +314,7 @@ SCHED_JOB_LOCK_GUARD_PATCHED = '''            _job_lock = _job_locks.claim(job_i
                     "Job '%s' already running in another process — skipping",
                     job.get("name", job_id),
                 )
-                with _running_lock:
-                    _running_job_ids.discard(job_id)
+                release_running_job(job_id)
                 # kube-agents patch: distinct from SKIP_ALREADY_RUNNING because
                 # the remedy is distinct — that one says the job outruns its
                 # own period, this one says two tickers are racing for the same

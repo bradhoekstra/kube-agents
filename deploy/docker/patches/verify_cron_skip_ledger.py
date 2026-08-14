@@ -172,13 +172,23 @@ def check_shape() -> None:
             "dispatch pass",
         )
         src = ast.unparse(guard)
-        released = src.find("_running_job_ids.discard(job_id)")
+        # ``release_running_job(job_id)``, not the bare ``discard``: v2026.8.13
+        # moved ``_running_lock`` behind that helper, so the discard is no
+        # longer written here at all. The ordering it stands for is unchanged
+        # and is still the thing being asserted.
+        released = src.find("release_running_job(job_id)")
         recorded = src.find("SKIP_ALREADY_RUNNING_ELSEWHERE")
         check(
             "the running slot is released before the cross-process skip is written",
             0 <= released < recorded,
             "a slow ledger write would leave the job wedged in the running "
             "set, suppressing it on the next tick as well",
+        )
+        check(
+            "and the slot is released through the scheduler's own helper",
+            "_running_job_ids.discard" not in src,
+            "reaching into the set here re-implements the lock discipline "
+            "that release_running_job now owns",
         )
 
 
