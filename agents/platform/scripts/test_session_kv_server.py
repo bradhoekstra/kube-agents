@@ -637,10 +637,44 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         query = session_kv_server._build_agent_query("test-session", payload)
-        cta = next(line for line in query.splitlines() if line.startswith("👉"))
+        cta = next(line for line in query.splitlines() if "apply Option A" in line)
         self.assertNotIn("<letter>", cta)
-        self.assertIn("apply Option A", cta)
         self.assertIn("apply Option B", cta)
+
+    def test_template_uses_only_the_three_permitted_sections(self):
+        # The template says "formatted exactly like this", so it outranks the
+        # persona for this path. SOUL.md section 7 permits exactly three `##`
+        # sections; a fourth labelled block here would override that policy
+        # silently rather than extend it, and the two briefs would contradict.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query("test-session", payload)
+        headings = [line.strip() for line in query.splitlines() if line.startswith("## ")]
+        self.assertEqual(headings, ["## What's wrong", "## Why", "## What to do"])
+        # The old shape's labelled blocks are gone, not merely relocated.
+        for stale in ("📋 **Incident Triage**", "🛠️ **Proposed Fixes (GitOps):**", "- **Issue:**"):
+            self.assertNotIn(stale, query)
+
+    def test_approval_line_survives_inside_what_to_do(self):
+        # The authorization words are the one thing the reader cannot recover
+        # if the shape change drops them: without them they have a recommended
+        # GitOps fix and no stated way to authorize it.
+        payload = {
+            "reason": "OOMKilled",
+            "namespace": "test-ns",
+            "kind_of_object": "Pod",
+            "name": "test-pod",
+            "message": "some message"
+        }
+        query = session_kv_server._build_agent_query("test-session", payload)
+        body = query.split("## What to do", 1)[1].split("**GitOps PR Instructions", 1)[0]
+        self.assertIn("apply Option A", body)
+        self.assertIn("Recommended: Option", body)
 
 
 if __name__ == "__main__":
