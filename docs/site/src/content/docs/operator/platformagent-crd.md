@@ -264,14 +264,17 @@ Three things change while it is on:
 - The gateway container runs `hermes --profile platform gateway run`. Above one replica the container
   still runs `leader_elect.py`, which reads the same choice from `HERMES_GATEWAY_PROFILE` and builds
   that command line for the process it supervises.
-- `profile-platform.overlay.yaml` gains what only the `default` profile's rendering carried before:
-  the chat adapters, their display mode, the toolsets each chat platform key resolves, the ingress
-  plugins, leader election, and the `kanban` block. That last one follows the gateway for the same
-  reason leader election does — the dispatcher and the notifier run in the gateway process and read
-  their settings from its own home — so [`tuning.maxInProgress`](#specharnesstuning) keeps applying.
-- The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and rebuilds it
-  with the same three-way merge the `default` profile gets, so `/sethome` and `monitoring.install_id`
-  survive a restart — see [How config reaches each profile](#how-config-reaches-each-profile).
+- `profile-platform.overlay.yaml` gains the three profile-shaped things only the `default` profile
+  carried before: the toolsets each chat platform key resolves, the ingress plugins, and the
+  `kanban` block. The adapters themselves are not copied — the managed scope at `/etc/hermes` is
+  machine-global, so `platforms.*` and `display.platforms` already land on this profile. `kanban`
+  does have to follow the gateway, because the dispatcher and the notifier run in the gateway
+  process and read their settings from its own home; that is what keeps
+  [`tuning.maxInProgress`](#specharnesstuning) applying.
+- The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
+  it instead, on the same terms as the `default` profile's own file, so `/sethome` and
+  `monitoring.install_id` survive a restart — see
+  [How config reaches each profile](#how-config-reaches-each-profile).
 
 Setting the field back to `false` reverses all three. The overlay records what it applied, so the
 keys are unapplied rather than left behind, and the force-sync resumes.
@@ -291,14 +294,14 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 - The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
   shows that profile's sessions while the front door is the platform one.
 - **An [`AgentPlugin`](./agentplugin-crd.md) without a `spec.targetProfile` does not follow the
-  gateway.** All three halves of its wiring stay on the `default` profile: the image volume is
-  mounted at `$HERMES_HOME/plugins/<name>`, the name is added to that profile's `plugins.enabled`,
-  and a `platforms:` block in its `spec.config` is routed there as a gateway-level singleton. With
-  the flag on, the gateway is homed at `profiles/platform` and reads none of them, so the plugin is
-  neither loaded nor configured — silently, since nothing errors. The `pubsub-platform` adapter and
-  the `gke-stockout-investigator` alert route that depends on it are both affected. Setting
-  `spec.targetProfile: platform` moves the plugin and its `platform_toolsets` across, but not its
-  `platforms:` subtree, which is gateway-scoped and always rendered onto `default`.
+  gateway.** The two halves that decide whether it loads at all stay on the `default` profile: the
+  image volume is mounted at `$HERMES_HOME/plugins/<name>`, and the name is added to that profile's
+  `plugins.enabled`. With the flag on, the gateway is homed at `profiles/platform` and reads
+  neither, so the plugin never registers — silently, since nothing errors, and its `platforms:`
+  block does arrive here through the machine-global managed scope, configuring an adapter that has
+  nothing to configure. The `pubsub-platform` adapter and the `gke-stockout-investigator` alert
+  route that depends on it are both affected. Setting `spec.targetProfile: platform` moves the
+  plugin and its `platform_toolsets` across.
 - **The `default` profile's cron roster stops ticking.** Hermes binds its cron ticker to one
   `HERMES_HOME` — the job store, the execution ledger and `.tick.lock` all resolve from the gateway
   process's own home — so the one roster that ticks becomes `profiles/platform/cron/jobs.json`. The
@@ -309,16 +312,19 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   `profile-cron-tick`, the only thing that ticks a **named** profile's own store — so every
   `cluster-*` roster goes quiet with it. Nothing errors and nothing is logged: a job that is never
   ticked simply stays `scheduled` with a `next_run_at` in the past.
-- **Per-user memory does not follow the gateway either.** [`spec.harness.memory`](#specharnessmemory)
-  and the memory provider are rendered onto the `default` profile; the platform profile gets
-  `memory.provider: ""` and, from the image, `read_only: true`. With the flag on, the front door is
-  that profile, so chat has no recall, no per-user profile and no retention — while `memory` stays in
-  the profile's toolsets advertising all three. The keys cannot simply be copied across, because
-  `profiles/platform/config.yaml` is shared: it is also the home of every kanban-spawned specialist
-  and every job on the platform cron roster. Lifting `read_only` there would let a specialist write
-  the shared corpus, and un-blanking the provider would collapse those writes into one anonymous
-  bucket, since a specialist carries no gateway identity to scope a per-user store by. Carrying
-  memory to the front door needs those settings to be per-process rather than per-profile.
+- **Per-user memory does not follow the gateway either.** The front door's provider is
+  `multiuser_memory`, committed in `agents/chat/config.yaml` and reaching the `default` profile
+  alone. The platform profile is configured as a specialist instead: `read_only: true` from the
+  image, and a `memory.provider` its overlay blanks unless
+  [`spec.harness.memory`](#specharnessmemory) names a Hindsight-backed store. With the flag on the
+  front door is that profile, so chat has no recall, no per-user profile and no retention — while
+  `memory` stays in the profile's toolsets advertising all three. The keys cannot simply be copied
+  across, because `profiles/platform/config.yaml` is shared: it is also the home of every
+  kanban-spawned specialist and every job on the platform cron roster. Lifting `read_only` there
+  would let a specialist write the shared corpus, and un-blanking the provider would collapse those
+  writes into one anonymous bucket, since a specialist carries no gateway identity to scope a
+  per-user store by. Carrying memory to the front door needs those settings to be per-process
+  rather than per-profile.
 - Cluster profiles are otherwise unaffected — their scaffolding, config and skills are unchanged,
   and an existing profile keeps working; it is only the scheduled work above that stops.
 
@@ -410,43 +416,73 @@ $ kubectl describe platformagent platform-agent -n kubeagents-system
 ## How config reaches each profile
 
 A deployment runs several Hermes **profiles** from one pod: `default` (the Chat Agent front door),
-`platform`, and one `cluster-*` profile per managed cluster. Every one of them is configured by an
-overlay merged into an image-built base at startup, but what the operator puts in the `default`
-profile's overlay, and what happens to the runtime's own writes, are both different.
+`platform`, and one `cluster-*` profile per managed cluster. The named profiles are each configured
+by an overlay merged into an image-built base at startup. The `default` profile is the exception: it
+takes the operator's settings by _two_ routes at once — an overlay merged into its config, and a
+read-only **managed scope** pinned over it.
 
-| Profile                                                       | Delivery                                                                                                 | Who owns the file                         |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `default`                                                     | Image-built base + `profile-default.overlay.yaml`, which carries the whole rendered config               | Shared three ways — see below             |
-| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
-| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, reconciled by the three-way merge instead                                           | Shared three ways, exactly as `default`   |
-| `cluster-*`                                                   | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
+| Profile                                                       | Delivery                                                                                                                                                   | Who owns the file                                      |
+| ------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ |
+| `default`                                                     | Image-built base, writable on the PVC + `profile-default.overlay.yaml` merged at startup + a narrow set of keys pinned read-only at `/etc/hermes`          | Agent owns the file, operator the pins                 |
+| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                                                                       | Image owns the base, operator the overlay              |
+| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, but the base is back-filled rather than force-synced — and the `/etc/hermes` pins land here too, because that mount is machine-global | Agent owns the file, operator the overlay and the pins |
+| `cluster-*`                                                   | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists                                                   | Image owns the base, operator the overlay              |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
 a `profile-<name>` overlay for it as well. The class overlay merges first, so the per-profile file
 wins any conflict.
 
-**Why `default` is rendered whole but still merged.** It is the only profile whose config the
-operator can fully own, so `renderConfigYAML` emits all of it rather than a few keys, and it is the
-one change-control boundary: the deployed front door matches CR-derived intent and cannot drift from
-a stale copy on the PVC or an image/operator version skew. (It is _not_ a security sandbox — see the
+**Why `default` is also pinned.** The pins are the one change-control boundary the front door has:
+the agent's own config file is writable, so without them a bad runtime edit survives a restart. (It
+is _not_ a security sandbox — see the
 [AgentPlugin trust boundary](/kube-agents/reference/security-and-iam/#change-control--safety).)
 
+**What is pinned is narrow, on purpose.** `/etc/hermes` is machine-global — one file for every
+profile in the pod, not just `default` — so it carries only what is identical for every profile
+_and_ beyond the agent's own repair: `model.*`, `platforms.*`, `approvals.cron_mode` and
+`display.platforms`. The reasoning is that as long as a human can reach the agent (`platforms`) and
+the agent can reason (`model`), anything else it breaks it can be talked into fixing.
+
+Everything else the operator owns for the front door goes in `profile-default.overlay.yaml`
+instead: `plugins.enabled` for AgentPlugins with no `targetProfile`, those plugins' non-gateway
+config subtrees, and `spec.harness.tuning`'s `default` limits and `maxInProgress`. Those are
+profile-shaped — pinning them machine-globally would hand the front door's settings to every
+specialist — and they are all recoverable by an agent that can still talk and still reason.
+Nothing the operator renders appears on both routes. What appears on neither, and so stays the
+image's alone, is each profile's toolsets, `mcp_servers` and `memory`.
+
 It is also the only profile whose config the _running agent_ writes to: `/sethome` records the home
-channel there, and the monitoring policy mints `monitoring.install_id`. So the render is merged in
-rather than mounted over the file. A mount would make the path read-only and fail every one of those
-writes — `/sethome` with a permission error, the rest silently.
+channel there, the monitoring policy mints `monitoring.install_id`, and slash commands save
+preferences. Those two facts pulled in opposite directions, and the managed scope is what resolves
+them.
 
-Merging it means three parties write one file, so the entrypoint reconciles them with a three-way
-merge rather than a plain overlay: the image base and the operator's overlay give the intended
-config, and the runtime's own edits since the last start are carried onto it. **The operator wins any
-key both it and the runtime changed** — that is what makes editing the CR mean anything — and the
-runtime keeps the rest. `deploy/shared/default_profile_config.py` documents the per-key rules.
+The rendering is published as the `managed-config.yaml` key of the `<agent>-config` ConfigMap and
+mounted read-only at `/etc/hermes/config.yaml`. Hermes treats that directory as an administrator
+layer and overlays it, **per leaf key**, on top of `$HERMES_HOME/config.yaml` at every load. Three
+things enforce it (`hermes_cli/managed_scope.py`):
 
-One consequence is worth knowing before you edit `renderConfigYAML`: because the image base and the
-overlay both declare the same file, a list named in both is unioned, not replaced. Dropping an entry
-from the render alone does nothing while [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml)
-still lists it. The operator's `TestRenderConfigYAMLListsMatchChatConfig` fails when the two diverge.
+- `load_config` deep-merges the managed dict on top of the agent's own;
+- `save_config` strips every managed leaf before writing, so a save cannot persist one;
+- `hermes config set` rejects a managed key by name.
+
+So `$HERMES_HOME/config.yaml` stays an ordinary writable file — `/sethome` and the install id work —
+while every leaf the operator renders is authoritative and immutable at runtime. Whatever ends up in
+the PVC file, the operator's value is what loads, so a restart always heals. Earlier shapes did not
+manage both: mounting the render over `$HERMES_HOME/config.yaml` made the path read-only and failed
+every runtime write (`/sethome` with a permission error, the rest silently — issue #658), and
+merging it into the file at startup left every merged key mutable, so an agent that repointed
+`model.base_url` at nothing kept that across restarts.
+
+`platforms.<platform>.home_channel` is deliberately **not** pinned, so `/sethome` can still set it
+from chat. The platform credentials and endpoints that have no `config.yaml` equivalent are pinned
+through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
+let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
+
+One consequence is worth knowing before you edit `renderConfigYAML`: the managed overlay is a
+leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than
+unioning with it — for every profile at once. That is why the render emits no lists at all today,
+and why adding one is the change to think hardest about.
 
 **Why the others get overlays.** Their `config.yaml` is assembled at image build time by merging the
 shared defaults with that profile's own overlay, content the operator does not have; a `cluster-*`
@@ -456,7 +492,10 @@ profiles, strip that identity record.
 
 Every overlay is a key in the one `<agent>-config` ConfigMap, so a change to any of them moves the
 config hash and rolls the pod. That restart is required, not incidental: the merge happens once at
-startup, so a live ConfigMap update without a restart would be a no-op.
+startup, so a live ConfigMap update without a restart would be a no-op. The managed key shares the
+ConfigMap and so rolls the pod too, though for it the restart is belt-and-braces rather than
+required — it is mounted as a directory, not a `subPath`, so the kubelet propagates updates and
+Hermes re-reads the file when its mtime or size changes.
 
 Startup is not the only moment a merge happens. Onboarding a cluster scaffolds a new profile without
 changing the ConfigMap, so nothing rolls the pod; that profile applies the overlays itself as it is
@@ -465,26 +504,34 @@ however the CR is tuned.
 
 **Ordering.** The entrypoint force-syncs each profile's image-owned files first, then merges the
 overlays. The reverse order would silently erase every overlay on each restart. The `default`
-profile's `config.yaml` is the exception to the force-sync — it is rebuilt by the three-way merge
-above, because a force-sync is exactly what would throw the runtime's edits away.
+profile's `config.yaml` is the exception to the force-sync: it is the agent's own file, and a
+force-sync is exactly what would throw the runtime's edits away. It is instead seeded from the image
+on a fresh volume, and thereafter only back-filled — keys the image declares and the live file has
+lost are restored, keys it already holds are left alone. Its overlay is merged after that
+back-fill, so the operator's settings are not undone by it.
 
 The platform profile's `config.yaml` becomes a second exception under
 [`platformFrontDoor`](#platformfrontdoor), and for the same reason: the gateway is homed there, so
 that file is now the one `/sethome` and the monitoring policy write to. It leaves the force-sync
-list, takes the three-way merge, and is skipped by the overlay pass — one file must have one writer,
-because the record of what was last applied is what makes a withdrawn overlay undoable. Everything
-else the image owns in that profile — the persona files, `cron/`, `skills/`, `governance/`,
-`hindsight/` — still force-syncs either way.
+list and is back-filled from the image template instead, on exactly the terms `default` gets — keys
+the template declares and the live file has lost are restored, keys it already holds are left
+alone. Its overlay merges after that back-fill as it always did. Everything else the image owns in
+that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
+force-syncs either way.
 
-**Merge semantics.** Maps merge recursively, lists union (so `plugins.enabled` accumulates), and
-scalars are replaced by the overlay. Precedence, lowest to highest: Hermes built-in default → the
-value committed in `agents/<persona>/config.yaml` → the operator overlay from the CR.
+**Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
+wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
+lists union, and scalars are replaced by the overlay; precedence, lowest to highest, is Hermes
+built-in default → the value committed in `agents/<persona>/config.yaml` → the operator overlay from
+the CR. In the **managed scope** the merge is per leaf key, so a list replaces rather than unions,
+and it wins over everything else because it is applied at every load rather than once at startup.
 
 **Two writers, two authorities.** Both `spec.harness.tuning` (operator policy) and an
 `AgentPlugin`'s `spec.config` (plugin-supplied) land in the same overlay file, but not with equal
-rights. A plugin's config is restricted to `approvals`, `platforms`, and `platform_toolsets`; the
-`agent` subtree holding the execution limits is dropped from plugin config and writable only by the
-operator. That is a coordination boundary rather than a security one — plugin code executes
+rights. A plugin's config is restricted to `approvals`, `platforms`, and `platform_toolsets`, and
+for an untargeted plugin only `platforms` reaches the machine-global managed scope — the rest goes
+to the front door's overlay. The `agent` subtree holding the execution limits is dropped from plugin
+config and writable only by the operator. That is a coordination boundary rather than a security one — plugin code executes
 in-process and could change these at runtime — but it keeps limits with board-wide consequences in
 one reviewable place.
 
