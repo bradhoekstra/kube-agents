@@ -123,11 +123,33 @@ if [ "$COPY_TOOL" = "docker" ] && [ "$DRY_RUN" -ne 1 ]; then
   echo "    copy. Install crane or skopeo to mirror the manifest list byte-for-byte."
 fi
 
+# Drop the tag from a reference that carries both a tag and a digest, leaving
+# "repo@sha256:...". Three inventory entries pin that way — both Hindsight
+# images and the Hermes base — and skopeo's docker:// transport refuses the
+# combined form outright ("Docker references with both a tag and digest are
+# currently not supported"), so a skopeo host would fail exactly those copies
+# and mirror everything else. The digest half is the one to keep: it names the
+# same manifest the tag resolved to, whereas dropping the digest would copy
+# whatever the tag points at today and silently unpin the image. crane accepts
+# the combined form, so only the skopeo path needs this.
+digest_only_ref() {
+  local ref=$1
+  case "$ref" in
+    *@*)
+      # The tag separator is the last colon before the "@": a registry port
+      # ("reg:5000/foo:1.0@sha256:...") puts an earlier colon in the string.
+      local tagged="${ref%@*}"
+      echo "${tagged%:*}@${ref#*@}"
+      ;;
+    *) echo "$ref" ;;
+  esac
+}
+
 copy_image() {
   local src=$1 dst=$2
   case "$COPY_TOOL" in
     crane) crane copy "$src" "$dst" ;;
-    skopeo) skopeo copy --all "docker://${src}" "docker://${dst}" ;;
+    skopeo) skopeo copy --all "docker://$(digest_only_ref "$src")" "docker://${dst}" ;;
     docker)
       docker pull "$src" && docker tag "$src" "$dst" && docker push "$dst"
       ;;

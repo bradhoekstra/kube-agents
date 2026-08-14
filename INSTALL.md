@@ -206,6 +206,9 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
   # mirror-images is a root-level target, gcp-provision an operator one.
   REPO_ROOT="$(git rev-parse --show-toplevel)"
 
+  # Exported before the mirror step so both halves use the same tag.
+  export IMAGE_TAG=v0.1.0
+
   cd "$REPO_ROOT"
   make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 
@@ -218,6 +221,13 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
 
   `make mirror-images` reads `images.json` at the repository root — the inventory of every image
   an install pulls — and copies each one, keeping the trailing image name only.
+
+  `IMAGE_TAG` is not optional here. The mirror holds only the tag it was told to copy — `latest`
+  if it was told nothing — while `make gcp-provision` asks for whatever `IMAGE_TAG` says, and in
+  non-interactive mode it refuses to run without one. Set the two to different values and the four
+  first-party images name a reference the mirror was never given: provisioning reports success and
+  the pods sit in ImagePullBackOff, after the cluster, node pools, and cert-manager already exist.
+  Export it once, as above, so the mirror and the install cannot disagree.
 
   The two prefixes are separate because the images fall into two groups. `REGISTRY_PREFIX`
   replaces `ghcr.io/gke-labs/kube-agents` for the images this project builds — the operator, the
