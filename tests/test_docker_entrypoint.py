@@ -638,5 +638,123 @@ class SyncProfileSkillsTest(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in (tmp / "profile").iterdir()), ["skills"])
 
 
+class PlatformFrontDoorTest(unittest.TestCase):
+    """The three startup decisions that turn on spec.harness.experimental.platformFrontDoor.
+
+    The operator renders that flag as HERMES_GATEWAY_PROFILE=platform on the gateway
+    container, and the gateway then runs as the platform profile instead of the default
+    one. That moves profiles/platform/config.yaml out of the image's ownership and into
+    the agent's: `/sethome` persists the home channel into it and the monitoring policy
+    mints monitoring.install_id there. Step 2.6 must stop force-syncing it, step 2.6b
+    rebuilds it by the three-way merge instead, and step 2.7 must leave it to 2.6b.
+
+    All three ask the same predicate, so it is tested once and the two callers that
+    change behaviour are tested against it — the failure worth catching is the three
+    disagreeing, which is a config.yaml written twice per boot by two writers with
+    different ideas of what was last applied.
+
+    Extracted rather than run through the whole script for the reason step 2.6a's tests
+    give: the surrounding steps are guarded on /opt/hermes and /opt/agent-config, which
+    exist only inside the image.
+    """
+
+    def _run(self, snippet, profile=None):
+        """Run `snippet` under `set -e` with the front-door helpers in scope."""
+        script = "set -e\n"
+        for name in (
+            "platform_is_front_door",
+            "platform_sync_items",
+            "overlay_owned_by_another_step",
+        ):
+            script += _extract_shell_function(name) + "\n"
+        script += snippet
+        env = {"PATH": "/usr/bin:/bin"}
+        if profile is not None:
+            env["HERMES_GATEWAY_PROFILE"] = profile
+        return subprocess.run(
+            ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
+        )
+
+    def _predicate(self, snippet, profile=None):
+        proc = self._run(f'if {snippet}; then echo YES; else echo NO; fi\n', profile=profile)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip() == "YES"
+
+    def _items(self, profile=None):
+        proc = self._run("platform_sync_items\n", profile=profile)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split()
+
+    def test_the_front_door_is_off_unless_the_operator_names_this_profile(self):
+        """Only the exact value opts in; everything else is the behaviour every install has.
+
+        The empty string matters on its own: Kubernetes renders an absent value as one
+        rather than omitting the variable, so a half-wired manifest arrives here as `""`.
+        """
+        for profile in (None, "", "  ", "default", "cluster-prod", "Platform", "platform2"):
+            self.assertFalse(
+                self._predicate("platform_is_front_door", profile=profile),
+                f"HERMES_GATEWAY_PROFILE={profile!r} must not opt an install in",
+            )
+        self.assertTrue(self._predicate("platform_is_front_door", profile="platform"))
+
+    def test_the_front_door_drops_config_yaml_and_nothing_else(self):
+        """config.yaml is the only entry whose ownership the flag changes.
+
+        Asserted as a set difference rather than against a spelled-out list, because the
+        bug to catch is a persona or a directory quietly falling out of the sync on
+        front-door installs only — where it would present months later as an agent whose
+        skills never updated, on the one install nobody compares against the image.
+        """
+        default = self._items()
+        front_door = self._items(profile="platform")
+
+        self.assertIn("config.yaml", default)
+        self.assertEqual(
+            set(default) - set(front_door),
+            {"config.yaml"},
+            "the front door must drop config.yaml from the force-sync and keep the rest",
+        )
+        self.assertEqual(
+            set(front_door) - set(default), set(), "the front door must not add entries"
+        )
+
+    def test_step_2_7_yields_the_platform_profile_only_at_the_front_door(self):
+        """Both halves, because each failure is silent in its own direction.
+
+        Skipping when the flag is off drops every targeted plugin and tuning override on
+        the platform profile — step 2.6 has just force-synced the image's config over
+        them and 2.7 is the only thing that puts the operator's back. Not skipping when
+        it is on gives one file two writers, each with its own last-applied record, and
+        the overlay then cannot be withdrawn.
+        """
+        cases = {
+            (None, "platform"): False,
+            (None, "cluster-prod"): False,
+            ("platform", "platform"): True,
+            ("platform", "cluster-prod"): False,
+            ("platform", "default"): False,
+        }
+        for (profile, name), want in cases.items():
+            got = self._predicate(f'overlay_owned_by_another_step "{name}"', profile=profile)
+            self.assertEqual(
+                got,
+                want,
+                f"HERMES_GATEWAY_PROFILE={profile!r}, profile {name!r}: "
+                f"step 2.7 {'skipped' if got else 'ran'}, expected the opposite",
+            )
+
+    def test_the_predicate_survives_set_e_when_it_is_false(self):
+        """The off path is every existing install, so a false return must not end the boot.
+
+        `platform_is_front_door || _items=...` and `if platform_is_front_door` are both
+        exempt from `set -e`, but a future caller written as a bare command would not be,
+        and the symptom is a CrashLoopBackOff on the installs that did NOT opt in.
+        """
+        proc = self._run("platform_sync_items >/dev/null\necho SURVIVED\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SURVIVED", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

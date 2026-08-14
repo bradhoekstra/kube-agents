@@ -74,6 +74,22 @@ const (
 	sharedStateSetupSkip   = "skip"
 )
 
+// Which Hermes profile the gateway runs as, when it is not the default one.
+//
+// Two readers, and both are in the gateway container. leader_elect.py builds the
+// `hermes gateway run` argv it supervises, so above one replica the --profile flag
+// cannot come from the container args. docker-entrypoint.sh reads it to stop
+// force-syncing that profile's config.yaml from the image: as the front door it becomes
+// a file the agent itself writes to (`/sethome`, monitoring.install_id), and the
+// force-sync would discard those on every restart.
+//
+// The dashboard sidecar deliberately does NOT get it. It carries
+// AGENT_SHARED_STATE_SETUP=skip, so it execs out of the entrypoint before any of the
+// setup steps and never touches a profile config; the cost is that `hermes dashboard`
+// still shows the default profile while the front door is the platform one, which is
+// recorded as a known limit rather than fixed by re-homing a second container.
+const gatewayProfileEnvVar = "HERMES_GATEWAY_PROFILE"
+
 // The single model name LiteLLM is configured to serve, used both in the profile
 // config the gateway reads and in the API server's own default. The two must agree:
 // the API server resolves its model once at startup, and a mismatch means every
@@ -193,12 +209,15 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 			continue
 		}
 		var limits *agentv1alpha1.AgentLimits
-		var memory map[string]any
+		var memory, frontDoor map[string]any
 		if profile == platformProfileName {
 			limits = platformProfileLimits(agent)
 			memory = memoryOverlay(agent)
+			// Only this profile can be the front door: it is the one the gateway is
+			// re-homed onto in buildBaseContainers.
+			frontDoor = frontDoorOverlay(agent)
 		}
-		if overlay := renderProfileOverlayYAML(targeted[profile], limits, memory); strings.TrimSpace(overlay) != "" {
+		if overlay := renderProfileOverlayYAML(targeted[profile], limits, memory, frontDoor); strings.TrimSpace(overlay) != "" {
 			data[profileOverlayKey(profile)] = overlay
 		}
 	}
@@ -207,7 +226,7 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 	// all of them rather than a file each. No memory subtree: agents/cluster/config.yaml
 	// configures no provider at all, on purpose — a cluster agent is spawned by the
 	// kanban dispatcher and carries no human identity to scope a store by.
-	if overlay := renderProfileOverlayYAML(nil, clusterProfileLimits(agent), nil); strings.TrimSpace(overlay) != "" {
+	if overlay := renderProfileOverlayYAML(nil, clusterProfileLimits(agent), nil, nil); strings.TrimSpace(overlay) != "" {
 		data[clusterProfileClassKey] = overlay
 	}
 	return data
@@ -527,6 +546,137 @@ func memoryOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	}
 }
 
+// platformFrontDoorEnabled reports whether spec.harness.experimental.platformFrontDoor
+// asks for the Platform Agent to be the profile the gateway runs as.
+func platformFrontDoorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Harness == nil || agent.Spec.Harness.Experimental == nil {
+		return false
+	}
+	return ptr.Deref(agent.Spec.Harness.Experimental.PlatformFrontDoor, false)
+}
+
+// frontDoorToolsets is the toolset list given to each chat platform key when the
+// Platform Agent is the front door.
+//
+// It is agents/platform/config.yaml's `cli` list verbatim, and that is the whole
+// intent: a chat message should reach the same surface a kanban worker on this
+// profile already has, no more. Substituting the platform's own composite for
+// `hermes-cli` would narrow it silently — `hermes-google_chat` is a plugin platform
+// with no static TOOLSETS entry, so it resolves to nothing and the core tools would
+// simply not appear. The composite is what _get_platform_tools expands to infer the
+// configurable toolsets; the `mcp-` names pass through as MCP server names, and
+// `memory` is the provider gate (see the note in agents/platform/config.yaml).
+//
+// Declaring the key at all is what matters most. Absent it, Hermes falls back to
+// `hermes-google_chat` for the platform key and every mcp-prefixed server — the
+// platform_control tools this agent exists for — resolves to nothing.
+//
+// TestFrontDoorToolsetsMatchPlatformConfig fails the build when this drifts from the
+// image's copy.
+var frontDoorToolsets = []string{
+	"hermes-cli",
+	"mcp-platform_control",
+	"mcp-developer_knowledge",
+	"mcp-gke",
+	"memory",
+}
+
+// frontDoorPlugins are the plugins the profile receiving chat ingress has to run, on
+// top of the three agents/platform/config.yaml already enables.
+//
+// They are the same ones renderConfigYAML gives the default profile, minus the two
+// that exist only to delegate (agent_roster injects the routable-specialist roster,
+// which a front door that does the work itself does not consult). legacy_slash_commands
+// unwraps a typed "/hermes sethome" before the gateway dispatcher sees it, and
+// session_store/session_otel_bridge/bootstrap_onboarding are what make an inbound chat
+// session persist, trace, and onboard at all — each hooks ingress, so enabling them on
+// a profile no message reaches does nothing, and NOT enabling them on the profile every
+// message reaches loses the behaviour outright.
+//
+// incident_context and hermes_otel and tool_call_audit are omitted here because the
+// image's copy already enables them; the overlay unions lists, so naming them again
+// would be inert rather than wrong.
+var frontDoorPlugins = []string{
+	"session_store",
+	"session_otel_bridge",
+	"bootstrap_onboarding",
+	"legacy_slash_commands",
+}
+
+// frontDoorOverlay renders the keys that turn the platform profile into the gateway's
+// front door: the platform adapters, their display verbosity, the toolsets each chat
+// platform key resolves, the ingress plugins, and leader election.
+//
+// It returns nil unless the experimental flag is on, which is what makes the flag
+// reversible: profile_overlay.py records what it applied, so withdrawing these keys
+// unapplies them rather than leaving a half-configured front door behind.
+//
+// What it deliberately does NOT carry is the Chat Agent's lockdown —
+// `agent.disabled_toolsets`, the three-toolset `platform_toolsets`, `toolsets: [kanban]`
+// as a ceiling. That lockdown is the Chat Agent's contract, and copying it here would
+// leave the Platform Agent unable to do the work the flag exists to let it do
+// directly. The trade is stated on the CRD field.
+func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
+	if !platformFrontDoorEnabled(agent) {
+		return nil
+	}
+
+	googleChat := map[string]any{"enabled": false}
+	slack := map[string]any{
+		// Set whether or not Slack is on, for the reason renderConfigYAML gives:
+		// inert while Slack is off, and impossible to miss when something turns it on.
+		"enabled": false,
+		"extra":   map[string]any{"rich_blocks": true},
+	}
+	display := map[string]map[string]any{}
+	platformToolsets := map[string][]string{}
+
+	if agent.Spec.Integration != nil {
+		if gchat := agent.Spec.Integration.GoogleChat; gchat != nil {
+			if gchat.Enabled != nil && *gchat.Enabled {
+				googleChat["enabled"] = true
+				googleChat["typing_status_text"] = "Kage is thinking…"
+			}
+			display["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
+		}
+		if sl := agent.Spec.Integration.Slack; sl != nil && sl.Enabled != nil {
+			slack["enabled"] = *sl.Enabled
+		}
+	}
+
+	// Both keys unconditionally, matching the adapters rendered above: a platform
+	// turned on later must not also need its toolsets remembered, and a key for a
+	// platform with no adapter is never resolved.
+	platformToolsets["google_chat"] = slices.Clone(frontDoorToolsets)
+	platformToolsets["slack"] = slices.Clone(frontDoorToolsets)
+
+	overlay := map[string]any{
+		"platforms": map[string]any{
+			"google_chat": googleChat,
+			"slack":       slack,
+		},
+		"platform_toolsets": platformToolsets,
+		"plugins":           map[string]any{"enabled": slices.Clone(frontDoorPlugins)},
+	}
+	if len(display) > 0 {
+		overlay["display"] = map[string]any{"platforms": display}
+	}
+
+	// Leader election is a property of the gateway, so it follows the gateway to
+	// whichever profile is running it. renderConfigYAML renders the same block for the
+	// default profile; leaving it only there would let two replicas both consume chat.
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	if replicas > 1 {
+		overlay["leader_election"] = map[string]any{
+			"enabled":    true,
+			"lease_name": agent.Name + "-leader",
+			"namespace":  agent.Namespace,
+		}
+	}
+
+	return overlay
+}
+
 // memoryProviderIsHindsightBacked reports whether a provider talks to the in-cluster
 // Hindsight service. Keep in sync with memory_provider_uses_hindsight in
 // k8s-operator/scripts/common.sh, which decides whether to deploy it.
@@ -590,7 +740,7 @@ func partitionPluginsByProfile(agentPlugins []*agentv1alpha1.AgentPlugin) ([]*ag
 // deploy/shared/defaults/config.yaml with the profile's own overlay, content the operator
 // does not have. Rendering it in full would fork the source of truth; a cluster profile
 // additionally carries a runtime `cluster_identity` stamp that overwriting would strip.
-func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agentv1alpha1.AgentLimits, memory map[string]any) string {
+func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agentv1alpha1.AgentLimits, memory, frontDoor map[string]any) string {
 	overlay := map[string]any{}
 
 	// Operator-owned execution limits from spec.harness.tuning. Written before the
@@ -605,6 +755,13 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 		overlay = mergeMaps(overlay, memory)
 	}
 
+	// The front-door keys, when this profile is the one the gateway runs as. Written
+	// before the plugin contributions for the same reason, and mergeMaps unions the
+	// `plugins.enabled` list below rather than replacing it.
+	if frontDoor != nil {
+		overlay = mergeMaps(overlay, frontDoor)
+	}
+
 	enabled := make([]string, 0, len(plugins))
 	for _, p := range plugins {
 		if !slices.Contains(enabled, p.Name) {
@@ -612,7 +769,10 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 		}
 	}
 	if len(enabled) > 0 {
-		overlay["plugins"] = map[string]any{"enabled": enabled}
+		// Merged, not assigned: the front-door overlay above may already have written
+		// `plugins.enabled`, and an assignment here would drop the ingress plugins the
+		// moment a plugin happens to target this profile.
+		overlay = mergeMaps(overlay, map[string]any{"plugins": map[string]any{"enabled": enabled}})
 	}
 
 	for _, p := range plugins {
@@ -2364,8 +2524,19 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	var args []string
 
 	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-	if replicas > 1 {
+	switch {
+	case replicas > 1:
+		// The wrapper starts the gateway itself, so the profile reaches it through
+		// gatewayProfileEnvVar rather than through this argv.
 		args = []string{"/opt/hermes/.venv/bin/python3", fmt.Sprintf("%s/leader_elect.py", homeDir)}
+	case platformFrontDoorEnabled(agent):
+		// Overrides the image's CMD, which is a bare `hermes gateway run`. The flag is
+		// global and pre-parsed: hermes_cli/main.py strips -p/--profile out of argv
+		// before any import and re-points HERMES_HOME at the profile's home, so the
+		// gateway comes up as the Platform Agent. `hermes gateway run --profile` would
+		// not work — the subcommand has no such flag — and the position therefore
+		// matters.
+		args = []string{"hermes", "--profile", platformProfileName, "gateway", "run"}
 	}
 
 	if isImageVolumeSupported {
@@ -2399,6 +2570,17 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		Name:  apiServerModelEnvVar,
 		Value: agentModelName,
 	})
+
+	// Appended last for the same reason as the two above: an AgentPlugin's spec.env
+	// reaches envVars verbatim, and a plugin that named this variable would re-home the
+	// gateway — or, worse, un-home it while the overlay still configures the platform
+	// profile as the front door, leaving chat ingress on a profile with no adapters.
+	if platformFrontDoorEnabled(agent) {
+		gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
+			Name:  gatewayProfileEnvVar,
+			Value: platformProfileName,
+		})
+	}
 
 	containers := []corev1.Container{
 		{

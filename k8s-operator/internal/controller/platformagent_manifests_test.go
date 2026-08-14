@@ -3295,7 +3295,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "platform_toolsets:\n  pubsub:\n    - gke\n"),
 		pluginWithProfile("second", "platform", ""),
-	}, nil, nil)
+	}, nil, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3319,7 +3319,7 @@ func TestRenderProfileOverlayYAML(t *testing.T) {
 func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\nlogging:\n  level: debug\napprovals:\n  cron_mode: approve\n"),
-	}, nil, nil)
+	}, nil, nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3339,7 +3339,7 @@ func TestRenderProfileOverlayYAMLDropsDisallowedSubtrees(t *testing.T) {
 func TestRenderProfileOverlayYAMLOperatorLimitsBeatPluginConfig(t *testing.T) {
 	overlay := renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{
 		pluginWithProfile("stockout", "platform", "agent:\n  max_turns: 9999\n"),
-	}, limits(8, 200), nil)
+	}, limits(8, 200), nil, nil)
 
 	var parsed map[string]any
 	if err := yaml.Unmarshal([]byte(overlay), &parsed); err != nil {
@@ -3483,7 +3483,7 @@ func sortedStrings(t *testing.T, list []any) []string {
 }
 
 func TestRenderProfileOverlayYAMLEmptyWhenNothingToSay(t *testing.T) {
-	if got := renderProfileOverlayYAML(nil, nil, nil); got != "" {
+	if got := renderProfileOverlayYAML(nil, nil, nil, nil); got != "" {
 		t.Errorf("expected empty overlay, got %q (an empty map marshals to \"{}\" and would rewrite the profile config every start)", got)
 	}
 }
@@ -3888,7 +3888,7 @@ approvals:
 		t.Errorf("targeted plugin's pubsub subscription must reach the DEFAULT profile, got %v", rendered["platforms"])
 	}
 	var overlay map[string]any
-	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil, nil)), &overlay); err != nil {
+	if err := yaml.Unmarshal([]byte(renderProfileOverlayYAML([]*agentv1alpha1.AgentPlugin{plugin}, nil, nil, nil)), &overlay); err != nil {
 		t.Fatalf("unmarshal overlay: %v", err)
 	}
 	if _, ok := overlay["platforms"]; ok {
@@ -4171,5 +4171,235 @@ func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
 	}
 	if !sawClusterName || !sawSessionKey {
 		t.Errorf("disabling the watcher must not strip its configuration, got %#v", off.Env)
+	}
+}
+
+// --- spec.harness.experimental.platformFrontDoor -----------------------------------
+
+// frontDoorAgent builds a PlatformAgent with Google Chat on and the experimental flag
+// set as given, so the on/off pair differs in exactly one field.
+func frontDoorAgent(name string, replicas int32, on bool) *agentv1alpha1.PlatformAgent {
+	agent := haAgent(name, replicas)
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	if on {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+			Experimental: &agentv1alpha1.ExperimentalSpec{PlatformFrontDoor: ptr.To(true)},
+		}
+	}
+	return agent
+}
+
+// platformOverlay parses the platform profile's overlay out of the ConfigMap.
+func platformOverlay(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+	t.Helper()
+	raw, ok := buildConfigMapData(agent, nil)[profileOverlayKey(platformProfileName)]
+	if !ok {
+		t.Fatalf("no %s in the ConfigMap", profileOverlayKey(platformProfileName))
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+	return parsed
+}
+
+// TestPlatformFrontDoorArgsSelectTheProfile pins where the profile name reaches the
+// gateway from, which differs by replica count.
+//
+// `--profile` is a GLOBAL flag: hermes_cli/main.py::_apply_profile_override pre-parses it
+// out of argv before any import and re-points HERMES_HOME. `hermes gateway run --profile
+// platform` is a different command — the subcommand has no such flag — so the position
+// here is load-bearing, not stylistic.
+//
+// Above one replica the argv belongs to leader_elect.py, which starts the gateway as a
+// child; the profile reaches it through HERMES_GATEWAY_PROFILE instead, and putting it in
+// the container args there would replace the wrapper and lose leader election entirely.
+func TestPlatformFrontDoorArgsSelectTheProfile(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		replicas int32
+		on       bool
+		want     []string
+	}{
+		{"off at one replica keeps the image CMD", 1, false, nil},
+		{"on at one replica names the profile", 1, true, []string{"hermes", "--profile", "platform", "gateway", "run"}},
+		{"off above one replica keeps the wrapper", 2, false, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+		{"on above one replica keeps the wrapper", 2, true, []string{"/opt/hermes/.venv/bin/python3", "/opt/data/leader_elect.py"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := buildDeployment(frontDoorAgent("fd-agent", tc.replicas, tc.on), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			gateway := containerNamed(t, dep, "platform-agent")
+
+			if len(gateway.Command) != 0 {
+				t.Errorf("Command must stay unset so the image ENTRYPOINT still runs the "+
+					"shared-state setup; got %v", gateway.Command)
+			}
+			if len(tc.want) == 0 {
+				if len(gateway.Args) != 0 {
+					t.Errorf("expected the image CMD to stand, got args=%v", gateway.Args)
+				}
+				return
+			}
+			if !reflect.DeepEqual(gateway.Args, tc.want) {
+				t.Errorf("args = %v, want %v", gateway.Args, tc.want)
+			}
+		})
+	}
+}
+
+// TestPlatformFrontDoorProfileEnvIsGatewayOnly pins the variable to the one container
+// that has readers for it.
+//
+// In the gateway it has two: leader_elect.py builds its argv from it, and
+// docker-entrypoint.sh step 2.6 reads it to stop force-syncing profiles/platform/config.yaml
+// from the image, because as the front door that file is one the agent itself writes to.
+//
+// The dashboard sidecar must NOT get it. It carries AGENT_SHARED_STATE_SETUP=skip and execs
+// out of the entrypoint at the step-1.5 gate, so it would never act on it — but it also does
+// not mount the operator's overlay directory, and a container that reached step 2.6b without
+// one would compute a baseline of pure image config and write it over the primary's.
+func TestPlatformFrontDoorProfileEnvIsGatewayOnly(t *testing.T) {
+	for _, replicas := range []int32{1, 2} {
+		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
+			on := buildDeployment(frontDoorAgent("fd-env", replicas, true), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			got, found := envValue(containerNamed(t, on, "platform-agent"), gatewayProfileEnvVar)
+			if !found || got != platformProfileName {
+				t.Errorf("gateway %s = %q (found=%v), want %q", gatewayProfileEnvVar, got, found, platformProfileName)
+			}
+			if _, found := envValue(containerNamed(t, on, "platform-agent-dashboard"), gatewayProfileEnvVar); found {
+				t.Errorf("the dashboard sidecar must not carry %s: it has no overlay mount, so "+
+					"acting on it would mean rebuilding the platform config from image defaults alone",
+					gatewayProfileEnvVar)
+			}
+
+			off := buildDeployment(frontDoorAgent("fd-env", replicas, false), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			if _, found := envValue(containerNamed(t, off, "platform-agent"), gatewayProfileEnvVar); found {
+				t.Errorf("%s must be absent while the flag is off; set, it stops the entrypoint "+
+					"force-syncing the platform config the image owns", gatewayProfileEnvVar)
+			}
+		})
+	}
+}
+
+// TestPlatformFrontDoorOverlayCarriesTheIngressKeys covers the config half: the profile the
+// gateway is now homed at has to have the adapters, the toolsets and the ingress plugins
+// that until now only the default profile's rendering carried.
+func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
+	overlay := platformOverlay(t, frontDoorAgent("fd-overlay", 1, true))
+
+	platforms, _ := overlay["platforms"].(map[string]any)
+	gchat, _ := platforms["google_chat"].(map[string]any)
+	if gchat["enabled"] != true {
+		t.Errorf("platforms.google_chat.enabled = %v, want true; a front door with no adapter "+
+			"is deaf with every health check green:\n%v", gchat["enabled"], overlay)
+	}
+
+	// The toolsets key is the one that cannot be left to the fallback:
+	// hermes-google_chat is a plugin platform with no static TOOLSETS entry, so an absent
+	// key resolves to nothing and the mcp- servers this agent exists for never load.
+	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
+	for _, platform := range []string{"google_chat", "slack"} {
+		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
+		want := slices.Sorted(slices.Values(frontDoorToolsets))
+		if !slices.Equal(got, want) {
+			t.Errorf("platform_toolsets.%s = %v, want %v", platform, got, want)
+		}
+	}
+	if len(toolsets) == 0 {
+		t.Error("platform_toolsets is empty")
+	}
+
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, plugin := range frontDoorPlugins {
+		if !slices.Contains(enabled, plugin) {
+			t.Errorf("plugins.enabled is missing %q; it hooks ingress, so a message reaching "+
+				"this profile without it silently loses the behaviour. Got %v", plugin, enabled)
+		}
+	}
+}
+
+// The flag is only worth having if it comes back off. profile_overlay.py unapplies a
+// withdrawn key from its last-applied record, so the revert is exactly "the operator stops
+// rendering these" — which is worth a test of its own, because the platform overlay is
+// written unconditionally and it would be easy to leave the keys in it.
+func TestPlatformFrontDoorOverlayIsEmptyWhenOff(t *testing.T) {
+	overlay := platformOverlay(t, frontDoorAgent("fd-off", 1, false))
+	for _, key := range []string{"platforms", "platform_toolsets", "display", "leader_election"} {
+		if _, present := overlay[key]; present {
+			t.Errorf("%s is rendered into the platform overlay with the flag off, so turning "+
+				"the flag off would not undo it:\n%v", key, overlay)
+		}
+	}
+	if plugins, ok := overlay["plugins"].(map[string]any); ok {
+		t.Errorf("plugins is rendered with no plugin targeting the profile: %v", plugins)
+	}
+}
+
+// TestPlatformFrontDoorOverlayKeepsTargetedPlugins guards a clobber that only appears when
+// both features are in use. The overlay's plugins.enabled used to be ASSIGNED after the
+// front-door keys were merged, so an AgentPlugin targeting the platform profile replaced the
+// ingress plugins wholesale — and the symptom is not a missing plugin but chat sessions that
+// stop persisting, on an install where the flag had been working.
+func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
+	agent := frontDoorAgent("fd-plugins", 1, true)
+	overlay := map[string]any{}
+	raw := buildConfigMapData(agent, []*agentv1alpha1.AgentPlugin{
+		pluginWithProfile("extratool", platformProfileName, ""),
+	})[profileOverlayKey(platformProfileName)]
+	if err := yaml.Unmarshal([]byte(raw), &overlay); err != nil {
+		t.Fatalf("unmarshal platform overlay: %v\n%s", err, raw)
+	}
+
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	for _, want := range append(slices.Clone(frontDoorPlugins), "extratool") {
+		if !slices.Contains(enabled, want) {
+			t.Errorf("plugins.enabled = %v, missing %q", enabled, want)
+		}
+	}
+}
+
+// Leader election is a property of the gateway, so it has to follow the gateway to
+// whichever profile is running it. Left only on the default profile, both replicas of an HA
+// install would consume chat.
+func TestPlatformFrontDoorOverlayCarriesLeaderElection(t *testing.T) {
+	if _, present := platformOverlay(t, frontDoorAgent("fd-le", 1, true))["leader_election"]; present {
+		t.Error("leader_election must not be rendered at a single replica")
+	}
+
+	overlay := platformOverlay(t, frontDoorAgent("fd-le", 2, true))
+	le, _ := overlay["leader_election"].(map[string]any)
+	if le["enabled"] != true || le["lease_name"] != "fd-le-leader" || le["namespace"] != "test-ns" {
+		t.Errorf("leader_election = %v, want enabled with lease fd-le-leader in test-ns", le)
+	}
+}
+
+// TestFrontDoorToolsetsMatchPlatformConfig is the drift guard frontDoorToolsets names.
+//
+// The list is the image's own `cli` toolsets verbatim, and that equality IS the contract:
+// a chat message should reach the surface a kanban worker on this profile already has, no
+// more. Add an MCP server to agents/platform/config.yaml and chat ingress would otherwise
+// silently not get it, which reads as the agent choosing not to use a tool.
+func TestFrontDoorToolsetsMatchPlatformConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "platform", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var image struct {
+		PlatformToolsets map[string][]string `yaml:"platform_toolsets"`
+	}
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	want, ok := image.PlatformToolsets["cli"]
+	if !ok {
+		t.Fatalf("platform_toolsets.cli is gone from %s; frontDoorToolsets has no source to "+
+			"track and this test would pass against nothing", path)
+	}
+	if got, want := slices.Sorted(slices.Values(frontDoorToolsets)), slices.Sorted(slices.Values(want)); !slices.Equal(got, want) {
+		t.Errorf("frontDoorToolsets differs from platform_toolsets.cli in %s:\n  operator: %v\n  image:    %v",
+			path, got, want)
 	}
 }

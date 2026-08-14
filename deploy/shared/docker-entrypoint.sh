@@ -553,6 +553,15 @@ fi
 #     one exception, and it runs after this on purpose. Without syncing it, an
 #     image that changes the platform's toolsets or plugins has no effect on any
 #     existing deployment.
+#
+#     That last premise stops holding when HERMES_GATEWAY_PROFILE names this
+#     profile. The gateway is then homed here, so this is the file `/sethome`
+#     persists the home channel into and the monitoring policy mints
+#     `monitoring.install_id` in — exactly the runtime state step 2d exists to
+#     protect on the default profile, and a force-sync discards it on every
+#     restart. So config.yaml leaves the --items list and step 2.6b below
+#     rebuilds it the way step 2d rebuilds the default profile's. Everything
+#     else here still force-syncs either way.
 #   - A cluster config.yaml is identity-stamped at scaffold time with that
 #     cluster's `cluster_identity` block (project/cluster/location), so it is
 #     runtime state. Overwriting it from the template would strip the record
@@ -631,13 +640,38 @@ fi
 #
 # This list shrinks to nothing once no live volume can still be carrying the
 # entries. Until then, removing a name from it silently strands that id.
+
+# Whether the platform profile is the one the GATEWAY runs as, rather than one only
+# kanban workers and cron jobs ever home to. The operator sets HERMES_GATEWAY_PROFILE
+# from spec.harness.experimental.platformFrontDoor; three steps below turn on the
+# answer, and they have to agree, so they ask it here rather than each testing the
+# variable. Unset — every install that has not opted in — every one of them is a no-op.
+platform_is_front_door() {
+    [ "${HERMES_GATEWAY_PROFILE:-}" = "platform" ]
+}
+
+# The image-owned entries step 2.6 force-syncs into the platform profile.
+#
+# config.yaml is on the list only while the image owns it outright. At the front door
+# the running agent writes to it — `/sethome` persists the home channel there and the
+# monitoring policy mints monitoring.install_id — so a force-sync discards both on
+# every restart. It comes off the list and step 2.6b rebuilds the file instead, by the
+# same three-way merge step 2d gives the default profile. Nothing else on the list is
+# written at runtime, so nothing else moves either way; the one entry is derived rather
+# than a second list so the two answers cannot drift apart.
+platform_sync_items() {
+    _items="SOUL.md AGENTS.md CAPABILITIES.md cron skills governance hindsight"
+    platform_is_front_door || _items="config.yaml $_items"
+    echo "$_items"
+}
+
 if [ -f "$TARGET_DIR/profiles/platform/profile.yaml" ] && [ -d "$PLATFORM_TEMPLATE" ] && [ -f "$SCAFFOLD" ]; then
     HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SCAFFOLD" \
         --name platform \
         --template "$PLATFORM_TEMPLATE" \
         --plugins /opt/defaults/plugins \
-        --items "config.yaml SOUL.md AGENTS.md CAPABILITIES.md cron skills governance hindsight" \
+        --items "$(platform_sync_items)" \
         --cron-retire "blueprint-sync policy-propagation global-capacity-orchestrator standardization-validator lifecycle-deprecation-manager" \
         >/dev/null || echo "WARN: platform profile force-sync failed; continuing" >&2
 fi
@@ -811,6 +845,47 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
     done
 fi
 
+# 2.6b Rebuild the platform profile's config.yaml when it is the front door.
+#
+# The default profile's step-2d problem, arriving at a second profile: this file is now
+# both the one the operator has the most to say about (the platform adapters, the chat
+# toolsets, the ingress plugins — spec.harness.experimental.platformFrontDoor renders all
+# of them into profile-platform.overlay.yaml) and the one the running agent writes to. So
+# it gets step 2d's algorithm rather than step 2.7's: the same script, the same three
+# inputs, its own baseline file. default_profile_config.py's docstring carries the per-key
+# rules and the reasoning behind them.
+#
+# The overlay is applied HERE and not in step 2.7, which skips this profile while the
+# variable is set. Applying it twice is not idempotent in the way it looks: profile_overlay
+# records what it last applied in .operator-overlay.json so a withdrawn key can be undone,
+# and a second writer whose record disagrees with the file is how a withdrawn overlay stops
+# being withdrawable.
+#
+# Runs after step 2.6, which is what leaves config.yaml alone for it to read, and after
+# the skills and cluster passes, which touch neither this file nor the overlay.
+#
+# PRIMARY ONLY, exactly as step 2d is, and for the same per-container reason: a container
+# without $OVERLAY_DIR mounted would compute a baseline of pure image config and write it
+# over the primary's. Under the operator no such container reaches this line — the
+# dashboard sidecar execs out at the step-1.5 gate — but the entrypoint also runs where
+# there is no operator, and the guard costs nothing.
+#
+# Flag off, this step does not run and step 2.6 force-syncs config.yaml as it always has;
+# the baseline file left behind is inert until the flag comes back.
+if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
+    && [ -f "$DEFAULT_CONFIG_SCRIPT" ] && [ -f "$PLATFORM_TEMPLATE/config.yaml" ] \
+    && [ -d "$TARGET_DIR/profiles/platform" ]; then
+    # Reported, not swallowed, for the reason step 2d gives: the symptom of a silent
+    # failure here is chat ingress landing on a profile with no adapters configured —
+    # a front door that is simply deaf, with every health check green.
+    "$INSTALL_DIR/.venv/bin/python3" "$DEFAULT_CONFIG_SCRIPT" \
+        --config "$TARGET_DIR/profiles/platform/config.yaml" \
+        --image "$PLATFORM_TEMPLATE/config.yaml" \
+        --overlay "$OVERLAY_DIR/profile-platform.overlay.yaml" \
+        --baseline "$TARGET_DIR/profiles/platform/.platform-config-baseline.yaml" \
+        || echo "WARN: could not rebuild profiles/platform/config.yaml; the Platform Agent front door is running the previous file, so operator settings (platform adapters, chat toolsets, ingress plugins) may not have applied" >&2
+fi
+
 # 2.65 Link profile-targeted plugin image volumes into their profile homes.
 #
 # The operator mounts a plugin with spec.targetProfile at /opt/agent-plugins/<profile>/<plugin>,
@@ -864,6 +939,24 @@ fi
 # absent, overlays_for() finds no files, and apply_overlay reads that as "the operator
 # withdrew the overlay" and deletes every profile's last-applied record. A container that
 # cannot see what the operator rendered must not get to decide what the operator said.
+
+# Whether some other step has already applied this profile's overlay.
+#
+# One name so far: the front-door platform profile is step 2.6b's, exactly as the default
+# profile is step 2d's — and for the same reason. Both are rebuilt from image + overlay +
+# the agent's own runtime edits, and profile_overlay records what it last applied so a
+# withdrawn key can be undone. A second writer keeping its own record of the same overlay
+# is how a withdrawn overlay stops being withdrawable, which is the half of the
+# experimental flag that lets it be turned back off.
+#
+# Note this is not `[ "$1" = "platform" ]` guarded by the front door: away from it, step
+# 2.6 force-syncs the platform config.yaml from the image and step 2.7 is the only thing
+# that puts the operator's overlay back on top. Skipping it there would silently drop
+# every targeted plugin and every tuning override on the platform profile.
+overlay_owned_by_another_step() {
+    platform_is_front_door && [ "$1" = "platform" ]
+}
+
 if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
     # Every profile directory is reconciled — including ones with no overlay, so a
     # withdrawn overlay is undone rather than left applied. Which files apply to a given
@@ -874,6 +967,9 @@ if [ -f "$OVERLAY_SCRIPT" ] && [ -d "$OVERLAY_DIR" ]; then
     for d in "$TARGET_DIR"/profiles/*; do
         [ -d "$d" ] && [ -f "$d/config.yaml" ] || continue
         name=$(basename "$d")
+        if overlay_owned_by_another_step "$name"; then
+            continue
+        fi
         "$INSTALL_DIR/.venv/bin/python3" "$OVERLAY_SCRIPT" --profile-dir "$d" --overlay-dir "$OVERLAY_DIR" \
             || echo "WARN: overlay sync failed for profile '$name'; settings it carries will not apply" >&2
     done

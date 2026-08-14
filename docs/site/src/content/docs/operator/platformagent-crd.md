@@ -56,6 +56,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                        |
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
+| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                             |
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
 milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
@@ -240,6 +241,55 @@ delays a delegated task, too high loses it silently. Raise it once you know your
 and your model quota — that quota is the other shared resource, and for most deployments it binds
 before memory does.
 
+### `spec.harness.experimental`
+
+Opt-in switches with no compatibility promise. A field here may change meaning, change its default,
+or be removed outright in any release; an install that depends on one is expected to re-check it at
+every upgrade. Fields live here while the question they answer is still open — once it is settled
+the switch either graduates into a supported block or goes away.
+
+#### `platformFrontDoor`
+
+Makes the **Platform Agent** the profile the Hermes gateway runs as, so a chat message is handled by
+the agent that has the tools instead of arriving at the Chat Agent, which delegates through the
+router MCP server and the kanban board.
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
+  -p '{"spec":{"harness":{"experimental":{"platformFrontDoor":true}}}}'
+```
+
+Three things change while it is on:
+
+- The gateway container runs `hermes --profile platform gateway run`. Above one replica the container
+  still runs `leader_elect.py`, which reads the same choice from `HERMES_GATEWAY_PROFILE` and builds
+  that command line for the process it supervises.
+- `profile-platform.overlay.yaml` gains what only the `default` profile's rendering carried before:
+  the chat adapters, their display mode, the toolsets each chat platform key resolves, the ingress
+  plugins, and leader election.
+- The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and rebuilds it
+  with the same three-way merge the `default` profile gets, so `/sethome` and `monitoring.install_id`
+  survive a restart — see [How config reaches each profile](#how-config-reaches-each-profile).
+
+Setting the field back to `false` reverses all three. The overlay records what it applied, so the
+keys are unapplied rather than left behind, and the force-sync resumes.
+
+**What it costs.** The Chat Agent's lockdown is the Chat Agent's whole reason for existing: a router
+with three toolsets, so an inbound message cannot reach the full Platform Agent tool surface before a
+card and a worker turn have framed it. With this on, an inbound message reaches that surface
+directly. The lockdown is deliberately **not** copied onto the platform profile — copying it would
+leave the Platform Agent unable to do the work the flag exists to let it do.
+
+**Known limits.**
+
+- One gateway means one profile, so this is not additive. While it is on, the Chat Agent persona sees
+  no chat at all and the router/kanban delegation path is simply unused.
+- `gateway.multiplex_profiles` is still off, so a `/p/<profile>/` prefix on an API request is
+  ignored. Those requests now land on the Platform Agent rather than the Chat Agent.
+- The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
+  shows that profile's sessions while the front door is the platform one.
+- Cluster profiles and their scaffolding are unaffected.
+
 ## `spec.deployment`
 
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
@@ -332,11 +382,12 @@ A deployment runs several Hermes **profiles** from one pod: `default` (the Chat 
 overlay merged into an image-built base at startup, but what the operator puts in the `default`
 profile's overlay, and what happens to the runtime's own writes, are both different.
 
-| Profile     | Delivery                                                                                                 | Who owns the file                         |
-| ----------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
-| `default`   | Image-built base + `profile-default.overlay.yaml`, which carries the whole rendered config               | Shared three ways — see below             |
-| `platform`  | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
-| `cluster-*` | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
+| Profile                                                       | Delivery                                                                                                 | Who owns the file                         |
+| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `default`                                                     | Image-built base + `profile-default.overlay.yaml`, which carries the whole rendered config               | Shared three ways — see below             |
+| `platform`                                                    | Image-built base + `profile-platform.overlay.yaml` merged at startup                                     | Image owns the base, operator the overlay |
+| `platform`, with [`platformFrontDoor`](#platformfrontdoor) on | The same two inputs, reconciled by the three-way merge instead                                           | Shared three ways, exactly as `default`   |
+| `cluster-*`                                                   | Image-built base + `profileclass-cluster.overlay.yaml`, plus `profile-<name>.overlay.yaml` if one exists | Image owns the base, operator the overlay |
 
 A cluster profile is the only one that can take two overlays: the class overlay carries
 `tuning.cluster`, which applies to all of them, and a plugin targeting one specific cluster produces
@@ -384,6 +435,14 @@ however the CR is tuned.
 overlays. The reverse order would silently erase every overlay on each restart. The `default`
 profile's `config.yaml` is the exception to the force-sync — it is rebuilt by the three-way merge
 above, because a force-sync is exactly what would throw the runtime's edits away.
+
+The platform profile's `config.yaml` becomes a second exception under
+[`platformFrontDoor`](#platformfrontdoor), and for the same reason: the gateway is homed there, so
+that file is now the one `/sethome` and the monitoring policy write to. It leaves the force-sync
+list, takes the three-way merge, and is skipped by the overlay pass — one file must have one writer,
+because the record of what was last applied is what makes a withdrawn overlay undoable. Everything
+else the image owns in that profile — the persona files, `cron/`, `skills/`, `governance/`,
+`hindsight/` — still force-syncs either way.
 
 **Merge semantics.** Maps merge recursively, lists union (so `plugins.enabled` accumulates), and
 scalars are replaced by the overlay. Precedence, lowest to highest: Hermes built-in default → the
