@@ -57,7 +57,7 @@ spec:
             # - name: CREDENTIAL_PROXY_IMAGE
             #   value: "registry.example.com/kube-agents/credential-proxy:latest"
             # - name: FLUENT_BIT_IMAGE
-            #   value: "registry.example.com/mirror/fluent-bit:5.0.7"
+            #   value: "registry.example.com/mirror/fluent-bit:5.1.0"
           ports:
             - containerPort: 8081
               name: health

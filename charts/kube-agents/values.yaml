@@ -122,7 +122,7 @@ litellm:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.0.7"
+    tag: "5.1.0"
 
 platformAgent:
   enabled: true
