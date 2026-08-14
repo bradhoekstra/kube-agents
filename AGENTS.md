@@ -196,19 +196,41 @@ with what follows, believe the comment and fix this section.
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review** — an active branch would otherwise pay for a re-read on every push. To get a
 fresh review of the current commit, comment `/review` on a line of its own (repository owners,
-members, and collaborators only). The `agent:ignore` label opts a pull request out entirely and
-outranks `/review`.
+members, and collaborators only) — that pass is the strict one, only what the bot is certain of,
+while `/review all` re-reads at the width of the automatic first review and includes findings it
+believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
+outranks both.
 
-**How to read it.** A 👀 reaction means the review started; a posted review means it finished — the
-review usually lands a couple of minutes after the pull request opens. A review that runs always
-reports back, so a one-line "no findings" is a result, not silence. Findings arrive as inline
-comments badged 🔴 High, 🟠 Medium, or 🟡 Low; findings the bot could not anchor to a changed line
-appear in the summary body under **Findings outside this diff**. A 👀 with nothing following it is a
-bug in the bot, not a verdict.
+**How to read it.** A 👀 reaction means the review started; a posted review means it finished.
+Across #630–#699 the 👀 landed within seconds of the trigger, and the review a median of **9
+minutes** after that — 15 minutes at the 90th percentile, 45 in the slowest of the 54 reviews in
+that range (#634, an XXL diff). A `/review` re-read is no quicker: median 11 minutes, and none of
+the 42 measured took longer than 22. A review that runs always reports back, so a one-line "no
+findings" is a result, not silence. Findings arrive as inline comments badged 🔴 High, 🟠 Medium, or
+🟡 Low; findings the bot could not anchor to a changed line appear in the summary body under
+**Findings outside this diff**. A 👀 with nothing following it is a bug in the bot, not a verdict —
+it happened to 3 of the 57 pull requests picked up in that range (#647, #649, #679), which is rare
+enough to be worth waiting through and common enough that you must not wait forever.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
-and **offer to wait for it** instead of reporting the work as finished. If the user accepts, poll
-until the review appears:
+and **offer to wait for it** instead of reporting the work as finished. If the user accepts, poll on
+a schedule rather than continuously — nothing is worth checking in the first 5 minutes, then once a
+minute. Expect the review by 15 minutes; at 30 with nothing posted, stop waiting and tell the user
+the bot dropped this one. Nothing retries on its own, so ask whether to spend a trigger — and say
+which: the review that went missing was a first-review-width one, so `/review all` is what replaces
+it, and `/review` narrows the retry to what the bot is certain of. Two things make a wait read
+wrong:
+
+- **The 👀 does not come back.** A reaction is one per user, so the eyes from the first review are
+  still sitting there when you comment `/review` or mark a draft ready. Only the review list moves:
+  note how many bot reviews exist _before_ you re-trigger, and wait for that count to change rather
+  than for a reaction that already fired.
+- **A draft is not waiting on anything.** The trigger is ready-for-review, not opened. Every
+  multi-hour gap in the range above was a draft sitting unreviewed by design — #652 for 12 hours,
+  #659 for 18 — and measured from the ready event each was picked up in seconds. Do not start the
+  clock, or report the bot broken, while the pull request is still a draft.
+
+Poll with:
 
 ```bash
 # Both commands name gke-labs/kube-agents explicitly: PR branches live on forks,
@@ -241,7 +263,9 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ```
 
 After pushing fixes, remember that the push alone does not re-trigger anything: ask the user whether
-to comment `/review` for another pass.
+to comment `/review` for another pass — `/review` to confirm the fixes against a strict read,
+`/review all` when the branch changed enough that it deserves a first-review-width look again. Then
+wait for it the same way, counting reviews rather than watching for a second 👀.
 
 **Then resolve the conversations.** `main` requires every conversation on a pull request to be
 resolved before it can merge, and the triage sweep counts an open thread as work outstanding on the
