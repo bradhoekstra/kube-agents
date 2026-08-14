@@ -175,7 +175,7 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
 - **Leave no conversation unresolved.** `main` will not merge while a review thread is open, and
-  the open thread also keeps the pull request assigned to its author rather than its reviewers.
+  the open thread also keeps the pull request counted as its author's outstanding work.
   Reply, then resolve every thread you are confident is addressed — commands and the bar for
   "confident" are in
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
