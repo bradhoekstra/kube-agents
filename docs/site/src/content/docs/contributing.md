@@ -17,6 +17,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 
 ## PR hygiene (from `AGENTS.md`)
 
+- **Check for existing work.** Before you start, scan open pull requests and issues for someone already on it — a PR touching the same files, or an issue you should be assigned to. [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this in full and gives agents the exact commands.
 - **Scope.** Keep changes scoped to the request. Don't bundle unrelated formatting changes.
 - **Structure.** Maintain the shape and intent of agent configuration files. Don't restructure `agents/platform/` for cosmetic reasons in an unrelated PR.
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).

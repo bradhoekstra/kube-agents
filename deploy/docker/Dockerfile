@@ -421,6 +421,36 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
     /opt/hermes/.venv/bin/python3 /tmp/channel-directory/verify_channel_directory_threads.py && \
     rm -rf /tmp/channel-directory
 
+# Slack: let bold and italic survive an inline code span in Block Kit output.
+# `_inline_elements` tokenized inline code by *splitting* the run on it and
+# handing each gap to the emphasis scan separately, so a `**` that opened before
+# a code span and closed after it could never pair -- both delimiters reached
+# Slack as literal asterisks. Card t_549d081c posted
+# "**`adam-new-cluster`** (us-east4) -> ..." into a user's thread that way. Only
+# the rich_text path is affected (list items, quotes, table cells): section
+# blocks go through the adapter's format_message, which protects inline code
+# before converting bold, so the identical markdown rendered correctly in a
+# paragraph and wrongly in a list item.
+#
+# A grep guard cannot catch this class of bug. All four anchors can match and
+# the renderer still emit a literal "**" -- a sentinel that is never restored, a
+# style dict that comes back empty, an emphasis rule that stops pairing across
+# the mask -- and every one of those failures looks exactly like a report that
+# happened to contain no bolded code. verify_slack_code_emphasis.py therefore
+# drives the real patched render_blocks over the reported line and asserts on
+# the elements it returns.
+# See the module docstring in deploy/docker/patches/apply_slack_code_emphasis.py.
+COPY deploy/docker/patches/apply_slack_code_emphasis.py \
+     deploy/docker/patches/verify_slack_code_emphasis.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/slack-code-emphasis/
+RUN /opt/hermes/.venv/bin/python3 /tmp/slack-code-emphasis/apply_slack_code_emphasis.py /opt/hermes && \
+    grep -q "_CODE_SENTINEL_RE" /opt/hermes/plugins/platforms/slack/block_kit.py && \
+    ! grep -q "inline code is opaque" /opt/hermes/plugins/platforms/slack/block_kit.py && \
+    cd /opt/hermes && \
+    /opt/hermes/.venv/bin/python3 /tmp/slack-code-emphasis/verify_slack_code_emphasis.py && \
+    rm -rf /tmp/slack-code-emphasis
+
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
 # every lifecycle tool with _check_kanban_mode, which is true for any profile
 # carrying the kanban toolset — so the Chat Agent front door is shipped
