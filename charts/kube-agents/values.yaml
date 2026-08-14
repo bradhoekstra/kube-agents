@@ -77,7 +77,7 @@ litellm:
     location: ""
   image:
     repository: ghcr.io/berriai/litellm
-    tag: v1.92.0
+    tag: v1.96.2
     pullPolicy: IfNotPresent
   replicaCount: 2
   resources:
