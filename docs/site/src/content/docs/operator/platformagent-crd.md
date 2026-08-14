@@ -266,9 +266,12 @@ Three things change while it is on:
   that command line for the process it supervises.
 - `profile-platform.overlay.yaml` gains what only the `default` profile's rendering carried before:
   the chat adapters, their display mode, the toolsets each chat platform key resolves, the ingress
-  plugins, leader election, and the `kanban` block. That last one follows the gateway for the same
-  reason leader election does — the dispatcher and the notifier run in the gateway process and read
-  their settings from its own home — so [`tuning.maxInProgress`](#specharnesstuning) keeps applying.
+  plugins, leader election, the `kanban` block, and `memory`. The last two follow the gateway for the
+  same reason leader election does. The dispatcher and the notifier run in the gateway process and
+  read their settings from its own home, so [`tuning.maxInProgress`](#specharnesstuning) keeps
+  applying; the per-user memory provider scopes its store by the gateway identity, so
+  [`spec.harness.memory`](#specharnessmemory) keeps applying too, and the specialist's `read_only`
+  lockdown is lifted there because the profile now has a human to attribute writes to.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and rebuilds it
   with the same three-way merge the `default` profile gets, so `/sethome` and `monitoring.install_id`
   survive a restart — see [How config reaches each profile](#how-config-reaches-each-profile).
@@ -299,7 +302,18 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   the `gke-stockout-investigator` alert route that depends on it are both affected. Setting
   `spec.targetProfile: platform` moves the plugin and its `platform_toolsets` across, but not its
   `platforms:` subtree, which is gateway-scoped and always rendered onto `default`.
-- Cluster profiles and their scaffolding are unaffected.
+- **The `default` profile's cron roster stops ticking.** Hermes binds its cron ticker to one
+  `HERMES_HOME` — the job store, the execution ledger and `.tick.lock` all resolve from the gateway
+  process's own home — so the one roster that ticks becomes `profiles/platform/cron/jobs.json`. The
+  Platform Agent's own watchdogs therefore tick natively, which is the upside; the cost is that the
+  four jobs on the `default` roster never come due. Those are `cluster-agent-reconcile`, which
+  scaffolds a profile for a newly onboarded cluster and prunes one for a deleted cluster;
+  `bootstrap-inventory-scan` and `bootstrap-inventory-delivery`, which are first-run onboarding; and
+  `profile-cron-tick`, the only thing that ticks a **named** profile's own store — so every
+  `cluster-*` roster goes quiet with it. Nothing errors and nothing is logged: a job that is never
+  ticked simply stays `scheduled` with a `next_run_at` in the past.
+- Cluster profiles are otherwise unaffected — their scaffolding, config and skills are unchanged,
+  and an existing profile keeps working; it is only the scheduled work above that stops.
 
 ## `spec.deployment`
 

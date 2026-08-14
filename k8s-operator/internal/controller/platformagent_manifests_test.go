@@ -4458,6 +4458,91 @@ func TestPlatformFrontDoorOverlayCarriesLeaderElection(t *testing.T) {
 	}
 }
 
+// Per-user memory is scoped by the gateway identity, so it has to follow the gateway.
+//
+// The specialist settings it replaces — memoryOverlay blanking any non-Hindsight provider,
+// and the image's `read_only: true` — both rest on "a specialist has no gateway identity",
+// which is exactly what the flag falsifies. Left in place on a stock install they leave the
+// front door advertising a `memory` toolset that resolves to nothing.
+func TestFrontDoorMemoryFollowsTheGateway(t *testing.T) {
+	off, _ := platformOverlay(t, frontDoorAgent("fd-mem-off", 1, false))["memory"].(map[string]any)
+	if off["provider"] != "" {
+		t.Fatalf("memoryOverlay no longer blanks a non-Hindsight provider for the specialist "+
+			"(%v), so this test would prove nothing about the front door overriding it", off)
+	}
+
+	on, ok := platformOverlay(t, frontDoorAgent("fd-mem-on", 1, true))["memory"].(map[string]any)
+	if !ok {
+		t.Fatal("the front-door overlay carries no memory subtree, so chat loses its provider")
+	}
+	want := map[string]any{
+		"provider":             defaultMemoryProvider,
+		"memory_enabled":       false,
+		"user_profile_enabled": false,
+		// Not merely absent: the image pins it true for the specialist, so the front door
+		// has to say false or every write is stripped while the provider looks healthy.
+		"read_only": false,
+	}
+	if !reflect.DeepEqual(on, want) {
+		t.Errorf("front-door memory = %v, want %v", on, want)
+	}
+}
+
+// Switching the built-in store on has to denylist the `memory` toolset, the same rule
+// renderConfigYAML applies to the default profile.
+//
+// One toolset name gates both the provider injection and the built-in MEMORY.md/USER.md
+// tool, and the built-in one is a read/write surface with no per-user scoping — precisely
+// what the provider exists to avoid. Hermes builds the store on either flag, so either has
+// to trigger this.
+func TestFrontDoorMemoryDenylistsTheBuiltInToolset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		memory  *agentv1alpha1.MemorySpec
+		denied  bool
+		enabled bool
+	}{
+		{name: "off by default", memory: nil},
+		{
+			name:    "memoryEnabled",
+			memory:  &agentv1alpha1.MemorySpec{MemoryEnabled: ptr.To(true)},
+			denied:  true,
+			enabled: true,
+		},
+		{
+			name:   "userProfileEnabled alone",
+			memory: &agentv1alpha1.MemorySpec{UserProfileEnabled: ptr.To(true)},
+			denied: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := frontDoorAgent("fd-mem-deny", 1, true)
+			agent.Spec.Harness.Memory = tc.memory
+			// Rendered into the same `agent` subtree, and the point of merging rather than
+			// assigning: a denylist must not cost the profile its execution limits.
+			agent.Spec.Harness.Tuning = &agentv1alpha1.TuningSpec{
+				Platform: &agentv1alpha1.AgentLimits{MaxTurns: ptr.To(42)},
+			}
+
+			overlay := platformOverlay(t, agent)
+			memory, _ := overlay["memory"].(map[string]any)
+			if memory["memory_enabled"] != tc.enabled {
+				t.Errorf("memory_enabled = %v, want %v", memory["memory_enabled"], tc.enabled)
+			}
+
+			agentSubtree, _ := overlay["agent"].(map[string]any)
+			if agentSubtree["max_turns"] != 42 {
+				t.Errorf("max_turns = %v, want the tuning limit to survive the merge (42)",
+					agentSubtree["max_turns"])
+			}
+			denied := fmt.Sprintf("%v", agentSubtree["disabled_toolsets"])
+			if strings.Contains(denied, "memory") != tc.denied {
+				t.Errorf("disabled_toolsets = %v, want memory denied == %v", denied, tc.denied)
+			}
+		})
+	}
+}
+
 // TestFrontDoorToolsetsMatchPlatformConfig is the drift guard frontDoorToolsets names.
 //
 // The list is the image's own `cli` toolsets verbatim, and that equality IS the contract:
