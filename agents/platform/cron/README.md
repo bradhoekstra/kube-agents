@@ -96,7 +96,11 @@ they rot the moment an SOP is edited.
 `test_cron_prompts_cite_the_real_sop_geography` in
 `../skills/fleet-audit/scripts/test_audit_report.py` re-derives both from the
 SOP itself, so an edit that skips re-measuring fails there rather than at 06:20
-in production. Run it after touching anything in `../governance/`.
+in production. It resolves every other section a prompt cites as well — the AI
+stream names the one that defines which workloads count as AI workloads, and
+cites it bare, with no line range to re-measure — so a section inserted ahead of
+that one renumbers it into a test failure rather than into a worker sent to the
+wrong section. Run it after touching anything in `../governance/`.
 
 No prompt is quoted here on purpose. A copy in prose is one more place for the
 same numbers to go stale, and the test above checks the roster against the SOPs

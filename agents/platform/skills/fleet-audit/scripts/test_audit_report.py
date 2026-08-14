@@ -2100,6 +2100,29 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"has {len(spec.checks)} checks",
                 )
 
+                # Any other section the prompt cites has to resolve as well.
+                # The span check above covers the checks section only, and it
+                # is not the sole citation: the AI stream also points at the
+                # section defining which workloads count as AI workloads, so a
+                # section inserted ahead of that one renumbers it with nothing
+                # to notice. Sections are cited bare there, without a line
+                # range, which is why the `span` pattern does not reach it.
+                for cited in sorted(
+                    {int(n) for n in re.findall(r"[Ss]ection (\d+)\b", prompt)}
+                ):
+                    self.assertEqual(
+                        1,
+                        len(
+                            [
+                                n
+                                for n in starts
+                                if lines[n - 1].startswith(f"### {cited}. ")
+                            ]
+                        ),
+                        f"the {audit_id} prompt cites section {cited} of "
+                        f"{name}, which has no one heading numbered that",
+                    )
+
     def test_every_sop_states_the_rules_that_hold_on_every_stream(self):
         """A fix written into one SOP has to reach all the others.
 
