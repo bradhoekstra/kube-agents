@@ -120,9 +120,10 @@ done <<< "$STANDARD_CLUSTERS_LIST"
 log_success "All deployments complete across all configured clusters!"
 
 # The hints below are meant to be pasted verbatim, so they carry the same flag
-# the deploy used. Resolved per cluster rather than hard-coded: main.tf enables
-# external DNS access on new clusters, but a staging cluster created before that
-# still has to be reached over its IP endpoint.
+# the deploy used. Resolved per cluster rather than hard-coded: main.tf asks for
+# external DNS access on every cluster in the map, but the flag also depends on
+# what the local gcloud supports and on the describe succeeding, and either can
+# leave a cluster on its IP endpoint. See gke_dns_endpoint.sh.
 while IFS='|' read -r c_name c_loc t_shape _; do
   if [ -n "$c_name" ]; then
     gke_dns_endpoint_flag "${c_name}" "${c_loc}" "${PROJECT_ID}"
