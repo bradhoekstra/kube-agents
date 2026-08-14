@@ -109,12 +109,16 @@ REPORT_FORMAT_STANZA = """\
 ## Report format
 
 Put the full answer in `result` as standard Markdown — the gateway posts it
-verbatim into the requester's chat thread, where Slack renders it as blocks:
+verbatim into the requester's chat thread, where Slack renders it as blocks
+and Google Chat flattens headings to bold, drops tables, and splits anything
+past 4000 characters across messages:
 
 - Open with one sentence saying what happened, then give the detail.
 - Use `##` and `###` for sections. Never `#` — the chat message already shows
   the card title, so an H1 renders as a second, duplicate banner.
-- Put tabular data in a Markdown pipe table with a `---` separator row.
+- Put tabular data in a Markdown pipe table with a `---` separator row, but
+  keep it to a few short columns and never let the table be the only place a
+  fact lives — Google Chat drops it.
 - Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
 - Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
   renders those as flat text.\
