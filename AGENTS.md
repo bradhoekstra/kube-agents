@@ -177,6 +177,11 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
+- **Leave no conversation unresolved.** `main` will not merge while a review thread is open, and
+  the open thread also keeps the pull request counted as its author's outstanding work.
+  Reply, then resolve every thread you are confident is addressed — commands and the bar for
+  "confident" are in
+  [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
   - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install the version CI pins (see the Install Prettier step in `.github/workflows/prettier.yml`), e.g. `npm install -g prettier@<that version>` — the manifests gate in `k8s-operator-test.yml` asserts byte-equality against that version's output, so a skew fails CI on files you did not touch. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .`). Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
@@ -240,3 +245,65 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 
 After pushing fixes, remember that the push alone does not re-trigger anything: ask the user whether
 to comment `/review` for another pass.
+
+**Then resolve the conversations.** `main` requires every conversation on a pull request to be
+resolved before it can merge, and the triage sweep counts an open thread as work outstanding on the
+author — so a branch whose fixes have all landed still sits blocked, and still shows up as the
+author's problem rather than the reviewers'. Clearing the threads is part of finishing the change,
+not a courtesy someone else will get to. Do it once the fixes are pushed and the last `/review` pass
+has settled: a fresh review opens fresh threads, so resolving before it lands means doing it twice.
+
+Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
+the fix is on the pull request head and you can name the commit, or the finding is factually wrong
+and you have said why. Check that second one against the merge target as it stands now, not against
+your working copy — a finding that looks wrong because the file it cites does not say that is very
+often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment call, a reviewer asking for
+something you chose not to do, a rebuttal nobody has answered yet — reply and leave it to them.
+Resolving says the conversation is finished; it is not a way to end a disagreement.
+
+Reply first, always. A resolved thread collapses, so the reviewer who opened it may never expand it
+again, and the reply is the only record of what happened. Name what changed and the commit that
+changed it. Then resolve:
+
+```bash
+# Every unresolved thread, with both ids you need: resolveReviewThread takes the
+# thread's node id, while the reply endpoint above takes the first comment's
+# databaseId. REST returns only the latter, which is why this one is GraphQL.
+gh api graphql -f query='
+query($pr: Int!) {
+  repository(owner: "gke-labs", name: "kube-agents") {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          id isResolved isOutdated viewerCanResolve path line
+          comments(first: 20) { nodes { databaseId author { login } body } }
+        }
+      }
+    }
+  }
+}' -F pr=<number> --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+  | select(.isResolved | not)
+  | "\(.path):\(.line // "outdated") thread \(.id) canResolve=\(.viewerCanResolve)
+  reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
+  replies so far: \(.comments.nodes | length - 1)"'
+
+# Per thread, once the reply naming the fix is posted:
+gh api graphql -f query='
+mutation($thread: ID!) {
+  resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
+}' -f thread='<PRRT_...>'
+```
+
+Four ways that goes wrong quietly:
+
+- `first: 100` is a cap, not a promise. A long-lived pull request can carry more threads than that;
+  page for the rest, or say you only looked at the first hundred rather than reporting the branch
+  clear.
+- `line` is `null` once a thread's line falls out of the diff. Outdated is not addressed — the code
+  moved, which says nothing about whether the finding still holds. Read the thread.
+- `viewerCanResolve` is the authoritative answer to whether your token can resolve at all; it
+  differs between a maintainer and a contributor pushing from a fork. Check it before you reply,
+  because a mutation that fails after the reply is posted leaves a half-answered thread that looks
+  handled.
+- `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
+  something you resolved.
