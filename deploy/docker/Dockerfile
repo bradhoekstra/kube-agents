@@ -986,8 +986,10 @@ COPY agents/chat/SOUL.md agents/chat/AGENTS.md /opt/defaults/
 # 2 bulk-copies /opt/defaults onto the PVC with `cp -ru`, and this is the one file there
 # the running agent writes to — `/sethome`'s home channel, the monitoring install id,
 # saved slash-command preferences. An mtime-driven copy racing an image roll would
-# discard all of it. Step 2d rebuilds config.yaml from this template plus the operator's
-# overlay plus the runtime's own edits, and it is the only writer.
+# discard all of it. Step 2d copies this template onto a FRESH volume only, and thereafter
+# only back-fills keys the live file has lost; the running agent is otherwise the file's
+# sole writer, and the operator's settings reach it as a read-only managed-scope overlay
+# at /etc/hermes rather than by rewriting it.
 COPY --chown=hermes:hermes agents/chat/config.yaml /opt/chat-template/config.yaml
 RUN rm -f /opt/defaults/config.yaml
 
@@ -996,9 +998,9 @@ RUN rm -f /opt/defaults/config.yaml
 # platform/cluster tooling all resolve under $HERMES_HOME/scripts.
 COPY agents/chat/scripts/ /opt/defaults/scripts/
 COPY agents/platform/scripts/ /opt/defaults/scripts/
-# One COPY for the four, not four: `credential-proxy` builds FROM this stage and the
+# One COPY for the three, not three: `credential-proxy` builds FROM this stage and the
 # chain is bounded at 128 layers — see the layer-budget note at the top of the file.
-# They share a destination anyway, which default_profile_config.py requires.
+# They share a destination anyway.
 #
 #   profile_overlay.py         merges the operator's per-profile config overlays at
 #                              startup (entrypoint step 2.7). Shipped as a file rather
@@ -1008,11 +1010,6 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 #                              profile homes (entrypoint step 2.65, and
 #                              cluster_agent_profile.py for profiles scaffolded later) —
 #                              see tests/test_profile_plugins.py.
-#   default_profile_config.py  rebuilds the DEFAULT profile's config.yaml at startup
-#                              (entrypoint step 2d) — see
-#                              tests/test_default_profile_config.py. Imports merge() from
-#                              profile_overlay.py, which is why the two must land in the
-#                              same directory.
 #   otel_config.py             points the hermes_otel plugin at the collector the operator
 #                              resolved (entrypoint step 4, and cluster_agent_profile.py
 #                              for profiles scaffolded later). The plugin does not read
@@ -1021,7 +1018,6 @@ COPY agents/platform/scripts/ /opt/defaults/scripts/
 #                              tests/test_otel_config.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
-     deploy/shared/default_profile_config.py \
      deploy/shared/otel_config.py \
      /opt/defaults/scripts/
 
