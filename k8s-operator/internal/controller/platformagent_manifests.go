@@ -585,52 +585,6 @@ func resolveMemoryProvider(agent *agentv1alpha1.PlatformAgent) string {
 	}
 }
 
-// resolveMemoryStoreFlags returns whether the built-in MEMORY.md/USER.md store is on
-// for the profile the gateway runs as, and whether the per-user profile half of it is.
-//
-// Both default off. Hermes builds the store when EITHER is set (agent_init.py:
-// `_memory_enabled or _user_profile_enabled`), which is why callers that care about the
-// store existing have to test both.
-func resolveMemoryStoreFlags(agent *agentv1alpha1.PlatformAgent) (memoryEnabled, userProfileEnabled bool) {
-	if agent == nil || agent.Spec.Harness == nil || agent.Spec.Harness.Memory == nil {
-		return false, false
-	}
-	if agent.Spec.Harness.Memory.MemoryEnabled != nil {
-		memoryEnabled = *agent.Spec.Harness.Memory.MemoryEnabled
-	}
-	if agent.Spec.Harness.Memory.UserProfileEnabled != nil {
-		userProfileEnabled = *agent.Spec.Harness.Memory.UserProfileEnabled
-	}
-	return memoryEnabled, userProfileEnabled
-}
-
-// frontDoorMemory renders the `memory` subtree for the platform profile when it is the
-// front door, replacing the specialist settings memoryOverlay and the image's
-// config.yaml give it.
-//
-// Both of those are justified by the same premise — a specialist is spawned by the
-// kanban dispatcher, so it has no gateway identity to scope a per-user store by — and
-// the flag falsifies it: this profile IS the gateway and does carry the human identity
-// the provider resolves "user:<id>" from. Left alone, a stock install (multiuser_memory,
-// which memoryProviderIsHindsightBacked rejects) hands the front door
-// `memory.provider: ""` plus the image's `read_only: true`, so inject_memory_provider_tools
-// has nothing to inject and recall, per-user profiles and retention all vanish from chat
-// while `memory` stays in frontDoorToolsets advertising them.
-//
-// read_only is the one value not simply copied from the default profile: the image pins
-// it true for the specialist and the default profile's config type never writes it, so
-// it has to be turned off explicitly here or the provider survives with every write
-// stripped.
-func frontDoorMemory(agent *agentv1alpha1.PlatformAgent) map[string]any {
-	memoryEnabled, userProfileEnabled := resolveMemoryStoreFlags(agent)
-	return map[string]any{
-		"provider":             resolveMemoryProvider(agent),
-		"memory_enabled":       memoryEnabled,
-		"user_profile_enabled": userProfileEnabled,
-		"read_only":            false,
-	}
-}
-
 // memoryOverlay renders the `memory` subtree for the platform profile's overlay.
 //
 // The specialist profiles read shared-scope memory, so they load a provider too — but
@@ -784,20 +738,6 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 		// block from the gateway's own HERMES_HOME, so it follows the gateway here for
 		// the same reason leader_election does below. See kanbanOverlay.
 		"kanban": kanbanOverlay(agent),
-		// Per-user memory is scoped by the gateway identity, so it follows the gateway
-		// too — and merges over the specialist `memory` subtree memoryOverlay wrote
-		// first. See frontDoorMemory.
-		"memory": frontDoorMemory(agent),
-	}
-
-	// The companion to switching the built-in store on, and the same rule
-	// renderConfigYAML applies to the default profile: one toolset name gates both the
-	// provider injection and the built-in MEMORY.md/USER.md tool, so an install that
-	// sets either flag would otherwise leave the front door holding an unscoped
-	// read/write surface next to the per-user provider. Denylisting it drops both,
-	// which is what this field did before the provider gate existed.
-	if memoryEnabled, userProfileEnabled := resolveMemoryStoreFlags(agent); memoryEnabled || userProfileEnabled {
-		overlay["agent"] = map[string]any{"disabled_toolsets": []string{"memory"}}
 	}
 	if len(display) > 0 {
 		overlay["display"] = map[string]any{"platforms": display}
@@ -1306,14 +1246,22 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// in a single bank separated by a scope tag: "user:<id>" resolved from the
 	// gateway identity (agent._user_id) for private facts, "scope:shared" for
 	// organisation-wide ones. Both are recalled into the prompt each turn; only
-	// the personal scope retains automatically at session end. This is the
-	// profile that gets it because it is the one the gateway runs as; when
-	// platformFrontDoor moves the gateway, frontDoorMemory carries the same
-	// three values over. A kanban-spawned specialist carries no human identity,
-	// and the provider fails closed there rather than collapsing its writes
+	// the personal scope retains automatically at session end. This is the only
+	// profile that gets it: kanban-spawned specialists carry no human identity,
+	// and the provider fails closed there rather than collapsing their writes
 	// into one anonymous bucket.
+	cfg.Memory.MemoryEnabled = false
 	cfg.Memory.Provider = resolveMemoryProvider(agent)
-	cfg.Memory.MemoryEnabled, cfg.Memory.UserProfileEnabled = resolveMemoryStoreFlags(agent)
+	cfg.Memory.UserProfileEnabled = false
+
+	if agent.Spec.Harness != nil && agent.Spec.Harness.Memory != nil {
+		if agent.Spec.Harness.Memory.MemoryEnabled != nil {
+			cfg.Memory.MemoryEnabled = *agent.Spec.Harness.Memory.MemoryEnabled
+		}
+		if agent.Spec.Harness.Memory.UserProfileEnabled != nil {
+			cfg.Memory.UserProfileEnabled = *agent.Spec.Harness.Memory.UserProfileEnabled
+		}
+	}
 
 	// Keeping `memory` out of DisabledToolsets is only safe while the built-in
 	// store is off. memoryEnabled is a supported CRD field, and setting it true

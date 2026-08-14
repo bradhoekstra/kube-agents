@@ -266,12 +266,9 @@ Three things change while it is on:
   that command line for the process it supervises.
 - `profile-platform.overlay.yaml` gains what only the `default` profile's rendering carried before:
   the chat adapters, their display mode, the toolsets each chat platform key resolves, the ingress
-  plugins, leader election, the `kanban` block, and `memory`. The last two follow the gateway for the
-  same reason leader election does. The dispatcher and the notifier run in the gateway process and
-  read their settings from its own home, so [`tuning.maxInProgress`](#specharnesstuning) keeps
-  applying; the per-user memory provider scopes its store by the gateway identity, so
-  [`spec.harness.memory`](#specharnessmemory) keeps applying too, and the specialist's `read_only`
-  lockdown is lifted there because the profile now has a human to attribute writes to.
+  plugins, leader election, and the `kanban` block. That last one follows the gateway for the same
+  reason leader election does — the dispatcher and the notifier run in the gateway process and read
+  their settings from its own home — so [`tuning.maxInProgress`](#specharnesstuning) keeps applying.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and rebuilds it
   with the same three-way merge the `default` profile gets, so `/sethome` and `monitoring.install_id`
   survive a restart — see [How config reaches each profile](#how-config-reaches-each-profile).
@@ -312,6 +309,16 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   `profile-cron-tick`, the only thing that ticks a **named** profile's own store — so every
   `cluster-*` roster goes quiet with it. Nothing errors and nothing is logged: a job that is never
   ticked simply stays `scheduled` with a `next_run_at` in the past.
+- **Per-user memory does not follow the gateway either.** [`spec.harness.memory`](#specharnessmemory)
+  and the memory provider are rendered onto the `default` profile; the platform profile gets
+  `memory.provider: ""` and, from the image, `read_only: true`. With the flag on, the front door is
+  that profile, so chat has no recall, no per-user profile and no retention — while `memory` stays in
+  the profile's toolsets advertising all three. The keys cannot simply be copied across, because
+  `profiles/platform/config.yaml` is shared: it is also the home of every kanban-spawned specialist
+  and every job on the platform cron roster. Lifting `read_only` there would let a specialist write
+  the shared corpus, and un-blanking the provider would collapse those writes into one anonymous
+  bucket, since a specialist carries no gateway identity to scope a per-user store by. Carrying
+  memory to the front door needs those settings to be per-process rather than per-profile.
 - Cluster profiles are otherwise unaffected — their scaffolding, config and skills are unchanged,
   and an existing profile keeps working; it is only the scheduled work above that stops.
 
