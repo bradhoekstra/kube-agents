@@ -575,6 +575,7 @@ def wake_kinds_for(
     events: Iterable[object],
     load_config: Optional[Callable[[], object]] = None,
     adapter: object = None,
+    passive_delivered: bool = True,
 ) -> set:
     """Return the subset of ``events``' kinds that should wake the creator.
 
@@ -582,25 +583,42 @@ def wake_kinds_for(
 
         {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
 
-    ``adapter`` opts a non-push adapter out of the narrowing entirely, and
-    passing it is not optional in the notifier. The whole argument for dropping
-    ``completed`` is that ``adapter.send()`` already put the worker's summary in
-    the thread, so the wake is a third hop over an answer the user is looking
-    at. On an adapter with no push channel — the API server, whose ``send()``
-    returns ``SendResult(success=False)`` by design — the notifier skips that
-    send and says so in its own comment: *"the wake self-post below IS the
-    delivery"*. Narrow the set there and a card that completes successfully is
-    never announced to anyone; upstream added that self-post to fix the
-    api_server wrong-session bug, and dropping ``completed`` re-breaks it.
+    The narrowing has exactly one precondition, and both keyword arguments
+    exist to test it: **a text ping carrying the worker's summary has already
+    reached this conversation**. The whole argument for dropping ``completed``
+    is that ``adapter.send()`` already put the report in the thread, so the
+    wake is a third hop over an answer the user is looking at. Where no send
+    happened, the wake *is* the delivery, and narrowing it away means a card
+    that completes successfully is never announced to anyone.
 
-    So the config key governs the push path only. On the non-push path the full
-    upstream set always applies, including an explicit ``wake_on_events: []``:
-    that key means "do not spend a turn re-reading an answer already
-    delivered", which is not a thing anyone can be asking for where nothing was
-    delivered.
+    There are two ways for that send not to happen, and neither implies the
+    other:
+
+    ``adapter``
+        A non-push adapter — the API server, whose ``send()`` returns
+        ``SendResult(success=False)`` by design — has no channel to ping. The
+        notifier skips the send and says so in its own comment: *"the wake
+        self-post below IS the delivery"*. Upstream added that self-post to fix
+        the api_server wrong-session bug, and dropping ``completed`` re-breaks
+        it.
+
+    ``passive_delivered``
+        v2026.8.13's ``delivery_mode``. A ``wake``-only subscription suppresses
+        the text ping on a *push* adapter too (``send_passive = mode != "wake"``
+        in the notifier), so the push path acquired a second way to reach the
+        wake with nothing yet delivered. ``adapter`` cannot see this — it is a
+        property of the subscription, not of the platform — which is why it is
+        a separate argument rather than a refinement of ``_adapter_can_push``.
+        Pass the notifier's own ``send_passive``.
+
+    Neither is optional in the notifier. So the config key governs the
+    ping-then-wake path only, and on either no-send path the full upstream set
+    always applies — including an explicit ``wake_on_events: []``. That key
+    means "do not spend a turn re-reading an answer already delivered", which
+    is not a thing anyone can be asking for where nothing was delivered.
     """
     allowed = resolve_wake_kinds(load_config)
-    if adapter is not None and not _adapter_can_push(adapter):
+    if not passive_delivered or (adapter is not None and not _adapter_can_push(adapter)):
         allowed = DEFAULT_WAKE_KINDS
     return {ev.kind for ev in events if getattr(ev, "kind", None) in allowed}
 

@@ -350,6 +350,13 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 # change the shape of the other two and would silently wake subscribers who
 # asked for notify-only delivery.
 #
+# The first of those greps carries `passive_delivered=send_passive` rather than
+# stopping at `adapter=adapter`, and the argument is not cosmetic: it is the
+# whole difference between narrowing a wake that duplicates a text ping and
+# narrowing one that IS the delivery. `delivery_mode="wake"` skips the ping on a
+# push adapter, so a gate satisfied by `adapter=adapter` alone would pass on a
+# build that drops completions for every wake-only subscriber.
+#
 # The anchors prove only that the text landed, and every way the wake half can
 # go wrong is silent: it fails towards upstream, so a moved hermes_cli.config, a
 # moved gateway.wake, or a DEFAULT_WAKE_KINDS whitelist that fell behind the
@@ -375,7 +382,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py 
     grep -q "h = _clip_handoff(payload_summary)" /opt/hermes/gateway/kanban_watchers.py && \
     grep -q "r = _clip_handoff(task.result)" /opt/hermes/gateway/kanban_watchers.py && \
     grep -q "handoff = _kanban_handoff_with_result(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF '_wake_kinds_for(d["events"], adapter=adapter)' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -qF 'd["events"], adapter=adapter, passive_delivered=send_passive' /opt/hermes/gateway/kanban_watchers.py && \
     grep -qF 'if wake_agent' /opt/hermes/gateway/kanban_watchers.py && \
     grep -qF 'wake_configured=wake_agent,' /opt/hermes/gateway/kanban_watchers.py && \
     grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers.py && \

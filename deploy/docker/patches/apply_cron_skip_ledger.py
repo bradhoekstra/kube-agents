@@ -283,7 +283,12 @@ SCHED_RUNNING_GUARD = '''            if not try_register_running_job(job_id):
 
 SCHED_RUNNING_GUARD_PATCHED = '''            if not try_register_running_job(job_id):
                 logger.info("Job '%s' already running — skipping", job.get("name", job_id))
-                # kube-agents patch: see tools/cron_skip_ledger.py.
+                # kube-agents patch: written outside the running-set lock on
+                # purpose — every dispatching thread in this tick takes that
+                # lock, and a ledger write behind a 5s busy timeout inside it
+                # would serialise the whole dispatch pass. Safe here because
+                # try_register_running_job() has already released it. See
+                # tools/cron_skip_ledger.py.
                 record_skip(
                     job_id,
                     source="builtin",

@@ -135,9 +135,13 @@ WAKE_ANCHOR = (
     f"{WAKE_INDENT})\n"
 )
 
-# `adapter=` is load-bearing, not decoration: without it the narrowing also
-# applies to adapters whose send() the notifier deliberately skips, where the
-# wake IS the delivery. See wake_kinds_for's docstring.
+# `adapter=` and `passive_delivered=` are both load-bearing, not decoration.
+# Each names one way the notifier reaches this point having sent no text ping,
+# and where nothing was sent the wake IS the delivery: narrowing it away drops
+# the completion on the floor. `adapter=` covers the non-push platforms;
+# `passive_delivered=send_passive` covers v2026.8.13's `delivery_mode="wake"`
+# subscriptions, which suppress the ping on a push adapter too. See
+# wake_kinds_for's docstring.
 #
 # ``if wake_agent else set()`` is upstream's, added in v2026.8.13 along with the
 # subscription's ``delivery_mode`` (notify / notify+wake / wake), and it is kept
@@ -145,6 +149,12 @@ WAKE_ANCHOR = (
 # questions and both have to hold: upstream's is "did this subscriber ask to be
 # woken at all", ours is "is this event kind worth a model turn". Collapsing
 # them would put a per-subscription setting inside a module-level config reader.
+#
+# Note that ``wake_agent`` and ``send_passive`` partition the three modes
+# differently and neither implies the other, which is the trap this arrangement
+# exists to avoid: ``notify`` has a ping and no wake, ``notify+wake`` has both,
+# and ``wake`` has a wake and no ping. Only the middle one has an already-
+# delivered answer for the narrowing to be redundant with.
 #
 # The marker call is the one block here that is not upstream-equivalent. It has
 # to sit at this exact point and no earlier: control only reaches the `else`
@@ -175,7 +185,9 @@ MARKER_CALL = (
 WAKE_PATCHED = (
     f"{WAKE_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
     f"{WAKE_INDENT}_wake_kinds = (\n"
-    f'{WAKE_INDENT}    _wake_kinds_for(d["events"], adapter=adapter)\n'
+    f'{WAKE_INDENT}    _wake_kinds_for(\n'
+    f'{WAKE_INDENT}        d["events"], adapter=adapter, passive_delivered=send_passive\n'
+    f"{WAKE_INDENT}    )\n"
     f"{WAKE_INDENT}    if wake_agent\n"
     f"{WAKE_INDENT}    else set()\n"
     f"{WAKE_INDENT})\n"
@@ -206,14 +218,16 @@ TRAILER = (
 #: and before the old delivery applier grew this guard a second pass exited 0
 #: and left a second hook call and a second trailer import behind.
 #:
-#: The wake sentinel is the helper call alone, not the whole assignment:
-#: v2026.8.13's ``delivery_mode`` gate made the patched statement a
-#: parenthesized conditional, so ``_wake_kinds = `` and the call no longer share
-#: a line. The call text is still unique in the file — the trailer's
-#: ``wake_kinds_for as _wake_kinds_for`` import does not carry the arguments.
+#: The wake sentinel is the helper's argument line, not the whole assignment and
+#: not the call opener: v2026.8.13's ``delivery_mode`` gate made the patched
+#: statement a parenthesized conditional, so ``_wake_kinds = `` and the call no
+#: longer share a line, and the arguments now wrap onto their own line too. The
+#: argument text is what is unique in the file — the trailer's
+#: ``wake_kinds_for as _wake_kinds_for`` import does not carry the arguments,
+#: and ``_wake_kinds_for(`` alone would also match that import's alias.
 SENTINELS = (
     "handoff = _kanban_handoff_with_result(handoff, task)",
-    '_wake_kinds_for(d["events"], adapter=adapter)',
+    'd["events"], adapter=adapter, passive_delivered=send_passive',
     "_kanban_note_suppressed(",
 )
 
