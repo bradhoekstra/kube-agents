@@ -16,7 +16,23 @@ diff visibly breaks and leaves the rest of the documentation question to that sk
 
 # Procedure
 
-## 1. Fix the diff range
+## 1. Run this in a context that did not write the change
+
+If you are the agent that just produced the diff, **do not run the pass in the conversation that
+produced it**. Spawn a subagent, or start a new session, and hand it the diff range and the
+repository — not your reasoning, not your plan, not the summary you were about to write. A model
+reviewing work it has just justified is the weakest configuration there is: it is poorly calibrated
+about its own output, rates it higher than an outsider would, and the bias is worst on exactly the
+lines it got wrong. It is also more likely to "fix" something correct than to catch something
+broken, which is why step 5 exists and why step 6 will not let you edit on a hunch.
+
+That is why `.claude/commands/pr-review-batch.md` gives each pull request its own subagent. A
+self-review gets the same treatment for the same reason.
+
+You will be tempted to skip this on a small diff. The cost of a fresh context is one subagent; the
+cost of skipping it is that the pass reports what you already believed.
+
+## 2. Fix the diff range
 
 Everything below is measured against one range, so name it before you start:
 
@@ -30,7 +46,7 @@ The three-dot form keeps unrelated base-branch drift out of scope.
 Read the changed files at their **post-merge state**, not just the hunks. A hunk shows you what
 moved; the enclosing function tells you whether it still works.
 
-## 2. Establish intent
+## 3. Establish intent
 
 Write down, in one sentence, **what this change claims to do**. Take it from the issue it closes,
 the pull request body, or — for a branch with neither — the change itself. Keep that sentence: it
@@ -42,7 +58,7 @@ finding. And do not treat the stated intent as a description of the diff: where 
 the diff is what merges. A description promising a behaviour the diff does not implement, or
 silent about one it does, is itself a finding.
 
-## 3. Find candidates (ten angles)
+## 4. Find candidates (ten angles)
 
 Work all ten angles yourself, in sequence. Do not skip an angle because an earlier one found
 nothing there, and do not let one angle's conclusion suppress another's — if two angles flag the
@@ -50,7 +66,7 @@ same line for different reasons, record both.
 
 Each angle surfaces up to six candidates, each with a `file`, a `line`, a one-line `summary`, and a
 concrete `failure_scenario`. Pass every candidate with a nameable failure scenario through to step
-4 — silently dropping half-believed candidates is the dominant cause of misses. A candidate you
+5 — silently dropping half-believed candidates is the dominant cause of misses. A candidate you
 cannot express as a failure scenario is not yet a candidate.
 
 **Angle A — line-by-line diff scan.** Read every hunk, line by line. Then read the enclosing
@@ -65,12 +81,30 @@ invariant it enforced, then find where the new code re-establishes it. If you ca
 that's a candidate: a removed guard, a dropped error path, a narrowed validation, a deleted test
 that was covering a real case, a loosened RBAC or NetworkPolicy rule.
 
+**A weakened check is a removed invariant**, and it is the one an agent reaches for when a gate
+will not go green, so audit CI separately and by name: a test removed, renamed, or marked skip or
+xfail; a coverage threshold lowered; `|| true`, `continue-on-error`, or a silenced exit status
+appended to a step; a workflow that no longer triggers on pull requests or on forks; a step newly
+gated behind a condition it did not have. Any of these is a candidate on its own — the failure
+scenario is the class of defect that gate was catching, now shipping unobserved. **A diff whose
+only changes are to test files, on a branch whose CI was failing, is a candidate until you can
+show the test was wrong.** That is the shape of a change that makes the build green without making
+the code right.
+
 **Angle C — cross-file tracer.** For each function, template, chart value, or CRD field the diff
 changes, grep for its consumers and check whether the change breaks any of them: a new
 precondition, a changed return shape, a renamed key a manifest still reads, a timing dependency.
 Trace runtime wiring through to the source — which container an env var lands in, which process
 reads a port, which service account a binding actually grants — rather than inferring it from
 names.
+
+Then trace the other direction, because a change written by an agent can call things that do not
+exist: for every symbol, method, flag, chart value, CRD field, environment variable, or file path
+the diff **introduces a reference to**, open its definition. A plausible name is not evidence. The
+repo already applies this to prose — identifiers verified against source, not against other
+docs — and code gets it for the same reason. Watch for the neighbours: an import added for a symbol
+nothing uses, a dependency added without a pin or a provenance, a value hard-coded where the
+surrounding code reads configuration, and files changed that the stated intent never mentioned.
 
 **Angle D — operations and security.** This repo provisions clusters and holds credentials, so
 weigh blast radius: IAM and RBAC scope, credential handling and redaction, NetworkPolicy reach,
@@ -101,7 +135,7 @@ hand-edited, identifiers verified against source rather than against other docs.
 is the exhaustive form of that check and the author is required to have run it before opening —
 which is a reason to read what they reported, not a reason to skip this angle.
 
-**Angle I — scope and test coverage.** Hold the diff against the intent sentence from step 2. Flag
+**Angle I — scope and test coverage.** Hold the diff against the intent sentence from step 3. Flag
 changes that do not serve it: an unrelated refactor riding along, a dependency bump nobody asked
 for, a behaviour change buried in a change described as a rename, reformatting that inflates the
 diff and hides the real hunks. Repo convention is scoped changes and no unrelated formatting, so
@@ -113,6 +147,12 @@ Then check that the intent is actually tested: for each behaviour the change cla
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
 behaviour, not the absent test — say which regression would ship silently. Bug fixes without a
 regression test, and new error paths nothing exercises, are the usual cases.
+
+For a change that fixes something, naming the test is not enough — **run it against the pre-change
+behaviour and watch it fail.** A test that passes with the fix reverted is testing something else,
+and a fix with no test that can be made to fail usually means the defect was not understood. Say
+which it was. A red-then-green test is the one answer in this whole pass that does not come from
+your own reading, which is what makes it worth more than any amount of staring at the diff.
 
 **Angle J — sibling pull requests.** Every angle so far has looked only at this change. Widen
 once, to the open pull requests touching adjacent paths:
@@ -135,7 +175,7 @@ something has to be cut.
 Prefer running things over reasoning about them: execute the test suites the change touches and
 reproduce the failures you claim.
 
-## 4. Verify every claim (this step is not optional)
+## 5. Verify every claim (this step is not optional)
 
 Dedup first: candidates pointing at the same line and the same mechanism collapse into the one with
 the most concrete failure scenario.
@@ -179,9 +219,9 @@ Then clean up after the edit, because these are what give away a second pass:
 **The finished review must read as a single confident first pass.** No "Correction", no
 "Verification pass", no "on second look", no "an earlier draft said", no "downgraded from", no
 diff-of-claims, no changelog of your own reasoning. The reader should have no way to tell that step
-4 happened.
+5 happened.
 
-## 5. Act on what survived, and record the disposition
+## 6. Act on what survived, and record the disposition
 
 Every surviving finding gets a disposition, and there are only two:
 
@@ -190,6 +230,15 @@ Every surviving finding gets a disposition, and there are only two:
   path is unreachable for a stated invariant, the cost lands on a code path being deleted next
   week, the fix belongs to a separate issue that is now filed. "Out of scope", "pre-existing", and
   "will fix later" are not reasons on their own.
+
+**Edit on CONFIRMED, report on PLAUSIBLE.** A CONFIRMED finding on your own change is a defect you
+now know about, so fix it. A PLAUSIBLE one is a mechanism you could not pin down, and rewriting
+working code to chase it is how a self-review makes a change worse than it started: the temptation
+to "fix" something that was already right is the characteristic failure of reviewing your own work,
+and it is strongest on the lines you were least sure about. Write it into the section as an open
+question, say what would settle it, and leave the code alone unless the answer arrives. Recording a
+PLAUSIBLE finding you did not act on is a complete disposition — it hands the reviewer the doubt
+instead of a silent edit.
 
 When the review is your own, before opening a pull request, that disposition list **is** the PR
 body's **Self-Review** section. See `AGENTS.md`, "Pull Request Hygiene".
@@ -201,8 +250,8 @@ Severity-ordered findings, each with:
 - an anchor (`file:line`),
 - what is wrong, in one sentence,
 - the concrete failure scenario,
-- the verdict from step 4,
-- the disposition from step 5.
+- the verdict from step 5,
+- the disposition from step 6.
 
 Then two short sections:
 
@@ -212,4 +261,4 @@ Then two short sections:
   infrastructure you did not have. An honest gap is worth more than an implied one.
 
 "No findings" is an ordinary outcome on a good change. Report it as one, alongside what you looked
-for — never pad the list with something step 4 should have deleted.
+for — never pad the list with something step 5 should have deleted.

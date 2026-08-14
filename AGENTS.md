@@ -155,9 +155,19 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
   [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
   this list first, then reconcile them to it.
+  - **Run the pass in a context that did not write the change** — a subagent, or a new session,
+    handed the diff range and nothing else. Not your plan, not your reasoning, not the summary you
+    were about to write. Reviewing a diff in the conversation that produced it is the one
+    configuration that reliably does not work: the same context that talked you into the code
+    talks you into approving it, and the blind spot sits exactly where you were already wrong. It
+    is why `.claude/commands/pr-review-batch.md` gives every pull request its own subagent, and a
+    self-review earns it for the same reason.
   - **A finding you decide not to fix is an answer**, provided the reason is an argument about
     this change rather than a shrug. "Out of scope", "pre-existing", and "will fix later" are not
     reasons on their own; the separate issue you filed is.
+  - **Fix what the pass confirms; report what it only suspects.** A finding it could not pin down
+    is an open question for the section, not a licence to rewrite working code — chasing an
+    uncertain finding on your own change is how a self-review makes it worse than it started.
   - **"No findings" is an answer only alongside what you looked for.** The skill's angles are the
     vocabulary for that, and a pass that names none of them is indistinguishable from no pass.
   - **Do not claim more than you did.** A self-review the diff contradicts is worse than none: it

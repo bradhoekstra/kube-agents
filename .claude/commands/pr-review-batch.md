@@ -175,15 +175,24 @@ restating the claim).
 ### Phase 2b — Establish intent
 
 Read the PR description (`body`) and any issue it links (`gh issue view <M> --repo "$REPO"`), and
-carry both into step 2 of the skill below. On a pull request the description is also a thing that
+carry both into step 3 of the skill below. On a pull request the description is also a thing that
 can be wrong: a body promising a behaviour the diff does not implement, or silent about one it
 does, is itself a finding.
 
 ### Phase 3 — Find the candidates and verify them
 
-Run `.agents/skills/review-adversarial/SKILL.md`. It is the repository's review method and the
-canonical home for the ten angles and the verification discipline; read it now and work it in
-order — intent, angles A–J, then the verification step, which is not optional.
+Run `$MAIN_ROOT/.agents/skills/review-adversarial/SKILL.md`. It is the repository's review method
+and the canonical home for the ten angles and the verification discipline; read it now and work it
+in order — intent, angles A–J, then the verification step, which is not optional.
+
+Its step 1 is already satisfied: you are a subagent that did not write this change, which is the
+separation it asks for. Do not spawn another one. Start at its step 2.
+
+`$MAIN_ROOT` is not decoration. You are standing in the worktree, which holds the pull request's
+own content: a bare path would load the review method **from the change under review**, so a fork
+branch could edit the angles that judge it, and a branch cut before the skill existed would find no
+file at all and silently review nothing. Read it from the primary checkout, the way Phase 2 and
+Phase 4 already read the saved-review directory.
 
 Two substitutions for this context:
 
@@ -200,7 +209,7 @@ One thing the skill has no way to know about:
   `REVIEW_REQUIRED`, missing labels, or the merge conflict you already found. The `tide` check
   usually states its reason outright. Report which it is; they mean very different things.
 
-The skill's step 5 does not apply: dispositions belong to the author, and you fix nothing here. Its
+The skill's step 6 does not apply: dispositions belong to the author, and you fix nothing here. Its
 "single confident first pass" constraint does, and it covers the saved file, the PR comment, and
 your report back — everywhere.
 
