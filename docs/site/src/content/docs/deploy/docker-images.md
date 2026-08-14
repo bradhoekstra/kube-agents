@@ -82,7 +82,7 @@ Confining it takes more than a scratch `$PLATFORM_AGENT_HOME`, because two of th
 The Hermes base image tag is pinned in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) at the repo root:
 
 ```bash
-HERMES_AGENT_TAG=v2026.8.3@sha256:16788311e2fa3035456bdc1bafb8ec2b1777db64ebf020af9bb7eb73c3712c9e
+HERMES_AGENT_TAG=v2026.8.13@sha256:68e15ae2a6d894d0ccbd9f8aacbbe13d4d28fa5dc9b6a303970b67bb2499b1a6
 ```
 
 Docker builds source `tags.env` via the `HERMES_AGENT_TAG` build arg:
