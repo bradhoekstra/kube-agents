@@ -1225,6 +1225,29 @@ class PlatformFrontDoorTest(unittest.TestCase):
         self.assertIn("platform_is_front_door", guard)
         self.assertIn("IS_BOOTSTRAP_PRIMARY", guard)
 
+    def test_step_2_6_asks_the_helper_rather_than_carrying_its_own_list(self):
+        """The call site, not just the helper — a literal here re-opens the whole bug.
+
+        Everything above tests platform_sync_items in isolation, which stays green if
+        step 2.6's `--items` is edited back to the spelled-out list it used to carry:
+        the helper would go on answering correctly and nothing would ask it. The result
+        is config.yaml force-synced over the front door's own file on every restart,
+        discarding `/sethome` and monitoring.install_id, silently.
+        """
+        lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+        # Two invocations name this profile — step 2.5 scaffolds it when absent, step 2.6
+        # force-syncs it on every boot — and only the second passes --items at all.
+        items = []
+        for i, line in enumerate(lines):
+            if line.strip() != "--name platform \\":
+                continue
+            items += [a.strip() for a in lines[i : i + 8] if a.strip().startswith("--items")]
+        self.assertEqual(
+            items,
+            ['--items "$(platform_sync_items)" \\'],
+            "step 2.6 must resolve its --items through platform_sync_items, not a literal",
+        )
+
     def test_the_predicate_survives_set_e_when_it_is_false(self):
         """The off path is every existing install, so a false return must not end the boot.
 

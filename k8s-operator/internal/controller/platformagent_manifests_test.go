@@ -4338,7 +4338,13 @@ func TestPlatformFrontDoorArgsSelectTheProfile(t *testing.T) {
 // The dashboard sidecar must NOT get it. It carries AGENT_SHARED_STATE_SETUP=skip and execs
 // out of the entrypoint at the step-1.5 gate, so it would never act on it — but it also does
 // not mount the operator's overlay directory, and a container that reached step 2.6b without
-// one would compute a baseline of pure image config and write it over the primary's.
+// one would back-fill the platform config from image defaults alone while the primary was
+// writing the same file.
+//
+// On the gateway it is present either way, and the off case is the half worth pinning: the
+// operator emitting nothing leaves an AgentPlugin's spec.env — copied verbatim, no allowlist
+// — as the only writer of the name, and last-wins cannot settle a duplicate that does not
+// exist. Empty is the off answer both readers already understand.
 func TestPlatformFrontDoorProfileEnvIsGatewayOnly(t *testing.T) {
 	for _, replicas := range []int32{1, 2} {
 		t.Run(fmt.Sprintf("replicas=%d", replicas), func(t *testing.T) {
@@ -4354,9 +4360,15 @@ func TestPlatformFrontDoorProfileEnvIsGatewayOnly(t *testing.T) {
 			}
 
 			off := buildDeployment(frontDoorAgent("fd-env", replicas, false), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-			if _, found := envValue(containerNamed(t, off, "platform-agent"), gatewayProfileEnvVar); found {
-				t.Errorf("%s must be absent while the flag is off; set, it stops the entrypoint "+
-					"force-syncing the platform config the image owns", gatewayProfileEnvVar)
+			got, found = envValue(containerNamed(t, off, "platform-agent"), gatewayProfileEnvVar)
+			if !found || got != "" {
+				t.Errorf("gateway %s = %q (found=%v) with the flag off, want an empty value that "+
+					"is still emitted: a name the operator never writes is one an AgentPlugin's "+
+					"spec.env can claim outright", gatewayProfileEnvVar, got, found)
+			}
+			if _, found := envValue(containerNamed(t, off, "platform-agent-dashboard"), gatewayProfileEnvVar); found {
+				t.Errorf("the dashboard sidecar must not carry %s with the flag off either",
+					gatewayProfileEnvVar)
 			}
 		})
 	}
@@ -4368,9 +4380,9 @@ func TestPlatformFrontDoorProfileEnvIsGatewayOnly(t *testing.T) {
 func TestPlatformFrontDoorOverlayCarriesTheIngressKeys(t *testing.T) {
 	overlay := platformOverlay(t, frontDoorAgent("fd-overlay", 1, true))
 
-	// The toolsets key is the one that cannot be left to the fallback:
-	// hermes-google_chat is a plugin platform with no static TOOLSETS entry, so an absent
-	// key resolves to nothing and the mcp- servers this agent exists for never load.
+	// The toolsets key is the one that cannot be left to the fallback: an absent key puts
+	// the platform on the auto-generated `hermes-google_chat` composite and unions in every
+	// enabled MCP server, which is broader than the worker surface this pins, not narrower.
 	toolsets, _ := overlay["platform_toolsets"].(map[string]any)
 	for _, platform := range []string{"google_chat", "slack"} {
 		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
@@ -4465,8 +4477,9 @@ func TestPlatformFrontDoorOverlayKeepsTargetedPlugins(t *testing.T) {
 // profile reaches the same merge — and mergeMaps only recurses into a nested map that
 // toStrMap recognises. Built as map[string][]string the front door's own subtree was
 // REPLACED rather than merged, and the symptom is not a missing key: the chat platforms fall
-// back to `hermes-google_chat`, which has no static TOOLSETS entry, so the front door answers
-// with no tools at all on an install where the flag had been working.
+// back to the auto-generated `hermes-google_chat` composite — the full core bundle plus every
+// enabled MCP server (see frontDoorToolsets) — so the front door quietly widens rather than
+// failing shut, on an install where the flag had been working.
 func TestPlatformFrontDoorOverlayMergesTargetedPluginToolsets(t *testing.T) {
 	agent := frontDoorAgent("fd-toolsets", 1, true)
 	overlay := map[string]any{}
@@ -4550,11 +4563,14 @@ func TestFrontDoorKanbanMatchesChatConfig(t *testing.T) {
 
 // TestFrontDoorPluginsMatchChatConfig is the drift guard frontDoorPlugins names.
 //
-// The list is derived, not chosen: every ingress plugin the chat profile enables, less
-// `agent_roster` (delegation only, and the front door does the work itself) and less the
-// three agents/platform/config.yaml already enables. Adding an ingress plugin to the chat
-// profile and not here is the drift that matters — it hooks a message the front door is
-// the one receiving, so the behaviour is simply lost, with nothing logged.
+// The list is derived, not chosen: every ingress plugin the chat profile enables, less the
+// two named below, less the three agents/platform/config.yaml already enables. Adding an
+// ingress plugin to the chat profile and not here is the drift that matters — it hooks a
+// message the front door is the one receiving, so the behaviour is simply lost, with
+// nothing logged.
+//
+// The two exclusions are listed here rather than assumed, so that adding a third is a
+// deliberate edit to a test that states its reason and not a quiet trim of a var.
 func TestFrontDoorPluginsMatchChatConfig(t *testing.T) {
 	read := func(name string) []string {
 		t.Helper()
@@ -4577,13 +4593,25 @@ func TestFrontDoorPluginsMatchChatConfig(t *testing.T) {
 		return image.Plugins.Enabled
 	}
 
+	// agent_roster: delegation only, and the front door does the work itself.
+	// bootstrap_onboarding: its markers and its delivery job both resolve from the home
+	// the flag moves away from, so enabling it here greets an onboarded install and
+	// promises a report the dead `default` roster can never deliver.
+	excluded := []string{"agent_roster", "bootstrap_onboarding"}
+
 	onPlatform := read("platform")
 	want := []string{}
 	for _, plugin := range read("chat") {
-		if plugin == "agent_roster" || slices.Contains(onPlatform, plugin) {
+		if slices.Contains(excluded, plugin) || slices.Contains(onPlatform, plugin) {
 			continue
 		}
 		want = append(want, plugin)
+	}
+	for _, plugin := range excluded {
+		if !slices.Contains(read("chat"), plugin) {
+			t.Errorf("%q is excluded from frontDoorPlugins but the chat profile no longer "+
+				"enables it; the exclusion and its reasoning are now stale", plugin)
+		}
 	}
 	if got := slices.Sorted(slices.Values(frontDoorPlugins)); !slices.Equal(got, slices.Sorted(slices.Values(want))) {
 		t.Errorf("frontDoorPlugins is no longer the chat profile's ingress plugins:\n"+

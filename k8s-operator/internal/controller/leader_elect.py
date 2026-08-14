@@ -13,8 +13,11 @@ is_shutting_down = False
 #
 # At one replica the operator puts the whole command line in the container's args and
 # this file never runs; above one it runs instead of that command line, so anything the
-# args would have carried has to arrive as an environment variable. HERMES_GATEWAY_PROFILE
-# is set (to "platform") only by spec.harness.experimental.platformFrontDoor.
+# args would have carried has to arrive as an environment variable. The operator always
+# sets HERMES_GATEWAY_PROFILE — empty unless spec.harness.experimental.platformFrontDoor
+# names a profile, so that an AgentPlugin's spec.env cannot become its only writer — and
+# empty means the default profile, which is the `hermes gateway run` this file has always
+# supervised.
 #
 # `--profile` is a GLOBAL flag and its position is load-bearing: hermes_cli/main.py
 # pre-parses it out of argv before any import and re-points HERMES_HOME at that profile's

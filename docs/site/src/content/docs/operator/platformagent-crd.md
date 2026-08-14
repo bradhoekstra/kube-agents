@@ -270,7 +270,9 @@ Three things change while it is on:
   machine-global, so `platforms.*` and `display.platforms` already land on this profile. `kanban`
   does have to follow the gateway, because the dispatcher and the notifier run in the gateway
   process and read their settings from its own home; that is what keeps
-  [`tuning.maxInProgress`](#specharnesstuning) applying.
+  [`tuning.maxInProgress`](#specharnesstuning) applying. The board itself does not move — Hermes
+  anchors `kanban.db` at the shared root rather than the active profile, deliberately, so the
+  dispatcher/worker handoff survives — so cards in flight are unaffected by the flip.
 - The entrypoint stops force-syncing `profiles/platform/config.yaml` from the image and back-fills
   it instead, on the same terms as the `default` profile's own file, so `/sethome` and
   `monitoring.install_id` survive a restart — see
@@ -288,7 +290,9 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 **Known limits.**
 
 - One gateway means one profile, so this is not additive. While it is on, the Chat Agent persona sees
-  no chat at all and the router/kanban delegation path is simply unused.
+  no chat at all and the router MCP path is simply unused. Kanban delegation is not: the front door
+  keeps `dispatch_in_gateway`, so it can still hand a card to a spawned worker — it just does so as
+  the agent that could also have done the work itself.
 - `gateway.multiplex_profiles` is still off, so a `/p/<profile>/` prefix on an API request is
   ignored. Those requests now land on the Platform Agent rather than the Chat Agent.
 - The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
@@ -325,8 +329,35 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   writes into one anonymous bucket, since a specialist carries no gateway identity to scope a
   per-user store by. Carrying memory to the front door needs those settings to be per-process
   rather than per-profile.
-- Cluster profiles are otherwise unaffected — their scaffolding, config and skills are unchanged,
-  and an existing profile keeps working; it is only the scheduled work above that stops.
+- **First-run onboarding does not follow the gateway.** Its two jobs are on the `default` roster the
+  bullet above stops ticking, and its greeting hook — the `bootstrap_onboarding` plugin — resolves
+  its once-per-deployment markers from the gateway's home, so on the platform profile it would greet
+  an already-onboarded install and promise a report nothing can deliver. The operator therefore
+  leaves that plugin off the front door deliberately. Bring an install up with the flag off, let
+  onboarding finish, then turn it on.
+- **A home channel set with `/sethome` stays on the profile it was set on.** The operator renders no
+  `home_channel` of its own, so on an install that did not populate the CR's Google Chat or Slack
+  `homeChannel` the value lives only in the config file the gateway last wrote. Flipping the flag
+  changes which file that is, and nothing carries it across. The Platform Agent's own `deliver: all`
+  watchdogs then tick in-process, where the delivery target is read from the environment alone —
+  so every scheduled report posts nowhere while chat replies stay healthy and the install looks
+  fine. Either populate `homeChannel` on the CR before flipping, or re-run `/sethome` after.
+- **`chat_message_audit` stops recording.** It is a hook rather than a plugin, and hooks are only
+  ever copied into the root home — nothing puts them on a named profile, and Hermes reads
+  `$HERMES_HOME/hooks` and returns silently when the directory is absent. `tool_call_audit` is a
+  plugin, is enabled on this profile and still records the inbound message with its session and
+  pseudonymised user id, so what is actually lost is the record carrying the agent's **response**
+  text. Response content remains in the session store.
+- **The platform profile's `config.yaml` stops being restored from the image on every restart.**
+  Handing the file to the agent is the point — that is what lets `/sethome` and
+  `monitoring.install_id` survive — but the same change means a key the running agent writes there
+  is not reverted at boot. Keys the image adds still arrive through the back-fill; keys already in
+  the file stay as they were last written. Operator-owned settings are unaffected: they come from
+  the overlay and the `/etc/hermes` pins, both re-applied every boot.
+- Cluster profiles that already exist are otherwise unaffected — their config, skills and
+  scaffolding on disk are unchanged and they keep working. What stops is the scheduled work above,
+  which includes `cluster-agent-reconcile`, so a cluster onboarded while the flag is on gets no
+  profile until the flag goes back off.
 
 ## `spec.deployment`
 

@@ -683,16 +683,21 @@ func platformFrontDoorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 //
 // It is agents/platform/config.yaml's `cli` list verbatim, and that is the whole
 // intent: a chat message should reach the same surface a kanban worker on this
-// profile already has, no more. Substituting the platform's own composite for
-// `hermes-cli` would narrow it silently — `hermes-google_chat` is a plugin platform
-// with no static TOOLSETS entry, so it resolves to nothing and the core tools would
-// simply not appear. The composite is what _get_platform_tools expands to infer the
-// configurable toolsets; the `mcp-` names pass through as MCP server names, and
-// `memory` is the provider gate (see the note in agents/platform/config.yaml).
+// profile already has, no more. `hermes-cli` is what _get_platform_tools expands to
+// infer the configurable toolsets; the `mcp-` names pass through as MCP server names,
+// and `memory` is the provider gate (see the note in agents/platform/config.yaml).
 //
-// Declaring the key at all is what matters most. Absent it, Hermes falls back to
-// `hermes-google_chat` for the platform key and every mcp-prefixed server — the
-// platform_control tools this agent exists for — resolves to nothing.
+// Declaring the key is a NARROWING, and being exact about that matters because the
+// error is fail-OPEN. With no list saved for the platform key, hermes_cli's
+// _get_platform_tools falls back to `hermes-<platform>`, and toolsets.resolve_toolset
+// AUTO-GENERATES that name for a plugin platform such as google_chat once the adapter
+// registers: _HERMES_CORE_TOOLS plus whatever tools the plugin contributed — terminal,
+// write_file, execute_code, browser, delegation. The same absence also drops the MCP
+// allowlist, so every globally enabled server is unioned in rather than the three named
+// here. The fallback is therefore the full base bundle plus everything, on a profile
+// whose overlay renders no `agent.disabled_toolsets` to bound it — which is why
+// agents/chat/config.yaml pins its own `google_chat` key with the same reasoning ("so it
+// never falls back to a full base bundle").
 //
 // TestFrontDoorToolsetsMatchPlatformConfig fails the build when this drifts from the
 // image's copy.
@@ -707,14 +712,25 @@ var frontDoorToolsets = []string{
 // frontDoorPlugins are the plugins the profile receiving chat ingress has to run, on
 // top of the three agents/platform/config.yaml already enables.
 //
-// They are agents/chat/config.yaml's list, minus agent_roster, which exists only to
-// delegate: it injects the routable-specialist roster into every turn, which a front
-// door that does the work itself does not consult. legacy_slash_commands unwraps a typed
-// "/hermes sethome" before the gateway dispatcher sees it, and
-// session_store/session_otel_bridge/bootstrap_onboarding are what make an inbound chat
-// session persist, trace, and onboard at all — each hooks ingress, so enabling them on
-// a profile no message reaches does nothing, and NOT enabling them on the profile every
-// message reaches loses the behaviour outright.
+// They are agents/chat/config.yaml's list, less two. legacy_slash_commands unwraps a typed
+// "/hermes sethome" before the gateway dispatcher sees it, and session_store and
+// session_otel_bridge are what make an inbound chat session persist and trace at all —
+// each hooks ingress, so enabling them on a profile no message reaches does nothing, and
+// NOT enabling them on the profile every message reaches loses the behaviour outright.
+//
+// agent_roster is left off because it exists only to delegate: it injects the
+// routable-specialist roster into every turn, which a front door that does the work
+// itself does not consult.
+//
+// bootstrap_onboarding is left off because its state does not follow it. The hook resolves
+// its markers from HERMES_HOME, which the flag moves, so on the platform profile the
+// once-per-deployment gate reads a home where `.bootstrap_completed`/`.bootstrap_greeted`
+// have never been written while the assets check still passes on the absolute
+// /opt/defaults/onboarding — and the delivery job it binds to lives on the `default`
+// roster, which the flag stops ticking. Enabling it would greet an already-onboarded
+// install with the scan-in-progress text and promise a report nothing can deliver. Its
+// own README states the rule ("Do not relocate any part of this flow"), and the CRD page
+// carries the cost as a known limit.
 //
 // hermes_otel, tool_call_audit and incident_context are the three the image's own copy
 // already enables; the overlay unions lists, so naming them again would be inert rather
@@ -722,7 +738,6 @@ var frontDoorToolsets = []string{
 var frontDoorPlugins = []string{
 	"session_store",
 	"session_otel_bridge",
-	"bootstrap_onboarding",
 	"legacy_slash_commands",
 }
 
@@ -806,10 +821,12 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 	// recurses into a nested map only when toStrMap recognises it — which it does for
 	// map[string]any alone. As map[string][]string it fell through to a plain assignment,
 	// so a plugin targeting this profile with a `platform_toolsets:` block of its own
-	// REPLACED the chat keys instead of unioning with them, leaving the front door on the
-	// `hermes-google_chat` fallback with no static TOOLSETS entry and therefore no tools.
-	// That also broke the union contract the AgentPlugin CRD page states outright. The
-	// []string values below are fine: toSlice already handles them.
+	// REPLACED the chat keys instead of unioning with them, dropping the front door onto
+	// the auto-generated `hermes-google_chat` fallback — the full core bundle plus every
+	// enabled MCP server, per the note on frontDoorToolsets, which is why the symptom was
+	// an over-broad surface rather than a visibly toolless agent. That also broke the
+	// union contract the AgentPlugin CRD page states outright. The []string values below
+	// are fine: toSlice already handles them.
 	//
 	// Both platform keys unconditionally, matching the adapters the managed scope pins
 	// whether or not each is enabled: a platform turned on later must not also need its
@@ -2517,12 +2534,23 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// gateway — or, worse, un-home it while the overlay still configures the platform
 	// profile as the front door, leaving chat on the default profile while the toolsets,
 	// ingress plugins and kanban settings meant for it sit on a profile receiving none.
+	//
+	// Which is why it is appended UNCONDITIONALLY, empty when the flag is off, rather
+	// than only when there is a profile to name. Last-wins only settles a duplicate; a
+	// name the operator never emits is not a duplicate, so a plugin declaring
+	// HERMES_GATEWAY_PROFILE=platform on a flag-off install would be the only writer and
+	// would re-home the gateway to a profile whose overlay carries no ingress keys at
+	// all. Both readers treat empty as off — leader_elect.py falls back to the default
+	// profile, and the entrypoint's platform_is_front_door tests for `platform`
+	// exactly — so the off value is a real answer rather than a placeholder.
+	frontDoorProfile := ""
 	if platformFrontDoorEnabled(agent) {
-		gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
-			Name:  gatewayProfileEnvVar,
-			Value: platformProfileName,
-		})
+		frontDoorProfile = platformProfileName
 	}
+	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
+		Name:  gatewayProfileEnvVar,
+		Value: frontDoorProfile,
+	})
 
 	containers := []corev1.Container{
 		{
