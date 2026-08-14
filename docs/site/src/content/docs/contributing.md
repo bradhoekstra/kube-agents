@@ -99,8 +99,9 @@ Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs
 - **Pushing more commits does not re-trigger it.** To ask for a fresh review of the current commit, comment `/review` on a line of its own. Owners, members, and collaborators can trigger it.
 - **Reading the result.** 👀 means the review started, a posted review means it finished. Findings are inline comments badged 🔴 High, 🟠 Medium, or 🟡 Low; findings about code outside the diff are listed in the summary body. "No findings" is the common outcome and is a real result — a 👀 with nothing following it is a bug in the bot.
 - **Opting out.** The `agent:ignore` label excludes a pull request from review and outranks `/review`.
+- **Resolving the threads is part of the work.** `main` will not merge while any conversation is open, whether the bot or a human started it, and an open thread keeps the pull request counted as its author's outstanding work. Whoever is confident a thread is addressed — author or reviewer — replies saying what changed, then resolves it. Threads that are still a judgment call stay open for the person who raised them.
 
-AI agents working in this repository have a further obligation: after opening a pull request they should offer to wait for this review and then walk its findings with you before changing any code. See [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md).
+AI agents working in this repository have a further obligation: after opening a pull request they should offer to wait for this review and then walk its findings with you before changing any code, and they resolve the threads they have addressed. See [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md).
 
 ## Where to file issues
 
