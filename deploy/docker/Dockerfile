@@ -40,7 +40,7 @@ FROM envoyproxy/envoy:${ENVOY_VERSION} AS envoy-bin
 # $BUILDPLATFORM keeps the Go toolchain running natively on the build host; it
 # cross-compiles to TARGETARCH, the architecture of the image being produced.
 # The :-amd64 fallback only fires on builders that don't populate TARGETARCH.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS watcher-builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS watcher-builder
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /workspace
