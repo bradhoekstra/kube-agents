@@ -10,9 +10,9 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Chat Agent front door — the `default` Hermes profile that receives chat ingress and delegates to specialists.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
-- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
+- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, IaC parity, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
-- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
+- `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
@@ -135,7 +135,10 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
 - Keep changes scoped to the request.
 - Do not commit unrelated formatting changes.
 - Maintain the structure and intent of the agent configuration files.
-- Use Conventional Commits for commit messages.
+- **Conventional Commits & PR Title Enforcement:** All PR titles and commit messages must strictly adhere to the Conventional Commits specification (`type(optional-scope): description`):
+  - **Permitted Types:** `feat` (new user-facing capability), `fix` (bug fix), `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`.
+  - **Breaking Changes:** Mark with `!` before the colon (e.g. `feat!:`, `fix(operator)!:`) or a `BREAKING CHANGE:` footer.
+  - **Release Preparation:** Standardized PR titles ensure consistent commit history and establish the Conventional Commit metadata required for the automated SemVer release pipeline. AI agents must ensure the proposed PR title prefix accurately reflects the changes in the branch diff and confirm classification with the author before opening a PR.
 - Push PR branches to a fork, not to the upstream repository.
 - **Pin GitHub Actions to a full commit SHA.** Every third-party `uses:` in
   `.github/workflows/` must reference a 40-character commit SHA with the human-readable
@@ -197,6 +200,17 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   - **If the change cannot reach a running installation** — docs-only, a CI workflow, a code path
     that needs infrastructure you do not have — write "Not live-tested" and say why. An empty
     section is not an answer.
+- **IaC parity review when a PR touches more than one install surface's territory:**
+  the provisioning scripts (`k8s-operator/scripts/`, `k8s-operator/config/`), the
+  Terraform modules, and the Helm chart each express the same install, and nothing in
+  the languages keeps them together. `make iac-parity-check`
+  (`scripts/check_iac_parity.py`) enforces the scalar subset — image tags, IAM role
+  bundles, identifiers, KMS and backup defaults — and CI runs it. Run the
+  `review-iac-parity` skill (`.agents/skills/review-iac-parity/SKILL.md`) for the
+  structural drift no scalar comparison catches: a resource only one surface creates,
+  a knob only one surface can express. The scripts and `k8s-operator/config/` are the
+  source of truth; deliberate divergences are listed in both the skill and the
+  script's docstring, and adding one means editing both.
 - **Expect an automated review after opening a PR.** Opening the pull request starts
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
