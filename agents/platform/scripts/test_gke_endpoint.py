@@ -3,9 +3,11 @@
 Run: python3 -m unittest agents.platform.scripts.test_gke_endpoint
 
 Every case drives a fake runner rather than gcloud, so the predicate is pinned
-without a project or a network. The shapes below are real describe output: the
-`allowExternalTraffic: false` one is `kube-agents-cluster` in `bhoekstra-gkedemos`,
-the cluster that proved passing the flag blindly yields a kubeconfig which 403s.
+without a project or a network. The shapes below are real describe output with
+the identifying values replaced: an endpoint hostname carries the project number
+of the cluster it names, so these are synthetic and the IPs come from the
+documentation ranges. The `allowExternalTraffic: false` case is the one that
+proved passing the flag blindly yields a kubeconfig which 403s.
 """
 
 import io
@@ -42,13 +44,13 @@ DNS_INTERNAL_ONLY = {
     "controlPlaneEndpointsConfig": {
         "dnsEndpointConfig": {
             "allowExternalTraffic": False,
-            "endpoint": "gke-a13c947a2043445a8340cc7620e4b30d2389-757207957170.us-central1.gke.goog",
+            "endpoint": "gke-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b-123456789012.us-central1.gke.goog",
         },
         "ipEndpointsConfig": {
             "enabled": True,
             "enablePublicEndpoint": True,
-            "privateEndpoint": "10.128.0.6",
-            "publicEndpoint": "35.253.54.92",
+            "privateEndpoint": "10.0.0.2",
+            "publicEndpoint": "203.0.113.10",
         },
     }
 }

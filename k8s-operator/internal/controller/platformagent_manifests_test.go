@@ -1361,7 +1361,16 @@ func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
 
 	hostnames := []string{
 		// GKE DNS-based control plane endpoint: <cluster-hash>-<project-number>.<region>.gke.goog
-		"gke-a13c947a2043445a8340cc7620e4b30d2389-757207957170.us-central1.gke.goog",
+		//
+		// Synthetic, but the shape is copied from live clusters: a 36-character
+		// hash, a project number, and a location label. Do not paste a real
+		// endpoint in — the hostname carries the project number of whoever's
+		// cluster it came from, and what this test needs is the shape.
+		"gke-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b-123456789012.us-central1.gke.goog",
+		// A zonal cluster puts the zone where the region sits, so the label is
+		// longer but the shape is unchanged. Keeping both means a pattern
+		// narrowed to a region-shaped label fails here rather than in the field.
+		"gke-9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e-210987654321.us-central1-a.gke.goog",
 		"container.googleapis.com",
 		"oauth2.googleapis.com",
 		"accounts.google.com",
