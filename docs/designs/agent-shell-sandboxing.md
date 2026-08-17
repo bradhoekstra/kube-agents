@@ -320,8 +320,11 @@ with an external dependency.
 
 - [`credential-proxy-placement.md`](credential-proxy-placement.md) — Part C. Ships
   independently and first.
-- [#720](https://github.com/gke-labs/kube-agents/pull/720) — unshares the sandbox and
-  proxy UID and PID namespaces. In-pod hardening; complementary and much nearer term.
+- [#720](https://github.com/gke-labs/kube-agents/pull/720) — **a prerequisite, not
+  merely complementary.** It moves the credential broker into its own Deployment. A
+  shell in a sandbox pod cannot reach a broker bound to the agent pod's loopback
+  interface, so until the broker has a Service address of its own, moving the shell
+  means giving up `kubectl`, `gcloud`, `gh`, and `git` entirely.
 - [#674](https://github.com/gke-labs/kube-agents/pull/674) — read-only root
   filesystem. Complementary.
 - [#610](https://github.com/gke-labs/kube-agents/issues/610) — the gVisor/WAL SQLite

@@ -20,6 +20,12 @@ This document proposes moving the proxy to a **dedicated Deployment per
 PlatformAgent**, following the shape `github-token-minter` already uses in this
 repository, and removing the Workload Identity binding from the agent pod entirely.
 
+[#720](https://github.com/gke-labs/kube-agents/pull/720) already builds that
+Deployment and reaches the same finding independently; it closes the metadata-server
+path with a NetworkPolicy egress allowlist instead. The remaining work described here
+is the part that does not depend on the cluster's CNI enforcing NetworkPolicy — see
+[Denying the route versus removing the identity](#denying-the-route-versus-removing-the-identity).
+
 **Status:** proposed, not implemented. Tracked as Part C of
 [#737](https://github.com/gke-labs/kube-agents/issues/737). Part C is independent of
 the shell-sandboxing work in
@@ -150,6 +156,44 @@ Workload Identity binding changes nothing — the shell still mints the same tok
 success criterion is not "the proxy is elsewhere" but **"the agent pod has no cloud
 identity worth stealing."**
 
+### Most of this is already in flight
+
+[#720](https://github.com/gke-labs/kube-agents/pull/720) builds the structure
+independently and reaches the same conclusion: it adds
+`buildCredentialBrokerDeployment`, a `splitCredentialBrokerPod` flag, and an
+`egressPolicy: Allowlist` mode, and its API documentation states the reasoning
+directly — a Pod-level NetworkPolicy cannot deny the metadata server to the agent
+container while allowing it to the broker container beside it, because they share a
+network namespace. The operator refuses the unsafe combination and reports
+`Degraded` rather than breaking the agent.
+
+**This document should not be read as proposing a competing split.** The split is
+#720's. What remains is the difference in _how the metadata-server path is closed_,
+below.
+
+### Denying the route versus removing the identity
+
+#720 closes the path by **not listing** `169.254.169.254` in a default-deny egress
+policy. This design closes it by **taking the Workload Identity binding off the agent
+pod's Kubernetes service account**. The distinction is enforcement:
+
+| Property                                         | Egress allowlist (#720)          | Removing the WI binding |
+| ------------------------------------------------ | -------------------------------- | ----------------------- |
+| Depends on the CNI enforcing NetworkPolicy       | Yes                              | No                      |
+| Effective on GKE Standard without network policy | No                               | Yes                     |
+| Effective in the default install                 | No — the split is off by default | Yes, once defaulted     |
+
+The first row is not a hypothetical, and #720 says so in its own API documentation:
+_"The policy does nothing at all on a cluster whose CNI does not enforce
+NetworkPolicy (GKE Standard without network policy enabled)."_ The reference install
+this project is developed against is exactly that cluster, so on it the allowlist is
+inert and the metadata-server path stays open.
+
+Removing the identity needs no CNI feature, no admission check, and no operator
+guard against a misconfiguration, because there is nothing left to reach. The two are
+complementary — keep the allowlist as defence in depth — but only one of them holds
+on a cluster that does not enforce policy.
+
 ### The precedent already in the tree
 
 `github-token-minter` is this exact pattern, in production: a separate Deployment,
@@ -160,9 +204,9 @@ converge over time.
 
 ### Rejected alternatives
 
-**Sidecar with hardening (status quo plus #720).** Fails for ADC credentials, per
-above. #720 remains worth landing on its own merits — it closes the environment-
-variable read, which this proposal also closes but later.
+**Sidecar with hardening (UID and PID split alone).** Fails for ADC credentials, per
+above — which is why #720 pairs its namespace hardening with the Pod split rather
+than relying on it.
 
 **Bind to `0.0.0.0` and add a NetworkPolicy, keeping the sidecar.** Does not address
 Workload Identity at all. It also inverts the threat model: a policy admitting the
@@ -273,10 +317,12 @@ and is deliberately out of scope here.
 
 ## Related work
 
-- [#720](https://github.com/gke-labs/kube-agents/pull/720) — unshares the sandbox and
-  proxy UID and PID namespace, and adds `splitCredentialBrokerPod`. Moves in this
-  direction and closes the environment-variable read; does not close the
-  metadata-server path.
+- [#720](https://github.com/gke-labs/kube-agents/pull/720) — **the load-bearing
+  dependency.** Unshares the proxy's UID and PID namespaces, adds
+  `buildCredentialBrokerDeployment` and `splitCredentialBrokerPod`, and denies the
+  metadata server through an `egressPolicy: Allowlist`. Builds the structure this
+  document describes; what it leaves is a protection that depends on the CNI
+  enforcing NetworkPolicy.
 - [#723](https://github.com/gke-labs/kube-agents/pull/723),
   [#724](https://github.com/gke-labs/kube-agents/pull/724),
   [#725](https://github.com/gke-labs/kube-agents/pull/725) — proxy hardening:
