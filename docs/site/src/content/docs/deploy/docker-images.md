@@ -35,12 +35,12 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.96.2` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.0` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
-| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.8.6@sha256:3db1536d84a14a10afbd08cc8f82bf4eec03c123d950705226c999bea14ca0f0` | `HINDSIGHT_API_IMAGE` | Provisioning step 13, when the memory provider uses Hindsight. |
+| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab` | `HINDSIGHT_API_IMAGE` | Provisioning step 13, when the memory provider uses Hindsight. |
 | `hindsight-postgresql` | `docker.io/ankane/pgvector` | `latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8` | `HINDSIGHT_POSTGRES_IMAGE` | Provisioning step 13, alongside the Hindsight API. |
-| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.14.4` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
-| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.14.4` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
-| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.14.4` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
-| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.14.4` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist. |
+| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.1` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
+| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.1` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
+| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.1` | — | cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set. |
+| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.21.1` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist. |
 
 ### Base images
 
@@ -49,7 +49,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
-| `envoy` | `docker.io/envoyproxy/envoy` | `v1.38.0` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
+| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.0` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.26-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages. |
 | `python` | `docker.io/library/python` | `3.11-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile runtime stage. |
@@ -166,8 +166,8 @@ most:
 - `--dry-run` — print the copy plan and copy nothing.
 
 Destinations keep the trailing image name only, so
-`quay.io/jetstack/cert-manager-webhook:v1.14.4` lands as
-`<prefix>/cert-manager-webhook:v1.14.4`. Every consumer below assumes that flat layout.
+`quay.io/jetstack/cert-manager-webhook:v1.21.1` lands as
+`<prefix>/cert-manager-webhook:v1.21.1`. Every consumer below assumes that flat layout.
 
 ### 2. Point the install at it
 

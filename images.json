@@ -67,7 +67,7 @@
       "name": "hindsight-api",
       "origin": "third-party",
       "repository": "ghcr.io/vectorize-io/hindsight-api",
-      "tag": "0.8.6@sha256:3db1536d84a14a10afbd08cc8f82bf4eec03c123d950705226c999bea14ca0f0",
+      "tag": "0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab",
       "override": "HINDSIGHT_API_IMAGE",
       "pulledBy": "Provisioning step 13, when the memory provider uses Hindsight.",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
@@ -85,7 +85,7 @@
       "name": "cert-manager-controller",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-controller",
-      "tag": "v1.14.4",
+      "tag": "v1.21.1",
       "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
       "description": "Issues the webhook serving certificates the operator's webhooks need."
     },
@@ -93,7 +93,7 @@
       "name": "cert-manager-cainjector",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-cainjector",
-      "tag": "v1.14.4",
+      "tag": "v1.21.1",
       "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
       "description": "Injects CA bundles into webhook configurations."
     },
@@ -101,7 +101,7 @@
       "name": "cert-manager-webhook",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-webhook",
-      "tag": "v1.14.4",
+      "tag": "v1.21.1",
       "pulledBy": "cert-manager, installed by provision_03 unless SKIP_CERT_MANAGER is set.",
       "description": "cert-manager's own admission webhook."
     },
@@ -109,7 +109,7 @@
       "name": "cert-manager-acmesolver",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-acmesolver",
-      "tag": "v1.14.4",
+      "tag": "v1.21.1",
       "pulledBy": "cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself, but provision_03 rewrites the flag onto the mirror along with the rest of the manifest, so the copy has to exist.",
       "description": "Solver pod cert-manager runs for ACME HTTP-01 challenges."
     },
@@ -129,7 +129,7 @@
       "name": "envoy",
       "origin": "build-time",
       "repository": "docker.io/envoyproxy/envoy",
-      "tag": "v1.38.0",
+      "tag": "v1.39.0",
       "buildArg": "ENVOY_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
       "description": "Source of the envoy binary copied into the credential-proxy image."

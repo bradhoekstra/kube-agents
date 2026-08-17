@@ -11,8 +11,8 @@
 #
 # Destination naming keeps the trailing image name only:
 #
-#   quay.io/jetstack/cert-manager-controller:v1.14.4
-#     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.14.4
+#   quay.io/jetstack/cert-manager-controller:v1.21.1
+#     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.21.1
 #
 # That flat layout is what the rest of the project assumes of a mirror — the
 # operator derives the credential-proxy reference from the agent reference by
