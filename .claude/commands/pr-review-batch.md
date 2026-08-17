@@ -319,9 +319,9 @@ matching this PR.
   saying they are not asking for review yet, and review comments on unfinished work are noise at
   best. Wait for ready-for-review;
 - a saved review already exists for this PR **and** `headRefOid` matches the head SHA it recorded —
-  nothing has changed since;
+  nothing has changed since (`full` mode only, see below);
 - a saved review exists and the author has landed no work of their own since — merging the base
-  branch in is not new work to review:
+  branch in is not new work to review (`full` mode only, see below):
 
   ```bash
   git log <recorded-sha>..HEAD --no-merges --not "$BASE_REF"     # empty → skip
@@ -339,6 +339,16 @@ before them, so a matching head SHA there says that nothing new has landed, not 
 ever read whole — skipping on it would let one narrowed pass suppress the full one permanently.
 Proceed instead, and say in your report that the prior review was a narrowed one and what it
 covered. A saved review with no scope field predates the narrowed mode and was a full pass.
+
+**Neither condition applies at all when `$REVIEW_MODE` is `since`.** They read a saved review of
+ours; Phase −1 read the bot's and mine; and because the two never consult each other, the second
+condition silently cancels precisely the pass Phase −1 got authorisation for. It is empty _by
+construction_ on a merge tail — `--no-merges` drops the merge and `--not "$BASE_REF"` drops
+everything it pulled in — which is the same fact that made Phase −1 call the bot review current and
+offer the narrowed pass in the first place. Skipping there means the merge's `git show --cc` output
+is read by nobody, and that output is the whole reason I paid for the pass. So run it. If the delta
+turns out empty, Phase 3 says so and names what it ran, which is a report; `status: skipped` off a
+condition I was never asked about is not.
 
 A merge conflict is **not** a skip reason. Neither is an unmergeable `mergeStateStatus`.
 
