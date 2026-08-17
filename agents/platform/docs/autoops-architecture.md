@@ -219,7 +219,7 @@ the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth
 - **Option A (<Action Title>):** <1-sentence GitOps fix>
 - **Option B (<Action Title>):** <1-sentence GitOps fix>
 - ✅ **Recommended: Option <letter>** — <why this is the safer choice>
-- **Reply 'apply'** ... or name one directly with **'apply Option A'** / **'apply Option B'**
+- **To authorize:** reply **'apply'** ... or name one directly with **'apply Option A'** / **'apply Option B'**
 
 **GitOps PR Instructions (for subsequent turns):**
 1. You are explicitly authorized to create a branch, modify manifests, commit, push, open a PR.
@@ -233,7 +233,9 @@ the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth
   the persona, so a shape here that disagrees with SOUL.md §7 does not extend that policy, it silently
   replaces it. A new domain's template starts from §7's three sections.
 - **The approval interaction** — the exact words that turn a suggestion into an authorized action, and
-  the fact that a reply is required at all.
+  the fact that a reply is required at all. It now shares a bullet list with the fix options, so it is
+  labelled `To authorize:` and the instruction above the template says it is not an option; a bare
+  fourth bullet in a lettered list reads as Option C.
 - **The write boundary** — the agent may open a PR; it may not touch the live cluster. This is the
   safety property of the whole architecture, and it is stated in the prompt.
 

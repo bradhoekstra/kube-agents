@@ -514,7 +514,10 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     and a fourth labelled block added here silently overrides the policy rather
     than extending it. The GitOps call-to-action lives inside **What to do**
     because it is an action, and because §7 rule 3 cuts trailing lines that
-    read as an offer rather than a finding.
+    read as an offer rather than a finding. It shares a list with the Option
+    bullets now that the old ``👉`` block is gone, so it carries a
+    ``To authorize:`` label and the instruction above the template says it is
+    not an option — without both, the fourth bullet reads as Option C.
 
     The report template below is STANDARD markdown, and must stay that way.
     Every chat platform's adapter translates the agent's markdown on the way
@@ -550,6 +553,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
         f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
+        f"The last bullet under '## What to do' is the call to action, not another option: keep its 'To authorize:' label, never give it an Option letter, and never count it when you number the options.\n\n"
         f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this — "
         f"the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
@@ -560,7 +564,7 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
         f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n"
         f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n"
-        f"- **Reply 'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
+        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
         f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
         f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
         f"---"

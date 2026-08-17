@@ -629,6 +629,11 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         # rather than a choice they can act on. `<letter>` is still correct in
         # the instruction prose above the template, which the agent reads but
         # never echoes -- so pin the template line, not the whole query.
+        #
+        # Locate it structurally, by its position and label, rather than by the
+        # text under test: selecting the line that contains `apply Option A`
+        # would make the assertions below tautological, and the instruction
+        # prose above the template legitimately says `apply Option <letter>`.
         payload = {
             "reason": "OOMKilled",
             "namespace": "test-ns",
@@ -637,8 +642,13 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
             "message": "some message"
         }
         query = session_kv_server._build_agent_query("test-session", payload)
-        cta = next(line for line in query.splitlines() if "apply Option A" in line)
+        what_to_do = query.split("## What to do", 1)[1]
+        cta = next(
+            line for line in what_to_do.splitlines()
+            if line.startswith("- **To authorize:**")
+        )
         self.assertNotIn("<letter>", cta)
+        self.assertIn("apply Option A", cta)
         self.assertIn("apply Option B", cta)
 
     def test_template_uses_only_the_three_permitted_sections(self):
@@ -675,6 +685,14 @@ class TestSessionKvServerQueryBuilding(unittest.TestCase):
         body = query.split("## What to do", 1)[1].split("**GitOps PR Instructions", 1)[0]
         self.assertIn("apply Option A", body)
         self.assertIn("Recommended: Option", body)
+        # It shares a bullet list with the Options now that the separate `👉`
+        # block is gone, so it has to be labelled as the authorization step or
+        # it reads as one more thing to choose between.
+        authorize = next(
+            line for line in body.splitlines()
+            if line.startswith("- **To authorize:**")
+        )
+        self.assertNotRegex(authorize, r"\*\*Option [A-Z]")
 
 
 if __name__ == "__main__":
