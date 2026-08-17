@@ -170,7 +170,12 @@ make gcp-provision
 - On the first run, the script prompts for configuration inputs (GCP Project ID, region, cluster name, model provider, API key, etc.) and saves them locally in `scripts/vars.sh`.
 - Subsequent invocations reuse `scripts/vars.sh` for non-interactive idempotency.
 
-- **Private Container Registry**: If your GKE clusters cannot pull from `ghcr.io`, mirror the `kube-agents` container images into your private registry (e.g. Artifact Registry `us-docker.pkg.dev/my-project/kube-agents`) and set `REGISTRY_PREFIX="us-docker.pkg.dev/my-project/kube-agents"` in `scripts/vars.sh` or pass `--registry-prefix="us-docker.pkg.dev/my-project/kube-agents"` to `install.sh`. See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the full image list.
+- **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
+  [Private container registry](#private-container-registry) below for the full recipe. Mirroring
+  only the `kube-agents` images is not enough on its own: `REGISTRY_PREFIX` (or `install.sh`'s
+  `--registry-prefix`) covers the four images this project builds, and cert-manager, LiteLLM,
+  fluent-bit, the GitHub token minter and Hindsight need `THIRD_PARTY_REGISTRY_PREFIX` (or
+  `--third-party-registry-prefix`) as well.
 
 > [!NOTE]
 > Because the provisioning scripts persist configuration state in `scripts/vars.sh`, running the script again will reuse the same options selected on the first run. If you want to change configuration variables, manually edit `scripts/vars.sh` or perform a teardown first.
@@ -198,52 +203,65 @@ The automated installer includes local state hardening and Cloud KMS (CMEK) etcd
 > `cd k8s-operator && make help` for the complete, always-current list of provisioning and teardown
 > targets.
 
-- **Private container registry**: If your clusters may only pull from an approved registry, copy
-  every image the install needs there first, then export `REGISTRY_PREFIX` before provisioning:
+#### Private container registry
 
-  ```bash
-  # The two targets live in different Makefiles, so each cd is load-bearing:
-  # mirror-images is a root-level target, gcp-provision an operator one.
-  REPO_ROOT="$(git rev-parse --show-toplevel)"
+If your clusters may only pull from an approved registry, copy every image the install needs
+there first, then export both registry prefixes before provisioning:
 
-  # Exported before the mirror step so both halves use the same tag.
-  export IMAGE_TAG=v0.1.0
+```bash
+# The two targets live in different Makefiles, so each cd is load-bearing:
+# mirror-images is a root-level target, gcp-provision an operator one.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
 
-  cd "$REPO_ROOT"
-  make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
+# Exported before the mirror step so both halves use the same tag.
+export IMAGE_TAG=v0.1.0
 
-  export REGISTRY_PREFIX=registry.example.com/kube-agents
-  export THIRD_PARTY_REGISTRY_PREFIX=registry.example.com/kube-agents
+cd "$REPO_ROOT"
+make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 
-  cd "$REPO_ROOT/k8s-operator"
-  make gcp-provision
-  ```
+export REGISTRY_PREFIX=registry.example.com/kube-agents
+export THIRD_PARTY_REGISTRY_PREFIX=registry.example.com/kube-agents
 
-  `make mirror-images` reads `images.json` at the repository root — the inventory of every image
-  an install pulls — and copies each one, keeping the trailing image name only.
+cd "$REPO_ROOT/k8s-operator"
+make gcp-provision
+```
 
-  `IMAGE_TAG` is not optional here. The mirror holds only the tag it was told to copy — `latest`
-  if it was told nothing — while `make gcp-provision` asks for whatever `IMAGE_TAG` says, and in
-  non-interactive mode it refuses to run without one. Set the two to different values and the four
-  first-party images name a reference the mirror was never given: provisioning reports success and
-  the pods sit in ImagePullBackOff, after the cluster, node pools, and cert-manager already exist.
-  Export it once, as above, so the mirror and the install cannot disagree.
+`make mirror-images` reads `images.json` at the repository root — the inventory of every image
+an install pulls — and copies each one, keeping the trailing image name only.
 
-  The two prefixes are separate because the images fall into two groups. `REGISTRY_PREFIX`
-  replaces `ghcr.io/gke-labs/kube-agents` for the images this project builds — the operator, the
-  agent, and the replay proxy. `THIRD_PARTY_REGISTRY_PREFIX` covers the ones it does not: the
-  LiteLLM gateway, the fluent-bit sidecar, the GitHub token minter, and cert-manager. **Neither
-  implies the other**, so an install that mirrors everything sets both, as above; set only the
-  first and the third-party images are still pulled from their upstream registries (the scripts
-  warn when they detect that combination). The individual `OPERATOR_IMAGE`, `AGENT_IMAGE`,
-  `REPLAY_IMAGE`, `LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE` variables still win over both.
+`IMAGE_TAG` is not optional here. The mirror holds only the tag it was told to copy — `latest`
+if it was told nothing — while `make gcp-provision` asks for whatever `IMAGE_TAG` says, and in
+non-interactive mode it refuses to run without one. Set the two to different values and the four
+first-party images name a reference the mirror was never given: provisioning reports success and
+the pods sit in ImagePullBackOff, after the cluster, node pools, and cert-manager already exist.
+Export it once, as above, so the mirror and the install cannot disagree.
 
-  The Helm chart differs here, deliberately: `global.thirdPartyImageRegistry` defaults to
-  `global.imageRegistry`, because that value is new and carries no existing meaning to preserve.
+The two prefixes are separate because the images fall into two groups. `REGISTRY_PREFIX`
+replaces `ghcr.io/gke-labs/kube-agents` for the images this project builds — the operator, the
+agent, and the replay proxy. `THIRD_PARTY_REGISTRY_PREFIX` covers the ones it does not: the
+LiteLLM gateway, the fluent-bit sidecar, the GitHub token minter, and cert-manager. **Neither
+implies the other**, so an install that mirrors everything sets both, as above; set only the
+first and the third-party images are still pulled from their upstream registries (the scripts
+warn when they detect that combination). The individual `OPERATOR_IMAGE`, `AGENT_IMAGE`,
+`REPLAY_IMAGE`, `LITELLM_IMAGE`, and `GITHUB_MINTER_IMAGE` variables still win over both.
 
-  See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
-  inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
-  from mirrored base images rather than copying.
+The Helm chart differs here, deliberately: `global.thirdPartyImageRegistry` defaults to
+`global.imageRegistry`, because that value is new and carries no existing meaning to preserve.
+
+`install.sh` takes the same pair as flags — `--registry-prefix=PATH` and
+`--third-party-registry-prefix=PATH` — and writes both into `scripts/vars.sh`, so the one-liner
+install reaches the same place. It does not mirror anything: run `make mirror-images` from a
+checkout first, then point the installer at what it produced.
+
+```bash
+./install.sh -y --image-tag=v0.1.0 \
+  --registry-prefix=registry.example.com/kube-agents \
+  --third-party-registry-prefix=registry.example.com/kube-agents
+```
+
+See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md) for the
+inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
+from mirrored base images rather than copying.
 
 #### Step 3: Verify Running Components
 

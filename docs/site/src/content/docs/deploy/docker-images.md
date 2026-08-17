@@ -11,6 +11,13 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the provisioning scripts resolve their third-party defaults from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
+That cuts both ways: **a version bump edits `images.json` and nothing else.** For most images the
+manifest, Dockerfile, or chart value that used to carry the pin now names a variable, so editing
+the old location changes nothing, and for the three the inventory is the only copy of —
+`hindsight-api`, `github-token-minter-server`, and the four cert-manager entries — nothing else in
+the tree disagrees loudly enough for `make images-check` to notice. Bump the pin here, then run
+`make images-check` and `make docs-generate`.
+
 <!-- BEGIN GENERATED: container-images -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
 <!-- prettier-ignore-start -->
