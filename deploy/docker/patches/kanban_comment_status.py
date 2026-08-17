@@ -166,14 +166,23 @@ READER_NONE = "nobody"
 #: Written at the model, not at a log reader. It has to survive being skimmed,
 #: so it leads with the refutation rather than the explanation, and it names the
 #: two tools that do what the caller was actually trying to do.
+#:
+#: It used to carry a third clause — that the card's chat subscription was
+#: closed when the card finished. That is the module docstring's leg 2, and
+#: v2026.8.13 ended it for ``done``: the subscription now survives, so the note
+#: would have handed the model a false premise on every ``done`` card, which is
+#: the one thing this module exists to stop doing. Dropped rather than made
+#: conditional on the status, because the clause was never load-bearing:
+#: "commenting never sends a chat message on any card" is strictly stronger,
+#: true of every card, and already says everything the subscription clause said
+#: about whether this comment reaches a human.
 TERMINAL_NOTE_TEMPLATE = (
     "This card is already {status}, so nothing will happen because of this "
-    "comment: no worker is scheduled to read it, its chat subscription was "
-    "closed when the card finished, and commenting never sends a chat message "
-    "on any card. Do NOT say that results will follow from this comment, and "
-    "do not wait for them. The card's answer already exists — read it with "
-    "kanban_show({task_id!r}) and reply with it yourself. If new work is "
-    "needed, create a new card with kanban_create."
+    "comment: no worker is scheduled to read it, and commenting never sends a "
+    "chat message on any card. Do NOT say that results will follow from this "
+    "comment, and do not wait for them. The card's answer already exists — read "
+    "it with kanban_show({task_id!r}) and reply with it yourself. If new work "
+    "is needed, create a new card with kanban_create."
 )
 
 
