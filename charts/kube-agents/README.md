@@ -302,6 +302,33 @@ other third-party images, so a mirrored install needs nothing extra; set
 `platformAgent.cleanupHook.image.repository` and `.tag` to point somewhere else
 entirely — any image with `kubectl` and `/bin/sh` works.
 
+> **Breaking:** `platformAgent.cleanupHook.image` was a single string
+> (`alpine/k8s:1.34.9`) and is now a `{repository, tag}` map, because the
+> registry rewrite needs the two halves separately. A values file that still
+> sets the string form fails the render rather than installing something wrong:
+>
+> ```
+> coalesce.go:286: warning: cannot overwrite table with non table for
+>   kube-agents.platformAgent.cleanupHook.image
+> Error: template: kube-agents/templates/platform-agent-cr-cleanup.yaml:94:85:
+>   can't evaluate field repository in type interface {}
+> ```
+>
+> Split it:
+>
+> ```yaml
+> platformAgent:
+>   cleanupHook:
+>     image:
+>       repository: docker.io/alpine/k8s # was: image: alpine/k8s:1.34.9
+>       tag: "1.34.9"
+> ```
+>
+> The default reference also gained its registry — `alpine/k8s:1.34.9` is now
+> spelled `docker.io/alpine/k8s:1.34.9`. That resolves to the same image on a
+> default install; it is written out because a prefix cannot be prepended to a
+> reference whose registry is implied.
+
 With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 
 ```bash
