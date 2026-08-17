@@ -201,6 +201,17 @@ while `/review all` re-reads at the width of the automatic first review and incl
 believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
 outranks both.
 
+**A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
+run alongside its review — `success` when it found nothing, `neutral` when it did — and
+`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
+anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
+clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
+a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
+completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
+assign a reviewer immediately — the override for a finding you have answered but disagree with, or
+for a review that never arrived. Nothing here changes who is picked; that is still the config file.
+
 **How to read it.** A 👀 reaction means the review started; a posted review means it finished.
 Across #630–#699 the 👀 landed within seconds of the trigger, and the review a median of **9
 minutes** after that — 15 minutes at the 90th percentile, 45 in the slowest of the 54 reviews in
