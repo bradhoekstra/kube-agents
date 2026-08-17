@@ -174,24 +174,37 @@ most:
   install pulls; add `build-time` only if you also rebuild from source.
 - `--dry-run` — print the copy plan and copy nothing.
 
-Destinations keep the trailing image name only, so
+Destinations are flat, named after the inventory entry's `name`, so
 `quay.io/jetstack/cert-manager-webhook:v1.21.1` lands as
-`<prefix>/cert-manager-webhook:v1.21.1`. Every consumer below assumes that flat layout.
+`<prefix>/cert-manager-webhook:v1.21.1`. The `name`, not the repository's trailing segment —
+they are the same word for almost every entry, but where they differ the name wins, and
+`docker.io/ankane/pgvector` lands as `<prefix>/hindsight-postgresql`. Every consumer below
+assumes that flat layout.
 
 ### 2. Point the install at it
 
 Pick the row for how you install. Each has two prefixes: one for the images this project builds,
-one for the images it does not (LiteLLM, fluent-bit, the GitHub token minter, cert-manager,
-Hindsight).
+one for the images it does not.
 
-| Install path                      | First-party            | Third party                      | If the second is unset              |
-| --------------------------------- | ---------------------- | -------------------------------- | ----------------------------------- |
-| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | those images stay upstream          |
-| Provisioning scripts              | `REGISTRY_PREFIX`      | `THIRD_PARTY_REGISTRY_PREFIX`    | those images stay upstream          |
-| Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | falls back to the first-party value |
-| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value |
+| Install path                      | First-party            | Third party                      | If the second is unset              | Reaches cert-manager |
+| --------------------------------- | ---------------------- | -------------------------------- | ----------------------------------- | -------------------- |
+| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | those images stay upstream          | yes                  |
+| Provisioning scripts              | `REGISTRY_PREFIX`      | `THIRD_PARTY_REGISTRY_PREFIX`    | those images stay upstream          | yes                  |
+| Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | falls back to the first-party value | n/a                  |
+| Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value | **no**               |
 
-The last column is the one asymmetry in this page, and it is deliberate. `REGISTRY_PREFIX`
+What "third party" covers differs by row, because the paths install different things. Every row
+covers LiteLLM and fluent-bit; the scripts additionally cover the GitHub token minter, Hindsight,
+and cert-manager. The chart never renders cert-manager at all — it expects one to be present
+already — so there is nothing for its prefixes to reach. Terraform is the row to read twice: it
+does install cert-manager, as a separate `helm_release` of the upstream chart, and that release
+is not passed either prefix. On an approved-registry cluster set `enable_cert_manager = false`
+and install cert-manager yourself from the mirror; `images.json` carries all four of its images,
+so `make mirror-images` has already copied them. The composition's
+[README](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/README.md)
+has the detail.
+
+The "if the second is unset" column is the one asymmetry in this page, and it is deliberate. `REGISTRY_PREFIX`
 shipped long before this inventory and has always meant "the registry holding the images this
 project builds" — a mirror populated against it holds those and nothing else, so inheriting it
 would send an existing install after cert-manager images its registry was never given, and

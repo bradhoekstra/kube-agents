@@ -119,6 +119,21 @@ The mirror must be readable with the nodes' own credentials — an Artifact
 Registry in the same project is the simple case. No `imagePullSecrets` are
 rendered.
 
+**cert-manager is not covered.** `image_registry` and
+`third_party_image_registry` are values on `helm_release.kube_agents`;
+`helm_release.cert_manager` is a separate release of an upstream chart and
+never sees them, so with `enable_cert_manager = true` its four images still
+come from `quay.io/jetstack` however the prefixes are set. The chart itself is
+fetched over the network from `https://charts.jetstack.io`, which an air-gapped
+runner cannot reach at all. On a cluster that may only pull from an approved
+registry, set `enable_cert_manager = false` and install cert-manager yourself
+from the mirror before applying — `images.json` carries all four entries
+(`cert-manager-controller`, `-cainjector`, `-webhook`, `-acmesolver`), so
+`make mirror-images` has already copied them. `enable_webhooks` needs
+cert-manager present either way; the composition's `depends_on` only orders the
+release it manages, so with `enable_cert_manager = false` it is on you to have
+cert-manager serving first.
+
 ### IAM roles (`permission_set` and `project_roles`)
 
 `permission_set` names one of the bundles
