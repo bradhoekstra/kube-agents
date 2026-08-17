@@ -60,6 +60,15 @@ scripts/mirror_images.sh writes and what the operator assumes when it derives
 the credential-proxy reference from the agent one. An empty registry returns
 the repository untouched, so a default install renders byte-identically.
 
+The trailing segment is a stand-in for the real rule. mirror_images.sh names
+each destination after the images.json entry's .name, and a chart cannot read
+images.json at render time, so this reproduces it by convention rather than by
+lookup. Two inventory entries already break that convention
+(hindsight-postgresql, distroless-static) and neither is rendered here; add a
+third that is, and the chart would ask for <prefix>/<segment> while the mirror
+holds <prefix>/<name>. Check 3c in hack/check-image-inventory.sh fails the
+build in that case, which is what keeps the shortcut safe.
+
 Takes a dict: {repository, registry}. Returns the repository only — the
 PlatformAgent CR carries repository and tag in separate fields, so joining
 them here would not suit every caller.

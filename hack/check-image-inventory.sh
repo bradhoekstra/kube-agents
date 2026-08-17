@@ -54,6 +54,13 @@ repo_of() {
   jq -r --arg n "$1" '.images[] | select(.name == $n) | .repository' "$INVENTORY"
 }
 
+# Every inventory name carried by a repository. Plural because nothing stops
+# two entries sharing a repository, and a mirror populated from the inventory
+# would then hold the image under both names.
+names_of_repo() {
+  jq -r --arg r "$1" '.images[] | select(.repository == $r) | .name' "$INVENTORY"
+}
+
 # A Dockerfile's `ARG FOO=bar` default, or empty if the arg has no default.
 arg_default() {
   sed -n "s/^ARG $2=\(.*\)$/\1/p" "$1" | head -n1
@@ -171,7 +178,7 @@ split_ref() {
 
 default_images="$(chart_images)" || exit 1
 [ -n "$default_images" ] || {
-  echo "ERROR: the chart rendered no image references at all — the extraction patterns in chart_images no longer match the manifests, so checks 3a and 3b are inspecting nothing." >&2
+  echo "ERROR: the chart rendered no image references at all — the extraction patterns in chart_images no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
   exit 1
 }
 mirrored_images="$(chart_images --set "global.imageRegistry=$MIRROR")" || exit 1
@@ -205,6 +212,32 @@ while read -r image; do
   *) fail "with global.imageRegistry set, the chart still renders '$image' outside the mirror." ;;
   esac
 done <<<"$mirrored_images"
+
+# 3c. Mirrored install, continued: the reference has to be in the mirror, not
+#     merely under its prefix. scripts/mirror_images.sh names each destination
+#     after the inventory entry's `.name`, but the chart cannot read
+#     images.json at render time, so kube-agents.imageRepository reproduces
+#     that by taking the repository's trailing path segment. The two agree only
+#     while `.name` equals that segment for every image the chart renders.
+#
+#     Two entries already break the convention — hindsight-postgresql
+#     (docker.io/ankane/pgvector) and distroless-static (gcr.io/distroless/
+#     static) — and neither is rendered by the chart, which is the only reason
+#     this has never bitten. Add a third that is, and 3b still passes: the
+#     reference sits under the mirror prefix, just under a name nothing ever
+#     pushed there, and the install fails at pull time on the one path this
+#     feature exists for.
+while read -r image; do
+  [ -n "$image" ] || continue
+  split_ref "$image"
+  segment="${ref_repo##*/}"
+  entry_names="$(names_of_repo "$ref_repo")"
+  # No entry at all is check 3a's finding, not this one; reporting it twice
+  # would say "add an entry" and "rename the entry you do not have".
+  [ -n "$entry_names" ] || continue
+  grep -qxF "$segment" <<<"$entry_names" ||
+    fail "the chart renders '$ref_repo', which $INVENTORY names '$(paste -sd/ - <<<"$entry_names")' — 'make mirror-images' pushes it to <prefix>/$(head -n1 <<<"$entry_names") while the chart asks for <prefix>/${segment}. Either rename the entry to '${segment}' or teach kube-agents.imageRepository the real name."
+done <<<"$default_images"
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by

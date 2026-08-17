@@ -9,16 +9,29 @@
 # copy step; `images.json` is the source of truth for what has to be copied, so
 # an image added there is mirrored here without editing this file.
 #
-# Destination naming keeps the trailing image name only:
+# Destination naming is flat: "<prefix>/<the inventory entry's .name>".
 #
 #   quay.io/jetstack/cert-manager-controller:v1.21.1
 #     -> ${MIRROR_THIRD_PARTY_PREFIX}/cert-manager-controller:v1.21.1
+#
+# The name, not the repository's trailing segment. For most entries they are
+# the same word, which is why this is easy to state wrong; where they are not,
+# the name wins — docker.io/ankane/pgvector lands as "<prefix>/hindsight-
+# postgresql", after the entry that describes what it is for rather than after
+# the upstream image it happens to be.
 #
 # That flat layout is what the rest of the project assumes of a mirror — the
 # operator derives the credential-proxy reference from the agent reference by
 # swapping the last path element (resolveCredentialProxyImage in
 # k8s-operator/internal/controller/platformagent_manifests.go), and the
-# provisioning scripts build every default as "<prefix>/<name>".
+# provisioning scripts build every default as "<prefix>/<name>" through
+# third_party_image in k8s-operator/scripts/common.sh.
+#
+# The Helm chart is the one consumer that cannot read this file, so it rewrites
+# onto the repository's trailing segment instead (kube-agents.imageRepository).
+# The two agree only while every image the chart renders has .name equal to that
+# segment, which check 3c in hack/check-image-inventory.sh now enforces rather
+# than leaving to whoever adds the next entry.
 #
 # Usage:
 #   MIRROR_PREFIX=registry.example.com/kube-agents ./scripts/mirror_images.sh

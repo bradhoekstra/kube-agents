@@ -315,8 +315,12 @@ warn_unmirrored_third_party() {
 
 # Resolve a third-party image by its images.json name: the upstream reference
 # for a default install, or "<prefix>/<name>:<tag>" once the images have been
-# mirrored. The mirrored form keeps the trailing image name only, matching what
-# scripts/mirror_images.sh writes.
+# mirrored. The mirrored form is named after the inventory entry, matching what
+# scripts/mirror_images.sh writes — the entry's .name, not the repository's
+# trailing segment. The two differ for hindsight-postgresql
+# (docker.io/ankane/pgvector), which is exactly the case this line used to get
+# wrong: it said "the trailing image name only" while the code below has always
+# used $name.
 third_party_image() {
   local name=$1
   local repository tag prefix
