@@ -76,6 +76,10 @@ module "gke_cluster" {
   kms_key_name               = var.kms_key_name
   allow_external_dns_traffic = var.allow_external_dns_traffic
 
+  resource_labels = {
+    "kube-agents-host" = "true"
+  }
+
   depends_on = [google_project_service.required]
 }
 

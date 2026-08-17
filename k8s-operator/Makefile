@@ -144,6 +144,14 @@ undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
 
+.PHONY: deploy-hindsight
+deploy-hindsight: kustomize ## Deploy the Hindsight memory store.
+	$(KUSTOMIZE) build config/integrations/hindsight | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
+
+.PHONY: undeploy-hindsight
+undeploy-hindsight: kustomize ## Undeploy the Hindsight memory store (keeps its PVC).
+	$(KUSTOMIZE) build config/integrations/hindsight | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -
+
 .PHONY: deploy-inference-replay
 deploy-inference-replay: kustomize ## Deploy Inference Replay proxy integration.
 	$(KUSTOMIZE) build config/integrations/inference-replay/base | envsubst '$$NAMESPACE $$REPLAY_IMAGE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -
@@ -293,15 +301,25 @@ gcp-provision-12-gke-backup-plan: ## Step 12: Provision GKE Backup Plan for disa
 	@chmod +x scripts/*.sh
 	@./scripts/provision_12_gke_backup_plan.sh $(ARGS)
 
-.PHONY: gcp-provision-13-verify-rollout
-gcp-provision-13-verify-rollout: ## Step 13: Verify the PlatformAgent Deployment rollout.
+.PHONY: gcp-provision-13-hindsight
+gcp-provision-13-hindsight: ## Step 13: Deploy Hindsight memory store.
 	@chmod +x scripts/*.sh
-	@./scripts/provision_13_verify_agent_rollout.sh $(ARGS)
+	@./scripts/provision_13_deploy_hindsight.sh $(ARGS)
+
+.PHONY: gcp-provision-14-verify-rollout
+gcp-provision-14-verify-rollout: ## Step 14: Verify the PlatformAgent Deployment rollout.
+	@chmod +x scripts/*.sh
+	@./scripts/provision_14_verify_agent_rollout.sh $(ARGS)
 
 .PHONY: dev-rebuild-agent
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
+
+.PHONY: gcp-teardown-13-hindsight
+gcp-teardown-13-hindsight: ## Teardown Step 13: Undeploy Hindsight memory store.
+	@chmod +x scripts/*.sh
+	@./scripts/teardown_13_deploy_hindsight.sh $(ARGS)
 
 .PHONY: gcp-teardown-12-gke-backup-plan
 gcp-teardown-12-gke-backup-plan: ## Teardown Step 12: Delete GKE Backup Plan and snapshots.

@@ -1,6 +1,6 @@
 # GKE Autopilot Cluster Module
 
-Reusable Terraform module for provisioning a GKE Autopilot cluster configured for Kube-Agents workloads. Autopilot clusters are regional: `location` must be a region (a zone is rejected at plan time).
+Reusable Terraform module for provisioning a GKE Autopilot cluster configured for Kube-Agents workloads. Autopilot clusters are regional: `location` must be a region (a zone is rejected at plan time). The full-install composition passes `kube-agents-host=true` through `resource_labels` so the admin portal can discover the deployed host; standalone callers can use the same input when they install kube-agents on the cluster.
 
 By default (`enable_database_encryption = true`), the module provisions a Cloud KMS Keyring and CryptoKey, binds `roles/cloudkms.cryptoKeyEncrypterDecrypter` to the GKE Service Agent, and enables etcd database encryption (CMEK).
 
@@ -19,10 +19,13 @@ The default is `false`, which is GKE's own default and therefore the value every
 
 ```hcl
 module "gke_cluster" {
-  source       = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=vX.Y.Z"
-  project_id   = "my-gcp-project"
-  cluster_name = "production-host-01"
-  location     = "us-central1"
+  source          = "git::https://github.com/gke-labs/kube-agents.git//terraform/modules/gke-cluster?ref=vX.Y.Z"
+  project_id      = "my-gcp-project"
+  cluster_name    = "production-host-01"
+  location        = "us-central1"
+  resource_labels = {
+    "kube-agents-host" = "true"
+  }
 
   # Reachable by a Platform Agent that does not sit in this VPC. Omit for a
   # cluster that should stay VPC-only.

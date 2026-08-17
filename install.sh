@@ -71,6 +71,7 @@ PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
+PARAM_MEMORY="${MEMORY:-file}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
@@ -107,6 +108,22 @@ Flags for AI Agents & Automation:
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
+  --memory=MODE                 Long-term agent memory: file | hindsight | off
+                                (default: file)
+                                  file      SMALL / PERSONAL deployments, and the default —
+                                            it is what every install got before the searchable
+                                            store existed, so an upgrade that says nothing
+                                            keeps the store it already has. Per-user Markdown
+                                            files inside the pod (multiuser_memory). No extra
+                                            services, but the whole store is loaded into the
+                                            model's context every turn, so it stops scaling
+                                            once there is more than a few pages of it.
+                                  hindsight ENTERPRISE deployments. Searchable, ranked recall
+                                            that stays affordable as the store grows
+                                            (kube_agents_memory). Deploys the Hindsight API
+                                            and a Postgres database into the cluster.
+                                  off       nothing is retained between sessions. No memory
+                                            provider, and no database to run.
   --image-tag=TAG               Validated immutable release tag or full commit SHA
                                 (default: this checkout's HEAD; required via curl | bash)
   --registry-prefix=PATH        Container registry path without a URL scheme
@@ -139,6 +156,7 @@ parse_args() {
       --gvisor=*) PARAM_ENABLE_GVISOR="${1#*=}"; shift ;;
       --enable-web-ui=*|--enable-webui=*|--webui=*) PARAM_ENABLE_WEBUI="${1#*=}"; shift ;;
       --enable-web-ui|--enable-webui|--webui) PARAM_ENABLE_WEBUI="true"; shift ;;
+      --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
@@ -720,6 +738,7 @@ write_json_report() {
   "model_provider": "$(json_escape "${model_provider:-}")",
   "permission_set": "$(json_escape "${permission_set:-}")",
   "gvisor_enabled": ${enable_gvisor:-false},
+  "memory_mode": "$(json_escape "${memory_mode:-file}")",
   "gitops_repo": "$(json_escape "$report_gitops_repo")",
   "vars_file": "$(json_escape "${vars_file:-}")",
   "timestamp": "$(json_escape "$timestamp")"
@@ -1379,6 +1398,21 @@ main() {
     print_error "--enable-web-ui must be either true or false."
     exit 1
   fi
+  # An agent that forgets every conversation is the worse default, so memory is
+  # on unless it is turned off. The choice decides two things: whether the
+  # harness keeps memory at all, and — when it does — whether that costs an
+  # extra API server and Postgres database in the cluster. Nothing downstream
+  # infers one from the other, so both are recorded.
+  #
+  # `file` is the default because it is what every install got before the
+  # searchable store existed: an upgrade that says nothing about memory keeps
+  # the store it already has, and no install grows a Postgres database it never
+  # asked for. Enterprise deployments opt in with --memory=hindsight.
+  local memory_mode="${PARAM_MEMORY:-file}"
+  if [[ ! "$memory_mode" =~ ^(off|file|hindsight)$ ]]; then
+    print_error "--memory must be one of: off, file, hindsight."
+    exit 1
+  fi
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # These are GCP IAM role bundles for the agent's GSA, nothing else. Kubernetes
     # RBAC stays read-only in every set, and the GitOps pull-request path works in
@@ -1426,7 +1460,62 @@ main() {
     if [ "$webui_choice" = "2" ]; then
       PARAM_ENABLE_WEBUI="true"
     fi
+
+    # The two stores differ in what they cost to run and in how far they scale,
+    # and the label says which so the choice can be made without reading a design
+    # doc: the file store adds no services but is loaded into the model's context
+    # whole on every turn, so it is bounded by the window; Hindsight retrieves only
+    # what a question needs, at the price of an API server and a database.
+    #
+    # The file store is listed first because prompt_menu's default answer is
+    # always option 1, and this is the one an install should get for saying
+    # nothing — it is what installs got before the searchable store existed, and
+    # it is the only option that adds no services to the cluster.
+    local memory_choice=""
+    prompt_menu "Should the agent remember things between conversations?" \
+      "Files on the agent's own disk (Default) - For small or personal deployments. Per-user Markdown, no extra services to run, does not scale past a few pages" \
+      "Searchable store - For enterprise deployments. Ranked recall that scales, deploys Hindsight (API + Postgres) into the cluster" \
+      "No - Nothing is retained once a session ends" \
+      memory_choice
+
+    # Every branch assigns, rather than letting option 1 fall through to
+    # --memory=: an answer given at the prompt is the more recent instruction of
+    # the two, and the permission-set and gVisor prompts above already work this way.
+    case "$memory_choice" in
+      1) memory_mode="file" ;;
+      2) memory_mode="hindsight" ;;
+      3) memory_mode="off" ;;
+    esac
   fi
+
+  # MEMORY_PROVIDER carries the whole choice — including "no memory at all",
+  # which is what `none` means. Everything downstream reads it and nothing else:
+  # provisioning step 13 deploys Hindsight only for a Hindsight-backed provider,
+  # the specialist overlay blanks anything that cannot be made read-only, and the
+  # entrypoint gates the one-way file import the same way.
+  #
+  # MEMORY_ENABLED is a different switch and stays false. It turns on Hermes'
+  # *built-in* MEMORY.md/USER.md, which has no per-user scoping and would sit
+  # alongside whichever provider is chosen — two competing stores in front of one
+  # agent. Every provider here replaces it rather than supplementing it. Nothing
+  # about memory keys off this flag, so an upgrade cannot read a false left in an
+  # old vars.sh as "this install wanted no memory".
+  #
+  # `none` rather than an empty string: the choice has to survive the trip
+  # through the CR, and an absent provider takes the CRD default. The operator
+  # translates `none` back to Hermes' own spelling — see MEMORY_PROVIDER_CHOICES
+  # in k8s-operator/scripts/common.sh.
+  #
+  # `multiuser_memory` is the default provider everywhere it is named with no
+  # install to ask (the CRD default, common.sh, and both profiles' config.yaml),
+  # and `file` is what an install that says nothing about memory gets — the same
+  # store those installs already had before the searchable one existed.
+  local memory_enabled="false"
+  local memory_provider="multiuser_memory"
+  case "$memory_mode" in
+    hindsight) memory_provider="kube_agents_memory" ;;
+    off) memory_provider="none" ;;
+  esac
 
   print_step "10. Generating Configuration State (k8s-operator/scripts/vars.sh)"
   local vars_file="${repo_dir}/k8s-operator/scripts/vars.sh"
@@ -1484,8 +1573,8 @@ main() {
   write_state_var "$vars_file" KMS_KEYRING "$kms_keyring"
   write_state_var "$vars_file" KMS_KEY "$kms_key"
   write_state_var "$vars_file" GITHUB_PEM_PATH "$github_pem_path"
-  write_state_var "$vars_file" MEMORY_ENABLED "false"
-  write_state_var "$vars_file" MEMORY_PROVIDER "multiuser_memory"
+  write_state_var "$vars_file" MEMORY_ENABLED "$memory_enabled"
+  write_state_var "$vars_file" MEMORY_PROVIDER "$memory_provider"
   write_state_var "$vars_file" USER_PROFILE_ENABLED "false"
   write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
@@ -1514,6 +1603,7 @@ main() {
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
+  echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
   if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
   fi
