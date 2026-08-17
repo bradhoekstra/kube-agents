@@ -23,6 +23,8 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus provisioning scripts.
 - `examples/`: Example integrations (LiteLLM provider configs, vLLM serving, inference replay).
 - `bench/`: Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/kubernetes-sigs/devops-bench) against the Platform Agent as a pip-installed library.
+- `images.json`: Inventory of every container image an install pulls, with its upstream reference
+  and pin. Read by `make mirror-images`, the provisioning scripts, and the docs generator.
 - `INSTALL.md`: Installation guide.
 - `README.md`: Project overview.
 
@@ -101,6 +103,7 @@ adding a paragraph, check whether the topic already has an owner:
 | End-state architecture                                   | `docs/architecture/`                         |
 | Per-feature design rationale                             | `docs/designs/`                              |
 | What each provisioning script does                       | `k8s-operator/scripts/README.md`             |
+| Which container images an install pulls, and their pins  | `images.json`                                |
 | The install procedure (self-contained, agent-executable) | `INSTALL.md`                                 |
 | What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
 | How to develop a specific directory                      | that directory's `README.md` (keep it short) |
@@ -108,9 +111,9 @@ adding a paragraph, check whether the topic already has an owner:
 Rules:
 
 - **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
-  catalogue, and the provisioning steps are generated into `<!-- BEGIN GENERATED -->` regions by
-  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
-  then run `make docs-generate`.
+  catalogue, the provisioning steps, and the container-image inventory are generated into
+  `<!-- BEGIN GENERATED -->` regions by `scripts/generate_docs.py`, which also writes
+  `docs/family-roster.txt` whole. Edit the source, then run `make docs-generate`.
 - **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
   a `## description` comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
@@ -253,6 +256,17 @@ members, and collaborators only) — that pass is the strict one, only what the 
 while `/review all` re-reads at the width of the automatic first review and includes findings it
 believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
 outranks both.
+
+**A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
+run alongside its review — `success` when it found nothing, `neutral` when it did — and
+`.github/workflows/auto_request_review.yml` waits for that check to go green before assigning
+anyone from `.github/auto_request_review.yml`. Opening a pull request no longer pings a human, so
+clearing the findings and commenting `/review` for a clean pass is what puts the change in front of
+a reviewer. Two exceptions: a pull request opened by a bot is assigned as soon as the check
+completes, whatever the conclusion, because Dependabot cannot re-run `/review` on itself; and an
+owner, member, or collaborator can comment `/request-review` (at the start of the comment) to
+assign a reviewer immediately — the override for a finding you have answered but disagree with, or
+for a review that never arrived. Nothing here changes who is picked; that is still the config file.
 
 **How to read it.** A 👀 reaction means the review started; a posted review means it finished.
 Across #630–#699 the 👀 landed within seconds of the trigger, and the review a median of **9

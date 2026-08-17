@@ -72,6 +72,18 @@ variable "image_tag" {
   default     = "latest"
 }
 
+variable "image_registry" {
+  description = "Registry prefix for the images built from this project (operator, agent, credential proxy). Empty pulls the public ghcr.io images. Set this for a cluster that may only pull from an approved registry, after copying the images there with `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>` from the repository root — the prefix here must be the same one, and that IMAGE_TAG must be the image_tag set below, since the mirror only holds the tag it was told to copy. Registry authentication is out of scope: the mirror has to be readable with the nodes' own credentials, e.g. an Artifact Registry in this project."
+  type        = string
+  default     = ""
+}
+
+variable "third_party_image_registry" {
+  description = "Registry prefix for the images this project does not build (LiteLLM, fluent-bit). Defaults to image_registry; set it only when the mirror keeps third-party images under a different path."
+  type        = string
+  default     = ""
+}
+
 variable "model_provider" {
   description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai — chatgpt needs the kustomize overlay and is rejected by the chart). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
   type        = string
