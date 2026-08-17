@@ -59,7 +59,8 @@ picks it up within a minute and runs it through the identical path the 06:20 tic
 stream's prompt verbatim, its `skills` preloaded, and this profile's `max_turns`.
 
 `cronjob(action='run')` is not the route. Where the session cannot take a detached result — a
-one-shot `hermes -z`, a Kanban worker, a nested cron run — or where the dispatch pool is full, it
+one-shot `hermes -z`, a stateless HTTP turn, a Kanban worker, a nested cron run — or where the
+dispatch pool is full, it
 executes the job synchronously inside the session that calls it, which is the re-enactment the next
 paragraph exists to prevent. Elsewhere it hands the run to the background delegation executor and
 returns a handle; that is closer to what you want, but `hermes cron run` is the one route that

@@ -266,18 +266,31 @@ check(
 # patch more conservative, which is deliberate and is asserted below.
 print("coupling to the notifier:")
 watchers = Path("gateway/kanban_watchers.py").read_text()
-_terminal = re.search(r"task_terminal = task and task\.status (==|in) (.+)", watchers)
-if _terminal is None:
-    notifier_terminal = None
-elif _terminal.group(1) == "==":
-    notifier_terminal = {ast.literal_eval(_terminal.group(2).strip())}
-else:
-    notifier_terminal = set(ast.literal_eval(_terminal.group(2).strip()))
+# Every way this can fail to parse has to land on the named check below rather
+# than as a traceback out of the module. Two shapes reach it: a non-literal
+# right-hand side (`task.status in TERMINAL`), which literal_eval raises
+# ValueError on, and a second assignment elsewhere in the file, which would
+# leave the old re.search reading whichever came first. Both mean the same thing
+# to the porter — the terminal test moved, re-derive this — which is exactly
+# what "the notifier's terminal test was located" says. A trailing comment is
+# not one of them: `(.+)` swallows it and literal_eval ignores it, so the
+# current shape keeps parsing.
+_terminals = re.findall(r"task_terminal = task and task\.status (==|in) (.+)", watchers)
+notifier_terminal = None
+if len(_terminals) == 1:
+    _op, _rhs = _terminals[0]
+    try:
+        _value = ast.literal_eval(_rhs.strip())
+    except (ValueError, SyntaxError):
+        notifier_terminal = None
+    else:
+        notifier_terminal = {_value} if _op == "==" else set(_value)
 check(
     "the notifier's terminal test was located",
     notifier_terminal is not None,
     "gateway/kanban_watchers.py no longer assigns task_terminal from "
-    "task.status — re-derive this check and TERMINAL_STATUSES with it",
+    "task.status exactly once against a literal — re-derive this check and "
+    "TERMINAL_STATUSES with it",
 )
 check(
     "every status the notifier unsubscribes on is one this patch calls dead",

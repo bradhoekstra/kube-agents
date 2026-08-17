@@ -157,7 +157,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
-# three fleet-audit streams published wrong ledgers on 2026-08-04. Eight edits
+# three fleet-audit streams published wrong ledgers on 2026-08-04. Ten edits
 # across three files, so the surgery lives in an applier script rather than
 # inline; it fails the build on any anchor that no longer matches.
 # verify_cron_run_scope.py then exercises the patched code. The applier only
@@ -344,11 +344,17 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
 #
 # The wake edit is now three greps rather than one because v2026.8.13 gave the
 # subscription its own `delivery_mode`, so the patched line is a parenthesized
-# `_wake_kinds_for(...) if wake_agent else set()`. The gates check the helper
-# call, upstream's per-subscription gate, and the `wake_configured=` the marker
-# reads it back through -- separately, because losing the middle one would not
-# change the shape of the other two and would silently wake subscribers who
-# asked for notify-only delivery.
+# `_wake_kinds_for(...) if wake_agent else set()` and one grep no longer spans
+# it. All three needles are text the applier itself emits, so -- like the
+# signature grep above -- they pin that the edit landed in the shape expected,
+# not that upstream still writes `wake_agent`. They cannot fail independently of
+# the applier: WAKE_ANCHOR carries `if wake_agent` too, so upstream dropping the
+# per-subscription gate fails the substitution first.
+#
+# The pin on upstream is in verify_kanban_notifier.py, which asserts
+# `send_passive = mode != "wake"` is still in the notifier's own source. That
+# string belongs to upstream and no applier writes it, so a rename is caught
+# there -- before the patched line reaches a notifier tick and raises NameError.
 #
 # The first of those greps carries `passive_delivered=send_passive` rather than
 # stopping at `adapter=adapter`, and the argument is not cosmetic: it is the
@@ -417,9 +423,15 @@ sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would 
 #
 # The negative gate is on upstream's unfiltered work list rather than on the old
 # `conversations_info(channel=entry["id"])`, which upstream itself no longer
-# writes: an anchor that upstream cannot regress to proves nothing, whereas a
-# bump that reinstates `unresolved = [ch for ch in channels ...]` would silently
-# restore the perpetual re-probe while every positive gate above still matched.
+# writes and so could no longer fail. Be precise about what the replacement
+# buys, because it is less than it looks: the applier's OLD_RESOLVE anchor
+# already contains `unresolved = [ch for ch in channels ...]` and substitute()
+# demands exactly one occurrence, so the ordinary regression -- upstream
+# reinstating the unfiltered list -- fails the applier, not this grep. What is
+# left to the grep is the case substitute() cannot see: a SECOND occurrence of
+# that work list somewhere else in channel_directory.py, which the applier would
+# leave untouched and every positive gate above would still match. That is a
+# narrow catch, and it is the honest description of one.
 #
 # A grep guard cannot catch this class of bug: the original code resolved every
 # entry, handled the error and logged it, and was wrong only in the value it

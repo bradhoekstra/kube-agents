@@ -112,9 +112,13 @@ check(
 )
 # The old negative here was `conversations_info(channel=entry["id"])`, the shape
 # that caused the storm. v2026.8.13 stopped writing it — upstream groups by base
-# id itself now — so the check could no longer fail and proved nothing. What
-# upstream *can* still regress to is its own unfiltered work list, which would
-# reinstate the perpetual re-probe with every other anchor here intact.
+# id itself now — so the check could no longer fail and proved nothing. Its
+# replacement is narrower than it reads: the applier's OLD_RESOLVE anchor
+# carries this same work list and substitute() insists on exactly one
+# occurrence, so upstream simply reinstating it fails the applier long before
+# this runs. What is left here is a second, distinct occurrence elsewhere in the
+# file — the one shape substitute() cannot see, and the one that would reinstate
+# the perpetual re-probe with every other anchor intact.
 check(
     "the work list is the capped, miss-cached one",
     "unresolved = [ch for ch in channels" not in _src,
