@@ -133,7 +133,7 @@ The registry is configurable at three layers, from broadest to most specific:
    current `IMAGE_TAG` to it when it names neither a tag nor a digest — `provision_03` for
    the operator, agent, and credential-proxy references, `provision_11` for the replay
    proxy. `FLUENT_BIT_IMAGE` is excluded, because it names an upstream release. Set a value
-   explicitly (`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:v1.4.0`) to pin
+   explicitly (`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:1.4.0`) to pin
    a reference independently of `IMAGE_TAG`.
 
 2. **Operator environment** — the controller manager reads three optional env vars (see the

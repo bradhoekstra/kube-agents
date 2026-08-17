@@ -63,7 +63,7 @@ scripts warn when an export is ignored or a saved image no longer matches the pr
 it with every step without saving it. The saved `*_IMAGE` values are therefore bare repository
 paths, and the step that consumes one attaches the current `IMAGE_TAG` through
 `qualify_image_ref` (`common.sh`) unless the value already names a tag or a digest — so pinning
-`OPERATOR_IMAGE=…/k8s-operator:v1.4.0` in `vars.sh` survives a run at a different `IMAGE_TAG`.
+`OPERATOR_IMAGE=…/k8s-operator:1.4.0` in `vars.sh` survives a run at a different `IMAGE_TAG`.
 Step 03 also forwards `PLATFORM_AGENT_IMAGE`, `CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE`
 overrides to the operator Deployment on the same terms; `FLUENT_BIT_IMAGE` is the exception, as
 it names an upstream release whose tag has nothing to do with `IMAGE_TAG`. `install.sh` writes
