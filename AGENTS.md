@@ -367,3 +367,36 @@ Four ways that goes wrong quietly:
   handled.
 - `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
   something you resolved.
+
+## Before Reviewing Someone Else's Pull Request
+
+The section above is about your own pull request being reviewed, and it already says where a
+reviewer starts: the **Self-Review** section, before the diff. This one is the question that comes
+before even that — whether the review you have been asked for needs to happen at all.
+
+By the time anyone asks, a pull request here has usually been read twice already: `kube-agents-bot`
+reads every one, and "Pull Request Hygiene" separately required the author to run
+`review-adversarial` over their own diff, record the result in **Self-Review**, and exercise the
+change under **Live validation**. Where both of those hold and neither has gone stale, a third
+hostile read is usually redundant spend.
+
+So check for both first — and then **ask rather than decide**. Say what the evidence is and that
+the extra round may be unnecessary; let the person who asked choose whether to spend it. Skipping a
+review unilaterally is not yours to do, and neither is quietly running one you have reason to
+believe nobody needs.
+
+Two things make this go wrong quietly:
+
+- **Currency.** A clean review sitting at an older commit proves nothing about the current head —
+  unless the only commits since it are merges from the base branch, which are not new work to
+  review. Treat a review whose commit has vanished from the branch as stale, not clean. An
+  unresolved review thread says the same thing: work outstanding, however clean the latest review
+  reads.
+- **A Self-Review that is present but unanswered.** "No findings" counts only alongside what was
+  looked for, so a bare "reviewed it" is an absent section with characters in it — and, per the
+  section above, the first finding your review reports rather than a reason to skip it.
+
+[`.claude/commands/pr-review-batch.md`](.claude/commands/pr-review-batch.md) is the canonical home
+for the mechanics — the queries, what counts as a clean verdict, the verdicts they produce, and what
+to put in front of the user. Follow it whether or not the review was started through the slash
+command, and change it rather than this section when the mechanics move.

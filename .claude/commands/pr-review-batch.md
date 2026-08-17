@@ -9,13 +9,165 @@ PRs always live in that repo. Everything else — remote names, the base branch,
 location — is discovered at runtime, so this command works for any teammate in any clone regardless
 of what they called their remotes or where they cloned to.
 
-Spawn **one subagent per PR number**, all in a single message so they run concurrently. Each
-subagent owns exactly one PR end to end and reports back a short structured result. Do not review
-any PR yourself in the main loop — your job is to fan out, then relay.
+Run **Phase −1 in the main loop first**, for every PR number, and wait for my answer. Then spawn
+**one subagent per PR number that survives it**, all in a single message so they run concurrently.
+Each subagent owns exactly one PR end to end and reports back a short structured result. Do not
+review any PR yourself in the main loop — your job is to pre-flight, fan out, then relay.
 
-Give each subagent the instructions below verbatim, with `<N>` replaced by its PR number.
+Give each subagent everything under **[Subagent instructions (per PR)](#subagent-instructions-per-pr)**
+verbatim, with `<N>` replaced by its PR number, plus the PR's pre-flight verdict and the review mode
+I chose for it. Phase −1 is yours and stops at that heading: it asks me a question, which a subagent
+cannot do, so handing it on would either hang the subagent or have it answer on my behalf.
 
 ---
+
+## Phase −1 — Pre-flight: is this review already covered? (main loop)
+
+Every PR here is read by `kube-agents-bot` on the way in, and the repo requires the author to have
+run `review-adversarial` over their own diff and written the disposition into the body before
+opening. When both of those happened and neither has gone stale, a third hostile read usually buys
+nothing — so find that out before spending it.
+
+This phase runs **in the main loop, before any subagent exists**, for two reasons. Its output is a
+question for me, and a subagent has no way to ask one. And it is pure GitHub API — no worktree, no
+fetch, no diff read — so it costs two calls per PR whatever the answer turns out to be.
+
+### The two queries
+
+The repo is named literally in both: Phase −1 runs before Phase 0 defines `$REPO`.
+
+```bash
+# Signal 1, in one call: the head SHA, the bot's reviews with the commit each one
+# actually read, the commit graph, and the open threads. The filter reports the
+# commits *after* the review's commit, which is what the currency test needs.
+gh api graphql -f query='
+query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(number:$pr){
+  headRefOid isDraft state author{login}
+  reviews(last:20){nodes{author{login} state submittedAt body commit{oid}}}
+  commits(last:100){nodes{commit{oid messageHeadline parents{totalCount}}}}
+  reviewThreads(first:100){nodes{isResolved path}}
+}}}' -F pr=<N> --jq '.data.repository.pullRequest as $p
+| ([$p.reviews.nodes[] | select(.author.login == "kube-agents-bot")] | last) as $r
+| ($p.commits.nodes | map(.commit)) as $cs
+| ($cs | map(.oid) | index($r.commit.oid // "")) as $i
+| "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length)",
+  (if $r == null then "lastbot: NONE"
+   else "lastbot at=\($r.submittedAt) commit=\($r.commit.oid)",
+        ($r.body | split("\n") | [.[0], (.[] | select(startswith("_This was a")))] | join("\n")),
+        (if $i == null then "since: review commit is not among those \($cs|length) commits"
+         elif $i == ($cs|length) - 1 then "since: nothing, the review is at the tip"
+         else "since:\n  " + ($cs[$i+1:] | map("\(.oid[0:7]) parents=\(.parents.totalCount) \(.messageHeadline)") | join("\n  "))
+         end)
+   end)'
+
+# Signal 2: the PR description. Read it yourself — see below.
+gh pr view <N> --repo gke-labs/kube-agents --json body -q .body
+```
+
+Use GraphQL for the reviews rather than `gh api repos/$REPO/pulls/<N>/reviews`: the REST endpoint
+has been observed returning an empty body against this repo while `/pulls/<N>/comments` worked.
+(REST does carry the review's `commit_id`, so that is not the reason — availability is.)
+
+Keep the filter's `.[0]` / `startswith` shape if you edit it. `gh --jq` is gojq, but the same
+program gets piped through real `jq` often enough that it has to run in both, and jq rejects a field
+access applied straight to a function call — `capture("…").s` compiles under gojq and is a syntax
+error under jq 1.6.
+
+All three page sizes are caps rather than promises:
+
+- `reviews(last: 20)` and `reviewThreads(first: 100)` — on a long-lived PR, say you looked at the
+  last twenty reviews rather than reporting it clear off a truncated list.
+- `commits(last: 100)` — a branch can outrun that, and a review older than the window is then
+  indistinguishable from one whose commit was force-pushed away. Both print the same
+  `since: … not among those N commits`. That lands on stale either way, which is the safe direction,
+  but when `commits=100` say "could not confirm currency" rather than "force-pushed".
+
+### Signal 1 — a current, clean bot review
+
+Three things must hold.
+
+**Clean.** The **last** bot review's body opens with either of the two clean verdicts. GraphQL
+reports the login as `kube-agents-bot`, without the `[bot]` suffix the REST API adds. Take the last
+one: after a `/review` the earlier review is still sitting there, and reading it back looks exactly
+like the new one.
+
+- `**No findings.**` — nothing raised anywhere.
+- `**No findings in the code.**` — the bot cleared the diff and raised something outside it, a note
+  on the description usually. It counts, but quote the note in the evidence rather than letting the
+  word "clean" swallow it.
+
+Note the width too. The footer reads `_This was a strict pass: only what I am certain of…_` or
+`_This was a wider pass: as well as what I am certain of…_`. A strict-pass clean covers less ground
+than a wide-pass clean, and I may want the difference.
+
+**Current.** Either the review's commit is the head, or everything after it is a merge
+(`parents.totalCount > 1`). Merging the base branch in is not new work to review — this is the
+API-only twin of the `git log <sha>..HEAD --no-merges --not "$BASE_REF"` rule in Phase 2. Two ways
+it is softer than that rule, both worth saying out loud rather than papering over:
+
+- A conflicted merge carries hand-written resolution that no review has seen, and over the API it
+  looks exactly like a clean one. When the tail is merges, call them presumed base merges and offer
+  the delta pass; only a worktree (`git show --cc <sha>`) can tell the two apart, and Phase −1 has
+  no worktree by design.
+- A review commit missing from the list is stale, but see the `commits(last: 100)` caveat above for
+  which kind of stale.
+
+**Nothing left open.** No unresolved review thread. An open thread is outstanding work by the repo's
+own merge rules, however clean the latest review reads.
+
+### Signal 2 — the author reviewed and tested it themselves
+
+Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" requires before a
+pull request is opened at all:
+
+- **`## Self-Review`** — the disposition list from the author's own `review-adversarial` pass: what
+  they looked for, what it found, and for each finding whether they fixed it or decided not to and
+  why. This is the signal that matters most here, because it is the only one that says somebody
+  already read this diff hostilely.
+- **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
+  exercised. `Not live-tested` with a stated reason is a filled section.
+
+Judge them by reading, not by measuring. A section holding only the template's HTML comment,
+whitespace, or a bare `-` is unfilled — but so is a paragraph that says "reviewed it, looks fine",
+because the bar AGENTS.md sets is that "no findings" counts **only alongside what was looked for**.
+Length settles neither question. Watch for the section heading appearing in prose elsewhere in the
+body, which is why this is a read rather than a regex: a PR that discusses the `## Self-Review`
+section is not a PR that filled one in.
+
+When the section is missing or unanswered, Signal 2 fails — say so plainly, since that is the first
+thing the review would report anyway.
+
+Do not reach for the author's inline comments as a substitute. Authors here do not leave top-level
+inline comments on their own diffs; what you see under an author's name are replies to bot threads,
+which is engagement with a review rather than one.
+
+### The verdicts
+
+| Verdict   | When                                                                    | What you do                                                                  |
+| --------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `skip`    | Draft, closed, or merged                                                | Report it and stop — no queries argued, no subagent                          |
+| `covered` | Signal 1 in full, plus Signal 2                                         | Report the evidence and **ask me** before reviewing                          |
+| `partial` | Clean bot review but stale, or Signal 2 missing, or a thread still open | Report it, name exactly what is missing, and offer a narrower or a full pass |
+| `review`  | No clean bot review — the bot found issues, or never ran                | Proceed to fan-out with no prompt                                            |
+
+`skip` is the same judgement Phase 2 makes and the same one it reports; making it here as well just
+saves spawning a subagent to reach it. A draft is the author saying they are not asking yet.
+
+### The ask
+
+If nothing is `covered` or `partial`, say so in one line and fan out. Otherwise, per such PR, put
+the evidence in front of me before you spend anything:
+
+- the bot review's first line, its width, and its date;
+- its commit versus the head, and what the commits in between are, if any;
+- what the Self-Review section says it looked for and found, in a line or two;
+- the Live-validation section in one line — what the author says they exercised;
+- for `partial`, the single thing that is missing.
+
+Then offer three choices: **skip it**, **review only what landed since `<sha>`** (the point of the
+`partial` case; empty by construction when the review is current), or **a full pass anyway**. I
+decide — coverage is a suggestion, and "the bot found nothing" is not a review verdict of yours.
+Fan out only for what I keep, and tell each subagent its verdict and mode.
 
 ## Subagent instructions (per PR)
 
@@ -165,6 +317,18 @@ matching this PR.
   wrong even when the author pushed nothing at all.
 
 A merge conflict is **not** a skip reason. Neither is an unmergeable `mergeStateStatus`.
+
+**Do not re-litigate coverage.** Phase −1 already weighed the bot's verdict and the author's
+evidence — either it found no coverage worth raising, or it raised it and was told to go ahead. You
+were spawned either way, so a clean bot review is not a skip reason at this point, and neither is a
+thorough Self-Review section. Review at the mode you were given.
+
+Both are still worth reading, for a different purpose. The Self-Review section is where AGENTS.md
+tells every reviewer to start — it says where the author's own pass stopped, so yours can start
+there — and the bot's review says what a second reader already cleared. Neither is a reason to drop
+a finding of your own; both are a reason to be able to say why they missed it. A finding on a line
+the bot passed, or one the author rejected with a reason, needs the skill's step 5 to answer them
+rather than talk past them.
 
 Otherwise proceed. If a prior review exists but new commits landed, review the current head in full
 and note in your report which findings from the prior review the new commits resolved. Read the
