@@ -17,6 +17,7 @@ to stop.
 """
 
 import random
+import re
 import unittest
 
 import request_reviewers as rr
@@ -78,6 +79,34 @@ def check_run(conclusion="success", **overrides):
     }
     base.update(overrides)
     return base
+
+
+def review(login, state="COMMENTED", user_type="User"):
+    return {"user": {"login": login, "type": user_type}, "state": state}
+
+
+class FakeAPI:
+    """Just enough of `GitHubAPI` for the two functions that call it."""
+
+    def __init__(self, pulls=(), commits=None, check_runs=None):
+        self.repo = "gke-labs/kube-agents"
+        self.pulls = list(pulls)
+        self.commits = commits or {}
+        self.check_runs = check_runs or {}
+
+    def get_all(self, path):
+        if path.endswith("/pulls?state=open"):
+            return self.pulls
+        matched = re.search(r"/pulls/(\d+)/commits$", path)
+        if matched:
+            return [{"sha": sha} for sha in self.commits.get(int(matched.group(1)), [])]
+        raise AssertionError(f"unexpected list call: {path}")
+
+    def get(self, path):
+        matched = re.search(r"/commits/([0-9a-f]+)/check-runs$", path)
+        if matched:
+            return {"check_runs": self.check_runs.get(matched.group(1), [])}
+        raise AssertionError(f"unexpected call: {path}")
 
 
 class GlobTest(unittest.TestCase):
@@ -234,12 +263,30 @@ class SkipReasonTest(unittest.TestCase):
         skipped = rr.skip_reason(pull_request(requested_teams=[{"slug": "sre"}]), [], CONFIG)
         self.assertIn("team:sre", skipped)
 
-    def test_a_human_review_already_submitted_is_skipped(self):
-        reviews = [{"user": {"login": "bnaylor", "type": "User"}}]
-        self.assertIn("bnaylor", rr.skip_reason(pull_request(), reviews, CONFIG))
+    def test_a_human_verdict_already_submitted_is_skipped(self):
+        for state in ("APPROVED", "CHANGES_REQUESTED"):
+            reviews = [review("bnaylor", state)]
+            self.assertIn("bnaylor", rr.skip_reason(pull_request(), reviews, CONFIG), state)
 
     def test_the_bots_own_review_does_not_count_as_human_coverage(self):
-        reviews = [{"user": {"login": "kube-agents-bot[bot]", "type": "Bot"}}]
+        reviews = [review("kube-agents-bot[bot]", user_type="Bot")]
+        self.assertIsNone(rr.skip_reason(pull_request(), reviews, CONFIG))
+
+    def test_the_authors_replies_to_the_bot_do_not_block_their_own_reviewer(self):
+        # Answering a review thread files a `COMMENTED` review under the
+        # replier's name, and AGENTS.md tells authors to answer every finding
+        # before running `/review`. Counting those would starve exactly the pull
+        # requests that follow the process.
+        reviews = [review("kube-agents-bot[bot]", user_type="Bot"), review("author")]
+        self.assertIsNone(rr.skip_reason(pull_request(), reviews, CONFIG))
+
+    def test_a_drive_by_comment_from_a_colleague_does_not_block_it_either(self):
+        self.assertIsNone(rr.skip_reason(pull_request(), [review("bnaylor")], CONFIG))
+
+    def test_a_verdict_from_the_author_is_still_the_author(self):
+        # GitHub will not let you approve your own pull request, but a
+        # `CHANGES_REQUESTED` on your own is possible and is not coverage.
+        reviews = [review("author", "CHANGES_REQUESTED")]
         self.assertIsNone(rr.skip_reason(pull_request(), reviews, CONFIG))
 
 
@@ -287,6 +334,59 @@ class AiReviewGateTest(unittest.TestCase):
 
     def test_a_bot_author_still_needs_the_check_to_have_run(self):
         self.assertIsNotNone(rr.ai_review_block_reason(None, author_is_bot=True))
+
+
+class ResolvePullRequestTest(unittest.TestCase):
+    """`resolve_pull_request` -- commit to pull request, head or not."""
+
+    def api(self):
+        return FakeAPI(
+            pulls=[
+                pull_request(number=10, head={"sha": "aaaa111"}),
+                pull_request(number=11, head={"sha": "bbbb222"}),
+            ],
+            commits={10: ["0000abc", "aaaa111"], 11: ["bbbb222"]},
+        )
+
+    def test_the_head_commit_resolves_without_listing_commits(self):
+        api = self.api()
+        api.commits = {}  # listing commits at all would raise here
+        self.assertEqual(rr.resolve_pull_request(api, "bbbb222")["number"], 11)
+
+    def test_a_commit_the_head_has_moved_past_still_resolves(self):
+        # The author pushed while the bot was reading. Nothing else will fire:
+        # a push does not start another AI review.
+        self.assertEqual(rr.resolve_pull_request(self.api(), "0000abc")["number"], 10)
+
+    def test_a_commit_on_no_open_pull_request_resolves_to_nothing(self):
+        self.assertIsNone(rr.resolve_pull_request(self.api(), "deadbee"))
+
+
+class GateCheckRunTest(unittest.TestCase):
+    """`gate_check_run` -- which verdict the gate is decided on."""
+
+    def test_the_triggering_run_decides_when_it_is_on_the_head(self):
+        triggering = check_run("success", id=1, head_sha="aaaa111")
+        api = FakeAPI()  # any call would raise
+        chosen = rr.gate_check_run(api, pull_request(head={"sha": "aaaa111"}), triggering)
+        self.assertEqual(chosen["id"], 1)
+
+    def test_a_newer_verdict_on_the_new_head_wins(self):
+        triggering = check_run("success", id=1, head_sha="aaaa111")
+        api = FakeAPI(check_runs={"bbbb222": [check_run("neutral", id=2)]})
+        chosen = rr.gate_check_run(api, pull_request(head={"sha": "bbbb222"}), triggering)
+        self.assertEqual(chosen["id"], 2)
+
+    def test_a_stale_verdict_still_decides_when_the_new_head_has_none(self):
+        # Otherwise the pull request waits forever for a review nobody will run.
+        triggering = check_run("success", id=1, head_sha="aaaa111")
+        api = FakeAPI(check_runs={"bbbb222": []})
+        chosen = rr.gate_check_run(api, pull_request(head={"sha": "bbbb222"}), triggering)
+        self.assertEqual(chosen["id"], 1)
+
+    def test_without_a_triggering_run_the_head_decides(self):
+        api = FakeAPI(check_runs={"deadbeef": [check_run("success", id=3)]})
+        self.assertEqual(rr.gate_check_run(api, pull_request(), None)["id"], 3)
 
 
 if __name__ == "__main__":

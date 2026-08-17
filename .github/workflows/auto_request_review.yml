@@ -23,11 +23,19 @@ on:
 
 permissions: {}
 
-# One run at a time per pull request, queued rather than cancelled. A `/review`
+# One run at a time per commit, queued rather than cancelled: a `/review`
 # re-read completes a second `AI Review` check, and two runs reading "has this
 # pull request got a reviewer yet?" at the same moment would both answer no.
+#
+# The check run's *name* is in the key because the group is evaluated before the
+# `if:` below, so every one of the ~16 checks on a commit lands in it. Keyed on
+# the commit alone they queue behind each other, and GitHub keeps only one run
+# pending per group -- so the `AI Review` run, the only one that does anything,
+# can be cancelled before it starts by the next check to finish.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.check_run.head_sha || github.event.issue.number }}
+  group: >-
+    ${{ github.workflow }}-${{ github.event.check_run.name || 'request-review' }}-${{
+    github.event.check_run.head_sha || github.event.issue.number }}
   cancel-in-progress: false
 
 jobs:
@@ -68,18 +76,20 @@ jobs:
       - name: Install the script's one third-party import
         run: python3 -m pip install pyyaml
 
-      # The head SHA rather than a pull request number: a `check_run` payload
-      # has no pull request on it, and `check_run.pull_requests` is empty for
-      # fork pull requests. The script maps the SHA back to the pull request.
+      # The check run's id rather than a pull request number: a `check_run`
+      # payload has no pull request on it, and `check_run.pull_requests` is
+      # empty for fork pull requests. The script reads the check run back from
+      # the API for the commit and the verdict, then finds the pull request that
+      # commit belongs to.
       - name: Request a reviewer now the AI review has passed
         if: github.event_name == 'check_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Through the environment, not interpolated into the script: event
           # fields are attacker-controlled input on a pull-request trigger.
-          HEAD_SHA: ${{ github.event.check_run.head_sha }}
+          CHECK_RUN_ID: ${{ github.event.check_run.id }}
         run: |
-          python3 scripts/request_reviewers.py --head-sha "$HEAD_SHA" --require-ai-review-pass
+          python3 scripts/request_reviewers.py --check-run-id "$CHECK_RUN_ID" --require-ai-review-pass
 
       # No `--require-ai-review-pass`: bypassing the gate is what the command is
       # for. The `if:` above already checked who is asking.

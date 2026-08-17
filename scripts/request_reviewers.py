@@ -47,6 +47,10 @@ AI_REVIEW_APP_ID = 4437198
 DEFAULT_CONFIG_PATH = ".github/auto_request_review.yml"
 DEFAULT_IGNORED_KEYWORDS = ["DO NOT REVIEW"]
 
+# Review states that mean a person has actually reviewed. `COMMENTED` is not one
+# of them: GitHub files a `COMMENTED` review for a reply to a review thread.
+HUMAN_VERDICT_STATES = {"APPROVED", "CHANGES_REQUESTED"}
+
 API_ROOT = "https://api.github.com"
 PER_PAGE = 100
 
@@ -258,13 +262,20 @@ def skip_reason(pull_request, reviews, config):
     if requested:
         return f"review is already requested from {', '.join(requested)}"
 
+    # Only a verdict from another person counts. Replying to a review thread
+    # files a `COMMENTED` review under the replier's name, and AGENTS.md tells
+    # authors to answer every finding before running `/review` -- so counting
+    # those would mean the pull requests that follow the process are exactly the
+    # ones that never get a reviewer.
+    author = (pull_request.get("user") or {}).get("login")
     humans = _dedupe(
         [
             review["user"]["login"]
             for review in reviews
             if (review.get("user") or {}).get("type") != "Bot"
+            and review.get("state") in HUMAN_VERDICT_STATES
         ],
-        exclude=None,
+        exclude=author,
     )
     if humans:
         return f"{', '.join(humans)} already reviewed it"
@@ -363,15 +374,77 @@ class GitHubAPI:
 
 
 def resolve_pull_request(api, head_sha):
-    """Find the open pull request whose head is `head_sha`.
+    """Find the open pull request the commit `head_sha` belongs to.
 
     Not `GET /commits/{sha}/pulls`: that endpoint returns nothing for a fork's
     head commit (checked against #734), and every pull request here is a fork.
+
+    Usually the commit is still the head. It is not when the author pushed
+    during the review -- the check run carries the commit the bot read, which by
+    the time it completes is one behind. Matching on the head alone would drop
+    that event, and nothing would retry it: a push does not start another AI
+    review. So fall back to the pull request that *contains* the commit, at the
+    cost of one extra call per open pull request in a case that is rare.
     """
-    for pull_request in api.get_all(f"/repos/{api.repo}/pulls?state=open"):
+    open_pull_requests = api.get_all(f"/repos/{api.repo}/pulls?state=open")
+
+    for pull_request in open_pull_requests:
         if pull_request["head"]["sha"] == head_sha:
             return pull_request
+
+    for pull_request in open_pull_requests:
+        commits = api.get_all(f"/repos/{api.repo}/pulls/{pull_request['number']}/commits")
+        if any(commit["sha"] == head_sha for commit in commits):
+            log(
+                f"#{pull_request['number']} has moved on to {pull_request['head']['sha'][:7]} "
+                f"since {head_sha[:7]} was reviewed"
+            )
+            return pull_request
+
+    # A force-push during the review leaves the reviewed commit on no branch at
+    # all, and there is nothing left to match against.
     return None
+
+
+def gate_check_run(api, pull_request, triggering):
+    """The `AI Review` check run the gate should be decided on.
+
+    The triggering one, unless the head has moved since -- then the current head
+    may carry a newer verdict, and a newer verdict wins. If it carries none, the
+    stale one still decides: holding out for a review that will never be
+    requested is how a pull request goes quiet forever.
+    """
+    head_sha = pull_request["head"]["sha"]
+
+    if triggering is not None and triggering.get("head_sha") == head_sha:
+        return triggering
+
+    check_runs = api.get(f"/repos/{api.repo}/commits/{head_sha}/check-runs")["check_runs"]
+    current = latest_ai_review(check_runs)
+
+    if current is None and triggering is not None:
+        log(f"No {AI_REVIEW_CHECK_NAME} on the current head; deciding on the one that triggered this run")
+        return triggering
+
+    return current
+
+
+def fetch_ai_review_check_run(api, check_run_id):
+    """The triggering check run, refetched and re-identified.
+
+    The workflow's `if:` has already checked the name and the App, but it
+    checked an event payload. This reads the same fields back from the API, and
+    gets the commit the bot actually reviewed rather than trusting the payload
+    for it.
+    """
+    check_run = api.get(f"/repos/{api.repo}/check-runs/{check_run_id}")
+
+    name = check_run.get("name")
+    app_id = (check_run.get("app") or {}).get("id")
+    if name != AI_REVIEW_CHECK_NAME or app_id != AI_REVIEW_APP_ID:
+        raise ValueError(f"check run {check_run_id} is {name!r} from app {app_id}, not the AI review")
+
+    return check_run
 
 
 # --------------------------------------------------------------------------- #
@@ -383,7 +456,12 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--pr", type=int, help="pull request number")
-    target.add_argument("--head-sha", help="head commit of the pull request to find")
+    target.add_argument("--head-sha", help="a commit of the pull request to find")
+    target.add_argument(
+        "--check-run-id",
+        type=int,
+        help="the AI Review check run that triggered this; supplies the commit and the verdict",
+    )
     parser.add_argument(
         "--repo",
         default=os.environ.get("GITHUB_REPOSITORY", "gke-labs/kube-agents"),
@@ -412,12 +490,17 @@ def main(argv=None):
     config = load_config(args.config)
     api = GitHubAPI(args.repo, token)
 
+    triggering_check_run = None
+    if args.check_run_id:
+        triggering_check_run = fetch_ai_review_check_run(api, args.check_run_id)
+
     if args.pr:
         pull_request = api.get(f"/repos/{args.repo}/pulls/{args.pr}")
     else:
-        pull_request = resolve_pull_request(api, args.head_sha)
+        commit = args.head_sha or triggering_check_run["head_sha"]
+        pull_request = resolve_pull_request(api, commit)
         if pull_request is None:
-            log(f"No open pull request has head {args.head_sha}; nothing to do")
+            log(f"No open pull request contains {commit}; nothing to do")
             return 0
 
     number = pull_request["number"]
@@ -431,10 +514,9 @@ def main(argv=None):
         return 0
 
     if args.require_ai_review_pass:
-        head_sha = pull_request["head"]["sha"]
-        check_runs = api.get(f"/repos/{args.repo}/commits/{head_sha}/check-runs")["check_runs"]
         reason = ai_review_block_reason(
-            latest_ai_review(check_runs), pull_request["user"].get("type") == "Bot"
+            gate_check_run(api, pull_request, triggering_check_run),
+            pull_request["user"].get("type") == "Bot",
         )
         if reason:
             log(f"Not requesting a reviewer: {reason}")
