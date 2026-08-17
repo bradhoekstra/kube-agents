@@ -42,6 +42,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | ----- | ------------------ | --- | -------- | --------- |
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.96.2` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.0` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
+| `k8s` | `docker.io/alpine/k8s` | `1.34.9` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab` | `HINDSIGHT_API_IMAGE` | Provisioning step 13, when the memory provider uses Hindsight. |
 | `hindsight-postgresql` | `docker.io/ankane/pgvector` | `latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8` | `HINDSIGHT_POSTGRES_IMAGE` | Provisioning step 13, alongside the Hindsight API. |

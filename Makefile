@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map chart-sync chart-check iac-parity-check tf-apply tf-destroy
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -222,6 +222,15 @@ chart-sync: ## Sync the Helm chart's CRD copies and operator ClusterRole rules f
 
 chart-check: ## Verify the chart's CRD/RBAC copies match k8s-operator/config (CI runs this).
 	@./hack/sync-chart-manifests.sh --check
+
+iac-parity-check: ## Verify the provisioning scripts, Terraform, and the Helm chart agree (CI runs this).
+	@python3 scripts/check_iac_parity.py
+
+tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
+	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
+
+tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
+	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
 
 validate: ## Fail if any skill sits under agents/*/defaults/skills/.
 	@if [ -n "$(BAD_SKILLS)" ]; then \
