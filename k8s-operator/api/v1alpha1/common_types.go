@@ -98,10 +98,50 @@ type HarnessSpec struct {
 	// +optional
 	Memory *MemorySpec `json:"memory,omitempty"`
 
+	// EventWatcher configures cluster event ingestion — the k8s-event-watcher that
+	// turns cluster warnings into autonomous triage sessions. Its `enabled: false`
+	// is the emergency stop for an event storm.
+	// +optional
+	EventWatcher *EventWatcherSpec `json:"eventWatcher,omitempty"`
+
 	// Tuning sets per-persona execution limits. Unset values keep the defaults
 	// baked into the agent image.
 	// +optional
 	Tuning *TuningSpec `json:"tuning,omitempty"`
+}
+
+// EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service
+// inside the credential-proxy sidecar alongside Envoy and the credential runtime.
+// It streams warning events from every watched cluster, deduplicates them, and posts
+// each surviving incident to the pod-local Session KV server, which starts an
+// autonomous triage session for it.
+type EventWatcherSpec struct {
+	// Enabled controls whether the watcher is started at all. Absent means started:
+	// the watcher is how a fleet notices its own incidents, so only an explicit
+	// false turns it off.
+	//
+	// This is an emergency stop, not a tuning knob. It exists for the case where
+	// events arrive faster than the agent can triage them — a fleet-wide rollout
+	// gone wrong, a node pool flapping — and the cheapest way to get the agent back
+	// is to cut the inflow rather than to chase the cards it has already been given.
+	// It is all-or-nothing across every watched cluster: the watcher's reason and
+	// namespace filters are fixed by the sidecar's entrypoint and not exposed here,
+	// so there is no way to silence one noisy namespace through this field.
+	//
+	// Three consequences to know before pressing it:
+	//
+	//   - It rolls the pod. The value reaches the sidecar as an environment variable,
+	//     so changing it rewrites the pod template. During a storm that restart is
+	//     usually wanted anyway — it is also what ends the sessions already running.
+	//   - It stops the inflow only. Kanban cards and sessions created from events
+	//     already delivered keep running and still have to be dealt with on the board.
+	//   - Nothing turns it back on. An install left with the watcher off has no
+	//     incident detection at all while the container stays Ready, which is why the
+	//     operator reports the off state as an `EventWatcher` condition on the CR
+	//     instead of letting it sit unremarked in the spec.
+	// +kubebuilder:default=true
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
 }
 
 // TuningSpec carries execution limits per agent persona.
@@ -133,21 +173,30 @@ type TuningSpec struct {
 	// every worker it spawns — platform and cluster alike — draws on the same model
 	// quota. Setting it to 1 serialises all delegated work.
 	//
-	// Unset leaves Hermes' own behaviour, which does not cap concurrency. Cap it when
-	// a deployment's model quota cannot absorb parallel fan-out: workers that exhaust
-	// their retry budget exit without calling a terminal kanban tool, which the
-	// dispatcher then reports as a "protocol violation" rather than as the quota
-	// exhaustion it actually is. Capping costs throughput — one long-running worker
-	// holds the only slot — so it is a trade, not a default.
+	// Unset means 2, the operator's default — not Hermes' own behaviour, which does not
+	// cap concurrency at all. The default exists because a worker is a full agent process
+	// holding a few hundred MiB for the length of the task: unbounded dispatch lets a
+	// burst of queued cards spawn workers until the cgroup OOM killer takes them, and
+	// that kills a child process rather than the container, so it produces no Kubernetes
+	// event and no restart while the dispatcher strands the card instead of retrying it.
 	//
-	// Do NOT reach for it as a latency fix. An uncapped fan-out does spawn every
-	// sandboxed worker at once and they contend during startup, but a slot is held
-	// for a worker's entire run, so a cap serialises minutes of model work to save
-	// seconds of boot. Measured against real fan-outs on a live cluster, capping at
-	// 2 roughly doubled the time for the batch to finish. What the workers contend
-	// for is not established either — CPU limit, memory ceiling and gVisor I/O all
-	// fit the evidence, and gVisor hides the cgroup throttle counters that would
-	// settle it — so raising resources is not a guaranteed fix; measure it.
+	// The cap is bought at a real price, so raise it deliberately rather than leaving it
+	// alone by default. A slot is held for a worker's entire run, so capping serialises
+	// minutes of model work: measured against real fan-outs on a live cluster, capping at
+	// 2 roughly doubled the time for a batch to finish. Do NOT reach for a lower value as
+	// a latency fix — an uncapped fan-out does spawn every sandboxed worker at once and
+	// they contend during startup, but a cap trades minutes of model work for seconds of
+	// boot. What the workers contend for is not established either — CPU limit, memory
+	// ceiling and gVisor I/O all fit the evidence, and gVisor hides the cgroup throttle
+	// counters that would settle it — so raising resources is not a guaranteed fix;
+	// measure it.
+	//
+	// Set it higher once a deployment has measured its own worker footprint and model
+	// quota — a fleet with headroom is throttled by 2. Set it to 1 to serialise all
+	// delegated work. When quota rather than memory binds, note the related failure mode:
+	// workers that exhaust their retry budget exit without calling a terminal kanban
+	// tool, and the dispatcher reports that as a "protocol violation" rather than as the
+	// quota exhaustion it actually is.
 	// +kubebuilder:validation:Minimum=1
 	// +optional
 	MaxInProgress *int `json:"maxInProgress,omitempty"`
@@ -184,7 +233,26 @@ type MemorySpec struct {
 	// +optional
 	MemoryEnabled *bool `json:"memoryEnabled,omitempty"`
 
-	// Provider specifies the memory provider implementation (e.g. "multiuser_memory").
+	// Provider selects the memory provider plugin. Two ship in the agent image:
+	// "multiuser_memory" — the default, for small or personal deployments — keeps a
+	// per-user Markdown file inside the pod and needs nothing else running, at the
+	// price of loading the whole store into the model's context on every turn, and
+	// "kube_agents_memory" — for enterprise deployments — gives ranked recall backed
+	// by the in-cluster Hindsight service and its Postgres database. Any other
+	// plugin Hermes ships may be named here too.
+	//
+	// The file store is the default because it is what this API shipped before
+	// "kube_agents_memory" existed. A CR written against the older schema omits this
+	// field, and taking the default must leave that agent with the store it already
+	// has rather than pointing it at a Hindsight service nobody deployed.
+	//
+	// Use "none" for no external provider at all. That is not the same as leaving
+	// this field empty: an absent field takes the default below, so "none" is the
+	// only way to express the choice. The operator translates it to the empty
+	// string Hermes itself uses.
+	//
+	// Only a Hindsight-backed provider reaches the specialist profiles, and only
+	// read-only; see memoryOverlay in the controller for why.
 	// +kubebuilder:default="multiuser_memory"
 	// +optional
 	Provider string `json:"provider,omitempty"`

@@ -10,7 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Chat Agent front door — the `default` Hermes profile that receives chat ingress and delegates to specialists.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
-- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (security audits, docs-drift, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
+- `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -34,6 +34,54 @@ To use these agents:
 
 1. Follow the instructions in [INSTALL.md](INSTALL.md) to set up and register the Platform Agent in your agent harness.
 2. Refer to the documentation site content in [docs/site/src/content/docs/](docs/site/src/content/docs/) for architecture, concepts, and operational guides.
+
+## Before Starting a Task
+
+Many people and agents work in this repository at once, so the first step of a non-trivial task
+is finding out whether someone is already doing it. Scan the open work and report what you find
+to the user **before** you write code. Skip the scan only when the user has already named the
+issue or pull request you are working on, or when the change is a one-liner they asked for
+directly.
+
+Branches live on forks, so name the upstream repository on every call:
+
+```bash
+# Open PRs, with the files each one touches. File overlap is the strongest duplicate
+# signal and one call gets it for every open PR.
+gh pr list --repo gke-labs/kube-agents --state open --limit 100 \
+  --json number,title,author,headRefName,isDraft,updatedAt,files
+
+# Open issues, and who has already claimed them.
+gh issue list --repo gke-labs/kube-agents --state open --limit 100 \
+  --json number,title,assignees,labels
+
+# Already tried? A closed pull request is a decision, not an absence.
+gh search prs --repo gke-labs/kube-agents --state closed --limit 20 '<keywords>'
+```
+
+Then report before you start:
+
+- **An open pull request touches your files or solves your problem.** Give the number, author,
+  and URL, and say how your task differs. Do not push to someone else's branch and do not open
+  a competing pull request without the user's go-ahead. Overlap alone is a merge-conflict
+  warning, not a stop sign — say which it is.
+- **An open issue describes the task and is unassigned.** Give the number and title, offer to
+  claim it, and say what you would comment. Assign or comment only after the user agrees:
+  `gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me`. `@me` is the account
+  whose token you hold — a person — so you are volunteering them, not yourself. Contributors
+  working from a fork without write access cannot self-assign; offer a comment instead.
+- **The issue is assigned to someone else.** Report it and ask before starting anything.
+- **Nothing matches.** Say so in one line and carry on.
+
+Carry the result into the pull request's **Context** section — `Closes #<number>`, or the
+related open pull request and how yours differs.
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) already reserves that
+section for it.
+
+This is not the `status:in-progress` claim in
+[`agents/platform/skills/github-issue-resolver/SKILL.md`](agents/platform/skills/github-issue-resolver/SKILL.md).
+That is the deployed Platform Agent claiming an issue on a user's repository at runtime. Here
+the assignee is the claim; do not apply `status:` labels to issues in this repository.
 
 ## Skills Guidelines
 
@@ -97,6 +145,33 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   SHA and the comment together.
 - Use `.github/PULL_REQUEST_TEMPLATE.md` for PR body structure and level of
   detail. Do not use `--fill` with `gh pr create` as it bypasses the template.
+- **Adversarial self-review before opening a PR, and record it in the PR body.** Run the
+  `review-adversarial` skill (`.agents/skills/review-adversarial/SKILL.md`) against your branch
+  diff, fix what it confirms, and fill in the template's **Self-Review** section with what you
+  looked for, what it found, and the disposition of each finding. This is a required pre-PR step
+  for AI agents working in this repository: you are the change's first hostile reader, and a
+  reviewer who has to find what you could have found spends their attention on the wrong things.
+  This bullet is the canonical statement of the requirement; the site's
+  [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
+  [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
+  this list first, then reconcile them to it.
+  - **Run the pass in a context that did not write the change** — a subagent, or a new session,
+    handed the diff range and nothing else. Not your plan, not your reasoning, not the summary you
+    were about to write. Reviewing a diff in the conversation that produced it is the one
+    configuration that reliably does not work: the same context that talked you into the code
+    talks you into approving it, and the blind spot sits exactly where you were already wrong. It
+    is why `.claude/commands/pr-review-batch.md` gives every pull request its own subagent, and a
+    self-review earns it for the same reason.
+  - **A finding you decide not to fix is an answer**, provided the reason is an argument about
+    this change rather than a shrug. "Out of scope", "pre-existing", and "will fix later" are not
+    reasons on their own; the separate issue you filed is.
+  - **Fix what the pass confirms; report what it only suspects.** A finding it could not pin down
+    is an open question for the section, not a licence to rewrite working code — chasing an
+    uncertain finding on your own change is how a self-review makes it worse than it started.
+  - **"No findings" is an answer only alongside what you looked for.** The skill's angles are the
+    vocabulary for that, and a pass that names none of them is indistinguishable from no pass.
+  - **Do not claim more than you did.** A self-review the diff contradicts is worse than none: it
+    spends the reviewer's trust before they reach the code.
 - **Docs-drift review before opening a PR:** run the `review-docs-drift` skill
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
@@ -126,9 +201,15 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   `kube-agents-bot`; see
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
+- **Leave no conversation unresolved.** `main` will not merge while a review thread is open, and
+  the open thread also keeps the pull request counted as its author's outstanding work.
+  Reply, then resolve every thread you are confident is addressed — commands and the bar for
+  "confident" are in
+  [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
 - **Local Validation Checks:** Before committing, try to run checks locally to avoid CI failures:
   - **Formatting:** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files. You can check all files using `make prettier-check` (note: this checks files outside your PR scope; CI only checks the ones your branch changed). Install the version CI pins (see the Install Prettier step in `.github/workflows/prettier.yml`), e.g. `npm install -g prettier@<that version>` — the manifests gate in `k8s-operator-test.yml` asserts byte-equality against that version's output, so a skew fails CI on files you did not touch. Prefer the installed binary over `npx prettier`, which re-resolves the package against the npm registry on every run and fails outright behind an authenticated mirror — that failure is why this step has previously been skipped rather than run.
   - **Docker Build:** Validate the agent runner Dockerfile by building it locally (e.g., `docker build --platform linux/amd64 -f deploy/docker/Dockerfile --target platform .`). Keep `--platform linux/amd64`: the base images are multi-arch and deployment targets are amd64 GKE nodes, so a bare build on an arm64 machine produces an image that cannot run on the cluster (#560).
+  - **Image Layer Budget:** If you add a `RUN` or `COPY` to `deploy/docker/Dockerfile`, build the `credential-proxy` target with `-t credential-proxy:latest` and run `python3 scripts/check_image_layers.py`. Docker's overlay2 driver stops mounting at 128 layers and that chain is the longest in the file; because buildx has no such limit, an over-budget image passes every PR build and fails only in Cloud Build, on main, after merge (#658). CI runs the same check in `docker-build.yml`.
   - **Operator Code:** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to ensure compilation succeeds.
 
 ## Automated Review After Opening a Pull Request
@@ -139,22 +220,56 @@ Opening a pull request is therefore not the end of the task. The bot introduces 
 on every pull request it picks up, and that comment states its current contract; if it disagrees
 with what follows, believe the comment and fix this section.
 
+**What any reviewer reads first — human or agent, this bot included.** Read the pull request's
+**Self-Review** section before the diff. It tells you what the author already looked for, what they
+found, and what they consciously chose not to fix, so the review can start where theirs stopped.
+Three things to do with it:
+
+- **Absent, empty, or a bare "reviewed it"** → say so as the first thing you report. The section is
+  required (see Pull Request Hygiene) and an unanswered one is the finding.
+- **A claim it makes that the diff does not support** → that is a finding in its own right, and a
+  more serious one than most defects: it misdirects every reader after you.
+- **A finding the author rejected with a reason** → engage with the reason. Restating the finding
+  as though the reason were not there wastes both of you.
+
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
 start another review** — an active branch would otherwise pay for a re-read on every push. To get a
 fresh review of the current commit, comment `/review` on a line of its own (repository owners,
-members, and collaborators only). The `agent:ignore` label opts a pull request out entirely and
-outranks `/review`.
+members, and collaborators only) — that pass is the strict one, only what the bot is certain of,
+while `/review all` re-reads at the width of the automatic first review and includes findings it
+believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
+outranks both.
 
-**How to read it.** A 👀 reaction means the review started; a posted review means it finished — the
-review usually lands a couple of minutes after the pull request opens. A review that runs always
-reports back, so a one-line "no findings" is a result, not silence. Findings arrive as inline
-comments badged 🔴 High, 🟠 Medium, or 🟡 Low; findings the bot could not anchor to a changed line
-appear in the summary body under **Findings outside this diff**. A 👀 with nothing following it is a
-bug in the bot, not a verdict.
+**How to read it.** A 👀 reaction means the review started; a posted review means it finished.
+Across #630–#699 the 👀 landed within seconds of the trigger, and the review a median of **9
+minutes** after that — 15 minutes at the 90th percentile, 45 in the slowest of the 54 reviews in
+that range (#634, an XXL diff). A `/review` re-read is no quicker: median 11 minutes, and none of
+the 42 measured took longer than 22. A review that runs always reports back, so a one-line "no
+findings" is a result, not silence. Findings arrive as inline comments badged 🔴 High, 🟠 Medium, or
+🟡 Low; findings the bot could not anchor to a changed line appear in the summary body under
+**Findings outside this diff**. A 👀 with nothing following it is a bug in the bot, not a verdict —
+it happened to 3 of the 57 pull requests picked up in that range (#647, #649, #679), which is rare
+enough to be worth waiting through and common enough that you must not wait forever.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
-and **offer to wait for it** instead of reporting the work as finished. If the user accepts, poll
-until the review appears:
+and **offer to wait for it** instead of reporting the work as finished. If the user accepts, poll on
+a schedule rather than continuously — nothing is worth checking in the first 5 minutes, then once a
+minute. Expect the review by 15 minutes; at 30 with nothing posted, stop waiting and tell the user
+the bot dropped this one. Nothing retries on its own, so ask whether to spend a trigger — and say
+which: the review that went missing was a first-review-width one, so `/review all` is what replaces
+it, and `/review` narrows the retry to what the bot is certain of. Two things make a wait read
+wrong:
+
+- **The 👀 does not come back.** A reaction is one per user, so the eyes from the first review are
+  still sitting there when you comment `/review` or mark a draft ready. Only the review list moves:
+  note how many bot reviews exist _before_ you re-trigger, and wait for that count to change rather
+  than for a reaction that already fired.
+- **A draft is not waiting on anything.** The trigger is ready-for-review, not opened. Every
+  multi-hour gap in the range above was a draft sitting unreviewed by design — #652 for 12 hours,
+  #659 for 18 — and measured from the ready event each was picked up in seconds. Do not start the
+  clock, or report the bot broken, while the pull request is still a draft.
+
+Poll with:
 
 ```bash
 # Both commands name gke-labs/kube-agents explicitly: PR branches live on forks,
@@ -187,4 +302,68 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ```
 
 After pushing fixes, remember that the push alone does not re-trigger anything: ask the user whether
-to comment `/review` for another pass.
+to comment `/review` for another pass — `/review` to confirm the fixes against a strict read,
+`/review all` when the branch changed enough that it deserves a first-review-width look again. Then
+wait for it the same way, counting reviews rather than watching for a second 👀.
+
+**Then resolve the conversations.** `main` requires every conversation on a pull request to be
+resolved before it can merge, and the triage sweep counts an open thread as work outstanding on the
+author — so a branch whose fixes have all landed still sits blocked, and still shows up as the
+author's problem rather than the reviewers'. Clearing the threads is part of finishing the change,
+not a courtesy someone else will get to. Do it once the fixes are pushed and the last `/review` pass
+has settled: a fresh review opens fresh threads, so resolving before it lands means doing it twice.
+
+Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
+the fix is on the pull request head and you can name the commit, or the finding is factually wrong
+and you have said why. Check that second one against the merge target as it stands now, not against
+your working copy — a finding that looks wrong because the file it cites does not say that is very
+often a stale checkout rather than a wrong finding. Anything short of that stays open. A judgment call, a reviewer asking for
+something you chose not to do, a rebuttal nobody has answered yet — reply and leave it to them.
+Resolving says the conversation is finished; it is not a way to end a disagreement.
+
+Reply first, always. A resolved thread collapses, so the reviewer who opened it may never expand it
+again, and the reply is the only record of what happened. Name what changed and the commit that
+changed it. Then resolve:
+
+```bash
+# Every unresolved thread, with both ids you need: resolveReviewThread takes the
+# thread's node id, while the reply endpoint above takes the first comment's
+# databaseId. REST returns only the latter, which is why this one is GraphQL.
+gh api graphql -f query='
+query($pr: Int!) {
+  repository(owner: "gke-labs", name: "kube-agents") {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100) {
+        nodes {
+          id isResolved isOutdated viewerCanResolve path line
+          comments(first: 20) { nodes { databaseId author { login } body } }
+        }
+      }
+    }
+  }
+}' -F pr=<number> --jq '.data.repository.pullRequest.reviewThreads.nodes[]
+  | select(.isResolved | not)
+  | "\(.path):\(.line // "outdated") thread \(.id) canResolve=\(.viewerCanResolve)
+  reply to \(.comments.nodes[0].databaseId) — \(.comments.nodes[0].author.login): \(.comments.nodes[0].body | split("\n")[0])
+  replies so far: \(.comments.nodes | length - 1)"'
+
+# Per thread, once the reply naming the fix is posted:
+gh api graphql -f query='
+mutation($thread: ID!) {
+  resolveReviewThread(input: {threadId: $thread}) { thread { isResolved } }
+}' -f thread='<PRRT_...>'
+```
+
+Four ways that goes wrong quietly:
+
+- `first: 100` is a cap, not a promise. A long-lived pull request can carry more threads than that;
+  page for the rest, or say you only looked at the first hundred rather than reporting the branch
+  clear.
+- `line` is `null` once a thread's line falls out of the diff. Outdated is not addressed — the code
+  moved, which says nothing about whether the finding still holds. Read the thread.
+- `viewerCanResolve` is the authoritative answer to whether your token can resolve at all; it
+  differs between a maintainer and a contributor pushing from a fork. Check it before you reply,
+  because a mutation that fails after the reply is posted leaves a half-answered thread that looks
+  handled.
+- `unresolveReviewThread`, same `threadId`, is the undo. Use it the moment the user disagrees with
+  something you resolved.
