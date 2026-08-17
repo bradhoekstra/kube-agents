@@ -169,12 +169,24 @@ Then offer three choices: **skip it**, **review only what landed since `<sha>`**
 commit, the one the query prints as `lastbot … commit=` — or **a full pass anyway**. I decide —
 coverage is a suggestion, and "the bot found nothing" is not a review verdict of yours.
 
-One case is empty and you can say so from here: `since: nothing, the review is at the tip`. Offer
-two choices rather than three. Do **not** say it of the other way a review can be current, a tail of
-presumed base merges. That is the case where the option earns its keep — a conflicted merge's
-hand-written resolution is precisely the code no review has read, and from up here it looks exactly
-like a clean one. It may still turn out to hold nothing, but that is a result Phase 3 reports after
-running `git show --cc` in a worktree, not a promise you can make before spending it.
+Two of the filter's three `since:` outcomes take the narrowed option off the table, and for opposite
+reasons. Offer two choices, not three, when the line reads either of these:
+
+- **`since: nothing, the review is at the tip`** — there is nothing after the review to narrow to.
+- **`since: review commit is not among those N commits`** — there is no anchor at all. That commit
+  was force-pushed away, or the branch outran the `commits(last: 100)` window, and either way
+  "everything since `<sha>`" names a starting point that is not on the branch. Phase 1 fetches only
+  `refs/pull/<N>/head`, so the SHA would not even resolve in the worktree, and `git log
+"$SINCE_SHA"..pr<N>` fails with `fatal: bad revision` on empty stdout — indistinguishable, to a
+  subagent reading stdout, from a delta that is genuinely empty. This is the case a stale verdict
+  exists for: offer the full pass, and say the anchor is gone rather than that there is nothing to
+  see.
+
+Do **not** withhold it for the remaining case, a tail of presumed base merges. That is where the
+option earns its keep — a conflicted merge's hand-written resolution is precisely the code no review
+has read, and from up here it looks exactly like a clean one. It may still turn out to hold nothing,
+but that is a result Phase 3 reports after running `git show --cc` in a worktree, not a promise you
+can make before spending it.
 
 Fan out only for what I keep, and tell each subagent its verdict, its mode, and — for a narrowed
 pass — the SHA, which it has no way to recover from a decision I made in the main loop.
@@ -402,16 +414,29 @@ Two substitutions for this context:
   `git diff "$SINCE_SHA"..pr<N>`, is the wrong one: every base-branch commit an intervening merge
   pulled in lands inside it — on #675 that is 250 files and 25,323 insertions of already-reviewed
   work, more than the full pass I declined rather than less. The three-dot form is no escape, being
-  the identical diff whenever `$SINCE_SHA` is an ancestor of `pr<N>`, which here it always is. Read
-  the commits instead, and against `pr<N>` rather than `HEAD`, since `HEAD` after a clean merge
-  carries a merge commit Phase 1b created seconds ago that no author wrote:
+  the identical diff whenever `$SINCE_SHA` is an ancestor of `pr<N>` — which is a precondition to
+  check, not a property to assume. Read the commits instead, and against `pr<N>` rather than `HEAD`,
+  since `HEAD` after a clean merge carries a merge commit Phase 1b created seconds ago that no
+  author wrote:
 
   ```bash
+  # Precondition. Phase 1 fetched only refs/pull/<N>/head, so a rebased-away anchor is
+  # not in this worktree at all: every command below would then exit 128 on empty stdout.
+  git merge-base --is-ancestor "$SINCE_SHA" pr<N> || exit 1
+
   git log "$SINCE_SHA"..pr<N> --no-merges --not "$BASE_REF" --format=%H   # the author's own commits
   git show <sha>                                                          # one per commit above
   git log "$SINCE_SHA"..pr<N> --merges --format=%H                        # every merge in between
   git show --cc <merge-sha>                                               # one per merge above
   ```
+
+  **Stop if the precondition fails** and report `status: skipped`, reason `since-anchor <sha> is not
+an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in exactly that case,
+  so reaching here means either it did not, or the branch was force-pushed between its query and
+  your fetch. Do not fall back to a full pass I did not ask for, and above all do not read the empty
+  stdout as an empty delta: `fatal: bad revision` and "nothing landed since" are the same two blank
+  lines, and Phase 2's skip conditions — which would otherwise have caught a stale anchor — are
+  disabled for this mode.
 
   `--not "$BASE_REF"` earns its place for the reason Phase 2 gives. `--cc` is what this mode exists
   for: it prints only the hunks a merge resolved by hand, so empty output is the clean base merge
@@ -419,9 +444,10 @@ Two substitutions for this context:
   pass. Those hunks together are what the skill's step 2 means by the range — its angles apply to
   them, read as always at their state in `pr<N>` rather than as isolated hunks.
 
-  **Both lists coming back empty is a real outcome**, and #675 is one — no author commits, and a
-  merge whose `--cc` is bare. Report the delta as empty and say what you ran; do not go looking for
-  something to say, and do not quietly widen to the full diff I did not ask for. A defect you happen
+  **Both lists coming back empty is a real outcome once the precondition has passed**, and #675 is
+  one — no author commits, and a merge whose `--cc` is bare. Report the delta as empty and say what
+  you ran; do not go looking for something to say, and do not quietly widen to the full diff I did
+  not ask for. A defect you happen
   to notice outside the delta is still worth reporting, but you have not read the rest of the diff,
   so do not imply you have — Phase 4 records the scope.
 
