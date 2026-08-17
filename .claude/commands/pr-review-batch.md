@@ -15,9 +15,10 @@ Each subagent owns exactly one PR end to end and reports back a short structured
 review any PR yourself in the main loop — your job is to pre-flight, fan out, then relay.
 
 Give each subagent everything under **[Subagent instructions (per PR)](#subagent-instructions-per-pr)**
-verbatim, with `<N>` replaced by its PR number, plus the PR's pre-flight verdict and the review mode
-I chose for it. Phase −1 is yours and stops at that heading: it asks me a question, which a subagent
-cannot do, so handing it on would either hang the subagent or have it answer on my behalf.
+verbatim, with `<N>` replaced by its PR number, plus the PR's pre-flight verdict, the review mode I
+chose for it, and the SHA that mode starts from when it is a narrowed one. Phase −1 is yours and
+stops at that heading: it asks me a question, which a subagent cannot do, so handing it on would
+either hang the subagent or have it answer on my behalf.
 
 ---
 
@@ -164,10 +165,19 @@ the evidence in front of me before you spend anything:
 - the Live-validation section in one line — what the author says they exercised;
 - for `partial`, the single thing that is missing.
 
-Then offer three choices: **skip it**, **review only what landed since `<sha>`** (the point of the
-`partial` case; empty by construction when the review is current), or **a full pass anyway**. I
-decide — coverage is a suggestion, and "the bot found nothing" is not a review verdict of yours.
-Fan out only for what I keep, and tell each subagent its verdict and mode.
+Then offer three choices: **skip it**, **review only what landed since `<sha>`** — the bot review's
+commit, the one the query prints as `lastbot … commit=` — or **a full pass anyway**. I decide —
+coverage is a suggestion, and "the bot found nothing" is not a review verdict of yours.
+
+One case is empty and you can say so from here: `since: nothing, the review is at the tip`. Offer
+two choices rather than three. Do **not** say it of the other way a review can be current, a tail of
+presumed base merges. That is the case where the option earns its keep — a conflicted merge's
+hand-written resolution is precisely the code no review has read, and from up here it looks exactly
+like a clean one. It may still turn out to hold nothing, but that is a result Phase 3 reports after
+running `git show --cc` in a worktree, not a promise you can make before spending it.
+
+Fan out only for what I keep, and tell each subagent its verdict, its mode, and — for a narrowed
+pass — the SHA, which it has no way to recover from a decision I made in the main loop.
 
 ## Subagent instructions (per PR)
 
@@ -211,6 +221,13 @@ Set `BASE_REF` once to whichever applies and use `$BASE_REF` everywhere below.
 
 `$MAIN_ROOT` is the top of the primary checkout even when you are standing inside a worktree; it is
 where saved reviews live so that every run — and every teammate — sees the same history.
+
+Two more variables come from the main loop rather than from here, and carry the same way:
+`$REVIEW_MODE` is `full` or `since`, and in `since` mode `$SINCE_SHA` is the commit Phase −1 found
+already reviewed. Phase 3 picks what it reads off them and Phase 4 records them. **Spawned without
+a mode, you are `full`** — that is what the `review` verdict hands over, and it is the common case.
+Never infer a narrower one from the PR's history yourself: narrowing is mine to authorise, and a
+review that silently reads less than the whole diff still saves a file the next run trusts.
 
 ### Phase 1 — Worktree
 
@@ -316,6 +333,13 @@ matching this PR.
   skip. Phase 1b has already merged the base locally by this point, which makes the unfiltered range
   wrong even when the author pushed nothing at all.
 
+Both of those conditions read the saved review's **scope** as well as its SHA, and skip only on
+`scope: full`. A file recording `scope: since <sha>` covers the commits after that SHA and nothing
+before them, so a matching head SHA there says that nothing new has landed, not that the diff was
+ever read whole — skipping on it would let one narrowed pass suppress the full one permanently.
+Proceed instead, and say in your report that the prior review was a narrowed one and what it
+covered. A saved review with no scope field predates the narrowed mode and was a full pass.
+
 A merge conflict is **not** a skip reason. Neither is an unmergeable `mergeStateStatus`.
 
 **Do not re-litigate coverage.** Phase −1 already weighed the bot's verdict and the author's
@@ -360,8 +384,37 @@ Phase 4 already read the saved-review directory.
 
 Two substitutions for this context:
 
-- **The diff range is the one Phase 1b settled on** — `$BASE_REF...HEAD` after a clean merge, or
-  `$BASE_REF...pr<N>` when the merge conflicted and was aborted. Never `main` on its own.
+- **The diff range follows `$REVIEW_MODE`.** In `full` mode it is the one Phase 1b settled on —
+  `$BASE_REF...HEAD` after a clean merge, or `$BASE_REF...pr<N>` when the merge conflicted and was
+  aborted. Never `main` on its own.
+
+  `since` mode has **no such range, and you must not invent one.** The obvious answer,
+  `git diff "$SINCE_SHA"..pr<N>`, is the wrong one: every base-branch commit an intervening merge
+  pulled in lands inside it — on #675 that is 250 files and 25,323 insertions of already-reviewed
+  work, more than the full pass I declined rather than less. The three-dot form is no escape, being
+  the identical diff whenever `$SINCE_SHA` is an ancestor of `pr<N>`, which here it always is. Read
+  the commits instead, and against `pr<N>` rather than `HEAD`, since `HEAD` after a clean merge
+  carries a merge commit Phase 1b created seconds ago that no author wrote:
+
+  ```bash
+  git log "$SINCE_SHA"..pr<N> --no-merges --not "$BASE_REF" --format=%H   # the author's own commits
+  git show <sha>                                                          # one per commit above
+  git log "$SINCE_SHA"..pr<N> --merges --format=%H                        # every merge in between
+  git show --cc <merge-sha>                                               # one per merge above
+  ```
+
+  `--not "$BASE_REF"` earns its place for the reason Phase 2 gives. `--cc` is what this mode exists
+  for: it prints only the hunks a merge resolved by hand, so empty output is the clean base merge
+  Phase −1 could only presume it was, and non-empty output is the unreviewed code that justified the
+  pass. Those hunks together are what the skill's step 2 means by the range — its angles apply to
+  them, read as always at their state in `pr<N>` rather than as isolated hunks.
+
+  **Both lists coming back empty is a real outcome**, and #675 is one — no author commits, and a
+  merge whose `--cc` is bare. Report the delta as empty and say what you ran; do not go looking for
+  something to say, and do not quietly widen to the full diff I did not ask for. A defect you happen
+  to notice outside the delta is still worth reporting, but you have not read the rest of the diff,
+  so do not imply you have — Phase 4 records the scope.
+
 - **Angle J already has an author to filter by**, which the skill cannot assume:
   `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
   review comments on any sibling touching adjacent paths.
@@ -382,13 +435,16 @@ your report back — everywhere.
 Save the review to `$MAIN_ROOT/.claude/pr-reviews/pr-<N>-<short-slug>.md`, matching the structure of
 the files already in that directory:
 
-- header block: title, author, review date, **head SHA reviewed** (needed for the skip check on the
-  next run), base branch and base SHA, diff stat, worktree path;
+- header block: title, author, review date, **head SHA reviewed**, **scope** — `full`, or
+  `since <sha>` — base branch and base SHA, diff stat, worktree path. The next run's skip check
+  needs both of the bold ones: it trusts a matching SHA only where the scope says the whole diff was
+  read, so a narrowed pass that records only the SHA reads exactly like a full one and cancels it;
 - **Intent** — the one-sentence claim from Phase 2b, so the next reader knows what the findings were
   measured against;
 - **Verdict** — can this merge as is, yes or no, with the blocking items named, and what the
   `mergeStateStatus` actually reflects. When the PR conflicts with its base, say so here and state
-  that the review covers the PR as authored, not as merged;
+  that the review covers the PR as authored, not as merged. In `since` mode say that too: the
+  verdict speaks for the commits you read, not for the pull request;
 - **Checks run** — commands executed and what they showed;
 - **Findings** — severity-ordered, each with anchor, description, failure scenario, and verdict;
 - **Not findings, for the record** — things that look wrong but are fine, so the next reader does
@@ -404,6 +460,7 @@ Report back to the main agent, and nothing more than this:
 pr: <N>
 status: reviewed | skipped
 reason: <one line, only when skipped>
+scope: full | since <sha>
 mergeable: yes | no
 block_reason: ci | review-required | labels | conflicts | none
 conflicts: none | <comma-separated paths>
@@ -420,8 +477,9 @@ blockers: <one line each, file:line — claim>
 
 Print one compact table across all PRs — number, title, verdict, block reason, blocker count,
 review file path — then the blocker one-liners grouped by PR. Call out explicitly any PR that was
-skipped and why, and any that was reviewed against a conflicting base (those reviews cover the PR
-as authored, not as merged).
+skipped and why, any that was reviewed against a conflicting base (those reviews cover the PR as
+authored, not as merged), and any reviewed at a narrowed scope, naming the SHA it started from —
+those cover the commits since that SHA and say nothing about the rest of the diff.
 
 Do not post to GitHub unless I ask. When I do, post findings only — no verdict, no CI summary, no
 closing section — and tell me whether you posted it as an issue comment or a formal review.
