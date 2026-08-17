@@ -255,7 +255,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope
 # minute-ly ticker evicts a daily watchdog's only row inside 17 hours.
 # Retention becomes per job, with a global ceiling and a per-job floor.
 #
-# Must stay AFTER the cron_tick_lock_scope block: two of the fourteen anchors
+# Must stay AFTER the cron_tick_lock_scope block: two of the seventeen anchors
 # are text that patch inserts.
 COPY --chmod=0644 deploy/docker/patches/cron_skip_ledger.py /opt/hermes/tools/cron_skip_ledger.py
 COPY deploy/docker/patches/apply_cron_skip_ledger.py \
@@ -272,6 +272,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/apply_cron_skip_ledger.p
     grep -q "reason=SKIP_INTERPRETER_SHUTDOWN" /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_DISPATCH_CLAIM_REJECTED" /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_MISSED_WINDOW" /opt/hermes/cron/jobs.py && \
+    grep -q "reason=SKIP_ALREADY_RUNNING," /opt/hermes/tools/cronjob_tools.py && \
+    grep -q "reason=SKIP_ALREADY_RUNNING_ELSEWHERE" /opt/hermes/tools/cronjob_tools.py && \
     grep -q '"unknown", "skipped"}' /opt/hermes/agent/monitoring/cron_health.py && \
     ! grep -q "LIMIT -1 OFFSET" /opt/hermes/cron/executions.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/verify_cron_skip_ledger.py && \

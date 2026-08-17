@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Wire tools/cron_skip_ledger.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Fourteen anchored
-replacements across four files, with the same guarantee as every other patch in
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Seventeen anchored
+replacements across five files, with the same guarantee as every other patch in
 that Dockerfile: each anchor must be found the exact number of times expected,
 each edited file must still parse, and anything else fails the build loudly
 rather than shipping a half-patched image.
 
 **Must run after ``apply_cron_tick_lock_scope.py``.** Two of the anchors here
 are text that patch inserts — the cross-process ``_job_locks.claim`` guard in
-``tick`` — so applying this one first would fail on a missing anchor rather
-than silently mis-apply, but the ordering is still load-bearing and the
-Dockerfile records it.
+``tick``, and its counterpart in ``_run_claimed_job`` — so applying this one
+first would fail on a missing anchor rather than silently mis-apply, but the
+ordering is still load-bearing and the Dockerfile records it.
 
 Why each edit is needed is documented in the module docstring of
 ``deploy/docker/patches/cron_skip_ledger.py``. Usage::
@@ -452,6 +452,104 @@ HEALTH_FLUSH_PATCHED = '''        # kube-agents patch: 'skipped' is terminal, so
             target.flush(timeout=1.0)
 '''
 
+# --- tools/cronjob_tools.py: the dispatch path loses occurrences too --------
+#
+# Both refusals in ``_run_claimed_job`` sit after ``claim_job_for_fire`` has
+# advanced ``next_run_at``, so each one drops a scheduled occurrence for a run
+# that never happened — the same shape as the two guards in ``tick`` above, and
+# recorded with the same two reasons.
+#
+# This became true at v2026.8.13. Before it, upstream had no in-flight dedupe
+# here, and the kube-agents flock was taken *before* the CAS precisely so that a
+# refusal cost nothing. The split into ``_run_claimed_job`` gave the run half
+# four call sites, so the flock had to follow the run; the occurrence loss is
+# the price, and ``tools/cron_skip_ledger.py`` exists to stop that price being
+# paid silently.
+#
+# ``source="direct"`` rather than the ``"builtin"`` the tick guards use:
+# ``run_one_job`` — the function these refusals stop us reaching — records its
+# own executions as ``direct``, so a skip here is a refused manual/dispatched
+# fire and reads as one in ``hermes cron runs``.
+
+TOOLS_IMPORT = (
+    "    resume_job,\n"
+    "    update_job,\n"
+    ")\n"
+)
+
+TOOLS_IMPORT_PATCHED = (
+    "    resume_job,\n"
+    "    update_job,\n"
+    ")\n"
+    "\n"
+    "# kube-agents patch: a dispatched occurrence that never ran used to leave\n"
+    "# nothing behind but a return value the caller may not be reading. See\n"
+    "# tools/cron_skip_ledger.py.\n"
+    "from tools.cron_skip_ledger import (\n"
+    "    SKIP_ALREADY_RUNNING,\n"
+    "    SKIP_ALREADY_RUNNING_ELSEWHERE,\n"
+    "    record_skip,\n"
+    ")\n"
+)
+
+# Upstream's own in-process dedupe, new in v2026.8.13. The in-process mirror of
+# the flock below, so it takes the in-process reason — exactly as tick's pair
+# does.
+TOOLS_REGISTER_GUARD = (
+    "        if not try_register_running_job(job_id):\n"
+    "            return {\n"
+)
+
+TOOLS_REGISTER_GUARD_PATCHED = (
+    "        if not try_register_running_job(job_id):\n"
+    "            # kube-agents patch: the claim above already advanced\n"
+    "            # next_run_at, so this refusal costs a scheduled occurrence.\n"
+    "            # See tools/cron_skip_ledger.py.\n"
+    "            record_skip(\n"
+    "                job_id,\n"
+    '                source="direct",\n'
+    "                reason=SKIP_ALREADY_RUNNING,\n"
+    "                detail=(\n"
+    '                    "A run of this job was already in flight in this "\n'
+    '                    "process when the fire was claimed; the occurrence was "\n'
+    '                    "dropped, not queued."\n'
+    "                ),\n"
+    "            )\n"
+    "            return {\n"
+)
+
+# Inserted by apply_cron_tick_lock_scope.py — this applier must run after it.
+TOOLS_LOCK_GUARD = (
+    "        _run_lock = _job_locks.claim(job_id)\n"
+    "        if _run_lock is None:\n"
+    "            _registered = False\n"
+    "            release_running_job(job_id)\n"
+    "            return {\n"
+)
+
+TOOLS_LOCK_GUARD_PATCHED = (
+    "        _run_lock = _job_locks.claim(job_id)\n"
+    "        if _run_lock is None:\n"
+    "            _registered = False\n"
+    "            release_running_job(job_id)\n"
+    "            # kube-agents patch: same reasoning as the register guard\n"
+    "            # above, one process out. The returned error reaches a caller\n"
+    "            # on a synchronous run, but a background dispatch hands it to a\n"
+    "            # daemon worker with nobody reading, so the ledger is the only\n"
+    "            # durable record. See tools/cron_skip_ledger.py.\n"
+    "            record_skip(\n"
+    "                job_id,\n"
+    '                source="direct",\n'
+    "                reason=SKIP_ALREADY_RUNNING_ELSEWHERE,\n"
+    "                detail=(\n"
+    '                    "Another process held this job\'s run lock when the "\n'
+    '                    "fire was claimed; the occurrence was dropped, not "\n'
+    '                    "queued."\n'
+    "                ),\n"
+    "            )\n"
+    "            return {\n"
+)
+
 # (relative path, [(anchor, replacement, expected occurrences)])
 PATCHES = (
     (
@@ -484,6 +582,14 @@ PATCHES = (
             (HEALTH_IMPORT, HEALTH_IMPORT_PATCHED, 1),
             (HEALTH_ERROR_CLASS, HEALTH_ERROR_CLASS_PATCHED, 1),
             (HEALTH_FLUSH, HEALTH_FLUSH_PATCHED, 1),
+        ),
+    ),
+    (
+        "tools/cronjob_tools.py",
+        (
+            (TOOLS_IMPORT, TOOLS_IMPORT_PATCHED, 1),
+            (TOOLS_REGISTER_GUARD, TOOLS_REGISTER_GUARD_PATCHED, 1),
+            (TOOLS_LOCK_GUARD, TOOLS_LOCK_GUARD_PATCHED, 1),
         ),
     ),
 )
