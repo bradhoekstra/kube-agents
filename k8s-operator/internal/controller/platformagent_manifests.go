@@ -2474,6 +2474,23 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 // adapter and admin_console — and the Authorization: Bearer form is theirs too.
 // Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
 // 1-second default timeout is far too tight for a container this busy at boot.
+//
+// The exit-7 branch is what makes this probe safe above one replica. At
+// replicas > 1 the container runs leader_elect.py, and a pod that does not hold
+// the lease never starts `hermes gateway run` at all — nothing binds 8642, so a
+// plain curl probe would fail every attempt and kubelet would kill a standby
+// that is doing exactly its job. curl exits 7 for "could not connect", which is
+// precisely that state, so it counts as healthy while leader election is on.
+// It is deliberately not tolerated on a single-replica agent, where nothing
+// listening means the gateway is down.
+//
+// Tolerating 7 does not hide a dead leader: leader_elect.py exits with the
+// gateway's own status when the process it started dies, so the container
+// restarts rather than lingering unreachable. And it is a connection refusal
+// only — a gateway that answers with 5xx exits 22, and a hung one 28, both of
+// which still fail. Detecting the standby by looking for the process instead
+// would not work: `hermes` is a shim that execs `s6-suid hermes $REAL "$@"`, so
+// the string "hermes gateway run" never appears in any command line to match.
 func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 	return &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{
@@ -2482,7 +2499,10 @@ func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
 					"sh", "-c",
 					`curl --fail --silent --show-error -o /dev/null ` +
 						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
-						`http://127.0.0.1:8642/api/sessions?limit=1`,
+						`http://127.0.0.1:8642/api/sessions?limit=1; rc=$?; ` +
+						`[ "$rc" -eq 0 ] && exit 0; ` +
+						`[ "$rc" -eq 7 ] && [ "$ENABLE_LEADER_ELECTION" = "true" ] && exit 0; ` +
+						`exit "$rc"`,
 				},
 			},
 		},
@@ -3188,40 +3208,28 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 
 // buildPlatformPDB generates the PodDisruptionBudget manifest for PlatformAgent.
 //
-// The budget is derived from the resolved replica count rather than fixed,
-// because the two cases need opposite fields. At two or more replicas a
-// minAvailable of 1 keeps one pod through a node drain. At one — the default,
-// and the shape a Recreate strategy and an RWO data volume imply — the same
-// minAvailable would instead leave zero allowed disruptions, so `kubectl drain`
-// on that node never completes and node-pool upgrades, auto-repair, and
-// autoscaler scale-down all stall until a human deletes this object. That is
-// the critical `blocking-pdb` finding in the Workload Reliability Audit this
-// project ships (agents/platform/governance/obtainability_audit_sop.md §3.4);
-// emitting one from the operator would put it on every install at once.
-// maxUnavailable: 1 is the honest budget for a singleton: no protection to
-// give, and an explicit statement that the pod may be evicted.
+// maxUnavailable: 1 at every replica count, which is the shape the Workload
+// Reliability Audit this project ships requires:
+// agents/platform/governance/obtainability_audit_sop.md §3.3 — "Always
+// maxUnavailable, never minAvailable ... maxUnavailable: 1 is structurally safe
+// at any replica count >= 2."
+//
+// The reason it is unconditional rather than derived from the replica count is
+// that a budget keyed to replicas is only safe while the replica count holds.
+// minAvailable: 1 against one replica leaves zero allowed disruptions, so
+// `kubectl drain` never completes and node-pool upgrades, auto-repair, and
+// autoscaler scale-down all stall until a human deletes this object — the
+// critical `blocking-pdb` finding of §3.4. Deriving the field from the resolved
+// count avoids that on the way up but not on the way down: a scaled-out agent
+// carrying minAvailable: 1 that is later scaled back to one produces exactly
+// that deadlock, and nothing reconciles the budget at the moment someone runs
+// `kubectl scale`.
 //
 // The selector is the Deployment's, NOT the Service's. Above, a multi-replica
 // Service narrows to kubeagents.io/is-leader so only the leader serves; a PDB
-// carrying that label would budget the single leader pod instead of the
-// Deployment's pods, and at minAvailable: 1 would block every drain no matter
-// how far the agent was scaled out.
+// carrying that label would budget the single leader pod rather than the
+// Deployment's pods.
 func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
-	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
-
-	spec := policyv1.PodDisruptionBudgetSpec{
-		Selector: &metav1.LabelSelector{
-			MatchLabels: map[string]string{
-				"app": agent.Name + "-gateway",
-			},
-		},
-	}
-	if replicas > 1 {
-		spec.MinAvailable = ptr.To(intstr.FromInt32(1))
-	} else {
-		spec.MaxUnavailable = ptr.To(intstr.FromInt32(1))
-	}
-
 	return &policyv1.PodDisruptionBudget{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "policy/v1",
@@ -3231,7 +3239,14 @@ func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptio
 			Name:      agent.Name,
 			Namespace: agent.Namespace,
 		},
-		Spec: spec,
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable: ptr.To(intstr.FromInt32(1)),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": agent.Name + "-gateway",
+				},
+			},
+		},
 	}
 }
 
