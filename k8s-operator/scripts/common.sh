@@ -278,17 +278,30 @@ warn_on_registry_prefix_mismatch() {
 # ':latest', which the provisioner never builds or pushes.
 # A reference that already names a tag or digest is returned untouched, so
 # this is safe to apply to a user-supplied override.
+#
+# This is the shell twin of resolveAgentImage() in
+# k8s-operator/internal/controller/manifest_helpers.go, which applies the same
+# split-at-the-last-slash rule to CR-supplied images. The two differ on purpose
+# when no tag is available: the operator is serving a live CR and falls back to
+# "latest", while a provisioning run can still fail and so does, loudly. Change
+# one and check the other.
 qualify_image_ref() {
   local ref="$1"
   local tag="${2:-${IMAGE_TAG:-}}"
+  if [ -z "$ref" ]; then
+    print_error "qualify_image_ref: called with an empty image reference"
+    return 1
+  fi
   # Only the final path segment can hold the tag — a registry host may carry
   # a port, as in 'registry.example.com:5000/kube-agents/platform-agent'.
   case "${ref##*/}" in
     *:* | *@*) ;;
     *)
-      if [ -n "$tag" ]; then
-        ref="${ref}:${tag}"
+      if [ -z "$tag" ]; then
+        print_error "qualify_image_ref: no tag available for bare reference '${ref}' (IMAGE_TAG is unset). Set IMAGE_TAG, or pin the reference with an explicit tag or digest."
+        return 1
       fi
+      ref="${ref}:${tag}"
       ;;
   esac
   echo "$ref"

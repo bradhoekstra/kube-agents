@@ -60,11 +60,16 @@ scripts warn when an export is ignored or a saved image no longer matches the pr
 
 `IMAGE_TAG` is the deliberate exception to `vars.sh` reuse: tags change between deploys, so
 `provision.sh` asks for it once per pipeline run (or takes an exported `IMAGE_TAG`) and shares
-it with every step without saving it. The saved `*_IMAGE` values are therefore bare
-repository paths. Step 03 also forwards
-`PLATFORM_AGENT_IMAGE`, `CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE` overrides to the
-operator Deployment, attaching the current `IMAGE_TAG` to any kube-agents reference that names
-neither a tag nor a digest (`FLUENT_BIT_IMAGE` is left alone — it names an upstream release).
+it with every step without saving it. The saved `*_IMAGE` values are therefore bare repository
+paths, and the step that consumes one attaches the current `IMAGE_TAG` through
+`qualify_image_ref` (`common.sh`) unless the value already names a tag or a digest — so pinning
+`OPERATOR_IMAGE=…/k8s-operator:v1.4.0` in `vars.sh` survives a run at a different `IMAGE_TAG`.
+Step 03 also forwards `PLATFORM_AGENT_IMAGE`, `CREDENTIAL_PROXY_IMAGE`, and `FLUENT_BIT_IMAGE`
+overrides to the operator Deployment on the same terms; `FLUENT_BIT_IMAGE` is the exception, as
+it names an upstream release whose tag has nothing to do with `IMAGE_TAG`. `install.sh` writes
+no `CREDENTIAL_PROXY_IMAGE`: the operator derives the sidecar from each CR's own agent image,
+and this env var overrides that derivation for every agent in the cluster, so it is for pinning
+the sidecar by hand.
 See the docs site's
 [Docker images page](../../docs/site/src/content/docs/deploy/docker-images.md) for the list of
 images to mirror and override precedence.

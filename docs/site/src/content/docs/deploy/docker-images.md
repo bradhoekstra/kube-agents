@@ -129,10 +129,12 @@ The registry is configurable at three layers, from broadest to most specific:
    is ignored or a saved image no longer matches the effective prefix.
 
    `IMAGE_TAG` is per-run and is deliberately not saved to `vars.sh`, so the `*_IMAGE`
-   variables normally hold a bare repository path. `provision_03` attaches the current
-   `IMAGE_TAG` to any of them that names neither a tag nor a digest; set one explicitly
-   (`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:v1.4.0`) to pin a
-   reference independently of `IMAGE_TAG`.
+   variables normally hold a bare repository path. The step that consumes one attaches the
+   current `IMAGE_TAG` to it when it names neither a tag nor a digest — `provision_03` for
+   the operator, agent, and credential-proxy references, `provision_11` for the replay
+   proxy. `FLUENT_BIT_IMAGE` is excluded, because it names an upstream release. Set a value
+   explicitly (`OPERATOR_IMAGE=registry.example.com/kube-agents/k8s-operator:v1.4.0`) to pin
+   a reference independently of `IMAGE_TAG`.
 
 2. **Operator environment** — the controller manager reads three optional env vars (see the
    commented block in `k8s-operator/config/manager/manager.yaml`):
@@ -141,7 +143,9 @@ The registry is configurable at three layers, from broadest to most specific:
    - `CREDENTIAL_PROXY_IMAGE` — explicit credential-proxy sidecar image. When unset, the proxy
      image is derived from the agent image (same registry and tag, image name `platform-agent`
      mapped to `credential-proxy`), so mirrors that keep the image names only need
-     `PLATFORM_AGENT_IMAGE`.
+     `PLATFORM_AGENT_IMAGE`. `install.sh` leaves it unset for that reason: setting it pins one
+     sidecar image for every agent in the cluster, which the per-CR derivation would otherwise
+     keep in step with each agent's own image.
    - `FLUENT_BIT_IMAGE` — replaces the Docker Hub `fluent/fluent-bit` sidecar image.
 3. **Per-agent CR** — `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent`
    override the defaults above for that agent's containers, and the credential-proxy image is

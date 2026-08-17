@@ -1580,11 +1580,16 @@ main() {
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
   # Bare repository paths on purpose: IMAGE_TAG is scoped to a single pipeline
   # run and is never persisted here, so the consuming step attaches it with
-  # qualify_image_ref. The replay proxy has no entry — provision_11 derives
-  # REPLAY_IMAGE from REGISTRY_PREFIX itself.
+  # qualify_image_ref.
+  #
+  # Two images are absent on purpose. provision_11 derives REPLAY_IMAGE from
+  # REGISTRY_PREFIX itself. CREDENTIAL_PROXY_IMAGE would pin the sidecar for
+  # every PlatformAgent in the cluster: the operator otherwise derives it from
+  # each CR's own agent image, and a cluster-wide env override beats that
+  # derivation, so a later re-render of the CR at a new tag would leave the
+  # sidecar behind on the tag of the install that wrote this file.
   write_state_var "$vars_file" OPERATOR_IMAGE "${registry_prefix}/k8s-operator"
   write_state_var "$vars_file" PLATFORM_AGENT_IMAGE "${registry_prefix}/platform-agent"
-  write_state_var "$vars_file" CREDENTIAL_PROXY_IMAGE "${registry_prefix}/credential-proxy"
   write_state_var "$vars_file" INFERENCE_REPLAY_ENABLED "false"
   write_state_var "$vars_file" NO_CONFIRM "1"
   chmod 600 "$vars_file"
