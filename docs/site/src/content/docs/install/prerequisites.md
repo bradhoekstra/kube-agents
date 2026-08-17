@@ -14,8 +14,8 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 - **`envsubst`** — usually shipped with `gettext`.
 - **`jq`** — [install](https://jqlang.github.io/jq/download/). Stages 03, 09, 10 and 13 read the
   container-image pins out of `images.json` with it, and each exits at its prerequisite check
-  without it. `./install.sh` installs it for you; a manual `make gcp-provision` does not, and the
-  failure lands at stage 03 with the cluster already created.
+  without it. `./install.sh` pre-flights it and offers to install it; a manual `make gcp-provision`
+  does not, and the failure lands at stage 03 with the cluster already created.
 
 ## GCP project
 

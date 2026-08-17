@@ -11,12 +11,13 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the provisioning scripts resolve their third-party defaults from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-That cuts both ways: **a version bump edits `images.json` and nothing else.** For most images the
-manifest, Dockerfile, or chart value that used to carry the pin now names a variable, so editing
-the old location changes nothing, and for the three the inventory is the only copy of —
-`hindsight-api`, `github-token-minter-server`, and the four cert-manager entries — nothing else in
-the tree disagrees loudly enough for `make images-check` to notice. Bump the pin here, then run
-`make images-check` and `make docs-generate`.
+That cuts both ways: **a version bump edits `images.json` and nothing else.** The manifest,
+Dockerfile, or chart value that used to carry a pin now names a variable, so editing the old
+location changes nothing. `make images-check` cross-checks the entries that still have a second
+copy — LiteLLM and fluent-bit against the chart values, the build-time bases against their
+Dockerfile `ARG` defaults — but for `github-token-minter-server`, both Hindsight images, and the
+four cert-manager entries this file is the only copy, and nothing else in the tree is left to
+disagree with it. Bump the pin here, then run `make images-check` and `make docs-generate`.
 
 <!-- BEGIN GENERATED: container-images -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
@@ -184,6 +185,7 @@ Hindsight).
 
 | Install path                      | First-party            | Third party                      | If the second is unset              |
 | --------------------------------- | ---------------------- | -------------------------------- | ----------------------------------- |
+| `install.sh`                      | `--registry-prefix`    | `--third-party-registry-prefix`  | those images stay upstream          |
 | Provisioning scripts              | `REGISTRY_PREFIX`      | `THIRD_PARTY_REGISTRY_PREFIX`    | those images stay upstream          |
 | Helm chart                        | `global.imageRegistry` | `global.thirdPartyImageRegistry` | falls back to the first-party value |
 | Terraform `examples/full-install` | `image_registry`       | `third_party_image_registry`     | falls back to the first-party value |
