@@ -36,7 +36,7 @@ import (
 )
 
 var (
-	// DefaultPlatformAgentVersion is injected at build time via -ldflags "-X ...DefaultPlatformAgentVersion=vX.Y.Z"
+	// DefaultPlatformAgentVersion is injected at build time via -ldflags "-X ...DefaultPlatformAgentVersion=X.Y.Z"
 	// or defaults to "latest" during local development.
 	DefaultPlatformAgentVersion = "latest"
 )
@@ -49,7 +49,7 @@ func fallbackPlatformAgentImage() string {
 }
 
 const (
-	fallbackFluentBitImage = "fluent/fluent-bit:5.0.7"
+	fallbackFluentBitImage = "fluent/fluent-bit:5.1.0"
 
 	// Operator-level image overrides for installs that mirror images into a
 	// private registry. Set on the controller-manager Deployment; a CR's

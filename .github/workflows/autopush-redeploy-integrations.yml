@@ -9,6 +9,9 @@ on:
       - "k8s-operator/scripts/provision_09_deploy_litellm.sh"
       - "k8s-operator/scripts/provision_10_deploy_github_minter.sh"
       - "k8s-operator/Makefile"
+      # The LiteLLM and token-minter pins live here, not in the manifests that
+      # consume them, so a version bump touches only this file.
+      - "images.json"
   workflow_dispatch:
     inputs:
       deploy_litellm:
@@ -30,9 +33,13 @@ permissions:
 
 jobs:
   call-deploy:
+    # inherit, not an explicit mapping: the called workflow's jobs read
+    # GH_APP_ID, an environment secret. A `uses:` job cannot declare an
+    # environment, so mapping the secrets here would evaluate them in this job,
+    # pass GH_APP_ID through empty, and silently skip the minter deploy.
     secrets: inherit
-    uses: ./.github/workflows/reusable-deploy-integrations.yml
+    uses: ./.github/workflows/reusable-deploy-integrations.yml # zizmor: ignore[secrets-inherit]
     with:
       target_environment: "autopush"
       force_deploy: ${{ github.event_name == 'workflow_dispatch' }}
-      checkout_ref: ${{ github.ref }}
+      checkout_sha: ${{ github.sha }}

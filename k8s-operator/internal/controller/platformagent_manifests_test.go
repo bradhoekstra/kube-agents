@@ -760,8 +760,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.0.7" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.0.7, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.0" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.0, got %s", fbContainer.Image)
 	}
 
 	// Verify volumes
@@ -967,6 +967,19 @@ func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesOtelSdkDisabled(t *testing.T) {
+	// The chart documents OTEL_SDK_DISABLED as the off-switch for clusters
+	// with no OTLP collector, where the exporter otherwise retries an
+	// unresolvable hostname for the life of the pod. Off the allowlist the
+	// documented recipe renders, validates, and silently does nothing.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "OTEL_SDK_DISABLED", Value: "true"},
+	})
+	if len(got) != 1 || got[0].Name != "OTEL_SDK_DISABLED" || got[0].Value != "true" {
+		t.Fatalf("expected OTEL_SDK_DISABLED to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without
@@ -1123,10 +1136,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.0.7" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.0" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.0.7")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.0")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -1136,7 +1149,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.0.7" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.0" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -1155,7 +1168,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.0.7")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.0")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -1289,7 +1302,9 @@ func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
 	}
 }
 
-func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
+// fqdnPatternsFromPolicy returns the egress match patterns buildFQDNNetworkPolicy emits.
+func fqdnPatternsFromPolicy(t *testing.T) []string {
+	t.Helper()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "platform-agent",
@@ -1310,14 +1325,79 @@ func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
 	if !ok || len(matchesList) == 0 {
 		t.Fatalf("expected matches list in FQDN policy")
 	}
-	var goPatterns []string
+	var patterns []string
 	for _, m := range matchesList {
 		if mMap, isMap := m.(map[string]interface{}); isMap {
 			if p, isStr := mMap["pattern"].(string); isStr {
-				goPatterns = append(goPatterns, p)
+				patterns = append(patterns, p)
 			}
 		}
 	}
+	return patterns
+}
+
+// fqdnPatternToRegexp compiles an FQDNNetworkPolicy match pattern the way the
+// Dataplane V2 (Cilium) engine does: dots are literal and a wildcard spans DNS
+// characters only, so it stops at a label boundary. GKE documents the same rule
+// — "*.company.com" matches "api.company.com" but not "eu.api.company.com".
+func fqdnPatternToRegexp(t *testing.T, pattern string) *regexp.Regexp {
+	t.Helper()
+	escaped := strings.ReplaceAll(pattern, ".", "[.]")
+	escaped = strings.ReplaceAll(escaped, "*", "[-a-zA-Z0-9_]*")
+	re, err := regexp.Compile("^" + escaped + "$")
+	if err != nil {
+		t.Fatalf("pattern %q does not compile: %v", pattern, err)
+	}
+	return re
+}
+
+// TestFQDNPatternList_MatchesRealHostnames pins the egress allowlist against
+// hostnames the gateway actually dials. TestFQDNPatternList_MatchesKustomizeManifest
+// only proves the two copies of the list agree — it would pass just as happily
+// if both were wrong, which is how "*.gke.goog" was first shipped one label
+// short of every DNS control-plane endpoint it was added to allow.
+func TestFQDNPatternList_MatchesRealHostnames(t *testing.T) {
+	patterns := fqdnPatternsFromPolicy(t)
+
+	hostnames := []string{
+		// GKE DNS-based control plane endpoint: <cluster-hash>-<project-number>.<region>.gke.goog
+		//
+		// Synthetic, but the shape is copied from live clusters: a 36-character
+		// hash, a project number, and a location label. Do not paste a real
+		// endpoint in — the hostname carries the project number of whoever's
+		// cluster it came from, and what this test needs is the shape.
+		"gke-0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b-123456789012.us-central1.gke.goog",
+		// A zonal cluster puts the zone where the region sits, so the label is
+		// longer but the shape is unchanged. Keeping both means a pattern
+		// narrowed to a region-shaped label fails here rather than in the field.
+		"gke-9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e-210987654321.us-central1-a.gke.goog",
+		"container.googleapis.com",
+		"oauth2.googleapis.com",
+		"accounts.google.com",
+		"us-central1-docker.pkg.dev",
+		"us.gcr.io",
+		"github.com",
+		"api.github.com",
+		"objects.githubusercontent.com",
+		"slack.com",
+	}
+
+	for _, host := range hostnames {
+		matched := false
+		for _, p := range patterns {
+			if fqdnPatternToRegexp(t, p).MatchString(host) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			t.Errorf("no FQDN egress pattern matches %q; the gateway cannot reach it under FQDN network policy (patterns: %v)", host, patterns)
+		}
+	}
+}
+
+func TestFQDNPatternList_MatchesKustomizeManifest(t *testing.T) {
+	goPatterns := fqdnPatternsFromPolicy(t)
 
 	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "gke-dataplane-v2", "fqdn-networkpolicy.yaml")
 	data, err := os.ReadFile(path)
