@@ -31,7 +31,8 @@ nothing — so find that out before spending it.
 
 This phase runs **in the main loop, before any subagent exists**, for two reasons. Its output is a
 question for me, and a subagent has no way to ask one. And it is pure GitHub API — no worktree, no
-fetch, no diff read — so it costs two calls per PR whatever the answer turns out to be.
+fetch, no diff read — so it costs two calls per PR, plus one per merge sitting after the bot's
+review, which is nearly always none or one.
 
 ### The two queries
 
@@ -45,7 +46,7 @@ gh api graphql -f query='
 query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(number:$pr){
   headRefOid isDraft state author{login}
   reviews(last:20){nodes{author{login} state submittedAt body commit{oid}}}
-  commits(last:100){nodes{commit{oid messageHeadline parents{totalCount}}}}
+  commits(last:100){nodes{commit{oid messageHeadline parents(first:2){totalCount nodes{oid}}}}}
   reviewThreads(first:100){nodes{isResolved path}}
 }}}' -F pr=<N> --jq '.data.repository.pullRequest as $p
 | ([$p.reviews.nodes[] | select(.author.login == "kube-agents-bot")] | last) as $r
@@ -54,10 +55,10 @@ query($pr:Int!){repository(owner:"gke-labs",name:"kube-agents"){pullRequest(numb
 | "head=\($p.headRefOid) state=\($p.state) draft=\($p.isDraft) commits=\($cs|length) unresolved=\([$p.reviewThreads.nodes[]|select(.isResolved|not)]|length)",
   (if $r == null then "lastbot: NONE"
    else "lastbot at=\($r.submittedAt) commit=\($r.commit.oid)",
-        ($r.body | split("\n") | [.[0], (.[] | select(startswith("_This was a")))] | join("\n")),
+        ($r.body | split("\n") | [.[0], (.[] | select(startswith("### Findings outside") or startswith("#### ") or startswith("_This was a")))] | join("\n")),
         (if $i == null then "since: review commit is not among those \($cs|length) commits"
          elif $i == ($cs|length) - 1 then "since: nothing, the review is at the tip"
-         else "since:\n  " + ($cs[$i+1:] | map("\(.oid[0:7]) parents=\(.parents.totalCount) \(.messageHeadline)") | join("\n  "))
+         else "since:\n  " + ($cs[$i+1:] | map("\(.oid[0:7]) parents=\(.parents.totalCount)\(if .parents.totalCount > 1 then " p2=" + .parents.nodes[1].oid[0:7] else "" end) \(.messageHeadline)") | join("\n  "))
          end)
    end)'
 
@@ -97,19 +98,47 @@ like the new one.
   on the description usually. It counts, but quote the note in the evidence rather than letting the
   word "clean" swallow it.
 
+Where that note lives decides whether you have it. Sometimes it is in the first line, as on #684.
+Sometimes the body carries a whole `### Findings outside this diff` section — findings the bot could
+not anchor to a changed line — and on #709 that section ran to a 🔴 High and fifteen hundred words.
+The filter keeps the section heading and each finding's `####` title line, not the argument under
+them, which is enough to see that one exists and to quote it in a line. When the heading does
+appear, re-run the same query with `--jq '…| last | .body'` and read it before you put `covered` in
+front of me — one more call, on the rare PR that needs it. An unanchored High is a live finding on
+the pull request, and it must not vanish between the review and the evidence I am shown.
+
 Note the width too. The footer reads `_This was a strict pass: only what I am certain of…_` or
 `_This was a wider pass: as well as what I am certain of…_`. A strict-pass clean covers less ground
 than a wide-pass clean, and I may want the difference.
 
-**Current.** Either the review's commit is the head, or everything after it is a merge
-(`parents.totalCount > 1`). Merging the base branch in is not new work to review — this is the
-API-only twin of the `git log <sha>..HEAD --no-merges --not "$BASE_REF"` rule in Phase 2. Two ways
-it is softer than that rule, both worth saying out loud rather than papering over:
+**Current.** Either the review's commit is the head, or everything after it is a merge **from the
+base branch**. Merging the base branch in is not new work to review — this is the API-only twin of
+the `git log <sha>..HEAD --no-merges --not "$BASE_REF"` rule in Phase 2.
+
+`parents.totalCount > 1` is necessary and nowhere near sufficient. A sibling feature branch, or a
+colleague's fork branch, merges with two parents exactly like `main` does, and it brings an entire
+branch of code no review has read; `messageHeadline` is no backstop, since `Merge branch 'main'` is
+a string anyone can type. The git rule catches this and the parent count does not, which is why the
+filter prints the second parent as `p2=`. Confirm it is on the base branch before calling the review
+current:
+
+```bash
+# One call per merge in the tail. "identical" or "behind" means <p2> was already on
+# the base branch, so the merge brought in nothing unreviewed. "ahead" or "diverged"
+# means it brought in a branch of its own: the review is stale, not current.
+gh api repos/gke-labs/kube-agents/compare/<base-branch>...<p2> --jq .status
+```
+
+On #675 that is `behind` for `p2=5bc8165`, which is what makes its 8-commit tail a base merge. An
+octopus merge has parents past the second; check each of them the same way, or call the review stale
+and say why. Two ways this is still softer than the git rule, both worth saying out loud rather than
+papering over:
 
 - A conflicted merge carries hand-written resolution that no review has seen, and over the API it
-  looks exactly like a clean one. When the tail is merges, call them presumed base merges and offer
-  the delta pass; only a worktree (`git show --cc <sha>`) can tell the two apart, and Phase −1 has
-  no worktree by design.
+  looks exactly like a clean one — `compare` reports on the parent, not on what the author did with
+  it. When the tail is merges, call them presumed base merges and offer the delta pass; only a
+  worktree can tell the two apart, and Phase −1 has no worktree by design. Phase 3 does that check;
+  it does not use `git show --cc`, for a reason worth reading before you assume it would have.
 - A review commit missing from the list is stale, but see the `commits(last: 100)` caveat above for
   which kind of stale.
 
@@ -185,8 +214,8 @@ reasons. Offer two choices, not three, when the line reads either of these:
 Do **not** withhold it for the remaining case, a tail of presumed base merges. That is where the
 option earns its keep — a conflicted merge's hand-written resolution is precisely the code no review
 has read, and from up here it looks exactly like a clean one. It may still turn out to hold nothing,
-but that is a result Phase 3 reports after running `git show --cc` in a worktree, not a promise you
-can make before spending it.
+but that is a result Phase 3 reports after replaying the merge in a worktree, not a promise you can
+make before spending it.
 
 Fan out only for what I keep, and tell each subagent its verdict, its mode, and — for a narrowed
 pass — the SHA, which it has no way to recover from a decision I made in the main loop.
@@ -357,9 +386,9 @@ ours; Phase −1 read the bot's and mine; and because the two never consult each
 condition silently cancels precisely the pass Phase −1 got authorisation for. It is empty _by
 construction_ on a merge tail — `--no-merges` drops the merge and `--not "$BASE_REF"` drops
 everything it pulled in — which is the same fact that made Phase −1 call the bot review current and
-offer the narrowed pass in the first place. Skipping there means the merge's `git show --cc` output
-is read by nobody, and that output is the whole reason I paid for the pass. So run it. If the delta
-turns out empty, Phase 3 says so and names what it ran, which is a report; `status: skipped` off a
+offer the narrowed pass in the first place. Skipping there means the merge's hand-written
+resolution is read by nobody, and that resolution is the whole reason I paid for the pass. So run
+it. If the delta turns out empty, Phase 3 says so and names what it ran, which is a report; `status: skipped` off a
 condition I was never asked about is not.
 
 A merge conflict is **not** a skip reason. Neither is an unmergeable `mergeStateStatus`.
@@ -427,7 +456,11 @@ Two substitutions for this context:
   git log "$SINCE_SHA"..pr<N> --no-merges --not "$BASE_REF" --format=%H   # the author's own commits
   git show <sha>                                                          # one per commit above
   git log "$SINCE_SHA"..pr<N> --merges --format=%H                        # every merge in between
-  git show --cc <merge-sha>                                               # one per merge above
+
+  # Per merge: replay it, and diff the machine's result against the author's. What
+  # comes out is exactly what the human did that an automatic merge would not have.
+  AUTO=$(git merge-tree --write-tree <merge-sha>^1 <merge-sha>^2 | head -1)
+  git diff "$AUTO" <merge-sha>^{tree}
   ```
 
   **Stop if the precondition fails** and report `status: skipped`, reason `since-anchor <sha> is not
@@ -438,18 +471,36 @@ an ancestor of pr<N>`. Phase −1 is supposed to withhold the narrowed option in
   lines, and Phase 2's skip conditions — which would otherwise have caught a stale anchor — are
   disabled for this mode.
 
-  `--not "$BASE_REF"` earns its place for the reason Phase 2 gives. `--cc` is what this mode exists
-  for: it prints only the hunks a merge resolved by hand, so empty output is the clean base merge
-  Phase −1 could only presume it was, and non-empty output is the unreviewed code that justified the
-  pass. Those hunks together are what the skill's step 2 means by the range — its angles apply to
-  them, read as always at their state in `pr<N>` rather than as isolated hunks.
+  `--not "$BASE_REF"` earns its place for the reason Phase 2 gives, and it is doing more work than
+  it looks: a sibling branch merged into the PR contributes its own non-merge commits to that first
+  list, because they are reachable from `pr<N>` and not from the base. That is the git-side check
+  Phase −1 can only approximate with `compare`.
+
+  **Do not reach for `git show --cc` here**, however natural it looks. `--cc` prunes every hunk whose
+  merge result matches one of the parents, and taking one side wholesale — `git checkout --ours`,
+  `--theirs`, or picking a variant per hunk — is how most conflicts are actually resolved. A merge
+  that discarded the base branch's change to a file the PR also touched prints a bare 162-byte
+  header, byte-identical to a merge that had no conflict at all. Empty `--cc` means "nothing was
+  resolved into a form that differs from both parents", which is not the claim this mode needs.
+
+  `git merge-tree --write-tree` (git ≥ 2.38) makes the claim it needs. It replays the merge with no
+  worktree and prints the tree an automatic merge would have produced — conflict markers and all,
+  exiting 1 when it hit one — so diffing that tree against the merge's own tree yields precisely the
+  author's contribution: the resolution they wrote, or nothing at all when the merge really was
+  clean. Empty there **is** the clean base merge Phase −1 could only presume it was, and non-empty is
+  the unreviewed code that justified the pass. Two edges: on a merge with more than two parents
+  `merge-tree` takes only two, and on git below 2.38 the flag does not exist. In either case fall
+  back to `git show --cc`, and say in the review that the merge was checked with the weaker test.
+
+  The author's commits and whatever the replay turns up are together what the skill's step 2 means
+  by the range — its angles apply to them, read as always at their state in `pr<N>` rather than as
+  isolated hunks.
 
   **Both lists coming back empty is a real outcome once the precondition has passed**, and #675 is
-  one — no author commits, and a merge whose `--cc` is bare. Report the delta as empty and say what
-  you ran; do not go looking for something to say, and do not quietly widen to the full diff I did
-  not ask for. A defect you happen
-  to notice outside the delta is still worth reporting, but you have not read the rest of the diff,
-  so do not imply you have — Phase 4 records the scope.
+  one — no author commits, and a merge the replay reproduces exactly. Report the delta as empty and
+  say what you ran; do not go looking for something to say, and do not quietly widen to the full
+  diff I did not ask for. A defect you happen to notice outside the delta is still worth reporting,
+  but you have not read the rest of the diff, so do not imply you have — Phase 4 records the scope.
 
 - **Angle J already has an author to filter by**, which the skill cannot assume:
   `gh pr list --repo "$REPO" --author <login> --state open --json number,title,files`. Read the
