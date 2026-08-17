@@ -68,6 +68,24 @@ spec:
             # directory keeps whatever auth method it was created with.
             - name: POSTGRES_HOST_AUTH_METHOD
               value: trust
+          # Readiness only, deliberately: the Service above publishes this pod's
+          # address the moment the container starts, and initdb takes several
+          # seconds on a fresh volume, so the Hindsight API otherwise races the
+          # database on first install. A *liveness* probe on Postgres is the
+          # opposite of helpful — a busy database that misses a check gets
+          # restarted mid-transaction.
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - hindsight
+                - -d
+                - hindsight
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests:
               cpu: 250m

@@ -34,6 +34,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -2463,6 +2464,35 @@ func resolveCredentialProxyImage(deployment *agentv1alpha1.DeploymentSpec) strin
 	return prefix + name + suffix
 }
 
+// agentAPIProbe returns a probe that asks the Hermes API on loopback for one
+// session. Callers supply periodSeconds and failureThreshold, which is the only
+// difference between the gateway's startup and readiness probes: the startup
+// one has to cover a cold boot that scaffolds every profile onto a fresh PVC,
+// while readiness afterwards should withdraw the pod quickly.
+//
+// /api/sessions is the endpoint the agent's own callers use — see the pubsub
+// adapter and admin_console — and the Authorization: Bearer form is theirs too.
+// Every timing is explicit, per the gke-reliability skill's rule 3; kubelet's
+// 1-second default timeout is far too tight for a container this busy at boot.
+func agentAPIProbe(periodSeconds, failureThreshold int32) *corev1.Probe {
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"sh", "-c",
+					`curl --fail --silent --show-error -o /dev/null ` +
+						`-H "Authorization: Bearer $API_SERVER_KEY" ` +
+						`http://127.0.0.1:8642/api/sessions?limit=1`,
+				},
+			},
+		},
+		InitialDelaySeconds: 5,
+		PeriodSeconds:       periodSeconds,
+		TimeoutSeconds:      5,
+		FailureThreshold:    failureThreshold,
+	}
+}
+
 // buildBaseContainers generates the base containers for PlatformAgent.
 func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVars []corev1.EnvVar, agentPlugins []*agentv1alpha1.AgentPlugin, isImageVolumeSupported bool) []corev1.Container {
 	homeDir := defaultAgentHome
@@ -2589,6 +2619,22 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 			Env:          gatewayEnvVars,
 			Resources:    resources,
 			VolumeMounts: volumeMounts,
+			// Without these the Service publishes this pod the moment the container
+			// process starts, minutes before the Hermes API binds :8642 — the
+			// entrypoint scaffolds every profile onto the PVC before it execs the
+			// gateway. Callers that resolve the Service in that window get
+			// connection-refused from a pod Kubernetes calls Ready.
+			//
+			// exec, not httpGet: API_SERVER_HOST is 127.0.0.1 (the sidecar's Envoy on
+			// :8643 is what the Service targets), and kubelet dials the pod IP, so an
+			// httpGet or tcpSocket probe would never reach a loopback listener. This
+			// is the same shape as the credential proxy's own probe below.
+			//
+			// The bearer key is the non-secret loopback sentinel already in this
+			// container's env, and API_SERVER_ENABLED is unconditionally true above,
+			// so the probe is valid in every configuration.
+			StartupProbe:   agentAPIProbe(10, 60),
+			ReadinessProbe: agentAPIProbe(15, 3),
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -2710,6 +2756,24 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 				},
 			},
 			VolumeMounts: append(dashboardVolumeMounts, extraVolumeMounts...),
+			// The Service publishes :9119 whenever the dashboard is enabled, so
+			// without this the UI port is advertised before anything listens on it.
+			//
+			// tcpSocket rather than httpGet: this one binds all interfaces, so kubelet
+			// can reach it on the pod IP, but `hermes dashboard` exposes no health
+			// path we have verified — and a probe against a guessed path that 404s
+			// would hold the whole pod unready, taking the API down with it.
+			ReadinessProbe: &corev1.Probe{
+				ProbeHandler: corev1.ProbeHandler{
+					TCPSocket: &corev1.TCPSocketAction{
+						Port: intstr.FromString("dashboard"),
+					},
+				},
+				InitialDelaySeconds: 5,
+				PeriodSeconds:       15,
+				TimeoutSeconds:      5,
+				FailureThreshold:    3,
+			},
 			SecurityContext: &corev1.SecurityContext{
 				AllowPrivilegeEscalation: ptr.To(false),
 				Capabilities: &corev1.Capabilities{
@@ -3119,6 +3183,55 @@ func buildPlatformService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 			Selector: selector,
 			Ports:    ports,
 		},
+	}
+}
+
+// buildPlatformPDB generates the PodDisruptionBudget manifest for PlatformAgent.
+//
+// The budget is derived from the resolved replica count rather than fixed,
+// because the two cases need opposite fields. At two or more replicas a
+// minAvailable of 1 keeps one pod through a node drain. At one — the default,
+// and the shape a Recreate strategy and an RWO data volume imply — the same
+// minAvailable would instead leave zero allowed disruptions, so `kubectl drain`
+// on that node never completes and node-pool upgrades, auto-repair, and
+// autoscaler scale-down all stall until a human deletes this object. That is
+// the critical `blocking-pdb` finding in the Workload Reliability Audit this
+// project ships (agents/platform/governance/obtainability_audit_sop.md §3.4);
+// emitting one from the operator would put it on every install at once.
+// maxUnavailable: 1 is the honest budget for a singleton: no protection to
+// give, and an explicit statement that the pod may be evicted.
+//
+// The selector is the Deployment's, NOT the Service's. Above, a multi-replica
+// Service narrows to kubeagents.io/is-leader so only the leader serves; a PDB
+// carrying that label would budget the single leader pod instead of the
+// Deployment's pods, and at minAvailable: 1 would block every drain no matter
+// how far the agent was scaled out.
+func buildPlatformPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	replicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+
+	spec := policyv1.PodDisruptionBudgetSpec{
+		Selector: &metav1.LabelSelector{
+			MatchLabels: map[string]string{
+				"app": agent.Name + "-gateway",
+			},
+		},
+	}
+	if replicas > 1 {
+		spec.MinAvailable = ptr.To(intstr.FromInt32(1))
+	} else {
+		spec.MaxUnavailable = ptr.To(intstr.FromInt32(1))
+	}
+
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "policy/v1",
+			Kind:       "PodDisruptionBudget",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name,
+			Namespace: agent.Namespace,
+		},
+		Spec: spec,
 	}
 }
 

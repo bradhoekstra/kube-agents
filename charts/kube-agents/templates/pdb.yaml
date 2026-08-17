@@ -1,0 +1,58 @@
+{{/*
+PodDisruptionBudgets for the two workloads this chart owns.
+
+The budget is derived from replicaCount rather than fixed, because the same
+template has to be correct at both settings. With two or more replicas a
+minAvailable keeps one pod serving through a drain. With one replica it would
+instead set disruptionsAllowed to 0, and `kubectl drain` on that node would
+never complete: node-pool upgrades, node auto-repair, and autoscaler
+scale-down all stall until a human deletes the PDB. That is the
+`blocking-pdb` finding in the Workload Reliability Audit this project ships
+(agents/platform/governance/obtainability_audit_sop.md §3.4), and it is
+critical severity there for the same reason. A single-replica release
+therefore gets maxUnavailable: 1 — no protection to give, but an explicit
+statement that the pod may be evicted.
+
+Selectors reuse the Deployments' own selector labels. The audit's §3.3 matches
+a PDB to a workload by selector, never by name, so these must stay in step
+with the pod templates in operator-deployment.yaml and litellm.yaml.
+*/}}
+{{- if and .Values.operator.enabled .Values.operator.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-controller-manager
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}-operator
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  {{- if gt (int .Values.operator.replicaCount) 1 }}
+  minAvailable: {{ .Values.operator.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "kube-agents.operatorSelectorLabels" . | nindent 6 }}
+{{- end }}
+{{- if and .Values.litellm.enabled .Values.litellm.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: litellm
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  {{- if gt (int .Values.litellm.replicaCount) 1 }}
+  minAvailable: {{ .Values.litellm.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: 1
+  {{- end }}
+  selector:
+    matchLabels:
+      app: litellm
+{{- end }}
