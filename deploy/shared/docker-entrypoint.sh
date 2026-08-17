@@ -1063,12 +1063,29 @@ fi
 #
 # Flag off, this step does not run and step 2.6 force-syncs config.yaml as it always
 # has, which subsumes any fill.
+#
+# Both of step 2d's arms, for the same reason it has two. Once config.yaml is off the
+# force-sync, this step is the ONLY thing left that can write it: step 2.5 is gated on
+# the profile being absent, step 2.6 no longer carries the name in --items, and step
+# 2.7 skips a profile directory whose config.yaml is missing. So a profile registered
+# without one — profile_scaffold writes profile.yaml before it copies the template, and
+# the caller above swallows a failure between the two with a WARN — would stay that way
+# for the life of the volume, on the profile receiving chat, with an absent
+# platform_toolsets resolving to the full core bundle rather than failing closed. Flag
+# off the next boot healed it; flag on nothing does. Seed from the template when the
+# file is absent, fill it when it is not.
 if platform_is_front_door && [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] \
     && [ -f "$PLATFORM_TEMPLATE/config.yaml" ] \
-    && [ -f "$TARGET_DIR/profiles/platform/config.yaml" ]; then
-    backfill_config_from_template \
-        "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
-        || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
+    && [ -d "$TARGET_DIR/profiles/platform" ]; then
+    if [ -f "$TARGET_DIR/profiles/platform/config.yaml" ]; then
+        backfill_config_from_template \
+            "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
+            || echo "WARN: could not backfill profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door may be missing keys the image template owns" >&2
+    else
+        echo "[ENTRYPOINT] profiles/platform/config.yaml is missing; seeding it from the image template." >&2
+        cp "$PLATFORM_TEMPLATE/config.yaml" "$TARGET_DIR/profiles/platform/config.yaml" \
+            || echo "WARN: could not seed profiles/platform/config.yaml from $PLATFORM_TEMPLATE/config.yaml; the front door has no config of its own" >&2
+    fi
 fi
 
 # 2.65 Link profile-targeted plugin image volumes into their profile homes.
