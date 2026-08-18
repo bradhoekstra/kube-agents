@@ -15,7 +15,7 @@ This page is the canonical glossary for humans. The agents carry their own trimm
 
 The conversational front door shipped in `agents/chat/` — the `default` [Hermes profile](#hermes-profile), and the only profile that receives chat ingress (Google Chat / Slack). It works out what a request actually requires, then files that work as a [kanban card](#kanban-task-delegation) for the specialist that can execute it; the available specialists are injected into every turn by its `agent_roster` plugin, and the `router` MCP tool `list_agents` re-reads the same list on demand. Progress and results reach the thread on their own: the specialist's heartbeats and the card's completion post there directly, verbatim and without waking the front door, which is woken only when a card blocks or fails. It holds no infrastructure tools of its own: it can plan and delegate, not mutate. One profile receives chat ingress and it is this one, unless the experimental [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) flag moves the gateway to the Platform Agent, in which case this persona sees no chat at all.
 
-The source tree is `agents/chat/` and the Hermes profile is `default`; neither identifier carries the name. Chat Agent was the earlier name and still appears where this rename did not reach: source comments, design and architecture documents, and the CRD field descriptions `kubectl explain` prints.
+The source tree is `agents/chat/` and the Hermes profile is `default`; neither identifier carries the name. Chat Agent was the earlier name for the same component and still appears in parts of the tree this rename did not reach, including the CRD field descriptions `kubectl explain` prints.
 
 ### Platform Agent
 
