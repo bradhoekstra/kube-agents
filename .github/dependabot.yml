@@ -83,8 +83,9 @@ updates:
         patterns:
           - "*"
 
-  # The docs site. agents/platform/skills/gke-app-onboarding/assets is a
-  # scaffold the agent hands to users, not a dependency this repository runs.
+  # The docs site holds the only package.json with dependencies to update. The
+  # gke-app-onboarding scaffold's declares none, so the old glob covered it
+  # without ever having anything to propose.
   - package-ecosystem: "npm"
     directory: "/docs/site"
     schedule:
@@ -101,13 +102,34 @@ updates:
       npm:
         patterns:
           - "*"
-# No docker entry. Every FROM in an image this repository builds interpolates
-# two ARGs -- `FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}` -- which the Docker
-# updater cannot resolve; images.json and `make mirror-images` own those pins.
-#
-# Two literal FROMs the old `/**/*` glob did cover are now unmonitored, and
-# neither is in images.json: agents/platform/skills/gke-app-onboarding/assets
-# (`node:18-slim`, EOL, baked into the platform image and handed to users by
-# the skill) and tests/e2e/operator/templates/plugin_src (`alpine:3.19`).
-# Bumping either is a deliberate change, not something to restore by adding a
-# glob back here.
+
+  # These two directories hold the only literal FROM pins in the tree, and
+  # images.json covers neither. The gke-app-onboarding one is `node:18-slim`,
+  # past end of life, and deploy/docker/Dockerfile copies
+  # agents/platform/skills/ wholesale into the published platform image, so it
+  # ships. The other is `alpine:3.19` in an e2e fixture.
+  #
+  # Every other Dockerfile is out of reach rather than excluded: the images
+  # this repository builds interpolate two ARGs each
+  # (`FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}`), which the Docker updater cannot
+  # resolve, and the agentplugins ones are `FROM scratch`. images.json and
+  # `make mirror-images` own the ARG-interpolated pins. Naming the two
+  # directories, rather than globbing, is what keeps this from recreating #763.
+  - package-ecosystem: "docker"
+    directories:
+      - "/agents/platform/skills/gke-app-onboarding/assets"
+      - "/tests/e2e/operator/templates/plugin_src"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "ci"
+    groups:
+      docker:
+        patterns:
+          - "*"
