@@ -345,7 +345,14 @@ class ModelDefaultsTest(unittest.TestCase):
         self.assertEqual(self._run('"anthropic" "claude-sonnet-4-5-20250929"'), [])
 
     def test_both_alternatives_of_a_multi_pattern_arm_are_read(self):
-        """`chatgpt | openai)` names two providers, not one string with a pipe."""
+        """`chatgpt | openai)` names two providers, not one string with a pipe.
+
+        This pins the alternation parse, not the backtracking fix — the
+        capture group wraps the whole alternation, so the pre-fix pattern
+        passes it too. ArmScannerBacktrackingTest is the guard for that. What
+        this one catches is a parser rewritten to stop splitting arms on "|"
+        at all, which would silently drop every provider after the first.
+        """
         self.assertEqual(self._run('"chatgpt" "gpt-5.4" "openai" "gpt-5.4"'), [])
         self.assertEqual(
             self._run('"openai" "gpt-4"'),
