@@ -101,7 +101,13 @@ updates:
       npm:
         patterns:
           - "*"
-# No docker entry. Every FROM that ships interpolates two ARGs --
-# `FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}` -- which the Docker updater cannot
-# resolve, so the entry opened no pull requests and would open none. images.json
-# and `make mirror-images` own those pins.
+# No docker entry. Every FROM in an image this repository builds interpolates
+# two ARGs -- `FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}` -- which the Docker
+# updater cannot resolve; images.json and `make mirror-images` own those pins.
+#
+# Two literal FROMs the old `/**/*` glob did cover are now unmonitored, and
+# neither is in images.json: agents/platform/skills/gke-app-onboarding/assets
+# (`node:18-slim`, EOL, baked into the platform image and handed to users by
+# the skill) and tests/e2e/operator/templates/plugin_src (`alpine:3.19`).
+# Bumping either is a deliberate change, not something to restore by adding a
+# glob back here.
