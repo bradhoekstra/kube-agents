@@ -1,3 +1,16 @@
+# Each ecosystem below names its directories explicitly and batches everything
+# it finds into one grouped pull request. Both are deliberate.
+#
+# Globbed directories (`/**/*`) recreate #763: pip's parser follows the
+# `-r admin_console/requirements.txt` include at the root, so a root job and an
+# `/admin_console` job edit the same file and open two pull requests for one
+# change. Add a directory only after checking that no other entry already
+# reaches the manifest it holds.
+#
+# Without `groups`, five ecosystems at five pull requests each is a ceiling of
+# 25 open at once -- 20 of them arrived in three minutes the first time this
+# config ran. A catch-all group per ecosystem makes that one pull request per
+# ecosystem per week.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -12,10 +25,14 @@ updates:
       - "github-actions"
     commit-message:
       prefix: "ci"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
+  # k8s-operator holds the only go.mod in the tree.
   - package-ecosystem: "gomod"
-    directories:
-      - "/**/*"
+    directory: "/k8s-operator"
     schedule:
       interval: "weekly"
     cooldown:
@@ -26,11 +43,20 @@ updates:
       - "go"
     commit-message:
       prefix: "ci"
+    groups:
+      gomod:
+        patterns:
+          - "*"
 
+  # "/" covers requirements-test.txt and, through its `-r` include,
+  # admin_console/requirements.txt -- naming /admin_console as well is what
+  # opened #763 and #764 for the same httpx bump. /bench is left out on
+  # purpose: bench/pyproject.toml pins devops-bench to a git SHA that its own
+  # comment says to bump deliberately.
   - package-ecosystem: "pip"
     directories:
       - "/"
-      - "/**/*"
+      - "/tests/e2e"
     schedule:
       interval: "weekly"
     cooldown:
@@ -41,10 +67,22 @@ updates:
       - "python"
     commit-message:
       prefix: "ci"
+    # requirements-test.txt holds mcp below 2.0 because agent_common_server.py
+    # imports mcp.server.fastmcp, which 2.x moved. #751 widened the constraint
+    # to <3 anyway; the tests stub the module, so nothing caught it.
+    ignore:
+      - dependency-name: "mcp"
+        update-types:
+          - "version-update:semver-major"
+    groups:
+      python:
+        patterns:
+          - "*"
 
+  # The docs site. agents/platform/skills/gke-app-onboarding/assets is a
+  # scaffold the agent hands to users, not a dependency this repository runs.
   - package-ecosystem: "npm"
-    directories:
-      - "/**/*"
+    directory: "/docs/site"
     schedule:
       interval: "weekly"
     cooldown:
@@ -55,17 +93,11 @@ updates:
       - "javascript"
     commit-message:
       prefix: "ci"
-
-  - package-ecosystem: "docker"
-    directories:
-      - "/**/*"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 7
-    open-pull-requests-limit: 5
-    labels:
-      - "dependencies"
-      - "docker"
-    commit-message:
-      prefix: "ci"
+    groups:
+      npm:
+        patterns:
+          - "*"
+# No docker entry. Every FROM that ships interpolates two ARGs --
+# `FROM ${GOLANG_IMAGE}:${GOLANG_VERSION}` -- which the Docker updater cannot
+# resolve, so the entry opened no pull requests and would open none. images.json
+# and `make mirror-images` own those pins.
