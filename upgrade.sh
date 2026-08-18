@@ -383,7 +383,25 @@ main() {
   export REGION="$target_region"
 
   print_step "2. Connecting kubectl to GKE Cluster"
-  gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project"
+  # Taken from repo_dir rather than beside this script: upgrade.sh is also run
+  # piped from curl, where BASH_SOURCE names no directory to look in.
+  local dns_helper="${repo_dir}/k8s-operator/scripts/gke_dns_endpoint.sh"
+  GKE_DNS_ENDPOINT_FLAG=""
+  if [ -f "$dns_helper" ]; then
+    # source= points -x runs at the real file; disable=SC1091 covers the bare
+    # `shellcheck upgrade.sh` that CI runs, where the directive locates the file
+    # but following it still needs -x, so the info-level finding fails the job.
+    # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+    # shellcheck disable=SC1091
+    source "$dns_helper"
+    gke_dns_endpoint_flag "$target_cluster" "$target_region" "$target_project"
+    if [ -n "$GKE_DNS_ENDPOINT_FLAG" ]; then
+      print_info "Cluster '${target_cluster}' publishes an external DNS endpoint; using it."
+    fi
+  fi
+  # Unquoted on purpose: empty must contribute no argument at all.
+  # shellcheck disable=SC2086
+  gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project" $GKE_DNS_ENDPOINT_FLAG
 
   local target_namespace="${NAMESPACE:-kubeagents-system}"
   print_step "3. Reconciling Pod-Scoped Session Keys"

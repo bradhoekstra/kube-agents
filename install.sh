@@ -80,6 +80,11 @@ PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # check and the one at the workspace step do not report the same verdict twice.
 SOURCE_REF_VERIFIED=""
 PARAM_REGISTRY_PREFIX="${REGISTRY_PREFIX:-}"
+# Empty means "leave the third-party images on their upstream registries", the
+# supported default. Unlike REGISTRY_PREFIX this has no fallback in common.sh,
+# because widening REGISTRY_PREFIX to cover images its mirror was never given is
+# exactly the failure third_party_registry_prefix() exists to avoid.
+PARAM_THIRD_PARTY_REGISTRY_PREFIX="${THIRD_PARTY_REGISTRY_PREFIX:-}"
 
 show_help() {
   cat << EOF
@@ -130,7 +135,14 @@ Flags for AI Agents & Automation:
                                             provider, and no database to run.
   --image-tag=TAG               Validated immutable release tag or full commit SHA
                                 (default: this checkout's HEAD; required via curl | bash)
-  --registry-prefix=PATH        Container registry path without a URL scheme
+  --registry-prefix=PATH        Container registry path without a URL scheme, for the images
+                                this project builds (operator, agent, credential proxy, replay
+                                proxy)
+  --third-party-registry-prefix=PATH
+                                Registry path holding the mirrored third-party images
+                                (cert-manager, LiteLLM, fluent-bit, the GitHub token minter,
+                                Hindsight). Unset leaves them on their upstream registries;
+                                --registry-prefix does not imply it. See 'make mirror-images'
   --allow-unverified-source     Provision from a dirty or mismatched checkout (local script edits
                                 are applied even though the deployed image was built elsewhere)
   --enable-google-chat          Enable Google Chat integration
@@ -168,6 +180,7 @@ parse_args() {
       --memory=*) PARAM_MEMORY="${1#*=}"; shift ;;
       --image-tag=*) PARAM_IMAGE_TAG="${1#*=}"; shift ;;
       --registry-prefix=*) PARAM_REGISTRY_PREFIX="${1#*=}"; shift ;;
+      --third-party-registry-prefix=*) PARAM_THIRD_PARTY_REGISTRY_PREFIX="${1#*=}"; shift ;;
       --allow-unverified-source|--allow-dirty) PARAM_ALLOW_UNVERIFIED_SOURCE="true"; shift ;;
       --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
@@ -1043,7 +1056,11 @@ main() {
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"
-  for tool in git make gcloud kubectl gh helm; do
+  # jq is required from step 03 onward: the provisioning scripts read every
+  # third-party image reference, and the cert-manager version, out of
+  # images.json. Missing it fails at step 03 with the cluster already created,
+  # so it is checked here with the rest rather than discovered halfway through.
+  for tool in git make gcloud kubectl gh helm jq; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
@@ -1548,6 +1565,12 @@ main() {
     print_error "--registry-prefix must be a non-empty registry path without a URL scheme."
     exit 1
   fi
+  # Empty is the default and means "upstream", so only the scheme is rejected.
+  local third_party_registry_prefix="${PARAM_THIRD_PARTY_REGISTRY_PREFIX%/}"
+  if [[ "$third_party_registry_prefix" == *"://"* ]]; then
+    print_error "--third-party-registry-prefix must be a registry path without a URL scheme."
+    exit 1
+  fi
 
   local api_server_key
   api_server_key="$(openssl rand -hex 16 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
@@ -1603,10 +1626,24 @@ main() {
   write_state_var "$vars_file" USER_PROFILE_ENABLED "${PARAM_USER_PROFILE_ENABLED:-${USER_PROFILE_ENABLED:-false}}"
   write_state_var "$vars_file" HERMES_DASHBOARD_ENABLED "${PARAM_ENABLE_WEBUI:-false}"
   write_state_var "$vars_file" REGISTRY_PREFIX "$registry_prefix"
+  # Written only when asked for. An empty value here would be sourced over an
+  # exported one, turning "leave them upstream" from a default into an override
+  # the installer never took a flag for.
+  if [ -n "$third_party_registry_prefix" ]; then
+    write_state_var "$vars_file" THIRD_PARTY_REGISTRY_PREFIX "$third_party_registry_prefix"
+  fi
+  # Bare repository paths on purpose: IMAGE_TAG is scoped to a single pipeline
+  # run and is never persisted here, so the consuming step attaches it with
+  # qualify_image_ref.
+  #
+  # Two images are absent on purpose. provision_11 derives REPLAY_IMAGE from
+  # REGISTRY_PREFIX itself. CREDENTIAL_PROXY_IMAGE would pin the sidecar for
+  # every PlatformAgent in the cluster: the operator otherwise derives it from
+  # each CR's own agent image, and a cluster-wide env override beats that
+  # derivation, so a later re-render of the CR at a new tag would leave the
+  # sidecar behind on the tag of the install that wrote this file.
   write_state_var "$vars_file" OPERATOR_IMAGE "${registry_prefix}/k8s-operator"
   write_state_var "$vars_file" PLATFORM_AGENT_IMAGE "${registry_prefix}/platform-agent"
-  write_state_var "$vars_file" CREDENTIAL_PROXY_IMAGE "${registry_prefix}/credential-proxy"
-  write_state_var "$vars_file" REPLAY_PROXY_IMAGE "${registry_prefix}/replay-proxy"
   write_state_var "$vars_file" INFERENCE_REPLAY_ENABLED "false"
   write_state_var "$vars_file" NO_CONFIRM "1"
   chmod 600 "$vars_file"
@@ -1629,6 +1666,14 @@ main() {
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"
+  # Only shown for a mirrored install: on a default one both lines restate the
+  # defaults. The second line is the one worth seeing before confirming, because
+  # a mirror that covers only the first-party images fails at cert-manager, with
+  # the cluster already built.
+  if [ "$registry_prefix" != "$DEFAULT_REGISTRY_PREFIX" ] || [ -n "$third_party_registry_prefix" ]; then
+    echo -e "  • ${C_CYAN}Container Registry:${C_RESET} ${registry_prefix}"
+    echo -e "  • ${C_CYAN}Third-Party Images:${C_RESET} ${third_party_registry_prefix:-upstream registries (quay.io, ghcr.io, docker.io, us-docker.pkg.dev)}"
+  fi
   if [ -n "$github_org" ] && [ -n "$github_repo" ]; then
     echo -e "  • ${C_CYAN}GitOps Infrastructure Repo:${C_RESET} https://github.com/${github_org}/${github_repo}"
   fi
