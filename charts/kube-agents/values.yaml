@@ -305,6 +305,19 @@ platformAgent:
     #   - identity hashing falls back to a per-pod random salt with a warning.
     # Upgrading an install that predates these keys is the case that hits this:
     # add them to the existing Secret (upgrade.sh does it for script installs).
+    #
+    # Two further keys belong to the shell sandbox (#737 Part B) and are the one
+    # pair the chart cannot generate for you — sprig can make an ed25519 private
+    # key but cannot encode its public half in authorized_keys form:
+    #   SANDBOX_SSH_PRIVATE_KEY  the agent dials the sandbox with it
+    #   SANDBOX_SSH_PUBLIC_KEY   copied into the <name>-shell-authorized-keys
+    #                            Secret the sandbox mounts
+    # Supply both or neither. The installer scripts and
+    # terraform/examples/full-install generate them, so only a bare `helm
+    # install` has to; without them the sandbox has no way to authenticate the
+    # agent and stays unusable. Rotating them locks the agent out until the
+    # sandbox pod restarts, so an existing pair is carried forward rather than
+    # regenerated. See docs/designs/agent-shell-sandboxing.md#key-management.
     create: false
     data: {}
   integration:

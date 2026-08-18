@@ -56,6 +56,24 @@ if [ -n "$CLUSTER_EXISTS" ]; then
       echo -e "  ${C_GREEN}✓ GKE Secret 'platform-agent-secrets' does not exist in namespace '${NAMESPACE}'.${C_RESET}"
     fi
 
+    # Clean up the shell sandbox's authorized_keys Secret
+    SANDBOX_KEYS_EXIST=""
+    if [ "${DRY_RUN:-0}" -ne 1 ]; then
+      SANDBOX_KEYS_EXIST=$(kubectl get secret platform-agent-shell-authorized-keys -n "${NAMESPACE}" --ignore-not-found 2>/dev/null || echo "")
+    fi
+
+    if [ "${DRY_RUN:-0}" -eq 1 ] || [ -n "$SANDBOX_KEYS_EXIST" ]; then
+      echo -e "  ${C_CYAN}ℹ Deleting GKE Secret 'platform-agent-shell-authorized-keys' from namespace '${NAMESPACE}'...${C_RESET}"
+      if [ "${DRY_RUN:-0}" -eq 1 ]; then
+        echo -e "  ${C_GREEN}[DRY-RUN] Would delete GKE Secret 'platform-agent-shell-authorized-keys' from namespace '${NAMESPACE}'.${C_RESET}"
+      else
+        kubectl delete secret platform-agent-shell-authorized-keys -n "${NAMESPACE}" --ignore-not-found || true
+        echo -e "  ${C_GREEN}✓ GKE Secret 'platform-agent-shell-authorized-keys' successfully deleted.${C_RESET}"
+      fi
+    else
+      echo -e "  ${C_GREEN}✓ GKE Secret 'platform-agent-shell-authorized-keys' does not exist in namespace '${NAMESPACE}'.${C_RESET}"
+    fi
+
     # Clean up GitHub Minter Credentials Secret
     MINTER_SECRET_EXISTS=""
     if [ "${DRY_RUN:-0}" -ne 1 ]; then

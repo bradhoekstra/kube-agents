@@ -14,20 +14,29 @@ problem, reasoned its way to editing the session database with `sqlite3`, wrote 
 own configuration, and restarted itself. Every step was a legitimate shell command.
 Nothing was exploited. The design simply allows it.
 
-This document proposes running the shell in a **[Agent Sandbox]** pod — a separate
-Kubernetes workload with its own filesystem and identity — reached over Hermes'
-existing `ssh` terminal backend, and states what has to be true first.
+This document proposes running the shell in a **separate Kubernetes pod** — its own
+filesystem, its own identity, no credentials — reached over Hermes' existing `ssh`
+terminal backend, and states what has to be true first.
 
-**Status:** proposed, not implemented. Tracked as Parts A and B of
+**Status:** the sandbox image ships ([`deploy/sandbox/`](../../deploy/sandbox/));
+nothing reconciles it yet. Tracked as Parts A and B of
 [#737](https://github.com/gke-labs/kube-agents/issues/737). Part C, the credential
 proxy, is a separate document — [`credential-proxy-placement.md`](credential-proxy-placement.md) —
 and lands first.
+
+**Revised 2026-08-18.** The pod was going to be a `Sandbox` custom resource from
+[Agent Sandbox]. It is a StatefulSet reconciled by our own operator instead. The
+evidence for the reversal is in
+[Agent Sandbox, and why not yet](#agent-sandbox-and-why-not-yet); everything else in
+this document is unchanged, because nothing else depended on which controller
+created the pod.
 
 | Layer                          | Where it lives                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Terminal backend selection     | Hermes `terminal.backend` / `TERMINAL_ENV`. **Unset everywhere in this repo** → `local`                                                                                                                                                                                               |
 | The agent's Hermes config      | [`agents/platform/config.yaml`](../../agents/platform/config.yaml)                                                                                                                                                                                                                    |
-| The pod that would host it     | new `Sandbox` resource, one per agent, reconciled by the operator                                                                                                                                                                                                                     |
+| The pod that would host it     | a `<agent>-shell` StatefulSet, one per agent, reconciled by the operator — [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)                                                                                                          |
+| The image it runs              | [`deploy/sandbox/`](../../deploy/sandbox/) — first-party, `sshd` plus the credential-proxy wrappers                                                                                                                                                                                   |
 | The Session KV store           | [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py), SQLite under `/var/lib/kube-agents/session/`                                                                                                                                    |
 | Its in-process clients         | [`agents/chat/defaults/plugins/session_store/`](../../agents/chat/defaults/plugins/session_store/), [`session_otel_bridge/`](../../agents/chat/defaults/plugins/session_otel_bridge/), [`agents/platform/plugins/incident_context/`](../../agents/platform/plugins/incident_context/) |
 | Existing session documentation | [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md)                                                                                                                                                                                      |
@@ -37,7 +46,7 @@ and lands first.
 | Section                                       | What it gives you                                              |
 | --------------------------------------------- | -------------------------------------------------------------- |
 | [Background](#background)                     | the incident, and what Hermes actually offers                  |
-| [The decision](#the-decision)                 | why Agent Sandbox, and what was rejected                       |
+| [The decision](#the-decision)                 | what runs the sandbox pod, and what was rejected               |
 | [The design](#the-design)                     | a tool call traced end to end, and what persists between calls |
 | [The Session KV store](#the-session-kv-store) | Part A, and why the shell move does not fully replace it       |
 | [Prerequisites](#prerequisites)               | what has to land first, including one known blocker            |
@@ -122,16 +131,81 @@ per-call container. Hermes' persistence model assumes the far end outlives the c
 
 ## The decision
 
-**Agent Sandbox** ([`kubernetes-sigs/agent-sandbox`][Agent Sandbox]), a SIG Apps
-subproject available as a GKE addon. Its `Sandbox` CRD is a long-running stateful
-singleton pod with a stable identity and an attached volume — which is exactly the
-shape Hermes' persistence model assumes. `SandboxTemplate` and `SandboxClaim` give
-the operator a per-agent provisioning path, `SandboxWarmPool` amortises startup, and
-isolation strength is a `runtimeClassName` choice (gVisor or Kata) rather than a
-rewrite.
+**A StatefulSet, one per agent, reconciled by the operator that already reconciles
+everything else the agent needs.** One replica, a `volumeClaimTemplate` for the
+workspace, a headless Service in front of it, and an image this repository builds.
+Hermes reaches it over `ssh` at a stable DNS name.
 
-It is also the only option on the list that is a Kubernetes API. The operator already
-reconciles per-agent resources; adding one more CR is the smallest new concept.
+The shape is dictated by Hermes rather than by taste. Its persistence model
+reconstructs continuity from state left behind on the far end — the cwd marker, the
+`export -p` snapshot, the files themselves — so the far end has to be a durable
+singleton with a stable name and an attached volume. A Deployment gives none of the
+three; a Job or a per-call container gives less. `StatefulSet` with `replicas: 1` is
+the Kubernetes noun for exactly this.
+
+One item on that volume is why a Deployment plus a PVC is not an equivalent
+spelling: sshd's **host keys**. Hermes connects with
+`StrictHostKeyChecking=accept-new`, which accepts a key it has never seen and
+refuses one that changed. A sandbox that regenerates its host key on restart does
+not prompt anybody — it fails every command from then on until `known_hosts` is
+edited by hand. Stable identity is a correctness requirement here, not a nicety.
+
+### Agent Sandbox, and why not yet
+
+This document originally chose **Agent Sandbox**
+([`kubernetes-sigs/agent-sandbox`][Agent Sandbox]), a SIG Apps subproject available
+as a GKE addon: its `Sandbox` CRD is a long-running stateful singleton pod with a
+stable identity and an attached volume, `SandboxTemplate` and `SandboxClaim` give the
+operator a per-agent provisioning path, `SandboxWarmPool` amortises startup, and
+isolation strength becomes a `runtimeClassName` choice. The closing argument was that
+"adding one more CR is the smallest new concept."
+
+That was written from the project's documentation. Installing v0.5.5 on the reference
+cluster and running the sandbox image under it produced four observations, and
+together they invert the conclusion:
+
+- **Three of the four CRDs do not exist.** The install creates
+  `sandboxes.agents.x-k8s.io` and nothing else; `SandboxTemplate`, `SandboxClaim` and
+  `SandboxWarmPool` each come back as "the server doesn't have a resource type". The
+  per-agent provisioning path and the warm pool were the two things the API was
+  supposed to give us that a StatefulSet does not, and neither has shipped.
+- **What did ship maps one-to-one onto a StatefulSet.** `podTemplate` we write either
+  way. `service: true` is a headless Service, six lines of it.
+  `volumeClaimTemplates` is the same field under the same name.
+  `shutdownPolicy: Retain` is `persistentVolumeClaimRetentionPolicy`.
+  `operatingMode: Running` is `replicas: 1`. `runtimeClassName` is a pod field and
+  belongs to neither.
+- **It propagates spec changes worse than a StatefulSet does.** A patch to
+  `spec.podTemplate` on a running `Sandbox` never reached the pod, while the
+  resource's conditions stayed `Ready` and `DependenciesReady`. Only
+  `kubectl delete pod` applied it. A StatefulSet would have rolled it; had it not,
+  `.status` would have said which revision the pod was on.
+- **Nothing in this repository installs it.** No chart, no Terraform module and no
+  provisioning script mentions `agents.x-k8s.io`. Adopting it means a third-party CRD
+  and controller added to all three install surfaces under the IaC-parity contract,
+  plus `registry.k8s.io/agent-sandbox/agent-sandbox-controller` mirrored into
+  [`images.json`](../../images.json) and kept pinned.
+
+So the sentence to withdraw is the one about the smallest new concept. With only
+`Sandbox` shipped, the CR is not the smaller concept: the operator already builds
+StatefulSets, Services, PVCs and NetworkPolicies for this agent, and the sandbox is
+one more of each. Agent Sandbox costs a dependency, three install-surface changes and
+a controller whose reconciliation we would have to work around, in exchange for
+fields we can already write.
+
+**This is a deferral, not a rejection**, and the difference is load-bearing. The bet
+the original decision made — a Kubernetes-native sandbox API, warm pools, isolation
+as a one-line runtime choice — is still the right bet if the project delivers it. So
+the interface below is drawn to make adopting it a swap rather than a rewrite: an
+SSH-reachable pod at a stable name, a workspace volume, and an image that knows
+nothing about what scheduled it. On the day the other three CRDs exist, what changes
+is one builder function in the operator. Nothing in `deploy/sandbox/`, nothing in
+Hermes' configuration, and nothing in this document above this line.
+
+What we give up meanwhile is the warm pool, and it costs less than it sounds: sandbox
+lifetime is tied to the agent rather than the conversation (see
+[What persists](#what-persists-and-for-how-long)), so a cold start is a pod restart,
+not a per-conversation tax.
 
 ### Agent Substrate, and why not
 
@@ -142,9 +216,10 @@ addressing. Density is not our problem: one agent, one shell. Bypassing the
 Kubernetes API costs us the operator integration that makes this cheap. And it
 depends on Pod Certificates, which are default-off until Kubernetes 1.36.
 
-The distinction worth keeping: Substrate optimises _many sessions per node_; Agent
-Sandbox optimises _one durable, isolated session with an identity_. We want the
-second.
+The distinction worth keeping: Substrate optimises _many sessions per node_; this
+design wants _one durable, isolated session with an identity_. That is the axis the
+choice turns on, and it is why the reversal above changes nothing here — a
+StatefulSet is no more of a density layer than a `Sandbox` CR was.
 
 ### What sandboxing does and does not close
 
@@ -188,6 +263,151 @@ Three pods per agent instead of one:
 - **the sandbox pod** — an `sshd`, a workspace volume, the agent's tools, the
   credential-proxy shims. No Kubernetes service-account token, no route to the
   metadata server, no real `kubectl`.
+
+### The sandbox workload
+
+Three objects per agent, all owned by the `PlatformAgent` CR so they are garbage
+collected with it. Sketched in
+[`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)
+— builders and their tests, not yet called from `Reconcile`.
+
+| Object                       | Named           | What it is for                                                                     |
+| ---------------------------- | --------------- | ---------------------------------------------------------------------------------- |
+| `StatefulSet`, `replicas: 1` | `<agent>-shell` | the pod, and the `workspace` volumeClaimTemplate behind it                         |
+| `Service`, `clusterIP: None` | `<agent>-shell` | the StatefulSet's governing service, and the name Hermes dials                     |
+| `NetworkPolicy`              | `<agent>-shell` | ingress on 2222 from the gateway only; egress to DNS and the credential proxy only |
+
+Four fields carry an argument rather than a default:
+
+- **`persistentVolumeClaimRetentionPolicy: Retain` / `Retain`.** The volume holds the
+  sshd host keys. Reclaiming it means the next pod generates new ones, and
+  `accept-new` turns a changed host key into every subsequent command failing — so a
+  scale-down or a workload delete has to leave the claim, at the cost of a PVC that
+  outlives its StatefulSet.
+- **`automountServiceAccountToken: false`.** The entire point. Without it the sandbox
+  has a Kubernetes credential and the boundary is decorative.
+- **No `runAsNonRoot`.** sshd's privilege separation forks as root and drops to the
+  `agent` user for the session, so the container starts as uid 0 and nothing the
+  agent runs does. This one reads like a gap in a security review and is not; the
+  comment in the builder says so at the field.
+- **`CREDENTIAL_PROXY_URL`, and nothing else, from the pod environment.** The image's
+  entrypoint forwards an allowlist into the SSH session, because sshd does not pass
+  its own environment to sessions. See
+  [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh).
+
+Notably absent: a ServiceAccount, a Role, and any Secret other than the public half
+of the agent's SSH key. If a future change needs one of those in the sandbox, that is
+the boundary moving, and it should be argued for here first.
+
+### Key management
+
+Two keypairs are in play and only one of them is a problem.
+
+**Host keys are already automatic.** The image's entrypoint generates an ed25519 and
+an RSA host key on the workspace volume the first time a pod starts on it, and leaves
+them alone on every later start
+([`entrypoint.sh`](../../deploy/sandbox/entrypoint.sh)). Hermes connects with
+`StrictHostKeyChecking=accept-new`, so the first connection trusts the key and every
+later one pins it. Because the keys live on the PVC rather than in a Secret, no
+private key is written to etcd and no install surface has to know they exist — which
+is also the reason for the `Retain` retention policy above. Agent Sandbox's own SSH
+example regenerates an ephemeral host key on every start unless you mount one; this
+avoids both that churn and the Secret it would otherwise need.
+
+**The client keypair is generated at install time.** `SSHEnvironment` passes
+`-i <key_path>`, so the private half has to arrive as a **file** in the agent pod,
+not an environment variable — which turns out to be the hard part, and is dealt
+with under [Getting the key into the agent pod](#getting-the-key-into-the-agent-pod)
+below. Nothing rotates it; see the sharp edges.
+
+#### It follows an existing pattern
+
+`SESSION_KV_API_KEY` and `SESSION_KV_SALT` are the model: generated by every install
+surface, never prompted for, and never rewritten once present. The keypair takes the
+same contract, and three of the four surfaces can express it with what they already
+use:
+
+| Surface                                   | How it generates a secret today                                | What it does for the keypair                                                                                                                      |
+| ----------------------------------------- | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provision_07_gcp_k8s_secrets.sh`         | reads the live Secret back, `openssl rand` only if absent      | `ssh-keygen -t ed25519` in a private temp dir, read back from the live Secret first; `ssh-keygen` added to its `check_prereqs`                    |
+| `upgrade.sh` (`backfill_sandbox_ssh_key`) | additive `kubectl patch`, an existing value is never rewritten | the same guard, for installs that predate the keypair                                                                                             |
+| `terraform/examples/full-install`         | `random_password`                                              | `tls_private_key` with `ED25519`, whose `private_key_openssh` / `public_key_openssh` attributes give both halves without shelling out             |
+| Helm, `platformAgent.credentials.create`  | `lookup` the live Secret, else `randAlphaNum 48`               | **cannot generate.** sprig's `genPrivateKey "ed25519"` emits PEM and sprig has no function that encodes the public half in `authorized_keys` form |
+
+So the two paths that install production — the scripts and the Terraform composition
+— get a keypair with nothing typed. Helm's `credentials.create` accepts a supplied
+pair and renders the sandbox's Secret from it, but generates nothing; absent a key it
+renders no Secret and the sandbox stays unusable. Adding a post-install hook `Job` to
+close that gap would mean a ServiceAccount with write access to the credential
+Secret, which is a worse trade than the gap. It is also consistent with what
+[`values.yaml`](../../charts/kube-agents/values.yaml) already says about the flag:
+convenience for dev installs, and a pre-created Secret in production.
+
+#### Two Secrets, not one
+
+| Secret                                | Holds                                                  | Mounted into  |
+| ------------------------------------- | ------------------------------------------------------ | ------------- |
+| `platform-agent-secrets` (existing)   | `SANDBOX_SSH_PRIVATE_KEY` and `SANDBOX_SSH_PUBLIC_KEY` | the agent pod |
+| `<agent>-shell-authorized-keys` (new) | `authorized_keys`, the public half, alone              | the sandbox   |
+
+One Secret with `items:` selecting a different key for each pod would also work —
+kubelet projects only the listed items. It is rejected because it puts the object
+holding every model API key into the sandbox's volume list, one edit away from being
+readable there in full. "The sandbox mounts no credential Secret" is a claim worth
+being able to make without qualification, and duplicating a **public** key across two
+Secrets is the cheapest possible way to buy it.
+
+Both halves live in `platform-agent-secrets` so that any surface re-running against
+an existing install can recover the pair from one place, and so the chart can render
+the sandbox's Secret without being handed the key again. The private half goes there
+rather than into a dedicated `kubernetes.io/ssh-auth` Secret — the typed one is the
+better convention and Agent Sandbox uses it, but it would mean teaching four install
+surfaces to create a fourth object, where an extra key in a Secret they all already
+create costs them a line each.
+
+#### Getting the key into the agent pod
+
+Mounting the Secret and pointing `ssh -i` at it does not work, and the way it fails
+is worth stating so nobody re-derives it. The agent pod runs `runAsNonRoot` as uid
+10000; a Secret volume's files are owned by root; and `ssh` refuses any private key
+with a group or other permission bit set. So `0400` is unreadable by the agent and
+`0440` is refused by `ssh` — there is no mode that satisfies both, and every
+combination fails at connection time with a message about permissions that reads like
+a bad key and sends the reader to the wrong pod.
+
+The way through is a copy. The Secret is mounted `0444` — world-readable _within a
+pod that is the key's legitimate holder_, which concedes nothing — and a small init
+container running as the pod's own uid `install -m 0600`s it into an `emptyDir` the
+agent container mounts read-only. The copy is owned by the account that reads it, so
+`ssh` is satisfied. A missing key logs and exits 0 rather than failing the pod,
+because the sandbox is opt-in and an install without a keypair is not broken.
+
+Built in
+[`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)
+as `buildShellSandboxClientKeyVolumes`, `buildShellSandboxClientKeyInitContainer` and
+`buildShellSandboxClientKeyMount`. Like the rest of that file they are builders with
+tests and no caller — the agent Deployment does not mount the key yet, because
+nothing reads it until `terminal.backend` is switched to `ssh`.
+
+#### Two sharp edges left
+
+- **Rotation is ordered.** Write the Secret, restart the sandbox, then restart the
+  gateway. In the other order the agent holds a key the sandbox has not authorised
+  yet. The restart is needed because the entrypoint copies `authorized_keys` into
+  place once at startup; symlinking the mounted file instead would let kubelet's
+  Secret propagation make rotation live, and is worth doing when rotation is. Every
+  install surface therefore preserves an existing pair rather than regenerating it —
+  a re-run that quietly minted a new key would lock the agent out of its own shell.
+- **Nothing rotates on a schedule.** The key's lifetime is the install's. Acceptable
+  for a key that never leaves the cluster and authenticates one pod to one pod, but
+  it is a decision rather than an oversight.
+
+Agent Sandbox contributes nothing to lift here: its controller generates no SSH keys
+at all — the only key generation in it is an ECDSA CA for its own webhook TLS — and
+its example scripts `ssh-keygen` and `kubectl create secret` by hand. The one idea in
+that example worth taking is not about keys: it runs dropbear rather than OpenSSH
+specifically so the pod can be fully non-root with all capabilities dropped, which
+bears on the `runAsNonRoot` bullet above and is tracked as open below.
 
 ### A tool call, traced
 
@@ -282,9 +502,12 @@ filter.
 
 ### Egress
 
-Agent Sandbox's default GKE policy blocks egress to RFC1918, cluster DNS, and the
-metadata server. That default is close to what we want and should be kept, with holes
-punched only for the credential proxy Service and the agent pod's SSH ingress.
+Agent Sandbox ships a default GKE policy blocking egress to RFC1918, cluster DNS and
+the metadata server. Not taking the CRD means not inheriting that default either, so
+the equivalent is ours to write: deny by default, with holes punched only for cluster
+DNS, the credential proxy Service, and the agent pod's SSH ingress on 2222. That is
+the `NetworkPolicy` in the table above, and it is the one piece of the reversal that
+is genuinely extra work rather than a rename.
 
 Note that NetworkPolicy is **not enforced** on the reference install
 (`addonsConfig.networkPolicyConfig.disabled: true`, no Dataplane V2), so on that
@@ -295,8 +518,11 @@ disruptive maintenance action and should be sequenced deliberately.
 
 Part C first — it is independent, it closes the credential path without waiting on
 any of this, and it is the only part with a proven live exploit. Part A next, because
-it is cheap and unblocked. Part B last, because it is the largest change and the one
-with an external dependency.
+it is cheap and unblocked. Part B last, because it is the largest change and the only
+one that depends on another part: without Part C the sandbox has no credential path
+at all, so `kubectl`, `gcloud`, `gh` and `git` report that they are unconfigured.
+That is a usable state for testing file and code-execution tools, and not one to ship
+the agent in.
 
 ---
 
@@ -306,15 +532,35 @@ with an external dependency.
   Hermes backend should be written instead. SSH is what exists today; a
   `kubectl exec`-shaped backend would avoid running a second authentication system,
   but it is upstream work.
-- **Startup latency.** A cold sandbox in front of the first `terminal` call of a
-  conversation is a user-visible delay. `SandboxWarmPool` exists for this and has not
-  been measured here.
+- **Startup latency.** A cold sandbox in front of the first `terminal` call is a
+  user-visible delay, and has not been measured. Tying sandbox lifetime to the agent
+  makes it rare rather than absent; the warm-pool answer is no longer available to
+  us (see [Agent Sandbox, and why not yet](#agent-sandbox-and-why-not-yet)), so if
+  the number turns out to matter, the fix is a pod that is already running before
+  the agent asks — which is a decision, not a field.
 - **What the agent legitimately needs mounted.** The whole design's strength is a
   function of this list, and nobody has enumerated it.
 - **Whether `sync_back` should be on at all.** Stated above as an open decision, not
   a resolved one.
-- **Agent Sandbox's own maturity.** It is a young subproject. Depending on it is a
-  bet, and the fallback if it stalls is a hand-rolled StatefulSet with the same shape.
+- **Whether the operator should own the sandbox at all**, or whether it belongs to a
+  second controller with its own lifecycle. Reconciling it alongside the gateway is
+  the smaller change and the one sketched; it also means a bad sandbox spec is a
+  failed `PlatformAgent` reconcile.
+- **Whether dropbear should replace OpenSSH in the image.** Agent Sandbox's example
+  uses it so the pod can run `runAsNonRoot` with all capabilities dropped, and
+  `fsGroup` then removes the entrypoint's `chown` — together the two reasons the
+  container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
+  `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
+  spike against `make docker-smoke-sandbox`; not worth assuming.
+- **The keypair is generated but has never authenticated anything.** Every install
+  surface now mints it (see [Key management](#key-management)), and the staging init
+  container is unit-tested, but no agent has yet opened an SSH connection with a key
+  that arrived this way. The `0444`-plus-copy dance in particular is reasoned from
+  how `ssh` and Secret volumes behave, not from having watched it work.
+- **Nobody has driven this end to end.** The image is built and tested
+  (`make docker-smoke-sandbox`) and a single pod of it has run on the reference
+  cluster, but Hermes has never been pointed at it: file sync, `execute_code`, and
+  whether delegated subagents inherit the SSH backend are all unexercised.
 
 ## Related work
 

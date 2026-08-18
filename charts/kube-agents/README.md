@@ -36,6 +36,18 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   whatever created the Secret supplies them; `provision_07_gcp_k8s_secrets.sh`
   and the Terraform example both do.
 
+  Two more, `SANDBOX_SSH_PRIVATE_KEY` and `SANDBOX_SSH_PUBLIC_KEY`, are the
+  agent's keypair for the shell sandbox, and they are the one pair the chart
+  cannot generate: sprig can make an ed25519 private key but has no function
+  that encodes the public half in `authorized_keys` form. Supply both or
+  neither. `provision_07_gcp_k8s_secrets.sh` and the Terraform example generate
+  them, so only a bare `helm install` has to. Given the public half, the chart
+  also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
+  Secret the sandbox mounts — the sandbox never mounts the credential Secret
+  itself. Without the pair nothing breaks today, because the sandbox is not yet
+  reconciled; see
+  [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
+
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
   authenticates with `SESSION_KV_API_KEY`, treats an empty value as fatal, and
   exits on every start, so **no cluster events are watched at all**; the

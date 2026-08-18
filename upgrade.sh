@@ -200,6 +200,93 @@ backfill_session_kv_keys() {
   fi
 }
 
+# Add the shell sandbox's SSH keypair to an install that predates it.
+#
+# Same additive contract as the Session KV backfill above and for a sharper
+# reason: the sandbox copies authorized_keys into place once at startup, so
+# replacing a keypair that is already in use locks the agent out of its own
+# shell until that pod restarts. An existing pair is therefore never rewritten,
+# and a half-written pair (one key present, the other missing) is treated as
+# absent rather than patched around — a private key whose public half was lost
+# authenticates nothing.
+#
+# The public half is written twice on purpose: into platform-agent-secrets so a
+# later run can recover the pair from one place, and into a Secret of its own
+# for the sandbox to mount. The sandbox must not mount the first one; see
+# docs/designs/agent-shell-sandboxing.md#key-management.
+backfill_sandbox_ssh_key() {
+  local namespace="$1"
+  local secret_name="platform-agent-secrets"
+  local keys_secret="platform-agent-shell-authorized-keys"
+
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    print_warning "ssh-keygen not found; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+  if ! kubectl get secret "$secret_name" -n "$namespace" >/dev/null 2>&1; then
+    print_warning "Secret '$secret_name' not found in '$namespace'; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+
+  local existing_private existing_public
+  existing_private="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PRIVATE_KEY}' 2>/dev/null || echo "")"
+  existing_public="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PUBLIC_KEY}' 2>/dev/null || echo "")"
+  if [ -n "$existing_private" ] && [ -n "$existing_public" ]; then
+    print_info "The shell sandbox keypair is already present; leaving it untouched."
+    return 0
+  fi
+
+  print_info "Generating the missing shell sandbox SSH keypair into Secret '$secret_name'..."
+  local key_dir old_umask
+  old_umask="$(umask)"
+  umask 077
+  key_dir="$(mktemp -d)"
+  umask "$old_umask"
+  if ! ssh-keygen -q -t ed25519 -N '' -C "kube-agents-shell-sandbox" -f "$key_dir/id_ed25519"; then
+    rm -rf "$key_dir"
+    print_warning "ssh-keygen failed; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+
+  # --from-file, not --from-literal: an OpenSSH private key is multi-line, and
+  # kubectl create secret is the shortest path to a correctly encoded value.
+  # The manifest stays on the pipe rather than being written to disk.
+  #
+  # The labels are the ones provision_07_gcp_k8s_secrets.sh stamps on every
+  # Secret it applies, so a later provisioner run over a backfilled install is
+  # a no-op rather than a relabelling.
+  #
+  # This Secret is written before the keypair is patched into "$secret_name",
+  # and the order matters: the guard above treats a half-written pair as
+  # absent, so a failure here leaves the next run free to regenerate both. The
+  # reverse order would record a complete pair and skip forever, leaving the
+  # sandbox with no authorized_keys.
+  kubectl create secret generic "$keys_secret" \
+    --namespace="$namespace" \
+    --from-file=authorized_keys="$key_dir/id_ed25519.pub" \
+    --dry-run=client -o yaml \
+    | kubectl label --local -f - -o yaml \
+        "app.kubernetes.io/name=platform-agent" \
+        "app.kubernetes.io/instance=${namespace}-platform-agent" \
+        "app.kubernetes.io/part-of=kube-agents" \
+        "app.kubernetes.io/managed-by=provisioner" \
+    | kubectl apply -f - >/dev/null
+
+  # Patching `data` with base64 rather than `stringData` with the raw key, which
+  # is what the Session KV backfill above does: a PEM contains newlines, and
+  # this patch is built by string interpolation into JSON. base64's alphabet
+  # needs no escaping, so there is nothing here for a newline to break. `tr`
+  # because macOS base64 has no -w0.
+  local priv_b64 pub_b64
+  priv_b64="$(base64 < "$key_dir/id_ed25519" | tr -d '\n')"
+  pub_b64="$(base64 < "$key_dir/id_ed25519.pub" | tr -d '\n')"
+  rm -rf "$key_dir"
+  kubectl patch secret "$secret_name" -n "$namespace" --type=merge \
+    -p "{\"data\":{\"SANDBOX_SSH_PRIVATE_KEY\":\"$priv_b64\",\"SANDBOX_SSH_PUBLIC_KEY\":\"$pub_b64\"}}" >/dev/null
+
+  print_success "Shell sandbox keypair backfilled into '$secret_name' and '$keys_secret'."
+}
+
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
@@ -353,6 +440,7 @@ main() {
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
     echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-ghcr.io/gke-labs/kube-agents}/*:${PARAM_IMAGE_TAG}"
     echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into 'platform-agent-secrets' only if absent (existing values are never rewritten)"
+    echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate the shell sandbox SSH keypair into 'platform-agent-secrets' and 'platform-agent-shell-authorized-keys' only if absent"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
@@ -406,6 +494,10 @@ main() {
   local target_namespace="${NAMESPACE:-kubeagents-system}"
   print_step "3. Reconciling Pod-Scoped Session Keys"
   backfill_session_kv_keys "$target_namespace"
+  # No rollout is triggered for this one, unlike the Session KV keys below:
+  # nothing mounts the keypair yet (#737 Part B is not reconciled), so an
+  # install that gains it gains a Secret and no behaviour change.
+  backfill_sandbox_ssh_key "$target_namespace"
 
   case "$PARAM_UPGRADE_MODE" in
     operator)

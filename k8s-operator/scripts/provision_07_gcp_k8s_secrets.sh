@@ -20,7 +20,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 # ─── Prerequisites Check ──────────────────────────────────────────────────────
 print_step "Checking Local Prerequisites"
-check_prereqs "gcloud" "kubectl" "openssl"
+check_prereqs "gcloud" "kubectl" "openssl" "ssh-keygen"
 
 # ─── Configuration & State Restoration ────────────────────────────────────────
 print_step "Setting up Configuration State"
@@ -191,6 +191,48 @@ execute_k8s_secrets() {
     fi
   done
 
+  # Recover or generate the agent's SSH keypair for the shell sandbox
+  # (docs/designs/agent-shell-sandboxing.md, #737 Part B). The agent pod holds
+  # the private half and dials the sandbox with it; the sandbox authorises it
+  # and holds nothing else.
+  #
+  # Preserve-then-generate like everything above, and here the preservation is
+  # load-bearing in a way a re-runnable script has to respect: the sandbox
+  # copies authorized_keys into place once at startup, so replacing the pair
+  # under a running sandbox locks the agent out until that pod restarts.
+  #
+  # Unlike its neighbours these two never reach vars.sh. save_secret_var
+  # persists to a file in the source tree by default, and a private key is not
+  # something to leave there when the cluster read-back above already makes a
+  # re-run idempotent without it.
+  local sandbox_ssh_private="" sandbox_ssh_public=""
+  if [ "${DRY_RUN:-0}" -ne 1 ]; then
+    sandbox_ssh_private=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath='{.data.SANDBOX_SSH_PRIVATE_KEY}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+    sandbox_ssh_public=$(kubectl get secret platform-agent-secrets -n "$NAMESPACE" -o jsonpath='{.data.SANDBOX_SSH_PUBLIC_KEY}' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+  fi
+  if [ -n "$sandbox_ssh_private" ] && [ -n "$sandbox_ssh_public" ]; then
+    print_info "Preserving existing sandbox SSH keypair from Kubernetes Secret..."
+  else
+    print_info "Generating an ed25519 SSH keypair for the shell sandbox..."
+    # ssh-keygen only writes to files, so this is the one value in the script
+    # that touches the disk. umask 077 makes the directory private before the
+    # key lands in it, and the directory is removed on both paths out — a
+    # `trap ... RETURN` would not fire on the `exit 1` below.
+    local sandbox_key_dir old_umask
+    old_umask="$(umask)"
+    umask 077
+    sandbox_key_dir="$(mktemp -d)"
+    umask "$old_umask"
+    if ! ssh-keygen -q -t ed25519 -N '' -C "kube-agents-shell-sandbox" -f "$sandbox_key_dir/id_ed25519"; then
+      rm -rf "$sandbox_key_dir"
+      print_error "ssh-keygen failed; cannot provision the shell sandbox keypair."
+      exit 1
+    fi
+    sandbox_ssh_private="$(cat "$sandbox_key_dir/id_ed25519")"
+    sandbox_ssh_public="$(cat "$sandbox_key_dir/id_ed25519.pub")"
+    rm -rf "$sandbox_key_dir"
+  fi
+
   # Recover or prompt for Slack tokens on the connected target cluster
   if is_truthy "${SLACK_ENABLED:-false}"; then
     if [ -z "${SLACK_BOT_TOKEN:-}" ]; then
@@ -269,6 +311,23 @@ execute_k8s_secrets() {
         --from-literal=ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
         --from-literal=SLACK_BOT_TOKEN="${SLACK_BOT_TOKEN:-}" \
         --from-literal=SLACK_APP_TOKEN="${SLACK_APP_TOKEN:-}" \
+        --from-literal=SANDBOX_SSH_PRIVATE_KEY="$sandbox_ssh_private" \
+        --from-literal=SANDBOX_SSH_PUBLIC_KEY="$sandbox_ssh_public" \
+        --dry-run=client -o yaml | apply_labelled_secret
+  )
+
+  # The sandbox's half, in a Secret of its own. Both halves are in
+  # platform-agent-secrets above so that a re-run can recover the pair from one
+  # place, but the sandbox must not mount that object: it holds every model API
+  # key, and `items:` selecting one entry out of it is one careless edit away
+  # from exposing the rest inside the very pod this design exists to keep
+  # credential-free. See docs/designs/agent-shell-sandboxing.md#key-management.
+  print_info "Writing Kubernetes Secret 'platform-agent-shell-authorized-keys' into '$NAMESPACE'..."
+  (
+    set -o pipefail
+    kubectl create secret generic platform-agent-shell-authorized-keys \
+        --namespace="$NAMESPACE" \
+        --from-literal=authorized_keys="$sandbox_ssh_public" \
         --dry-run=client -o yaml | apply_labelled_secret
   )
 

@@ -74,9 +74,14 @@ locals {
       # and their future ones.
       SESSION_KV_API_KEY = random_password.session_kv_api_key.result
       SESSION_KV_SALT    = random_password.session_kv_salt.result
-      ANTHROPIC_API_KEY  = var.anthropic_api_key
-      GEMINI_API_KEY     = var.gemini_api_key
-      OPENAI_API_KEY     = var.openai_api_key
+      # The agent's half of the shell sandbox keypair, generated for the same
+      # reason: nobody has to choose its value. The chart copies the public
+      # half into <name>-shell-authorized-keys for the sandbox to mount.
+      SANDBOX_SSH_PRIVATE_KEY = tls_private_key.sandbox_ssh.private_key_openssh
+      SANDBOX_SSH_PUBLIC_KEY  = tls_private_key.sandbox_ssh.public_key_openssh
+      ANTHROPIC_API_KEY       = var.anthropic_api_key
+      GEMINI_API_KEY          = var.gemini_api_key
+      OPENAI_API_KEY          = var.openai_api_key
     } : key => value if value != ""
   }
 
@@ -136,6 +141,21 @@ resource "random_password" "session_kv_api_key" {
 resource "random_password" "session_kv_salt" {
   length  = 48
   special = false
+}
+
+# The agent's SSH keypair for the shell sandbox (#737 Part B). The agent pod
+# holds the private half and dials the sandbox with it; the sandbox authorises
+# it and holds nothing else.
+#
+# tls_private_key rather than shelling out to ssh-keygen, which is what the
+# installer scripts have to do: private_key_openssh and public_key_openssh give
+# both halves in the exact encodings sshd and `ssh -i` want, with no local-exec
+# and no provisioner. Held in Terraform state like the two passwords above, so
+# `terraform apply` is idempotent without reading the cluster — and so a plan
+# never proposes a new pair, which would lock the agent out of a running
+# sandbox until that pod restarted.
+resource "tls_private_key" "sandbox_ssh" {
+  algorithm = "ED25519"
 }
 
 resource "google_project_service" "required" {
