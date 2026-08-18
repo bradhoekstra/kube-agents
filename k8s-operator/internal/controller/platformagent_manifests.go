@@ -90,6 +90,21 @@ const (
 // recorded as a known limit rather than fixed by re-homing a second container.
 const gatewayProfileEnvVar = "HERMES_GATEWAY_PROFILE"
 
+// The two switches spec.harness.experimental.directProfileRouting sets together.
+//
+// gatewayMultiplexProfilesEnvVar is Hermes' own gateway.multiplex_profiles, the flag
+// that makes a turn's source.profile actually select which profile's HERMES_HOME,
+// config, tools and credentials serve it. Every profile-scoped path in gateway/run.py is
+// gated on it, so without it the direct_agent_routing plugin's stamp is ignored.
+//
+// directProfileRoutingEnvVar gates the plugin itself. Both are set from one field and
+// read "true"/"false"; Hermes treats an empty value as unset rather than off, which is
+// why the off value is spelled out.
+const (
+	gatewayMultiplexProfilesEnvVar = "GATEWAY_MULTIPLEX_PROFILES"
+	directProfileRoutingEnvVar     = "KUBE_AGENTS_DIRECT_ROUTING"
+)
+
 // The single model name LiteLLM is configured to serve, used both in the profile
 // config the gateway reads and in the API server's own default. The two must agree:
 // the API server resolves its model once at startup, and a mismatch means every
@@ -231,15 +246,19 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 			continue
 		}
 		var limits *agentv1alpha1.AgentLimits
-		var memory, frontDoor map[string]any
+		var memory, frontDoor, chatToolsets map[string]any
 		if profile == platformProfileName {
 			limits = platformProfileLimits(agent)
 			memory = memoryOverlay(agent)
 			// Only this profile can be the front door: it is the one the gateway is
 			// re-homed onto in buildBaseContainers.
 			frontDoor = frontDoorOverlay(agent)
+			// What a "/platform …" message may reach. Additive to the front-door keys
+			// rather than an alternative — the two flags are independent, and the lists
+			// are identical, so mergeMaps unioning them is a no-op when both are on.
+			chatToolsets = chatToolsetsOverlay(agent, frontDoorToolsets)
 		}
-		if overlay := renderProfileOverlayYAML(targeted[profile], limits, memory, frontDoor); strings.TrimSpace(overlay) != "" {
+		if overlay := renderProfileOverlayYAML(targeted[profile], limits, memory, frontDoor, chatToolsets); strings.TrimSpace(overlay) != "" {
 			data[profileOverlayKey(profile)] = overlay
 		}
 	}
@@ -247,8 +266,11 @@ func buildConfigMapData(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agen
 	// Cluster profiles are named at runtime, so they get one class overlay applied to
 	// all of them rather than a file each. No memory subtree: agents/cluster/config.yaml
 	// configures no provider at all, on purpose — a cluster agent is spawned by the
-	// kanban dispatcher and carries no human identity to scope a store by.
-	if overlay := renderProfileOverlayYAML(nil, clusterProfileLimits(agent), nil, nil); strings.TrimSpace(overlay) != "" {
+	// kanban dispatcher and carries no human identity to scope a store by. The chat
+	// toolsets do belong here, because direct routing addresses a cluster agent by name
+	// ("/cluster-prod …") and the message arrives over a chat platform its own config
+	// declares no key for.
+	if overlay := renderProfileOverlayYAML(nil, clusterProfileLimits(agent), nil, chatToolsetsOverlay(agent, clusterChatToolsets)); strings.TrimSpace(overlay) != "" {
 		data[clusterProfileClassKey] = overlay
 	}
 	return data
@@ -678,6 +700,15 @@ func platformFrontDoorEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return ptr.Deref(agent.Spec.Harness.Experimental.PlatformFrontDoor, false)
 }
 
+// directProfileRoutingEnabled reports whether spec.harness.experimental.directProfileRouting
+// asks for "/<agent> <text>" to run as a turn on that agent's own profile.
+func directProfileRoutingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Harness == nil || agent.Spec.Harness.Experimental == nil {
+		return false
+	}
+	return ptr.Deref(agent.Spec.Harness.Experimental.DirectProfileRouting, false)
+}
+
 // frontDoorToolsets is the toolset list given to each chat platform key when the
 // Platform Agent is the front door.
 //
@@ -739,6 +770,81 @@ var frontDoorPlugins = []string{
 	"session_store",
 	"session_otel_bridge",
 	"legacy_slash_commands",
+	// Direct routing is orthogonal to which profile the gateway is homed at: with
+	// the front door moved here, "/cluster-<name>" still has somewhere to go, and
+	// "/platform" resolves to this profile and is a no-op. The plugin gates itself
+	// on KUBE_AGENTS_DIRECT_ROUTING, so listing it here costs nothing while
+	// directProfileRouting is off.
+	directRoutingPlugin,
+}
+
+// clusterChatToolsets is what a cluster profile's chat platform keys resolve to when
+// direct routing lets a message reach one.
+//
+// It is agents/cluster/config.yaml's `cli` list verbatim, for the same reason
+// frontDoorToolsets is the platform profile's: a chat message must reach the surface a
+// kanban worker on that profile already has, and no more. Notably no
+// mcp-platform_control — a Cluster Agent debugs one cluster and does not provision — and
+// no `memory`, because that template configures no provider at all.
+//
+// The fail-OPEN hazard described on frontDoorToolsets applies here identically: with no
+// key for the arriving platform, hermes_cli auto-generates a `hermes-<platform>` bundle
+// (the core tools plus every enabled MCP server) instead. TestClusterChatToolsetsMatchClusterConfig
+// fails the build when this drifts from the image's copy.
+var clusterChatToolsets = []string{
+	"hermes-cli",
+	"mcp-developer_knowledge",
+	"mcp-gke",
+}
+
+// chatToolsetsOverlay renders the `platform_toolsets` chat keys a profile needs before a
+// chat message may run a turn on it. Returns nil when direct routing is off.
+//
+// Both platform keys unconditionally, matching the adapters the managed scope pins
+// whether or not each is enabled — the same reasoning frontDoorOverlay states, and for
+// the same reason: a platform turned on later must not also need its toolsets remembered.
+//
+// map[string]any, not map[string][]string, and the type is load-bearing for the reason
+// spelled out in frontDoorOverlay: mergeMaps recurses into a nested map only when
+// toStrMap recognises it, and the typed form falls through to a plain assignment that
+// REPLACES a profile's own platform_toolsets instead of unioning with them.
+func chatToolsetsOverlay(agent *agentv1alpha1.PlatformAgent, toolsets []string) map[string]any {
+	if !directProfileRoutingEnabled(agent) {
+		return nil
+	}
+	return map[string]any{
+		"platform_toolsets": map[string]any{
+			"google_chat": slices.Clone(toolsets),
+			"slack":       slices.Clone(toolsets),
+		},
+	}
+}
+
+// directRoutingPlugin is the plugin that reads the "/<agent> <text>" prefix off an
+// inbound chat message and stamps the target profile on it.
+const directRoutingPlugin = "direct_agent_routing"
+
+// directRoutingFrontDoorOverlay enables that plugin on the `default` profile. Returns nil
+// when direct routing is off.
+//
+// agents/chat/config.yaml enables it too, and on a fresh install that is where it comes
+// from. It is not enough on its own: step 2d's config back-fill
+// (deploy/shared/docker-entrypoint.sh) only restores whole keys the live file does not
+// hold, and an install whose PVC already carries a `plugins.enabled` list predating this
+// plugin has that key — so the new entry never arrives, and the feature is inert on
+// exactly the installs that upgrade into it. The overlay is the route that works on both,
+// because profile_overlay.merge unions lists.
+//
+// Removal is safe on either. unapply strips only the entries the overlay itself
+// introduced, so withdrawing this leaves the image's own entry alone on a fresh install
+// and takes it back out on an upgraded one.
+func directRoutingFrontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
+	if !directProfileRoutingEnabled(agent) {
+		return nil
+	}
+	return map[string]any{
+		"plugins": map[string]any{"enabled": []string{directRoutingPlugin}},
+	}
 }
 
 // kanbanDispatchIntervalSeconds and kanbanWakeOnEvents mirror the `kanban` block
@@ -906,7 +1012,7 @@ func partitionPluginsByProfile(agentPlugins []*agentv1alpha1.AgentPlugin) ([]*ag
 // deploy/shared/defaults/config.yaml with the profile's own overlay, content the operator
 // does not have. Rendering it in full would fork the source of truth; a cluster profile
 // additionally carries a runtime `cluster_identity` stamp that overwriting would strip.
-func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agentv1alpha1.AgentLimits, memory, frontDoor map[string]any) string {
+func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agentv1alpha1.AgentLimits, memory map[string]any, owned ...map[string]any) string {
 	overlay := map[string]any{}
 
 	// Operator-owned execution limits from spec.harness.tuning. Written before the
@@ -921,11 +1027,15 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 		overlay = mergeMaps(overlay, memory)
 	}
 
-	// The front-door keys, when this profile is the one the gateway runs as. Written
-	// before the plugin contributions for the same reason, and mergeMaps unions the
-	// `plugins.enabled` list below rather than replacing it.
-	if frontDoor != nil {
-		overlay = mergeMaps(overlay, frontDoor)
+	// The remaining operator-owned subtrees for this profile — the front-door keys when
+	// it is the one the gateway runs as, the chat toolsets when direct routing can send
+	// a message to it. Written before the plugin contributions for the same reason, and
+	// mergeMaps unions both the `plugins.enabled` list below and the `platform_toolsets`
+	// each other contributes rather than replacing them.
+	for _, subtree := range owned {
+		if subtree != nil {
+			overlay = mergeMaps(overlay, subtree)
+		}
 	}
 
 	enabled := make([]string, 0, len(plugins))
@@ -983,7 +1093,8 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 // already declares, which is the only way an AgentPlugin with no targetProfile ever loads:
 // a mounted plugin is inert until it is named, since Hermes calls register(ctx) only for
 // enabled plugins. `targetProfile: default` is rejected at admission, so this route is the
-// only one an untargeted plugin has.
+// only one an untargeted plugin has. directRoutingFrontDoorOverlay rides the same union
+// to enable `direct_agent_routing` on an install whose PVC predates it.
 //
 // spec.harness.tuning.default, for the same machine-global reason: one profile's turn
 // budget must not become every profile's.
@@ -992,7 +1103,7 @@ func renderProfileOverlayYAML(plugins []*agentv1alpha1.AgentPlugin, limits *agen
 // agents/chat/config.yaml (defaultKanbanMaxInProgress), so an unset CR leaves the image's
 // number in force rather than having the operator restate it on every reconcile.
 func renderDefaultProfileOverlayYAML(agent *agentv1alpha1.PlatformAgent, plugins []*agentv1alpha1.AgentPlugin) string {
-	overlay := renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, nil)
+	overlay := renderProfileOverlayYAML(plugins, defaultProfileLimits(agent), nil, directRoutingFrontDoorOverlay(agent))
 
 	tuning := agentTuning(agent)
 	if tuning == nil || tuning.MaxInProgress == nil {
@@ -2571,6 +2682,29 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
 		Name:  gatewayProfileEnvVar,
 		Value: frontDoorProfile,
+	})
+
+	// Direct routing's two switches, appended unconditionally and with an explicit off
+	// value for the same reason as the variable above: an AgentPlugin's spec.env reaches
+	// envVars verbatim, and a name the operator never emits is not a duplicate for
+	// last-wins to settle. A plugin declaring GATEWAY_MULTIPLEX_PROFILES on its own would
+	// otherwise make the gateway serve every profile's adapters on an install whose
+	// profiles were never given chat toolsets.
+	//
+	// They are separate because they gate different things. GATEWAY_MULTIPLEX_PROFILES is
+	// Hermes' own flag: without it source.profile is ignored and every turn runs on the
+	// profile the gateway is homed at. KUBE_AGENTS_DIRECT_ROUTING gates the
+	// direct_agent_routing plugin, which ships enabled in the image's config.yaml — the
+	// gate is what lets the image and this field move independently, and what makes a
+	// "/platform …" message fall through to the Chat Agent unrouted while the field is
+	// off, rather than running on the front door with its prefix quietly stripped.
+	directRouting := strconv.FormatBool(directProfileRoutingEnabled(agent))
+	gatewayEnvVars = append(gatewayEnvVars, corev1.EnvVar{
+		Name:  gatewayMultiplexProfilesEnvVar,
+		Value: directRouting,
+	}, corev1.EnvVar{
+		Name:  directProfileRoutingEnvVar,
+		Value: directRouting,
 	})
 
 	containers := []corev1.Container{

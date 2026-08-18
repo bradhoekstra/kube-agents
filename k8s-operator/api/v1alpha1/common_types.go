@@ -136,6 +136,28 @@ type ExperimentalSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	PlatformFrontDoor *bool `json:"platformFrontDoor,omitempty"`
+
+	// DirectProfileRouting lets a chat user address a specialist by name:
+	// "/platform scale the frontend" runs as a turn on the platform profile,
+	// "/cluster-prod ..." on that cluster's, skipping both the Chat Agent's
+	// routing turn and the kanban card it would have filed. A message naming no
+	// agent is unaffected and still arrives at the Chat Agent.
+	//
+	// It carries the same trade as PlatformFrontDoor, message by message rather
+	// than install-wide: a routed message reaches the target's full tool surface
+	// with no card and no worker turn framing it. Authorization is unchanged —
+	// the routing hook rewrites the message rather than skipping dispatch, so the
+	// platform allowlist is still checked — and routing is not a way to reach a
+	// profile the sender could not otherwise talk to.
+	//
+	// Two costs are worth knowing before turning it on. It enables Hermes'
+	// gateway.multiplex_profiles, which namespaces session keys per profile, so
+	// existing threads start a fresh session once at rollout. And per-user memory
+	// does not follow: the provider is configured on the Chat Agent's profile, so
+	// a routed turn has no personal-memory recall.
+	// +kubebuilder:default=false
+	// +optional
+	DirectProfileRouting *bool `json:"directProfileRouting,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service

@@ -4727,3 +4727,192 @@ func TestFrontDoorToolsetsMatchPlatformConfig(t *testing.T) {
 			path, got, want)
 	}
 }
+
+// directRoutingAgent is frontDoorAgent's sibling for spec.harness.experimental.directProfileRouting.
+func directRoutingAgent(name string, on bool) *agentv1alpha1.PlatformAgent {
+	agent := haAgent(name, 1)
+	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
+		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+	}
+	if on {
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+			Experimental: &agentv1alpha1.ExperimentalSpec{DirectProfileRouting: ptr.To(true)},
+		}
+	}
+	return agent
+}
+
+// clusterClassOverlay parses the overlay applied to every runtime-scaffolded cluster profile.
+func clusterClassOverlay(t *testing.T, agent *agentv1alpha1.PlatformAgent) map[string]any {
+	t.Helper()
+	raw, ok := buildConfigMapData(agent, nil)[clusterProfileClassKey]
+	if !ok {
+		return nil
+	}
+	var parsed map[string]any
+	if err := yaml.Unmarshal([]byte(raw), &parsed); err != nil {
+		t.Fatalf("unmarshal cluster class overlay: %v\n%s", err, raw)
+	}
+	return parsed
+}
+
+// TestClusterChatToolsetsMatchClusterConfig is the drift guard clusterChatToolsets names,
+// and it exists for the same reason as the platform one: the equality IS the contract. A
+// "/cluster-prod …" message must reach the surface a kanban worker on that profile already
+// has, so an MCP server added to the template has to reach chat ingress too.
+func TestClusterChatToolsetsMatchClusterConfig(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "cluster", "config.yaml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	var image struct {
+		PlatformToolsets map[string][]string `yaml:"platform_toolsets"`
+	}
+	if err := yaml.Unmarshal(raw, &image); err != nil {
+		t.Fatalf("unmarshaling %s: %v", path, err)
+	}
+	want, ok := image.PlatformToolsets["cli"]
+	if !ok {
+		t.Fatalf("platform_toolsets.cli is gone from %s; clusterChatToolsets has no source to "+
+			"track and this test would pass against nothing", path)
+	}
+	if got, want := slices.Sorted(slices.Values(clusterChatToolsets)), slices.Sorted(slices.Values(want)); !slices.Equal(got, want) {
+		t.Errorf("clusterChatToolsets differs from platform_toolsets.cli in %s:\n  operator: %v\n  image:    %v",
+			path, got, want)
+	}
+}
+
+// TestDirectRoutingOverlayCarriesChatToolsets covers the config half of the flag. A routed
+// message arrives over a chat platform, and neither agents/platform/config.yaml nor
+// agents/cluster/config.yaml declares a key for one — they were written for profiles that
+// only ever run as kanban workers. An absent key is fail-OPEN (see frontDoorToolsets), so
+// the missing narrowing is what would hand a chat turn the full auto-generated bundle.
+func TestDirectRoutingOverlayCarriesChatToolsets(t *testing.T) {
+	agent := directRoutingAgent("dr-overlay", true)
+	for _, tc := range []struct {
+		name    string
+		overlay map[string]any
+		want    []string
+	}{
+		{"platform", platformOverlay(t, agent), frontDoorToolsets},
+		{"cluster-class", clusterClassOverlay(t, agent), clusterChatToolsets},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.overlay == nil {
+				t.Fatal("no overlay rendered")
+			}
+			for _, platform := range []string{"google_chat", "slack"} {
+				got := sortedStrings(t, listAt(t, tc.overlay, []string{"platform_toolsets", platform}))
+				if want := slices.Sorted(slices.Values(tc.want)); !slices.Equal(got, want) {
+					t.Errorf("platform_toolsets.%s = %v, want %v", platform, got, want)
+				}
+			}
+		})
+	}
+}
+
+// The flag is only worth having if it comes back off: profile_overlay.py unapplies a
+// withdrawn key from its last-applied record, so the revert is exactly "the operator stops
+// rendering these". The platform overlay is written unconditionally, which makes leaving the
+// keys in it easy to do and invisible.
+func TestDirectRoutingOverlayIsEmptyWhenOff(t *testing.T) {
+	agent := directRoutingAgent("dr-off", false)
+	if _, present := platformOverlay(t, agent)["platform_toolsets"]; present {
+		t.Error("platform_toolsets is rendered into the platform overlay with the flag off, " +
+			"so turning the flag off would not undo it")
+	}
+	if overlay := clusterClassOverlay(t, agent); overlay != nil {
+		if _, present := overlay["platform_toolsets"]; present {
+			t.Error("platform_toolsets is rendered into the cluster class overlay with the flag off")
+		}
+	}
+}
+
+// TestDirectRoutingUnionsWithTheFrontDoorKeys guards the interaction between the two
+// experimental flags. They are independent, both write platform_toolsets onto the same
+// profile, and mergeMaps only unions what toStrMap recognises — so a typed map here would
+// have one flag silently replace the other's keys rather than merge with them.
+func TestDirectRoutingUnionsWithTheFrontDoorKeys(t *testing.T) {
+	agent := frontDoorAgent("dr-both", 1, true)
+	agent.Spec.Harness.Experimental.DirectProfileRouting = ptr.To(true)
+	overlay := platformOverlay(t, agent)
+
+	for _, platform := range []string{"google_chat", "slack"} {
+		got := sortedStrings(t, listAt(t, overlay, []string{"platform_toolsets", platform}))
+		if want := slices.Sorted(slices.Values(frontDoorToolsets)); !slices.Equal(got, want) {
+			t.Errorf("platform_toolsets.%s = %v, want %v", platform, got, want)
+		}
+	}
+	// The front door's own keys must survive the second writer.
+	if _, present := overlay["kanban"]; !present {
+		t.Errorf("the front door's kanban block is gone once direct routing also writes to "+
+			"this profile:\n%v", overlay)
+	}
+	enabled := sortedStrings(t, listAt(t, overlay, []string{"plugins", "enabled"}))
+	if !slices.Contains(enabled, "direct_agent_routing") {
+		t.Errorf("plugins.enabled = %v, missing direct_agent_routing; with the gateway homed "+
+			"at this profile it is the only thing that can route /cluster-<name>", enabled)
+	}
+}
+
+// TestDirectRoutingEnablesThePluginOnTheFrontDoor covers the half of the feature that
+// agents/chat/config.yaml cannot deliver on its own. That file is the source for a fresh
+// install, but the entrypoint's config back-fill only restores whole keys the live file
+// does not hold — an upgraded install already has `plugins.enabled`, so the new entry
+// never lands there and the plugin stays mounted and unregistered. Hermes calls
+// register(ctx) only for enabled plugins, which makes that silent: the env var says the
+// feature is on, the directory is in the pod, and "/platform …" still goes to the Chat
+// Agent.
+func TestDirectRoutingEnablesThePluginOnTheFrontDoor(t *testing.T) {
+	key := profileOverlayKey("default")
+	for _, tc := range []struct{ on, want bool }{{true, true}, {false, false}} {
+		t.Run(fmt.Sprintf("flag=%v", tc.on), func(t *testing.T) {
+			raw, ok := buildConfigMapData(directRoutingAgent("dr-frontdoor", tc.on), nil)[key]
+			if !ok {
+				if tc.want {
+					t.Fatalf("no %s in the ConfigMap", key)
+				}
+				return
+			}
+			var parsed map[string]any
+			if err := yaml.Unmarshal([]byte(raw), &parsed); err != nil {
+				t.Fatalf("unmarshal default overlay: %v\n%s", err, raw)
+			}
+			enabled, _ := lookup(parsed, []string{"plugins", "enabled"})
+			var got []string
+			if enabled != nil {
+				got = sortedStrings(t, listAt(t, parsed, []string{"plugins", "enabled"}))
+			}
+			if slices.Contains(got, directRoutingPlugin) != tc.want {
+				t.Errorf("plugins.enabled = %v, want direct_agent_routing present=%v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDirectRoutingEnvIsAlwaysEmitted pins both switches to the gateway container, in both
+// states. The off value is the half worth pinning, for the reason
+// TestPlatformFrontDoorProfileEnvIsGatewayOnly gives: an AgentPlugin's spec.env is copied
+// verbatim with no allowlist, so a name the operator never writes is one a plugin can claim
+// outright — and GATEWAY_MULTIPLEX_PROFILES claimed by a plugin would have the gateway serve
+// every profile's adapters on an install whose profiles were never given chat toolsets.
+//
+// "false" rather than "": Hermes reads a blank value as unset, not as off.
+func TestDirectRoutingEnvIsAlwaysEmitted(t *testing.T) {
+	for _, tc := range []struct {
+		on   bool
+		want string
+	}{{true, "true"}, {false, "false"}} {
+		t.Run(tc.want, func(t *testing.T) {
+			d := buildDeployment(directRoutingAgent("dr-env", tc.on), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+			gateway := containerNamed(t, d, "platform-agent")
+			for _, name := range []string{gatewayMultiplexProfilesEnvVar, directProfileRoutingEnvVar} {
+				got, found := envValue(gateway, name)
+				if !found || got != tc.want {
+					t.Errorf("gateway %s = %q (found=%v), want %q", name, got, found, tc.want)
+				}
+			}
+		})
+	}
+}

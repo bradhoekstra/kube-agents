@@ -389,6 +389,14 @@ plugins:
     - incident_context
     - bootstrap_onboarding
     - legacy_slash_commands
+    # Sends `/<agent> <text>` straight to that agent's profile, skipping this
+    # profile's turn and the kanban card. Listed after `incident_context` for the
+    # ordering reason above: that hook steps aside for a leading `/`, so it must
+    # see the message while the prefix is still on it. Inert unless the operator
+    # sets KUBE_AGENTS_DIRECT_ROUTING and GATEWAY_MULTIPLEX_PROFILES, from
+    # spec.harness.experimental.directProfileRouting. See
+    # defaults/plugins/direct_agent_routing/README.md.
+    - direct_agent_routing
     # Injects the routable-specialist roster into every turn, so choosing an
     # `assignee` costs no tool call. See defaults/plugins/agent_roster/README.md.
     # The operator writes the deployed copy of this list; keep the two in sync

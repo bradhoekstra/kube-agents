@@ -57,6 +57,7 @@ the agent a usable kubectl context) when it has the complete triple; with one mi
 | `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                             |
 | `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                   |
 | `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                             |
+| `experimental.directProfileRouting`            | bool   | **Unsupported.** Let a chat message address a specialist by name — `/platform <text>`. Default `false`. See below.                                           |
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
 milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
@@ -293,8 +294,9 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   no chat at all and the router MCP path is simply unused. Kanban delegation is not: the front door
   keeps `dispatch_in_gateway`, so it can still hand a card to a spawned worker — it just does so as
   the agent that could also have done the work itself.
-- `gateway.multiplex_profiles` is still off, so a `/p/<profile>/` prefix on an API request is
-  ignored. Those requests now land on the Platform Agent rather than the Chat Agent.
+- `gateway.multiplex_profiles` is off unless [`directProfileRouting`](#directprofilerouting) turns it
+  on, so on this flag alone a `/p/<profile>/` prefix on an API request is ignored. Those requests now
+  land on the Platform Agent rather than the Chat Agent.
 - The `hermes dashboard` sidecar is deliberately left on the `default` profile, so the dashboard
   shows that profile's sessions while the front door is the platform one.
 - **An [`AgentPlugin`](./agentplugin-crd.md) without a `spec.targetProfile` does not follow the
@@ -358,6 +360,81 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   scaffolding on disk are unchanged and they keep working. What stops is the scheduled work above,
   which includes `cluster-agent-reconcile`, so a cluster onboarded while the flag is on gets no
   profile until the flag goes back off.
+
+#### `directProfileRouting`
+
+Lets a chat user address a specialist by name. `/platform scale the frontend` runs as a turn on the
+`platform` profile, `/cluster-prod why is it down?` on that cluster's, with no Chat Agent turn and no
+kanban card in between. A message naming no agent is unaffected. This is the per-message form of the
+trade [`platformFrontDoor`](#platformfrontdoor) makes install-wide, and the two compose.
+
+```bash
+kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
+  -p '{"spec":{"harness":{"experimental":{"directProfileRouting":true}}}}'
+```
+
+Which names route is decided at message time, against the same roster `list_agents` returns, so a
+cluster agent scaffolded a moment ago is addressable on the next message. Anything unrecognised is
+left untouched and Hermes' own slash-command resolution takes it from there: `/sethome` and the rest
+still reach their handlers, while a leading word that is neither a command nor a profile —
+`/nosuchagent`, or a bare `/platform` with no text — gets the gateway's `Unknown command` reply
+rather than a Chat Agent turn. That is pre-existing behaviour for any `/word`, not something this
+flag introduces.
+[ChatOps → Addressing a specialist directly](/kube-agents/concepts/chatops/#addressing-a-specialist-directly)
+is the user-facing description; the `direct_agent_routing` plugin's
+[README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/direct_agent_routing/README.md)
+is the design of record.
+
+Three things change while it is on:
+
+- The gateway container gets `GATEWAY_MULTIPLEX_PROFILES=true`, which is what makes Hermes honour a
+  per-message profile at all, and `KUBE_AGENTS_DIRECT_ROUTING=true`, the plugin's own gate. Both are
+  emitted on every reconcile, `false` included, so clearing the field withdraws the behaviour rather
+  than leaving the pod on its last value.
+- `profile-default.overlay.yaml` gains `direct_agent_routing` in `plugins.enabled`. The image's own
+  `agents/chat/config.yaml` lists it too, but only a fresh volume gets that copy: the entrypoint's
+  config back-fill restores whole keys the live file lacks, and an upgraded install already has a
+  `plugins.enabled` list. Without the overlay the plugin would sit mounted and unregistered on
+  exactly the installs that upgrade into the feature.
+- `profile-platform.overlay.yaml` and the cluster-profile class overlay gain a `platform_toolsets`
+  block naming each chat platform's toolsets. That key is fail-**open** in Hermes: a profile with no
+  entry for the platform a message arrived on gets a synthesised bundle carrying terminal,
+  `write_file`, `execute_code` and every enabled MCP server. Pinning it keeps a routed turn on the
+  toolsets the profile's own `cli` list already grants.
+
+**What it costs.** The Chat Agent's framing, per routed message: an allowlisted user reaches the
+target's full tool surface with no card and no worker turn between. Authorization itself is
+unchanged — the routing hook rewrites the message rather than skipping dispatch, so the platform
+allowlist is checked exactly as it would be otherwise, and naming a profile is not a way to reach one
+the sender could not already talk to.
+
+**Known limits.**
+
+- **A routed message binds the rest of the conversation to that profile.** Routing is per-message
+  only for the first one. `gateway.multiplex_profiles` scopes session keys per profile
+  (`agent:platform:…` instead of `agent:main:…`), and the key the routed turn asks for does not
+  exist yet — so Hermes recovers one, and `find_latest_gateway_session_for_peer` ranks candidates by
+  recency for the `(platform, user, chat)` peer while ignoring the namespace it was asked for. It
+  returns the conversation's existing session and rewrites that durable row's `session_key`,
+  `profile_name` and system prompt. Every later message in the conversation then continues in it,
+  prefix or no prefix, and the Chat Agent does not get the next one.
+  `_recovered_row_allowed_for_active_profile` is the guard that refuses a cross-profile revival, and
+  it applies only while multiplexing is off. Nothing expires the binding on a stock install, whose
+  reset policy is `none`; `/new` or `/reset` starts a clean session, and clearing this flag makes the
+  guard apply again so the conversation reverts to `agent:main`.
+- **Per-user memory does not follow a routed turn.** `multiuser_memory` is configured on the
+  `default` profile, for the reasons the `platformFrontDoor` bullet above sets out; a `/platform`
+  turn has no personal-memory recall and cannot resolve "my cluster".
+- **No progress notifications.** There is no card, so there is no rolling `⏳` message. The answer
+  arrives as an ordinary reply when the turn finishes, which for long work means silence until then.
+- **Secondary-profile adapters are attempted at startup.** With multiplex on, the gateway tries to
+  serve adapters for every named profile, and the `/etc/hermes` managed scope is machine-global — so
+  `platforms.*` lands on all of them. Hermes detects the same-credential collision, logs it as an
+  error and skips that adapter, so the effect is log noise rather than a second poller.
+- **DM pairing is profile-scoped.** Once per-profile pairing stores are registered, a paired-DM
+  install would need the user paired on the target profile. Installs that authorize by env allowlist
+  (`GOOGLE_CHAT_ALLOWED_USERS`, `SLACK_ALLOWED_USERS`, the `*_ALLOW_ALL_USERS` flags) are unaffected:
+  those are process-global and are checked first.
 
 ## `spec.deployment`
 

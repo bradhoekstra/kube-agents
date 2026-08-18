@@ -7,7 +7,7 @@ sidebar:
 
 Chat is the harness's primary interface — for requests from humans and for the unprompted messages the harness raises itself ([Proactive alerts](#proactive-alerts-both-channels)). The channels shipping today are **Google Chat** (the reference channel, fully wired and E2E tested; enable with `GOOGLE_CHAT_ENABLED=true` during provisioning) and **Slack** (enable with `SLACK_ENABLED=true` during provisioning). Both are opt-in and default to disabled.
 
-Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress. It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`). Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Chat Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
+Both channels terminate at the **Chat Agent** — the `default` Hermes profile in the agent pod, and the only profile that receives chat ingress (with one opt-in exception, [Addressing a specialist directly](#addressing-a-specialist-directly)). It knows which specialists exist because the roster is injected into every turn by the `agent_roster` plugin (its `router` MCP tool `list_agents` re-reads the same list on demand), and delegates the request to the right one as a card on the shared **kanban board** (`kanban_create`). Results come back on their own: the gateway posts each completed card's answer into the thread verbatim, and the Chat Agent handles the hand-off and anything that blocks or fails. The [Platform Agent](/kube-agents/concepts/platform-agent/) does the actual infrastructure work as a delegated kanban worker, and per-cluster [Cluster Agents](/kube-agents/concepts/cluster-agents/) handle single-cluster runtime debugging; neither receives chat directly. A user still sees a single conversational agent regardless of channel — the delegation is visible only as progress updates in the thread. The design of record for this coordination model is [`docs/designs/agent-communication.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-communication.md).
 
 ## Google Chat
 
@@ -73,6 +73,25 @@ Until you do, a typed `/hermes <subcommand>` arrives as an ordinary channel mess
 It is optional at provisioning time: leave the prompt empty and set it later from Slack by running `/sethome` (or `/hermes sethome`) in the channel you want. That writes the value into the **Chat Agent** profile — the one that owns Slack ingress — which is why the command has to run through the gateway rather than being applied by an agent on its own profile.
 
 A scheduled brief posts flat in that channel, never inside a thread. `/sethome` also records whichever thread it happened to be typed in, and threading every scheduled report under one ageing thread leaves only the first one visible — so cron delivery drops the thread deliberately. A job that wants its output in a thread names an explicit `deliver=` target instead.
+
+## Addressing a specialist directly
+
+The path above is the right one when the user describes a problem and the front door has to work out who owns it. It is pure latency when the user already knows. `spec.harness.experimental.directProfileRouting` on the PlatformAgent adds a prefix for that case, on both channels:
+
+```text
+/platform what's the CPU request on the frontend deployment?
+/cluster-prod why is that pod crashlooping?
+```
+
+The message runs as an ordinary gateway turn on the named agent's own profile — its config, skills, tools and credentials — with no Chat Agent turn and no kanban card. Streaming, threading and session continuity work as they do for any other message, and the reply arrives in the same thread.
+
+Which names work is read per message from the same roster `list_agents` returns, so a cluster agent scaffolded a moment ago is addressable on the next message. Anything else is left untouched: `/sethome` and the other slash commands still reach their handlers, and a `/platform` that appears mid-sentence rather than at the start is ordinary prose the Chat Agent answers. A leading bot mention before the prefix is fine. A name that is neither a command nor an agent — a typo, or a bare `/platform` with no text after it — gets Hermes' `Unknown command` reply, which is what any unrecognised `/word` has always done.
+
+Only the first message is really per-message. Routing the conversation once moves its whole session onto that agent's profile, so the messages after it continue there too, prefix or not, until `/new` starts a fresh session. [`directProfileRouting` → Known limits](/kube-agents/operator/platformagent-crd/#directprofilerouting) has the mechanism.
+
+Two other things a routed turn gives up. There is no card, so there is no rolling `⏳` progress message — the answer simply arrives when the turn finishes. And per-user memory is configured on the Chat Agent profile alone, so a routed turn has no personal-memory recall and cannot resolve "my cluster". Authorization is not among them: the routing hook rewrites the message rather than bypassing dispatch, so the channel allowlist is checked exactly as it would be otherwise.
+
+The flag is experimental and defaults off — it hands an allowlisted chat user the specialist's full tool surface without the card and worker turn that normally frame it, the same trade [`platformFrontDoor`](/kube-agents/operator/platformagent-crd/#platformfrontdoor) makes install-wide. See [`directProfileRouting`](/kube-agents/operator/platformagent-crd/#directprofilerouting) for what changes in the deployment, and the `direct_agent_routing` plugin's [README](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/defaults/plugins/direct_agent_routing/README.md) for the design of record.
 
 ## Proactive alerts (both channels)
 

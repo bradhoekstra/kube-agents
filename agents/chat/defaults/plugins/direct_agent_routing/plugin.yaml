@@ -1,0 +1,4 @@
+name: direct_agent_routing
+version: 0.1.0
+description: Routes a "/<agent> <text>" message straight to that agent's Hermes profile, so a user who already knows which specialist they want skips the Chat Agent turn and the kanban card.
+kind: standalone

@@ -606,6 +606,10 @@ spec:
             - name: API_SERVER_MODEL_NAME
               value: model-default
             - name: HERMES_GATEWAY_PROFILE
+            - name: GATEWAY_MULTIPLEX_PROFILES
+              value: "false"
+            - name: KUBE_AGENTS_DIRECT_ROUTING
+              value: "false"
           image: ghcr.io/gke-labs/kube-agents/platform-agent:latest
           imagePullPolicy: IfNotPresent
           name: platform-agent
