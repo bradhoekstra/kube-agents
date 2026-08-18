@@ -31,6 +31,7 @@ Tagged with the release version; `:latest` on every push to `main`.
 | ----- | ------------------ | --- | -------- | --------- |
 | `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, and its sandbox init container. |
 | `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy sidecar in the agent pod. |
+| `agent-sandbox` | `ghcr.io/gke-labs/kube-agents/agent-sandbox` | release tag | `AGENT_SANDBOX_IMAGE` | The Sandbox the agent's shell, file and code-execution tools run in, when execution isolation is enabled. |
 | `k8s-operator` | `ghcr.io/gke-labs/kube-agents/k8s-operator` | release tag | `OPERATOR_IMAGE` | The controller-manager Deployment. |
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
 
@@ -60,7 +61,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.0` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.26-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages. |
-| `python` | `docker.io/library/python` | `3.11-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile. |
+| `python` | `docker.io/library/python` | `3.11-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile runtime stage. |
 
 <!-- prettier-ignore-end -->
