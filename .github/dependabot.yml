@@ -70,10 +70,14 @@ updates:
     # requirements-test.txt holds mcp below 2.0 because agent_common_server.py
     # imports mcp.server.fastmcp, which 2.x moved. #751 widened the constraint
     # to <3 anyway; the tests stub the module, so nothing caught it.
+    # `versions` and not `update-types`: a semver-major comparison needs a
+    # resolved current version, and `mcp<2` is a bare range rather than an `==`
+    # pin, so there is none. That is why #751 arrived titled "update mcp
+    # requirement from <2 to <3" instead of as a version bump.
     ignore:
       - dependency-name: "mcp"
-        update-types:
-          - "version-update:semver-major"
+        versions:
+          - ">=2"
     groups:
       python:
         patterns:
