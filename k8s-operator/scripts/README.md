@@ -71,6 +71,14 @@ resolution for a single image. Unlike the kube-agents images, these are delibera
 persisted to `vars.sh`: a saved pin would be a second copy of a version `images.json` already
 owns, and would survive an upgrade that moved it.
 
+Neither prefix carries credentials, and these scripts have no flag that does: the mirror has to
+be readable with the nodes' own credentials. For one that is not — Harbor or Artifactory with
+token auth — set `IMAGE_PULL_SECRETS` on the controller manager by hand after step 03, which
+covers the agent pods the operator renders but not the operator, LiteLLM, or minter pods the
+scripts apply themselves. [Docker images § Registry
+authentication](../../docs/site/src/content/docs/deploy/docker-images.md#registry-authentication)
+is canonical and covers the chart and Terraform forms.
+
 Two of these are pinned by digest as well as tag. The mirrored form drops the digest, because
 `make mirror-images` pushes to a tag and a digest names the upstream manifest, not the copy —
 so a mirrored install asks for `<prefix>/hindsight-api:0.9.1` while a default one gets the

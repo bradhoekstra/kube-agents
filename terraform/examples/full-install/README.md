@@ -115,12 +115,30 @@ for `image_tag` — so a mirror populated at `latest` against an `image_tag` of
 reports success and the pods sit in ImagePullBackOff. Pass the same value to
 both.
 
-The mirror must be readable with the nodes' own credentials — an Artifact
-Registry in the same project is the simple case. No `imagePullSecrets` are
-rendered.
+A mirror the nodes cannot read on their own — Harbor or Artifactory with token
+auth, rather than an Artifact Registry in the same project — needs
+`image_pull_secrets` as well. It takes Secret names, and the Secrets are
+referenced rather than created, which is what keeps registry credentials out of
+Terraform state. Create them before applying, and create the namespace first:
+`create_namespace = true` on the release means Helm has not made it yet.
 
-**cert-manager is not covered.** `image_registry` and
-`third_party_image_registry` are values on `helm_release.kube_agents`;
+```bash
+kubectl create namespace kubeagents-system
+kubectl create secret docker-registry regcred \
+  --namespace kubeagents-system \
+  --docker-server=harbor.example.com \
+  --docker-username=robot\$kube-agents \
+  --docker-password="$TOKEN"
+```
+
+Both are idempotent against what Helm then finds. The names reach every pod the
+chart renders and, through `IMAGE_PULL_SECRETS` on the operator and
+`spec.deployment.imagePullSecrets` on the `PlatformAgent`, the agent pods the
+operator renders too.
+
+**cert-manager is not covered.** `image_registry`,
+`third_party_image_registry`, and `image_pull_secrets` are values on
+`helm_release.kube_agents`;
 `helm_release.cert_manager` is a separate release of an upstream chart and
 never sees them, so with `enable_cert_manager = true` its four images still
 come from `quay.io/jetstack` however the prefixes are set. The chart itself is

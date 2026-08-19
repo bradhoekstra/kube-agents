@@ -79,6 +79,19 @@ surfaces that have drifted, which is worse than no check at all.
 * **``googleChat.homeChannel`` is settable from the chart and Terraform only**;
   ``platform-agent.yaml.template`` hardcodes it empty. A script-path init_var
   is a follow-up, not silent drift.
+* **``imagePullSecrets`` is expressible from the CRD, the chart, and Terraform
+  only.** ``spec.deployment.imagePullSecrets`` and the operator's
+  ``IMAGE_PULL_SECRETS`` default are reachable through
+  ``global.imagePullSecrets`` and ``image_pull_secrets``. The script path has no
+  knob for either — not ``vars.sh``, not ``platform-agent.yaml.template``, not
+  ``provision_03``, and no ``install.sh`` flag beside ``--registry-prefix`` — so
+  a script install still needs a mirror the nodes can read, as it did before the
+  field existed. Registry authentication is where the install surfaces stopped
+  being equivalent, and the chart and Terraform are where new install
+  configuration goes; closing it on the scripts is a change in its own right,
+  not silent drift. Nothing scalar to compare either way: the chart and
+  Terraform default to empty and the scripts have no counterpart to default
+  against.
 
 Standard library only, so it runs in CI and in a bare clone.
 
