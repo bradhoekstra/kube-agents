@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -24,6 +25,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -233,15 +235,29 @@ func TestShellSandboxObjectsShareOneSelector(t *testing.T) {
 }
 
 func TestResolveShellSandboxImageHonoursTheMirrorOverride(t *testing.T) {
+	agent := shellSandboxTestAgent()
+
 	t.Setenv(shellSandboxImageEnvVar, "registry.example.com/mirror/agent-sandbox:v1.2.3")
-	if got := resolveShellSandboxImage(); got != "registry.example.com/mirror/agent-sandbox:v1.2.3" {
+	if got := resolveShellSandboxImage(agent); got != "registry.example.com/mirror/agent-sandbox:v1.2.3" {
 		t.Errorf("expected the %s override to win, got %q", shellSandboxImageEnvVar, got)
+	}
+
+	// A per-agent image beats the controller-wide one: the override exists for an
+	// install mirroring every image, the CR field for one agent being moved.
+	withImage := shellSandboxTestAgent()
+	withImage.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{
+			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Image: "registry.example.com/team/agent-sandbox:dev"},
+		},
+	}
+	if got := resolveShellSandboxImage(withImage); got != "registry.example.com/team/agent-sandbox:dev" {
+		t.Errorf("expected the CR image to win over %s, got %q", shellSandboxImageEnvVar, got)
 	}
 
 	t.Setenv(shellSandboxImageEnvVar, "")
 	// The default must track the agent's version, not float on :latest: the two
 	// images are built from one commit by one workflow.
-	got := resolveShellSandboxImage()
+	got := resolveShellSandboxImage(agent)
 	if !strings.HasSuffix(got, ":"+DefaultPlatformAgentVersion) {
 		t.Errorf("expected the default sandbox image to carry the build version %q, got %q", DefaultPlatformAgentVersion, got)
 	}
@@ -360,5 +376,121 @@ func TestShellSandboxAuthorizedKeysSecretIsNotTheCredentialSecret(t *testing.T) 
 		if v.Secret != nil && v.Secret.SecretName == defaultPlatformAgentSecrets {
 			t.Errorf("the sandbox pod must not reference %q, found volume %q", defaultPlatformAgentSecrets, v.Name)
 		}
+	}
+}
+
+// shellSandboxAgent returns a test agent with the sandbox toggle set.
+func shellSandboxAgent(enabled bool) *agentv1alpha1.PlatformAgent {
+	agent := shellSandboxTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
+		Experimental: &agentv1alpha1.ExperimentalSpec{
+			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(enabled)},
+		},
+	}
+	return agent
+}
+
+// Absent means off. Every install that exists today says nothing about the
+// sandbox, and each of these shapes is one of them — a nil check missed anywhere
+// in the four-level path is a panic in the reconcile loop, not a default.
+func TestShellSandboxIsOffUnlessAskedFor(t *testing.T) {
+	off := map[string]*agentv1alpha1.PlatformAgent{
+		"nil agent":           nil,
+		"no harness":          shellSandboxTestAgent(),
+		"no experimental":     {Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{}}},
+		"no sandbox block":    {Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Experimental: &agentv1alpha1.ExperimentalSpec{}}}},
+		"sandbox without set": {Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Experimental: &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{}}}}},
+		"explicitly false":    shellSandboxAgent(false),
+	}
+	for name, agent := range off {
+		if shellSandboxEnabled(agent) {
+			t.Errorf("%s must leave the shell local", name)
+		}
+	}
+	if !shellSandboxEnabled(shellSandboxAgent(true)) {
+		t.Error("an explicit true must turn the sandbox on")
+	}
+}
+
+// The managed scope is what makes the backend something the agent cannot write its
+// way out of. An agent that saves `backend: local` into its own config.yaml has not
+// changed a preference, it has left the sandbox — so these keys have to be in the
+// rendering that Hermes treats as immutable, and absent from it entirely when the
+// feature is off so that no existing install sees a new key.
+func TestManagedConfigCarriesTheTerminalBackendOnlyWhenSandboxed(t *testing.T) {
+	if got := renderConfigYAML(shellSandboxAgent(false), nil); strings.Contains(got, "terminal:") {
+		t.Errorf("the managed scope must say nothing about the terminal when the sandbox is off:\n%s", got)
+	}
+
+	agent := shellSandboxAgent(true)
+	got := renderConfigYAML(agent, nil)
+	for _, want := range []string{
+		"backend: ssh",
+		"ssh_host: " + shellSandboxHost(agent),
+		"ssh_user: " + shellSandboxUser,
+		fmt.Sprintf("ssh_port: %d", shellSandboxPort),
+		"ssh_key: " + shellSandboxClientKeyFilePath(),
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("expected the managed terminal block to carry %q:\n%s", want, got)
+		}
+	}
+	// cwd is the profile-shaped part of the block, and a leaf here REPLACES each
+	// profile's own value rather than merging with it.
+	if strings.Contains(got, "cwd:") {
+		t.Errorf("the managed scope must not pin terminal.cwd:\n%s", got)
+	}
+}
+
+// The builders were tested in isolation long before anything called them. This is
+// the join: with the toggle on, the agent pod has to carry the init container, both
+// volumes and the read-only mount, and with it off it must carry none of them —
+// an install that has never heard of the sandbox should not grow a reference to a
+// Secret key it does not have.
+func TestAgentPodStagesTheClientKeyOnlyWhenSandboxed(t *testing.T) {
+	has := func(pod corev1.PodSpec) (init, volume, staged, mount bool) {
+		for _, c := range pod.InitContainers {
+			if c.Name == "sandbox-ssh-key" {
+				init = true
+			}
+		}
+		for _, v := range pod.Volumes {
+			switch v.Name {
+			case shellSandboxClientKeySecretVolume:
+				volume = true
+			case shellSandboxClientKeyVolume:
+				staged = true
+			}
+		}
+		for _, c := range pod.Containers {
+			for _, m := range c.VolumeMounts {
+				if m.Name == shellSandboxClientKeyVolume {
+					mount = m.ReadOnly && m.MountPath == shellSandboxClientKeyPath
+				}
+				// The Secret mount is the init container's alone: it is the
+				// world-readable copy, and the agent container reads the staged one.
+				if m.Name == shellSandboxClientKeySecretVolume {
+					t.Errorf("container %q must not see the raw Secret volume", c.Name)
+				}
+			}
+		}
+		return
+	}
+
+	off := buildPodTemplateSpec(shellSandboxAgent(false), "", "", "", "", nil, renderOptions{})
+	if init, volume, staged, mount := has(off.Spec); init || volume || staged || mount {
+		t.Errorf("an agent with the sandbox off must carry no key staging (init=%v secret=%v staged=%v mount=%v)", init, volume, staged, mount)
+	}
+
+	on := buildPodTemplateSpec(shellSandboxAgent(true), "", "", "", "", nil, renderOptions{})
+	init, volume, staged, mount := has(on.Spec)
+	if !init {
+		t.Error("expected the sandbox-ssh-key init container")
+	}
+	if !volume || !staged {
+		t.Errorf("expected both key volumes, got secret=%v staged=%v", volume, staged)
+	}
+	if !mount {
+		t.Errorf("expected the staged key mounted read-only at %s in the agent container", shellSandboxClientKeyPath)
 	}
 }

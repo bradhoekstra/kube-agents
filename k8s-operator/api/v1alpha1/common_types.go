@@ -136,6 +136,44 @@ type ExperimentalSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	PlatformFrontDoor *bool `json:"platformFrontDoor,omitempty"`
+
+	// ShellSandbox moves the agent's shell off the gateway pod and into a
+	// separate container it reaches over SSH, so that a command the agent runs
+	// cannot read the agent's own filesystem, environment or credentials. See
+	// docs/designs/agent-shell-sandboxing.md.
+	// +optional
+	ShellSandbox *ShellSandboxSpec `json:"shellSandbox,omitempty"`
+}
+
+// ShellSandboxSpec configures the per-agent shell sandbox: a StatefulSet running
+// sshd, which Hermes' `ssh` terminal backend points at. Every tool that reaches a
+// shell — terminal, the four file tools, and execute_code — follows the backend,
+// so turning this on moves the agent's whole execution surface into that pod.
+//
+// Experimental for two reasons. Until #737 Part C makes the credential proxy
+// reachable from outside the gateway pod, kubectl, gcloud, gh and git report that
+// they are not configured, which is a usable state for testing and not one to ship
+// an agent in. And the shape of the spec is still open — whether the sandbox
+// belongs to this operator at all is listed as unresolved in the design.
+type ShellSandboxSpec struct {
+	// Enabled turns the sandbox on. Absent means off: an install that says
+	// nothing keeps the shell local, which is the behaviour every existing
+	// install has.
+	//
+	// Turning it on needs a keypair in the agent's credential Secret
+	// (SANDBOX_SSH_PRIVATE_KEY) and its public half in
+	// <agent>-shell-authorized-keys. Every install surface mints both; an
+	// install that predates them gets them from upgrade.sh. With the toggle on
+	// and no key, the sandbox runs and the agent cannot log into it.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Image overrides the sandbox image. Empty takes the operator's own default,
+	// which the install surfaces set from the same tag inventory as every other
+	// image (AGENT_SANDBOX_IMAGE).
+	// +optional
+	Image string `json:"image,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service

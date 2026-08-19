@@ -250,7 +250,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
+	// 11. Reconcile the shell sandbox before the workload that connects to it. The
+	// order is not load-bearing — ssh retries and Hermes rebuilds a failed backend
+	// on the next call — but it keeps a cold-start sandbox from being the first
+	// thing an agent waits on.
+	if err := r.reconcileShellSandbox(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint); err != nil {
 		return ctrl.Result{}, err
@@ -512,6 +520,67 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 			return fmt.Errorf("refusing to delete unowned legacy %T %s/%s", resource, resource.GetNamespace(), resource.GetName())
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, resource)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileShellSandbox creates or removes the agent's shell sandbox — the pod its
+// terminal, file and code-execution tools run in when the ssh backend is on. The
+// manifests and the reasoning behind them are in shell_sandbox_manifests.go.
+//
+// The off path deletes rather than leaves the workload behind: a sandbox nothing
+// connects to is a pod holding a node's worth of quota for no reason, and the
+// namespace quota on the reference install is tight enough that it matters. The
+// PersistentVolumeClaim survives, both because a StatefulSet never reclaims its
+// own claims and because its retention policy says Retain — so a toggle off and
+// back on returns to the same host keys.
+//
+// The credential proxy is a sidecar bound to the gateway pod's loopback, so there
+// is no URL to hand the sandbox yet; the empty string is the state the entrypoint
+// documents and starts under. #737 Part C is what fills it in.
+func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	if !shellSandboxEnabled(agent) {
+		return r.deleteShellSandbox(ctx, agent)
+	}
+
+	objs := []client.Object{
+		buildShellSandboxService(agent),
+		buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), ""),
+		buildShellSandboxNetworkPolicy(agent),
+	}
+	for _, obj := range objs {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on shell sandbox %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply shell sandbox %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// deleteShellSandbox removes the sandbox for an agent that has it switched off,
+// refusing anything this controller does not own — the same guard, and for the same
+// reason, as deleteLegacyCredentialIsolationResources.
+func (r *PlatformAgentReconciler) deleteShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	objMeta := metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}
+	for _, obj := range []client.Object{
+		&appsv1.StatefulSet{ObjectMeta: objMeta},
+		&corev1.Service{ObjectMeta: objMeta},
+		&networkingv1.NetworkPolicy{ObjectMeta: objMeta},
+	} {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				return err
+			}
+			continue
+		}
+		if !metav1.IsControlledBy(obj, agent) {
+			return fmt.Errorf("refusing to delete unowned shell sandbox %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
 			return err
 		}
 	}

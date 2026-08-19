@@ -38,9 +38,59 @@ FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 # SSH connection (tools/environments/ssh.py: `tar cf - -C /` on the way back,
 # `tar xf -` on the way in) and never shells out to rsync, so shipping it would
 # only widen the image.
+#
+# The rest of the list is deploy/docker/Dockerfile's own apt layer, minus what
+# the sandbox must not have. Those packages are in the agent image because the
+# agent's shell tools call them, and the shell is what moved here: a skill that
+# pipes kubectl through jq works in the agent container today and has to keep
+# working. bsdextrautils is the one addition rather than a copy — `column`
+# appears 24 times across the shipped skills and is in neither image, because
+# trixie split it out of util-linux.
+#
+# Left behind on purpose: apt-transport-https and gnupg exist in the agent
+# image only to add Google's apt repository in the credential-proxy stage, and
+# a sandbox that can add an apt repository is a sandbox that can install a real
+# gcloud. ca-certificates is already in the python base.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends openssh-server && \
+    apt-get install -y --no-install-recommends \
+      bsdextrautils \
+      curl \
+      dnsutils \
+      iputils-ping \
+      jq \
+      nano \
+      openssh-server \
+      patch \
+      vim \
+      wget && \
     rm -rf /var/lib/apt/lists/*
+
+# The credential-free utility CLIs, same versions as deploy/docker/Dockerfile's
+# step 2. k9s is not among them: it is a full-screen terminal UI, and every
+# command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
+# it could not run even if a skill asked for it. Nothing in agents/ does.
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
+    chmod +x /usr/local/bin/yq && \
+    curl -sSLf -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
+    tar -xzf /tmp/helm.tar.gz -C /tmp && \
+    mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
+    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+
+# In the agent container `python3` resolves through PATH into the Hermes venv,
+# so a shell command there gets these for free; here python3 is the bare base
+# image. No skill script imports a third-party module today — the ones that do
+# (credential_proxy.py, platform_mcp_server.py, session_kv_server.py,
+# profile_cron_tick.py, cluster_agent_profile.py) all run in the agent pod — but
+# that is an undeclared contract. Two packages rather than the venv's ~150: a
+# script written on the fly parses YAML or makes an HTTP call, and reaches for
+# the standard library for everything else.
+#
+# Not the google-cloud or kubernetes clients, which are the bulk of what is left
+# there. Both authenticate before they are useful and the sandbox holds no
+# credential for either to find, so they would import and then fail; a skill
+# needing one goes through the wrapped CLIs, which is the whole arrangement.
+RUN pip install --no-cache-dir pyyaml requests
 
 # The login the agent connects as. `usermod -p '*'` matters: useradd leaves a
 # '!' in /etc/shadow, which sshd reads as a locked account and refuses even for

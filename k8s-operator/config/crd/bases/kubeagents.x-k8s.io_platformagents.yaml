@@ -8198,6 +8198,33 @@ spec:
                             One gateway means one profile, so this is not additive: while it is on, the
                             Chat Agent persona sees no chat at all.
                           type: boolean
+                        shellSandbox:
+                          description: |-
+                            ShellSandbox moves the agent's shell off the gateway pod and into a
+                            separate container it reaches over SSH, so that a command the agent runs
+                            cannot read the agent's own filesystem, environment or credentials. See
+                            docs/designs/agent-shell-sandboxing.md.
+                          properties:
+                            enabled:
+                              default: false
+                              description: |-
+                                Enabled turns the sandbox on. Absent means off: an install that says
+                                nothing keeps the shell local, which is the behaviour every existing
+                                install has.
+
+                                Turning it on needs a keypair in the agent's credential Secret
+                                (SANDBOX_SSH_PRIVATE_KEY) and its public half in
+                                <agent>-shell-authorized-keys. Every install surface mints both; an
+                                install that predates them gets them from upgrade.sh. With the toggle on
+                                and no key, the sandbox runs and the agent cannot log into it.
+                              type: boolean
+                            image:
+                              description: |-
+                                Image overrides the sandbox image. Empty takes the operator's own default,
+                                which the install surfaces set from the same tag inventory as every other
+                                image (AGENT_SANDBOX_IMAGE).
+                              type: string
+                          type: object
                       type: object
                     hermes:
                       description:

@@ -18,13 +18,12 @@ limitations under the License.
 // run in once Hermes' `ssh` terminal backend is turned on. Design and rationale
 // live in docs/designs/agent-shell-sandboxing.md; the image is deploy/sandbox/.
 //
-// NOT YET RECONCILED. These are builders and their tests, nothing calls them from
-// Reconcile, and the CR has no field that switches them on. That is deliberate:
-// the sandbox is useless until Part C gives the credential proxy an address of its
-// own (see the credentialProxyURL parameter below), and a workload the operator
-// creates but the agent cannot use is a pod nobody notices is broken. Wiring it up
-// means an API field, RBAC for StatefulSets, a status condition, and a live test —
-// each of which is a reviewable change on its own.
+// Reconciled only when spec.harness.experimental.shellSandbox.enabled is true, which
+// no install sets by default. It stays experimental until #737 Part C gives the
+// credential proxy an address of its own (see the credentialProxyURL parameter
+// below): without it the sandbox has no credential path at all, so kubectl, gcloud,
+// gh and git report that they are unconfigured. That is a usable state for testing
+// the file and code-execution tools and not one to ship an agent in.
 //
 // On the name: "sandbox" already means something else here. The agent's own
 // container is the credential-isolation sandbox — see buildSandboxCredentialCleanup
@@ -66,6 +65,11 @@ const (
 	// registry, matching the "override" field of the agent-sandbox entry in
 	// images.json. Set on the controller-manager Deployment.
 	shellSandboxImageEnvVar = "AGENT_SANDBOX_IMAGE"
+
+	// The login the agent ssh's in as, created by deploy/sandbox/Dockerfile as uid
+	// 1000 with its home on the workspace volume. Not root, and not the agent pod's
+	// own uid 10000 — the two pods share nothing but a public key.
+	shellSandboxUser = "agent"
 
 	shellSandboxWorkspaceVolume = "workspace"
 	shellSandboxKeysVolume      = "authorized-keys"
@@ -121,8 +125,9 @@ func fallbackShellSandboxImage() string {
 	return "ghcr.io/gke-labs/kube-agents/agent-sandbox:" + DefaultPlatformAgentVersion
 }
 
-// resolveShellSandboxImage returns the sandbox image: AGENT_SANDBOX_IMAGE if set,
-// else the public ghcr.io default.
+// resolveShellSandboxImage returns the sandbox image: the CR's own override if it
+// carries one, else AGENT_SANDBOX_IMAGE from the controller, else the public
+// ghcr.io default.
 //
 // Deliberately not derived from the resolved agent image the way
 // resolveCredentialProxyImage is. That derivation exists because the proxy is a
@@ -130,13 +135,33 @@ func fallbackShellSandboxImage() string {
 // beside in one pod; the sandbox is a separate artifact in a separate pod, and
 // inferring its registry from a CR's spec.deployment.image would mean a user who
 // points the agent at their own mirror silently gets a sandbox image from a
-// repository they never populated. When this is wired up, a per-agent override
-// belongs in the CR as its own field.
-func resolveShellSandboxImage() string {
+// repository they never populated. Hence the explicit per-agent field.
+func resolveShellSandboxImage(agent *agentv1alpha1.PlatformAgent) string {
+	if spec := shellSandboxSpec(agent); spec != nil && spec.Image != "" {
+		return spec.Image
+	}
 	if override := os.Getenv(shellSandboxImageEnvVar); override != "" {
 		return override
 	}
 	return fallbackShellSandboxImage()
+}
+
+// shellSandboxSpec returns the CR's sandbox block, or nil. Every access to it goes
+// through here because the path is four optional levels deep and a nil check missed
+// anywhere in it is a panic in the reconcile loop.
+func shellSandboxSpec(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ShellSandboxSpec {
+	if agent == nil || agent.Spec.Harness == nil || agent.Spec.Harness.Experimental == nil {
+		return nil
+	}
+	return agent.Spec.Harness.Experimental.ShellSandbox
+}
+
+// shellSandboxEnabled reports whether this agent's shell runs in the sandbox.
+// Absent means off: an install that says nothing keeps the local shell every
+// existing install has.
+func shellSandboxEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	spec := shellSandboxSpec(agent)
+	return spec != nil && spec.Enabled != nil && *spec.Enabled
 }
 
 // shellSandboxName is the name of every object in this file: the StatefulSet, its
@@ -261,7 +286,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// fails at login, which reads as a key problem.
 					Containers: []corev1.Container{{
 						Name:  "shell",
-						Image: resolveShellSandboxImage(),
+						Image: resolveShellSandboxImage(agent),
 						// No command or args: the image's entrypoint does the
 						// volume-dependent setup and execs sshd. An earlier
 						// prototype carried all of it as a heredoc in the pod

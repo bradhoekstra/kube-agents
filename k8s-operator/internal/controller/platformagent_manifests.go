@@ -1119,6 +1119,23 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 // entrypoint merges into the agent's own config.yaml with lists UNIONED. Anything
 // operator-owned that must remain mutable — plugins.enabled above all — belongs there
 // and must not be duplicated here.
+// managedTerminalConfig is the `terminal` block rendered into the managed scope
+// when the shell sandbox is on. The key names are Hermes' own: hermes_cli/config.py
+// maps each one onto the TERMINAL_* environment variable tools/terminal_tool.py
+// reads, and tools/environments/ssh.py turns them into an ssh command line.
+//
+// Five keys and no more. `cwd` is absent on purpose — it is per-profile, and a
+// value here would replace each profile's own (see the note on renderConfigYAML).
+// `ssh_persistent` is absent because Hermes has no env var for it, so rendering it
+// would look like a setting and be one only for in-process callers.
+type managedTerminalConfig struct {
+	Backend string `json:"backend"`
+	SSHHost string `json:"ssh_host"`
+	SSHUser string `json:"ssh_user"`
+	SSHPort int    `json:"ssh_port"`
+	SSHKey  string `json:"ssh_key"`
+}
+
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 
@@ -1163,6 +1180,17 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		Display struct {
 			Platforms map[string]map[string]any `json:"platforms,omitempty"`
 		} `json:"display,omitempty"`
+		// Where the agent's shell runs. Rendered only when the shell sandbox is on,
+		// and rendered HERE rather than in a profile's config for the two reasons
+		// this function's note gives. It is uniform: one sandbox per pod, and every
+		// profile in the pod reaches it at the same address with the same key —
+		// `terminal.cwd`, which is the profile-shaped part, is deliberately not
+		// among these keys. And it is beyond the agent's own repair in the strongest
+		// sense in the file: an agent that writes `backend: local` into its own
+		// config.yaml has not broken a setting, it has left the sandbox, and no
+		// human telling it to put the value back would be reason to trust the value.
+		// The managed scope is what makes that write have no effect.
+		Terminal *managedTerminalConfig `json:"terminal,omitempty"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1184,6 +1212,20 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// not declare the key. Leaving it out would silently deny every cron-initiated
 	// approval on a scaffolded cluster profile.
 	cfg.Approvals.CronMode = "approve"
+
+	// Terminal. Absent unless the sandbox is on, and absent is what every install
+	// that has never turned it on renders — so the key never appears in the managed
+	// scope, Hermes' own default (`local`) applies, and nothing about the existing
+	// fleet changes.
+	if shellSandboxEnabled(agent) {
+		cfg.Terminal = &managedTerminalConfig{
+			Backend: "ssh",
+			SSHHost: shellSandboxHost(agent),
+			SSHUser: shellSandboxUser,
+			SSHPort: shellSandboxPort,
+			SSHKey:  shellSandboxClientKeyFilePath(),
+		}
+	}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
 
@@ -1581,6 +1623,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// credentialed deployments before the agent sandbox can mount the PVC.
 	initContainers = append([]corev1.Container{buildSandboxCredentialCleanup(image, pullPolicy)}, initContainers...)
 
+	// The shell sandbox's half of the SSH keypair, staged into an emptyDir the
+	// agent container can read — see buildShellSandboxClientKeyVolumes for why the
+	// Secret cannot be handed to `ssh -i` directly. Added only when the sandbox is
+	// on, so an install with the toggle off carries no extra init container and no
+	// reference to a key it does not use.
+	var shellSandboxVolumes []corev1.Volume
+	if shellSandboxEnabled(agent) {
+		initContainers = append(initContainers, buildShellSandboxClientKeyInitContainer(image))
+		shellSandboxVolumes = buildShellSandboxClientKeyVolumes()
+	}
+
 	pluginsDebugVal := "0"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PluginsDebug != nil {
 		if *agent.Spec.Harness.Hermes.PluginsDebug {
@@ -1903,6 +1956,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	if len(extraVolumes) > 0 {
 		volumes = append(volumes, extraVolumes...)
 	}
+	volumes = append(volumes, shellSandboxVolumes...)
 
 	var affinity *corev1.Affinity
 	var nodeSelector map[string]string
@@ -2489,6 +2543,12 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	}
 	if len(extraVolumeMounts) > 0 {
 		volumeMounts = append(volumeMounts, extraVolumeMounts...)
+	}
+	// The staged SSH key, read-only. Only the emptyDir the init container wrote —
+	// the container that opens the connection has no reason to see the Secret mount
+	// the init container read from.
+	if shellSandboxEnabled(agent) {
+		volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
 	}
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
