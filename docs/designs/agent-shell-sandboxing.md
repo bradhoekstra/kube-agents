@@ -470,7 +470,7 @@ references into five classes with four different delivery mechanisms.
 | Skills, including their `scripts/`           | Hermes' existing `~/.hermes` sync      | already works, verified live                  |
 | Governance SOPs                              | baked into the sandbox image           | static, versioned with the repo               |
 | The shell-invoked subset of `scripts/`       | baked into the sandbox image           | static, and the subset is small               |
-| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod | per-install content, cannot be baked          |
+| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod | per-install content, rendered by the operator |
 | Outputs (`INVENTORY.md`, scratch workspaces) | written to `/workspace` at runtime     | data, not delivery                            |
 
 **The persona stays behind, and that is a property rather than an omission.** Nothing
@@ -506,11 +506,10 @@ the prose), `kanban_notify_propagate.py` (4), `cluster_preflight.sh` (3) and
 image gets an explicit allowlist, enforced the way the image already fails the build if
 a real `gcloud` appears.
 
-**`SETTINGS.md` is mounted, not baked, and not at `/opt/data`.** Its content is
-per-install: the operator renders it from `spec.integration.github.gitRepo` into an
-`<agent>-settings` ConfigMap (`buildSettingsConfigMap`) and mounts it as a subPath.
-Baking would freeze one installation's repository URL into a shared image. The
-ConfigMap already exists, so the operator mounts it a second time into the sandbox pod.
+**`SETTINGS.md` is mounted, and not at `/opt/data`.** Its content is per-install: the
+operator renders it from `spec.integration.github.gitRepo` into an `<agent>-settings`
+ConfigMap (`buildSettingsConfigMap`) and mounts it as a subPath. The ConfigMap already
+exists, so the operator mounts it a second time into the sandbox pod.
 
 Mounting it at `/opt/data/SETTINGS.md` inside the sandbox was considered, because it
 would need no code change at all — three parsers hardcode that path
