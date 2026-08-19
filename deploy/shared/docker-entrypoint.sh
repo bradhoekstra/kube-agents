@@ -192,13 +192,13 @@ if ! agent_owns_shared_state "$@"; then
     # whatever directory the container started in — /opt/hermes for the dashboard sidecar.
     # That is not cosmetic: the credential proxy refuses any cwd outside
     # CREDENTIAL_PROXY_WORKSPACE_ROOT, which the operator sets to this same $TARGET_DIR,
-    # so every kubectl/gcloud/gh/git call in a non-owner container fails with "working
-    # directory is outside the shared workspace" before it runs. The reasoning for the
+    # so every gh/git call in a non-owner container fails with "working directory is
+    # outside the shared workspace" before it runs. The reasoning for the
     # cd, and why the cwd is the only lever that reaches every caller, is at the bottom.
     # Guarded for the same reason it is there: a non-owner can legitimately start before
     # the owner has created the tree, and that must not abort the container.
     if ! cd "$TARGET_DIR"; then
-        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (gh/git) will be refused by the credential proxy as out-of-workspace" >&2
     fi
     exec "$@"
 fi
@@ -1300,12 +1300,10 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/session_kv_ser
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 127.0.0.1 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
-# 5.5. The default kubectl context is NOT established here. `gcloud` in this
-# container is the credential-proxy shim, so get-credentials would execute in
-# the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
-# outright, because the steps above run from a working directory outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT (step 6 moves into it, but only for the agent
-# process it execs). The sidecar bootstraps its own context from
+# 5.5. The default kubectl context is NOT established here. There is no `gcloud`
+# in this container at all as of #737 — not the binary and not the shim — and
+# before that the shim would have run get-credentials in the sidecar and written
+# the sidecar's kubeconfig, not ours. The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
 # request. The k8s-event-watcher does not need a copy either: it runs inside the
@@ -1366,13 +1364,13 @@ fi
 # 6. Execute primary process from inside the shared workspace.
 #
 # The image inherits WORKDIR /opt/hermes from the upstream base, and every
-# credentialed CLI in this container (kubectl, gcloud, gh, git) is a PATH shim
-# for credential_proxy_client.py. That client posts `"cwd": os.getcwd()` on
-# every request unconditionally, and the proxy refuses any cwd outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT — which the operator sets to this same
-# $TARGET_DIR. Launched from /opt/hermes, therefore, a plain `kubectl version
-# --client` fails with "working directory is outside the shared workspace"
-# before it runs, purely because of where the process was started.
+# credentialed CLI left in this container — gh and git; kubectl and gcloud went
+# to the sandbox with #737 — is a PATH shim for credential_proxy_client.py. That
+# client posts `"cwd": os.getcwd()` on every request unconditionally, and the
+# proxy refuses any cwd outside CREDENTIAL_PROXY_WORKSPACE_ROOT — which the
+# operator sets to this same $TARGET_DIR. Launched from /opt/hermes, therefore,
+# a plain `git status` fails with "working directory is outside the shared
+# workspace" before it runs, purely because of where the process was started.
 #
 # The cwd is the only lever that reaches every caller. Hermes resolves the
 # terminal and execute_code working directories from a ladder that ends at
@@ -1387,7 +1385,7 @@ fi
 # one. $TARGET_DIR is created in step 2 and written throughout, so the warning
 # is a canary for a broken mount rather than an expected path.
 if ! cd "$TARGET_DIR"; then
-    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (gh/git) will be refused by the credential proxy as out-of-workspace" >&2
 fi
 
 exec "$@"

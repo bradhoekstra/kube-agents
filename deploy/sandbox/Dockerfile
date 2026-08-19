@@ -65,8 +65,10 @@ RUN apt-get update && \
       wget && \
     rm -rf /var/lib/apt/lists/*
 
-# The credential-free utility CLIs, same versions as deploy/docker/Dockerfile's
-# step 2. k9s is not among them: it is a full-screen terminal UI, and every
+# The credential-free utility CLIs, at the versions the agent image carried
+# before #737 moved them here. This is now their only home — deploy/docker's
+# step 2 says so and its guard enforces it — so a version bump has one place to
+# happen. k9s did not come across: it is a full-screen terminal UI, and every
 # command here arrives over a non-interactive `ssh host -- cmd` with no tty, so
 # it could not run even if a skill asked for it. Nothing in agents/ does.
 RUN ARCH=$(dpkg --print-architecture) && \

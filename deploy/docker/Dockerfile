@@ -91,17 +91,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install credential-free utility CLIs used by the sandbox.
-RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
-    chmod +x /usr/local/bin/yq && \
-    curl -sSLf -o /tmp/k9s.tar.gz "https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Linux_${ARCH}.tar.gz" && \
-    tar -xzf /tmp/k9s.tar.gz -C /usr/local/bin k9s && \
-    rm /tmp/k9s.tar.gz && \
-    curl -sSLf -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
-    tar -xzf /tmp/helm.tar.gz -C /tmp && \
-    mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
-    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+# 2. No helm, k9s or yq. They were here for the model's shell, and the shell now
+# runs in the sandbox image (deploy/sandbox/Dockerfile), which installs the two
+# of them it can use at the same pinned versions. Nothing left in this container
+# invokes a cluster CLI: Hermes and the Python services that used to shell out to
+# one call agents/platform/scripts/sandbox_exec.py and run it over SSH instead.
+# The guard at the end of this stage fails the build if any of them returns.
 
 RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     ddgs \
@@ -968,11 +963,18 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
 # Remove the build-only clone dependency after all plugin installation is done.
+#
+# The loop is what step 2 above defers to. git is native up to the purge on the
+# line above and nothing by the other six names is ever installed here — the
+# shims further down are symlinks, and helm, k9s and yq left with #737 — so a hit
+# is a step someone added rather than a leftover. `/opt/credential-proxy/bin` is
+# not on the build PATH (profile.d puts it there at login), so `command -v` can
+# only be finding a real binary.
 RUN apt-get purge -y git && apt-get autoremove -y && \
 	rm -rf /var/lib/apt/lists/* && \
-	for binary in gcloud kubectl gh git; do \
+	for binary in gcloud kubectl gh git helm k9s yq; do \
 		if command -v "${binary}" >/dev/null 2>&1; then \
-			echo "unexpected credential-aware CLI in sandbox image: ${binary}" >&2; \
+			echo "unexpected cluster CLI in the agent image: ${binary}" >&2; \
 			exit 1; \
 		fi; \
 	done
@@ -1025,11 +1027,27 @@ RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfi
 COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
+
+# Two shims, not four. `kubectl` and `gcloud` are gone from this image with
+# #737: the model's shell runs in the sandbox, and the agent-pod code that used
+# to invoke them directly — the platform MCP server, the cluster-agent scripts,
+# gke_endpoint.py — goes through sandbox_exec.run() over SSH, so the sandbox is
+# the only place a cluster command is issued from. `gh` and `git` stay because
+# gitops_workspace.py and github_token_refresh.py still run in this container
+# and still need the proxy's shared /workspace; moving them is the rest of #737.
+#
+# The loop guards the deletion. It is cheap to reinstate a symlink here without
+# reinstating the caller, and the failure that produces is a cluster command
+# that runs in the wrong pod and works, which nothing else would catch.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/kubectl && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gcloud && \
     ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gh && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/git
+    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/git && \
+    for binary in kubectl gcloud helm k9s yq; do \
+        if [ -e "/opt/credential-proxy/bin/${binary}" ]; then \
+            echo "cluster tooling back on the agent image PATH: ${binary}" >&2; \
+            exit 1; \
+        fi; \
+    done
 
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher

@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Run a cluster command in the shell sandbox rather than in the agent pod.
 
-The agent image carries no `kubectl`, `gcloud`, `gh` or `git`, and knows nothing
-about the credential proxy: every command that needs one runs in the sandbox,
-which is the only place a proxy call originates. Agent-side code that still has
-a reason to invoke one — the platform MCP server, the cluster-agent scripts —
-calls `run()` here instead of `subprocess.run`.
+The agent image carries no `kubectl` and no `gcloud`, in any form: not the
+binaries, and not the credential-proxy shims that used to stand in for them
+(`deploy/docker/Dockerfile` step 2 and the guard at the end of that stage).
+Agent-side code with a reason to invoke one — the platform MCP server, the
+cluster-agent scripts, `gke_endpoint.py` — calls `run()` here instead of
+`subprocess.run`, and the command executes in the sandbox.
+
+`gh` and `git` are still shims in the agent image, because `gitops_workspace.py`
+and `github_token_refresh.py` still run there and still need the credential
+proxy's shared workspace. Nothing about a cluster does.
 
 Two things about this module are load-bearing and easy to undo by accident.
 

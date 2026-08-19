@@ -78,12 +78,9 @@ The agent Deployment image. Built from the `platform` target of [`deploy/docker/
 - **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
 - **Also to GAR**: [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
 
-The Dockerfile installs system tooling the Platform Agent needs to inspect and remediate clusters:
+There is no cluster tooling in this image, and a build guard fails if any reappears. `kubectl`, `gcloud`, `helm` and `yq` live in the `agent-sandbox` image, which is where the agent's shell now runs; agent-pod code that needs one of them reaches the sandbox over SSH through `agents/platform/scripts/sandbox_exec.py`. `gh` and `git` are here, as credential-proxy shims — symlinks to a client that forwards the command to the sidecar, which holds the credential — because the GitOps and GitHub-token paths still run in the agent pod.
 
-- `google-cloud-cli` + `google-cloud-cli-gke-gcloud-auth-plugin`
-- `kubectl`
-- `gh` (GitHub CLI), `yq`, `k9s`, `helm`
-- Standard debugging tools: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `git`, `wget`, `nano`, `vim`
+What is installed is the debugging set the agent's own processes use: `curl`, `jq`, `dnsutils`, `iputils-ping`, `patch`, `wget`, `nano`, `vim`.
 
 It also builds the `k8s-event-watcher` binary from `k8s-operator/cmd/k8s-event-watcher/` in a Go builder stage and copies it into the image.
 
