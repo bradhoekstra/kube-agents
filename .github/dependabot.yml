@@ -68,7 +68,7 @@ updates:
     commit-message:
       prefix: "ci"
     # requirements-test.txt holds mcp below 2.0 because agent_common_server.py
-    # imports mcp.server.fastmcp, which 2.x moved. #751 widened the constraint
+    # imports mcp.server.fastmcp, which 2.x deletes. #751 widened the constraint
     # to <3 anyway; the tests stub the module, so nothing caught it.
     # `versions` and not `update-types`: a semver-major comparison needs a
     # resolved current version, and `mcp<2` is a bare range rather than an `==`
