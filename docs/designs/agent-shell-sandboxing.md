@@ -500,11 +500,18 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 `router_server.py`, `profile_cron_tick.py`, `credential_proxy.py`. Shipping them
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. The set the agent
-actually invokes from the shell is four: `cluster_agent_profile.py` (8 call sites in
-the prose), `kanban_notify_propagate.py` (4), `cluster_preflight.sh` (3) and
-`cluster_agent_reconcile.py` (1). One of those four is disqualified below. So the
-image gets an explicit allowlist, enforced the way the image already fails the build if
-a real `gcloud` appears.
+actually invokes from the shell is `cluster_agent_profile.py` (8 call sites in the
+prose), `kanban_notify_propagate.py` (4) and `cluster_preflight.sh` (3). So the image
+gets an explicit allowlist, enforced the way the image already fails the build if a
+real `gcloud` appears. `kanban_notify_propagate.py` is disqualified below.
+
+`cluster_agent_reconcile.py` looked like a fourth and is not, which is the trap the
+allowlist has to be written against. It has one shell call site
+(`cluster-agent-lifecycle/SKILL.md:100`, a `--dry-run`), but it is also the script
+behind the `cluster-agent-reconcile` cron job — and cron scripts run in the agent pod,
+for the reasons below. Baking it would put a second copy in the sandbox that can drift
+from the one that actually runs. A script's shell call sites do not qualify it on their
+own; being absent from every `jobs.json` is the other half of the test.
 
 **`SETTINGS.md` is mounted, and not at `/opt/data`.** Its content is per-install: the
 operator renders it from `spec.integration.github.gitRepo` into an `<agent>-settings`
@@ -521,6 +528,82 @@ one-line check that tells anybody whether the isolation is real. The
 `${PLATFORM_AGENT_HOME:-/opt/data}/SETTINGS.md`, so the override precedent exists;
 `PLATFORM_AGENT_HOME` becomes the standard, set in the sandbox environment, and the two
 parsers that cannot honour it are changed.
+
+#### Cron scripts stay in the agent pod and reach into the sandbox from there
+
+A `no_agent` cron job — one carrying a `script` rather than a `prompt` — is unaffected
+by the terminal backend. The scheduler's `_run_job_script` resolves the script against
+`HERMES_HOME/scripts`, rejects anything resolving outside it, picks `/bin/bash` or
+`sys.executable` by extension, and calls `subprocess.run` with an environment from
+`build_subprocess_env` — imported from `tools.environments.local`, hardcoded. There is
+no backend lookup anywhere in the scheduler. The script is a subprocess of the gateway
+process, in the agent pod. A cron job with a `prompt` behaves the opposite way: it runs
+a real turn, and that turn's tools go to the sandbox.
+
+This is the outcome to want. It keeps the no-LLM guarantee that the `no_agent` mode
+exists for, and it is what lets all five of these scripts keep their PVC, their
+`kanban.db`, and their `hermes` binary while the shell moves away.
+
+It also closes a path that was open before. `HERMES_HOME/scripts` holds trusted code
+executed agent-side with full credentials, and until now the model could `write_file`
+into that directory and then register a cron job pointing at it. With file tools routed
+to the sandbox it cannot, which raises the stakes on the `sync_back` channel above:
+whatever that syncs back must not be able to land in a scripts directory.
+
+What it does break is bootstrap onboarding, and quietly. The inventory pipeline
+straddles the boundary in the wrong direction: `INVENTORY.raw.md` is written by the
+`platform` kanban worker and `INVENTORY.md` by the prioritization worker — both agent
+turns, so both writes now go to the sandbox, where `/opt/data` neither exists nor is
+writable. The readers did not move. `bootstrap_delivery.py` and `bootstrap_scan_gate.py`
+are `no_agent` scripts hardcoding `/opt/data/INVENTORY*.md` on the PVC, so the delivery
+job ticks every minute against a file that will never appear. A silent run is its normal
+no-op, so onboarding simply never delivers and nothing logs an error.
+
+**Moving the scripts into the sandbox was the obvious fix and does not work.** The
+mechanism is sound — `subprocess.run(capture_output=True)` returns stdout verbatim and
+`ssh` forwards both remote stdout and the remote exit code, so verbatim delivery
+survives the hop. There is just nothing left to wrap. Every one of the five is bound to
+the agent pod: `profile_cron_tick.py` and `cluster_agent_reconcile.py` drive `hermes`
+against profile state on the PVC; `bootstrap_scan_gate.py` shells
+`/opt/hermes/.venv/bin/hermes profile list`; and `bootstrap_delivery.py` and
+`github_scan_gate.py` import Hermes' own Python namespace — `from cron.jobs import
+remove_job` and `from hermes_cli.kanban import run_slash`, which no amount of packaging
+reproduces in the sandbox. Moving them would make both of the deferred problems below
+blocking instead.
+
+Two lesser obstacles point the same way. The scheduler passes `job.get("script")`
+straight to path resolution with no `shlex` and no arguments field, so a generic
+`run_in_sandbox.sh <script>` entry cannot be expressed without patching Hermes. And a
+volume shared between the two pods is unavailable regardless: `platform-agent-data` and
+`workspace-platform-agent-shell-0` are both `ReadWriteOnce` on `standard-rwo`, so two
+pods cannot mount one, and `ReadWriteMany` would mean Filestore.
+
+**So the script stays in the agent pod and reaches into the sandbox for the part that
+belongs there.** The agent pod already has `/usr/bin/ssh`, the client key at
+`/etc/sandbox-ssh`, and `known_hosts` on the PVC, so this needs no new infrastructure
+and no new trust: the agent pod is the privileged side and already holds the key.
+Direction is the whole argument. The agent pod reaching into the sandbox grants nothing
+the sandbox did not already have; the reverse is what [Part C](credential-proxy-placement.md)
+rules out, and for the same reason. The artifact crossing back is model-authored text
+that was already going to the user verbatim — it is read, never executed — and no model
+sits in the delivery path, so the `no_agent` guarantee holds unchanged.
+
+`github_scan_gate.py` is the clean case, because it already has the seam. Its agent-side
+half files a kanban card through `run_slash`; its other half is `resolver.py poll`, which
+needs only `gh` and the standard library and returns JSON on stdout. That half is a skill
+script under `github-issue-resolver/scripts/`, which Hermes' sync already places in the
+sandbox — so the split is one function, `run_resolver_poll`, becoming an `ssh` call.
+It is gated on Part C: the sandbox image ships the four proxy symlinks at
+`/opt/credential-proxy/bin/`, but that directory is not on its `PATH` and
+`CREDENTIAL_PROXY_URL` is unset, so `gh` does not resolve there yet.
+
+This also settles a question asked of the agent pod itself: it holds no cluster
+tooling. `kubectl`, `gcloud`, `gh` and `git` in the `platform-agent` container are all
+symlinks to `credential-proxy-exec`, with no native binary anywhere on its filesystem —
+the real ones live only in the `envoy-credential-proxy` sidecar. Agent-side cron scripts
+that appear to run `gcloud` are already going through the proxy and its per-subcommand
+policy. Nothing needs removing; what remains is that the proxy answers on pod loopback
+and authenticates no caller, which is the problem Part C exists to solve.
 
 #### Two problems deferred, and what has already been ruled out for them
 
@@ -678,15 +761,14 @@ the agent in.
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
-- **The keypair is generated but has never authenticated anything.** Every install
-  surface now mints it (see [Key management](#key-management)), and the staging init
-  container is unit-tested, but no agent has yet opened an SSH connection with a key
-  that arrived this way. The `0444`-plus-copy dance in particular is reasoned from
-  how `ssh` and Secret volumes behave, not from having watched it work.
-- **Nobody has driven this end to end.** The image is built and tested
-  (`make docker-smoke-sandbox`) and a single pod of it has run on the reference
-  cluster, but Hermes has never been pointed at it: file sync, `execute_code`, and
-  whether delegated subagents inherit the SSH backend are all unexercised.
+- **Cron has not been exercised against a sandboxed agent.** The finding that
+  `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
+  doubt, but no roster has run in this configuration, and the bootstrap handoff the
+  section above specifies is designed and unimplemented. Onboarding is broken until it
+  lands, and broken silently.
+- **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
+  backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
+  would be a hole rather than a degradation.
 
 ## Related work
 
