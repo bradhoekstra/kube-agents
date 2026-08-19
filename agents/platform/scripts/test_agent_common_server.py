@@ -43,19 +43,9 @@ def _load_agent_common_server():
     fall back to minimal stubs so the module still imports in a bare checkout.
     Each stub package sets __path__ so it is treated as a real package.
 
-    ABSENT is not the same as BROKEN, and only the first earns a stub. With an
-    installed mcp 2.x the per-module check below would find `mcp` and
-    `mcp.server` importable and stub only `mcp.server.fastmcp` -- the one
-    module 2.x deleted -- which reads as a pass and tests nothing. That is the
-    shape that let #751 widen the ceiling to <3 unnoticed, so an mcp that is
-    present but missing the module raises instead.
-
-    The presence check asks importlib.metadata rather than
-    importlib.util.find_spec: find_spec consults sys.modules first and reads
-    __spec__ off whatever it finds, which is None on the ModuleType stubs this
-    very function leaves behind, and it raises ValueError instead of answering.
-    Discovery imports this whole directory into one process, so those stubs are
-    what the next module's check would see.
+    ABSENT is not BROKEN: stub only when no mcp distribution is installed, and
+    ask importlib.metadata rather than importlib.util.find_spec. Why, and what
+    an installed-but-incompatible mcp means, is in test_mcp_package_contract.py.
     """
     try:
         return importlib.import_module("agent_common_server")

@@ -21,24 +21,15 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 # silently does not run. That is how three denial tests for the /inject
 # authentication came to be passing-by-not-existing.
 #
-# The guard distinguishes ABSENT from BROKEN, and only the first earns a stub.
-# Absent means a bare checkout with no mcp installed, where a stub is the point.
-# Broken means mcp is installed and does not expose the module -- every 2.x,
-# which replaced mcp.server.fastmcp with mcp.server.mcpserver -- and there
-# session_kv_server genuinely cannot run, so the ImportError is the finding
-# rather than something to route around. Stubbing both alike is what let #751
-# widen the ceiling in requirements-test.txt to <3 without CI noticing.
+# ABSENT is not BROKEN: stub only when no mcp distribution is installed -- see
+# test_mcp_package_contract.py.
 try:  # pragma: no cover - depends on the installed mcp version
     import mcp.server.fastmcp  # noqa: F401
 except Exception:  # pragma: no cover
     import importlib.metadata
     import types
 
-    # importlib.metadata and not importlib.util.find_spec: find_spec consults
-    # sys.modules first and reads __spec__ off whatever it finds, which is None
-    # on a ModuleType stub -- and it raises ValueError rather than answering.
-    # Discovery imports this whole directory into one process, and the sibling
-    # test modules leave exactly such stubs behind in a bare checkout.
+    # importlib.metadata, not find_spec -- see test_mcp_package_contract.py.
     try:
         importlib.metadata.distribution("mcp")
     except importlib.metadata.PackageNotFoundError:

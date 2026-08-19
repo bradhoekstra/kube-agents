@@ -55,6 +55,11 @@ def _mcp_distribution_installed():
     first, and in a bare checkout it leaves exactly such a stub under "mcp".
     The question being asked is about the installed distribution anyway, which
     is the one thing sys.modules cannot tell you.
+
+    This is the one copy of that reasoning. The four guards that ask the same
+    question -- test_agent_common_server, test_platform_mcp_server,
+    test_session_kv_server, agents/chat/scripts/test_router_server -- point
+    here rather than restate it, so lifting the ceiling changes one place.
     """
     try:
         distribution("mcp")

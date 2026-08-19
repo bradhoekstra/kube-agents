@@ -13,23 +13,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 # Stub the hermes runtime deps only when mcp is not installed at all, so this
-# module still imports in a bare checkout. ABSENT is not the same as BROKEN: an
-# installed mcp that no longer exposes mcp.server.fastmcp is every 2.x, which
-# replaced it with mcp.server.mcpserver, and platform_mcp_server cannot run
-# there. Stubbing past that is what let #751 widen the ceiling in
-# requirements-test.txt to <3 with CI green; test_mcp_package_contract.py is
-# the test that reports it.
+# module still imports in a bare checkout. ABSENT is not BROKEN, and only the
+# first earns a stub -- see test_mcp_package_contract.py.
 try:
     import mcp.server.fastmcp
 except Exception:
     import importlib
     import importlib.metadata
 
-    # importlib.metadata and not importlib.util.find_spec: find_spec consults
-    # sys.modules first and reads __spec__ off whatever it finds, which is None
-    # on the ModuleType stubs below and raises ValueError rather than
-    # answering. Discovery imports this whole directory into one process, so
-    # those stubs are exactly what a later module's check would see.
+    # importlib.metadata, not find_spec -- see test_mcp_package_contract.py.
     try:
         importlib.metadata.distribution("mcp")
     except importlib.metadata.PackageNotFoundError:

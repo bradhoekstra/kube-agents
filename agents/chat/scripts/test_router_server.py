@@ -22,23 +22,17 @@ def _load_router_server():
     still imports in a bare checkout. `FastMCP().tool()` returns identity, so
     the decorated tools remain plain callables.
 
-    ABSENT is not the same as BROKEN, and only the first earns a stub. An
-    installed mcp that no longer exposes mcp.server.fastmcp -- every 2.x, which
-    replaced it with mcp.server.mcpserver -- means router_server cannot run in
-    that environment, and the ImportError is the finding. Stubbing past it is
-    how #751 widened the ceiling to <3 and kept CI green;
-    agents/platform/scripts/test_mcp_package_contract.py is the test that says
-    so out loud, and it covers this module too.
+    ABSENT is not BROKEN: stub only when no mcp distribution is installed, and
+    ask importlib.metadata rather than importlib.util.find_spec. Why is in
+    agents/platform/scripts/test_mcp_package_contract.py, which covers this
+    module too.
 
-    Stub per module rather than by bulk sys.modules.update: unittest discovery
-    imports every test module into one process, so an entry left here is what
-    the next module finds. A fake `pydantic` bearing nothing but Field is not a
-    thing to hand to fastapi seventeen imports later.
-
-    The presence check asks importlib.metadata rather than
-    importlib.util.find_spec: find_spec consults sys.modules first and reads
-    __spec__ off whatever it finds, which is None on the ModuleType stubs below
-    and raises ValueError rather than answering.
+    Stub per module rather than by bulk sys.modules.update: overwriting a real,
+    importable module with a stub is wrong even where nothing else in this
+    directory would notice. Nothing here does today -- discovery runs one
+    process per directory and this module currently sorts last of its own --
+    but agents/platform/scripts/test_agent_common_server.py has the case where
+    a leaked stub is what a later module finds.
     """
     try:
         return importlib.import_module("router_server")
