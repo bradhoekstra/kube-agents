@@ -916,13 +916,15 @@ the agent in.
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
-- **The SSH helper is built and not yet exercised through a real cluster call.**
+- **The SSH helper reaches the sandbox; nothing behind it runs yet.**
   `agents/platform/scripts/sandbox_exec.py` routes all fifteen agent-side call sites,
   and the `hermes` account, its authorised key and the `.bashrc` isolation are covered
-  by `make docker-smoke-sandbox`. What no test can reach is the far end: every one of
-  those commands stops at `CREDENTIAL_PROXY_URL is not configured`, so the connection
-  is proven and the command behind it is not. The helper had to land before the agent
-  image can drop `credential-proxy-exec`, which makes it the gate on that change.
+  by `make docker-smoke-sandbox`. Run from the agent pod against a live install it
+  connects as uid 1001 on the sandbox host, and a routed `gcloud` or `kubectl` stops at
+  `CREDENTIAL_PROXY_URL is not configured` — a message the agent pod cannot produce,
+  since the variable is set there. So the connection is proven and the command behind
+  it is not. The helper had to land before the agent image can drop
+  `credential-proxy-exec`, which makes it the gate on that change.
 - **The MCP server's kubeconfig has moved and the credential proxy does not know.**
   `_thread_kubeconfig_path` writes into `/home/hermes/.kubeconfigs` when the sandbox is
   on, because a kubeconfig names an `exec` credential plugin that kubectl runs, and any
