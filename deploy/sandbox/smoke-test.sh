@@ -181,7 +181,11 @@ ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
 "${SSH[@]}" "printf '%s\n' '$(cat "$WORK/rogue.pub")' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
 check "the model can authorise a new key for its own account" "agent" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" agent@127.0.0.1 whoami 2>&1)"
-check_absent "the same key does not open a hermes session" "hermes" \
+# Asserted as a refusal rather than as the absence of "hermes" in the output:
+# sshd's own denial names the account it refused ("hermes@127.0.0.1: Permission
+# denied"), so a check for that substring can never pass however well the image
+# behaves.
+check "the same key does not open a hermes session" "Permission denied" \
   "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" hermes@127.0.0.1 whoami 2>&1)"
 
 # Undo the sabotage: later sections use the agent session and would otherwise
