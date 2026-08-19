@@ -1,6 +1,6 @@
 ---
 description: Run the required pre-PR review passes — adversarial, docs-drift, IaC parity — each in its own subagent
-argument-hint: [base-ref]
+argument-hint: [base-branch]
 ---
 
 Run the pre-PR review passes over this branch, against base: **$ARGUMENTS** (empty means `main`).
@@ -16,7 +16,9 @@ only reason to do it.
 
 Resolve the base before anything else, with the recipe in `review-preflight` §1 — it finds the
 remote, fetches it, and stops rather than falling back to a base it could not refresh. Substitute
-the base I named above for its `BASE_BRANCH`, if I named one.
+the base I named above for its `BASE_BRANCH`, if I named one, reduced to a branch name as §1 says.
+Fetch it even if I handed you one that already resolves: I may have typed a branch that has not been
+refreshed in a week, and §1 says why that is the failure it exists to stop.
 
 Report before you act: the merged disposition list, which passes ran and which you skipped, and
 anything the passes said they could not cover. Then fix what the passes confirmed, per

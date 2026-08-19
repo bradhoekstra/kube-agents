@@ -43,9 +43,20 @@ BASE=refs/kube-agents-base/$BASE_BRANCH
 git diff --stat "$BASE"...HEAD     # three-dot: against the merge base, not the base tip
 ```
 
-Three-dot keeps base-branch drift out of everyone's scope. If you were handed a ref that already
-resolves (`git rev-parse --verify`), use it and skip the fetch. If the fetch fails, stop and say so:
+Three-dot keeps base-branch drift out of everyone's scope. If the fetch fails, stop and say so:
 there is no safe fallback, because the wrong base fails in the direction that hides findings.
+
+`BASE_BRANCH` is the branch name as the remote has it, so reduce whatever you were handed to that
+first. `origin/main`, `refs/heads/main`, and the `refs/kube-agents-base/main` a previous run wrote
+all go into the refspec verbatim, ask for a branch no remote has, and trip the guard above over a
+base that was fine.
+
+Skip the fetch only for a base that cannot go stale — a commit SHA, or a tag. That a name resolves
+is not that test: a local `main` forty commits behind resolves, and so does a remote-tracking ref
+last fetched a week ago, which is the ordinary state of a checkout here — "Branch from a `main` you
+have just fetched" in `AGENTS.md` is there because of it. Fetching a base you already fetched costs
+a round trip; the other way costs the passes reviewing commits that merged last week as though this
+branch wrote them.
 
 ## 2. Decide which passes apply
 
