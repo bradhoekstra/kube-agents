@@ -435,6 +435,39 @@ If the previous command had been `cd /workspace/logs`, that would have been capt
 by the marker and applied here, and `read_file("output.log")` would resolve against
 the same directory — because the file tools share the environment object.
 
+### `HERMES_WRITE_SAFE_ROOT` has to move with the shell
+
+The Hermes base image sets `HERMES_WRITE_SAFE_ROOT=/opt/data`, and with the sandbox on
+that value denies every write the agent attempts — including to the sandbox's own
+workspace. The first live run found it immediately: `write_file` and `patch` returned
+"Write denied" for every path.
+
+The guardrail is a string-prefix test, and it runs in the wrong process to know about
+any of this. `agent/file_safety.py` splits the variable on `os.pathsep`, `realpath`s
+each entry, and requires the resolved target to equal a root or begin with `root + "/"`
+— all of it in the agent process, before the write is dispatched to any backend. So it
+is checking sandbox paths against a list containing only the agent's own home. Every
+sandbox path fails the prefix test, and `/opt/data`, the one path that would pass, does
+not exist in the sandbox. Unsetting it is not the answer either: the check is opt-in and
+an empty value skips it entirely, which drops the guardrail rather than moving it.
+
+The operator therefore repoints it, in `buildPodTemplateSpec` and only when the sandbox
+is enabled, at the sandbox's two writable directories — `/workspace` and
+`/home/agent`, the latter being `shellSandboxUser`'s home and the cwd every `ssh`
+command starts in. That gives up no isolation. With `backend: ssh` the file tools
+cannot reach the agent's filesystem at all, so the roots they are checked against
+should describe the filesystem they actually write to.
+`TestSandboxRepointsTheWriteSafeRoot` asserts the variable is absent with the sandbox
+off, is exactly these two paths with it on, and never admits `/opt/data`.
+
+Two things this does not cover. `/home/agent` is on the container filesystem rather
+than the workspace volume, so writes there do not survive a sandbox restart — it is
+writable because commands land there, not because anything should be kept there. And
+the credential denylist that sits alongside this check (`~/.ssh`, `~/.aws`,
+`~/.config/gcloud`, `~/.docker`) is still expressed against the agent's home; in the
+sandbox those paths name nothing, which is harmless today and wrong if the sandbox ever
+holds credentials of its own.
+
 ### What persists, and for how long
 
 | Thing             | Mechanism                                 | Lifetime               |
@@ -597,13 +630,56 @@ It is gated on Part C: the sandbox image ships the four proxy symlinks at
 `/opt/credential-proxy/bin/`, but that directory is not on its `PATH` and
 `CREDENTIAL_PROXY_URL` is unset, so `gh` does not resolve there yet.
 
-This also settles a question asked of the agent pod itself: it holds no cluster
-tooling. `kubectl`, `gcloud`, `gh` and `git` in the `platform-agent` container are all
-symlinks to `credential-proxy-exec`, with no native binary anywhere on its filesystem —
-the real ones live only in the `envoy-credential-proxy` sidecar. Agent-side cron scripts
-that appear to run `gcloud` are already going through the proxy and its per-subcommand
-policy. Nothing needs removing; what remains is that the proxy answers on pod loopback
-and authenticates no caller, which is the problem Part C exists to solve.
+#### The agent pod gives up cluster tooling entirely
+
+Sandboxing the shell does not, by itself, take `kubectl` away from the agent. The
+`platform-agent` container has no native `kubectl`, `gcloud`, `gh` or `git` — all four
+are symlinks to `credential-proxy-exec`, and the real binaries live only in the
+`envoy-credential-proxy` sidecar — but the symlinks are a working credential path, and
+the model can reach one without going near a shell.
+[`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py) is the
+proof: it is launched as a stdio MCP server from `agents/platform/config.yaml:30`, runs
+in the agent pod, and shells out at eleven sites — `kubectl logs`, `kubectl describe`,
+`kubectl get pods`, `gcloud logging read` among them. Those are model-facing tools. The
+shell moving to the sandbox does nothing to them.
+
+So the decision is that the agent pod holds no way to invoke cluster tooling in any
+form: the four symlinks and `credential-proxy-exec` itself leave the agent image, and
+the image gains the same build-time guard the sandbox image already has, failing the
+build if any of the four resolves. The sandbox becomes the only place a credential-proxy
+call can originate.
+
+Agent-side callers reach the tooling the same way everything else in this section does —
+by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),
+`cluster_agent_reconcile.py` (2), `cluster_agent_profile.py` (1) and `gke_endpoint.py`
+(1, a capability probe) share one helper that reads `terminal.ssh_*` from the managed
+config at `/etc/hermes/config.yaml` rather than re-deriving the address. Nothing else in
+`agents/` needs it: the remaining callers — `gitops_workspace.py`, `resolver.py`,
+`cluster_preflight.sh` — are already invoked from the shell and so already run there.
+
+**This makes the sandbox required.** With the symlinks gone there is no fallback, so
+`shellSandbox` disabled is a configuration in which the MCP tools fail. That is accepted
+rather than worked around: keeping a local path alive for the disabled case would keep
+the exact capability this removes, and an image that behaves differently depending on a
+CR field is harder to reason about than one that does not carry the binaries at all.
+Removing the toggle is the follow-through and is not yet done.
+
+What this does **not** buy is a boundary, and the distinction matters because the
+opposite is easy to assume. The proxy answers on pod loopback and authenticates no
+caller, so anything running in the agent container can still reach it with `curl`;
+removing the symlinks removes the ergonomic path and makes the intent testable, not the
+capability. The boundary arrives with [Part C](credential-proxy-placement.md), which
+moves the proxy into its own pod — and only if the agent pod is then denied network
+access to it, which is a decision that belongs to that part.
+
+One entanglement to carry across. `gcloud container clusters get-credentials` writes a
+kubeconfig that the proxy validates with `_within_workspace`
+(`credential_proxy.py:1044`), and the shared volume making that work is `/opt/data`,
+mounted `rw` into both containers. A sandbox-side `kubectl` cannot use it, and neither
+can a proxy in its own pod — the PVCs are `ReadWriteOnce`. Part C already replaces the
+mechanism with `content_workspace.py` and a `/v1/workspace/*` API whose working tree
+lives in the broker's own volume. The sandbox should land on that rather than grow a
+second handoff.
 
 #### Two problems deferred, and what has already been ruled out for them
 
