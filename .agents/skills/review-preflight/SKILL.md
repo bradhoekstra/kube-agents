@@ -104,10 +104,10 @@ instead. In order of preference:
   ```bash
   claude -p "In $PWD, follow .agents/skills/review-adversarial/SKILL.md against $BASE...HEAD.
   Derive the change's intent from the diff. Do not read the branch's commit message bodies,
-  plan files, or scratch notes."
+  plan files, or scratch notes. Report every finding and edit nothing; its step 6 is mine."
   ```
 
-  That second sentence is not optional padding — step 5 explains why it carries the handoff.
+  Neither of those trailing instructions is padding — step 5 explains what each one carries.
 
 If none of those is available to you, **you are blocked, and the pull request waits**. Say what you
 are blocked on. `AGENTS.md` is explicit that an approval you could not get blocks this step rather
@@ -118,6 +118,19 @@ disclosing it is what you do when a human, told the above, tells you to proceed 
 ## 5. What to hand each pass, and what to withhold
 
 Hand it: the repository, the diff range, the path to its skill, and the gate output from step 3.
+
+**Say that the report is the deliverable and the pass writes nothing.** `review-docs-drift` and
+`review-iac-parity` already refuse to fix silently, but `review-adversarial` §6 tells whoever runs it
+to edit on CONFIRMED, and its Angle I asks for a test run against the pre-change behaviour — both of
+which mutate the tree. The passes run concurrently in your checkout rather than one worktree each, so
+a pass that reverts a file to watch a test fail is a file its siblings are reading at the same time.
+`.claude/commands/pr-review-batch.md` carries the sentence for the reviewer side and this is its
+author-side equivalent:
+
+> The skill's step 6 does not apply to you: report every finding, edit nothing, and leave the tree as
+> you found it. Dispositions are the caller's.
+
+Step 6 below is where those edits happen, once, after the relay.
 
 Withhold everything you know that it does not: your plan, your reasoning, the commit messages you
 drafted, the summary you were about to write, which hunks you think are the risky ones, and which
