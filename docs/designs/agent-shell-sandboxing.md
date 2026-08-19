@@ -664,13 +664,14 @@ the exact capability this removes, and an image that behaves differently dependi
 CR field is harder to reason about than one that does not carry the binaries at all.
 Removing the toggle is the follow-through and is not yet done.
 
-What this does **not** buy is a boundary, and the distinction matters because the
-opposite is easy to assume. The proxy answers on pod loopback and authenticates no
-caller, so anything running in the agent container can still reach it with `curl`;
-removing the symlinks removes the ergonomic path and makes the intent testable, not the
-capability. The boundary arrives with [Part C](credential-proxy-placement.md), which
-moves the proxy into its own pod — and only if the agent pod is then denied network
-access to it, which is a decision that belongs to that part.
+The proxy still answers on pod loopback and authenticates no caller, so removing the
+symlinks does not make the agent pod unable to reach it — but reaching it now requires
+arbitrary code execution in that pod, and with the shell, the file tools and
+`execute_code` all in the sandbox the model has no path to that. What is left in the
+agent pod is trusted code: the MCP server, the cron scripts, the gateway. The point of
+the proxy is that raw credentials never reach the agent, not that no process can invoke
+a command, so this is the property that matters. [Part C](credential-proxy-placement.md)
+moving the proxy into its own pod turns loopback into a network boundary as well.
 
 One entanglement to carry across. `gcloud container clusters get-credentials` writes a
 kubeconfig that the proxy validates with `_within_workspace`
