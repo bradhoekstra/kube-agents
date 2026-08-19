@@ -25,6 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import sandbox_exec
 from gke_endpoint import dns_endpoint_args
 from profile_scaffold import ensure_profile, overlay_template
 
@@ -54,7 +55,12 @@ def log(msg: str) -> None:
 
 
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Env for subprocesses: HOME -> /tmp (writable creds) and HERMES_HOME pinned."""
+    """Env for agent-pod subprocesses: HOME -> /tmp and HERMES_HOME pinned.
+
+    Not for anything crossing into the sandbox. It carries the agent pod's whole
+    environment, `API_SERVER_KEY` included; `sandbox_exec.run` takes the handful
+    of variables a remote command needs through `remote_env` instead.
+    """
     return {**os.environ, "HOME": "/tmp", "HERMES_HOME": str(HERMES_HOME), **(extra or {})}
 
 
@@ -230,10 +236,19 @@ def create_profile(project: str, cluster: str, location: str) -> str:
         log(f"{name}: overlay sync failed ({e}); running on image defaults")
 
     # 3. Pin a kubeconfig scoped to the target cluster.
+    #
+    # The gcloud runs in the shell sandbox, so the file it writes lands there
+    # rather than in the agent pod — which is where it is needed, because every
+    # kubectl this profile goes on to run is a sandbox command too, reading the
+    # KUBECONFIG that step 3b pins. What has not been settled is the path: the
+    # profile home below is an agent-pod path with no counterpart in the
+    # sandbox, so this call writes to a directory that does not exist there
+    # until #737's per-profile sandbox directories land. gcloud says so plainly
+    # when it happens; the alternative was to invent the layout here.
     kubeconfig = home / "kubeconfig.yaml"
     env = _run_env({"KUBECONFIG": str(kubeconfig)})
     try:
-        subprocess.run(
+        sandbox_exec.run(
             [
                 "gcloud", "container", "clusters", "get-credentials", cluster,
                 f"--location={location}", f"--project={project}",
@@ -242,17 +257,26 @@ def create_profile(project: str, cluster: str, location: str) -> str:
                 # external traffic. gke_endpoint reads which before deciding.
                 *dns_endpoint_args(project, cluster, location, env=env),
             ],
-            check=True, capture_output=True, text=True, timeout=60, env=env,
+            check=True, timeout=60,
+            remote_env={"KUBECONFIG": str(kubeconfig)},
+            local_env=env,
         )
     except subprocess.CalledProcessError as e:
         raise SystemExit(f"ERROR: failed to fetch credentials for '{cluster}': {e.stderr.strip()}")
     except subprocess.TimeoutExpired:
         raise SystemExit(f"ERROR: timed out fetching credentials for '{cluster}'.")
+    except sandbox_exec.SandboxUnavailable as e:
+        # The command never ran. Distinct from the cases above, which are gcloud
+        # answering: a scaffold that reports a credential failure here would send
+        # whoever reads it to IAM rather than to the sandbox pod.
+        raise SystemExit(f"ERROR: could not reach the shell sandbox to fetch credentials "
+                         f"for '{cluster}': {e}")
     except OSError as e:
-        # `gcloud` not on PATH or not executable — raised before the process exists,
-        # so neither handler above sees it. Same failure mode the `hermes` invocation
-        # in profile_scaffold.ensure_profile guards against; keep it to one
-        # actionable line instead of a traceback in the container log.
+        # `ssh` (or `gcloud`, unsandboxed) not on PATH or not executable — raised
+        # before the process exists, so neither handler above sees it. Same failure
+        # mode the `hermes` invocation in profile_scaffold.ensure_profile guards
+        # against; keep it to one actionable line instead of a traceback in the
+        # container log.
         raise SystemExit(f"ERROR: could not execute 'gcloud' to fetch credentials for '{cluster}': {e}")
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
@@ -298,6 +322,8 @@ def delete_profile(name: str) -> None:
     """
     home = profile_home(name)
     try:
+        # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
+        # the gateway on loopback, and the sandbox image does not carry it.
         subprocess.run(
             ["hermes", "profile", "delete", name, "-y"],
             check=True, capture_output=True, text=True, timeout=30, env=_run_env(),

@@ -166,6 +166,15 @@ check "the planted shim does run for the agent itself" "FORGED" \
 # into its home or by authorising a new key in its own.
 check "the agent cannot enter the hermes home" "Permission denied" \
   "$("${SSH[@]}" 'ls /home/hermes/.ssh' 2>&1)"
+
+# The kubeconfig directory the platform MCP server writes to. A kubeconfig names
+# an exec credential plugin and kubectl runs it, so one the model can author is
+# arbitrary code execution as hermes. It lives inside the 0700 home for that
+# reason and not for tidiness.
+check "hermes can write its kubeconfig directory" "700 hermes" \
+  "$("${HERMES_SSH[@]}" 'stat -c "%a %U" /home/hermes/.kubeconfigs' 2>&1)"
+check "the agent cannot write a kubeconfig for hermes to use" "Permission denied" \
+  "$("${SSH[@]}" 'touch /home/hermes/.kubeconfigs/planted.yaml' 2>&1)"
 # Generated on the host so the private half never has to be copied back out of
 # the container: the model only needs the public half to authorise it.
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue

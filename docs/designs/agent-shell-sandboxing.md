@@ -651,11 +651,17 @@ call can originate.
 
 Agent-side callers reach the tooling the same way everything else in this section does —
 by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),
-`cluster_agent_reconcile.py` (2), `cluster_agent_profile.py` (1) and `gke_endpoint.py`
-(1, a capability probe) share one helper that reads `terminal.ssh_*` from the managed
-config at `/etc/hermes/config.yaml` rather than re-deriving the address. Nothing else in
-`agents/` needs it: the remaining callers — `gitops_workspace.py`, `resolver.py`,
+`cluster_agent_reconcile.py` (3), `cluster_agent_profile.py` (1) and `gke_endpoint.py`
+(1, a capability probe) share `sandbox_exec.py`, which reads `terminal.ssh_*` from the
+managed config at `/etc/hermes/config.yaml` rather than re-deriving the address. Nothing
+else in `agents/` needs it: the remaining callers — `gitops_workspace.py`, `resolver.py`,
 `cluster_preflight.sh` — are already invoked from the shell and so already run there.
+
+Two calls in those files stay in the agent pod, and neither is an exception to the rule
+above: `hermes send` and `hermes profile delete` are not cluster tooling. They need the
+profiles on the data PVC and the gateway on loopback, and the sandbox image does not
+carry the binary. The overlap in names is unfortunate — the SSH principal below is also
+called `hermes` — and is the one thing to check when reading a diff against these files.
 Which SSH identity that helper uses is the subject of the next section, and is not the
 one configured today.
 
@@ -910,12 +916,24 @@ the agent in.
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
-- **The SSH helper and its dedicated principal are designed and unbuilt.** The
-  `.bashrc` finding is measured, but nothing has yet run a cluster tool through a
-  second SSH identity, and the `SetEnv` ordering constraint means the credential-proxy
-  environment reaching that principal is an assumption until it is exercised. The
-  helper also has to land before the agent image can drop `credential-proxy-exec`,
-  which makes it the gate on that change rather than a parallel one.
+- **The SSH helper is built and not yet exercised through a real cluster call.**
+  `agents/platform/scripts/sandbox_exec.py` routes all fifteen agent-side call sites,
+  and the `hermes` account, its authorised key and the `.bashrc` isolation are covered
+  by `make docker-smoke-sandbox`. What no test can reach is the far end: every one of
+  those commands stops at `CREDENTIAL_PROXY_URL is not configured`, so the connection
+  is proven and the command behind it is not. The helper had to land before the agent
+  image can drop `credential-proxy-exec`, which makes it the gate on that change.
+- **The MCP server's kubeconfig has moved and the credential proxy does not know.**
+  `_thread_kubeconfig_path` writes into `/home/hermes/.kubeconfigs` when the sandbox is
+  on, because a kubeconfig names an `exec` credential plugin that kubectl runs, and any
+  path uid 1000 can write is code execution as the trusted principal. The proxy accepts
+  a caller-supplied `KUBECONFIG` only inside its workspace root, so Part C has to give
+  that directory standing or the tools fail one step later than they do now.
+- **The cluster-agent kubeconfig has nowhere to go yet.** `cluster_agent_profile.py`
+  runs its `get-credentials` in the sandbox but still names the profile home on the
+  agent pod's PVC, which has no counterpart there. Onboarding a cluster fails on the
+  missing directory until per-profile sandbox directories land. The alternative was to
+  invent that layout inside a call site, which is how two layouts end up shipping.
 - **Cron has not been exercised against a sandboxed agent.** The finding that
   `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
   doubt, but no roster has run in this configuration, and the bootstrap handoff the

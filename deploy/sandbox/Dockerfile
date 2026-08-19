@@ -126,12 +126,22 @@ RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 ag
 # thing to reason about, and a non-interactive ssh command needs none of them.
 # The home is 0700 and owned by hermes, so uid 1000 cannot read or write any
 # part of it, .ssh included.
+#
+# .kubeconfigs is where the platform MCP server's `get-credentials` writes and
+# its kubectl reads (platform_mcp_server._thread_kubeconfig_path). It has to be
+# somewhere uid 1000 cannot write: a kubeconfig names an `exec` credential
+# plugin — a binary and its argv — and kubectl runs it, so a kubeconfig the
+# model can author is arbitrary code execution as the one account here it is not
+# meant to reach. /workspace and /tmp are both shared with `agent`. Created in
+# the image rather than at first use, which keeps the runtime path to one round
+# trip and the mode out of the hands of whatever creates it.
 RUN groupadd --gid 1001 hermes && \
     useradd --no-create-home --no-user-group --gid 1001 --uid 1001 \
         --home-dir /home/hermes --shell /bin/bash hermes && \
     usermod -p '*' hermes && \
     install -d -m 0700 -o hermes -g hermes /home/hermes && \
-    install -d -m 0700 -o hermes -g hermes /home/hermes/.ssh
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.ssh && \
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.kubeconfigs
 
 # The credential-aware CLIs, exactly as the agent image provides them: symlinks
 # to one client that forwards argv to the credential proxy over HTTP and prints
