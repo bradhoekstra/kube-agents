@@ -80,6 +80,12 @@ const (
 	shellSandboxWorkspacePath = "/workspace"
 	shellSandboxKeysPath      = "/etc/ssh-authorized"
 
+	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It is
+	// the cwd every ssh command starts in, so it is writable alongside the workspace
+	// volume — see HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec. Unlike the
+	// workspace it is on the container filesystem and does not survive a restart.
+	shellSandboxHomePath = "/home/" + shellSandboxUser
+
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
 	// Secret cannot be handed to `ssh -i` directly.

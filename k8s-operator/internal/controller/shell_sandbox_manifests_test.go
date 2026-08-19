@@ -494,3 +494,45 @@ func TestAgentPodStagesTheClientKeyOnlyWhenSandboxed(t *testing.T) {
 		t.Errorf("expected the staged key mounted read-only at %s in the agent container", shellSandboxClientKeyPath)
 	}
 }
+
+// The Hermes base image ships HERMES_WRITE_SAFE_ROOT=/opt/data. Left alone with the
+// sandbox on, agent/file_safety.py refuses every sandbox path and permits only one
+// that does not exist there, so write_file and patch fail for everything — observed
+// on a live install before this was added.
+func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
+	safeRoot := func(pod corev1.PodSpec) (string, bool) {
+		for _, c := range pod.Containers {
+			if c.Name != "platform-agent" {
+				continue
+			}
+			for _, e := range c.Env {
+				if e.Name == "HERMES_WRITE_SAFE_ROOT" {
+					return e.Value, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	// Off, the operator says nothing and the image's own default stands.
+	off := buildPodTemplateSpec(shellSandboxAgent(false), "", "", "", "", nil, renderOptions{})
+	if got, found := safeRoot(off.Spec); found {
+		t.Errorf("an agent with the sandbox off must not override the write safe root, got %q", got)
+	}
+
+	on := buildPodTemplateSpec(shellSandboxAgent(true), "", "", "", "", nil, renderOptions{})
+	got, found := safeRoot(on.Spec)
+	if !found {
+		t.Fatal("expected HERMES_WRITE_SAFE_ROOT on the sandboxed agent container")
+	}
+	want := shellSandboxWorkspacePath + ":" + shellSandboxHomePath
+	if got != want {
+		t.Errorf("write safe root = %q, want %q", got, want)
+	}
+	// The agent's own home is what the file tools must no longer be able to name.
+	for _, p := range strings.Split(got, ":") {
+		if p == "/opt/data" {
+			t.Error("the sandboxed write safe root still permits the agent's own home")
+		}
+	}
+}

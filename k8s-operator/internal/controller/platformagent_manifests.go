@@ -1858,6 +1858,21 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "HERMES_MANAGED_DIR",
 		Value: managedScopeDir,
 	})
+	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
+	// own home and the right answer while the shell is local. Once the shell is in the
+	// sandbox it is the wrong one twice over: agent/file_safety.py checks the path
+	// prefix in the agent process before the write is routed anywhere, so every sandbox
+	// path is refused — and /opt/data, the one path it does allow, does not exist in
+	// the sandbox. write_file and patch return "Write denied" for everything, which is
+	// how this was found on a live install. Repointing it at the sandbox's two writable
+	// directories gives up no isolation: with backend: ssh the file tools cannot reach
+	// the agent's filesystem to begin with.
+	if shellSandboxEnabled(agent) {
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "HERMES_WRITE_SAFE_ROOT",
+			Value: strings.Join([]string{shellSandboxWorkspacePath, shellSandboxHomePath}, ":"),
+		})
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
 		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
