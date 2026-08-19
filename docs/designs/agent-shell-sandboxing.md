@@ -450,6 +450,126 @@ long-running operator, not a session; a per-conversation sandbox would throw awa
 working state between related tasks and make warm-pool startup the common case rather
 than the rare one.
 
+### What the sandbox needs, and where it comes from
+
+The shell moved; the paths it was written against did not. `/opt/data` is the agent's
+home on its PVC, it is named 59 files deep in `agents/`, and in the sandbox it does not
+exist. The first live run found this immediately: an environment probe dispatched as a
+Kanban card ran on `platform-agent-shell-0` as user `agent` and reported
+`/opt/data exists: False`, so the card's own declared workspace under
+`/opt/data/kanban/workspaces/` was not creatable and the worker fell back to its home
+directory.
+
+Enumerating what the sandbox legitimately needs — listed under
+[What is still unproven](#what-is-still-unproven) as nobody having done it — sorts the
+references into five classes with four different delivery mechanisms.
+
+| What                                         | Where it comes from                    | Why                                           |
+| -------------------------------------------- | -------------------------------------- | --------------------------------------------- |
+| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                 | read into the prompt, never through the shell |
+| Skills, including their `scripts/`           | Hermes' existing `~/.hermes` sync      | already works, verified live                  |
+| Governance SOPs                              | baked into the sandbox image           | static, versioned with the repo               |
+| The shell-invoked subset of `scripts/`       | baked into the sandbox image           | static, and the subset is small               |
+| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod | per-install content, cannot be baked          |
+| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/workspace` at runtime     | data, not delivery                            |
+
+**The persona stays behind, and that is a property rather than an omission.** Nothing
+writes `SOUL.md` through the shell. The only writer is
+[`profile_scaffold.py`](../../agents/platform/scripts/profile_scaffold.py), which
+overlays the image-baked `/opt/platform-template` onto the profile home at pod startup;
+everything else that names the file is a test fixture. So the agent cannot modify its
+own persona, because the persona is not on a filesystem any of its tools can reach.
+Before the sandbox that was true only by convention.
+
+**Skills already arrive, and whole.** Hermes' SSH backend syncs `~/.hermes/skills` into
+the sandbox, and it syncs trees rather than just the markdown: on the live pair,
+`github-issue-resolver`, `submit-suggestion` and `fleet-audit` each have their
+`scripts/*.py` present under `/home/agent/.hermes/skills/`. 62 skills, 16 MB. Nothing
+to build.
+
+**Governance and shared scripts are baked into the image rather than synced.** The
+alternative was extending the sync to cover them, which keeps one delivery mechanism
+instead of two. It was rejected because the sync is upstream Hermes behaviour scoped to
+`~/.hermes`, so widening it means carrying a patch, and because a baked image is
+auditable in a way a sync is not: what the sandbox contains is what the Dockerfile
+says, reviewable in the diff. The cost is accepted and real — skills update when the
+agent restarts, baked files only when the image is rebuilt, and the two can drift.
+
+**Not all of `scripts/` goes.** The directory holds over a hundred files and most are
+agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_server.py`,
+`router_server.py`, `profile_cron_tick.py`, `credential_proxy.py`. Shipping them
+wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
+wrong thing for a reviewer to find even though it is inert there. The set the agent
+actually invokes from the shell is four: `cluster_agent_profile.py` (8 call sites in
+the prose), `kanban_notify_propagate.py` (4), `cluster_preflight.sh` (3) and
+`cluster_agent_reconcile.py` (1). One of those four is disqualified below. So the
+image gets an explicit allowlist, enforced the way the image already fails the build if
+a real `gcloud` appears.
+
+**`SETTINGS.md` is mounted, not baked, and not at `/opt/data`.** Its content is
+per-install: the operator renders it from `spec.integration.github.gitRepo` into an
+`<agent>-settings` ConfigMap (`buildSettingsConfigMap`) and mounts it as a subPath.
+Baking would freeze one installation's repository URL into a shared image. The
+ConfigMap already exists, so the operator mounts it a second time into the sandbox pod.
+
+Mounting it at `/opt/data/SETTINGS.md` inside the sandbox was considered, because it
+would need no code change at all — three parsers hardcode that path
+(`resolver.py:18` with no override, `audit_report.py:4079` behind
+`FLEET_AUDIT_SETTINGS`, `gitops_workspace.py:119` off `agent_home()`). It was rejected:
+it makes `/opt/data` exist in the sandbox, and the absence of `/opt/data` is the
+one-line check that tells anybody whether the isolation is real. The
+`gke-stockout-investigator` plugin already reads
+`${PLATFORM_AGENT_HOME:-/opt/data}/SETTINGS.md`, so the override precedent exists;
+`PLATFORM_AGENT_HOME` becomes the standard, set in the sandbox environment, and the two
+parsers that cannot honour it are changed.
+
+#### Two problems deferred, and what has already been ruled out for them
+
+Neither blocks the work above. Both are recorded here so the dead ends are not
+re-walked.
+
+**Reaching `kanban.db`.** Two scripts touch the board.
+[`kanban_board_health.py`](../../agents/chat/scripts/kanban_board_health.py) never
+opens the file — it shells out to `hermes kanban diagnostics --json`, and says at line
+29 that opening `/opt/data/kanban.db` from an agent shell is what the persona forbids.
+[`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
+does open it, `sqlite3.connect` at line 63 — and `SOUL.md:61` tells the agent to run it
+from the shell. That is coherent today, where `SOUL.md:66`'s ban on touching the board
+is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not survive
+the move.
+
+Mounting `kanban.db` into the sandbox is ruled out. It would hand the shell exactly the
+write path that the rule exists to close, after a worker used that path on 2026-08-07
+to mark three cards `done` with an invented result. Under the split,
+`kanban_board_health.py` stays agent-side and stops being a problem;
+`kanban_notify_propagate.py` needs to become something the agent calls rather than
+something it runs.
+
+**Executing `hermes`.** Exactly one capability is invoked from sandbox-side prose:
+`hermes cron run <job-id>`, at `agents/platform/AGENTS.md:32` and
+`agents/platform/skills/fleet-audit/SKILL.md:53`. Both spell it
+`/opt/hermes/.venv/bin/hermes`, which is absent from the sandbox twice over. The other
+matches across `agents/` are either prose mentioning the binary or agent-side processes
+that stay put; `agentplugins/gke-stockout-investigator/scenarios/lib/common.sh:617`
+runs `hermes kanban ls --json` and has not been classified.
+
+Installing `hermes` in the sandbox image is ruled out. The command needs
+`HERMES_HOME=/opt/data/profiles/platform` — live profile state on the agent's PVC — so
+a `hermes` in the sandbox would have nothing to act on, and giving it something means
+mounting the profile tree there.
+
+Making `hermes` a fifth wrapped executable on the credential proxy was proposed and
+rejected. The pattern fits — `credential_proxy.py` already forwards argv, runs the real
+binary on the trusted side, and enforces a per-executable subcommand policy — but
+[Part C](credential-proxy-placement.md) moves the proxy into its own pod, which holds
+credentials and no profile state. The wrapper would run `hermes` somewhere it still
+cannot work. Whatever replaces it has to execute in the agent pod.
+
+`cronjob(action='run')` is the nearest existing tool and is not equivalent:
+`AGENTS.md:37` records that in several runtimes it executes the job synchronously
+inside the calling session, which is the behaviour `hermes cron run` was chosen to
+avoid.
+
 ---
 
 ## The Session KV store
@@ -543,8 +663,10 @@ the agent in.
   us (see [Agent Sandbox, and why not yet](#agent-sandbox-and-why-not-yet)), so if
   the number turns out to matter, the fix is a pod that is already running before
   the agent asks — which is a decision, not a field.
-- **What the agent legitimately needs mounted.** The whole design's strength is a
-  function of this list, and nobody has enumerated it.
+- **How the sandbox image and the agent image stay in step.** `shellSandbox.image` is
+  settable independently, so baked scripts and the persona that invokes them can drift
+  apart silently. Defaulting the sandbox tag to the agent's is the obvious answer and
+  has not been decided.
 - **Whether `sync_back` should be on at all.** Stated above as an open decision, not
   a resolved one.
 - **Whether the operator should own the sandbox at all**, or whether it belongs to a

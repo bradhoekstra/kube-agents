@@ -225,6 +225,17 @@ radius to every agent on the node.
 operator already reconciles per-agent resources and the Secret is already per-agent,
 so per-agent is the natural grain.
 
+**Wrapping `hermes` as a fifth executable, to give the sandbox a way to run it.**
+Proposed while working [Part B](agent-shell-sandboxing.md): `hermes cron run` is
+invoked from sandbox-side prose and the binary is not there, and the proxy already
+forwards argv, executes on the trusted side, and enforces per-executable subcommand
+policy. It does not work, because of this document. Moving the proxy out of the agent
+pod is the whole point of #720, and the pod it moves to holds credentials and no Hermes
+profile state — so a wrapped `hermes` would run somewhere it still cannot reach
+`HERMES_HOME`. The proxy is the sandbox's path to _credentials_; it is not a general
+path back into the agent pod, and anything needing agent-side state has to execute
+there.
+
 ---
 
 ## The design
