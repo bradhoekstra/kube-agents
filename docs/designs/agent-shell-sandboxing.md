@@ -649,13 +649,14 @@ the image gains the same build-time guard the sandbox image already has, failing
 build if any of the four resolves. The sandbox becomes the only place a credential-proxy
 call can originate.
 
-Agent-side callers reach the tooling the same way everything else in this section does —
-by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),
-`cluster_agent_reconcile.py` (2), `cluster_agent_profile.py` (1) and `gke_endpoint.py`
-(1, a capability probe) share one helper that reads `terminal.ssh_*` from the managed
-config at `/etc/hermes/config.yaml` rather than re-deriving the address. Nothing else in
-`agents/` needs it: the remaining callers — `gitops_workspace.py`, `resolver.py`,
-`cluster_preflight.sh` — are already invoked from the shell and so already run there.
+Most agent-side callers reach the tooling the same way everything else in this section
+does — by executing in the sandbox over SSH. `cluster_agent_reconcile.py` (2 sites),
+`cluster_agent_profile.py` (1) and `gke_endpoint.py` (1, a capability probe) share one
+helper that reads `terminal.ssh_*` from the managed config at `/etc/hermes/config.yaml`
+rather than re-deriving the address. Nothing else in `agents/` needs it: the remaining
+callers — `gitops_workspace.py`, `resolver.py`, `cluster_preflight.sh` — are already
+invoked from the shell and so already run there. `platform_mcp_server.py` accounts for
+eleven of the fifteen sites on its own and is handled differently, below.
 
 **This makes the sandbox required.** With the symlinks gone there is no fallback, so
 `shellSandbox` disabled is a configuration in which the MCP tools fail. That is accepted
@@ -681,6 +682,64 @@ can a proxy in its own pod — the PVCs are `ReadWriteOnce`. Part C already repl
 mechanism with `content_workspace.py` and a `/v1/workspace/*` API whose working tree
 lives in the broker's own volume. The sandbox should land on that rather than grow a
 second handoff.
+
+#### The MCP server splits rather than reaching out
+
+`platform_mcp_server.py` does not follow the SSH-out pattern, because it is doing three
+unrelated jobs and only one of them belongs in the sandbox. Six tools —
+`verify_gke_cluster`, `list_cc_healthchecks`, `get_cc_operator_status`,
+`get_cc_pod_diagnostics`, `list_cc_pods`, `audit_log_searcher` — are `kubectl` and
+`gcloud` wrappers holding no secret. `send_notification` is the one tool that reads
+`SESSION_KV_API_KEY`. And the module is also the parent process of the Session KV server,
+started at line 791, which owns the SQLite database on the system-metadata PVC.
+
+Moving the file wholesale would put the incident's exact target inside the sandbox, so
+the six cluster tools move and the other two jobs stay. Splitting also fixes something
+the move alone would not: `_run_env()` in `agent_common_server.py` is
+`{**os.environ, "HOME": "/tmp"}`, which hands every `kubectl` subprocess the entire
+agent-pod environment — the hazard `AGENTS.md` warns about. In the sandbox that
+environment holds nothing worth leaking.
+
+Transport is HTTP rather than stdio over SSH. Stdio would have been cheaper to build,
+since it reuses the key and the channel that already exist, and Hermes does recover from
+a dropped stdio transport — reconnect re-launches the configured command, so the `ssh`
+process is simply re-run. The problem is what gets re-run. Under stdio the MCP server
+_is_ the ssh child, so its lifetime is the connection's: every blip kills the server and
+starts a cold one, and a TCP connection to an evicted pod can sit half-open long enough
+to outlast the reconnect ladder unless the ssh invocation is hand-tuned with
+`ConnectTimeout` and `ServerAliveInterval`. Over HTTP the server is a supervised process
+that survives the blip, a readiness probe withdraws the Service endpoint while the pod is
+`NotReady` so connections fail immediately instead of hanging, and each retry costs one
+HTTP request rather than a key exchange and a Python interpreter start.
+
+The recovery machinery is the same either way, which is what makes the choice a matter of
+cost rather than capability. Hermes takes `url` and `headers` with recursive `${VAR}`
+expansion, probes the endpoint to pick streamable-HTTP or SSE, and runs the reconnect and
+park logic in the generic loop both transports share: five retries at one, two, four,
+eight and sixteen seconds, a 180-second idle keepalive, and then a park in which the
+tools are deregistered and the server self-probes every five minutes. A cross-node
+eviction exceeds the retry budget in either design — the `/workspace` PVC is
+`ReadWriteOnce` and has to detach and re-attach — so the realistic worst case is that the
+six tools are absent from the model's toolset for up to five minutes and then return on
+their own. Absent is a better failure than hanging, but it is a quiet one: the model
+reasons around a missing tool rather than waiting for it.
+
+HTTP costs an authentication story that SSH supplied for free. The server gets a bearer
+token from a Secret mounted `0400` to its own uid, and runs as that uid with its code
+owned by root. The threat is narrower than it first appears: the shell user shares the
+pod's network namespace and can always reach the listener on loopback, but calling these
+tools gains it nothing it could not get by running `kubectl` in the sandbox directly.
+What the separate uid and the token defend is the other direction — the model killing the
+server, binding the port ahead of it, or otherwise answering in its place and feeding
+forged results back to the agent. NetworkPolicy would normally cover the rest of the
+cluster; on a Standard cluster without Dataplane V2 it is inert, so the token is the
+boundary and the listener's bind address has to be chosen deliberately rather than left
+to a policy that will not be enforced.
+
+Whether the six tools earn their place at all is a separate question, deferred to its own
+issue. The proxy policy is a denylist of credential-disclosure patterns rather than an
+allowlist of subcommands, so these tools wrap commands the model can already run from the
+shell, and they may be worth less than the surface they add.
 
 #### Two problems deferred, and what has already been ruled out for them
 
@@ -838,6 +897,12 @@ the agent in.
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
+- **The MCP split is designed and unbuilt.** Nothing has run the six cluster tools from
+  the sandbox over HTTP, so the reconnect and park behaviour described above is read
+  from `mcp_tool.py` rather than observed, and the park window in particular deserves a
+  deliberate eviction to measure. The split also has to land before the agent image can
+  drop `credential-proxy-exec`, which makes it the gate on that change rather than a
+  parallel one.
 - **Cron has not been exercised against a sandboxed agent.** The finding that
   `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
   doubt, but no roster has run in this configuration, and the bootstrap handoff the
