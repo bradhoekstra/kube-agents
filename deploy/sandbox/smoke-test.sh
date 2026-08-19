@@ -25,17 +25,20 @@ IMAGE="${1:-agent-sandbox:latest}"
 PORT="${2:-12222}"
 NAME="sandbox-smoke-$$"
 WORK=$(mktemp -d)
+# Named volumes rather than bind mounts, for the ownership. A bind mount arrives
+# owned by whoever ran this script; a named volume is seeded from the image, so
+# /opt/data arrives agent-owned and /var/lib/sandbox-sshd root-owned — which is
+# what a PVC does and what the entrypoint's root-ownership check expects. It
+# also means nothing here has to chown a 0700 directory back out of the
+# container before `rm -rf` can finish.
+DATA_VOL="$NAME-data"
+SSHD_VOL="$NAME-sshd"
 PASS=0
 FAIL=0
 
 cleanup() {
-  docker rm -f "$NAME" "$NAME-nourl" >/dev/null 2>&1
-  # The container writes into the volume as uid 1000 and creates a 0700
-  # directory there, so an unprivileged `rm -rf` on the host cannot finish.
-  # --entrypoint: without it this runs sandbox-entrypoint, which exits on the
-  # missing authorized_keys long before it would reach the chown.
-  docker run --rm --entrypoint chown -v "$WORK:/w" "$IMAGE" \
-    -R "$(id -u):$(id -g)" /w >/dev/null 2>&1
+  docker rm -f "$NAME" "$NAME-nourl" "$NAME-badsshd" >/dev/null 2>&1
+  docker volume rm -f "$DATA_VOL" "$SSHD_VOL" >/dev/null 2>&1
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -68,7 +71,7 @@ check_absent() { # check_absent <label> <forbidden-substring> <actual>
 }
 
 ssh-keygen -q -t ed25519 -N '' -f "$WORK/id" -C sandbox-smoke
-mkdir -p "$WORK/keys" "$WORK/vol"
+mkdir -p "$WORK/keys"
 cp "$WORK/id.pub" "$WORK/keys/authorized_keys"
 chmod 644 "$WORK/keys/authorized_keys"
 
@@ -87,7 +90,8 @@ start_sandbox() {
   docker rm -f "$NAME" >/dev/null 2>&1
   docker run -d --name "$NAME" -p "$PORT:2222" \
     -v "$WORK/keys:/etc/ssh-authorized:ro" \
-    -v "$WORK/vol:/workspace" \
+    -v "$DATA_VOL:/opt/data" \
+    -v "$SSHD_VOL:/var/lib/sandbox-sshd" \
     -e CREDENTIAL_PROXY_URL=http://127.0.0.1:9999 \
     "$IMAGE" >/dev/null
   for _ in $(seq 30); do
@@ -113,17 +117,29 @@ logs=$(docker logs "$NAME" 2>&1)
 check "generated host keys on first start" "generating ed25519 host key" "$logs"
 check "reached exec" "ready; starting" "$logs"
 check "sshd is pid 1" "sshd" "$(docker exec "$NAME" ps -o comm= -p 1 2>&1)"
-# From inside the container: .sshd is 0700 owned by uid 1000, so listing it from
-# the host would fail for reasons unrelated to whether the keys are there.
-check "host keys landed on the volume" "ssh_host_ed25519_key" \
-  "$(docker exec "$NAME" ls /workspace/.sshd 2>&1)"
+# From inside the container: the state directory is 0700 root:root, so listing it
+# from the host would fail for reasons unrelated to whether the keys are there.
+check "host keys landed on their volume" "ssh_host_ed25519_key" \
+  "$(docker exec "$NAME" ls /var/lib/sandbox-sshd 2>&1)"
+check "the data volume is the agent's" "1000" \
+  "$(docker exec "$NAME" stat -c '%u' /opt/data 2>&1)"
 
 echo
 echo "== 3. who may log in =="
 check "the agent's key works" "agent" "$("${SSH[@]}" whoami 2>&1)"
+# sshd's own default, which is the home. It is not where the agent works: Hermes
+# is sent TERMINAL_CWD=/opt/data by the operator, because this home is the
+# container's ephemeral overlay and everything written here is gone on the next
+# pod recycle. The image cannot enforce that — asserted here so the two halves of
+# the arrangement are visible together.
 check "the session starts in the agent's home" "/home/agent" "$("${SSH[@]}" pwd 2>&1)"
-check "the workspace is writable" "ok" \
-  "$("${SSH[@]}" 'touch /workspace/probe && echo ok' 2>&1)"
+check "the data volume is writable" "ok" \
+  "$("${SSH[@]}" 'touch /opt/data/probe && echo ok' 2>&1)"
+# One path, two directories: /opt/data is also the agent pod's Hermes home, and
+# the marker is how a script or a person tells which side of the SSH connection
+# it is looking at.
+check "the data volume says which /opt/data it is" "shell sandbox" \
+  "$("${SSH[@]}" 'cat /opt/data/.sandbox' 2>&1)"
 check "root is refused" "Permission denied" \
   "$(ssh "${SSH_OPTS[@]}" root@127.0.0.1 whoami 2>&1)"
 # Two things stop a third account from using the same key: AllowUsers names the
@@ -193,6 +209,33 @@ check "the same key does not open a hermes session" "Permission denied" \
 "${SSH[@]}" 'rm -rf ~/bin && sed -i "1{/^export PATH=/d}" ~/.bashrc && sed -i "/sandbox-smoke-rogue/d" ~/.ssh/authorized_keys' >/dev/null 2>&1
 
 echo
+echo "== 3c. the host keys are not the model's =="
+# Both clients pin the host key with StrictHostKeyChecking=accept-new, which is
+# worth nothing if the sandboxed account holds the private half. An earlier build
+# kept these under the model's volume and chowned them to uid 1000 — the pin
+# still looked configured, and the model could read the key it pinned.
+check "the agent cannot read the host private key" "Permission denied" \
+  "$("${SSH[@]}" 'cat /var/lib/sandbox-sshd/ssh_host_ed25519_key' 2>&1)"
+# Mode bits on the key file alone would not settle this. Ownership of the
+# directory is what stops the model renaming it aside and having the entrypoint
+# populate a replacement it controls on the next start.
+check "the host key directory is root's" "700 root" \
+  "$(docker exec "$NAME" stat -c '%a %U' /var/lib/sandbox-sshd 2>&1)"
+check "the agent cannot write the host key directory" "Permission denied" \
+  "$("${SSH[@]}" 'touch /var/lib/sandbox-sshd/planted' 2>&1)"
+# And the split has to stay a split: nested under the data volume, everything
+# above is undone by the mount point the model owns.
+check_absent "the host keys are not under the model's volume" "/opt/data" \
+  "$(docker exec "$NAME" sh -c 'grep "^HostKey" /etc/ssh/sshd_config' 2>&1)"
+# The entrypoint refuses rather than trusting the deployment to get this right.
+# --entrypoint, then chown, then the real entrypoint: the only way to hand it a
+# state directory the sandboxed account owns.
+check "the entrypoint refuses a state directory the model could write" "not root" \
+  "$(docker run --rm --name "$NAME-badsshd" -v "$WORK/keys:/etc/ssh-authorized:ro" \
+    --entrypoint bash "$IMAGE" -c \
+    'chown agent:agent /var/lib/sandbox-sshd && exec /usr/local/bin/sandbox-entrypoint /usr/sbin/sshd -D -e' 2>&1)"
+
+echo
 echo "== 4. what the agent's tools need to find =="
 check "python3 exists (execute_code probes for it)" "python3" \
   "$("${SSH[@]}" 'command -v python3' 2>&1)"
@@ -228,16 +271,27 @@ check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/k
   "$("${SSH[@]}" 'bash -l -c "command -v kubectl"' 2>&1)"
 
 echo
-echo "== 6. a restart must not change the host key =="
+echo "== 6. a restart must not change the host key or lose the model's work =="
 # Hermes connects with StrictHostKeyChecking=accept-new, which accepts a key it
 # has never seen and refuses one that changed. A regenerated host key is not a
 # prompt, it is every later command failing until known_hosts is cleared by hand.
+# Two files, one on each side of the durability line: /opt/data/probe was
+# written in section 3 and this one goes in the home the shell would default to.
+"${SSH[@]}" 'touch ~/ephemeral-probe' >/dev/null 2>&1
 before=$(ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null | awk '{print $3}')
 start_sandbox || exit 1
 after=$(ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 2>/dev/null | awk '{print $3}')
 check "same host key after a recycle" "$before" "$after"
 check_absent "the second start reused the volume's keys" "generating ed25519" \
   "$(docker logs "$NAME" 2>&1)"
+# The other half of the reason the volumes exist, and the reason the operator
+# sends TERMINAL_CWD=/opt/data: without it the shell defaults to `~`, which is
+# the container overlay below, and a live install ran for five days with the
+# model's work on the wrong side of this line.
+check "the model's files on the data volume survived the recycle" "probe" \
+  "$("${SSH[@]}" 'ls /opt/data' 2>&1)"
+check_absent "the ones in the home did not" "ephemeral-probe" \
+  "$("${SSH[@]}" 'ls -a ~' 2>&1)"
 
 echo
 echo "== 7. an unconfigured proxy warns, it does not crash =="

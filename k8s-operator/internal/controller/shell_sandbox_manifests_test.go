@@ -69,7 +69,7 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 }
 
-func TestShellSandboxRetainsItsWorkspaceOnDeleteAndScale(t *testing.T) {
+func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 	// Hermes connects with StrictHostKeyChecking=accept-new and the host keys
 	// live on this volume, so a reclaimed claim is not a lost cache — it is every
 	// subsequent command failing until known_hosts is edited by hand.
@@ -84,8 +84,15 @@ func TestShellSandboxRetainsItsWorkspaceOnDeleteAndScale(t *testing.T) {
 	if policy.WhenScaled != appsv1.RetainPersistentVolumeClaimRetentionPolicyType {
 		t.Errorf("expected WhenScaled=Retain, got %s", policy.WhenScaled)
 	}
-	if len(sts.Spec.VolumeClaimTemplates) != 1 || sts.Spec.VolumeClaimTemplates[0].Name != shellSandboxWorkspaceVolume {
-		t.Fatalf("expected a single %q volumeClaimTemplate, got %#v", shellSandboxWorkspaceVolume, sts.Spec.VolumeClaimTemplates)
+	claims := map[string]bool{}
+	for _, c := range sts.Spec.VolumeClaimTemplates {
+		claims[c.Name] = true
+	}
+	// Two, and the split is the point: the host keys must not sit on the volume
+	// whose mount point uid 1000 owns. See shellSandboxSshdPath.
+	if len(claims) != 2 || !claims[shellSandboxDataVolume] || !claims[shellSandboxSshdVolume] {
+		t.Fatalf("expected %q and %q volumeClaimTemplates, got %#v",
+			shellSandboxDataVolume, shellSandboxSshdVolume, sts.Spec.VolumeClaimTemplates)
 	}
 }
 
@@ -104,8 +111,17 @@ func TestShellSandboxMountsMatchTheImage(t *testing.T) {
 	if got := mounts[shellSandboxKeysVolume]; got.MountPath != shellSandboxKeysPath || !got.ReadOnly {
 		t.Errorf("expected %s mounted read-only at %s, got %#v", shellSandboxKeysVolume, shellSandboxKeysPath, got)
 	}
-	if got := mounts[shellSandboxWorkspaceVolume]; got.MountPath != shellSandboxWorkspacePath {
-		t.Errorf("expected %s mounted at %s, got %#v", shellSandboxWorkspaceVolume, shellSandboxWorkspacePath, got)
+	if got := mounts[shellSandboxDataVolume]; got.MountPath != shellSandboxDataPath {
+		t.Errorf("expected %s mounted at %s, got %#v", shellSandboxDataVolume, shellSandboxDataPath, got)
+	}
+	if got := mounts[shellSandboxSshdVolume]; got.MountPath != shellSandboxSshdPath {
+		t.Errorf("expected %s mounted at %s, got %#v", shellSandboxSshdVolume, shellSandboxSshdPath, got)
+	}
+	// A regression guard with a security consequence rather than a cosmetic one:
+	// nested under the data path, the host keys are back on a volume the model
+	// can rename entries in, and the pinned host key stops meaning anything.
+	if strings.HasPrefix(shellSandboxSshdPath, shellSandboxDataPath+"/") {
+		t.Errorf("the sshd state path %s is inside the model's data path %s", shellSandboxSshdPath, shellSandboxDataPath)
 	}
 	if containers[0].Command != nil || containers[0].Args != nil {
 		t.Error("the image's entrypoint owns startup; a command or args here bypasses the volume-dependent setup")
@@ -525,14 +541,62 @@ func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 	if !found {
 		t.Fatal("expected HERMES_WRITE_SAFE_ROOT on the sandboxed agent container")
 	}
-	want := shellSandboxWorkspacePath + ":" + shellSandboxHomePath
+	want := shellSandboxDataPath + ":" + shellSandboxHomePath
 	if got != want {
 		t.Errorf("write safe root = %q, want %q", got, want)
 	}
-	// The agent's own home is what the file tools must no longer be able to name.
+	// The sandbox's data volume carries the agent pod's /opt/data path on purpose,
+	// so the old check — that the safe root no longer names /opt/data — no longer
+	// distinguishes anything. What still has to hold is that every entry resolves
+	// inside the sandbox: file_safety.py compares the prefix in the agent process,
+	// and a path that exists only in the agent pod would let write_file accept a
+	// write the ssh backend then makes on the far side, or refuse one it should
+	// allow.
 	for _, p := range strings.Split(got, ":") {
-		if p == "/opt/data" {
-			t.Error("the sandboxed write safe root still permits the agent's own home")
+		if p != shellSandboxDataPath && p != shellSandboxHomePath {
+			t.Errorf("write safe root entry %q is not a sandbox path", p)
 		}
+	}
+}
+
+// TERMINAL_CWD is the difference between the model's work surviving a pod recycle
+// and not. Hermes' ssh backend defaults cwd to `~` (tools/terminal_tool.py), which
+// is the sandbox's ephemeral home, so without this every relative path the model
+// wrote was on the container overlay while the volume beside it stayed empty —
+// observed on a live install, 44K on a five-day-old PVC.
+func TestSandboxPointsTheTerminalAtTheDataVolume(t *testing.T) {
+	cwd := func(pod corev1.PodSpec) (string, bool) {
+		for _, c := range pod.Containers {
+			if c.Name != "platform-agent" {
+				continue
+			}
+			for _, e := range c.Env {
+				if e.Name == "TERMINAL_CWD" {
+					return e.Value, true
+				}
+			}
+		}
+		return "", false
+	}
+
+	// Off, the shell is local and `~` is the agent's own durable home. Setting a
+	// cwd there would change behaviour for installs that are not sandboxed at all.
+	off := buildPodTemplateSpec(shellSandboxAgent(false), "", "", "", "", nil, renderOptions{})
+	if got, found := cwd(off.Spec); found {
+		t.Errorf("an agent with the sandbox off must not set TERMINAL_CWD, got %q", got)
+	}
+
+	on := buildPodTemplateSpec(shellSandboxAgent(true), "", "", "", "", nil, renderOptions{})
+	got, found := cwd(on.Spec)
+	if !found {
+		t.Fatal("expected TERMINAL_CWD on the sandboxed agent container")
+	}
+	if got != shellSandboxDataPath {
+		t.Errorf("TERMINAL_CWD = %q, want the sandbox data volume %q", got, shellSandboxDataPath)
+	}
+	// The home is the failure this exists to prevent, and it is a silent one: the
+	// shell works, the files are written, and they are gone on the next restart.
+	if got == shellSandboxHomePath {
+		t.Error("TERMINAL_CWD points at the ephemeral home; model writes will not survive a restart")
 	}
 }

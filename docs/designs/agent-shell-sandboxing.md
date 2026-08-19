@@ -18,11 +18,12 @@ This document proposes running the shell in a **separate Kubernetes pod** — it
 filesystem, its own identity, no credentials — reached over Hermes' existing `ssh`
 terminal backend, and states what has to be true first.
 
-**Status:** the sandbox image ships ([`deploy/sandbox/`](../../deploy/sandbox/));
-nothing reconciles it yet. Tracked as Parts A and B of
-[#737](https://github.com/gke-labs/kube-agents/issues/737). Part C, the credential
+**Status:** the sandbox image ships ([`deploy/sandbox/`](../../deploy/sandbox/)) and the
+operator reconciles it behind `harness.experimental.shellSandbox`. Tracked as Parts A and
+B of [#737](https://github.com/gke-labs/kube-agents/issues/737). Part C, the credential
 proxy, is a separate document — [`credential-proxy-placement.md`](credential-proxy-placement.md) —
-and lands first.
+and until it lands the sandbox's `kubectl`, `gcloud`, `gh` and `git` report that they are
+unconfigured.
 
 **Revised 2026-08-18.** The pod was going to be a `Sandbox` custom resource from
 [Agent Sandbox]. It is a StatefulSet reconciled by our own operator instead. The
@@ -197,7 +198,7 @@ fields we can already write.
 the original decision made — a Kubernetes-native sandbox API, warm pools, isolation
 as a one-line runtime choice — is still the right bet if the project delivers it. So
 the interface below is drawn to make adopting it a swap rather than a rewrite: an
-SSH-reachable pod at a stable name, a workspace volume, and an image that knows
+SSH-reachable pod at a stable name, an attached volume, and an image that knows
 nothing about what scheduled it. On the day the other three CRDs exist, what changes
 is one builder function in the operator. Nothing in `deploy/sandbox/`, nothing in
 Hermes' configuration, and nothing in this document above this line.
@@ -260,30 +261,29 @@ Three pods per agent instead of one:
   Part C. No shell of consequence.
 - **the credential proxy pod** — [Part C](credential-proxy-placement.md). Holds the
   credentials, runs the credentialed commands.
-- **the sandbox pod** — an `sshd`, a workspace volume, the agent's tools, the
+- **the sandbox pod** — an `sshd`, a durable `/opt/data`, the agent's tools, the
   credential-proxy shims. No Kubernetes service-account token, no route to the
   metadata server, no real `kubectl`.
 
 ### The sandbox workload
 
 Three objects per agent, all owned by the `PlatformAgent` CR so they are garbage
-collected with it. Sketched in
-[`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)
-— builders and their tests, not yet called from `Reconcile`.
+collected with it, built in
+[`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go).
 
 | Object                       | Named           | What it is for                                                                     |
 | ---------------------------- | --------------- | ---------------------------------------------------------------------------------- |
-| `StatefulSet`, `replicas: 1` | `<agent>-shell` | the pod, and the `workspace` volumeClaimTemplate behind it                         |
+| `StatefulSet`, `replicas: 1` | `<agent>-shell` | the pod, and the `data` and `sshd` volumeClaimTemplates behind it                  |
 | `Service`, `clusterIP: None` | `<agent>-shell` | the StatefulSet's governing service, and the name Hermes dials                     |
 | `NetworkPolicy`              | `<agent>-shell` | ingress on 2222 from the gateway only; egress to DNS and the credential proxy only |
 
 Five fields carry an argument rather than a default:
 
-- **`persistentVolumeClaimRetentionPolicy: Retain` / `Retain`.** The volume holds the
-  sshd host keys. Reclaiming it means the next pod generates new ones, and
-  `accept-new` turns a changed host key into every subsequent command failing — so a
-  scale-down or a workload delete has to leave the claim, at the cost of a PVC that
-  outlives its StatefulSet.
+- **`persistentVolumeClaimRetentionPolicy: Retain` / `Retain`.** One claim holds the
+  sshd host keys and the other holds the model's work, and neither survives being
+  reclaimed on a scale-down. New host keys turn `accept-new` into every subsequent
+  command failing; a fresh data volume loses whatever the agent had written. The cost
+  is two PVCs that outlive their StatefulSet.
 - **`automountServiceAccountToken: false`.** The entire point. Without it the sandbox
   has a Kubernetes credential and the boundary is decorative.
 - **`enableServiceLinks: false`.** Kubelet otherwise injects a docker-link-style env
@@ -309,15 +309,29 @@ the boundary moving, and it should be argued for here first.
 Two keypairs are in play and only one of them is a problem.
 
 **Host keys are already automatic.** The image's entrypoint generates an ed25519 and
-an RSA host key on the workspace volume the first time a pod starts on it, and leaves
-them alone on every later start
+an RSA host key under `/var/lib/sandbox-sshd` the first time a pod starts on that
+volume, and leaves them alone on every later start
 ([`entrypoint.sh`](../../deploy/sandbox/entrypoint.sh)). Hermes connects with
 `StrictHostKeyChecking=accept-new`, so the first connection trusts the key and every
-later one pins it. Because the keys live on the PVC rather than in a Secret, no
+later one pins it. Because the keys live on a PVC rather than in a Secret, no
 private key is written to etcd and no install surface has to know they exist — which
 is also the reason for the `Retain` retention policy above. Agent Sandbox's own SSH
 example regenerates an ephemeral host key on every start unless you mount one; this
 avoids both that churn and the Secret it would otherwise need.
+
+The second volume is the correction to a first version that kept the keys on the one
+the model writes and `chown`ed them to uid 1000. Both clients pin the host key, and
+the account being constrained by the pin could read the private half of it —
+demonstrated on the live install with `su agent -c 'cat …/ssh_host_ed25519_key'`. Mode
+bits would not have fixed it: uid 1000 owns that volume's mount point, so it can move
+any directory inside it aside and have the entrypoint populate a replacement it
+controls on the next start. Only a volume it cannot write settles the question, and
+sshd reads these as root, so uid 1000 needs no access to them at all. The entrypoint
+refuses to start if `/var/lib/sandbox-sshd` is not root-owned, and
+`make docker-smoke-sandbox` checks both the refusal and the read. Exploiting the
+original would still have needed a way to redirect the agent pod's connection, which
+the sandbox has no route to — so this was a control that was not doing its job rather
+than a live compromise.
 
 **The client keypair is generated at install time.** `SSHEnvironment` passes
 `-i <key_path>`, so the private half has to arrive as a **file** in the agent pod,
@@ -425,54 +439,111 @@ wrapper script: re-source the env snapshot, `cd` to the tracked working director
 run `bash -c 'grep error output.log'`, then emit the cwd marker and rewrite the
 snapshot.
 
-`grep` runs **in the sandbox pod**. `output.log` is read from the sandbox's workspace
+`grep` runs **in the sandbox pod**. `output.log` is read from the sandbox's data
 volume, where it was written by whichever earlier command produced it — the sandbox's
 disk is the only filesystem in the picture. Stdout comes back over the SSH channel;
 Hermes strips the marker and returns the rest to the model. The agent pod's
 filesystem is never involved.
 
-If the previous command had been `cd /workspace/logs`, that would have been captured
+If the previous command had been `cd /opt/data/logs`, that would have been captured
 by the marker and applied here, and `read_file("output.log")` would resolve against
 the same directory — because the file tools share the environment object.
 
 ### `HERMES_WRITE_SAFE_ROOT` has to move with the shell
 
-The Hermes base image sets `HERMES_WRITE_SAFE_ROOT=/opt/data`, and with the sandbox on
-that value denies every write the agent attempts — including to the sandbox's own
-workspace. The first live run found it immediately: `write_file` and `patch` returned
-"Write denied" for every path.
+The Hermes base image sets `HERMES_WRITE_SAFE_ROOT=/opt/data`, and on the install that
+first ran the sandbox that value denied every write the agent attempted. `write_file`
+and `patch` returned "Write denied" for every path.
 
 The guardrail is a string-prefix test, and it runs in the wrong process to know about
 any of this. `agent/file_safety.py` splits the variable on `os.pathsep`, `realpath`s
 each entry, and requires the resolved target to equal a root or begin with `root + "/"`
 — all of it in the agent process, before the write is dispatched to any backend. So it
-is checking sandbox paths against a list containing only the agent's own home. Every
-sandbox path fails the prefix test, and `/opt/data`, the one path that would pass, does
-not exist in the sandbox. Unsetting it is not the answer either: the check is opt-in and
-an empty value skips it entirely, which drops the guardrail rather than moving it.
+was checking sandbox paths against a list containing only the agent pod's own home, and
+at the time no `/opt/data` existed in the sandbox for any of them to match. Unsetting it
+is not the answer either: the check is opt-in and an empty value skips it entirely,
+which drops the guardrail rather than moving it.
 
-The operator therefore repoints it, in `buildPodTemplateSpec` and only when the sandbox
-is enabled, at the sandbox's two writable directories — `/workspace` and
-`/home/agent`, the latter being `shellSandboxUser`'s home and the cwd every `ssh`
-command starts in. That gives up no isolation. With `backend: ssh` the file tools
-cannot reach the agent's filesystem at all, so the roots they are checked against
-should describe the filesystem they actually write to.
-`TestSandboxRepointsTheWriteSafeRoot` asserts the variable is absent with the sandbox
-off, is exactly these two paths with it on, and never admits `/opt/data`.
+The operator therefore writes it out, in `buildPodTemplateSpec` and only when the
+sandbox is enabled, naming the sandbox's two writable directories: `/opt/data`, and
+`/home/agent` for the commands that land in the home. Since the sandbox's data volume
+now carries the `/opt/data` path itself, the interesting half of that is the home — but
+the value is written rather than left to the image default so the policy is visible in
+the pod spec rather than inherited from a base image two repositories away. It gives up
+no isolation. With `backend: ssh` the file tools cannot reach the agent pod's
+filesystem at all, so the roots they are checked against should describe the filesystem
+they actually write to. `TestSandboxRepointsTheWriteSafeRoot` asserts the variable is
+absent with the sandbox off, is exactly these two paths with it on, and names nothing
+that does not resolve in the sandbox.
 
-Two things this does not cover. `/home/agent` is on the container filesystem rather
-than the workspace volume, so writes there do not survive a sandbox restart — it is
-writable because commands land there, not because anything should be kept there. And
-the credential denylist that sits alongside this check (`~/.ssh`, `~/.aws`,
-`~/.config/gcloud`, `~/.docker`) is still expressed against the agent's home; in the
-sandbox those paths name nothing, which is harmless today and wrong if the sandbox ever
-holds credentials of its own.
+One thing this does not cover: the credential denylist that sits alongside the check
+(`~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.docker`) is still expressed against the
+agent pod's home. In the sandbox those paths name nothing, which is harmless today and
+wrong if the sandbox ever holds credentials of its own.
+
+### Where the model's files go
+
+The sandbox has three directories that matter and only one of them keeps anything.
+
+| Path                    | Backing                        | Owner    | What it is                   |
+| ----------------------- | ------------------------------ | -------- | ---------------------------- |
+| `/opt/data`             | `data` PVC                     | uid 1000 | the model's work             |
+| `/home/agent`           | the container's ephemeral disk | uid 1000 | the login's home             |
+| `/home/hermes`          | the container's ephemeral disk | uid 1001 | the trusted principal's home |
+| `/var/lib/sandbox-sshd` | `sshd` PVC                     | root     | the host keys                |
+
+**The homes are ephemeral on purpose.** `agent` owns `/home/agent/.bashrc`, bash sources
+it for a non-interactive `ssh host cmd`, and the model can delete Debian's
+non-interactive guard — so a shim planted there is executed for anything that logs in as
+`agent`. Putting that file on a volume would make the hijack outlive a pod recycle. It
+does not, and that is the arrangement working.
+
+**A durable home was the other option and it loses more than it gains.** The interesting
+files under a home are the dotfiles, and those are exactly what the previous paragraph
+wants thrown away. The model's actual output has somewhere better to be.
+
+**Which leaves `TERMINAL_CWD`.** Hermes' `ssh` backend defaults its working directory to
+`~` (`tools/terminal_tool.py`), so with an ephemeral home and nothing pointing elsewhere,
+every relative path the model wrote landed on the container overlay while the volume
+beside it stayed empty. That is what the live install did for five days: 5Gi attached,
+44K used, `lost+found` and the host keys the only things on it. The operator now sets
+`TERMINAL_CWD=/opt/data` on the agent container when the sandbox is on. It is an
+environment variable rather than a `terminal.cwd` in the managed config scope because
+the config bridge treats an explicit config key as an override of the environment
+(`hermes_cli/config.py`), which leaves this a pod-wide default a profile can narrow —
+the per-profile directories are their own issue, and a managed-scope value could not be
+narrowed by anything.
+
+**The path is `/opt/data` on both sides deliberately.** It is the agent pod's Hermes home
+as well, named in 59 files across `agents/`, and the alternative was a sandbox path that
+no existing SOP, skill or model-written script would resolve. The cost is one path naming
+two different directories on two different volumes, and one rule that follows from it:
+**no handoff may assume write-here-read-there.** Nothing is copied between them and
+nothing can read across, so a script that writes `/opt/data/x` in the agent pod and reads
+`/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
+the path itself looking wrong. The entrypoint writes a `.sandbox` marker into the
+sandbox's copy, which is how a script or a person tells which side they are on. The
+bootstrap inventory handoff is the known case; it has its own issue.
+
+The kubeconfig the platform MCP server writes stays out of `/opt/data` for the reason
+under [The SSH principal cannot be the shell user](#the-ssh-principal-cannot-be-the-shell-user):
+a kubeconfig names an `exec` credential plugin and `kubectl` runs it, so one the model
+can author is arbitrary code execution as `hermes`. `/opt/data` is now durable as well
+as model-writable, which makes it a worse place for that file rather than a better one.
+
+`volumeClaimTemplates` is immutable, so an install that already ran the single-volume
+layout does not roll into this one. The StatefulSet has to be deleted with
+`--cascade=orphan` and left to the operator to recreate, and the old claim is orphaned
+rather than reclaimed — which is the retention policy behaving as intended, and leaves
+whatever was on it available to copy across by hand. The pod's new host keys will not
+match what the agent pod pinned, so its `known_hosts` entry needs clearing in the same
+maintenance window.
 
 ### What persists, and for how long
 
 | Thing             | Mechanism                                 | Lifetime               |
 | ----------------- | ----------------------------------------- | ---------------------- |
-| Files             | the sandbox's attached volume             | the sandbox's lifetime |
+| Files             | the sandbox's `data` volume, `/opt/data`  | the sandbox's lifetime |
 | Working directory | in-band stdout marker, tracked in Hermes  | the task's environment |
 | Environment vars  | `export -p` snapshot file in the sandbox  | the sandbox's lifetime |
 | Shell processes   | nothing — every call is a fresh `bash -c` | one command            |
@@ -486,12 +557,14 @@ than the rare one.
 ### What the sandbox needs, and where it comes from
 
 The shell moved; the paths it was written against did not. `/opt/data` is the agent's
-home on its PVC, it is named 59 files deep in `agents/`, and in the sandbox it does not
-exist. The first live run found this immediately: an environment probe dispatched as a
-Kanban card ran on `platform-agent-shell-0` as user `agent` and reported
-`/opt/data exists: False`, so the card's own declared workspace under
-`/opt/data/kanban/workspaces/` was not creatable and the worker fell back to its home
-directory.
+home on its PVC and it is named 59 files deep in `agents/`. On the first live run it did
+not exist in the sandbox at all: an environment probe dispatched as a Kanban card ran on
+`platform-agent-shell-0` as user `agent` and reported `/opt/data exists: False`, so the
+card's own declared workspace under `/opt/data/kanban/workspaces/` was not creatable and
+the worker fell back to its home directory. Giving the sandbox's data volume the same
+path (above) is what closes that class of failure — the paths resolve on both sides now,
+against different volumes. What it does not close is content: a script that expects to
+_read_ something the agent pod put at `/opt/data` still finds nothing.
 
 Enumerating what the sandbox legitimately needs — listed under
 [What is still unproven](#what-is-still-unproven) as nobody having done it — sorts the
@@ -504,7 +577,7 @@ references into five classes with four different delivery mechanisms.
 | Governance SOPs                              | baked into the sandbox image           | static, versioned with the repo               |
 | The shell-invoked subset of `scripts/`       | baked into the sandbox image           | static, and the subset is small               |
 | `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod | per-install content, rendered by the operator |
-| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/workspace` at runtime     | data, not delivery                            |
+| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime      | data, not delivery                            |
 
 **The persona stays behind, and that is a property rather than an omission.** Nothing
 writes `SOUL.md` through the shell. The only writer is
@@ -742,8 +815,8 @@ same helper is nearly free.
 It also degrades better. Hermes recovers a dropped MCP transport with five retries at
 one, two, four, eight and sixteen seconds and then parks the server, deregistering its
 tools and self-probing every five minutes. Against an eviction that reschedules to
-another node — which the `ReadWriteOnce` `/workspace` PVC guarantees is slow, since it
-has to detach and re-attach — that budget is exhausted, and the tools disappear from the
+another node — which the sandbox's `ReadWriteOnce` PVCs guarantee is slow, since they
+have to detach and re-attach — that budget is exhausted, and the tools disappear from the
 model's toolset for up to five minutes. Per-call SSH has no such state: the sandbox being
 down is an error on the call the model made, which it can see and react to. The cost is a
 handshake per call, and OpenSSH 10.0 in the agent image supports `ControlMaster` with
@@ -831,7 +904,7 @@ Three things keep Part A worth doing:
 
 - **It decouples the outcome from mount hygiene.** "Safe because we did not mount the
   volume" is a property of a manifest that someone will eventually edit, in a repo
-  where the workspace mount is exactly the kind of thing that gets widened for
+  where a volume mount is exactly the kind of thing that gets widened for
   convenience. An interface is a property of the code.
 - **`sync_back` re-opens the door.** The shell can write a skill into the sandbox's
   `~/.hermes`; that file lands on the host and the gateway loads it — in the pod where

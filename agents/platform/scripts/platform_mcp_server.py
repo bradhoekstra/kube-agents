@@ -379,7 +379,7 @@ def _kubeconfig_slug(value: str) -> str:
 # and its arguments, and kubectl runs it — so a kubeconfig the model can write
 # is arbitrary code execution as the principal this server connects as, which
 # is the one account in the sandbox the model is not supposed to reach. Every
-# other writable path there (/workspace, /tmp) is shared with `agent`.
+# other writable path there (/opt/data, /tmp) is shared with `agent`.
 SANDBOX_KUBECONFIG_DIR = "/home/hermes/.kubeconfigs"
 
 

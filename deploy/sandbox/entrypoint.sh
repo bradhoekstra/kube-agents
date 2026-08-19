@@ -12,18 +12,34 @@ set -euo pipefail
 
 log() { echo "sandbox-entrypoint: $*" >&2; }
 
-WORKSPACE="${SANDBOX_WORKSPACE:-/workspace}"
+DATA="${SANDBOX_DATA:-/opt/data}"
+SSHD_STATE="${SANDBOX_SSHD_STATE:-/var/lib/sandbox-sshd}"
 AUTHORIZED_KEYS_SRC="${SANDBOX_AUTHORIZED_KEYS:-/etc/ssh-authorized/authorized_keys}"
 
-# 1. The workspace. A PVC mounts over the image's /workspace and arrives owned
-#    by root, so the agent could not write to its own working directory. Not
-#    recursive: only the mount point needs fixing, and a recursive chown over a
-#    volume that has been in use for a while is a slow way to start a pod.
-if [ ! -d "$WORKSPACE" ]; then
-  log "workspace $WORKSPACE does not exist"
+# 1. The model's durable directory. A PVC mounts over the image's /opt/data and
+#    arrives owned by root, so the agent could not write to it. Not recursive:
+#    only the mount point needs fixing, and a recursive chown over a volume that
+#    has been in use for a while is a slow way to start a pod.
+if [ ! -d "$DATA" ]; then
+  log "data directory $DATA does not exist"
   exit 1
 fi
-chown agent:agent "$WORKSPACE"
+chown agent:agent "$DATA"
+
+# Which /opt/data this is. The path is deliberately the same as the agent pod's
+# Hermes home so that a script naming it resolves wherever it runs, and the cost
+# of that is one path naming two different directories. A missing file used to
+# be the signal that a path belonged to the other side; this marker is what
+# replaces it.
+cat >"$DATA/.sandbox" <<'MARKER'
+This is the shell sandbox's /opt/data, on the sandbox's own volume.
+
+It is not the agent pod's Hermes home, which carries the same path and holds
+the profiles, the session databases and the model API keys. Nothing is copied
+between them and nothing can read across. A handoff that writes a file on one
+side and reads it on the other will not work, however identical the path looks.
+MARKER
+chown agent:agent "$DATA/.sandbox"
 
 # 2. The agent's public key. Failing loudly here is the point: without it sshd
 #    starts perfectly happily and every connection is refused with "Permission
@@ -42,24 +58,45 @@ install -m 0600 -o agent -g agent "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/author
 # CREDENTIAL_PROXY_URL on the same terms.
 install -m 0600 -o hermes -g hermes "$AUTHORIZED_KEYS_SRC" /home/hermes/.ssh/authorized_keys
 
-# 3. Host keys, on the volume rather than in the container. sshd_config
-#    explains why they must survive a pod recycle; this creates them the first
-#    time and leaves them alone afterwards.
-install -d -m 0700 -o agent -g agent "$WORKSPACE/.sshd"
+# 3. Host keys, on a volume of their own rather than in the container.
+#    sshd_config explains why they must survive a pod recycle; this creates them
+#    the first time and leaves them alone afterwards.
+#
+#    Root-owned, and on a different volume from $DATA. An earlier version kept
+#    them under the model's volume and chowned them to uid 1000, which handed
+#    the model the private half of the key both clients pin with
+#    StrictHostKeyChecking=accept-new. Mode bits alone would not fix that: the
+#    model owns $DATA's mount point, so it can rename any directory inside it
+#    aside and have this loop populate a replacement it controls. A separate
+#    volume it cannot write is what actually settles it, and sshd reads these as
+#    root, so uid 1000 needs no access at all.
+if [ ! -d "$SSHD_STATE" ]; then
+  log "sshd state directory $SSHD_STATE does not exist"
+  exit 1
+fi
+# Refuses the misconfiguration this split exists to prevent, rather than
+# silently accepting a state directory the model can write.
+sshd_state_owner="$(stat -c '%U' "$SSHD_STATE")"
+if [ "$sshd_state_owner" != "root" ]; then
+  log "$SSHD_STATE is owned by $sshd_state_owner, not root — refusing to keep"
+  log "host keys somewhere the sandboxed account could read or replace them."
+  exit 1
+fi
+chmod 0700 "$SSHD_STATE"
 for type in ed25519 rsa; do
-  key="$WORKSPACE/.sshd/ssh_host_${type}_key"
+  key="$SSHD_STATE/ssh_host_${type}_key"
   if [ ! -f "$key" ]; then
     log "generating $type host key (first start on this volume)"
     ssh-keygen -q -t "$type" -N '' -f "$key"
   fi
-  chown agent:agent "$key"
+  chown root:root "$key"
   chmod 600 "$key"
   # Guarded rather than assumed: a volume carrying a private key whose public
   # half was deleted is unusual but not impossible, and under `set -e` an
   # unguarded chown on the missing file would fail the pod start with an error
   # about a file sshd does not even read.
   if [ -f "$key.pub" ]; then
-    chown agent:agent "$key.pub"
+    chown root:root "$key.pub"
     chmod 644 "$key.pub"
   fi
 done

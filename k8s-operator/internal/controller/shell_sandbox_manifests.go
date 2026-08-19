@@ -67,23 +67,41 @@ const (
 	shellSandboxImageEnvVar = "AGENT_SANDBOX_IMAGE"
 
 	// The login the agent ssh's in as, created by deploy/sandbox/Dockerfile as uid
-	// 1000 with its home on the workspace volume. Not root, and not the agent pod's
-	// own uid 10000 — the two pods share nothing but a public key.
+	// 1000, with an ephemeral home and a durable /opt/data. Not root, and not the
+	// agent pod's own uid 10000 — the two pods share nothing but a public key.
 	shellSandboxUser = "agent"
 
-	shellSandboxWorkspaceVolume = "workspace"
-	shellSandboxKeysVolume      = "authorized-keys"
+	shellSandboxDataVolume = "data"
+	shellSandboxSshdVolume = "sshd"
+	shellSandboxKeysVolume = "authorized-keys"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
 	// that half works, which is the intended failure mode.
-	shellSandboxWorkspacePath = "/workspace"
-	shellSandboxKeysPath      = "/etc/ssh-authorized"
+	//
+	// The data path is the agent pod's Hermes home path, on purpose and on a
+	// different volume: the SOPs, skills and model-written scripts that hardcode
+	// /opt/data then resolve wherever they run, instead of failing on a directory
+	// that exists in only one of the two pods. Nothing is copied across and
+	// nothing can read across — see the marker file entrypoint.sh writes, and the
+	// design doc's note that no handoff may assume write-here-read-there.
+	shellSandboxDataPath = "/opt/data"
+	shellSandboxKeysPath = "/etc/ssh-authorized"
 
-	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It is
-	// the cwd every ssh command starts in, so it is writable alongside the workspace
-	// volume — see HERMES_WRITE_SAFE_ROOT in buildPodTemplateSpec. Unlike the
-	// workspace it is on the container filesystem and does not survive a restart.
+	// sshd's host keys, on a volume the model has no access to. They cannot live
+	// on the data volume: uid 1000 owns that mount point, so it can rename any
+	// directory inside it and take over whatever the entrypoint writes there
+	// next. Both clients pin the host key with StrictHostKeyChecking=accept-new,
+	// which is worth nothing if the sandboxed account holds the private half.
+	shellSandboxSshdPath = "/var/lib/sandbox-sshd"
+
+	// shellSandboxUser's home, from the useradd in deploy/sandbox/Dockerfile. It
+	// is writable alongside the data volume — see HERMES_WRITE_SAFE_ROOT in
+	// buildPodTemplateSpec — but it is on the container filesystem and does not
+	// survive a restart. That is deliberate: the model owns ~/.bashrc, bash
+	// sources it for a non-interactive `ssh host cmd`, and a hijack planted there
+	// should not outlive the pod. Durable work goes to the data volume, which is
+	// what TERMINAL_CWD points at.
 	shellSandboxHomePath = "/home/" + shellSandboxUser
 
 	// The agent pod's side of the same keypair. Two volumes rather than one for
@@ -255,12 +273,13 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			Replicas:    ptr.To(int32(1)),
 			ServiceName: name,
 			Selector:    &metav1.LabelSelector{MatchLabels: labels},
-			// Retain on both transitions. The workspace volume holds sshd's host
-			// keys, and Hermes connects with StrictHostKeyChecking=accept-new:
-			// a regenerated host key is not a prompt, it is every command from
-			// then on failing until known_hosts is edited by hand. Deleting the
-			// StatefulSet must therefore leave the claim, at the cost of a PVC
-			// that outlives its workload.
+			// Retain on both transitions, for both claims. The sshd volume holds
+			// the host keys, and Hermes connects with
+			// StrictHostKeyChecking=accept-new: a regenerated host key is not a
+			// prompt, it is every command from then on failing until known_hosts
+			// is edited by hand. The data volume holds whatever the agent has
+			// been working on. Deleting the StatefulSet must therefore leave both
+			// claims, at the cost of PVCs that outlive their workload.
 			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
 				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
@@ -283,7 +302,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// No securityContext, and that is a decision rather than an
 					// omission. sshd's privilege separation forks as uid 0 and
 					// drops to the unprivileged `agent` user for the session, and
-					// the entrypoint chowns the freshly-mounted workspace before
+					// the entrypoint chowns the freshly-mounted data volume before
 					// it — so runAsNonRoot cannot be set, and a capability drop
 					// has to keep at least CHOWN, SETUID, SETGID, SYS_CHROOT and
 					// DAC_OVERRIDE. Which of those is genuinely required is a
@@ -325,7 +344,8 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
-							{Name: shellSandboxWorkspaceVolume, MountPath: shellSandboxWorkspacePath},
+							{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
+							{Name: shellSandboxSshdVolume, MountPath: shellSandboxSshdPath},
 						},
 					}},
 					Volumes: []corev1.Volume{{
@@ -342,17 +362,41 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					}},
 				},
 			},
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
-				ObjectMeta: metav1.ObjectMeta{Name: shellSandboxWorkspaceVolume},
-				Spec: corev1.PersistentVolumeClaimSpec{
-					AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-					Resources: corev1.VolumeResourceRequirements{
-						Requests: corev1.ResourceList{
-							corev1.ResourceStorage: resource.MustParse(defaultStorageSize),
+			// Two claims, because one of them must be unreachable from the account
+			// that can write the other. See shellSandboxSshdPath.
+			//
+			// VolumeClaimTemplates is immutable, so an install that already has a
+			// sandbox needs its StatefulSet deleted (--cascade=orphan keeps the
+			// pod up meanwhile) before the operator can lay this down. The feature
+			// is experimental and off by default, which is what makes that
+			// acceptable rather than a migration.
+			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse(defaultStorageSize),
+							},
 						},
 					},
 				},
-			}},
+				{
+					// Two host keys and nothing else, so this is a minimum-size
+					// request rather than a sized one; the CSI driver rounds it up
+					// to whatever the storage class's disk type allows.
+					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxSshdVolume},
+					Spec: corev1.PersistentVolumeClaimSpec{
+						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+						Resources: corev1.VolumeResourceRequirements{
+							Requests: corev1.ResourceList{
+								corev1.ResourceStorage: resource.MustParse("1Gi"),
+							},
+						},
+					},
+				},
+			},
 		},
 	}
 }

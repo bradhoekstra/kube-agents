@@ -1859,18 +1859,33 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Value: managedScopeDir,
 	})
 	// The Hermes base image sets HERMES_WRITE_SAFE_ROOT=/opt/data, which is the agent's
-	// own home and the right answer while the shell is local. Once the shell is in the
-	// sandbox it is the wrong one twice over: agent/file_safety.py checks the path
-	// prefix in the agent process before the write is routed anywhere, so every sandbox
-	// path is refused — and /opt/data, the one path it does allow, does not exist in
-	// the sandbox. write_file and patch return "Write denied" for everything, which is
-	// how this was found on a live install. Repointing it at the sandbox's two writable
-	// directories gives up no isolation: with backend: ssh the file tools cannot reach
-	// the agent's filesystem to begin with.
+	// own home while the shell is local. agent/file_safety.py checks the path prefix in
+	// the agent process before the write is routed anywhere, so with the shell in the
+	// sandbox this has to name the sandbox's writable directories or write_file and
+	// patch return "Write denied" for everything — which is how the earlier value was
+	// found wrong on a live install. The sandbox's data volume carries the same
+	// /opt/data path deliberately, so the interesting half of this is the ephemeral
+	// home; the value is written out rather than left to the image default so the
+	// policy is visible in the pod spec. It gives up no isolation: with backend: ssh
+	// the file tools cannot reach the agent's own filesystem to begin with.
+	//
+	// TERMINAL_CWD is what stops the agent working in a directory that does not
+	// survive a restart. Hermes' ssh backend defaults cwd to `~`
+	// (tools/terminal_tool.py), which is the ephemeral home, so every relative path
+	// the model wrote was lost on the next pod recycle while the volume beside it
+	// stayed empty. Set as an environment variable rather than as `terminal.cwd` in
+	// the managed scope: the config bridge treats an explicit config key as an
+	// override of the environment (hermes_cli/config.py), so this is a pod-wide
+	// default a profile can still narrow to its own directory, which is what #11 is
+	// for. A managed-scope value could not be narrowed by anything.
 	if shellSandboxEnabled(agent) {
 		envVars = append(envVars, corev1.EnvVar{
 			Name:  "HERMES_WRITE_SAFE_ROOT",
-			Value: strings.Join([]string{shellSandboxWorkspacePath, shellSandboxHomePath}, ":"),
+			Value: strings.Join([]string{shellSandboxDataPath, shellSandboxHomePath}, ":"),
+		})
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "TERMINAL_CWD",
+			Value: shellSandboxDataPath,
 		})
 	}
 	envVars = append(envVars, corev1.EnvVar{

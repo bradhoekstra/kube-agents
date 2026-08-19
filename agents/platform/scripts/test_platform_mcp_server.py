@@ -512,7 +512,7 @@ class TestSandboxRouting(unittest.TestCase):
 
         Anywhere uid 1000 can write is arbitrary code execution as the
         principal this server connects as, so the path must be inside
-        hermes' 0700 home rather than /workspace or /tmp.
+        hermes' 0700 home rather than /opt/data or /tmp.
         """
         path = platform_mcp_server._thread_kubeconfig_path("proj", "clust", "us-central1")
         self.assertTrue(path.startswith(platform_mcp_server.SANDBOX_KUBECONFIG_DIR + "/"), path)

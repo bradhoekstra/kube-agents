@@ -7,14 +7,18 @@
 # Unprivileged port; the Sandbox CR's Service targets it by name.
 Port 2222
 
-# Host keys live on the workspace volume, not in the container's ephemeral
-# /etc/ssh. sshd would happily regenerate them on a pod recycle, and Hermes
-# connects with StrictHostKeyChecking=accept-new — which accepts a key it has
-# never seen and refuses one that changed. A regenerated host key is therefore
-# not a prompt, it is every subsequent command failing until someone clears the
-# known_hosts entry by hand. The entrypoint creates these on first start.
-HostKey /workspace/.sshd/ssh_host_ed25519_key
-HostKey /workspace/.sshd/ssh_host_rsa_key
+# Host keys live on a volume, not in the container's ephemeral /etc/ssh. sshd
+# would happily regenerate them on a pod recycle, and Hermes connects with
+# StrictHostKeyChecking=accept-new — which accepts a key it has never seen and
+# refuses one that changed. A regenerated host key is therefore not a prompt, it
+# is every subsequent command failing until someone clears the known_hosts entry
+# by hand. The entrypoint creates these on first start.
+#
+# Their own volume, not the model's /opt/data. Both clients pin these keys, and
+# a pinned key whose private half the sandboxed account can read is not a
+# control. entrypoint.sh refuses to start if this directory is not root-owned.
+HostKey /var/lib/sandbox-sshd/ssh_host_ed25519_key
+HostKey /var/lib/sandbox-sshd/ssh_host_rsa_key
 
 # Public keys only, two accounts, no root. The agent pod holds the private half
 # and nothing else is meant to be able to open a session here.

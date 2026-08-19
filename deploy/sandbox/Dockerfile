@@ -98,14 +98,27 @@ RUN pip install --no-cache-dir pyyaml requests
 # actually wanted.
 #
 # /run/sshd is sshd's privilege-separation directory and must exist before it
-# will start. /workspace is created here so the image is runnable without a
-# volume; when the Sandbox CR mounts its PVC over the top, the entrypoint
-# re-establishes ownership.
+# will start.
+#
+# /opt/data is the model's durable directory, created here so the image is
+# runnable without a volume; when the StatefulSet mounts its PVC over the top,
+# the entrypoint re-establishes ownership. It carries the same path as the agent
+# pod's Hermes home on purpose — the SOPs, skills and model-written scripts that
+# name /opt/data resolve on both sides of the SSH connection instead of failing
+# on a directory that exists in only one pod. The two are separate volumes and
+# nothing is copied between them; the marker file the entrypoint writes is how a
+# script or a person tells which side they are on.
+#
+# /var/lib/sandbox-sshd holds the host keys and is root-owned, deliberately on a
+# different volume from the one above. The model owns /opt/data's mount point, so
+# it can rename any entry there — a private key on that volume is one the model
+# can read today or displace tomorrow, whatever the mode on the file itself.
 RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 agent && \
     usermod -p '*' agent && \
     install -d -m 0700 -o agent -g agent /home/agent/.ssh && \
     install -d -m 0755 /run/sshd && \
-    install -d -m 0755 -o agent -g agent /workspace
+    install -d -m 0755 -o agent -g agent /opt/data && \
+    install -d -m 0700 -o root -g root /var/lib/sandbox-sshd
 
 # The second principal, for trusted code in the agent pod reaching in to run a
 # cluster command. It exists because `agent` cannot be used for that: `agent`
@@ -132,7 +145,7 @@ RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 ag
 # somewhere uid 1000 cannot write: a kubeconfig names an `exec` credential
 # plugin — a binary and its argv — and kubectl runs it, so a kubeconfig the
 # model can author is arbitrary code execution as the one account here it is not
-# meant to reach. /workspace and /tmp are both shared with `agent`. Created in
+# meant to reach. /opt/data and /tmp are both shared with `agent`. Created in
 # the image rather than at first use, which keeps the runtime path to one round
 # trip and the mode out of the hands of whatever creates it.
 RUN groupadd --gid 1001 hermes && \
