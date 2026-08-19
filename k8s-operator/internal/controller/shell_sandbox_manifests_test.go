@@ -50,6 +50,9 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	if pod.ServiceAccountName != "" {
 		t.Errorf("the sandbox must not name a ServiceAccount, got %q", pod.ServiceAccountName)
 	}
+	if pod.EnableServiceLinks == nil || *pod.EnableServiceLinks {
+		t.Error("the sandbox must not get service-link env vars: they hand it a map of the namespace it has no use for")
+	}
 	// One Secret, one key from it, and it is a public key. Anything else here is
 	// a credential in the pod the agent can run arbitrary commands in.
 	if len(pod.Volumes) != 1 {

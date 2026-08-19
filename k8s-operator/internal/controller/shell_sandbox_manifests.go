@@ -241,6 +241,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// Kubernetes credential and the boundary this workload exists
 					// to draw is decorative.
 					AutomountServiceAccountToken: ptr.To(false),
+					// Kubelet otherwise injects a docker-link-style env var for
+					// every Service in the namespace. None of them are secrets,
+					// but they hand the sandbox a map of the namespace it has no
+					// use for: a live pod came up knowing the cluster IP and port
+					// of another workload's Service. The sandbox reaches the
+					// credential proxy by an explicit URL, so it needs no
+					// service discovery at all.
+					EnableServiceLinks: ptr.To(false),
 					// No securityContext, and that is a decision rather than an
 					// omission. sshd's privilege separation forks as uid 0 and
 					// drops to the unprivileged `agent` user for the session, and

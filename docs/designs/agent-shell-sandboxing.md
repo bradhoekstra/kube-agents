@@ -277,7 +277,7 @@ collected with it. Sketched in
 | `Service`, `clusterIP: None` | `<agent>-shell` | the StatefulSet's governing service, and the name Hermes dials                     |
 | `NetworkPolicy`              | `<agent>-shell` | ingress on 2222 from the gateway only; egress to DNS and the credential proxy only |
 
-Four fields carry an argument rather than a default:
+Five fields carry an argument rather than a default:
 
 - **`persistentVolumeClaimRetentionPolicy: Retain` / `Retain`.** The volume holds the
   sshd host keys. Reclaiming it means the next pod generates new ones, and
@@ -286,6 +286,11 @@ Four fields carry an argument rather than a default:
   outlives its StatefulSet.
 - **`automountServiceAccountToken: false`.** The entire point. Without it the sandbox
   has a Kubernetes credential and the boundary is decorative.
+- **`enableServiceLinks: false`.** Kubelet otherwise injects a docker-link-style env
+  var for the cluster IP and port of every Service in the namespace. None of them are
+  secrets, and the first live pod came up with the address of an unrelated workload's
+  Service in its environment for no reason: the sandbox reaches the credential proxy
+  by an explicit URL and needs no service discovery.
 - **No `runAsNonRoot`.** sshd's privilege separation forks as root and drops to the
   `agent` user for the session, so the container starts as uid 0 and nothing the
   agent runs does. This one reads like a gap in a security review and is not; the
