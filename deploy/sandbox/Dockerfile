@@ -107,6 +107,32 @@ RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 ag
     install -d -m 0755 /run/sshd && \
     install -d -m 0755 -o agent -g agent /workspace
 
+# The second principal, for trusted code in the agent pod reaching in to run a
+# cluster command. It exists because `agent` cannot be used for that: `agent`
+# owns its own home directory, bash sources ~/.bashrc for a non-interactive
+# `ssh host cmd`, and the model can therefore choose what an agent-pod caller
+# sees — shadow a binary on PATH, and the forged output comes back as a trusted
+# tool result. Debian's stock guard at the top of .bashrc returns early for
+# non-interactive shells and hides this; the model owns the file and can delete
+# the guard.
+#
+# Both principals are authorised by the same key. A second keypair would buy
+# nothing: the private half lives only in the agent pod, which the model has no
+# way to execute in once the shell, the file tools and execute_code are all
+# over here.
+#
+# --no-user-group and an explicit gid keep this account out of the `agent`
+# group. No skeleton files: /etc/skel/.bashrc in this home would be one more
+# thing to reason about, and a non-interactive ssh command needs none of them.
+# The home is 0700 and owned by hermes, so uid 1000 cannot read or write any
+# part of it, .ssh included.
+RUN groupadd --gid 1001 hermes && \
+    useradd --no-create-home --no-user-group --gid 1001 --uid 1001 \
+        --home-dir /home/hermes --shell /bin/bash hermes && \
+    usermod -p '*' hermes && \
+    install -d -m 0700 -o hermes -g hermes /home/hermes && \
+    install -d -m 0700 -o hermes -g hermes /home/hermes/.ssh
+
 # The credential-aware CLIs, exactly as the agent image provides them: symlinks
 # to one client that forwards argv to the credential proxy over HTTP and prints
 # back what the proxy's own copy of the binary produced. The agent never holds

@@ -126,12 +126,58 @@ check "the workspace is writable" "ok" \
   "$("${SSH[@]}" 'touch /workspace/probe && echo ok' 2>&1)"
 check "root is refused" "Permission denied" \
   "$(ssh "${SSH_OPTS[@]}" root@127.0.0.1 whoami 2>&1)"
-# AuthorizedKeysFile is an absolute path, so every account on the box would
-# authenticate with the agent's key. AllowUsers is the only thing stopping it;
-# refusing root alone would prove only PermitRootLogin.
-docker exec "$NAME" useradd -m -u 1001 intruder >/dev/null 2>&1
+# Two things stop a third account from using the same key: AllowUsers names the
+# two that may log in, and AuthorizedKeysFile is %h-relative so an account with
+# no authorized_keys of its own has nothing to authenticate against. Refusing
+# root alone would prove only PermitRootLogin. uid 1002 because 1001 is hermes,
+# and a useradd that fails on a duplicate uid would make this pass for the wrong
+# reason.
+docker exec "$NAME" useradd -m -u 1002 intruder >/dev/null 2>&1
 check "AllowUsers refuses another account holding the same key" "Permission denied" \
   "$(ssh "${SSH_OPTS[@]}" intruder@127.0.0.1 whoami 2>&1)"
+
+echo
+echo "== 3b. the hermes principal =="
+# The account trusted agent-pod code connects as. It exists so that a caller
+# reaching in for a cluster command does not run as the login whose home the
+# model owns; see deploy/sandbox/Dockerfile.
+HERMES_SSH=(ssh "${SSH_OPTS[@]}" hermes@127.0.0.1)
+check "the same key opens a hermes session" "hermes" "$("${HERMES_SSH[@]}" whoami 2>&1)"
+check "hermes gets the forwarded proxy URL too" "http://127.0.0.1:9999" \
+  "$("${HERMES_SSH[@]}" 'echo "$CREDENTIAL_PROXY_URL"' 2>&1)"
+check "hermes gets the wrapper PATH too" "/opt/credential-proxy/bin/kubectl" \
+  "$("${HERMES_SSH[@]}" 'command -v kubectl' 2>&1)"
+
+# The property the whole account exists for. Bash sources ~/.bashrc for a
+# non-interactive `ssh host cmd`, so a shim planted by the model in its own home
+# would be executed by an agent-pod caller and its output returned as a trusted
+# tool result. Written above Debian's non-interactive guard, because below it
+# the guard hides the problem rather than fixing it.
+"${SSH[@]}" 'mkdir -p ~/bin && printf "#!/bin/sh\necho FORGED\n" > ~/bin/kubectl && chmod +x ~/bin/kubectl' >/dev/null 2>&1
+"${SSH[@]}" 'printf "export PATH=$HOME/bin:\$PATH\n%s" "$(cat ~/.bashrc)" > ~/.bashrc.new && mv ~/.bashrc.new ~/.bashrc' >/dev/null 2>&1
+check_absent "a shim planted in the agent's home does not reach a hermes session" "FORGED" \
+  "$("${HERMES_SSH[@]}" 'kubectl version' 2>&1)"
+# Same command as the agent proves the planted shim actually works, so the check
+# above is testing isolation rather than a typo in the setup.
+check "the planted shim does run for the agent itself" "FORGED" \
+  "$("${SSH[@]}" 'kubectl version' 2>&1)"
+
+# The model must not be able to reach hermes' authorized_keys, either by writing
+# into its home or by authorising a new key in its own.
+check "the agent cannot enter the hermes home" "Permission denied" \
+  "$("${SSH[@]}" 'ls /home/hermes/.ssh' 2>&1)"
+# Generated on the host so the private half never has to be copied back out of
+# the container: the model only needs the public half to authorise it.
+ssh-keygen -q -t ed25519 -N '' -f "$WORK/rogue" -C sandbox-smoke-rogue
+"${SSH[@]}" "printf '%s\n' '$(cat "$WORK/rogue.pub")' >> ~/.ssh/authorized_keys" >/dev/null 2>&1
+check "the model can authorise a new key for its own account" "agent" \
+  "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" agent@127.0.0.1 whoami 2>&1)"
+check_absent "the same key does not open a hermes session" "hermes" \
+  "$(ssh -i "$WORK/rogue" "${SSH_OPTS[@]:2}" hermes@127.0.0.1 whoami 2>&1)"
+
+# Undo the sabotage: later sections use the agent session and would otherwise
+# run against a hijacked PATH.
+"${SSH[@]}" 'rm -rf ~/bin && sed -i "1{/^export PATH=/d}" ~/.bashrc && sed -i "/sandbox-smoke-rogue/d" ~/.ssh/authorized_keys' >/dev/null 2>&1
 
 echo
 echo "== 4. what the agent's tools need to find =="

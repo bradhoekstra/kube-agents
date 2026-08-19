@@ -16,14 +16,26 @@ Port 2222
 HostKey /workspace/.sshd/ssh_host_ed25519_key
 HostKey /workspace/.sshd/ssh_host_rsa_key
 
-# Public keys only, one account, no root. The agent pod holds the private half
+# Public keys only, two accounts, no root. The agent pod holds the private half
 # and nothing else is meant to be able to open a session here.
+#
+# `agent` is the model's shell. `hermes` is what trusted agent-pod code connects
+# as to run a cluster command, and it exists because the model owns `agent`'s
+# home and can make a non-interactive session there return whatever it likes
+# (deploy/sandbox/Dockerfile says more).
+#
+# %h, not an absolute path, and that is the whole of what keeps the two apart.
+# An absolute AuthorizedKeysFile is read for every account, so with
+# /home/agent/.ssh/authorized_keys named here — a 0600 file the model owns and
+# can append to — the model could authorise its own key and then open a session
+# as `hermes`. Per-user resolution sends it to /home/hermes/.ssh/authorized_keys
+# instead, inside a 0700 home that uid 1000 cannot enter.
 PermitRootLogin no
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
-AuthorizedKeysFile /home/agent/.ssh/authorized_keys
-AllowUsers agent
+AuthorizedKeysFile %h/.ssh/authorized_keys
+AllowUsers agent hermes
 
 # The client does not get to choose the sandbox's environment. Hermes' ssh
 # backend sets what it needs inside the command it runs, so nothing legitimate

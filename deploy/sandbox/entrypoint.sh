@@ -35,6 +35,12 @@ if [ ! -r "$AUTHORIZED_KEYS_SRC" ]; then
   exit 1
 fi
 install -m 0600 -o agent -g agent "$AUTHORIZED_KEYS_SRC" /home/agent/.ssh/authorized_keys
+# The same key also authorises `hermes`, the principal trusted agent-pod code
+# connects as instead of `agent`. The Dockerfile comment on that account says
+# why the two cannot be the same login. Nothing else here needs changing: the
+# SetEnv drop-in written in step 4 is global, so `hermes` inherits PATH and
+# CREDENTIAL_PROXY_URL on the same terms.
+install -m 0600 -o hermes -g hermes "$AUTHORIZED_KEYS_SRC" /home/hermes/.ssh/authorized_keys
 
 # 3. Host keys, on the volume rather than in the container. sshd_config
 #    explains why they must survive a pod recycle; this creates them the first

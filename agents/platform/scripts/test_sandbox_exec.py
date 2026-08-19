@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Tests for the sandbox execution helper.
+
+Everything here is about what leaves the agent pod: which login the connection
+authenticates as, what the sandbox's shell is asked to parse, and what the ssh
+client is allowed to see of the agent pod's environment. Those are the three
+ways this helper can be wrong without any test failing elsewhere.
+
+Run:  python3 agents/platform/scripts/test_sandbox_exec.py
+"""
+
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent.absolute()))
+
+import sandbox_exec
+
+SANDBOX_CONFIG = """
+terminal:
+  backend: ssh
+  ssh_host: platform-agent-shell-0.platform-agent-shell.kubeagents-system.svc.cluster.local
+  ssh_key: /etc/sandbox-ssh/id_ed25519
+  ssh_port: 2222
+  ssh_user: agent
+"""
+
+LOCAL_CONFIG = """
+terminal:
+  backend: local
+"""
+
+
+def write_config(body):
+    handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+    handle.write(body)
+    handle.close()
+    return handle.name
+
+
+class ConfigTestCase(unittest.TestCase):
+    def test_ssh_backend_enables_the_sandbox(self):
+        self.assertTrue(sandbox_exec.sandbox_enabled(write_config(SANDBOX_CONFIG)))
+
+    def test_local_backend_does_not(self):
+        self.assertFalse(sandbox_exec.sandbox_enabled(write_config(LOCAL_CONFIG)))
+
+    def test_missing_config_is_not_an_error(self):
+        self.assertFalse(sandbox_exec.sandbox_enabled("/nonexistent/config.yaml"))
+
+
+class ArgvTestCase(unittest.TestCase):
+    def setUp(self):
+        self.config = write_config(SANDBOX_CONFIG)
+
+    def argv(self, command, **kwargs):
+        return sandbox_exec.ssh_argv(command, path=self.config, **kwargs)
+
+    def test_connects_as_hermes_not_as_the_shell_user(self):
+        """The whole point of the second principal.
+
+        terminal.ssh_user is `agent`, whose ~/.bashrc the model owns and which
+        bash sources for a non-interactive `ssh host cmd`. Authenticating as it
+        would let the model choose what this caller sees.
+        """
+        target = [a for a in self.argv(["kubectl", "get", "pods"]) if "@" in a]
+        self.assertEqual(len(target), 1)
+        self.assertTrue(target[0].startswith("hermes@"))
+        self.assertNotIn("agent@", " ".join(self.argv(["kubectl"])))
+
+    def test_carries_the_key_and_port_from_the_managed_config(self):
+        argv = self.argv(["kubectl"])
+        self.assertIn("/etc/sandbox-ssh/id_ed25519", argv)
+        self.assertIn("2222", argv)
+
+    def test_batch_mode_and_liveness_options_are_set(self):
+        argv = " ".join(self.argv(["kubectl"]))
+        for option in ("BatchMode=yes", "ConnectTimeout=10",
+                       "ServerAliveInterval=15", "ServerAliveCountMax=3"):
+            self.assertIn(option, argv)
+
+    def test_user_ssh_config_is_suppressed(self):
+        argv = self.argv(["kubectl"])
+        self.assertIn("-F", argv)
+        self.assertEqual(argv[argv.index("-F") + 1], "/dev/null")
+
+    def test_arguments_are_quoted_for_the_remote_shell(self):
+        remote = self.argv(["kubectl", "get", "pods", "-l", "app=a b; rm -rf /"])[-1]
+        # The metacharacters survive as data rather than becoming syntax.
+        self.assertIn("'app=a b; rm -rf /'", remote)
+
+    def test_remote_env_is_rendered_into_the_command(self):
+        remote = self.argv(["kubectl", "get", "pods"],
+                           remote_env={"KUBECONFIG": "/tmp/kube config.yaml"})[-1]
+        self.assertIn("env KUBECONFIG='/tmp/kube config.yaml'", remote)
+
+    def test_remote_env_rejects_a_name_that_is_not_a_name(self):
+        with self.assertRaises(ValueError):
+            self.argv(["kubectl"], remote_env={"A; rm -rf /": "x"})
+
+    def test_cwd_becomes_a_quoted_cd(self):
+        remote = self.argv(["kubectl"], cwd="/work space")[-1]
+        self.assertTrue(remote.startswith("cd '/work space' &&"))
+
+    def test_no_host_is_reported_as_unavailable(self):
+        empty = write_config("terminal:\n  backend: ssh\n")
+        with self.assertRaises(sandbox_exec.SandboxUnavailable):
+            sandbox_exec.ssh_argv(["kubectl"], path=empty)
+
+
+class ClientEnvironmentTestCase(unittest.TestCase):
+    def test_pod_secrets_are_not_offered_to_the_ssh_client(self):
+        """`_run_env()` would have passed these; this helper must not.
+
+        The sandbox declines them today (PermitUserEnvironment no, AcceptEnv
+        LANG LC_*), but that is the remote end's choice, not this end's.
+        """
+        with patch.dict(os.environ, {"API_SERVER_KEY": "sentinel",
+                                     "SESSION_KV_API_KEY": "sentinel",
+                                     "CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}):
+            env = sandbox_exec._client_env()
+        self.assertNotIn("API_SERVER_KEY", env)
+        self.assertNotIn("SESSION_KV_API_KEY", env)
+        self.assertNotIn("CREDENTIAL_PROXY_URL", env)
+        self.assertIn("PATH", env)
+
+
+class RunTestCase(unittest.TestCase):
+    def setUp(self):
+        self.config = write_config(SANDBOX_CONFIG)
+
+    def completed(self, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(args=["ssh"], returncode=returncode,
+                                           stdout=stdout, stderr=stderr)
+
+    def test_ssh_level_failure_raises_rather_than_looking_like_a_cluster_error(self):
+        failure = self.completed(255, stderr="ssh: connect to host x port 2222: Connection refused")
+        with patch("subprocess.run", return_value=failure):
+            with self.assertRaises(sandbox_exec.SandboxUnavailable):
+                sandbox_exec.run(["kubectl", "get", "pods"], path=self.config)
+
+    def test_a_remote_command_exiting_255_is_not_mistaken_for_a_transport_failure(self):
+        remote = self.completed(255, stderr="error: the server could not find the requested resource")
+        with patch("subprocess.run", return_value=remote):
+            result = sandbox_exec.run(["kubectl", "get", "pods"], path=self.config)
+        self.assertEqual(result.returncode, 255)
+
+    def test_the_unconfigured_proxy_arrives_as_an_ordinary_failure(self):
+        """The state every call is in until #737 Part C lands.
+
+        Exit 1 with the message on stderr and nothing on stdout, so a caller
+        cannot mistake the error text for output.
+        """
+        proxy = self.completed(1, stderr="CREDENTIAL_PROXY_URL is not configured")
+        with patch("subprocess.run", return_value=proxy):
+            result = sandbox_exec.run(["kubectl", "get", "pods"], path=self.config)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("not configured", result.stderr)
+
+    def test_args_reports_the_callers_command_not_the_transport(self):
+        with patch("subprocess.run", return_value=self.completed()):
+            result = sandbox_exec.run(["kubectl", "get", "pods"], path=self.config)
+        self.assertEqual(result.args, ["kubectl", "get", "pods"])
+
+    def test_check_raises_with_the_callers_command(self):
+        with patch("subprocess.run", return_value=self.completed(1, stderr="boom")):
+            with self.assertRaises(subprocess.CalledProcessError) as caught:
+                sandbox_exec.run(["kubectl", "get", "pods"], path=self.config, check=True)
+        self.assertEqual(caught.exception.cmd, ["kubectl", "get", "pods"])
+
+    def test_without_a_sandbox_the_command_runs_locally(self):
+        local = write_config(LOCAL_CONFIG)
+        with patch("subprocess.run", return_value=self.completed()) as runner:
+            sandbox_exec.run(["kubectl", "get", "pods"], path=local)
+        self.assertEqual(runner.call_args[0][0], ["kubectl", "get", "pods"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
