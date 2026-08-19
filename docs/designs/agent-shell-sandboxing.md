@@ -649,14 +649,15 @@ the image gains the same build-time guard the sandbox image already has, failing
 build if any of the four resolves. The sandbox becomes the only place a credential-proxy
 call can originate.
 
-Most agent-side callers reach the tooling the same way everything else in this section
-does — by executing in the sandbox over SSH. `cluster_agent_reconcile.py` (2 sites),
-`cluster_agent_profile.py` (1) and `gke_endpoint.py` (1, a capability probe) share one
-helper that reads `terminal.ssh_*` from the managed config at `/etc/hermes/config.yaml`
-rather than re-deriving the address. Nothing else in `agents/` needs it: the remaining
-callers — `gitops_workspace.py`, `resolver.py`, `cluster_preflight.sh` — are already
-invoked from the shell and so already run there. `platform_mcp_server.py` accounts for
-eleven of the fifteen sites on its own and is handled differently, below.
+Agent-side callers reach the tooling the same way everything else in this section does —
+by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),
+`cluster_agent_reconcile.py` (2), `cluster_agent_profile.py` (1) and `gke_endpoint.py`
+(1, a capability probe) share one helper that reads `terminal.ssh_*` from the managed
+config at `/etc/hermes/config.yaml` rather than re-deriving the address. Nothing else in
+`agents/` needs it: the remaining callers — `gitops_workspace.py`, `resolver.py`,
+`cluster_preflight.sh` — are already invoked from the shell and so already run there.
+Which SSH identity that helper uses is the subject of the next section, and is not the
+one configured today.
 
 **This makes the sandbox required.** With the symlinks gone there is no fallback, so
 `shellSandbox` disabled is a configuration in which the MCP tools fail. That is accepted
@@ -683,58 +684,70 @@ mechanism with `content_workspace.py` and a `/v1/workspace/*` API whose working 
 lives in the broker's own volume. The sandbox should land on that rather than grow a
 second handoff.
 
-#### The MCP server splits rather than reaching out
+#### The SSH principal cannot be the shell user
 
-`platform_mcp_server.py` does not follow the SSH-out pattern, because it is doing three
-unrelated jobs and only one of them belongs in the sandbox. Six tools —
-`verify_gke_cluster`, `list_cc_healthchecks`, `get_cc_operator_status`,
-`get_cc_pod_diagnostics`, `list_cc_pods`, `audit_log_searcher` — are `kubectl` and
-`gcloud` wrappers holding no secret. `send_notification` is the one tool that reads
-`SESSION_KV_API_KEY`. And the module is also the parent process of the Session KV server,
-started at line 791, which owns the SQLite database on the system-metadata PVC.
+The sandbox restricts what the model's code can reach, not what the agent pod may do.
+Trusted agent-side code moving into the sandbox is relocation, not demotion: it runs
+whatever it needs to, on a different machine. The only thing that machine changes is that
+the model's code is now on it too, which means trusted execution there needs a principal
+the model cannot influence. It does not have one today.
 
-Moving the file wholesale would put the incident's exact target inside the sandbox, so
-the six cluster tools move and the other two jobs stay. Splitting also fixes something
-the move alone would not: `_run_env()` in `agent_common_server.py` is
-`{**os.environ, "HOME": "/tmp"}`, which hands every `kubectl` subprocess the entire
-agent-pod environment — the hazard `AGENTS.md` warns about. In the sandbox that
-environment holds nothing worth leaking.
+`terminal.ssh_user` is `agent`, uid 1000 — the user whose shell the model drives, whose
+home directory it writes to, and who owns `/home/agent/.bashrc`. Bash sources `.bashrc`
+for a non-interactive `ssh host cmd`, so an agent-side caller that reaches into the
+sandbox as `agent` executes the model's startup file before its own command. The stock
+Debian guard at the top of that file returns early for non-interactive shells and hides
+this, but the model owns the file and can delete the guard; moving an `export` above it
+is enough to prove the mechanism, and the environment does cross.
 
-Transport is HTTP rather than stdio over SSH. Stdio would have been cheaper to build,
-since it reuses the key and the channel that already exist, and Hermes does recover from
-a dropped stdio transport — reconnect re-launches the configured command, so the `ssh`
-process is simply re-run. The problem is what gets re-run. Under stdio the MCP server
-_is_ the ssh child, so its lifetime is the connection's: every blip kills the server and
-starts a cold one, and a TCP connection to an evicted pod can sit half-open long enough
-to outlast the reconnect ladder unless the ssh invocation is hand-tuned with
-`ConnectTimeout` and `ServerAliveInterval`. Over HTTP the server is a supervised process
-that survives the blip, a readiness probe withdraws the Service endpoint while the pod is
-`NotReady` so connections fail immediately instead of hanging, and each retry costs one
-HTTP request rather than a key exchange and a Python interpreter start.
+The consequence is not that the model gains a capability. It already has a shell in the
+sandbox and can run `kubectl` there whenever it likes. The consequence is that it can
+choose what the agent-side caller _sees_ — shadow a binary earlier on `PATH`, define a
+function, and hand back output that arrives as a trusted tool result. Forging the answer
+to a diagnostic is a better attack than running the diagnostic.
 
-The recovery machinery is the same either way, which is what makes the choice a matter of
-cost rather than capability. Hermes takes `url` and `headers` with recursive `${VAR}`
-expansion, probes the endpoint to pick streamable-HTTP or SSE, and runs the reconnect and
-park logic in the generic loop both transports share: five retries at one, two, four,
-eight and sixteen seconds, a 180-second idle keepalive, and then a park in which the
-tools are deregistered and the server self-probes every five minutes. A cross-node
-eviction exceeds the retry budget in either design — the `/workspace` PVC is
-`ReadWriteOnce` and has to detach and re-attach — so the realistic worst case is that the
-six tools are absent from the model's toolset for up to five minutes and then return on
-their own. Absent is a better failure than hanging, but it is a quiet one: the model
-reasons around a missing tool rather than waiting for it.
+So the SSH helper does not authenticate as `agent`. The sandbox image adds a second
+principal with its own uid, its own home and its own `authorized_keys`, and the agent
+pod's key authorises that principal only. `sshd` is already running and the key
+distribution pattern already exists, so this is a second key pair rather than a second
+authentication system. Two details it has to get right: the `SetEnv` that carries
+`CREDENTIAL_PROXY_URL` and the credential-proxy `PATH` is written once by
+`entrypoint.sh`, and `sshd` keeps the first `SetEnv` directive it parses and silently
+discards the rest — so covering both principals means one directive that applies to both,
+or a `Match User` block, not a second global line. And the helper must not build its
+subprocess environment with `_run_env()`, which is `{**os.environ, "HOME": "/tmp"}` and
+would hand the whole agent-pod environment to the `ssh` client. Nothing crosses today —
+`sshd_config` sets `PermitUserEnvironment no` and `AcceptEnv LANG LC_*` — but that is the
+remote end declining to accept what the local end should not have offered.
 
-HTTP costs an authentication story that SSH supplied for free. The server gets a bearer
-token from a Secret mounted `0400` to its own uid, and runs as that uid with its code
-owned by root. The threat is narrower than it first appears: the shell user shares the
-pod's network namespace and can always reach the listener on loopback, but calling these
-tools gains it nothing it could not get by running `kubectl` in the sandbox directly.
-What the separate uid and the token defend is the other direction — the model killing the
-server, binding the port ahead of it, or otherwise answering in its place and feeding
-forged results back to the agent. NetworkPolicy would normally cover the rest of the
-cluster; on a Standard cluster without Dataplane V2 it is inert, so the token is the
-boundary and the listener's bind address has to be chosen deliberately rather than left
-to a policy that will not be enforced.
+This settles the transport question for `platform_mcp_server.py`, which was the one
+caller large enough to argue about. Running it in the sandbox and reaching it over HTTP
+was the alternative: it would put the tools next to the binaries and make the
+`_run_env()` leak harmless, since the sandbox environment holds nothing worth taking. It
+was rejected on cost. It needs a bearer token in a mounted Secret, a Service, a readiness
+probe and a supervised server process — a second mechanism running parallel to an SSH
+helper the three scripts need anyway — and it needs the file split, because
+`send_notification` reads `SESSION_KV_API_KEY` and the module is also the parent process
+of the Session KV server, so moving it wholesale would put the incident's exact target
+inside the sandbox. The dedicated principal, meanwhile, is not a cost the HTTP design
+avoids: the three scripts need it either way. Once it exists, the MCP server using the
+same helper is nearly free.
+
+It also degrades better. Hermes recovers a dropped MCP transport with five retries at
+one, two, four, eight and sixteen seconds and then parks the server, deregistering its
+tools and self-probing every five minutes. Against an eviction that reschedules to
+another node — which the `ReadWriteOnce` `/workspace` PVC guarantees is slow, since it
+has to detach and re-attach — that budget is exhausted, and the tools disappear from the
+model's toolset for up to five minutes. Per-call SSH has no such state: the sandbox being
+down is an error on the call the model made, which it can see and react to. The cost is a
+handshake per call, and OpenSSH 10.0 in the agent image supports `ControlMaster` with
+`ControlPersist`, so the calls multiplex over one connection.
+
+One correctness requirement, distinct from the security one above. Building a remote
+command string means the sandbox's shell parses it, so every model-supplied argument — a
+namespace, a pod name, a label selector, the `audit_log_searcher` filter — needs
+`shlex.quote`. This is not a boundary crossing, since the model already has that shell.
+It is that a pod name with a quote in it must not silently produce the wrong command.
 
 Whether the six tools earn their place at all is a separate question, deferred to its own
 issue. The proxy policy is a denylist of credential-disclosure patterns rather than an
@@ -897,12 +910,12 @@ the agent in.
   container currently starts as uid 0. The risk is that dropbear has no `SetEnv`, and
   `SetEnv` is what carries `CREDENTIAL_PROXY_URL` into a non-login session. Worth a
   spike against `make docker-smoke-sandbox`; not worth assuming.
-- **The MCP split is designed and unbuilt.** Nothing has run the six cluster tools from
-  the sandbox over HTTP, so the reconnect and park behaviour described above is read
-  from `mcp_tool.py` rather than observed, and the park window in particular deserves a
-  deliberate eviction to measure. The split also has to land before the agent image can
-  drop `credential-proxy-exec`, which makes it the gate on that change rather than a
-  parallel one.
+- **The SSH helper and its dedicated principal are designed and unbuilt.** The
+  `.bashrc` finding is measured, but nothing has yet run a cluster tool through a
+  second SSH identity, and the `SetEnv` ordering constraint means the credential-proxy
+  environment reaching that principal is an assumption until it is exercised. The
+  helper also has to land before the agent image can drop `credential-proxy-exec`,
+  which makes it the gate on that change rather than a parallel one.
 - **Cron has not been exercised against a sandboxed agent.** The finding that
   `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
   doubt, but no roster has run in this configuration, and the bootstrap handoff the
