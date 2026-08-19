@@ -562,8 +562,16 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 }
 
 // deleteShellSandbox removes the sandbox for an agent that has it switched off,
-// refusing anything this controller does not own — the same guard, and for the same
-// reason, as deleteLegacyCredentialIsolationResources.
+// leaving alone anything this controller does not own.
+//
+// Unlike deleteLegacyCredentialIsolationResources, an unowned object here is logged
+// and skipped rather than returned as an error. The names are predictable, so a
+// hand-applied StatefulSet called <agent>-shell is a thing an operator can easily
+// have left behind — and erroring on it stops the reconcile before the Deployment,
+// the Service and the ConfigMap, which takes the whole agent down over a sandbox
+// that is switched off. It was observed doing exactly that on a live install.
+// Skipping leaves the object running and unmanaged, which is what the person who
+// applied it by hand asked for.
 func (r *PlatformAgentReconciler) deleteShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	objMeta := metav1.ObjectMeta{Name: shellSandboxName(agent), Namespace: agent.Namespace}
 	for _, obj := range []client.Object{
@@ -578,7 +586,9 @@ func (r *PlatformAgentReconciler) deleteShellSandbox(ctx context.Context, agent 
 			continue
 		}
 		if !metav1.IsControlledBy(obj, agent) {
-			return fmt.Errorf("refusing to delete unowned shell sandbox %T %s/%s", obj, obj.GetNamespace(), obj.GetName())
+			logf.FromContext(ctx).Info("Leaving unowned shell sandbox object in place",
+				"kind", fmt.Sprintf("%T", obj), "namespace", obj.GetNamespace(), "name", obj.GetName())
+			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
 			return err
