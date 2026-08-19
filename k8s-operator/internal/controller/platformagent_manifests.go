@@ -1889,13 +1889,25 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: shellSandboxDataPath,
 		})
 	}
-	envVars = append(envVars, corev1.EnvVar{
-		Name:  "CREDENTIAL_PROXY_URL",
-		Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
-	})
+	// No CREDENTIAL_PROXY_URL, and no /opt/credential-proxy/bin on PATH. Both
+	// existed to serve the credential-proxy shims, and #737 took the last of them
+	// out of the agent image: this container has no kubectl, gcloud, gh or git in
+	// any form, and the code that used to invoke one goes through sandbox_exec.py
+	// to the shell sandbox instead. Neither variable has a reader here any more.
+	//
+	// This is tidiness, not containment. GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL
+	// above still name the same loopback address, and the proxy authenticates no
+	// caller, so anything in this container that can form an HTTP request can still
+	// reach it — that is what #737 Part C is for. What removing the variable does
+	// buy is that a shim reinstated here would have to be wired up deliberately
+	// rather than working the moment it appeared.
+	//
+	// buildShellSandboxStatefulSet sets the variable on the sandbox instead. It is
+	// empty there until Part C gives the proxy an address off this pod's loopback,
+	// and empty is a supported state the wrappers report clearly.
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
-		Value: "/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		Value: "/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
 	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PYTHONPATH",

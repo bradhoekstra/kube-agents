@@ -699,11 +699,10 @@ half files a kanban card through `run_slash`; its other half is `resolver.py pol
 needs only `gh` and the standard library and returns JSON on stdout. That half is a skill
 script under `github-issue-resolver/scripts/`, which Hermes' sync already places in the
 sandbox — so the split is one function, `run_resolver_poll`, becoming an `ssh` call.
-It is gated on Part C: the sandbox image ships the four proxy symlinks at
-`/opt/credential-proxy/bin/` and puts that directory first on `PATH`, but
-`CREDENTIAL_PROXY_URL` is unset there, so `gh` resolves and then exits 1 with
-`CREDENTIAL_PROXY_URL is not configured`. Moving the poll before Part C would trade a
-sweep that works for one that reports a fault every tick.
+That split is now the smaller half of what has already happened. `resolver.py` reaches
+`gh` through `sandbox_exec.run`, so every `gh` call the poll makes executes in the
+sandbox today; what is left to move is the script around them. It waits on Part C, for
+the same reason the sweep is currently down — the next section states the cost.
 
 #### The agent pod gives up cluster tooling entirely
 
@@ -723,23 +722,41 @@ form: the symlinks and eventually `credential-proxy-exec` itself leave the agent
 and the image gains the same build-time guard the sandbox image already has. The sandbox
 becomes the only place a credential-proxy call can originate.
 
-That lands in two steps, because the four names are not one problem. `kubectl` and
-`gcloud` are gone now, along with `helm`, `k9s` and `yq` — the utility CLIs that were in
-the agent image only because the shell was. Their agent-side callers all moved to
-`sandbox_exec.py` in the same change, so nothing in the pod is left holding a broken
-reference, and the guard at the end of the `agent-base` stage fails the build if any of
-the five resolves again. A second guard, in the RUN that creates the symlinks, fails if
-one is reinstated as a shim — `/opt/credential-proxy/bin` is not on the build PATH, so
-`command -v` alone cannot see that.
+All four names left in one change, along with `helm`, `k9s` and `yq` — the utility CLIs
+that were in the agent image only because the shell was. `/opt/credential-proxy` went
+with them, so there is no `credential-proxy-exec` left for a symlink to point at. Two
+guards keep it that way. The `agent-base` stage checks the seven names where `git` is
+purged, which catches a real binary; the guard at the end of the `platform` stage runs
+last and so sees everything both stages wrote, and it fails the build if
+`/opt/credential-proxy` exists or any of the seven resolves. The second is what catches
+a reinstated shim, which `command -v` in `agent-base` cannot see, because that directory
+is not on the build PATH.
 
-`gh` and `git` stay for now. One agent-pod caller still needs `gh`:
+`gh` needed one step the others did not.
 [`github_scan_gate.py`](../../agents/platform/scripts/github_scan_gate.py) runs
-`resolver.py poll` as a `no_agent` cron script, in the pod, and the resolver shells out
-to `gh` at every call site. Removing the shim would not move that call into the sandbox,
-it would stop the GitHub issue sweep — and moving the poll across is its own change,
-which needs Part C first, because the sandbox's shims have no proxy to reach either.
-`git` goes with it rather than separately: on its own it buys nothing while `gh`
-remains, and `credential-proxy-exec` has to stay for both.
+`resolver.py poll` as a `no_agent` cron script in the pod, and the resolver shells out to
+`gh` at every call site. Both modules funnel those invocations through one function —
+`forge.run_gh` and `resolver._run_gh_once` — so routing that pair through
+`sandbox_exec.run` carried the whole sweep across without moving the script. Both files
+also run on the far side of the boundary when the model invokes them from its shell, and
+one call site serves both: `sandbox_enabled()` reads an agent-pod file, so in the sandbox
+it is false and `run()` executes locally.
+
+`git` had nowhere to go. `credential_proxy.py::_execute` confines a git command's working
+directory to `CREDENTIAL_PROXY_WORKSPACE_ROOT` and re-runs it in the sidecar against the
+shared `/opt/data` volume, which only the agent pod and its sidecar mount — a
+sandbox-side `git` cannot reach that tree. It was removed anyway rather than left as the
+one credentialed binary in the container this section exists to disarm.
+
+**What that costs until Part C.** The sandbox image ships the four proxy shims at
+`/opt/credential-proxy/bin/` and puts that directory first on `PATH`, but
+`CREDENTIAL_PROXY_URL` is unset there — `buildShellSandboxStatefulSet` omits the variable
+while the URL is empty — so each of them resolves and then exits 1 with
+`CREDENTIAL_PROXY_URL is not configured`. `kubectl` and `gcloud` were already in that
+state. `gh` joining them takes the `*/10` `github-repo-watcher` sweep down: it reports a
+fault every tick rather than the repository's open work. `git` takes the GitOps and
+pull-request write paths with it. All of it returns when Part C gives the proxy an
+address off the agent pod's loopback and a workspace both sides can reach.
 
 Agent-side callers reach the tooling the same way everything else in this section does —
 by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),
@@ -761,7 +778,7 @@ called `hermes` — and is the one thing to check when reading a diff against th
 Which SSH identity that helper uses is the subject of the next section, and is not the
 one configured today.
 
-**This makes the sandbox required.** With the two symlinks gone there is no fallback, so
+**This makes the sandbox required.** With nothing left in the image to fall back to,
 `shellSandbox` disabled is a configuration in which the MCP tools fail — `sandbox_exec`'s
 local branch runs `subprocess.run(["kubectl", …])` against an image that has no
 `kubectl`, and reports the `FileNotFoundError` honestly. That is accepted rather than
@@ -771,8 +788,9 @@ harder to reason about than one that does not carry the binaries at all. Removin
 toggle is the follow-through and is not yet done.
 
 The proxy still answers on pod loopback and authenticates no caller, so removing the
-symlinks does not make the agent pod unable to reach it — the two that remain are a
-working path, and even without them a `curl` to `127.0.0.1:8765` is one. Reaching it
+symlinks does not make the agent pod unable to reach it — a `curl` to `127.0.0.1:8765`
+is a working path, and `GOOGLE_CHAT_RELAY_URL` still names that address in the agent
+container's environment for the relay code that legitimately posts there. Reaching it
 requires arbitrary code execution in that pod, and with the shell, the file tools and
 `execute_code` all in the sandbox the model has no path to that. What is left in the
 agent pod is trusted code: the MCP server, the cron scripts, the gateway. The point of

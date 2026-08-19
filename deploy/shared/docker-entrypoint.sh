@@ -189,16 +189,14 @@ if ! agent_owns_shared_state "$@"; then
     #
     # Skipping the SETUP is not skipping the cwd. This branch execs ~600 lines above the
     # `cd "$TARGET_DIR"` at the bottom, so without this the handed-over process keeps
-    # whatever directory the container started in — /opt/hermes for the dashboard sidecar.
-    # That is not cosmetic: the credential proxy refuses any cwd outside
-    # CREDENTIAL_PROXY_WORKSPACE_ROOT, which the operator sets to this same $TARGET_DIR,
-    # so every gh/git call in a non-owner container fails with "working directory is
-    # outside the shared workspace" before it runs. The reasoning for the
-    # cd, and why the cwd is the only lever that reaches every caller, is at the bottom.
+    # whatever directory the container started in — /opt/hermes for the dashboard sidecar,
+    # which is read-only to the runtime user, so every relative path it writes is lost.
+    # The reasoning for the cd, and why the cwd is the only lever that reaches every
+    # caller, is at the bottom.
     # Guarded for the same reason it is there: a non-owner can legitimately start before
     # the owner has created the tree, and that must not abort the container.
     if ! cd "$TARGET_DIR"; then
-        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+        echo "WARN: could not enter $TARGET_DIR; relative paths will resolve against a read-only directory" >&2
     fi
     exec "$@"
 fi
@@ -1361,16 +1359,19 @@ if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; t
     ) &
 fi
 
-# 6. Execute primary process from inside the shared workspace.
+# 6. Execute primary process from inside the agent's own directory.
 #
-# The image inherits WORKDIR /opt/hermes from the upstream base, and every
-# credentialed CLI left in this container — gh and git; kubectl and gcloud went
-# to the sandbox with #737 — is a PATH shim for credential_proxy_client.py. That
-# client posts `"cwd": os.getcwd()` on every request unconditionally, and the
-# proxy refuses any cwd outside CREDENTIAL_PROXY_WORKSPACE_ROOT — which the
-# operator sets to this same $TARGET_DIR. Launched from /opt/hermes, therefore,
-# a plain `git status` fails with "working directory is outside the shared
-# workspace" before it runs, purely because of where the process was started.
+# The image inherits WORKDIR /opt/hermes from the upstream base, which is
+# read-only to the runtime user, so a process left there writes every relative
+# path into a directory it cannot write and loses every one it can. $TARGET_DIR
+# is the writable home on the PVC.
+#
+# This used to be a credential rule as well: every CLI in this container was a
+# credential-proxy shim, the client posted `"cwd": os.getcwd()` on every
+# request, and the proxy refused any cwd outside its workspace root — so a plain
+# `git status` launched from /opt/hermes failed before it ran. #737 took the
+# shims out of this image entirely, so what is left is the write-path reason
+# above, which is enough on its own.
 #
 # The cwd is the only lever that reaches every caller. Hermes resolves the
 # terminal and execute_code working directories from a ladder that ends at
@@ -1385,7 +1386,7 @@ fi
 # one. $TARGET_DIR is created in step 2 and written throughout, so the warning
 # is a canary for a broken mount rather than an expected path.
 if ! cd "$TARGET_DIR"; then
-    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+    echo "WARN: could not enter $TARGET_DIR; relative paths will resolve against a read-only directory" >&2
 fi
 
 exec "$@"

@@ -1010,11 +1010,10 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
 # Remove the build-only clone dependency after all plugin installation is done.
 #
 # The loop is what step 2 above defers to. git is native up to the purge on the
-# line above and nothing by the other six names is ever installed here — the
-# shims further down are symlinks, and helm, k9s and yq left with #737 — so a hit
-# is a step someone added rather than a leftover. `/opt/credential-proxy/bin` is
-# not on the build PATH (profile.d puts it there at login), so `command -v` can
-# only be finding a real binary.
+# line above and nothing by the other six names is ever installed here — they all
+# left with #737 — so a hit is a step someone added rather than a leftover. This
+# catches a real binary only; the symlink case is the `platform` stage's guard,
+# which runs last and so sees everything both stages wrote.
 RUN apt-get purge -y git && apt-get autoremove -y && \
 	rm -rf /var/lib/apt/lists/* && \
 	for binary in gcloud kubectl gh git helm k9s yq; do \
@@ -1070,29 +1069,25 @@ RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfi
 # three destinations differ so these cannot be folded into one COPY. The layer
 # budget is why the modes are not a fourth instruction — see the note at the top.
 COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
-COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
-COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
 
-# Two shims, not four. `kubectl` and `gcloud` are gone from this image with
-# #737: the model's shell runs in the sandbox, and the agent-pod code that used
-# to invoke them directly — the platform MCP server, the cluster-agent scripts,
-# gke_endpoint.py — goes through sandbox_exec.run() over SSH, so the sandbox is
-# the only place a cluster command is issued from. `gh` and `git` stay because
-# gitops_workspace.py and github_token_refresh.py still run in this container
-# and still need the proxy's shared /workspace; moving them is the rest of #737.
+# No credential-proxy shims here, and no /opt/credential-proxy at all. There
+# were four — kubectl, gcloud, gh, git — each a symlink to a client that posted
+# the command to the sidecar. #737 moved every caller of all four out of this
+# container: the model's shell runs in the sandbox, and the agent-pod code that
+# invoked one directly (the platform MCP server, gke_endpoint.py, forge.py,
+# resolver.py) calls agents/platform/scripts/sandbox_exec.py and runs it over
+# SSH. The sandbox image carries the shims, credential-proxy-exec and
+# credential-proxy-path.sh instead; deploy/sandbox/Dockerfile is where they live
+# now. The guard at the end of the `platform` stage fails the build if any of it
+# reappears here.
 #
-# The loop guards the deletion. It is cheap to reinstate a symlink here without
-# reinstating the caller, and the failure that produces is a cluster command
-# that runs in the wrong pod and works, which nothing else would catch.
-RUN mkdir -p /opt/credential-proxy/bin && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gh && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/git && \
-    for binary in kubectl gcloud helm k9s yq; do \
-        if [ -e "/opt/credential-proxy/bin/${binary}" ]; then \
-            echo "cluster tooling back on the agent image PATH: ${binary}" >&2; \
-            exit 1; \
-        fi; \
-    done
+# Their absence is what makes the sandbox load-bearing rather than optional. A
+# `git` or `gh` issued in this container gets "command not found", which is the
+# honest answer for an install that turned the sandbox off — and until #737
+# Part C gives the proxy an address the sandbox can reach, the sandbox's own
+# shims answer "CREDENTIAL_PROXY_URL is not configured", so the GitHub paths are
+# down either way. That is a known cost of taking the credential out of reach of
+# the container the model's code used to run in.
 
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
@@ -1303,9 +1298,32 @@ RUN set -eu; \
 #
 # No speedup figure is claimed for this pass on its own; the 12.5s -> 6.0s in
 # step 5.7 is the whole tree, of which the plugins here are a few modules.
+#
+# The tooling guard rides along on this RUN rather than taking a layer of its
+# own, and it belongs here because here is last: this is the final root
+# instruction of the stage that produces the shipped agent image, so it sees
+# everything `agent-base` and `platform` wrote between them. `agent-base`'s own
+# loop catches a real binary at the point git is purged; this one catches the
+# other way cluster tooling comes back, which is a credential-proxy symlink.
+#
+# Worth a guard because reinstating one is a two-word diff with no visible
+# effect, and what it produces is a credentialed command running in the pod that
+# holds the Workload Identity — succeeding, silently, in the container #737
+# exists to take that capability away from. Nothing else in the build or the
+# test suite would report it.
 RUN set -eu; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
-      || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2
+      || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
+    if [ -e /opt/credential-proxy ]; then \
+      echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
+      exit 1; \
+    fi; \
+    for binary in gcloud kubectl gh git helm k9s yq; do \
+      if command -v "${binary}" >/dev/null 2>&1; then \
+        echo "cluster tooling is back in the agent image: ${binary}" >&2; \
+        exit 1; \
+      fi; \
+    done
 
 USER 10000:10000
 

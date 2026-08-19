@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Run a cluster command in the shell sandbox rather than in the agent pod.
 
-The agent image carries no `kubectl` and no `gcloud`, in any form: not the
-binaries, and not the credential-proxy shims that used to stand in for them
-(`deploy/docker/Dockerfile` step 2 and the guard at the end of that stage).
-Agent-side code with a reason to invoke one — the platform MCP server, the
-cluster-agent scripts, `gke_endpoint.py` — calls `run()` here instead of
-`subprocess.run`, and the command executes in the sandbox.
+The agent image carries no `kubectl`, `gcloud`, `gh` or `git`, in any form: not
+the binaries, and not the credential-proxy shims that used to stand in for them.
+`deploy/docker/Dockerfile` step 2 removed the first, the note where the symlinks
+used to be removed the second, and the guard at the end of the `platform` stage
+fails the build if either comes back. Agent-side code with a reason to invoke one
+— the platform MCP server, the cluster-agent scripts, `gke_endpoint.py`,
+`forge.py`, `resolver.py` — calls `run()` here instead of `subprocess.run`, and
+the command executes in the sandbox.
 
-`gh` and `git` are still shims in the agent image, because `gitops_workspace.py`
-and `github_token_refresh.py` still run there and still need the credential
-proxy's shared workspace. Nothing about a cluster does.
+Several of those files run on both sides of the boundary: `resolver.py poll` is a
+subprocess of the agent pod's cron gate, while `resolver.py claim` is invoked by
+the model from a shell that is already in the sandbox. One call site serves both,
+because `sandbox_enabled()` is false in the sandbox — the managed config it reads
+is an agent-pod file — and `run()` then executes locally.
 
 Two things about this module are load-bearing and easy to undo by accident.
 
@@ -208,11 +212,14 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     forwarded `KUBECONFIG` turns a `describe` into a guaranteed HTTP 400. It has
     no remote counterpart because the remote command inherits nothing from here.
 
-    Falls back to running locally when no sandbox is configured. That is not a
-    credential path: the agent image carries no cluster binaries, so the local
-    branch fails with "command not found" — which is the honest report for an
-    installation that turned the sandbox off, and is why the fallback is a
-    plain `subprocess.run` rather than an error raised here.
+    Falls back to running locally when no sandbox is configured. Two different
+    situations reach that branch and it is right for both. In the agent pod it
+    means the install turned the sandbox off, and the image carries no
+    credentialed binary, so the call fails with "command not found" — the honest
+    report, and why the fallback is a plain `subprocess.run` rather than an error
+    raised here. In the sandbox it is the normal case: `resolver.py` and
+    `forge.py` also run there, there is no managed config to read, and local is
+    where the command belongs.
 
     Raises SandboxUnavailable when ssh itself could not connect.
     """

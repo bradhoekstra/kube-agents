@@ -598,8 +598,13 @@ func TestBuildDeployment(t *testing.T) {
 	if envMap["AGENT_BROWSER_ARGS"].Value != "--no-sandbox --disable-gpu" {
 		t.Errorf("expected AGENT_BROWSER_ARGS --no-sandbox --disable-gpu, got %s", envMap["AGENT_BROWSER_ARGS"].Value)
 	}
-	if envMap["CREDENTIAL_PROXY_URL"].Value != "http://127.0.0.1:8765" {
-		t.Errorf("expected localhost Envoy CREDENTIAL_PROXY_URL, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
+	// The agent container is not told where the proxy is. #737 left it with no
+	// kubectl, gcloud, gh or git to use one, and the proxy authenticates no
+	// caller — so the address is only reachable by whatever can form an HTTP
+	// request in the pod that holds Workload Identity, which is the arrangement
+	// the sandbox exists to end. The sandbox StatefulSet gets it instead.
+	if _, ok := envMap["CREDENTIAL_PROXY_URL"]; ok {
+		t.Errorf("expected no CREDENTIAL_PROXY_URL on the agent container, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
 	}
 	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
 	proxyEnv := make(map[string]corev1.EnvVar)
@@ -663,8 +668,14 @@ func TestBuildDeployment(t *testing.T) {
 	if !proxyHasTokenMount {
 		t.Error("expected projected KSA token to be mounted only by credential sidecar")
 	}
-	if !strings.HasPrefix(envMap["PATH"].Value, "/opt/credential-proxy/bin:") {
-		t.Errorf("expected sandbox PATH to prefer credential proxy shims, got %s", envMap["PATH"].Value)
+	// The shim directory is gone from this image (#737), so PATH must not name
+	// it: a stale entry would make the resolution order depend on whether a
+	// later change put something back there.
+	if strings.Contains(envMap["PATH"].Value, "/opt/credential-proxy") {
+		t.Errorf("expected no credential-proxy shim dir on the agent PATH, got %s", envMap["PATH"].Value)
+	}
+	if !strings.HasPrefix(envMap["PATH"].Value, "/opt/hermes/.venv/bin:") {
+		t.Errorf("expected the Hermes venv first on PATH, got %s", envMap["PATH"].Value)
 	}
 	if envMap["GKE_CLUSTER_NAME"].Value != "gke-cluster" {
 		t.Errorf("expected GKE_CLUSTER_NAME gke-cluster, got %s", envMap["GKE_CLUSTER_NAME"].Value)
@@ -3137,7 +3148,7 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 			Image:    "gcr.io/env:v1",
 			Env: []corev1.EnvVar{
 				{Name: "SESSION_KV_DB_PATH", Value: "/tmp/hijacked.db"},
-				{Name: "CREDENTIAL_PROXY_URL", Value: "http://attacker.invalid"},
+				{Name: "PATH", Value: "/tmp/hijacked/bin:/usr/bin"},
 				{Name: "AGENT_SHARED_STATE_SETUP", Value: "skip"},
 				{Name: "HERMES_MANAGED_DIR", Value: "/opt/data/managed"},
 			},
@@ -3156,13 +3167,20 @@ func TestBuildPodTemplateSpec_PluginEnvOverridesOperatorEnv(t *testing.T) {
 		t.Errorf("expected plugin env to take precedence for SESSION_KV_DB_PATH, got %q", env["SESSION_KV_DB_PATH"])
 	}
 
-	// CREDENTIAL_PROXY_URL is appended after the plugin merge, so it stays operator-owned.
-	// That ordering is what keeps a plugin from redirecting the credential proxy.
-	if strings.Contains(env["CREDENTIAL_PROXY_URL"], "attacker.invalid") {
-		t.Errorf("plugin must not be able to override CREDENTIAL_PROXY_URL, got %q", env["CREDENTIAL_PROXY_URL"])
+	// PATH is appended after the plugin merge, so it stays operator-owned. That
+	// ordering is what stops a plugin prepending a directory it controls and
+	// having every unqualified command in the agent container resolve there —
+	// `python3`, `ssh`, and the entrypoint's own tools among them.
+	//
+	// It took CREDENTIAL_PROXY_URL's place in this test when #737 removed that
+	// variable from the container. There is nothing left here to redirect: the
+	// image carries no credential-proxy client and no CLI that would call one,
+	// so a plugin naming the variable is writing to something with no reader.
+	if strings.Contains(env["PATH"], "/tmp/hijacked/bin") {
+		t.Errorf("plugin must not be able to override PATH, got %q", env["PATH"])
 	}
-	if !strings.HasPrefix(env["CREDENTIAL_PROXY_URL"], "http://127.0.0.1:") {
-		t.Errorf("expected operator-owned CREDENTIAL_PROXY_URL on loopback, got %q", env["CREDENTIAL_PROXY_URL"])
+	if !strings.HasPrefix(env["PATH"], "/opt/hermes/.venv/bin:") {
+		t.Errorf("expected operator-owned PATH leading with the Hermes venv, got %q", env["PATH"])
 	}
 
 	// AGENT_SHARED_STATE_SETUP is operator-owned for the same reason and by the same

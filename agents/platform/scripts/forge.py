@@ -76,6 +76,8 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
+import sandbox_exec
+
 SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
 #: Shell convention for "command not found". Kept distinguishable from a `gh`
@@ -379,13 +381,24 @@ def run_gh(argv: Sequence[str]) -> subprocess.CompletedProcess:
     non-zero with usable stderr, and turning that into a traceback loses it.
     A missing binary is reported as `GH_MISSING_RC` so it stays distinguishable
     from a command that ran and failed.
+
+    The call goes through `sandbox_exec`, because the consumer that runs
+    unattended does not run where a `gh` exists. `github_scan_gate.py` imports
+    this module and the `*/10` cron tick executes it in the agent pod, which
+    holds no `gh` in any form as of #737 — so the binary this reaches is the
+    sandbox's. `sandbox_exec.run` falls back to a local subprocess when no
+    sandbox is configured, which is also the branch that runs when the model
+    invokes a skill that imports this file: it is already in the sandbox by
+    then, and there is nowhere further to forward to.
+
+    `SandboxUnavailable` is deliberately not caught. "Never raises" is about a
+    command that ran and exited non-zero; ssh failing to connect means it never
+    ran, and a tick that reports GitHub silence because the transport was down
+    is the one failure this whole path must not produce.
     """
     try:
-        return subprocess.run(
+        return sandbox_exec.run(
             ["gh", *argv],
-            check=False,
-            text=True,
-            capture_output=True,
             timeout=GH_TIMEOUT_S,
         )
     except FileNotFoundError:

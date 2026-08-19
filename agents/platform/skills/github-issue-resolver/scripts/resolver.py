@@ -25,6 +25,12 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+# Not lazy, unlike github_token_refresh above: every gh call in this file goes
+# through it, and it has no import-time dependency on anything under /opt — the
+# yaml it needs to read the managed config is imported inside the function that
+# reads it, and a missing config just means "no sandbox".
+import sandbox_exec  # noqa: E402 — needs the sys.path lines above
+
 
 SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
@@ -200,13 +206,24 @@ def resolve_repo_or_exit(required: bool = True) -> Optional[str]:
 def _run_gh_once(args: list) -> subprocess.CompletedProcess:
     """Run one gh command, mapping a missing binary onto a return code.
 
-    Never raises, so :func:`run_gh` can inspect a failure and decide whether it
-    is worth retrying before applying the caller's ``check`` semantics.
+    Never raises for a non-zero exit, so :func:`run_gh` can inspect a failure
+    and decide whether it is worth retrying before applying the caller's
+    ``check`` semantics.
+
+    Routed through ``sandbox_exec`` because this file runs on both sides of the
+    sandbox boundary. ``poll`` is a subprocess of ``github_scan_gate.py`` in the
+    agent pod, which as of #737 has no ``gh``; ``claim``, ``transition`` and the
+    report subcommands are invoked by the model, from a shell that is already in
+    the sandbox. ``sandbox_exec.run`` forwards over ssh in the first case and
+    falls back to a local subprocess in the second, so one call site serves
+    both.
+
+    ``SandboxUnavailable`` is left to propagate. A poll that cannot reach the
+    sandbox has not learned that the repository is quiet, and reporting it as
+    quiet is the outcome this path exists to avoid.
     """
     try:
-        return subprocess.run(
-            ["gh"] + args, check=False, text=True, capture_output=True
-        )
+        return sandbox_exec.run(["gh"] + args)
     except FileNotFoundError:
         # Distinguishable from a gh command that ran and failed, so callers can
         # name the fault precisely.

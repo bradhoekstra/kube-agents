@@ -361,6 +361,31 @@ class RunGhTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("404", result.stderr)
 
+    def test_the_call_goes_to_the_sandbox(self):
+        """The agent image holds no gh, and this module's cron consumer runs there.
+
+        The three tests above pass either way — `sandbox_exec.run` falls back to
+        `subprocess.run` when no sandbox is configured, which is what a test
+        machine looks like. So this is the one that would notice the routing
+        being reverted to a direct `subprocess.run(["gh", ...])`.
+        """
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            return_value=_completed(["gh", "auth", "status"], 0, "ok", ""),
+        ) as ran:
+            result = forge.run_gh(["auth", "status"])
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(ran.call_args.args[0], ["gh", "auth", "status"])
+
+    def test_an_unreachable_sandbox_is_not_a_quiet_repository(self):
+        """A transport failure has to reach the caller, not become an empty result."""
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            side_effect=forge.sandbox_exec.SandboxUnavailable("no route"),
+        ):
+            with self.assertRaises(forge.sandbox_exec.SandboxUnavailable):
+                forge.run_gh(["issue", "list"])
+
 
 class PreflightTest(unittest.TestCase):
     def test_authenticated_passes(self):

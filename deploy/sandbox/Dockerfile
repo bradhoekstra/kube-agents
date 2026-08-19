@@ -158,14 +158,18 @@ RUN groupadd --gid 1001 hermes && \
     install -d -m 0700 -o hermes -g hermes /home/hermes/.ssh && \
     install -d -m 0700 -o hermes -g hermes /home/hermes/.kubeconfigs
 
-# The credential-aware CLIs, exactly as the agent image provides them: symlinks
-# to one client that forwards argv to the credential proxy over HTTP and prints
-# back what the proxy's own copy of the binary produced. The agent never holds
-# the credential, here no differently than in the agent container.
+# The credential-aware CLIs: symlinks to one client that forwards argv to the
+# credential proxy over HTTP and prints back what the proxy's own copy of the
+# binary produced. The agent never holds the credential.
 #
-# credential-proxy-path.sh is shared with the agent image rather than copied,
-# so the two cannot drift: it puts /opt/credential-proxy/bin ahead of the
-# native binaries on the PATH of login shells. Hermes' ssh backend snapshots
+# This is the only image that has them. The agent image carried the same four
+# until #737 took them out along with every native CLI, so a credential-proxy
+# call can now originate only here; the guard at the end of that image's
+# `platform` stage fails the build if any of it reappears there.
+#
+# credential-proxy-path.sh stays under deploy/shared/, where it was when both
+# images used it. It puts /opt/credential-proxy/bin ahead of the native
+# binaries on the PATH of login shells. Hermes' ssh backend snapshots
 # its environment once with `bash -l -c` and replays that snapshot for every
 # later command (tools/environments/base.py), so a file in /etc/profile.d is
 # read exactly the way it is for the local backend.
