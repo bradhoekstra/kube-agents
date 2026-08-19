@@ -11,6 +11,7 @@ failed the way it did rather than reaching the network with a bad key.
 """
 
 import importlib
+import importlib.metadata
 import os
 import sys
 import time
@@ -25,18 +26,43 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 from session_manager import SessionManager
 
 
+def _mcp_distribution_installed():
+    try:
+        importlib.metadata.distribution("mcp")
+        return True
+    except importlib.metadata.PackageNotFoundError:
+        return False
+
+
 def _load_agent_common_server():
     """Import the module under test.
 
     These tests run in CI via `make test-python`, and the credential logic under
     test (resolve_agent_credentials) depends only on the stdlib. When the hermes
-    runtime deps (FastMCP / pydantic / session_manager) aren't importable, fall
-    back to minimal stubs so the module still imports in a bare checkout. Each
-    stub package sets __path__ so it is treated as a real package.
+    runtime deps (FastMCP / pydantic / session_manager) aren't installed at all,
+    fall back to minimal stubs so the module still imports in a bare checkout.
+    Each stub package sets __path__ so it is treated as a real package.
+
+    ABSENT is not the same as BROKEN, and only the first earns a stub. With an
+    installed mcp 2.x the per-module check below would find `mcp` and
+    `mcp.server` importable and stub only `mcp.server.fastmcp` -- the one
+    module 2.x deleted -- which reads as a pass and tests nothing. That is the
+    shape that let #751 widen the ceiling to <3 unnoticed, so an mcp that is
+    present but missing the module raises instead.
+
+    The presence check asks importlib.metadata rather than
+    importlib.util.find_spec: find_spec consults sys.modules first and reads
+    __spec__ off whatever it finds, which is None on the ModuleType stubs this
+    very function leaves behind, and it raises ValueError instead of answering.
+    Discovery imports this whole directory into one process, so those stubs are
+    what the next module's check would see.
     """
     try:
         return importlib.import_module("agent_common_server")
     except Exception:
+        if _mcp_distribution_installed():
+            raise
+
         import session_manager as real_session_manager
 
         def _stub_if_missing(name, module):

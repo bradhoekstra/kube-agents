@@ -1,4 +1,5 @@
 import importlib
+import importlib.metadata
 import sys
 import types
 import unittest
@@ -17,13 +18,44 @@ def _load_router_server():
 
     These tests exercise only stdlib logic (delegation to agent_roster + the
     absence of the removed relay). When the hermes runtime deps (FastMCP /
-    pydantic) aren't importable, fall back to minimal stubs so the module still
-    imports in a bare checkout. `FastMCP().tool()` returns identity, so the
-    decorated tools remain plain callables.
+    pydantic) aren't installed at all, fall back to minimal stubs so the module
+    still imports in a bare checkout. `FastMCP().tool()` returns identity, so
+    the decorated tools remain plain callables.
+
+    ABSENT is not the same as BROKEN, and only the first earns a stub. An
+    installed mcp that no longer exposes mcp.server.fastmcp -- every 2.x, which
+    replaced it with mcp.server.mcpserver -- means router_server cannot run in
+    that environment, and the ImportError is the finding. Stubbing past it is
+    how #751 widened the ceiling to <3 and kept CI green;
+    agents/platform/scripts/test_mcp_package_contract.py is the test that says
+    so out loud, and it covers this module too.
+
+    Stub per module rather than by bulk sys.modules.update: unittest discovery
+    imports every test module into one process, so an entry left here is what
+    the next module finds. A fake `pydantic` bearing nothing but Field is not a
+    thing to hand to fastapi seventeen imports later.
+
+    The presence check asks importlib.metadata rather than
+    importlib.util.find_spec: find_spec consults sys.modules first and reads
+    __spec__ off whatever it finds, which is None on the ModuleType stubs below
+    and raises ValueError rather than answering.
     """
     try:
         return importlib.import_module("router_server")
     except Exception:
+        try:
+            importlib.metadata.distribution("mcp")
+        except importlib.metadata.PackageNotFoundError:
+            pass  # absent: a bare checkout, which is what the stubs are for
+        else:
+            raise  # installed and incompatible: the ImportError is the finding
+
+        def _stub_if_missing(name, module):
+            try:
+                importlib.import_module(name)
+            except Exception:
+                sys.modules[name] = module
+
         mcp = types.ModuleType("mcp"); mcp.__path__ = []
         mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
         fastmcp = types.ModuleType("mcp.server.fastmcp")
@@ -31,10 +63,10 @@ def _load_router_server():
             tool=lambda *a, **k: (lambda f: f), run=lambda: None)
         pydantic = types.ModuleType("pydantic")
         pydantic.Field = lambda *a, **k: None
-        sys.modules.update({
-            "mcp": mcp, "mcp.server": mcp_server, "mcp.server.fastmcp": fastmcp,
-            "pydantic": pydantic,
-        })
+        _stub_if_missing("mcp", mcp)
+        _stub_if_missing("mcp.server", mcp_server)
+        _stub_if_missing("mcp.server.fastmcp", fastmcp)
+        _stub_if_missing("pydantic", pydantic)
         return importlib.import_module("router_server")
 
 

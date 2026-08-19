@@ -17,15 +17,34 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 # session_kv_server imports agent_common_server, which imports mcp.server.fastmcp.
-# That symbol is absent from some installed versions of the mcp package, and when
-# it is, this whole module fails to import -- so every test in it silently does
-# not run. That is how three denial tests for the /inject authentication came to
-# be passing-by-not-existing. Stub only when the real import fails, so a working
-# environment still exercises the real path.
+# When that import fails this whole module fails to import -- so every test in it
+# silently does not run. That is how three denial tests for the /inject
+# authentication came to be passing-by-not-existing.
+#
+# The guard distinguishes ABSENT from BROKEN, and only the first earns a stub.
+# Absent means a bare checkout with no mcp installed, where a stub is the point.
+# Broken means mcp is installed and does not expose the module -- every 2.x,
+# which replaced mcp.server.fastmcp with mcp.server.mcpserver -- and there
+# session_kv_server genuinely cannot run, so the ImportError is the finding
+# rather than something to route around. Stubbing both alike is what let #751
+# widen the ceiling in requirements-test.txt to <3 without CI noticing.
 try:  # pragma: no cover - depends on the installed mcp version
     import mcp.server.fastmcp  # noqa: F401
 except Exception:  # pragma: no cover
+    import importlib.metadata
     import types
+
+    # importlib.metadata and not importlib.util.find_spec: find_spec consults
+    # sys.modules first and reads __spec__ off whatever it finds, which is None
+    # on a ModuleType stub -- and it raises ValueError rather than answering.
+    # Discovery imports this whole directory into one process, and the sibling
+    # test modules leave exactly such stubs behind in a bare checkout.
+    try:
+        importlib.metadata.distribution("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        pass  # absent: a bare checkout, which is what the stub is for
+    else:
+        raise  # installed and incompatible: the ImportError is the finding
 
     _stub = types.ModuleType("mcp.server.fastmcp")
 

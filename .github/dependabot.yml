@@ -67,9 +67,13 @@ updates:
       - "python"
     commit-message:
       prefix: "ci"
-    # requirements-test.txt holds mcp below 2.0 because agent_common_server.py
-    # imports mcp.server.fastmcp, which 2.x deletes. #751 widened the constraint
-    # to <3 anyway; the tests stub the module, so nothing caught it.
+    # requirements-test.txt holds mcp below 2.0 to match the runtime image,
+    # which ships 1.28.1 from the digest-pinned Hermes base and cannot move:
+    # hermes-agent itself imports mcp.server.fastmcp, the module 2.x deletes.
+    # The full reasoning is on the pin in that file; the ceiling comes off when
+    # the base image ships 2.x (#800). #751 widened the constraint to <3 anyway
+    # and nothing caught it -- the tests fell back to a stub on the failing
+    # import -- so this rule stops Dependabot re-proposing it.
     # `versions` and not `update-types`: a semver-major comparison needs a
     # resolved current version, and `mcp<2` is a bare range rather than an `==`
     # pin, so there is none. That is why #751 arrived titled "update mcp
