@@ -1,0 +1,185 @@
+---
+name: review-preflight
+description: Runs the review passes required before a pull request is opened — adversarial, docs-drift, and IaC parity — each in a context that did not write the change, and merges what they return into one disposition list.
+---
+
+# Task
+
+Get every pre-PR review pass into a context that did not write the change, then merge what comes
+back into the list that becomes the pull request's **Self-Review** section.
+
+This skill is plumbing. It holds no review method — [`review-adversarial`](../review-adversarial/SKILL.md),
+[`review-docs-drift`](../review-docs-drift/SKILL.md), and
+[`review-iac-parity`](../review-iac-parity/SKILL.md) own that — and it does not state the
+requirement: "Pull Request Hygiene" in [`AGENTS.md`](../../../AGENTS.md) does, and that list wins if
+this file disagrees with it.
+
+[`.claude/commands/pr-preflight.md`](../../../.claude/commands/pr-preflight.md) is the Claude Code
+wrapper. Any harness can follow this file directly.
+
+# Procedure
+
+## 1. Fix the diff range
+
+One range, shared by every pass. Fetch the base first — a base you have not refreshed silently
+widens the range with commits that already merged, and the passes then review other people's work
+as though it were yours:
+
+```bash
+# The remote pointing at gke-labs/kube-agents is not reliably called `upstream`, and
+# on a clone of the upstream repository rather than a fork it is `origin`. Find it.
+BASE_BRANCH=main                                  # or the branch you will target
+BASE_REMOTE=$(git remote | while read -r r; do
+  case "$(git remote get-url "$r")" in *gke-labs/kube-agents*) echo "$r"; break;; esac
+done)
+: "${BASE_REMOTE:=git@github.com:gke-labs/kube-agents.git}"
+
+git fetch "$BASE_REMOTE" "+refs/heads/$BASE_BRANCH:refs/kube-agents-base/$BASE_BRANCH" || {
+  echo "base fetch failed — stop here rather than reviewing against a stale base" >&2
+  exit 1
+}
+BASE=refs/kube-agents-base/$BASE_BRANCH
+
+git diff --stat "$BASE"...HEAD     # three-dot: against the merge base, not the base tip
+```
+
+Three-dot keeps base-branch drift out of everyone's scope. If you were handed a ref that already
+resolves (`git rev-parse --verify`), use it and skip the fetch. If the fetch fails, stop and say so:
+there is no safe fallback, because the wrong base fails in the direction that hides findings.
+
+## 2. Decide which passes apply
+
+- `review-adversarial` — always.
+- `review-docs-drift` — always.
+- `review-iac-parity` — only when the range touches more than one install surface's territory: the
+  provisioning scripts (`k8s-operator/scripts/`, `k8s-operator/config/`), `terraform/`, and
+  `charts/`. One surface alone is not parity work. `AGENTS.md` owns that trigger and the surface
+  table in `review-iac-parity` owns the paths; read them if the range sits near the boundary.
+
+Say which you skipped and why. A pass nobody ran is a gap in the section, not an absence of
+findings.
+
+## 3. Run the mechanical gates first, in the main loop
+
+```bash
+make docs-check
+make iac-parity-check
+```
+
+Both, every time, whatever step 2 decided: CI runs them unfiltered on every pull request, and
+`iac-parity-check` compares the surfaces against each other, so a change to one surface alone is
+exactly how it starts failing. The conditional in step 2 governs the parity _pass_, not this gate.
+
+They are cheap, they are deterministic, and their output is a fact each pass would otherwise
+re-derive. Hand the result on. Neither gate substitutes for its pass: `docs-check` covers generated
+regions, links, terminology, and map coverage but not whether the prose is still true, and
+`iac-parity-check` covers the scalar subset but not a resource only one surface creates.
+
+These two are here because the passes want their output, not because they are the local checks you
+owe. `AGENTS.md` "Local Validation Checks" is the list — prettier on changed Markdown, JSON, and
+YAML, the Docker build, the image-layer budget, `go build` in `k8s-operator/` — and a clean preflight
+discharges none of it.
+
+## 4. Get each pass a context that did not write the change
+
+One subagent per applicable pass, spawned together so they run concurrently. The main loop fixes the
+range, runs the gates, fans out, and relays — it reviews nothing itself. `review-adversarial` §1 has
+the argument for why; the short form is that a context holding the reasoning behind a diff re-derives
+that reasoning instead of testing it.
+
+**The delegation has to be requested, and that is the problem this skill exists to solve.** Coding
+agents are instructed not to spawn subagents on their own initiative — Claude Code ships a standing
+instruction to that effect, and other harnesses carry their own version of it — so an agent reading
+only the requirement finds the one route it is told not to take, and quietly runs the pass inline
+instead. In order of preference:
+
+- **The user invoked `/pr-preflight`, or asked for the review in words.** That is the request. Spawn
+  the passes and do not ask again.
+- **You got here on your own.** Ask once, before the pass, and wait: say you need a context that did
+  not write the change, how many subagents that is, and that the alternative is a review by the
+  context that already believes the change is correct. Ask when you hit it, not after.
+- **The harness has no subagents.** Start a fresh session, or a headless run, handed the same
+  material and nothing else — one per applicable pass, not just the adversarial one:
+
+  ```bash
+  claude -p "In $PWD, follow .agents/skills/review-adversarial/SKILL.md against $BASE...HEAD.
+  Derive the change's intent from the diff. Do not read the branch's commit message bodies,
+  plan files, or scratch notes."
+  ```
+
+  That second sentence is not optional padding — step 5 explains why it carries the handoff.
+
+If none of those is available to you, **you are blocked, and the pull request waits**. Say what you
+are blocked on. `AGENTS.md` is explicit that an approval you could not get blocks this step rather
+than waiving it, so the authoring context is not the fallback — running the pass there and
+disclosing it is what you do when a human, told the above, tells you to proceed anyway. Then
+**Self-Review** says which context ran the pass, in those words.
+
+## 5. What to hand each pass, and what to withhold
+
+Hand it: the repository, the diff range, the path to its skill, and the gate output from step 3.
+
+Withhold everything you know that it does not: your plan, your reasoning, the commit messages you
+drafted, the summary you were about to write, which hunks you think are the risky ones, and which
+findings you expect. Each of those tells the pass what to conclude.
+
+Withhold your intent sentence in particular. `review-adversarial` §3 derives one from the change
+itself, and the gap between what you meant and what the diff says is a finding you cannot get any
+other way — supply the sentence and you have closed the gap by hand.
+
+**Some of it you cannot withhold, so tell the pass not to read it.** A diff range is made of commits,
+so every commit message you wrote travels with it, and the pass works in your checkout rather than a
+clean worktree, so your plan and scratch files are in front of it too. Both usually state the intent
+verbatim. Put the instruction in the handoff:
+
+> Derive the change's intent from the diff. Do not read the branch's commit message bodies, plan
+> files, or scratch notes.
+
+Without that line the gap closes itself and neither of you notices.
+
+## 6. Merge what comes back, and act on it
+
+Dedupe across passes before reading them as a list. The passes overlap by design: angle H of
+`review-adversarial` reaches into docs, angle D into security and operational blast radius. The same
+defect found twice is one finding, kept in whichever form names the failure concretely.
+
+Where two passes disagree, go and read the source. Do not average them and do not take the more
+alarming one on the grounds that it is safer.
+
+The passes do not grade alike, and the merged list keeps each pass's own severity rather than
+translating it. `review-adversarial` returns a verdict per finding, so `review-adversarial` §6
+governs its half: edit on CONFIRMED, report on PLAUSIBLE. `review-docs-drift` and `review-iac-parity`
+return a Blocking/Advisory triage instead and never emit a verdict — Blocking is addressed before the
+pull request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not restate a
+Blocking finding as CONFIRMED to make one column of it; the pass did not do the verification that
+word claims.
+
+Every survivor gets a disposition either way: fixed, or deliberately not, with a reason that argues
+about this change.
+
+## 7. Re-runs
+
+A fix changes the shared range, so re-run whatever the fix invalidated — not whichever pass raised
+the finding. They are rarely the same set: rewriting a paragraph to answer an adversarial finding is
+exactly how the prose starts contradicting another document, which is docs-drift's question and not
+one `make docs-check` can answer. Work that still holds stays, and is not re-run just to have been
+run against the new head; `AGENTS.md` states that rule and this restates it.
+
+New context, same handoff. Feeding the previous round's findings into the re-run defeats the point
+of the fresh one.
+
+# Output
+
+One severity-ordered disposition list covering every pass that ran. Severity and confidence are two
+axes, and a finding carries both: its pass's severity (`BLOCKER`/`HIGH`/`MEDIUM`/`LOW` from
+`review-adversarial`, Blocking or Advisory from the other two) orders the list, and its
+CONFIRMED/PLAUSIBLE verdict or triage says how sure the pass was. Name which pass each came from, so
+a reader can tell what kind of check stands behind it. Above the list, three lines the reviewer
+cannot reconstruct from the findings:
+
+- which passes ran, and which were skipped and why;
+- for each, what kind of context it ran in — subagent, fresh session, or the one that wrote the code;
+- what the passes could not cover: suites not run, infrastructure absent, angles refused.
+
+That list is the pull request's **Self-Review** section. "No findings" is an ordinary result, and a
+complete one only alongside what was looked for.
