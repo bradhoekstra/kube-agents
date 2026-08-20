@@ -3,9 +3,12 @@
 
 Docker's overlay2 storage driver refuses to mount a stack deeper than 128
 layers and reports ``max depth exceeded``. The longest chain in
-``deploy/docker/Dockerfile`` -- ``agent-base`` -> ``platform`` ->
-``credential-proxy`` -- runs close to that ceiling, and nothing in an ordinary
-build tells you how close.
+``deploy/docker/Dockerfile`` -- ``agent-base`` -> ``platform`` -- runs close to
+that ceiling, and nothing in an ordinary build tells you how close.
+
+``credential-proxy`` used to sit at the end of that chain and was the image
+this checked. It is built on the Envoy base now and is nowhere near the
+ceiling, so ``platform`` is both the deepest image and the one to measure.
 
 Why a check rather than a comment: the limit belongs to the classic Docker
 daemon, not to the image format. BuildKit has no equivalent limit, so an image
@@ -28,9 +31,9 @@ land a fix.
 
 Usage::
 
-    # after `make build-credential-proxy`, or any build that loads the image
+    # after `make build-platform`, or any build that loads the image
     python3 scripts/check_image_layers.py
-    python3 scripts/check_image_layers.py --image credential-proxy:latest --max 120
+    python3 scripts/check_image_layers.py --image platform-agent:latest --max 120
 
 Standard library only, but it does shell out to ``docker image inspect``, so it
 needs a Docker daemon and an image that has been loaded into it. A buildx build
@@ -54,7 +57,7 @@ OVERLAY2_MAX_DEPTH = 128
 # having to restructure the file under a broken publish.
 DEFAULT_MAX_LAYERS = 120
 
-DEFAULT_IMAGE = "credential-proxy:latest"
+DEFAULT_IMAGE = "platform-agent:latest"
 
 
 def layer_count(image: str) -> int:
@@ -70,7 +73,7 @@ def layer_count(image: str) -> int:
             f"cannot inspect {image}: {stderr}\n"
             f"Build it first, e.g.:\n"
             f"  docker build --platform linux/amd64 -f deploy/docker/Dockerfile "
-            f"--target credential-proxy -t {DEFAULT_IMAGE} ."
+            f"--target platform -t {DEFAULT_IMAGE} ."
         )
     return len(json.loads(proc.stdout))
 
@@ -103,8 +106,8 @@ def main() -> int:
             f"({OVERLAY2_MAX_DEPTH} is where Docker's overlay2 driver stops mounting "
             f"and Cloud Build starts failing with 'max depth exceeded').\n"
             f"\n"
-            f"Every RUN and COPY in the agent-base -> platform -> credential-proxy "
-            f"chain is a layer. Consolidate rather than adding: files sharing a "
+            f"Every RUN and COPY in the agent-base -> platform chain is a layer. "
+            f"Consolidate rather than adding: files sharing a "
             f"destination go in one COPY, and patch appliers are staged into a "
             f"directory instead of copied one at a time. See the layer-budget note "
             f"at the top of deploy/docker/Dockerfile.",

@@ -256,11 +256,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
+	// 10b. Reconcile the credential proxy before both of its clients. Neither the
+	// sandbox nor the gateway blocks on it — the wrapped CLIs report the proxy as
+	// unavailable and the chat relay retries its poll — but starting it first
+	// keeps the first minute after a fresh install from looking broken.
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 11. Reconcile the shell sandbox before the workload that connects to it. The
 	// order is not load-bearing — ssh retries and Hermes rebuilds a failed backend
 	// on the next call — but it keeps a cold-start sandbox from being the first
 	// thing an agent waits on.
-	if err := r.reconcileShellSandbox(ctx, instance); err != nil {
+	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -511,11 +519,17 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	return r.applyManaged(ctx, agent, dep)
 }
 
+// deleteLegacyCredentialIsolationResources removes what #368 left behind when it
+// folded the standalone credential-proxy pod into a sidecar.
+//
+// The proxy's Deployment and Service are no longer on this list: they carry the
+// same names again now that the proxy has moved back out into a pod of its own
+// (credential_proxy_manifests.go), and leaving them here deleted the object the
+// reconcile had just applied, every pass. credentialProxySelector reproduces the
+// pre-#368 labels so those objects are adopted rather than orphaned.
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-credential-proxy", Namespace: agent.Namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox-metadata-deny", Namespace: agent.Namespace}},
 	}
@@ -547,17 +561,18 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // own claims and because its retention policy says Retain — so a toggle off and
 // back on returns to the same host keys.
 //
-// The credential proxy is a sidecar bound to the gateway pod's loopback, so there
-// is no URL to hand the sandbox yet; the empty string is the state the entrypoint
-// documents and starts under. #737 Part C is what fills it in.
-func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// The credential proxy now runs in a pod of its own, so the sandbox is handed
+// its Service URL — that is what makes kubectl, gcloud, git and gh work inside
+// the sandbox at all. See credential_proxy_manifests.go for why the arrangement
+// is temporary.
+func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
 	if !shellSandboxEnabled(agent) {
 		return r.deleteShellSandbox(ctx, agent)
 	}
 
 	objs := []client.Object{
 		buildShellSandboxService(agent),
-		buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), ""),
+		buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxyURL(agent), settingsHash),
 		buildShellSandboxNetworkPolicy(agent),
 	}
 	for _, obj := range objs {
@@ -602,6 +617,27 @@ func (r *PlatformAgentReconciler) deleteShellSandbox(ctx context.Context, agent 
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// reconcileCredentialProxy creates the standalone credential-proxy pod, the
+// Service its two clients reach it through, and the NetworkPolicy that narrows
+// who those clients may be. credential_proxy_manifests.go carries the reasoning,
+// including what the move costs and why it is temporary.
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	objs := []client.Object{
+		buildCredentialProxyService(agent),
+		buildCredentialProxyDeployment(agent, policyHash),
+		buildCredentialProxyNetworkPolicy(agent),
+	}
+	for _, obj := range objs {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+		if err := r.applyManaged(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
 	return nil

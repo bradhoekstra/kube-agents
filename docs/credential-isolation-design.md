@@ -14,28 +14,36 @@ token to the agent. Preventing that disclosure is not part of this design.
 
 ### Design
 
-Each PlatformAgent runs as one long-lived Pod with these managed containers:
+Each PlatformAgent runs as one long-lived gateway Pod with these managed
+containers:
 
 1. `platform-agent`: the untrusted agent sandbox.
 2. `platform-agent-dashboard`: the optional local dashboard.
 3. `fluent-bit`: log forwarding.
-4. `envoy-credential-proxy`: Envoy, the credentialed command and chat runtime,
-   and the `k8s-event-watcher`, which forwards cluster events using a
-   non-secret internal key.
+4. `agent-api-auth`: the PlatformAgent API authenticator and the
+   `k8s-event-watcher`, which forwards cluster events using a non-secret
+   internal key. It holds no credential path.
+
+The credential runtime is no longer among them. `envoy-credential-proxy` — Envoy,
+the real CLIs, and the Slack and Google Chat relays — runs in a Deployment of its
+own, `<agent>-credential-proxy`, reached over a ClusterIP Service on port 8765
+instead of loopback. See
+[`designs/credential-proxy-placement.md`](designs/credential-proxy-placement.md)
+for why it moved and what the move does not yet deliver.
 
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
-send a structured argument vector to Envoy at `127.0.0.1:8765`. Envoy forwards
-requests over a private Unix socket to the credential runtime. Slack and Google
-Chat use the same local relay.
+send a structured argument vector to Envoy at `CREDENTIAL_PROXY_URL`. Envoy
+forwards requests over a private Unix socket to the credential runtime. Slack and
+Google Chat use the same relay.
 
 Only trusted sidecars receive projected Kubernetes ServiceAccount (KSA) tokens.
-The credential sidecar receives secret environment variables, credential state,
-and its identity token. It also receives a second, separately-audienced
-Kubernetes-API token, CA, and namespace projection, which the event watcher it
-hosts uses to reach the management cluster. Neither token is mounted in the
-agent or dashboard containers. The credential sidecar also authenticates callers of the
-PlatformAgent API before forwarding requests with a non-secret internal
-sentinel. Pod-wide automatic KSA token mounting is disabled.
+The credential-proxy Pod receives secret environment variables, credential
+state, and its identity token. The `agent-api-auth` sidecar receives a second,
+separately-audienced Kubernetes-API token, CA, and namespace projection, which
+the event watcher it hosts uses to reach the management cluster. Neither token is
+mounted in the agent or dashboard containers. That sidecar also authenticates
+callers of the PlatformAgent API before forwarding requests with a non-secret
+internal sentinel. Pod-wide automatic KSA token mounting is disabled.
 
 ### Guarantee
 
@@ -94,14 +102,16 @@ the agent does not deliberately request credentials from the metadata server.
 ## Architecture
 
 ```text
-PlatformAgent Pod
+PlatformAgent gateway Pod
 
   platform-agent
     credential-free env and mounts
     CLI wrappers / chat adapters
               |
-              | HTTP on 127.0.0.1:8765
+              | HTTP to the credential-proxy Service on :8765
               v
+credential-proxy Pod
+
   envoy-credential-proxy
     Envoy listener
               |
@@ -113,10 +123,12 @@ PlatformAgent Pod
 ```
 
 Envoy is the only listener for credentialed tool and chat requests. The
-credential runtime listens on a Unix socket mounted only in the sidecar, so the
-sandbox cannot bypass Envoy by calling the runtime directly. A separate sidecar
-listener authenticates the existing PlatformAgent API on port 8643 and forwards
-to the sandbox API on loopback using a non-secret sentinel.
+credential runtime listens on a Unix socket mounted only in its own Pod, so the
+sandbox cannot bypass Envoy by calling the runtime directly. Envoy itself
+authenticates no caller: loopback was the access control while the two shared a
+Pod, and the Service that replaced it is guarded only by a NetworkPolicy. The
+`agent-api-auth` sidecar authenticates the existing PlatformAgent API on port 8643
+and forwards to the sandbox API on loopback using a non-secret sentinel.
 
 The containers have the same lifecycle because they are part of the same
 Deployment and Pod. If the sidecar is not ready, the Pod is not ready. If either

@@ -26,7 +26,11 @@ path with a NetworkPolicy egress allowlist instead. The remaining work described
 is the part that does not depend on the cluster's CNI enforcing NetworkPolicy — see
 [Denying the route versus removing the identity](#denying-the-route-versus-removing-the-identity).
 
-**Status:** proposed, not implemented. Tracked as Part C of
+**Status:** partly implemented, as a stopgap. The proxy now runs in its own
+Deployment, because Part B's sandbox needs a proxy it can reach over the network and
+could not wait for #720. The stopgap keeps the agent pod's Workload Identity binding,
+so it does not yet deliver the property this document is about, and #720 reworks it —
+see [What shipped ahead of #720](#what-shipped-ahead-of-720). Tracked as Part C of
 [#737](https://github.com/gke-labs/kube-agents/issues/737). Part C is independent of
 the shell-sandboxing work in
 [`agent-shell-sandboxing.md`](agent-shell-sandboxing.md) and can land first.
@@ -44,12 +48,13 @@ the shell-sandboxing work in
 
 ## How to read this document
 
-| Section                       | What it gives you                                                  |
-| ----------------------------- | ------------------------------------------------------------------ |
-| [Background](#background)     | what the proxy protects and how it is wired today                  |
-| [The problem](#the-problem)   | why a sidecar cannot hold the line, and why it matters             |
-| [The decision](#the-decision) | where the proxy should run, and what was rejected                  |
-| [The design](#the-design)     | the workload, the five roles inside it, and everything that breaks |
+| Section                                                  | What it gives you                                                  |
+| -------------------------------------------------------- | ------------------------------------------------------------------ |
+| [Background](#background)                                | what the proxy protects and how it is wired today                  |
+| [The problem](#the-problem)                              | why a sidecar cannot hold the line, and why it matters             |
+| [The decision](#the-decision)                            | where the proxy should run, and what was rejected                  |
+| [The design](#the-design)                                | the workload, the five roles inside it, and everything that breaks |
+| [What shipped ahead of #720](#what-shipped-ahead-of-720) | the stopgap that is running now, and what it does not give you     |
 
 ---
 
@@ -309,6 +314,103 @@ split out from the broker. That is not a regression — the sidecar is one repli
 agent today — but it does mean the credential broker cannot be made highly available
 while it is fused with an inbound event pump. Splitting them is the obvious follow-up
 and is deliberately out of scope here.
+
+---
+
+## What shipped ahead of #720
+
+Part B moves the agent's shell into a sandbox pod, and `credential-proxy-exec` there
+needs a proxy it can address. Loopback stopped being an address the moment the shell
+left the pod, so the split below landed as a stopgap rather than waiting for #720.
+**It is meant to be deleted, not extended.** When #720 merges, its
+`buildCredentialBrokerDeployment` and `splitCredentialBrokerPod` replace what is here;
+the parts worth carrying across are the role flag and the image, and both are called
+out below.
+
+| What                                | Where                                                                                                   |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| The Deployment, Service, and policy | [`credential_proxy_manifests.go`](../../k8s-operator/internal/controller/credential_proxy_manifests.go) |
+| Which services a container starts   | [`start-services.sh`](../../deploy/shared/start-services.sh), on `CREDENTIAL_PROXY_ROLE`                |
+| The role dispatch                   | `serve()` in [`credential_proxy.py`](../../agents/platform/scripts/credential_proxy.py)                 |
+| The image                           | the `credential-proxy` stage of [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile)            |
+
+### The container split in two, because two of its roles cannot leave
+
+Three of the five roles in the table above have a peer on the gateway pod's loopback,
+and moving them would have cut it.
+
+The **PlatformAgent API proxy** forwards to `127.0.0.1:8642`, which is the Hermes
+gateway. It is not an internal detail: `buildPlatformService` publishes port 8642 with
+`targetPort: 8643`, so this listener _is_ the agent's external API front door. The
+**k8s-event-watcher** posts to `127.0.0.1:8699` and reads `--profiles-dir` off the
+read-write-once data PVC, which only the gateway pod mounts.
+
+So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
+
+| Role          | Starts                                               | Runs in                              |
+| ------------- | ---------------------------------------------------- | ------------------------------------ |
+| `credentials` | credential exec broker, Google Chat and Slack relays | the new credential-proxy pod         |
+| `agent-api`   | API authenticator, k8s-event-watcher                 | the gateway pod, as `agent-api-auth` |
+| `full`        | all of them                                          | nothing, now — the default           |
+
+`full` remains the default so an image paired with an operator that predates the flag
+behaves as it always did. The `agent-api` container loads no policy and builds no
+`CommandExecutor`: it compares one key and forwards, holding no credential path. It is
+named `agent-api-auth` rather than keeping the sidecar's old `envoy-credential-proxy`,
+which now names the container in the new pod — the one that does proxy credentials.
+
+### The image stopped being built on the agent image
+
+`credential-proxy` was the agent image plus Envoy. It is now built on the Envoy base
+directly. Nothing it runs is a Hermes process — the credential runtime is one
+stdlib-heavy Python file, the CLIs come from apt — so the old chain shipped the
+model's personas, skills, plugins, and the Hermes harness into the one container whose
+purpose is to be where credentials live.
+
+Two consequences. Its Python environment is now an explicit list in the Dockerfile
+rather than something inherited, and every third-party import in `credential_proxy.py`
+is lazy, so a new one that is not added to that list fails at the point of use rather
+than at start. And the image is off the layer-budget chain, so
+`scripts/check_image_layers.py` measures `platform` instead.
+
+### What the stopgap does not give you
+
+**The agent pod keeps its cloud identity.** Both pods run under
+`kubeagents-platform-agent`, the service account carrying the
+`iam.gke.io/gcp-service-account` annotation, so the agent's shell still mints the same
+token from the metadata server. The property this whole document is about is
+**not delivered**. #720's separate ServiceAccount is what delivers it, and until then
+the move buys reachability, not isolation.
+
+**The exec path authenticates no caller.** Envoy's bind moved from `127.0.0.1` to
+`CREDENTIAL_PROXY_LISTEN_ADDRESS=0.0.0.0` and nothing replaced loopback, so any pod
+that can route to the Service can run a credentialed command. The bearer token in
+[Caller authentication](#caller-authentication) is not implemented. A NetworkPolicy
+ships alongside restricting ingress to the agent and sandbox pods, and it is inert on
+the reference install for the reason that section already gives.
+
+**The workspace check is not re-based, it is switched off for remote callers.**
+`credential_proxy_client.py` sends `cwd` and `kubeconfig` only when the proxy is on
+loopback; a cross-pod caller sends neither, and the server falls back to its own
+workspace directory — an emptyDir in the proxy pod. `kubectl` and `gcloud` do not care.
+`git` does: the lease check is a statement about a directory the proxy can see, and
+from the sandbox there is no such directory, so proxied `git` is refused with the lease
+message. Re-basing it properly needs the GitOps workspace to live somewhere both pods
+can reach, which is Part C work.
+
+**The relay path did not reverse**, contrary to
+[The relay path reverses](#the-relay-path-reverses) above. Both Google Chat directions
+are gateway-initiated pulls against `/v1/chat/events` on the relay, so only
+`GOOGLE_CHAT_RELAY_URL` changed — from `127.0.0.1` to the proxy Service — and the
+gateway needs no new ingress rule.
+
+### One name it reuses
+
+The Deployment and Service are called `<agent>-credential-proxy`, the names the
+pre-#368 standalone proxy carried before it was folded into a sidecar. A Deployment's
+`spec.selector` is immutable, so `credentialProxySelector` reproduces the old labels
+and the legacy-cleanup list no longer names those two objects: deleting them each pass
+was tearing down the pod the same reconcile had just applied.
 
 ---
 

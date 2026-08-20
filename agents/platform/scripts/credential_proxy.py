@@ -1699,7 +1699,47 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
+def build_agent_api_server() -> ThreadingHTTPServer:
+    """The authenticated front door for the Hermes API on this pod's loopback."""
+    AgentAPIProxyHandler.external_key = os.getenv("API_SERVER_EXTERNAL_KEY", "").strip()
+    if not AgentAPIProxyHandler.external_key:
+        raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
+    AgentAPIProxyHandler.upstream_key = os.getenv(
+        "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
+    )
+    port = int(os.getenv("AGENT_API_PROXY_PORT", "8643"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), AgentAPIProxyHandler)
+    LOGGER.info("authenticated PlatformAgent API proxy listening on port %d", port)
+    return server
+
+
+def serve_agent_api() -> None:
+    """Run only the agent API authenticator, in the foreground.
+
+    No policy is loaded and no CommandExecutor is built, so this process holds
+    no credential path at all: it reads one key from the environment, compares
+    it, and forwards to the gateway beside it.
+    """
+    build_agent_api_server().serve_forever()
+
+
 def serve(args: argparse.Namespace) -> None:
+    # Three services live in this file and they no longer live in the same pod.
+    # The credential runtime and the chat relays hold credentials, so they moved
+    # into a pod of their own where the agent container cannot reach them over
+    # loopback; the agent API authenticator proxies to 127.0.0.1:8642, which is
+    # the Hermes gateway, so it has to stay beside it. `full` is what every
+    # install ran before the split and remains the default, so an image paired
+    # with an operator that predates the flag behaves as it always did.
+    #
+    # See docs/designs/credential-proxy-placement.md, "What shipped ahead of
+    # #720" — the arrangement is temporary and #720 reworks it.
+    if args.role not in ("full", "credentials", "agent-api"):
+        raise SystemExit(f"unknown --role {args.role!r}")
+    if args.role == "agent-api":
+        serve_agent_api()
+        return
+
     CredentialProxyHandler.policy = Policy.load(args.policy)
     executor = CommandExecutor(
         timeout_seconds=args.timeout_seconds,
@@ -1748,18 +1788,8 @@ def serve(args: argparse.Namespace) -> None:
                     )
 
         threading.Thread(target=initialize_slack_relay, daemon=True).start()
-    AgentAPIProxyHandler.external_key = os.getenv("API_SERVER_EXTERNAL_KEY", "").strip()
-    if not AgentAPIProxyHandler.external_key:
-        raise RuntimeError("API_SERVER_EXTERNAL_KEY must be configured")
-    AgentAPIProxyHandler.upstream_key = os.getenv(
-        "AGENT_API_UPSTREAM_KEY", "cluster-internal-trusted"
-    )
-    api_server = ThreadingHTTPServer(
-        ("0.0.0.0", int(os.getenv("AGENT_API_PROXY_PORT", "8643"))),
-        AgentAPIProxyHandler,
-    )
-    threading.Thread(target=api_server.serve_forever, daemon=True).start()
-    LOGGER.info("authenticated PlatformAgent API proxy listening on port 8643")
+    if args.role == "full":
+        threading.Thread(target=build_agent_api_server().serve_forever, daemon=True).start()
     if args.unix_socket:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1779,6 +1809,10 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv(
             "CREDENTIAL_PROXY_POLICY", "/etc/credential-proxy/policy.json"
         ),
+    )
+    parser.add_argument(
+        "--role", default=os.getenv("CREDENTIAL_PROXY_ROLE", "full"),
+        choices=("full", "credentials", "agent-api"),
     )
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument(

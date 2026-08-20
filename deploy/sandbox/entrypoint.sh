@@ -15,6 +15,22 @@ log() { echo "sandbox-entrypoint: $*" >&2; }
 DATA="${SANDBOX_DATA:-/opt/data}"
 SSHD_STATE="${SANDBOX_SSHD_STATE:-/var/lib/sandbox-sshd}"
 AUTHORIZED_KEYS_SRC="${SANDBOX_AUTHORIZED_KEYS:-/etc/ssh-authorized/authorized_keys}"
+DEFAULTS="${SANDBOX_DEFAULTS:-/opt/defaults}"
+
+# Which Hermes homes get a copy of the image's trees, as paths under $DATA with
+# `.` meaning $DATA itself. The agent pod keeps one home per profile and its
+# instructions name both levels: `/opt/data/scripts/forge.py` for the shared
+# scripts and `/opt/data/profiles/platform/governance/inventory_prioritize_sop.md`
+# for the Platform Agent's own SOPs. Both are read over SSH now, so both paths
+# have to resolve here.
+#
+# `platform` is named rather than discovered because the profile list lives on
+# the agent pod's PVC, which this container cannot see. The cluster profiles are
+# deliberately not in the list: everything agents/cluster names is under
+# /opt/data/scripts, which the machine home already carries. What the agent pod
+# does push in is the *empty* layout for every profile it has, including those —
+# deploy/shared/sandbox_mirror.py, which does know the list.
+SANDBOX_HOME_ROOTS="${SANDBOX_HOME_ROOTS:-. profiles/platform}"
 
 # 1. The model's durable directory. A PVC mounts over the image's /opt/data and
 #    arrives owned by root, so the agent could not write to it. Not recursive:
@@ -40,6 +56,48 @@ between them and nothing can read across. A handoff that writes a file on one
 side and reads it on the other will not work, however identical the path looks.
 MARKER
 chown agent:agent "$DATA/.sandbox"
+
+# 1a. The skills, SOPs and shared scripts the agent's shell runs, from the image
+#     onto the volume. The Dockerfile explains what is in each tree and why the
+#     staging directory exists at all: the PVC mounts over /opt/data, so anything
+#     baked there directly would be invisible the moment a volume is attached.
+#
+#     Replace rather than merge. `cp` over the top leaves behind a skill deleted
+#     from the image and a script renamed in it, and both then sit on the volume
+#     looking current for as long as the PVC lives — the same failure the agent
+#     pod's step 2.6a exists to prevent, arriving here by the same route. The
+#     model's own files belong in $DATA/scratch and $DATA/gitops, which this does
+#     not touch; a helper it writes into $DATA/scripts is gone at the next start,
+#     and that is the contract rather than an accident.
+#
+#     Not swallowed. A half-synced tree fails later and somewhere else — as a
+#     skill whose script is missing, or a stale one that no longer matches the
+#     SKILL.md the agent pod put in the prompt.
+#     Once per home root in $SANDBOX_HOME_ROOTS, so the same tree is reachable
+#     by the machine-home path and by the profile-home path the SOPs use. They
+#     are copies rather than symlinks: a symlinked profile tree makes an `rm -rf`
+#     inside one home delete the other's, and the model owns both.
+if [ -d "$DEFAULTS" ]; then
+  for root in $SANDBOX_HOME_ROOTS; do
+    if [ "$root" = "." ]; then
+      home="$DATA"
+    else
+      home="$DATA/$root"
+    fi
+    install -d -o agent -g agent "$home"
+    for entry in "$DEFAULTS"/*; do
+      [ -e "$entry" ] || continue
+      name="$(basename "$entry")"
+      rm -rf "${home:?}/$name"
+      cp -a "$entry" "$home/$name"
+      chown -R agent:agent "$home/$name"
+    done
+    log "synced $(cd "$DEFAULTS" && echo *) from $DEFAULTS into $home"
+  done
+else
+  log "no $DEFAULTS in this image — the agent's skills, SOPs and shared scripts"
+  log "will be absent from $DATA and every skill that names one will fail."
+fi
 
 # 2. The agent's public key. Failing loudly here is the point: without it sshd
 #    starts perfectly happily and every connection is refused with "Permission
@@ -124,9 +182,21 @@ done
 #    cannot be split into a static PATH in sshd_config plus a generated line
 #    here. Whichever came first would be the only one that survived. The
 #    sshd_config comment carries the same warning from the other side.
+#    HERMES_HOME and PLATFORM_AGENT_HOME are static, and set from $DATA rather
+#    than forwarded from the pod. Both name a data root, and the two pods' roots
+#    are different volumes that only happen to share a path: forwarding the agent
+#    container's value would point every skill here at a directory this container
+#    does not have the moment an install moves `spec.harness.hermes.agentHome`.
+#
+#    They have to be set at all because step 1a is only half the delivery. A
+#    SKILL.md says `"$HERMES_HOME"/scripts/github_token_refresh.py` as often as it
+#    says the literal path, cluster_preflight.sh defaults HERMES_HOME to /opt/data
+#    and would silently check the wrong tree if that default ever moved, and
+#    gitops_workspace.agent_home() reads PLATFORM_AGENT_HOME to decide where a
+#    leased clone goes. sshd starts sessions with neither.
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
 SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
-setenv_args="PATH=\"$SANDBOX_PATH\""
+setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
 # A one-element allowlist is still an allowlist. It is written as a loop because
 # the next variable to cross this boundary should be added to a list, not have
 # a second copy of this block written for it.

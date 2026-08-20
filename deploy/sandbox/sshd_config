@@ -82,3 +82,23 @@ ClientAliveCountMax 5
 # before this file is read and no generated drop-in can relax PermitRootLogin
 # or AllowUsers.
 Include /etc/ssh/sshd_config.d/*.conf
+
+# The working directory Hermes cds into has to exist on this side of the
+# connection, and nothing in Hermes' SSH backend creates it — a delegated kanban
+# card gets a scratch workspace on the agent pod's PVC and then every command it
+# runs here exits 126. sandbox-session-command creates the directory and then
+# runs what sshd would have run; the script says why the fix is here rather than
+# upstream, and docs/designs/agent-shell-sandboxing.md has the full account.
+#
+# Scoped to `agent` rather than global. `hermes` is the account trusted
+# agent-pod code connects as for cluster commands; it does not go through
+# Hermes' terminal wrapper, so there is nothing for this to fix there and one
+# fewer process between a cluster command and its output.
+#
+# Below the Include, and that matters as much as the Include being last. A Match
+# block ends the global section for everything after it, and SetEnv inside one
+# applies only to sessions that match — so putting this above would strand the
+# entrypoint's generated SetEnv inside a per-user block and leave the `hermes`
+# account with no PATH, no HERMES_HOME and no CREDENTIAL_PROXY_URL.
+Match User agent
+    ForceCommand /usr/local/bin/sandbox-session-command

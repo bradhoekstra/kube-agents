@@ -37,6 +37,13 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 # has to pick them up itself (see create_profile steps 2c/2d).
 OVERLAY_DIR = Path(os.environ.get("PROFILE_OVERLAY_DIR", "/opt/agent-config"))
 PLUGIN_MOUNT_ROOT = Path(os.environ.get("PLUGIN_MOUNT_ROOT", "/opt/agent-plugins"))
+# deploy/shared/sandbox_mirror.py, which the image stages here alongside
+# profile_overlay.py and profile_plugins.py. Named by path rather than imported:
+# it is a CLI, the entrypoint runs it the same way, and step 2e wants its exit
+# code and its log line rather than a return value.
+SANDBOX_MIRROR = Path(
+    os.environ.get("SANDBOX_MIRROR_SCRIPT", "/opt/defaults/scripts/sandbox_mirror.py")
+)
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
 
@@ -235,16 +242,46 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     except Exception as e:  # noqa: BLE001 - a missing overlay dir must not fail the scaffold
         log(f"{name}: overlay sync failed ({e}); running on image defaults")
 
+    # 2e. Give this profile a home in the shell sandbox.
+    #
+    # The shell, the file tools and gcloud all run over SSH in the sandbox pod,
+    # which mounts its own volume at the same absolute path as this one. It has
+    # the machine home and nothing below it, and it cannot create the rest for
+    # itself: the profile list is on this pod's PVC. The entrypoint pushes the
+    # layout for every profile that exists at startup (step 5.7), and a profile
+    # scaffolded here exists long after that — including the kubeconfig
+    # directory step 3 is about to write into.
+    #
+    # --skeleton-only: the one-shot migration of the model's files is the
+    # entrypoint's job and has a marker of its own. A brand new profile has no
+    # files to move.
+    #
+    # Never fatal. An install with no sandbox exits 0 from the script itself,
+    # and a sandbox that is down leaves a profile whose shell starts in the
+    # machine home — which is where it starts anyway.
+    if SANDBOX_MIRROR.is_file():
+        try:
+            subprocess.run(
+                [sys.executable, str(SANDBOX_MIRROR),
+                 "--agent-home", str(HERMES_HOME), "--skeleton-only", "--wait", "30"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            log(f"{name}: pushed the profile layout into the shell sandbox")
+        except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
+            log(f"{name}: could not push the profile layout into the shell sandbox ({e}); "
+                "the next container start retries it")
+
     # 3. Pin a kubeconfig scoped to the target cluster.
     #
     # The gcloud runs in the shell sandbox, so the file it writes lands there
     # rather than in the agent pod — which is where it is needed, because every
     # kubectl this profile goes on to run is a sandbox command too, reading the
-    # KUBECONFIG that step 3b pins. What has not been settled is the path: the
-    # profile home below is an agent-pod path with no counterpart in the
-    # sandbox, so this call writes to a directory that does not exist there
-    # until #737's per-profile sandbox directories land. gcloud says so plainly
-    # when it happens; the alternative was to invent the layout here.
+    # KUBECONFIG that step 3b pins. Step 2e is what makes the directory it
+    # writes into exist on that side; before that landed, this call named an
+    # agent-pod path with no counterpart in the sandbox and gcloud said so.
     kubeconfig = home / "kubeconfig.yaml"
     env = _run_env({"KUBECONFIG": str(kubeconfig)})
     try:

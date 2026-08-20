@@ -43,7 +43,7 @@ func shellSandboxTestAgent() *agentv1alpha1.PlatformAgent {
 }
 
 func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
-	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "")
+	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	pod := sts.Spec.Template.Spec
 
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
@@ -55,17 +55,38 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	if pod.EnableServiceLinks == nil || *pod.EnableServiceLinks {
 		t.Error("the sandbox must not get service-link env vars: they hand it a map of the namespace it has no use for")
 	}
-	// One Secret, one key from it, and it is a public key. Anything else here is
-	// a credential in the pod the agent can run arbitrary commands in.
-	if len(pod.Volumes) != 1 {
-		t.Fatalf("expected exactly one volume in the pod spec, got %d", len(pod.Volumes))
+	// The whole list, by name, rather than a count: every volume here is a way to
+	// put bytes into the pod the agent can run arbitrary commands in, so adding one
+	// should be a decision someone makes on purpose. Exactly two are allowed — the
+	// authorized-keys Secret and the SETTINGS.md ConfigMap — and neither carries a
+	// credential. Anything else fails here and gets argued about in review.
+	allowed := map[string]bool{
+		shellSandboxKeysVolume:     true,
+		shellSandboxSettingsVolume: true,
 	}
-	secret := pod.Volumes[0].Secret
+	byName := map[string]corev1.Volume{}
+	for _, v := range pod.Volumes {
+		if !allowed[v.Name] {
+			t.Errorf("unexpected volume %q in the sandbox pod: %#v", v.Name, v.VolumeSource)
+		}
+		byName[v.Name] = v
+	}
+	keys, ok := byName[shellSandboxKeysVolume]
+	if !ok {
+		t.Fatalf("expected the %q volume, got %#v", shellSandboxKeysVolume, pod.Volumes)
+	}
+	// One Secret, one key from it, and it is a public key.
+	secret := keys.Secret
 	if secret == nil {
-		t.Fatalf("expected the authorized-keys Secret volume, got %#v", pod.Volumes[0].VolumeSource)
+		t.Fatalf("expected the authorized-keys Secret volume, got %#v", keys.VolumeSource)
 	}
 	if len(secret.Items) != 1 || secret.Items[0].Key != "authorized_keys" {
 		t.Errorf("expected only the authorized_keys item from the Secret, got %#v", secret.Items)
+	}
+	// The other one is a ConfigMap, which is the part that matters: a Secret named
+	// here would be a credential arriving by the same route.
+	if settings, ok := byName[shellSandboxSettingsVolume]; ok && settings.ConfigMap == nil {
+		t.Errorf("expected %q to be a ConfigMap, got %#v", shellSandboxSettingsVolume, settings.VolumeSource)
 	}
 }
 
@@ -73,7 +94,7 @@ func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 	// Hermes connects with StrictHostKeyChecking=accept-new and the host keys
 	// live on this volume, so a reclaimed claim is not a lost cache — it is every
 	// subsequent command failing until known_hosts is edited by hand.
-	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "")
+	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	policy := sts.Spec.PersistentVolumeClaimRetentionPolicy
 	if policy == nil {
 		t.Fatal("expected an explicit PersistentVolumeClaimRetentionPolicy; the default is Retain today and is not guaranteed to stay so")
@@ -99,7 +120,7 @@ func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 func TestShellSandboxMountsMatchTheImage(t *testing.T) {
 	// deploy/sandbox/entrypoint.sh reads both paths and exits if either is wrong.
 	// The failure is loud, but it is loud in a pod's logs rather than in CI.
-	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "")
+	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	containers := sts.Spec.Template.Spec.Containers
 	if len(containers) != 1 {
 		t.Fatalf("expected a single container, got %d", len(containers))
@@ -133,18 +154,92 @@ func TestShellSandboxMountsMatchTheImage(t *testing.T) {
 	}
 }
 
+func TestShellSandboxGetsTheSameSettingsFileAsTheAgent(t *testing.T) {
+	// Six skills read SETTINGS.md by path, and reading a file is a shell tool now.
+	// The image cannot carry it — the content is per-install, rendered from the CR
+	// — so it is the one part of the delivery set that arrives as a mount. Everything
+	// else is baked at /opt/defaults and synced by deploy/sandbox/entrypoint.sh.
+	agent := shellSandboxTestAgent()
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
+
+	var mount *corev1.VolumeMount
+	for i, m := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
+		if m.Name == shellSandboxSettingsVolume {
+			mount = &sts.Spec.Template.Spec.Containers[0].VolumeMounts[i]
+		}
+	}
+	if mount == nil {
+		t.Fatalf("expected a %s mount on the sandbox container", shellSandboxSettingsVolume)
+	}
+	// The path the skills name, and subPath so the ConfigMap lands as one file
+	// rather than replacing the data volume's whole directory.
+	if want := shellSandboxDataPath + "/" + settingsFileName; mount.MountPath != want {
+		t.Errorf("expected SETTINGS.md at %s, got %s", want, mount.MountPath)
+	}
+	if mount.SubPath != settingsFileName {
+		t.Errorf("expected subPath %s, got %q — a directory mount here hides the synced tree", settingsFileName, mount.SubPath)
+	}
+	if !mount.ReadOnly {
+		t.Error("expected the settings mount to be read-only")
+	}
+
+	var vol *corev1.Volume
+	for i, v := range sts.Spec.Template.Spec.Volumes {
+		if v.Name == shellSandboxSettingsVolume {
+			vol = &sts.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if vol == nil || vol.ConfigMap == nil {
+		t.Fatalf("expected a ConfigMap volume named %s, got %#v", shellSandboxSettingsVolume, vol)
+	}
+	// The same object the agent container mounts, so the two sides cannot disagree
+	// about what the install's scope is.
+	if vol.ConfigMap.Name != settingsConfigMapName(agent) {
+		t.Errorf("expected the agent's settings ConfigMap %q, got %q", settingsConfigMapName(agent), vol.ConfigMap.Name)
+	}
+	if vol.ConfigMap.Name != buildSettingsConfigMap(agent).Name {
+		t.Errorf("the sandbox mounts %q but the reconciler writes %q", vol.ConfigMap.Name, buildSettingsConfigMap(agent).Name)
+	}
+	// Optional, unlike the agent container's copy. The reconciler writes the
+	// ConfigMap before the StatefulSet, but they are separate objects: a sandbox
+	// that will not start because one is briefly missing takes the whole shell down,
+	// while a skill reading an absent SETTINGS.md fails on its own terms.
+	if vol.ConfigMap.Optional == nil || !*vol.ConfigMap.Optional {
+		t.Error("expected the settings ConfigMap to be optional for the sandbox")
+	}
+}
+
+func TestShellSandboxRollsWhenSettingsChange(t *testing.T) {
+	// A subPath mount is resolved once at pod start, so a ConfigMap edit alone does
+	// not reach a running sandbox. The agent's Deployment carries the same hash
+	// annotation for the same reason; without it here, editing the CR's scope rolls
+	// the agent onto the new SETTINGS.md and leaves the sandbox — where the shell
+	// actually reads it — serving the old one indefinitely.
+	agent := shellSandboxTestAgent()
+	const key = "kubeagents.x-k8s.io/settings-config-hash"
+
+	first := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "hash-one")
+	if got := first.Spec.Template.Annotations[key]; got != "hash-one" {
+		t.Fatalf("expected %s=hash-one on the pod template, got %q", key, got)
+	}
+	second := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "hash-two")
+	if first.Spec.Template.Annotations[key] == second.Spec.Template.Annotations[key] {
+		t.Error("a different settings hash must change the pod template, or nothing restarts")
+	}
+}
+
 func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	// Empty is the state until #737 Part C, and it has to be a working state: the
 	// entrypoint warns and starts, so file and code-execution tools function while
 	// the credentialed wrappers report that they are unconfigured.
-	withoutURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "")
+	withoutURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	for _, env := range withoutURL.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "CREDENTIAL_PROXY_URL" {
 			t.Errorf("expected no CREDENTIAL_PROXY_URL when none was resolved, got %q", env.Value)
 		}
 	}
 
-	withURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://test-agent-credential-proxy:8765")
+	withURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://test-agent-credential-proxy:8765", "settings-hash")
 	var found string
 	for _, env := range withURL.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "CREDENTIAL_PROXY_URL" {
@@ -166,9 +261,9 @@ func TestShellSandboxServiceIsHeadlessAndPublishesTheStableName(t *testing.T) {
 	if !svc.Spec.PublishNotReadyAddresses {
 		t.Error("expected PublishNotReadyAddresses: the pod is addressable while sshd generates host keys on a first start")
 	}
-	if svc.Name != buildShellSandboxStatefulSet(agent, "sandbox-ssh", "").Spec.ServiceName {
+	if svc.Name != buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash").Spec.ServiceName {
 		t.Errorf("the StatefulSet's serviceName must be this Service, got %q vs %q",
-			buildShellSandboxStatefulSet(agent, "sandbox-ssh", "").Spec.ServiceName, svc.Name)
+			buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash").Spec.ServiceName, svc.Name)
 	}
 	// The host Hermes dials has to be resolvable by this Service, which means
 	// <pod>.<service>.<namespace>.svc and nothing else.
@@ -229,7 +324,7 @@ func TestShellSandboxObjectsShareOneSelector(t *testing.T) {
 	// Three objects, one label set. A Service that selects nothing and a
 	// NetworkPolicy that constrains nothing both look healthy in `kubectl get`.
 	agent := shellSandboxTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "")
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 	svc := buildShellSandboxService(agent)
 	np := buildShellSandboxNetworkPolicy(agent)
 
@@ -387,7 +482,7 @@ func TestShellSandboxAuthorizedKeysSecretIsNotTheCredentialSecret(t *testing.T) 
 		t.Errorf("expected the Secret to be named after the sandbox, got %q", name)
 	}
 
-	sts := buildShellSandboxStatefulSet(agent, name, "")
+	sts := buildShellSandboxStatefulSet(agent, name, "", "settings-hash")
 	for _, v := range sts.Spec.Template.Spec.Volumes {
 		if v.Secret != nil && v.Secret.SecretName == defaultPlatformAgentSecrets {
 			t.Errorf("the sandbox pod must not reference %q, found volume %q", defaultPlatformAgentSecrets, v.Name)

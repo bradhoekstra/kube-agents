@@ -248,6 +248,184 @@ check "no sftp subsystem is advertised" "subsystem request failed" \
     agent@127.0.0.1 </dev/null 2>&1)"
 
 echo
+echo "== 4b. what the skills need to find =="
+# The shell moved here, so the files a SKILL.md tells the model to run had to
+# follow it. The image stages them at /opt/defaults and the entrypoint syncs them
+# onto the volume, because a PVC mounting over /opt/data would otherwise hide
+# anything baked there.
+#
+# fleet-audit rather than any skill: Hermes' own ssh backend separately uploads a
+# skills tree to ~/.hermes/skills, and that tree is the *chat* profile's — it does
+# not contain fleet-audit, pr-conversation, or any of the gke-* skills. Naming one
+# of the 19 it lacks is what makes this a test of the baked tree.
+check "the platform agent's own skills are on the volume" "fleet-audit" \
+  "$("${SSH[@]}" 'ls /opt/data/skills' 2>&1)"
+check "and a skill's scripts came with it" "audit_report.py" \
+  "$("${SSH[@]}" 'ls /opt/data/skills/fleet-audit/scripts' 2>&1)"
+check "the governance SOPs are readable" "compliance_audit_sop.md" \
+  "$("${SSH[@]}" 'ls /opt/data/governance' 2>&1)"
+# The whole import closure in one call. Each of these is reachable from a skill
+# script the model runs, and a missing one shows up as an ImportError deep in a
+# skill rather than as anything anybody would connect to this image.
+check "the shared-script closure imports" "ok" \
+  "$("${SSH[@]}" 'python3 -c "import sys; sys.path.insert(0, \"/opt/data/scripts\"); import sandbox_exec, forge, pr_triggers, github_token_refresh, gitops_workspace; print(\"ok\")"' 2>&1)"
+check "and so does a skill script that imports across trees" "ok" \
+  "$("${SSH[@]}" 'python3 -c "import sys; sys.path.insert(0, \"/opt/data/scripts\"); sys.path.insert(0, \"/opt/data/skills/fleet-audit/scripts\"); import audit_report; print(\"ok\")"' 2>&1)"
+# The failure this replaces named an interpreter, not a script: four of these
+# started `#!/opt/hermes/.venv/bin/python3`, a path that exists in the agent image
+# and not in this one, so `./audit_report.py` died with "no such file or
+# directory" pointing at a venv. python:3.11-slim has no /usr/bin/python3 either,
+# so there is nothing to fall through to.
+check_absent "no script names an interpreter this image does not have" "/opt/hermes/" \
+  "$("${SSH[@]}" 'grep -rh "^#!" /opt/data/scripts /opt/data/skills | sort -u' 2>&1)"
+# And the shebang actually dispatches, rather than only looking right. bash reports
+# a missing interpreter as "No such file or directory" against the script's own
+# path, which reads as a missing script.
+check_absent "a script invoked directly starts" "No such file" \
+  "$("${SSH[@]}" '/opt/data/skills/fleet-audit/scripts/audit_report.py --help' 2>&1)"
+# The tests are the bulk of the tree and nothing here runs them.
+check_absent "the unit tests did not come along" "test_audit_report.py" \
+  "$("${SSH[@]}" 'ls /opt/data/skills/fleet-audit/scripts' 2>&1)"
+# cluster_agent_profile.py cannot work here — it shells out to `hermes profile
+# create` and writes the agent pod's PVC — and four SKILL.md files name it. The
+# stub is what the model gets, so the failure explains itself instead of reading
+# as a broken image.
+stub_out=$("${SSH[@]}" 'python3 /opt/data/scripts/cluster_agent_profile.py create --name x 2>&1; echo "rc=$?"' 2>&1)
+check "the agent-pod-only stub says why" "does not run in the shell sandbox" "$stub_out"
+check "and fails rather than reporting success" "rc=1" "$stub_out"
+# $HERMES_HOME and the literal /opt/data both appear in the SKILL.md files, and
+# gitops_workspace.agent_home() reads PLATFORM_AGENT_HOME. sshd starts sessions
+# with none of them, so the entrypoint puts them on its SetEnv line.
+check "HERMES_HOME reaches a non-login session" "/opt/data" \
+  "$("${SSH[@]}" 'echo "$HERMES_HOME"' 2>&1)"
+check "PLATFORM_AGENT_HOME too" "/opt/data" \
+  "$("${SSH[@]}" 'echo "$PLATFORM_AGENT_HOME"' 2>&1)"
+check "and the reference forms in the skills resolve to the same file" "ok" \
+  "$("${SSH[@]}" 'cmp -s "$HERMES_HOME"/scripts/forge.py /opt/data/scripts/forge.py && echo ok' 2>&1)"
+# The delivery is image-owned. An edit the model makes to a skill script is gone
+# at the next start, the same contract the agent pod's force-sync gives; section 6
+# is where the restart happens and this is the marker it looks for.
+"${SSH[@]}" 'echo "# planted" >> /opt/data/scripts/forge.py' >/dev/null 2>&1
+check "the model can edit what it runs" "planted" \
+  "$("${SSH[@]}" 'tail -1 /opt/data/scripts/forge.py' 2>&1)"
+
+echo
+echo "== 4c. the working directory Hermes cds into =="
+# Every terminal command Hermes sends opens with `builtin cd -- <cwd> || exit
+# 126`, and nothing in its SSH backend creates <cwd> on the remote. The
+# delegated-kanban path is where that lands: the dispatcher mkdirs a scratch
+# workspace on the agent pod's PVC and pins it as the worker's TERMINAL_CWD,
+# this pod has a different ReadWriteOnce PVC, and so every command the card runs
+# exits 126 with no output. /usr/local/bin/sandbox-session-command is the fix
+# and this section is its test.
+#
+# Sent on the wire the way ssh.py sends it — `bash -c <shlex.quote(script)>` —
+# rather than approximated. The wrapper parses that exact encoding, so a test
+# that handed it the script any other way would exercise nothing.
+hermes_ssh() { # hermes_ssh <cwd-word> <command>: the shape base.py builds
+  local script quoted
+  script=$(printf 'builtin cd -- %s || exit 126\neval %s\n__hermes_ec=$?\nexit $__hermes_ec' \
+    "$1" "'$2'")
+  quoted=${script//\'/\'\"\'\"\'}
+  "${SSH[@]}" "bash -c '$quoted'"
+}
+
+WS="/opt/data/kanban/workspaces/smoke-$$"
+# Asserted rather than assumed: if the path already existed the next check would
+# pass without the wrapper doing anything.
+check "the scratch workspace does not exist beforehand" "No such file" \
+  "$("${SSH[@]}" "ls -d $WS" 2>&1)"
+check "a wrapped command whose cwd is missing runs in it instead of exiting 126" "$WS" \
+  "$(hermes_ssh "$WS" 'pwd' 2>&1)"
+check "and the directory it created belongs to the model" "1000" \
+  "$("${SSH[@]}" "stat -c '%u' $WS" 2>&1)"
+
+# The pre-existing failure has to survive. A cwd that cannot be created must
+# still fail, and fail the same way, rather than be papered over into something
+# that runs in the wrong directory.
+uncreatable=$(hermes_ssh /nonexistent-root/ws 'pwd' 2>&1; echo "rc=$?")
+check "an uncreatable working directory still exits 126" "rc=126" "$uncreatable"
+check "and the wrapper says which directory it could not create" \
+  "could not create /nonexistent-root/ws" "$uncreatable"
+
+# _quote_cwd_for_cd emits a bare `~` and rewrites `~/x` through $HOME, so the
+# target is a shell word and has to be expanded on this side. A wrapper that
+# took it for a literal path would create a directory named '$HOME'.
+check "a bare ~ cwd resolves to this pod's home" "/home/agent" \
+  "$(hermes_ssh '~' 'pwd' 2>&1)"
+check "a \$HOME-relative cwd with a space stays one word" "/home/agent/smoke ws" \
+  "$(hermes_ssh "\$HOME/'smoke ws'" 'pwd' 2>&1)"
+check_absent "and nothing created a directory named for the variable" '$HOME' \
+  "$("${SSH[@]}" 'ls -a / ~' 2>&1)"
+
+# Everything that is not a Hermes wrapper has to pass through untouched. tar
+# over the connection is how file sync moves whole directories in both
+# directions, and it is the traffic a ForceCommand is likeliest to break.
+check "tar over the connection still streams" "etc/hostname" \
+  "$("${SSH[@]}" 'tar cf - -C / etc/hostname' 2>/dev/null | tar tf - 2>&1)"
+plain=$("${SSH[@]}" 'echo hello' 2>&1)
+check "a plain command with no cd line is unchanged" "hello" "$plain"
+check_absent "and is not mistaken for a broken wrapper" "sandbox-session-command:" "$plain"
+
+# ForceCommand replaces the login shell as well as a command, so an interactive
+# session has to be started by hand or ssh'ing in to debug this pod stops
+# working.
+check "an interactive session still gets a shell" "agent" \
+  "$(ssh "${SSH_OPTS[@]}" agent@127.0.0.1 <<<'whoami' 2>&1)"
+
+# The drift alarm. This fix parses a string tools/environments/base.py owns, and
+# the failure mode of a base-image bump that reshapes it is silence: the mkdir
+# stops happening and cards go back to exiting 126 for no visible reason. A
+# wrapper carrying __hermes_ec and no cd line is what that looks like from here,
+# and it has to be loud.
+drift=$(printf 'echo hi\n__hermes_ec=0\nexit $__hermes_ec')
+drift_out=$("${SSH[@]}" "bash -c '$drift'" 2>&1)
+check "a Hermes wrapper with no cd line is reported, not ignored" \
+  "no longer being applied" "$drift_out"
+check "and the command still runs" "hi" "$drift_out"
+
+echo
+echo "== 4d. the kanban variables the SSH crossing drops =="
+# The dispatcher sets HERMES_KANBAN_TASK and HERMES_KANBAN_WORKSPACE in the
+# worker's process environment and nothing carries them over the connection, so
+# the worker protocol's own `cd $HERMES_KANBAN_WORKSPACE` — unquoted — collapses
+# to a bare `cd`, which goes to $HOME rather than doing nothing. Three probe
+# cards run in parallel on a live install showed it: one wrote its output into
+# the shared /home/agent, exit 0, nothing in the output to say so. The wrapper
+# derives both from the cd target.
+KWS="/opt/data/kanban/workspaces/t_5eeded01"
+check "a scratch workspace yields the task id" "task=[t_5eeded01]" \
+  "$(hermes_ssh "$KWS" 'echo "task=[$HERMES_KANBAN_TASK]"' 2>&1)"
+check "and the workspace path" "ws=[$KWS]" \
+  "$(hermes_ssh "$KWS" 'echo "ws=[$HERMES_KANBAN_WORKSPACE]"' 2>&1)"
+# The property that makes the derivation safe to leave on: it comes from the
+# `<...>/workspaces/<id>` prefix, not from the cwd, so a command the model runs
+# from a subdirectory still reports the workspace rather than the subdirectory.
+check "a subdirectory still reports the workspace, not itself" "ws=[$KWS]" \
+  "$(hermes_ssh "$KWS/build/out" 'echo "ws=[$HERMES_KANBAN_WORKSPACE]"' 2>&1)"
+# The other board layout workspaces_root() produces.
+KBWS="/opt/data/kanban/boards/ops/workspaces/t_5eeded02"
+check "the per-board workspace layout resolves too" "ws=[$KBWS] task=[t_5eeded02]" \
+  "$(hermes_ssh "$KBWS" 'echo "ws=[$HERMES_KANBAN_WORKSPACE] task=[$HERMES_KANBAN_TASK]"' 2>&1)"
+# Absent beats wrong. A script that builds an absolute path from a workspace
+# that is not its own writes outside it, so anything that is not a task id under
+# a kanban `workspaces/` directory has to leave both unset.
+check "a directory that is not a task id sets nothing" "ws=[] task=[]" \
+  "$(hermes_ssh /opt/data/kanban/workspaces/scratchpad \
+    'echo "ws=[$HERMES_KANBAN_WORKSPACE] task=[$HERMES_KANBAN_TASK]"' 2>&1)"
+check "nor does a workspaces directory outside kanban" "ws=[] task=[]" \
+  "$(hermes_ssh /opt/data/other/workspaces/t_5eeded01 \
+    'echo "ws=[$HERMES_KANBAN_WORKSPACE] task=[$HERMES_KANBAN_TASK]"' 2>&1)"
+check "nor an ordinary working directory" "ws=[] task=[]" \
+  "$(hermes_ssh /opt/data 'echo "ws=[$HERMES_KANBAN_WORKSPACE] task=[$HERMES_KANBAN_TASK]"' 2>&1)"
+# The failure as the probe card actually hit it, end to end.
+check "the unquoted protocol idiom stays in the workspace" "$KWS" \
+  "$(hermes_ssh "$KWS" 'cd $HERMES_KANBAN_WORKSPACE && pwd' 2>&1)"
+check_absent "and does not land in the home every card shares" "/home/agent" \
+  "$(hermes_ssh "$KWS" 'cd $HERMES_KANBAN_WORKSPACE && pwd' 2>&1)"
+"${SSH[@]}" "rm -rf $KWS /opt/data/kanban/boards /opt/data/kanban/workspaces/scratchpad /opt/data/other" >/dev/null 2>&1
+
+echo
 echo "== 5. credential-proxy wrappers =="
 for cli in kubectl gcloud gh git; do
   check "$cli resolves to the wrapper, not 'command not found'" "/opt/credential-proxy/bin/$cli" \
@@ -292,6 +470,12 @@ check "the model's files on the data volume survived the recycle" "probe" \
   "$("${SSH[@]}" 'ls /opt/data' 2>&1)"
 check_absent "the ones in the home did not" "ephemeral-probe" \
   "$("${SSH[@]}" 'ls -a ~' 2>&1)"
+# The other side of that line, and the reason step 1a replaces rather than merges:
+# the skills, SOPs and shared scripts are image-owned, so the edit section 4b made
+# to forge.py has to be gone. Merging would leave a script deleted from the image
+# sitting on the volume looking current for as long as the PVC lives.
+check_absent "the image-owned trees are back to the image's copy" "planted" \
+  "$("${SSH[@]}" 'tail -1 /opt/data/scripts/forge.py' 2>&1)"
 
 echo
 echo "== 7. an unconfigured proxy warns, it does not crash =="

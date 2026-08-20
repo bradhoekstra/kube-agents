@@ -181,7 +181,7 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	containerByName(t, dep.Spec.Template.Spec.Containers, "agent-api-auth")
 
 	// Service
 	svc := &corev1.Service{}
@@ -272,12 +272,17 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	objects := []client.Object{
 		agent,
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	// The credential proxy's own Deployment and Service carry these names again,
+	// so the cleanup has to leave them alone; deleting them tore down the pod the
+	// same reconcile had just applied.
+	live := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objects, live...)...).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.deleteLegacyCredentialIsolationResources(context.Background(), agent); err != nil {
@@ -287,6 +292,12 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)
 		if !errors.IsNotFound(err) {
 			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
+		}
+	}
+	for _, object := range live {
+		if err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object); err != nil {
+			t.Errorf("expected credential proxy %T %s to survive the legacy cleanup, got %v",
+				object, object.GetName(), err)
 		}
 	}
 }

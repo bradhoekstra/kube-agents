@@ -31,7 +31,11 @@ class RecordingResponse(io.BytesIO):
 
 
 class SubmittedPayloadTestCase(unittest.TestCase):
-    def submit(self, argv, environ):
+    # A sidecar proxy. Whether the endpoint is loopback decides whether the
+    # client sends paths at all, so it is part of every case below.
+    LOCAL_ENDPOINT = "http://127.0.0.1:8765"
+
+    def submit(self, argv, environ, endpoint=LOCAL_ENDPOINT):
         """Run the client against a stubbed proxy, returning the request body."""
         captured = {}
 
@@ -42,7 +46,7 @@ class SubmittedPayloadTestCase(unittest.TestCase):
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client.urllib.request, "urlopen", fake_urlopen):
                 with patch("sys.stdout", new=io.StringIO()), patch("sys.stderr", new=io.StringIO()):
-                    credential_proxy_client.execute("http://proxy", argv)
+                    credential_proxy_client.execute(endpoint, argv)
         return captured["payload"]
 
 
@@ -80,6 +84,47 @@ class TestKubeconfigForwarding(SubmittedPayloadTestCase):
         # the server's containment check on a path that is actually fine.
         payload = self.submit(["kubectl", "get", "pods"], {"KUBECONFIG": self.PINNED + "\n"})
         self.assertEqual(payload["kubeconfig"], self.PINNED)
+
+
+class TestCrossPodCallerSendsNoPaths(SubmittedPayloadTestCase):
+    """A path only means something when both ends share a filesystem.
+
+    The sandbox calls the proxy over a Service, and its `/opt/data` is its own
+    volume. Sending either path field would have the server resolve it against
+    a filesystem where it names nothing, or something else.
+    """
+
+    REMOTE_ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+
+    def test_no_cwd(self):
+        payload = self.submit(["kubectl", "get", "pods"], {}, endpoint=self.REMOTE_ENDPOINT)
+        self.assertNotIn("cwd", payload)
+
+    def test_no_kubeconfig(self):
+        payload = self.submit(
+            ["kubectl", "get", "pods"],
+            {"KUBECONFIG": "/opt/data/profiles/cluster-a/kubeconfig.yaml"},
+            endpoint=self.REMOTE_ENDPOINT,
+        )
+        self.assertNotIn("kubeconfig", payload)
+
+    def test_a_sidecar_still_sends_its_cwd(self):
+        # The loopback case has to keep working: the workspace containment
+        # check and the git lease check are both driven by this field.
+        payload = self.submit(["kubectl", "get", "pods"], {})
+        self.assertIn("cwd", payload)
+
+
+class TestSharesFilesystemWithProxy(unittest.TestCase):
+    def test_loopback_hosts(self):
+        for endpoint in ("http://127.0.0.1:8765", "http://localhost:8765", "http://[::1]:8765"):
+            with self.subTest(endpoint=endpoint):
+                self.assertTrue(credential_proxy_client.shares_filesystem_with_proxy(endpoint))
+
+    def test_a_service_name_is_not_loopback(self):
+        for endpoint in ("http://agent-credential-proxy:8765", "http://10.4.0.7:8765"):
+            with self.subTest(endpoint=endpoint):
+                self.assertFalse(credential_proxy_client.shares_filesystem_with_proxy(endpoint))
 
 
 if __name__ == "__main__":

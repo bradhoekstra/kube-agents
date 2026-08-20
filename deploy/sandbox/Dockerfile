@@ -184,6 +184,120 @@ COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
 COPY --chmod=0644 deploy/sandbox/sshd_config /etc/ssh/sshd_config
 COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
+# The ForceCommand the sshd_config names for the `agent` account. Root-owned and
+# 0755: the model can run it and cannot rewrite it, which is the point, since
+# sshd runs it for every session that account opens.
+COPY --chmod=0755 deploy/sandbox/session-command.sh /usr/local/bin/sandbox-session-command
+
+# What the agent's shell actually reads and runs, staged at /opt/defaults for the
+# entrypoint to force-sync onto the volume. Same two-part arrangement as the agent
+# image (deploy/shared/docker-entrypoint.sh steps 2a/2b): a PVC mounts over
+# /opt/data and would otherwise shadow anything baked there, so the image keeps its
+# copy somewhere the mount cannot reach and the entrypoint puts it in place on
+# every start.
+#
+# It has to be here at all because the shell moved. A SKILL.md tells the model to
+# run `"$HERMES_HOME"/scripts/github_token_refresh.py`; before #737 that resolved
+# in the agent container, and now the command runs over SSH in this one. The three
+# trees below are what those instructions name.
+#
+#   skills/     — the skill directories' own scripts/ and assets/. Discovery still
+#                 happens in the agent pod, which reads SKILL.md from the platform
+#                 profile and puts it in the prompt; what arrives here is only the
+#                 part the resulting shell command touches.
+#   governance/ — the SOPs. `fleet-audit` cites them by relative path
+#                 (`governance/compliance_audit_sop.md`) and the model reads them
+#                 with a file tool, which is also over SSH now.
+#   scripts/    — the shared modules, as an allowlist rather than the directory.
+#
+# Hermes' own ssh backend separately syncs a skills tree to /home/agent/.hermes/skills.
+# That one is not authoritative and nothing here reads it: iter_skills_files resolves
+# its source from HERMES_HOME, which names the machine-level home rather than the
+# active profile, so it uploads the *chat* profile's skills — 19 of the platform
+# agent's own are missing from it, and the copies it does send lag the image. The
+# baked tree below is what $HERMES_HOME and TERMINAL_CWD both point at.
+COPY agents/platform/skills/ /opt/defaults/skills/
+COPY agents/platform/governance/ /opt/defaults/governance/
+
+# The shared-scripts allowlist: the entry points a SKILL.md names, plus the
+# transitive closure of what they import. Enumerated rather than copied wholesale
+# because most of agents/platform/scripts/ is agent-pod machinery — the MCP server,
+# the gateway relay, the cron tick — and a copy of it here would be code that cannot
+# work, sitting where the model will find it and try.
+#
+#   sandbox_exec.py        the both-sides-safe dispatch; inert here (no
+#                          /etc/hermes/config.yaml, so it runs commands locally)
+#   forge.py               GitHub REST client, imported by pr_conversation
+#   pr_triggers.py         imported by pr_conversation, imports forge
+#   github_token_refresh.py  invoked directly by submit-suggestion Step 5
+#   gitops_workspace.py    the leased clone every write skill uses
+#   gke_endpoint.py        the DNS-endpoint decision gke-networking sends the model
+#                          to read; stdlib only, and nothing in it is agent-pod-bound
+#   cluster_preflight.sh   the Cluster Agent's first command on every kanban task
+#                          (agents/cluster/SOUL.md); its kubectl is a proxy wrapper
+#
+# agents/platform/scripts/test_sandbox_delivery.py holds this list to the agents'
+# instructions: a skill that starts calling a shared script the sandbox does not
+# have fails that test rather than failing in a pod.
+#
+# Deliberately absent, and stubbed below instead: three scripts an agent is told to
+# run that cannot run here. cluster_agent_profile.py and cluster_agent_reconcile.py
+# shell out to `hermes profile create` and write /opt/data/profiles on the agent
+# pod's PVC — cluster_agent_profile.py:325 says so of itself — and
+# kanban_notify_propagate.py opens the kanban SQLite database in the agent pod's
+# Hermes home. Leaving the paths empty reads as a broken image; the stub says what
+# is actually true and exits non-zero.
+COPY agents/platform/scripts/sandbox_exec.py \
+     agents/platform/scripts/forge.py \
+     agents/platform/scripts/pr_triggers.py \
+     agents/platform/scripts/github_token_refresh.py \
+     agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/gke_endpoint.py \
+     agents/platform/scripts/cluster_preflight.sh \
+     /opt/defaults/scripts/
+COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
+COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
+COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/kanban_notify_propagate.py
+
+# Three things, in one layer.
+#
+# The tests come out. The agent image ships them because its copy of the tree is
+# also what CI and a developer shell read; nothing here runs them, and
+# test_audit_report.py alone is 354 KB. Stripping tests and __pycache__ takes the
+# staged skills tree from 2.3 MB to 0.9 MB.
+#
+# Then the shebang guard. Four scripts in this set used to start
+# `#!/opt/hermes/.venv/bin/python3` — a path that exists in the agent image and not
+# in this one, so `./audit_report.py` here died with "no such file or directory"
+# naming an interpreter rather than the script. They now use /usr/bin/env, and this
+# fails the build if one comes back. python:3.11-slim has no /usr/bin/python3 at
+# all, so there is no near-miss to fall through to.
+#
+# Then the executable bit, which `chmod -R u=rwX` does not set — X preserves an
+# existing one rather than adding it, so a script committed 644 arrives here
+# unrunnable. Five of the ten staged scripts were, `gitops_workspace.py` among
+# them, and `./gitops_workspace.py` over ssh answered `Permission denied`. That
+# is the same failure the shebang rewrite above was for, one step later: the
+# design has these executed directly, so the mode has to say so. The agent image
+# does exactly this to the same tree.
+#
+# Then ownership. /opt/data is agent-owned and the entrypoint copies these into it,
+# so the model can edit what it runs and lose the edit at the next restart — the
+# same contract the agent pod's force-sync gives. That is not a trust boundary: the
+# `hermes` principal must never execute anything under /opt/data, because uid 1000
+# owns that mount point and can rename any directory in it aside. What `hermes`
+# runs comes off PATH, out of root-owned /opt/credential-proxy/bin.
+RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
+    find /opt/defaults -name 'test_*.py' -type f -delete && \
+    find /opt/defaults -type d -name tests -prune -exec rm -rf {} + && \
+    if grep -rl '^#!/opt/hermes/' /opt/defaults; then \
+        echo "the files above name the agent image's venv interpreter, which does not exist here" >&2; \
+        exit 1; \
+    fi && \
+    chown -R agent:agent /opt/defaults && \
+    chmod -R u=rwX,go=rX /opt/defaults && \
+    find /opt/defaults/scripts -type f -exec chmod 755 {} + && \
+    find /opt/defaults/skills -path '*/scripts/*' -type f -exec chmod 755 {} +
 
 # The same guard the agent image runs, for the same reason and with more at
 # stake: a real gcloud or kubectl in this image is a credential path out of the

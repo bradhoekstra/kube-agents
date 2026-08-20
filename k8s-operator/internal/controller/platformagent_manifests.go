@@ -294,7 +294,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	}
 
 	if gchat := integration.GoogleChat; gchat != nil && gchat.Enabled != nil && *gchat.Enabled {
-		add("GOOGLE_CHAT_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
+		add("GOOGLE_CHAT_RELAY_URL", credentialProxyURL(agent))
 		add("GOOGLE_CHAT_PROJECT_ID", gchat.ProjectID)
 		add("GOOGLE_CHAT_SUBSCRIPTION_NAME", fmt.Sprintf("projects/%s/subscriptions/%s", gchat.ProjectID, gchat.SubscriptionName))
 		add("GOOGLE_CHAT_ALLOWED_USERS", strings.Join(gchat.AllowedUsers, ","))
@@ -302,7 +302,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	}
 
 	if slack := integration.Slack; slack != nil && slack.Enabled != nil && *slack.Enabled {
-		add("SLACK_RELAY_URL", fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort))
+		add("SLACK_RELAY_URL", credentialProxyURL(agent))
 		add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
 		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
 	}
@@ -334,6 +334,16 @@ func allowAllUsers(users []string) bool {
 	return len(users) == 1 && users[0] == ""
 }
 
+// settingsFileName is both the ConfigMap's only key and the file the agent reads.
+// Two pods mount it now — the agent container at its Hermes home, and the shell
+// sandbox at its own data path — so the string is shared rather than repeated.
+const settingsFileName = "SETTINGS.md"
+
+// settingsConfigMapName is where buildSettingsConfigMap writes and both mounts read.
+func settingsConfigMapName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-settings"
+}
+
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	gitRepo := ""
@@ -355,11 +365,11 @@ func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMa
 			Kind:       "ConfigMap",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agent.Name + "-settings",
+			Name:      settingsConfigMapName(agent),
 			Namespace: agent.Namespace,
 		},
 		Data: map[string]string{
-			"SETTINGS.md": settingsContent,
+			settingsFileName: settingsContent,
 		},
 	}
 }
@@ -1761,7 +1771,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "GOOGLE_CHAT_RELAY_URL",
-					Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+					Value: credentialProxyURL(agent),
 				},
 				{
 					Name:  "GOOGLE_CHAT_PROJECT_ID",
@@ -1792,7 +1802,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			envVars = append(envVars, []corev1.EnvVar{
 				{
 					Name:  "SLACK_RELAY_URL",
-					Value: fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort),
+					Value: credentialProxyURL(agent),
 				},
 				{
 					Name:  "SLACK_ALLOWED_USERS",
@@ -1955,7 +1965,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	containers := buildBaseContainers(agent, image, envVars, agentPlugins, opts.imageVolumeSupported)
-	containers = append(containers, buildCredentialProxySidecar(agent, homeDir))
+	containers = append(containers, buildAgentAPIAuthSidecar(agent, homeDir))
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -1992,7 +2002,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
-	volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
+	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -2017,7 +2027,6 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// immutable once created.
 	podLabels := commonLabels(agent)
 	podLabels["app"] = agent.Name + "-gateway"
-	podLabels["kubeagents.x-k8s.io/has-credential-proxy"] = "true"
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2061,7 +2070,6 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 			Namespace: agent.Namespace,
 			Labels: map[string]string{
 				"app": agent.Name + "-gateway",
-				"kubeagents.x-k8s.io/has-credential-proxy": "true",
 			},
 		},
 		Spec: appsv1.DeploymentSpec{
@@ -2146,8 +2154,8 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 		},
 		{
 			Name:      "settings-volume",
-			MountPath: path.Join(homeDir, "SETTINGS.md"),
-			SubPath:   "SETTINGS.md",
+			MountPath: path.Join(homeDir, settingsFileName),
+			SubPath:   settingsFileName,
 			ReadOnly:  true,
 		},
 		{
@@ -2229,16 +2237,34 @@ func eventWatcherEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return true
 }
 
-// buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
-// Its environment and volume mounts are intentionally disjoint from the agent
-// container even though both containers share a Pod network namespace.
-func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
+// buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
+// credential runtime moved out: the authenticated front door for the Hermes API,
+// and the k8s-event-watcher.
+//
+// Neither could follow the credential proxy into its own pod, and for the same
+// reason. The API authenticator forwards to 127.0.0.1:8642, which is the Hermes
+// gateway in this pod; the watcher posts its events to the Session KV server on
+// 127.0.0.1:8699, which the agent container starts. Both are loopback peers of
+// the agent, not of the credentials.
+//
+// What that leaves behind is a container with no credential path in it. It runs
+// the same image, with CREDENTIAL_PROXY_ROLE=agent-api telling
+// deploy/shared/start-services.sh to start neither Envoy nor the executor, and
+// its environment is built here rather than by buildCredentialProxyEnv so that
+// the Slack and Google Chat tokens, the token-broker URL and the gcloud
+// bootstrap stay out of the gateway pod entirely. The agent container cannot
+// reach a credentialed endpoint on this pod's loopback because there is no
+// longer one to reach — which is the property the sandbox split is for.
+//
+// Temporary, like the rest of the split; #720 reworks it. See
+// credential_proxy_manifests.go.
+func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
 	image := resolveCredentialProxyImage(agent.Spec.Deployment)
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
-	envVars := buildCredentialProxyEnv(agent)
+	envVars := buildAgentAPIAuthEnv(agent)
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
 	// The one piece of the event watcher's configuration that varies per
 	// install. Set unconditionally and from the same resolver the rest of the
@@ -2260,24 +2286,29 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	// same-named entry in spec.deployment.env, it would sit beside it, and
 	// server-side apply refuses a duplicate key in `env`.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
+	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "agent-api"})
 	return corev1.Container{
-		Name:            "envoy-credential-proxy",
+		Name:            "agent-api-auth",
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
-		// Starts three peer services: the credential runtime, Envoy, and the
-		// k8s-event-watcher. See deploy/shared/start-services.sh.
+		// Starts two of the image's three peer services — the API authenticator
+		// and the k8s-event-watcher. See deploy/shared/start-services.sh.
 		Command: []string{"/usr/local/bin/start-services"},
 		Env:     envVars,
-		Ports: []corev1.ContainerPort{
-			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
-			{Name: "proxy-api", ContainerPort: 8643},
-		},
+		Ports:   []corev1.ContainerPort{{Name: "proxy-api", ContainerPort: 8643}},
+		// TCP, not the HTTP probe the credential proxy uses. Every path on this
+		// listener requires the bearer key, so an unauthenticated GET is a 401
+		// whether the pod is healthy or not, and there is no /healthz to ask
+		// instead — that endpoint belongs to the credential runtime, which no
+		// longer runs here.
 		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
-				"curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8765/healthz",
-			}}},
+			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromString("proxy-api"),
+			}},
 			InitialDelaySeconds: 5,
 			PeriodSeconds:       15,
+			TimeoutSeconds:      3,
+			FailureThreshold:    3,
 		},
 		Resources: corev1.ResourceRequirements{
 			// Memory request covers the watcher's informer and dedup caches, which
@@ -2288,22 +2319,54 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "credential-proxy-policy", MountPath: "/etc/credential-proxy/policy.json", SubPath: "policy.json", ReadOnly: true},
+			// No policy mount: the executor it configures is not built in this
+			// role, and a policy file here would only be misleading.
 			{Name: "credential-proxy-tmp", MountPath: "/tmp"},
-			{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
-			{Name: "credential-proxy-runtime", MountPath: "/var/run/credential-proxy"},
 			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
-			{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
-			// Default audience, unlike credential-proxy-ksa-token above. This is the
-			// token rest.InClusterConfig reads, so it is what lets the watcher cover
-			// the management cluster, which never gets a Cluster Agent profile.
+			// Default audience. This is the token rest.InClusterConfig reads, so it
+			// is what lets the watcher cover the management cluster, which never
+			// gets a Cluster Agent profile.
 			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
+			// The watcher's --profiles-dir and its dedup snapshots, both under
+			// CREDENTIAL_PROXY_WORKSPACE_ROOT above.
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
 		},
 		SecurityContext: &corev1.SecurityContext{
 			AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 	}
+}
+
+// buildAgentAPIAuthEnv is the credential-free subset of buildCredentialProxyEnv:
+// what the API authenticator and the event watcher need, and nothing that would
+// put a credential back into the gateway pod. spec.deployment.env is merged the
+// same way, so the WATCHER_* tunables still reach the watcher.
+func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
+	if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
+		apiServerSecretRef = harness.Hermes.ApiServerSecretRef
+	}
+	envVars := []corev1.EnvVar{
+		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
+		{Name: "HOME", Value: "/tmp/credential-proxy/home"},
+		// $KUBECONFIG for anything in this container that shells out. The watcher
+		// itself runs --in-cluster and does not read it.
+		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
+		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
+		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
+		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
+		// The key external callers present to the Service's api port. The
+		// authenticator compares against it and swaps in the loopback sentinel
+		// above before forwarding, so the gateway's own key never leaves this pod.
+		{Name: "API_SERVER_EXTERNAL_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: apiServerSecretRef}},
+		// The watcher authenticates to the Session KV server with this; see
+		// start-services.sh --token-env.
+		{Name: "SESSION_KV_API_KEY", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)}},
+	}
+	if agent.Spec.Deployment != nil {
+		envVars = mergeCredentialProxyEnv(envVars, agent.Spec.Deployment.Env)
+	}
+	return envVars
 }
 
 // sessionKVApiKeySecretRef resolves the Secret key holding the bearer token for
@@ -2425,6 +2488,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 	}
 	for _, name := range []string{
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
+		// Appended after this merge in both containers the sidecar split into,
+		// so both need reserving here for the reason spelled out below. The
+		// listen address is the load-bearing one: an operator who set it to
+		// 127.0.0.1 through spec.deployment.env would take the credential proxy
+		// off the network and break every wrapped CLI in the sandbox.
+		"CREDENTIAL_PROXY_LISTEN_ADDRESS",
+		"CREDENTIAL_PROXY_ROLE",
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
@@ -2433,7 +2503,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// Both appended by buildCredentialProxySidecar after this merge runs,
+		// Both appended by buildAgentAPIAuthSidecar after this merge runs,
 		// so neither is in `managed` above and neither reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
@@ -2956,8 +3026,8 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	})
 
 	// The k8s-event-watcher is not a container of its own. It runs inside
-	// envoy-credential-proxy, which holds the credentials it needs to reach
-	// cluster API servers; see buildCredentialProxySidecar.
+	// agent-api-auth, beside the Session KV server it posts to; see
+	// buildAgentAPIAuthSidecar.
 
 	return containers
 }
@@ -3039,7 +3109,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
 					LocalObjectReference: corev1.LocalObjectReference{
-						Name: agent.Name + "-settings",
+						Name: settingsConfigMapName(agent),
 					},
 					DefaultMode: ptr.To(int32(0644)),
 				},

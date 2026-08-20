@@ -8,11 +8,16 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
 
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+
+# Hostnames that mean "the proxy is in this pod", and therefore that a local
+# path means the same thing on both sides of the call.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. `git` and `gh` ignore the variable, so
@@ -20,6 +25,25 @@ SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
 # out-of-workspace path rather than ignoring it, which would turn a stray
 # KUBECONFIG into a 400 on a command that has nothing to do with Kubernetes.
 KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
+
+
+def shares_filesystem_with_proxy(endpoint: str) -> bool:
+    """Whether a path sent to `endpoint` names the same file the caller means.
+
+    Both path-valued fields in the request — `cwd` and `kubeconfig` — are
+    resolved by the server against its own filesystem. That was always safe
+    while the proxy was a sidecar. It is wrong the moment the caller is in
+    another pod: the sandbox's `/opt/data` is its own volume, and the server
+    would either reject the path for being outside its workspace or, worse,
+    open a same-named file of its own. So a cross-pod caller sends neither, and
+    the server falls back to its own workspace.
+
+    The cost is that `git` cannot be driven from another pod — the lease check
+    it runs is a statement about a directory the proxy can see, and there is no
+    such directory. See docs/designs/credential-proxy-placement.md, "What
+    shipped ahead of #720".
+    """
+    return (urllib.parse.urlsplit(endpoint).hostname or "") in LOOPBACK_HOSTS
 
 
 def execute(
@@ -30,16 +54,18 @@ def execute(
     request_payload = {
         "requestId": str(uuid.uuid4()),
         "argv": argv,
-        "cwd": os.getcwd(),
     }
-    # The command runs in the sidecar, so the caller's environment is not
+    local = shares_filesystem_with_proxy(endpoint)
+    if local:
+        request_payload["cwd"] = os.getcwd()
+    # The command runs in the proxy, so the caller's environment is not
     # inherited. KUBECONFIG is the one variable an agent legitimately needs to
     # steer: Cluster Agent profiles pin themselves to a target cluster with it
     # (see agents/cluster/config.yaml). Forward the path and let the server
     # decide whether it is acceptable — it only honours paths inside the shared
     # workspace. Whitespace is stripped because profile .env files routinely
     # carry a trailing newline.
-    if argv and argv[0] in KUBECONFIG_AWARE:
+    if local and argv and argv[0] in KUBECONFIG_AWARE:
         kubeconfig = os.environ.get("KUBECONFIG", "").strip()
         if kubeconfig:
             request_payload["kubeconfig"] = kubeconfig

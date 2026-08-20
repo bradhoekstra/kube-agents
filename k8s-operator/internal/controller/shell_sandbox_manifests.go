@@ -42,6 +42,7 @@ package controller
 import (
 	"fmt"
 	"os"
+	"path"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -71,9 +72,10 @@ const (
 	// agent pod's own uid 10000 — the two pods share nothing but a public key.
 	shellSandboxUser = "agent"
 
-	shellSandboxDataVolume = "data"
-	shellSandboxSshdVolume = "sshd"
-	shellSandboxKeysVolume = "authorized-keys"
+	shellSandboxDataVolume     = "data"
+	shellSandboxSshdVolume     = "sshd"
+	shellSandboxKeysVolume     = "authorized-keys"
+	shellSandboxSettingsVolume = "settings"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -253,7 +255,14 @@ func buildShellSandboxService(agent *agentv1alpha1.PlatformAgent) *corev1.Servic
 // is a supported state — the entrypoint logs that the wrappers are unconfigured and
 // starts anyway, so file and code-execution tools work while the credentialed ones
 // report a clear error instead of a stack trace.
-func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorizedKeysSecret, credentialProxyURL string) *appsv1.StatefulSet {
+//
+// settingsConfigHash goes on the pod template for the same reason the agent's
+// Deployment carries it: SETTINGS.md is mounted with a subPath, and a subPath mount
+// is resolved once at pod start and never refreshed. Without the annotation, editing
+// the CR's scope rolls the agent pod onto the new file and leaves the sandbox holding
+// the old one — and the sandbox is where the shell reads it, so the skills that read
+// SETTINGS.md by path would be the ones getting the stale answer.
+func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorizedKeysSecret, credentialProxyURL, settingsConfigHash string) *appsv1.StatefulSet {
 	name := shellSandboxName(agent)
 	labels := shellSandboxSelector(agent)
 
@@ -285,7 +294,12 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 			},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: labels},
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+					Annotations: map[string]string{
+						"kubeagents.x-k8s.io/settings-config-hash": settingsConfigHash,
+					},
+				},
 				Spec: corev1.PodSpec{
 					// The whole point. With a token mounted, the sandbox holds a
 					// Kubernetes credential and the boundary this workload exists
@@ -346,6 +360,27 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 							{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
 							{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
 							{Name: shellSandboxSshdVolume, MountPath: shellSandboxSshdPath},
+							{
+								// The one file in the delivery set the image cannot
+								// carry: SETTINGS.md is per-install, rendered by the
+								// operator from the CR, and six skills read it by
+								// path. The image stages skills, SOPs and shared
+								// scripts at /opt/defaults for the entrypoint to sync
+								// (deploy/sandbox/Dockerfile); this arrives the way
+								// the agent container gets the same file, as a subPath
+								// mount over its own data volume.
+								//
+								// subPath, so the ConfigMap lands as a single file
+								// rather than replacing the directory. The cost is
+								// that it does not track ConfigMap updates — a
+								// subPath mount is resolved once at container start —
+								// which matches the agent container's behaviour, where
+								// a settings change already means a restart.
+								Name:      shellSandboxSettingsVolume,
+								MountPath: path.Join(shellSandboxDataPath, settingsFileName),
+								SubPath:   settingsFileName,
+								ReadOnly:  true,
+							},
 						},
 					}},
 					Volumes: []corev1.Volume{{
@@ -357,6 +392,23 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 								// sandbox has no business seeing the private half
 								// if it ever ends up stored alongside.
 								Items: []corev1.KeyToPath{{Key: "authorized_keys", Path: "authorized_keys"}},
+							},
+						},
+					}, {
+						Name: shellSandboxSettingsVolume,
+						VolumeSource: corev1.VolumeSource{
+							ConfigMap: &corev1.ConfigMapVolumeSource{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: settingsConfigMapName(agent),
+								},
+								// Optional, unlike the agent container's copy. The
+								// reconciler writes this ConfigMap before it builds
+								// the StatefulSet, but the two are separate objects
+								// and a sandbox that cannot start because one of them
+								// is briefly missing takes the agent's whole shell
+								// with it. A skill reading an absent SETTINGS.md
+								// fails on its own terms.
+								Optional: ptr.To(true),
 							},
 						},
 					}},
@@ -459,14 +511,10 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *network
 					},
 				},
 				{
-					// The credential proxy, which today is a sidecar in the gateway
-					// pod bound to that pod's loopback — so this rule permits a
-					// connection nothing can currently make. It is written against
-					// the gateway selector because #737 Part C moves the proxy into
-					// its own pod, and at that point this peer changes and nothing
-					// else here does.
+					// The credential proxy, now a pod of its own. This is the
+					// connection every wrapped CLI in the sandbox makes.
 					To: []networkingv1.NetworkPolicyPeer{{
-						PodSelector: &metav1.LabelSelector{MatchLabels: gateway},
+						PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
 					}},
 					Ports: []networkingv1.NetworkPolicyPort{{
 						Protocol: &tcp,

@@ -1359,6 +1359,46 @@ if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; t
     ) &
 fi
 
+# 5.7. Mirror the profile layout into the shell sandbox, and move the model's
+# existing files across the first time.
+#
+# The shell, the file tools and execute_code all run in the sandbox pod now, so
+# two things that used to be true stopped being true on the day that landed.
+# Paths under $TARGET_DIR/profiles/<name> no longer resolve for a file tool —
+# the sandbox has the machine home and nothing below it — and everything the
+# model had already written to $TARGET_DIR became invisible to it while staying
+# on the volume. The script's docstring covers what crosses and what does not.
+#
+# Here rather than in the sandbox's own entrypoint because the profile list is
+# on this pod's PVC and cluster profiles are created at runtime; the sandbox
+# cannot enumerate what it has never seen. cluster_agent_profile.py calls the
+# same script with --skeleton-only when it scaffolds one, so a profile created
+# between restarts does not wait for the next one.
+#
+# Backgrounded and non-fatal, for the reason step 5.6 gives and one more: the
+# sandbox is a separate StatefulSet with no start ordering against this
+# Deployment, so "not up yet" is an ordinary outcome rather than an error. The
+# script waits, gives up quietly, and both halves are idempotent — the layout is
+# re-pushed on every start and the copy is guarded by a marker on the sandbox's
+# own volume, so a fresh sandbox PVC gets a fresh copy and an existing one does
+# not.
+#
+# Gated on IS_BOOTSTRAP_PRIMARY: every replica can reach the sandbox, and two
+# tar streams extracting into the same directory would race. --skip-old-files
+# makes that lossless rather than harmful, but there is no reason to run it
+# twice.
+SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"
+[ -f "$SANDBOX_MIRROR_SCRIPT" ] || SANDBOX_MIRROR_SCRIPT="$TARGET_DIR/scripts/sandbox_mirror.py"
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SANDBOX_MIRROR_SCRIPT" ]; then
+    echo "Mirroring the profile layout into the shell sandbox..."
+    (
+        HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+            "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
+            >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1 \
+            || echo "WARN: sandbox mirror did not complete; the agent pod's files are untouched and the next start will retry (see logs/sandbox_mirror.log)" >&2
+    ) &
+fi
+
 # 6. Execute primary process from inside the agent's own directory.
 #
 # The image inherits WORKDIR /opt/hermes from the upstream base, which is

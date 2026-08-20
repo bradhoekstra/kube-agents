@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """One private git clone per concurrent operation, so agents stop stomping.
 
 The pod does not run in a checkout. `hermes run` starts an agent in its profile

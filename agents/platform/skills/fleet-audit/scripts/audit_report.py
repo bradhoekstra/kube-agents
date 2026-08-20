@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """
 audit_report.py — Deterministic reporting harness for the fleet-audit skill.
 

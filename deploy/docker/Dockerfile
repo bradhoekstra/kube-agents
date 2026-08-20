@@ -2,8 +2,10 @@
 #
 # LAYER BUDGET. Docker's overlay2 driver refuses to mount a stack deeper than
 # 128 layers ("max depth exceeded"), and the longest chain in this file --
-# agent-base -> platform -> credential-proxy -- is measured against that ceiling
-# by scripts/check_image_layers.py, which CI runs on every pull request.
+# agent-base -> platform -- is measured against that ceiling by
+# scripts/check_image_layers.py, which CI runs on every pull request.
+# credential-proxy used to sit on the end of that chain and no longer does: it
+# is built on the Envoy image, so its layers are its own.
 #
 # The ceiling is a property of the classic Docker daemon, not of images: buildx
 # has no such limit, so a build that is over budget passes `docker-build.yml`
@@ -14,7 +16,7 @@
 # third time is a red pull request instead.
 #
 # What this means when editing: every RUN and COPY below is a layer, and the
-# budget is shared by all three stages of that chain. Adding one is fine;
+# budget is shared by both stages of that chain. Adding one is fine;
 # adding a block of them is what to avoid. Where files share a destination they
 # travel in one COPY, and appliers are staged into a directory rather than
 # copied in one at a time -- that is why those instructions look the way they
@@ -47,7 +49,10 @@ ARG ENVOY_VERSION=v1.39.0
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.26-alpine
-FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
+
+# ENVOY_IMAGE is not consumed here — it is the base of the `credential-proxy`
+# stage at the end of the file, which is where the credential runtime and the
+# CLIs it wraps are installed on top of it.
 
 # Every binary in the final image must match the architecture the image ships
 # as, and nothing in this Dockerfile can pin that: the runtime base
@@ -1158,9 +1163,16 @@ COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 #                              OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint
 #                              baked above is the only one that ever takes effect — see
 #                              tests/test_otel_config.py.
+#   sandbox_mirror.py          pushes the profile directory layout into the shell sandbox
+#                              and moves the model's existing files across once (entrypoint
+#                              step 5.7, and cluster_agent_profile.py for profiles
+#                              scaffolded later). Runs here rather than in the sandbox
+#                              because the profile list and the SSH key are both on this
+#                              side — see tests/test_sandbox_mirror.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
+     deploy/shared/sandbox_mirror.py \
      /opt/defaults/scripts/
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
@@ -1330,19 +1342,51 @@ USER 10000:10000
 # --- CREDENTIAL PROXY TARGET ---
 # Only this image contains the real credential-aware CLIs. The platform target
 # above contains wrappers with the same names and cannot execute locally.
-FROM platform AS credential-proxy
+#
+# It is built on the Envoy image rather than on `platform`, which is where it
+# used to sit. Nothing it runs is a Hermes process: the credential runtime is
+# one stdlib-heavy Python file, the CLIs come from apt, and Envoy is the base
+# image's whole reason for existing — so inheriting the agent workspace shipped
+# the model's personas, skills, plugins and the Hermes harness itself into a
+# container whose entire purpose is to be the one place credentials live. The
+# smaller the thing holding the credential, the less there is to audit.
+#
+# Two consequences worth knowing before editing. The chain is now two stages
+# deep instead of three, so the layer budget at the top of this file is no
+# longer this stage's constraint — it is `platform`'s, and that is the image
+# scripts/check_image_layers.py measures. And the Python environment here is
+# built from an explicit list below rather than inherited: a new third-party
+# import in credential_proxy.py has to be added to it or the proxy fails at the
+# point of use, since every one of those imports is lazy.
+FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS credential-proxy
 
 USER root
 
-# No `mkdir -p /etc/envoy` ahead of the config COPY: COPY creates the missing
-# parent itself, and the RUN below sets its mode. This stage sits at the end of
-# the longest chain in the file, so an instruction that buys nothing is one the
-# chain cannot afford — see the layer-budget note at the top.
-COPY --from=envoy-bin --chmod=0755 /usr/local/bin/envoy /usr/local/bin/envoy
 COPY --chmod=0644 deploy/shared/envoy-credential-proxy.yaml /etc/envoy/envoy-credential-proxy.yaml
 COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
+COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
 
-RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg && \
+# The whole scripts directory, not the four files the proxy imports today.
+# credential_proxy.py resolves gke_endpoint, which resolves sandbox_exec, and it
+# shells out to github_token_refresh.py by absolute path; a sibling added later
+# would fail at runtime, inside the credential path, with an ImportError nobody
+# sees until a wrapped command needs it. The directory is text and costs one
+# layer either way.
+COPY --chmod=0755 agents/platform/scripts/ /opt/defaults/scripts/
+
+# procps is for the `pkill` in start-services.sh; the rest are the credential
+# CLIs the proxy exists to run. python3-venv rather than python3-pip: Ubuntu
+# marks the system interpreter externally-managed (PEP 668), so a venv is both
+# the supported way in and the isolation we want.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      apt-transport-https \
+      ca-certificates \
+      curl \
+      gnupg \
+      procps \
+      python3 \
+      python3-venv && \
+    curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor --yes -o /usr/share/keyrings/cloud.google.gpg && \
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list && \
     apt-get update && apt-get install -y --no-install-recommends \
       git \
@@ -1356,7 +1400,42 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     rm -rf /var/lib/apt/lists/* && \
     chmod 755 /etc/envoy
 
+# Every third-party import in credential_proxy.py, and only those: google-* for
+# the Google Chat relay, slack_sdk for the Slack relay, pyyaml for the policy
+# file. All of them are imported inside the function that needs them, so a
+# missing one surfaces as a failed relay rather than a failed start.
+RUN python3 -m venv /opt/credential-proxy-venv && \
+    /opt/credential-proxy-venv/bin/pip install --no-cache-dir --upgrade pip && \
+    /opt/credential-proxy-venv/bin/pip install --no-cache-dir \
+      google-api-python-client \
+      google-auth \
+      google-auth-httplib2 \
+      google-cloud-pubsub \
+      pyyaml \
+      slack_sdk
+
+# The pod runs as 10000:10000. The uid does not have to exist for the container
+# to start, but gcloud and git both look the caller up and misbehave when the
+# lookup fails, so it is created here to match the agent image's `hermes`.
+# No home directory is baked: HOME is set by the operator to a path under the
+# writable /tmp emptyDir, because the root filesystem here is read-only.
+#
+# Not named `proxy`: Debian ships a system group by that name (gid 13) and
+# groupadd fails the build on the collision.
+RUN groupadd -g 10000 credproxy && \
+    useradd -u 10000 -g 10000 -M -d /tmp/credential-proxy/home -s /bin/bash credproxy
+
 USER 10000:10000
+
+EXPOSE 8765
+
+# The operator sets `command` on both containers that run this image, which
+# overrides ENTRYPOINT either way. These are here so a plain `docker run` does
+# the same thing, and so the Envoy base's own entrypoint and CMD — which would
+# otherwise start a bare proxy with no credential runtime behind it, or append
+# `-c /etc/envoy/envoy.yaml` to this one as arguments — do not survive.
+ENTRYPOINT ["/usr/local/bin/start-services"]
+CMD []
 
 
 # --- ENTRYPOINT GATE TEST TARGET ---

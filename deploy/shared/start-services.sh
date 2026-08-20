@@ -9,6 +9,16 @@
 #   envoy                 fronts the credential proxy on loopback
 #   k8s-event-watcher     watches cluster API servers and reports events
 #
+# CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
+# run in the same pod. `credentials` is the standalone credential-proxy pod:
+# Envoy and the credential runtime, which the sandbox reaches over a Service.
+# `agent-api` is what is left in the gateway pod — the watcher, which posts to
+# the Session KV server on that pod's loopback, and the API authenticator, which
+# forwards to the Hermes gateway on the same loopback. Neither of those is a
+# credential path the agent container can drive, which is the point of the
+# split. `full` is the pre-split arrangement and stays the default so an image
+# paired with an older operator behaves as it did.
+#
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
 # credentialed command, so their exit ends the container and Kubernetes
@@ -18,6 +28,22 @@
 # deliberately: EVENT_WATCHER_ENABLED=false skips it entirely, which is the
 # emergency stop for an event storm. See event_watcher_disabled below.
 set -euo pipefail
+
+CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-full}"
+case "${CREDENTIAL_PROXY_ROLE}" in
+  full | credentials | agent-api) ;;
+  *)
+    echo "start-services: unknown CREDENTIAL_PROXY_ROLE=${CREDENTIAL_PROXY_ROLE}" >&2
+    exit 1
+    ;;
+esac
+
+# Which interface Envoy's credential listener binds. Loopback is the default and
+# was the only option while the proxy was a sidecar: it authenticates no caller,
+# so being unreachable off the pod was the whole access control. The standalone
+# pod sets 0.0.0.0 and gives that up — see the caveat in
+# docs/designs/credential-proxy-placement.md, "What shipped ahead of #720".
+CREDENTIAL_PROXY_LISTEN_ADDRESS="${CREDENTIAL_PROXY_LISTEN_ADDRESS:-127.0.0.1}"
 
 # Watcher restart policy. The watcher is retried in place rather than being
 # allowed to end the container, so these bound how hard a permanently broken
@@ -100,12 +126,31 @@ terminate() {
 trap terminate EXIT INT TERM
 
 start_credential_runtime() {
-  /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/credential_proxy.py &
+  # The proxy's own interpreter, not Hermes'. This image is no longer built on
+  # the agent image, so /opt/hermes does not exist in it — see the
+  # credential-proxy stage in deploy/docker/Dockerfile.
+  /opt/credential-proxy-venv/bin/python3 /opt/defaults/scripts/credential_proxy.py \
+    --role "${CREDENTIAL_PROXY_ROLE}" &
   runtime_pid=$!
 }
 
 start_envoy() {
-  /usr/local/bin/envoy --config-path /etc/envoy/envoy-credential-proxy.yaml --log-level info &
+  local config=/etc/envoy/envoy-credential-proxy.yaml
+  if [[ "${CREDENTIAL_PROXY_LISTEN_ADDRESS}" != "127.0.0.1" ]]; then
+    # The shipped config is baked into the image at a read-only path, and Envoy's
+    # --config-yaml overlay appends to `listeners` rather than replacing the entry,
+    # so a rewritten copy in the container's writable /tmp is the way to move the
+    # bind address. The substitution is anchored to the listener's own key: the
+    # only other address in the file is the backend, which is a pipe.
+    config=/tmp/envoy-credential-proxy.yaml
+    sed "s|^\( *\)address: 127\.0\.0\.1$|\1address: ${CREDENTIAL_PROXY_LISTEN_ADDRESS}|" \
+      /etc/envoy/envoy-credential-proxy.yaml >"${config}"
+    if ! grep -q "address: ${CREDENTIAL_PROXY_LISTEN_ADDRESS}" "${config}"; then
+      echo "start-services: could not rewrite the Envoy listener address to ${CREDENTIAL_PROXY_LISTEN_ADDRESS}; the credential proxy would come up unreachable" >&2
+      exit 1
+    fi
+  fi
+  /usr/local/bin/envoy --config-path "${config}" --log-level info &
   envoy_pid=$!
 }
 
@@ -231,9 +276,15 @@ start_event_watcher() {
 }
 
 start_credential_runtime
-start_envoy
-start_event_watcher
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "agent-api" ]]; then
+  start_envoy
+fi
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "credentials" ]]; then
+  start_event_watcher
+fi
 
-# Only the two credential-path services are waited on. The watcher is absent
-# from this list deliberately — see the header.
-wait -n "${runtime_pid}" "${envoy_pid}"
+# Only the credential-path services are waited on. The watcher is absent from
+# this list deliberately — see the header. envoy_pid is empty in the agent-api
+# role, and `wait -n` rejects an empty argument, so it is expanded unquoted.
+# shellcheck disable=SC2086
+wait -n "${runtime_pid}" ${envoy_pid}

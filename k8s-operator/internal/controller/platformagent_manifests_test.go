@@ -475,9 +475,9 @@ func TestBuildDeployment(t *testing.T) {
 				t.Errorf("event-watcher should no longer be a standalone container")
 			}
 		}
-		proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
-		if proxyC.Name != "envoy-credential-proxy" {
-			t.Errorf("expected managed Envoy sidecar, got %s", proxyC.Name)
+		proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "agent-api-auth")
+		if proxyC.Name != "agent-api-auth" {
+			t.Errorf("expected the managed agent-API sidecar, got %s", proxyC.Name)
 		}
 		// The watcher's loopback flags live in the entrypoint, not here — the
 		// container passes no arguments at all. Only the per-install cluster
@@ -606,16 +606,22 @@ func TestBuildDeployment(t *testing.T) {
 	if _, ok := envMap["CREDENTIAL_PROXY_URL"]; ok {
 		t.Errorf("expected no CREDENTIAL_PROXY_URL on the agent container, got %s", envMap["CREDENTIAL_PROXY_URL"].Value)
 	}
-	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "agent-api-auth")
 	proxyEnv := make(map[string]corev1.EnvVar)
 	for _, env := range proxyC.Env {
 		proxyEnv[env.Name] = env
 	}
 	if proxyEnv["CUSTOM_VAR"].Value != "new-custom-value" {
-		t.Errorf("expected spec.deployment.env only on credential sidecar, got %#v", proxyEnv)
+		t.Errorf("expected spec.deployment.env only on the sidecar, got %#v", proxyEnv)
 	}
-	if proxyEnv["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
-		t.Errorf("reserved proxy state directory was overridden: %#v", proxyEnv["CREDENTIAL_PROXY_STATE_DIR"])
+	// The state directory belongs to the credential runtime, which now runs in a
+	// pod of its own; the same merge protects it there.
+	credentialEnv := make(map[string]corev1.EnvVar)
+	for _, env := range buildCredentialProxyContainer(agent).Env {
+		credentialEnv[env.Name] = env
+	}
+	if credentialEnv["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
+		t.Errorf("reserved proxy state directory was overridden: %#v", credentialEnv["CREDENTIAL_PROXY_STATE_DIR"])
 	}
 	if _, found := proxyEnv["BASH_ENV"]; found {
 		t.Errorf("expected unsafe shell environment override to be rejected")
@@ -659,14 +665,23 @@ func TestBuildDeployment(t *testing.T) {
 			t.Errorf("sandbox must not mount a ServiceAccount token: %#v", mount)
 		}
 	}
+	// The projected KSA token went with the credential runtime. Neither the agent
+	// container nor what is left beside it in this pod mounts one.
+	for _, c := range dep.Spec.Template.Spec.Containers {
+		for _, mount := range c.VolumeMounts {
+			if mount.Name == "credential-proxy-ksa-token" {
+				t.Errorf("container %s must not mount the credential KSA token: %#v", c.Name, mount)
+			}
+		}
+	}
 	proxyHasTokenMount := false
-	for _, mount := range proxyC.VolumeMounts {
+	for _, mount := range buildCredentialProxyContainer(agent).VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" && mount.ReadOnly {
 			proxyHasTokenMount = true
 		}
 	}
 	if !proxyHasTokenMount {
-		t.Error("expected projected KSA token to be mounted only by credential sidecar")
+		t.Error("expected the projected KSA token to be mounted by the credential proxy pod")
 	}
 	// The shim directory is gone from this image (#737), so PATH must not name
 	// it: a stale entry would make the resolution order depend on whether a
@@ -891,8 +906,8 @@ func TestBuildDeployment_DashboardEnabled(t *testing.T) {
 			if dep.Spec.Template.Spec.Containers[2].Name != "fluent-bit" {
 				t.Errorf("expected container 2 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 			}
-			if dep.Spec.Template.Spec.Containers[3].Name != "envoy-credential-proxy" {
-				t.Errorf("expected container 3 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[3].Name)
+			if dep.Spec.Template.Spec.Containers[3].Name != "agent-api-auth" {
+				t.Errorf("expected container 3 to be agent-api-auth, got %s", dep.Spec.Template.Spec.Containers[3].Name)
 			}
 
 			svc := buildPlatformService(agent)
@@ -942,8 +957,8 @@ func TestBuildDeployment_DashboardDisabled(t *testing.T) {
 	if dep.Spec.Template.Spec.Containers[1].Name != "fluent-bit" {
 		t.Errorf("expected container 1 to be fluent-bit, got %s", dep.Spec.Template.Spec.Containers[1].Name)
 	}
-	if dep.Spec.Template.Spec.Containers[2].Name != "envoy-credential-proxy" {
-		t.Errorf("expected container 2 to be envoy-credential-proxy, got %s", dep.Spec.Template.Spec.Containers[2].Name)
+	if dep.Spec.Template.Spec.Containers[2].Name != "agent-api-auth" {
+		t.Errorf("expected container 2 to be agent-api-auth, got %s", dep.Spec.Template.Spec.Containers[2].Name)
 	}
 
 	svc := buildPlatformService(agent)
@@ -1060,7 +1075,7 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 		t.Fatalf("unexpected credential proxy policy: %#v", policy)
 	}
 
-	container := buildCredentialProxySidecar(agent, "/opt/hermes")
+	container := buildCredentialProxyContainer(agent)
 	if container.Name != "envoy-credential-proxy" || container.Image != "example/credential-proxy:v1" {
 		t.Errorf("unexpected proxy container: %#v", container)
 	}
@@ -1256,7 +1271,7 @@ func TestEventWatcherTokenEnvMatchesStartServices(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
 	}
 	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
-	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "envoy-credential-proxy")
+	proxyC := containerByName(t, dep.Spec.Template.Spec.Containers, "agent-api-auth")
 	for _, env := range proxyC.Env {
 		if env.Name != tokenEnv {
 			continue
@@ -1518,8 +1533,8 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	if _, ok := envMap["SLACK_APP_TOKEN"]; ok {
 		t.Error("expected SLACK_APP_TOKEN to be absent from sandbox")
 	}
-	if envMap["SLACK_RELAY_URL"].Value != "http://127.0.0.1:8765" {
-		t.Errorf("expected credential-free Slack relay URL, got %v", envMap["SLACK_RELAY_URL"])
+	if envMap["SLACK_RELAY_URL"].Value != "http://my-agent-credential-proxy.my-ns.svc.cluster.local:8765" {
+		t.Errorf("expected the relay URL to name the credential-proxy Service, got %v", envMap["SLACK_RELAY_URL"])
 	}
 	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
 		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
@@ -1532,7 +1547,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 
 	proxyEnv := make(map[string]corev1.EnvVar)
-	for _, env := range buildCredentialProxySidecar(agent, "/opt/hermes").Env {
+	for _, env := range buildCredentialProxyContainer(agent).Env {
 		proxyEnv[env.Name] = env
 	}
 	if proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
@@ -4205,7 +4220,7 @@ func TestCredentialProxyCarriesTheEventWatcherSwitch(t *testing.T) {
 		{"emergency stop", agentWithEventWatcher(ptr.To(false)), "false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sidecar := buildCredentialProxySidecar(tc.agent, "/opt/data")
+			sidecar := buildAgentAPIAuthSidecar(tc.agent, "/opt/data")
 			var found []corev1.EnvVar
 			for _, env := range sidecar.Env {
 				if env.Name == "EVENT_WATCHER_ENABLED" {
@@ -4248,7 +4263,7 @@ func TestDeploymentEnvCannotOverrideTheEventWatcherSwitch(t *testing.T) {
 			}
 
 			var found []string
-			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+			for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
 				if e.Name == "EVENT_WATCHER_ENABLED" {
 					found = append(found, e.Value)
 				}
@@ -4273,7 +4288,7 @@ func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
 	}
 
 	var found []string
-	for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
 		if e.Name == "EVENT_WATCHER_CLUSTER_NAME" {
 			found = append(found, e.Value)
 		}
@@ -4291,7 +4306,7 @@ func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
 // needed the moment the switch goes back on, so the stop is a decision about one
 // process rather than a teardown of the sidecar.
 func TestTheEmergencyStopLeavesTheSidecarWiringIntact(t *testing.T) {
-	off := buildCredentialProxySidecar(agentWithEventWatcher(ptr.To(false)), "/opt/data")
+	off := buildAgentAPIAuthSidecar(agentWithEventWatcher(ptr.To(false)), "/opt/data")
 
 	var tokenMount, kubeconfigMount bool
 	for _, m := range off.VolumeMounts {

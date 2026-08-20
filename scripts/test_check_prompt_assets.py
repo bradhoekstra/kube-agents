@@ -31,7 +31,32 @@ import check_prompt_assets as cpa
 REPO = Path(__file__).resolve().parents[1]
 
 
-def _copy_instructions(dockerfile: Path) -> list[list[str]]:
+def _stage_ancestry(dockerfile: Path, target: str) -> set[str]:
+    """`target` and every stage it is built on, by name.
+
+    A Dockerfile with more than one target describes more than one image, and
+    a path means whatever the stage it appears in says it means. The
+    credential-proxy stage is the case that forced this: it is built on the
+    Envoy image and puts the credential runtime under /opt/defaults/scripts
+    too, but nothing there is a Hermes profile default and no entrypoint ever
+    copies it over a profile home. Reading its COPY lines into the model below
+    describes an image that does not exist.
+    """
+    parents: dict[str, str] = {}
+    for line in dockerfile.read_text(encoding="utf-8").splitlines():
+        match = re.match(r"FROM\s+(?:--\S+\s+)*(\S+)\s+AS\s+(\S+)", line)
+        if match:
+            parents[match.group(2)] = match.group(1)
+
+    ancestry = set()
+    stage = target
+    while stage in parents and stage not in ancestry:
+        ancestry.add(stage)
+        stage = parents[stage]
+    return ancestry
+
+
+def _copy_instructions(dockerfile: Path, stages: set[str] | None = None) -> list[list[str]]:
     """Every build-context COPY in a Dockerfile, as its argument list.
 
     Continuations and the multi-source form both matter here: the lines this
@@ -46,11 +71,22 @@ def _copy_instructions(dockerfile: Path) -> list[list[str]]:
     /usr/local/bin and OPT_DEFAULTS would ignore them anyway; the point is that
     one aimed at an asset directory would otherwise be read as a repo path and
     quietly agree with a model that is wrong.
+
+    `stages`, when given, restricts the result to COPYs inside those build
+    stages. Instructions before the first FROM belong to no stage and are
+    dropped with it.
     """
     text = re.sub(r"\\\n", " ", dockerfile.read_text(encoding="utf-8"))
     instructions = []
+    stage: str | None = None
     for line in text.splitlines():
+        from_match = re.match(r"FROM\s+(?:--\S+\s+)*\S+\s+AS\s+(\S+)", line)
+        if from_match:
+            stage = from_match.group(1)
+            continue
         if not line.startswith("COPY "):
+            continue
+        if stages is not None and stage not in stages:
             continue
         flags = [argument for argument in line.split()[1:] if argument.startswith("--")]
         if any(flag.startswith("--from=") for flag in flags):
@@ -359,6 +395,41 @@ class ResolutionModelTests(unittest.TestCase):
             parsed, [["agents/platform/docs/glossary.md", "/opt/defaults/docs/"]]
         )
 
+    def test_a_copy_in_an_unrelated_stage_is_not_part_of_the_agent_image(self):
+        """Two images, one Dockerfile, and /opt/defaults in both of them.
+
+        The credential-proxy stage is built on the Envoy image and puts the
+        credential runtime under /opt/defaults/scripts as well. It shares no
+        layer with the agent image and has no profile homes, so counting its
+        COPY lines would put a second `scripts` entry in the model for a
+        directory the entrypoint never sees.
+        """
+        with TemporaryDirectory() as directory:
+            dockerfile = Path(directory) / "Dockerfile"
+            dockerfile.write_text(
+                "COPY before/first-stage.md /opt/defaults/\n"
+                "FROM ${HERMES_AGENT_IMAGE}:${TAG} AS agent-base\n"
+                "COPY agents/chat/SOUL.md /opt/defaults/\n"
+                "FROM agent-base AS platform\n"
+                "COPY agents/platform/scripts/ /opt/defaults/scripts/\n"
+                "FROM ${ENVOY_IMAGE}:${V} AS credential-proxy\n"
+                "COPY agents/platform/scripts/ /opt/defaults/scripts/\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                _stage_ancestry(dockerfile, "platform"), {"platform", "agent-base"}
+            )
+            parsed = _copy_instructions(
+                dockerfile, stages=_stage_ancestry(dockerfile, "platform")
+            )
+        self.assertEqual(
+            parsed,
+            [
+                ["agents/chat/SOUL.md", "/opt/defaults/"],
+                ["agents/platform/scripts/", "/opt/defaults/scripts/"],
+            ],
+        )
+
     def test_opt_defaults_matches_the_dockerfile(self):
         """OPT_DEFAULTS is a hand-written copy of the image layout.
 
@@ -369,9 +440,15 @@ class ResolutionModelTests(unittest.TestCase):
         and quietly widens what it accepts. Re-derive it from the COPY lines so
         that adding one to the Dockerfile fails here, at the one place that has
         to know.
+
+        Only the stages the agent image is built from count -- see
+        `_stage_ancestry`.
         """
+        dockerfile = REPO / "deploy/docker/Dockerfile"
         expected: list[tuple[str, str]] = []
-        for arguments in _copy_instructions(REPO / "deploy/docker/Dockerfile"):
+        for arguments in _copy_instructions(
+            dockerfile, stages=_stage_ancestry(dockerfile, "platform")
+        ):
             *sources, destination = arguments
             if not destination.startswith("/opt/defaults/"):
                 continue

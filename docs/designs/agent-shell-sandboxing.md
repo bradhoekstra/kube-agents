@@ -128,6 +128,66 @@ reason that the sandbox's disk is still there.
 That last point is what makes a _long-running_ sandbox necessary rather than a
 per-call container. Hermes' persistence model assumes the far end outlives the call.
 
+### The `ssh` backend is unfinished, and this design carries the workarounds
+
+Picking `ssh` means taking on the least finished of Hermes' backends. It is 435 lines
+against `docker.py`'s 2050 and `local.py`'s 1687, and the difference is capability
+rather than padding. `local.py` opts into environment passthrough with
+`_profile_scoped_passthrough = True` and `docker.py` resolves the same values into
+`-e KEY=VALUE` arguments; `ssh.py` sets neither and implements no environment handling
+of its own, so the only occurrence of the word `env` in the file is in a docstring. It
+also defines no `_wrap_command`, which leaves it inheriting a command preamble
+`base.py` wrote for a filesystem the caller shares with the shell.
+
+Every defect found so far has the same shape: a host-side operation performed on a
+guest path, or a feature the local and Docker backends implement that the SSH backend
+does not. Below the environment layer Hermes has two filesystems; above it, everything
+still assumes one. Three instances are confirmed, each found by running real work
+through the sandbox rather than by reading:
+
+- **The working directory is never created on the far side.** `base.py` emits
+  `builtin cd -- <cwd> || exit 126`, and `ssh.py`'s `_ensure_remote_dirs` creates only
+  `~/.hermes` and three children. Any other cwd has to already exist there, and the
+  kanban dispatcher's per-card workspace is created on the agent pod's PVC. Upstream
+  has this as [#86413](https://github.com/NousResearch/hermes-agent/issues/86413) —
+  "`terminal.cwd` carries no filesystem namespace", which counts five independent cwd
+  resolvers — and [#62169](https://github.com/NousResearch/hermes-agent/issues/62169),
+  with no fix in `main`.
+- **The dispatcher's environment does not cross.** `terminal.env_passthrough` exists
+  for exactly this and is read by `code_execution_tool.py` and the local and Docker
+  backends only, so every `HERMES_KANBAN_*` variable arrives empty on this backend.
+- **`kanban_complete(artifacts=[...])` stats a guest path on the host.**
+  `kanban_db.py` resolves each declared artifact with `pathlib` and calls `is_file()`
+  in the gateway process, so a file that exists in the sandbox is reported as
+  unavailable.
+
+Three workarounds carry the design past them. The sandbox image's
+[`ForceCommand`](#the-working-directory-has-to-exist-on-the-far-side-and-hermes-does-not-create-it)
+creates the working directory and recovers the two `HERMES_KANBAN_*` variables that a
+path can yield; the [skills tree is baked](#what-the-sandbox-needs-and-where-it-comes-from)
+into the image rather than left to the backend's profile-unaware sync; and workers use
+`kanban_attach` in place of declared artifacts. None of them are in Hermes source — see
+[Two problems deferred](#two-problems-deferred-and-what-has-already-been-ruled-out-for-them)
+for why the repository takes the parsing risk instead of a patch.
+
+The cost is functionality, not isolation. Every one of these failures is a command that
+exits 126, a variable that reads empty, or a tool call that refuses; none of them widen
+what the sandboxed account can reach, and none of them are a way back into the agent
+pod. The nearest thing to a security consequence is a worker's unquoted
+`cd $HERMES_KANBAN_WORKSPACE` landing in the shared `/home/agent` instead of its own
+workspace, which is cards colliding with each other inside the sandbox rather than
+anything crossing its boundary. The `ForceCommand`'s derived variables are likewise
+influenced by a cwd the model chooses, and add nothing: it is the model's own shell,
+where `export HERMES_KANBAN_TASK=anything` was already available.
+
+Calling the backend unfinished rather than buggy is worth the distinction because it
+predicts where the next one is — anywhere Hermes touches a path or an environment
+variable that did not come from the environment layer. Delegated subagents, cron
+handoff and the MCP server's kubeconfig are all unexercised and all sit on that line.
+It is not a reason to reverse the decision, since the alternatives lose more (below),
+but it does mean a Hermes version bump is a re-test of this surface rather than a
+dependency update.
+
 ---
 
 ## The decision
@@ -539,6 +599,77 @@ whatever was on it available to copy across by hand. The pod's new host keys wil
 match what the agent pod pinned, so its `known_hosts` entry needs clearing in the same
 maintenance window.
 
+### Per-profile directories, and moving what is already there
+
+Giving the sandbox's volume the same `/opt/data` makes an absolute path resolve on both
+sides. Two things it does not settle: whether each profile needs its own directory over
+there, and what happens to the files the model wrote before any of this existed.
+
+**The per-profile question is answered by what the agent pod already does, which is
+nothing per profile.** `/proc/1/environ` on the gateway holds `HERMES_HOME=/opt/data`,
+`PLATFORM_AGENT_HOME=/opt/data` and `TERMINAL_CWD=/opt/data` — process-global, one set
+for the whole gateway. A shell command dispatched by the `platform` profile and one
+dispatched by a cluster profile both land in `/opt/data`, and always have.
+`_get_env_config` in `tools/terminal_tool.py` reads `os.environ` and nothing else; the
+per-task overrides that could change it (`register_task_env_overrides`) are called by the
+ACP adapter and the TUI gateway, not by the chat gateway that serves these profiles. So
+the sandbox setting the same three variables to its own `/opt/data` is parity, not a
+regression, and a per-profile `TERMINAL_CWD` would be a new behaviour rather than a
+restored one. The per-profile homes under `/opt/data/profiles/<name>` are real, but they
+are Hermes' Python-side config and state homes, reached through `get_hermes_home()` and
+never through the shell.
+
+What the profiles do need is for their paths to _exist_ over there. A skill that writes
+`/opt/data/profiles/platform/plans/x.md` gets `No such file or directory` in a sandbox
+where only the machine home was created, and the model's recovery from that is to write
+somewhere else. So the layout is mirrored: every home the agent pod has — the machine
+home and one per profile — gets the same skeleton of working directories in the sandbox
+(`artifacts`, `gitops`, `plans`, `scratch`, `tmp`, `workspace`).
+
+**[`sandbox_mirror.py`](../../deploy/shared/sandbox_mirror.py) does the mirroring, and it
+runs on the agent pod.** That side has the three things the job needs and the sandbox has
+none of them: the profile list, the SSH key, and the files themselves. It runs from the
+agent entrypoint (step 5.7, backgrounded and non-fatal, gated on the bootstrap primary so
+two replicas do not both push) and again from `cluster_agent_profile.py` when a profile is
+scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart to get its
+directories. Nothing about it is ordered against the sandbox starting: the Deployment and
+the StatefulSet come up independently, so the script waits for sshd and, failing that,
+leaves the agent pod's files untouched and lets the next start retry.
+
+**The migration is the same mechanism run once.** An install that upgrades into the
+sandbox has files on the agent pod's PVC that the model will look for and not find —
+`scratch`, `gitops`, and on the install this was written against four directories the
+model invented for itself (`infra`, `infra-repo`, `infra_repo`, `work-d0452361`). Those
+cross on the first run, a `.sandbox-migrated` marker records what moved, and later starts
+skip the copy.
+
+The selection is a denylist. An allowlist of the directories the personas name would have
+carried `scratch` and `gitops` and silently dropped all four of the invented ones — which
+is precisely the "user upgraded and lost their files" outcome the migration exists to
+prevent. A denylist fails the other way: something unneeded gets copied, and it is visible
+in the log line that names it. What it excludes is Hermes' own runtime state, credentials,
+the trees the sandbox image delivers, databases and their write-ahead logs, and
+`$HERMES_HOME/home` — the process `$HOME`, which despite the name is where pip and gcloud
+caches accumulate (831 MiB of them here) rather than anywhere the model works.
+
+**Exclusion has to happen at two levels, and finding that out cost a leaked token.** The
+first live run applied the rules to each home's top-level entries only, decided `tmp` was
+the model's and copied it whole — carrying `tmp/gke_gcloud_auth_plugin_cache`, a cached
+GKE access token, into the pod whose entire purpose is to hold no credentials. The lesson
+generalises past that one file: a directory the model owns is a directory the model has
+been running `gcloud` and `kubectl` inside, so credential files land wherever `$HOME` or
+`$KUBECONFIG` pointed at the time, at whatever depth. The top-level rules now decide only
+which entries are named to `tar`, and a second set goes to `tar` as `--exclude` patterns,
+which GNU tar matches unanchored against every member — a bare `.kube` drops `tmp/.kube`
+as readily as `.kube`. `tests/test_sandbox_mirror.py` covers both levels against the real
+`tar`, including the nested case that got through.
+
+Two smaller properties. The copy extracts with `--skip-old-files`, because with no
+ordering between the two pods a migration can arrive mid-turn and must not replace a file
+the model wrote thirty seconds ago with the agent pod's older copy. And it is bounded —
+2 GiB by default, and never past leaving 512 MiB free on the sandbox's smaller volume —
+spending the budget smallest-first so one large clone cannot evict everything else.
+
 ### What persists, and for how long
 
 | Thing             | Mechanism                                 | Lifetime               |
@@ -554,6 +685,130 @@ long-running operator, not a session; a per-conversation sandbox would throw awa
 working state between related tasks and make warm-pool startup the common case rather
 than the rare one.
 
+### The working directory has to exist on the far side, and Hermes does not create it
+
+Every terminal command Hermes sends opens with the same line, built by
+`_wrap_command` in `tools/environments/base.py`:
+
+```
+builtin cd -- <cwd> || exit 126
+```
+
+Under the local and Docker backends the directory named there is on the same filesystem
+as the process that created it, so the `cd` always succeeds. Under the SSH backend it is
+not, and nothing bridges the gap: `tools/environments/ssh.py` defines no `_wrap_command`
+of its own, and its `_ensure_remote_dirs` creates `~/.hermes` and three children and
+stops. Any other working directory has to already exist on the sandbox.
+
+The Kanban dispatcher is where that bites. `hermes_cli/kanban_db.py` allocates a
+per-card scratch workspace under `workspaces_root(board)/<task id>` and `mkdir`s it — on
+the agent pod's PVC — then pins the path as the worker's `TERMINAL_CWD` and launches the
+worker process with the same path as its own `cwd`. The worker's terminal resolves that
+as its working directory and the `cd` runs on the sandbox, which has a different
+ReadWriteOnce volume. Every command a delegated card runs exits 126 with no output and
+no message the model can act on. There is no shared-filesystem answer available: both
+volumes are RWO and nothing here has Filestore.
+
+Upstream calls this a defect and has not fixed it.
+[NousResearch/hermes-agent#86413](https://github.com/NousResearch/hermes-agent/issues/86413)
+is the general statement — `terminal.cwd` carries no filesystem namespace, five
+independent resolvers disagree, guest paths are validated with a host `stat()` — and it
+names the `TERMINAL_CWD` pin in `kanban_db.py` as an unexercised surface.
+[#62169](https://github.com/NousResearch/hermes-agent/issues/62169) reports the hard
+`|| exit 126` directly. Two patches have been proposed,
+[#62189](https://github.com/NousResearch/hermes-agent/pull/62189) and the closed
+duplicate [#62405](https://github.com/NousResearch/hermes-agent/pull/62405); both make a
+missing directory fall back to `$HOME` rather than creating it, and a maintainer
+confirmed on the latter that main still has the hard exit. So the fix has to be ours,
+and it has to hold if #62189 ever lands — under that change a card would stop failing and
+start silently running in `/home/agent`, which is worse. Creating the directory is right
+against both.
+
+It lives in the sandbox image rather than in a Hermes source patch. `deploy/sandbox/`
+already owns `sshd_config` and the entrypoint, so there is a lever here that costs the
+repository no new anchor into upstream source — every patch pair under
+`deploy/docker/patches/` is another way a base-image bump breaks the build.
+`sshd_config` sets `ForceCommand /usr/local/bin/sandbox-session-command` inside a
+`Match User agent` block; the script reads `$SSH_ORIGINAL_COMMAND`, recovers the wrapped
+script from the `bash -c '<script>'` that `ssh.py` sends, takes the target out of the
+first `builtin cd --` line, `mkdir -p`s it, and then execs exactly what `sshd` would have
+run. Scoped to `agent` because `hermes` — the account trusted agent-pod code connects as
+for cluster commands — does not go through Hermes' terminal wrapper and has nothing to
+gain. Placed below the `Include`, because a `Match` block ends the global section and
+would otherwise strand the entrypoint's generated `SetEnv` in a per-user scope.
+
+The cost of fixing it on this side is that the script parses a string `base.py` owns, and
+the failure mode of a reshape is silence. That is what the drift alarm is for: a wrapper
+that carries the `__hermes_ec` marker and no `builtin cd --` line makes the script write
+to stderr, which surfaces in the tool result the model reads. A directory that cannot be
+created is not made fatal — the `cd` fails and the command exits 126, exactly as before —
+because a wrapper for a missing-directory bug must never turn a working command into a
+broken one. Section 4c of `deploy/sandbox/smoke-test.sh` covers all of it over a real SSH
+connection: the missing workspace, the uncreatable one, the `~` and `$HOME/'a b'` forms
+`_quote_cwd_for_cd` emits, `tar` and plain commands passing through untouched, an
+interactive session still getting a shell, and the drift alarm firing.
+
+What this does not settle is where the card's output ends up. The workspace the worker
+writes now lives on the sandbox's volume, the gateway never collects it, and
+`kanban_db.py` deletes its own copy on completion. Workers report through
+`kanban_complete` rather than by leaving files behind, so nothing known depends on it —
+but a card written to hand back a file will not work, and that is a separate decision.
+
+#### The same crossing drops `HERMES_KANBAN_TASK` and `HERMES_KANBAN_WORKSPACE`
+
+Three probe cards run in parallel against the fixed image found the second half of the
+same gap. The dispatcher sets both variables in the worker's process environment, and
+nothing carries them to the far side: `ssh.py` has no environment handling at all, and
+`terminal.env_passthrough` — the config key that exists for exactly this — is read only
+by `code_execution_tool.py` and the local and Docker backends. Both arrive empty.
+
+That is not harmless, because of how the worker protocol tells workers to use them. Two
+of the three probes wrote `cd "$HERMES_KANBAN_WORKSPACE"`, quoted, where an empty value
+is a no-op, and stayed put. The third wrote it unquoted, which is `cd` with no argument
+at all — and a bare `cd` goes to `$HOME`. It wrote its output into `/home/agent`, which
+every concurrent card on the pod shares, with exit 0 and nothing in the output to say
+so. The workspaces themselves are isolated and the shell already lands in the right one;
+it is the documented `cd` that moves a worker back out of it.
+
+The wrapper recovers both from the cd target, which is the one place that information
+survives the crossing. The derivation is deliberately narrow. It reads the
+`<...>/workspaces/<task id>` prefix rather than the whole path, so a command run from a
+subdirectory still reports the workspace; it accepts both layouts `workspaces_root()`
+produces, the default board's `<home>/kanban/workspaces/<id>` and every other board's
+`<home>/kanban/boards/<slug>/workspaces/<id>`; and it requires the component to look
+like a task id under a kanban `workspaces/` directory, leaving both variables unset for
+anything else rather than guessing. Absent beats wrong here — a script that builds an
+absolute path from a workspace that is not its own writes outside it, which is the
+failure the derivation exists to prevent. Section 4d of the smoke test covers the two
+layouts, the subdirectory case, the three shapes that must set nothing, and the unquoted
+idiom itself.
+
+Only these two. The dispatcher also injects `HERMES_KANBAN_BOARD`, `_DB`,
+`_WORKSPACES_ROOT`, `_RUN_ID` and others, and none of them are recoverable from a path.
+They remain unset in the sandbox.
+
+#### `kanban_complete(artifacts=[...])` checks the file on the wrong pod
+
+A second run of three parallel probe cards, against the image carrying both fixes,
+resolved the workspace and both variables correctly and then hit the third instance of
+the same root cause. `kanban_complete` takes a list of scratch artifacts, and
+`kanban_db.py` validates each one by expanding it with `pathlib`, resolving it, checking
+it is under the workspace root, and calling `is_file()`. All four run in the gateway
+process. The file is on the sandbox, so the call fails with `declared scratch artifact
+is unavailable or not a regular file` for a file the worker can `cat` in the same turn.
+
+Nothing on this side can fix it. The validation is not a path the sandbox participates
+in — no command is sent, so there is nothing for the `ForceCommand` to repair — and the
+gateway genuinely cannot see the file, because the two pods hold separate
+ReadWriteOnce volumes. All three probes reached the same workaround unprompted:
+`kanban_attach` with the content inline, which travels through the tool call rather
+than through the filesystem. That is what a worker should use here, and the persona
+text has not been updated to say so.
+
+This is the concrete version of the open question above about whether anything needs to
+read a card's workspace after it finishes. One thing does, and it is a documented
+parameter of the completion tool.
+
 ### What the sandbox needs, and where it comes from
 
 The shell moved; the paths it was written against did not. `/opt/data` is the agent's
@@ -562,22 +817,22 @@ not exist in the sandbox at all: an environment probe dispatched as a Kanban car
 `platform-agent-shell-0` as user `agent` and reported `/opt/data exists: False`, so the
 card's own declared workspace under `/opt/data/kanban/workspaces/` was not creatable and
 the worker fell back to its home directory. Giving the sandbox's data volume the same
-path (above) is what closes that class of failure — the paths resolve on both sides now,
-against different volumes. What it does not close is content: a script that expects to
-_read_ something the agent pod put at `/opt/data` still finds nothing.
+path (above) is necessary and was not sufficient: the paths resolve on both sides now,
+against different volumes, but a directory the agent pod created still does not exist
+here, which is the subject of the section above. What neither closes is content: a script
+that expects to _read_ something the agent pod put at `/opt/data` still finds nothing.
 
-Enumerating what the sandbox legitimately needs — listed under
-[What is still unproven](#what-is-still-unproven) as nobody having done it — sorts the
-references into five classes with four different delivery mechanisms.
+Enumerating what the sandbox legitimately needs sorts the references into six classes
+with four delivery mechanisms.
 
-| What                                         | Where it comes from                    | Why                                           |
-| -------------------------------------------- | -------------------------------------- | --------------------------------------------- |
-| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                 | read into the prompt, never through the shell |
-| Skills, including their `scripts/`           | Hermes' existing `~/.hermes` sync      | already works, verified live                  |
-| Governance SOPs                              | baked into the sandbox image           | static, versioned with the repo               |
-| The shell-invoked subset of `scripts/`       | baked into the sandbox image           | static, and the subset is small               |
-| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod | per-install content, rendered by the operator |
-| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime      | data, not delivery                            |
+| What                                         | Where it comes from                                | Why                                           |
+| -------------------------------------------- | -------------------------------------------------- | --------------------------------------------- |
+| Persona (`SOUL.md`, `AGENTS.md`)             | stays in the agent pod                             | read into the prompt, never through the shell |
+| Skills, including their `scripts/`           | baked at `/opt/defaults`, synced by the entrypoint | the existing sync delivers the wrong tree     |
+| Governance SOPs                              | the same bake and sync                             | static, versioned with the repo               |
+| The shell-invoked subset of `scripts/`       | the same bake and sync, as an allowlist            | static, and the subset is small               |
+| `SETTINGS.md`                                | ConfigMap mounted into the sandbox pod             | per-install content, rendered by the operator |
+| Outputs (`INVENTORY.md`, scratch workspaces) | written to `/opt/data` at runtime                  | data, not delivery                            |
 
 **The persona stays behind, and that is a property rather than an omission.** Nothing
 writes `SOUL.md` through the shell. The only writer is
@@ -587,53 +842,134 @@ everything else that names the file is a test fixture. So the agent cannot modif
 own persona, because the persona is not on a filesystem any of its tools can reach.
 Before the sandbox that was true only by convention.
 
-**Skills already arrive, and whole.** Hermes' SSH backend syncs `~/.hermes/skills` into
-the sandbox, and it syncs trees rather than just the markdown: on the live pair,
-`github-issue-resolver`, `submit-suggestion` and `fleet-audit` each have their
-`scripts/*.py` present under `/home/agent/.hermes/skills/`. 62 skills, 16 MB. Nothing
-to build.
+**The skills that arrive by sync are the wrong ones.** An earlier read of this said the
+sync already handled it, on the strength of `github-issue-resolver`,
+`submit-suggestion` and `fleet-audit` being present under
+`/home/agent/.hermes/skills/`. Those three are in the intersection of two different
+skill sets, which is why the spot-check passed. Diffing the sets shows what it missed:
+the sandbox's synced tree holds the 40 skills of the machine-level home, and 19 of the
+platform agent's own — `fleet-audit`, `pr-conversation`, and every `gke-*`
+troubleshooting skill — are not among them. 22 stock Hermes skills (`apple`,
+`creative`, `smart-home`) are there in their place.
 
-**Governance and shared scripts are baked into the image rather than synced.** The
-alternative was extending the sync to cover them, which keeps one delivery mechanism
-instead of two. It was rejected because the sync is upstream Hermes behaviour scoped to
-`~/.hermes`, so widening it means carrying a patch, and because a baked image is
-auditable in a way a sync is not: what the sandbox contains is what the Dockerfile
-says, reviewable in the diff. The cost is accepted and real — skills update when the
-agent restarts, baked files only when the image is rebuilt, and the two can drift.
+The copies that do arrive are stale as well. `resolver.py` is 28091 bytes in the repo
+and in the platform profile, md5 `627c7fb6`; the sandbox has a 14492-byte copy, md5
+`45e687e0`, dated five days earlier and without the `sandbox_exec` routing the shell
+move added to it.
+
+Neither is a bug in the sync so much as the sync answering a different question.
+`iter_skills_files` reads `_resolve_hermes_home()/skills`, which resolves through
+`HERMES_HOME` to the agent's data root — the default (chat) profile's skills — rather
+than to the active profile at `/opt/data/profiles/platform`. It is structurally
+profile-unaware, there is no configuration that changes it, and its source directory is
+one the startup skill sync marks user-modified and skips. So the sync is not the
+delivery mechanism; it is a 15 MB tree in the sandbox that nothing reads. Skill
+discovery happens in the agent pod, which reads `SKILL.md` from the platform profile
+and puts it in the prompt, and every path a `SKILL.md` then names resolves through
+`HERMES_HOME` or `TERMINAL_CWD` — both `/opt/data` in the sandbox, and both the baked
+tree.
+
+**Skills, governance and the shared scripts are baked, and synced onto the volume by
+the entrypoint.** Baking them at `/opt/data` directly does not work: the StatefulSet
+mounts a PVC over that path and the image's copy disappears under it. This is the
+problem the agent image already solved, and the sandbox uses the same shape — the
+image stages at `/opt/defaults`, and `deploy/sandbox/entrypoint.sh` copies it onto the
+volume on every start, before sshd is exec'd.
+
+The sync replaces rather than merges. Copying over the top leaves a skill deleted from
+the image, or a script renamed in it, sitting on the volume for as long as the PVC
+lives and looking current. That makes the trees image-owned: the model can edit a
+script it is debugging and the edit is gone at the next restart, which is the same
+contract the agent pod's force-sync gives. Model-written files belong in
+`/opt/data/scratch` and `/opt/data/gitops`, which the sync does not touch.
+
+Extending Hermes' sync to cover governance and scripts was the alternative, and it
+keeps one mechanism instead of two. It was rejected before the measurement above and
+the measurement only strengthens it: the sync is upstream behaviour scoped to
+`~/.hermes`, widening it means carrying a patch, and a baked image is auditable in a
+way a sync is not — what the sandbox contains is what the Dockerfile says.
 
 **Not all of `scripts/` goes.** The directory holds over a hundred files and most are
 agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_server.py`,
 `router_server.py`, `profile_cron_tick.py`, `credential_proxy.py`. Shipping them
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
-wrong thing for a reviewer to find even though it is inert there. The set the agent
-actually invokes from the shell is `cluster_agent_profile.py` (8 call sites in the
-prose), `kanban_notify_propagate.py` (4) and `cluster_preflight.sh` (3). So the image
-gets an explicit allowlist, enforced the way the image already fails the build if a
-real `gcloud` appears. `kanban_notify_propagate.py` is disqualified below.
+wrong thing for a reviewer to find even though it is inert there. So the image gets an
+explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py` and
+`cluster_preflight.sh` — the entry points an agent is told to run, plus the transitive
+closure of what they import.
 
-`cluster_agent_reconcile.py` looked like a fourth and is not, which is the trap the
-allowlist has to be written against. It has one shell call site
-(`cluster-agent-lifecycle/SKILL.md:100`, a `--dry-run`), but it is also the script
-behind the `cluster-agent-reconcile` cron job — and cron scripts run in the agent pod,
-for the reasons below. Baking it would put a second copy in the sandbox that can drift
-from the one that actually runs. A script's shell call sites do not qualify it on their
-own; being absent from every `jobs.json` is the other half of the test.
+**The test for whether a script qualifies is what it needs, not how it is called.** An
+earlier version of this proposed "shell call sites, and absent from every `jobs.json`",
+and that test admits `cluster_agent_profile.py` — the script with the most shell call
+sites of any, and one that cannot run in the sandbox at all. It shells out to `hermes
+profile create` and writes `/opt/data/profiles` on the agent pod's PVC, as its own line
+325 says: _"Stays in the agent pod: `hermes` needs the profiles on the data PVC"_. The
+qualifying question is the one the cron section below already asks — does it need
+agent-pod-only resources: the `hermes` binary, the profiles tree, the session or kanban
+databases, Hermes' own Python namespace.
 
-**`SETTINGS.md` is mounted, and not at `/opt/data`.** Its content is per-install: the
-operator renders it from `spec.integration.github.gitRepo` into an `<agent>-settings`
-ConfigMap (`buildSettingsConfigMap`) and mounts it as a subPath. The ConfigMap already
-exists, so the operator mounts it a second time into the sandbox pod.
+Three scripts an agent is told to run fail it: `cluster_agent_profile.py`,
+`cluster_agent_reconcile.py` and `kanban_notify_propagate.py`. Each gets a stub at its
+path in the sandbox that prints why it cannot run there and exits non-zero. Leaving the
+path empty was the other option and reads worse — the model gets `No such file or
+directory`, concludes the image is broken, and spends a turn proving it. The fuller
+answer for the profile scripts is an MCP tool, since the MCP server runs in the agent
+pod; `platform_mcp_server.py` exposes no profile tool today.
 
-Mounting it at `/opt/data/SETTINGS.md` inside the sandbox was considered, because it
-would need no code change at all — three parsers hardcode that path
-(`resolver.py:18` with no override, `audit_report.py:4079` behind
-`FLEET_AUDIT_SETTINGS`, `gitops_workspace.py:119` off `agent_home()`). It was rejected:
-it makes `/opt/data` exist in the sandbox, and the absence of `/opt/data` is the
-one-line check that tells anybody whether the isolation is real. The
-`gke-stockout-investigator` plugin already reads
-`${PLATFORM_AGENT_HOME:-/opt/data}/SETTINGS.md`, so the override precedent exists;
-`PLATFORM_AGENT_HOME` becomes the standard, set in the sandbox environment, and the two
-parsers that cannot honour it are changed.
+None of this is held together by review.
+[`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
+reads the allowlist out of the Dockerfile and checks it against the agents' own
+instructions: every shared script named by a runtime path is baked or stubbed, the
+allowlist is closed under import, and nothing on it names an interpreter the sandbox
+does not have. Adding a skill that calls a new shared script fails that test rather
+than failing in a pod.
+
+**`SETTINGS.md` is mounted, at `/opt/data/SETTINGS.md`.** Its content is per-install:
+the operator renders it from `spec.integration.github.gitRepo` into an
+`<agent>-settings` ConfigMap (`buildSettingsConfigMap`) and mounts it as a subPath. The
+ConfigMap already exists, so the operator mounts it a second time into the sandbox pod
+— over the data volume, the way the agent container already mounts it over its PVC.
+
+An earlier version of this rejected that path on the grounds that it makes `/opt/data`
+exist in the sandbox, and that the absence of `/opt/data` is the one-line check for
+whether the isolation is real. That reasoning is obsolete: giving the sandbox's volume
+the same path was a deliberate later decision, and the `.sandbox` marker the entrypoint
+writes is what replaces absence as the tell. Mounting at the path the parsers already
+hardcode (`resolver.py:18` with no override, `audit_report.py:4079` behind
+`FLEET_AUDIT_SETTINGS`, `gitops_workspace.py:119` off `agent_home()`) therefore needs
+no parser change. The mount is optional, unlike the agent container's: the ConfigMap
+and the StatefulSet are separate objects, and a sandbox that will not start because one
+is briefly missing takes the agent's whole shell down, while a skill reading an absent
+`SETTINGS.md` fails on its own terms.
+
+A subPath mount is resolved once at pod start and is never refreshed, so the sandbox
+pod template carries the same `kubeagents.x-k8s.io/settings-config-hash` annotation the
+agent's Deployment does. Without it, editing the CR's scope rolls the agent pod onto the
+new file and leaves the sandbox holding the old one — and the sandbox is where the shell
+reads it, so the six skills that read `SETTINGS.md` by path would be the ones served the
+stale answer, indefinitely and with nothing in either pod's logs to say so.
+
+**`HERMES_HOME` and `PLATFORM_AGENT_HOME` are set in the sandbox**, both to its own
+`/opt/data`. sshd starts sessions with neither, and the delivery is only half done
+without them: a `SKILL.md` writes `"$HERMES_HOME"/scripts/…` about as often as the
+literal path, `cluster_preflight.sh` defaults `HERMES_HOME` to `/opt/data` and would
+check the wrong tree if that default moved, and `gitops_workspace.agent_home()` reads
+`PLATFORM_AGENT_HOME` to decide where a leased clone goes. They are set from the
+sandbox's own data path rather than forwarded from the agent container, because the two
+roots are different volumes that happen to share a path — forwarding the agent's value
+would point every skill here at a directory this pod does not have the moment an
+install moves `spec.harness.hermes.agentHome`.
+
+**Four scripts named an interpreter the sandbox does not have.**
+`github_token_refresh.py`, `gitops_workspace.py`, `audit_report.py` and
+`submit_suggestion.py` began `#!/opt/hermes/.venv/bin/python3`, a path that exists in
+the agent image and not in this one, so `./audit_report.py` here died with `No such
+file or directory` naming an interpreter rather than the script. They now use
+`/usr/bin/env python3`, which is what the other 18 shared scripts already used. Nothing
+in the four imports a third-party module, so neither image cares which Python answers;
+`python:3.11-slim` has no `/usr/bin/python3` at all, so there was nothing to fall
+through to.
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there
 
@@ -704,12 +1040,66 @@ That split is now the smaller half of what has already happened. `resolver.py` r
 sandbox today; what is left to move is the script around them. It waits on Part C, for
 the same reason the sweep is currently down — the next section states the cost.
 
+#### Nothing collects the sandbox's finished workspaces, so a cron job does
+
+Hermes removes a card's scratch workspace from one place: `_cleanup_workspace`, called
+by `complete_task` after the transaction commits, best-effort with the exception
+swallowed. There is no periodic sweep anywhere in `kanban_db.py`, and that single call
+site misses more than it catches. On the month-old install this was measured against,
+`/opt/data/kanban/workspaces` held 33 scratch directories — 20 of them `done`, 2
+`cancelled`, and only 11 belonging to live cards. All but one of the `done` ones had no
+children at all, so the deliberate active-children deferral does not explain them: a
+card that reaches a terminal state by any route other than `kanban_complete` never
+reaches the call site, and `cancelled` and `failed` never reach it by any route.
+
+The sandbox turns that into a second leak with no cleanup path at all, because
+`_cleanup_workspace` calls `shutil.rmtree` in the gateway process on the gateway's path.
+Under `terminal.backend: ssh` the directory the worker actually wrote to is on the
+sandbox's own ReadWriteOnce volume, which that call cannot see — the same
+host-operates-on-a-guest-path shape as the rest of
+[the backend's defects](#the-ssh-backend-is-unfinished-and-this-design-carries-the-workarounds).
+
+`kanban_workspace_gc.py` reconciles both sides, daily, as a `no_agent` job on the
+platform roster. It is the third shape of cron job on that roster and it belongs in the
+agent pod for a reason neither of the others has: its authority is the board DB, and the
+board DB is here. `kanban_home()` resolves through `get_default_hermes_root()`, which
+strips the `/profiles/<name>` suffix, so a job running under the platform profile
+reaches the one shared board rather than forking a per-profile view of it.
+
+A sweep rather than the `kanban_task_completed` plugin hook, which is the other
+mechanism Hermes offers. The hook fires on precisely the path that already works, while
+the leak is in the paths that have none; a reconciler is also self-healing after a
+missed event, where a hook is one more thing that can miss one. It fires in the worker
+process too, so it would need the same SSH call regardless.
+
+Two details carry the safety of it. The removable set is derived from task rows alone —
+terminal status, `workspace_kind='scratch'`, no non-terminal children, and a path that
+is a direct child of that board's `workspaces_root()` with the name the dispatcher mints
+— which reproduces Hermes' own `_is_managed_scratch_path` containment guard and keeps
+the sweep away from the task-shaped directories other code paths leave elsewhere. A live
+sandbox has `/opt/data/tmp/t_384aaaba` and `/opt/data/gitops/t_dc3f1647`, and a
+`find -name 't_*'` would have taken both. The sandbox's own directory listing is then
+used only to narrow that set, never to add to it, so the account the model owns can at
+worst hide a directory from the sweep.
+
+It connects as `agent` rather than `hermes`, which is the one place in the repository
+that does, and the reason is permissions: the workspaces are `agent:agent 755` to the
+leaves, so uid 1001 cannot unlink inside them. The alternative was a shared group, a
+setgid workspaces root and a `umask 002` for every session, which grants the trusted
+account standing write access to the model's tree in order to delete from it — a wider
+change than the narrower login. What makes the narrower login safe here does not
+generalise, and `sandbox_exec.TERMINAL_PRINCIPAL` says so: this caller reads no output
+as a fact about the cluster, and a `.bashrc` that hijacked its `rm` would be doing to
+uid 1000's own files what uid 1000 can already do. The commands are `/bin/ls` and
+`/bin/rm` by absolute path, which that file cannot shadow — a bash function name cannot
+contain a slash, and a non-interactive shell does not expand aliases.
+
 #### The agent pod gives up cluster tooling entirely
 
 Sandboxing the shell does not, by itself, take `kubectl` away from the agent. The
 `platform-agent` container never held a native `kubectl`, `gcloud`, `gh` or `git` — the
 four were symlinks to `credential-proxy-exec`, and the real binaries live only in the
-`envoy-credential-proxy` sidecar — but a symlink is a working credential path, and the
+credential-proxy image — but a symlink is a working credential path, and the
 model can reach one without going near a shell.
 [`platform_mcp_server.py`](../../agents/platform/scripts/platform_mcp_server.py) is the
 proof: it is launched as a stdio MCP server from `agents/platform/config.yaml:30`, runs
@@ -1020,7 +1410,19 @@ the agent in.
 - **How the sandbox image and the agent image stay in step.** `shellSandbox.image` is
   settable independently, so baked scripts and the persona that invokes them can drift
   apart silently. Defaulting the sandbox tag to the agent's is the obvious answer and
-  has not been decided.
+  has not been decided. Baking the skills tree raises the stakes: the `SKILL.md` in the
+  prompt comes from the agent image and the `scripts/` it names come from the sandbox
+  image, so a mismatched pair is now two halves of one skill at different versions.
+- **The sync leaves a 15 MB tree in the sandbox that nothing reads.** Hermes' SSH
+  backend uploads `~/.hermes/skills` on connect, and as measured above that is the chat
+  profile's tree rather than the platform agent's. There is no configuration that turns
+  it off, so it sits at `/home/agent/.hermes/skills` alongside the baked tree at
+  `/opt/data/skills` — dead weight, and a wrong answer for anyone debugging by hand.
+  Suppressing it means patching `iter_skills_files`, which has not been decided. The
+  same channel creates empty `credentials` and `cache` directories: both are empty
+  today because the agent pod's `~/.hermes/credentials` is, but anything that ever
+  writes there would be pushed into the sandbox. That is the forward-direction mirror
+  of the `sync_back` question above.
 - **Whether `sync_back` should be on at all.** Stated above as an open decision, not
   a resolved one.
 - **Whether the operator should own the sandbox at all**, or whether it belongs to a
@@ -1048,11 +1450,15 @@ the agent in.
   path uid 1000 can write is code execution as the trusted principal. The proxy accepts
   a caller-supplied `KUBECONFIG` only inside its workspace root, so Part C has to give
   that directory standing or the tools fail one step later than they do now.
-- **The cluster-agent kubeconfig has nowhere to go yet.** `cluster_agent_profile.py`
-  runs its `get-credentials` in the sandbox but still names the profile home on the
-  agent pod's PVC, which has no counterpart there. Onboarding a cluster fails on the
-  missing directory until per-profile sandbox directories land. The alternative was to
-  invent that layout inside a call site, which is how two layouts end up shipping.
+- **The cluster-agent kubeconfig has nowhere to go yet, and onboarding now fails
+  earlier than that.** `cluster_agent_profile.py` writes a profile home on the agent
+  pod's PVC and shells out to `hermes`, so it is one of the three scripts the sandbox
+  stubs rather than bakes. The four skills that tell the model to run it by its runtime
+  path therefore stop at the stub's message instead of reaching the kubeconfig problem
+  at all. Both want the same fix — per-profile directories on the sandbox side, and an
+  MCP tool that lets the model ask the agent pod to create a profile rather than
+  running a script that has to live there. Inventing that layout inside a call site was
+  the alternative, and it is how two layouts end up shipping.
 - **Cron has not been exercised against a sandboxed agent.** The finding that
   `no_agent` scripts stay in the agent pod is read from the scheduler and is not in
   doubt, but no roster has run in this configuration, and the bootstrap handoff the
@@ -1061,6 +1467,20 @@ the agent in.
 - **Delegated subagents.** Whether a subagent spawned mid-turn inherits the SSH
   backend, or falls back to a local shell in the agent pod, is unexercised. A fallback
   would be a hole rather than a degradation.
+- **The rest of the dispatcher's `HERMES_KANBAN_*` environment still does not cross.**
+  `TASK` and `WORKSPACE` are derived from the cd target by the `ForceCommand` above;
+  `BOARD`, `DB`, `WORKSPACES_ROOT`, `RUN_ID` and the others are not recoverable from a
+  path and arrive empty. Nothing in the repository reads them from a shell today. The
+  general fix is `terminal.env_passthrough` support in `environments/ssh.py`, which is
+  upstream work.
+- **A card's scratch workspace is unreadable from the gateway, and one tool needs it.**
+  The `ForceCommand` above makes a delegated card run, and it runs in the sandbox's copy
+  of the workspace; the gateway's copy stays empty. `kanban_complete(artifacts=[...])`
+  is the known casualty, above — `kanban_attach` is the workaround, and the worker
+  protocol does not yet tell anyone that. Whether anything else depends on those files
+  is unenforced, and the failure mode is a card that reports success and leaves its
+  output on the wrong volume. Reclaiming the space is settled (`kanban-workspace-gc`,
+  above); getting the contents back before it runs is not.
 
 ## Related work
 

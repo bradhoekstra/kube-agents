@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """
 GKE Platform Agent — GitOps PR Suggestion Submitter
 

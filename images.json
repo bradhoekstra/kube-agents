@@ -15,8 +15,8 @@
       "repository": "ghcr.io/gke-labs/kube-agents/credential-proxy",
       "tagPolicy": "release",
       "override": "CREDENTIAL_PROXY_IMAGE",
-      "pulledBy": "The credential-proxy sidecar in the agent pod.",
-      "description": "The platform-agent image plus the Envoy-based credential proxy runtime."
+      "pulledBy": "The credential-proxy Deployment, and the agent-api-auth sidecar in the agent pod.",
+      "description": "Envoy, the credential runtime, and the CLIs it wraps — the only image holding real credentials."
     },
     {
       "name": "agent-sandbox",
@@ -148,8 +148,8 @@
       "repository": "docker.io/envoyproxy/envoy",
       "tag": "v1.39.0",
       "buildArg": "ENVOY_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
-      "description": "Source of the envoy binary copied into the credential-proxy image."
+      "pulledBy": "deploy/docker/Dockerfile (credential-proxy stage).",
+      "description": "Base image of the credential-proxy image."
     },
     {
       "name": "golang",
