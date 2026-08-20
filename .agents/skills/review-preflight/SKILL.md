@@ -1,6 +1,6 @@
 ---
 name: review-preflight
-description: Runs the review passes required before a pull request is opened — adversarial, docs-drift, and IaC parity — each in a context that did not write the change, and merges what they return into one disposition list.
+description: Runs the review passes required before a pull request is opened — adversarial and docs-drift — each in a context that did not write the change, and merges what they return into one disposition list.
 ---
 
 # Task
@@ -8,9 +8,8 @@ description: Runs the review passes required before a pull request is opened —
 Get every pre-PR review pass into a context that did not write the change, then merge what comes
 back into the list that becomes the pull request's **Self-Review** section.
 
-This skill is plumbing. It holds no review method — [`review-adversarial`](../review-adversarial/SKILL.md),
-[`review-docs-drift`](../review-docs-drift/SKILL.md), and
-[`review-iac-parity`](../review-iac-parity/SKILL.md) own that — and it does not state the
+This skill is plumbing. It holds no review method — [`review-adversarial`](../review-adversarial/SKILL.md)
+and [`review-docs-drift`](../review-docs-drift/SKILL.md) own that — and it does not state the
 requirement: "Pull Request Hygiene" in [`AGENTS.md`](../../../AGENTS.md) does, and that list wins if
 this file disagrees with it.
 
@@ -58,37 +57,30 @@ have just fetched" in `AGENTS.md` is there because of it. Fetching a base you al
 a round trip; the other way costs the passes reviewing commits that merged last week as though this
 branch wrote them.
 
-## 2. Decide which passes apply
+## 2. Which passes run
 
 - `review-adversarial` — always.
 - `review-docs-drift` — always.
-- `review-iac-parity` — only when the range touches more than one install surface's territory: the
-  provisioning scripts (`k8s-operator/scripts/`, `k8s-operator/config/`), `terraform/`, and
-  `charts/`. One surface alone is not parity work. `AGENTS.md` owns that trigger and the surface
-  table in `review-iac-parity` owns the paths; read them if the range sits near the boundary.
 
-Say which you skipped and why. A pass nobody ran is a gap in the section, not an absence of
-findings.
+Both, on every change. Neither has a trigger to evaluate and there is no third pass, so this step is
+a checklist rather than a judgment — but say which ran anyway, and say it when one of them did not.
+A pass nobody ran is a gap in the section, not an absence of findings.
 
-## 3. Run the mechanical gates first, in the main loop
+## 3. Run the mechanical gate first, in the main loop
 
 ```bash
 make docs-check
-make iac-parity-check
 ```
 
-Both, every time, whatever step 2 decided: CI runs them unfiltered on every pull request, and
-`iac-parity-check` compares the surfaces against each other, so a change to one surface alone is
-exactly how it starts failing. The conditional in step 2 governs the parity _pass_, not this gate.
+Every time, whatever the range touches: CI runs it unfiltered on every pull request. It is cheap, it
+is deterministic, and its output is a fact the passes would otherwise re-derive, so hand the result
+on. It does not substitute for its pass — it covers generated regions, links, terminology, and map
+coverage, but not whether the prose is still true, which is the whole of what `review-docs-drift`
+asks.
 
-They are cheap, they are deterministic, and their output is a fact each pass would otherwise
-re-derive. Hand the result on. Neither gate substitutes for its pass: `docs-check` covers generated
-regions, links, terminology, and map coverage but not whether the prose is still true, and
-`iac-parity-check` covers the scalar subset but not a resource only one surface creates.
-
-These two are here because the passes want their output, not because they are the local checks you
-owe. `AGENTS.md` "Local Validation Checks" is the list — prettier on changed Markdown, JSON, and
-YAML, the Docker build, the image-layer budget, `go build` in `k8s-operator/` — and a clean preflight
+It is here because the passes want its output, not because it is the local check you owe.
+`AGENTS.md` "Local Validation Checks" is that list — prettier on changed Markdown, JSON, and YAML,
+the Docker build, the image-layer budget, `go build` in `k8s-operator/` — and a clean preflight
 discharges none of it.
 
 ## 4. Get each pass a context that did not write the change
@@ -130,11 +122,11 @@ disclosing it is what you do when a human, told the above, tells you to proceed 
 
 Hand it: the repository, the diff range, the path to its skill, and the gate output from step 3.
 
-**Say that the report is the deliverable and the pass writes nothing.** `review-docs-drift` and
-`review-iac-parity` already refuse to fix silently, but `review-adversarial` §6 tells whoever runs it
-to edit on CONFIRMED, and its Angle I asks for a test run against the pre-change behaviour — both of
-which mutate the tree. The passes run concurrently in your checkout rather than one worktree each, so
-a pass that reverts a file to watch a test fail is a file its siblings are reading at the same time.
+**Say that the report is the deliverable and the pass writes nothing.** `review-docs-drift` already
+refuses to fix silently, but `review-adversarial` §6 tells whoever runs it to edit on CONFIRMED, and
+its Angle I asks for a test run against the pre-change behaviour — both of which mutate the tree. The
+passes run concurrently in your checkout rather than one worktree each, so a pass that reverts a file
+to watch a test fail is a file its sibling is reading at the same time.
 `.claude/commands/pr-review-batch.md` carries the sentence for the reviewer side and this is its
 author-side equivalent:
 
@@ -170,13 +162,13 @@ defect found twice is one finding, kept in whichever form names the failure conc
 Where two passes disagree, go and read the source. Do not average them and do not take the more
 alarming one on the grounds that it is safer.
 
-The passes do not grade alike, and the merged list keeps each pass's own severity rather than
+The two passes do not grade alike, and the merged list keeps each one's own severity rather than
 translating it. `review-adversarial` returns a verdict per finding, so `review-adversarial` §6
-governs its half: edit on CONFIRMED, report on PLAUSIBLE. `review-docs-drift` and `review-iac-parity`
-return a Blocking/Advisory triage instead and never emit a verdict — Blocking is addressed before the
-pull request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not restate a
-Blocking finding as CONFIRMED to make one column of it; the pass did not do the verification that
-word claims.
+governs its half: edit on CONFIRMED, report on PLAUSIBLE. `review-docs-drift` returns a
+Blocking/Advisory triage instead and never emits a verdict — Blocking is addressed before the pull
+request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not restate a Blocking
+finding as CONFIRMED to make one column of it; the pass did not do the verification that word
+claims.
 
 Every survivor gets a disposition either way: fixed, or deliberately not, with a reason that argues
 about this change.
@@ -196,7 +188,7 @@ of the fresh one.
 
 One severity-ordered disposition list covering every pass that ran. Severity and confidence are two
 axes, and a finding carries both: its pass's severity (`BLOCKER`/`HIGH`/`MEDIUM`/`LOW` from
-`review-adversarial`, Blocking or Advisory from the other two) orders the list, and its
+`review-adversarial`, Blocking or Advisory from `review-docs-drift`) orders the list, and its
 CONFIRMED/PLAUSIBLE verdict or triage says how sure the pass was. Name which pass each came from, so
 a reader can tell what kind of check stands behind it. Above the list, three lines the reviewer
 cannot reconstruct from the findings:

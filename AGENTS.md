@@ -260,9 +260,9 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
   looked for, what it found, and the disposition of each finding. This is a required pre-PR step
   for AI agents working in this repository: you are the change's first hostile reader, and a
   reviewer who has to find what you could have found spends their attention on the wrong things.
-  The section carries every pre-PR pass, not this one alone — the docs-drift pass below always, the
-  IaC-parity pass where its trigger fires — merged into one list, so a reviewer reads what was
-  looked for in one place rather than inferring which passes ran from which findings appeared.
+  The section carries every pre-PR pass, not this one alone — the docs-drift pass below runs on
+  every change too — merged into one list, so a reviewer reads what was looked for in one place
+  rather than inferring which passes ran from which findings appeared.
   This bullet is the canonical statement of the requirement; the site's
   [contributing guide](docs/site/src/content/docs/contributing.md) and the comment in
   [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) summarise it — change
@@ -274,13 +274,13 @@ documentation map (`docs/README.md`) — the same four checks CI runs.
     talks you into approving it, and the blind spot sits exactly where you were already wrong. It
     is why `.claude/commands/pr-review-batch.md` gives every pull request its own subagent, and a
     self-review earns it for the same reason.
-  - **`/pr-preflight` is how you get one**, and it covers the docs-drift and IaC-parity passes below
-    at the same time. It wraps
+  - **`/pr-preflight` is how you get one**, and it covers the docs-drift pass below at the same
+    time. It wraps
     [`.agents/skills/review-preflight/SKILL.md`](.agents/skills/review-preflight/SKILL.md), which
-    holds the plumbing: one diff range, the mechanical gates first, one subagent per applicable
-    pass, and what to withhold from each. Read the skill directly if your harness has no slash
-    commands. Invoking the command is also the request to delegate that an agent is otherwise told
-    to wait for — coding agents are instructed not to spawn subagents on their own initiative, so an
+    holds the plumbing: one diff range, the mechanical gate first, one subagent per pass, and what to
+    withhold from each. Read the skill directly if your harness has no slash commands. Invoking the
+    command is also the request to delegate that an agent is otherwise told to wait for — coding
+    agents are instructed not to spawn subagents on their own initiative, so an
     agent that reads only the rule above finds its one route closed and takes the silent fallback.
   - **If your harness will not spawn one without a human's approval, go and get the approval.** A
     setting that requires sign-off before starting a subagent blocks this step; it does not waive

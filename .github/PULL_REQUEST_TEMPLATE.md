@@ -63,10 +63,10 @@ Full contract: AGENTS.md, "Pull Request Hygiene".
 
 <!--
 Required: an empty section is not an answer. You are this change's first hostile
-reader, and this is where you say so. Which passes you ran — adversarial always,
-docs-drift always, IaC parity where it applies — what you looked for, what they
-found, and what you did with each finding: fixed, or deliberately not, with the
-reason. One merged list, not a section per pass.
+reader, and this is where you say so. Which passes you ran — adversarial and
+docs-drift, both on every change — what you looked for, what they found, and what
+you did with each finding: fixed, or deliberately not, with the reason. One merged
+list, not a section per pass.
 
 "No findings" is a normal outcome and a complete answer only when you also say
 what you looked for. A reason for not fixing something is an answer when it is an

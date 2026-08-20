@@ -1,5 +1,5 @@
 ---
-description: Run the required pre-PR review passes — adversarial, docs-drift, IaC parity — each in its own subagent
+description: Run the required pre-PR review passes — adversarial and docs-drift — each in its own subagent
 argument-hint: [base-branch]
 ---
 
@@ -10,7 +10,7 @@ base ref and the fact that you were asked.
 
 **You were asked.** Invoking this command is the request to delegate, so spawn the subagents without
 asking me again — one per applicable pass, all in a single message so they run concurrently. Review
-nothing yourself: your job is the range, the mechanical gates, the fan-out, and the relay. A pass you
+nothing yourself: your job is the range, the mechanical gate, the fan-out, and the relay. A pass you
 run in this context is the one configuration the passes exist to avoid, and I have just removed the
 only reason to do it.
 

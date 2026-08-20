@@ -151,8 +151,8 @@ Read the body. Two of its sections are what AGENTS.md's "Pull Request Hygiene" r
 pull request is opened at all:
 
 - **`## Self-Review`** — the disposition list from the author's own pre-PR passes, merged:
-  `review-adversarial` always, `review-docs-drift` always, `review-iac-parity` where it applies. What
-  they looked for, what kind of context each pass ran in, what it found, and for each finding whether
+  `review-adversarial` and `review-docs-drift`, both on every change. What they looked for, what
+  kind of context each pass ran in, what it found, and for each finding whether
   they fixed it or decided not to and why. This is the signal that matters most here, because it is
   the only one that says somebody already read this diff hostilely.
 - **`### Live validation`** (and the `## Testing` section around it) — that the change was actually
