@@ -31,7 +31,10 @@ BASE_BRANCH=main                                  # or the branch you will targe
 BASE_REMOTE=$(git remote | while read -r r; do
   case "$(git remote get-url "$r")" in *gke-labs/kube-agents*) echo "$r"; break;; esac
 done)
-: "${BASE_REMOTE:=git@github.com:gke-labs/kube-agents.git}"
+# HTTPS, not SSH. The fallback fires when no remote matches — a plain clone of a fork,
+# which every open pull request here comes from — and that is where a sandbox or a CI
+# runner has no key. The repository is public, so HTTPS needs no credential at all.
+: "${BASE_REMOTE:=https://github.com/gke-labs/kube-agents.git}"
 
 git fetch "$BASE_REMOTE" "+refs/heads/$BASE_BRANCH:refs/kube-agents-base/$BASE_BRANCH" || {
   echo "base fetch failed — stop here rather than reviewing against a stale base" >&2
@@ -105,10 +108,18 @@ instead. In order of preference:
   material and nothing else — one per applicable pass, not just the adversarial one:
 
   ```bash
-  claude -p "In $PWD, follow .agents/skills/review-adversarial/SKILL.md against $BASE...HEAD.
-  Derive the change's intent from the diff. Do not read the branch's commit message bodies,
-  plan files, or scratch notes. Report every finding and edit nothing; its step 6 is mine."
+  claude -p "In $PWD, follow .agents/skills/review-adversarial/SKILL.md against
+  refs/kube-agents-base/main...HEAD. Derive the change's intent from the diff. Do not read the
+  branch's commit message bodies, plan files, or scratch notes. Report every finding and edit
+  nothing; its step 6 is mine."
   ```
+
+  Write the range out, substituting the ref §1 resolved, rather than `$BASE`. Most harnesses run
+  each command in its own shell — Claude Code is one — so a variable §1 assigned is gone by the
+  time you compose this one, while `$PWD` above is set afresh by every shell and survives. An
+  empty `$BASE` is not an error either: `git diff ...HEAD` defaults the omitted left side to
+  `HEAD`, so the pass reviews `HEAD...HEAD`, exits 0, and reports no findings on no diff. That is
+  the silent wrong-range failure §1 exists to stop, arriving through the handoff instead.
 
   Neither of those trailing instructions is padding — step 5 explains what each one carries.
 
