@@ -372,10 +372,12 @@ assign a reviewer immediately — the override for a finding you have answered b
 for a review that never arrived. Nothing here changes who is picked; that is still the config file.
 
 **What agents must do.** After creating a pull request, tell the user the bot review is on its way
-and **offer to wait for it** instead of reporting the work as finished. A review that runs always
-reports back, so a one-line "no findings" is a result rather than silence; a review that never
-arrives is a bug in the bot, not a verdict, and the workflow doc says how long to wait and which
-trigger replaces the pass you lost.
+and **offer to wait for it** instead of reporting the work as finished — unless you opened a draft,
+which is not in the queue at all until it is marked ready, so a wait started there never ends and
+the bot is not broken for failing to answer it. A review that runs always reports back, so a
+one-line "no findings" is a result rather than silence; a review that never arrives is a bug in the
+bot, not a verdict, and the workflow doc says how long to wait and which trigger replaces the pass
+you lost.
 
 Then work the findings **with** the user rather than acting on them unilaterally: summarise each
 one, say whether you think it should be fixed, pushed back on, or deferred, and let the user decide
