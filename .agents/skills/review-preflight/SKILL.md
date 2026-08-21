@@ -79,11 +79,10 @@ Every time, whatever the range touches: CI runs it unfiltered on every pull requ
 is deterministic, and its output is a fact the passes would otherwise re-derive, so hand the result
 on. It does not substitute for its pass — it covers generated regions, links, terminology, map
 coverage, and the always-loaded instruction files' context budget, but not whether the prose is
-still true, which is the whole of what `review-docs-drift`
-asks.
+still true, which is the whole of what `review-docs-drift` asks.
 
 It is here because the passes want its output, not because it is the local check you owe.
-`AGENTS.md` "Local Validation Checks" is that list — prettier on changed Markdown, JSON, and YAML,
+`AGENTS.md` "Local Validation Checks" is that list — prettier on changed Markdown and YAML,
 the Docker build, the image-layer budget, `go build` in `k8s-operator/` — and a clean preflight
 discharges none of it.
 
@@ -182,9 +181,8 @@ request opens, Advisory gets the same disposition treatment as PLAUSIBLE. Do not
 finding as CONFIRMED to make one column of it; the pass did not do the verification that word
 claims.
 
-Every survivor gets a disposition either way: fixed, or deliberately not, with a reason that argues
-about this change. "Out of scope", "pre-existing", and "will fix later" are not reasons on their
-own; the separate issue you filed is.
+Every survivor gets a disposition either way, to the bar `AGENTS.md` sets: fixed, or deliberately
+not, with a reason that argues about this change.
 
 Report what a pass only suspects rather than acting on it. A finding it could not pin down is an
 open question for the pull request's **Self-Review** section, not a licence to rewrite working code

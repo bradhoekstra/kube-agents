@@ -95,9 +95,10 @@ on a dirty tree, so commit or stash before you start one.
 
 `AGENTS.md` names these checks; the detail is here.
 
-**Formatting.** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files.
-`make prettier-check` checks all files — note that this covers files outside your PR scope, while CI
-only checks the ones your branch changed. Install the version CI pins (see the Install Prettier step
+**Formatting.** Run `prettier --write <files>` on changed Markdown or YAML files — `.md`, `.yaml`,
+and `.yml` are the three extensions both CI and `make prettier-check` look at, so a reformatted
+`.json` file is churn nothing asked for. `make prettier-check` checks all files — note that this
+covers files outside your PR scope, while CI only checks the ones your branch changed. Install the version CI pins (see the Install Prettier step
 in `.github/workflows/prettier.yml`), e.g. `npm install -g prettier@<that version>`: the manifests
 gate in `k8s-operator-test.yml` asserts byte-equality against that version's output, so a skew fails
 CI on files you did not touch. Prefer the installed binary over `npx prettier`, which re-resolves the
@@ -116,8 +117,9 @@ nodes, so a bare build on an arm64 machine produces an image that cannot run on 
 **Image layer budget.** If you add a `RUN` or `COPY` to `deploy/docker/Dockerfile`, build the
 `platform` target with `-t platform-agent:latest` and run `python3 scripts/check_image_layers.py`.
 Docker's overlay2 driver stops mounting at 128 layers and `agent-base` → `platform` is the deepest
-chain the file ships; because buildx has no such limit, an over-budget image passes every PR build
-and fails only in Cloud Build, on main, after merge (#658). CI runs the same check in
+chain the file ships; the gate fails at 120, leaving a fix somewhere to go. Because buildx has no
+such limit, an over-budget image passes every PR build and fails only in Cloud Build, on main,
+after merge (#658). CI runs the same check in
 `docker-build.yml`. The docstring in `scripts/check_image_layers.py` owns which image the gate points
 at and why — read it before changing the target.
 

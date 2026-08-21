@@ -3,11 +3,14 @@
 
 Run: cd scripts && python3 -m unittest test_context_budget
 
-This guard fails *green* in the way that matters: if ``is_import`` stops
-recognising CLAUDE.md's ``@AGENTS.md`` line, the total silently doubles
-AGENTS.md and the check starts failing for a reason that has nothing to do with
-anyone's pull request -- and the obvious fix, raising BUDGET, hides the real
-size. The import handling is therefore tested rather than trusted.
+Import handling is where this check goes wrong quietly, so it is tested rather
+than trusted. Charge an import too little -- drop the line, or lose the
+recursion into the file it names -- and moving a section out to
+``@docs/page.md`` registers as a saving the harness never made. Charge it twice
+-- lose the ``seen`` set that ``measure`` shares across the roots, so
+CLAUDE.md's ``@AGENTS.md`` re-expands a file already counted -- and the check
+starts failing for a reason no pull request caused, whose obvious fix (raise
+BUDGET) hides the real size.
 
 The budget assertion at the end is the check itself, run against the real
 files, so ``python3 -m unittest`` catches an over-budget tree even where the
@@ -64,13 +67,7 @@ class IsImportTest(unittest.TestCase):
 
 
 class LoadedSizeTest(unittest.TestCase):
-    """`loaded_size` -- the import line is not charged to the importing file."""
-
-    def test_import_line_is_not_counted(self):
-        with TemporaryDirectory() as tmp:
-            path = Path(tmp) / "CLAUDE.md"
-            path.write_text("@AGENTS.md\nrule\n", encoding="utf-8")
-            self.assertEqual(check_context_budget.loaded_size(path), len("rule\n"))
+    """`loaded_size` -- an import costs what the harness loads for it."""
 
     def test_content_is_counted_whole(self):
         with TemporaryDirectory() as tmp:
@@ -78,15 +75,68 @@ class LoadedSizeTest(unittest.TestCase):
             path.write_text("# Title\n\nbody\n", encoding="utf-8")
             self.assertEqual(check_context_budget.loaded_size(path), len("# Title\n\nbody\n"))
 
+    def test_import_is_charged_the_target_not_the_line(self):
+        # The failure this stops: moving a section out to `@docs/page.md` reads
+        # as a saving while the harness still loads every character of it.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_text("a" * 500 + "\n", encoding="utf-8")
+            path = root / "CLAUDE.md"
+            path.write_text("@AGENTS.md\nrule\n", encoding="utf-8")
+            self.assertEqual(check_context_budget.loaded_size(path), 501 + len("rule\n"))
+
+    def test_import_resolves_relative_to_the_importing_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "docs" / "page.md").write_text("body\n", encoding="utf-8")
+            path = root / "CLAUDE.md"
+            path.write_text("@docs/page.md\n", encoding="utf-8")
+            self.assertEqual(check_context_budget.loaded_size(path), len("body\n"))
+
+    def test_missing_target_is_charged_as_text(self):
+        # The harness has nothing to expand either, so the line stays on screen.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "CLAUDE.md"
+            path.write_text("@docs/gone.md\n", encoding="utf-8")
+            self.assertEqual(check_context_budget.loaded_size(path), len("@docs/gone.md\n"))
+
+    def test_a_file_reached_twice_is_charged_once(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "shared.md").write_text("x" * 100 + "\n", encoding="utf-8")
+            path = root / "CLAUDE.md"
+            path.write_text("@shared.md\n@shared.md\n", encoding="utf-8")
+            self.assertEqual(check_context_budget.loaded_size(path), 101)
+
+    def test_an_import_cycle_terminates(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.md").write_text("@b.md\nA\n", encoding="utf-8")
+            (root / "b.md").write_text("@a.md\nB\n", encoding="utf-8")
+            self.assertEqual(check_context_budget.loaded_size(root / "a.md"), len("A\nB\n"))
+
+
+class MeasureTest(unittest.TestCase):
+    """`measure` -- the roots share one `seen` set, so nothing is double-charged."""
+
+    def test_a_root_imported_by_another_root_is_counted_once(self):
+        # This is the real shape: CLAUDE.md's `@AGENTS.md` must not add a second
+        # copy of AGENTS.md on top of the one measured as a root in its own right.
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_text("a" * 500 + "\n", encoding="utf-8")
+            (root / "CLAUDE.md").write_text("@AGENTS.md\nrule\n", encoding="utf-8")
+            with mock.patch.object(check_context_budget, "REPO", root):
+                sizes = check_context_budget.measure(("AGENTS.md", "CLAUDE.md"))
+        self.assertEqual(sizes, {"AGENTS.md": 501, "CLAUDE.md": len("rule\n")})
+
 
 class RealFilesTest(unittest.TestCase):
     """The repository's own files are inside the budget."""
 
     def test_within_budget(self):
-        total = sum(
-            check_context_budget.loaded_size(check_context_budget.REPO / name)
-            for name in check_context_budget.FILES
-        )
+        total = sum(check_context_budget.measure().values())
         self.assertLessEqual(
             total,
             check_context_budget.BUDGET,
@@ -119,10 +169,7 @@ class FailurePathTest(unittest.TestCase):
         self.assertIn("docs/pull-request-workflow.md", output)
 
     def test_small_overage_is_not_reported_as_zero(self):
-        real = sum(
-            check_context_budget.loaded_size(check_context_budget.REPO / name)
-            for name in check_context_budget.FILES
-        )
+        real = sum(check_context_budget.measure().values())
         with mock.patch.object(check_context_budget, "BUDGET", real - 200):
             code, output = run_main()
         self.assertEqual(code, 1)

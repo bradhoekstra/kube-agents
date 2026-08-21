@@ -133,7 +133,7 @@ adding a paragraph, check whether the topic already has an owner:
 | Shared installer defaults and the `vars.sh` state model  | `k8s-operator/scripts/README.md`             |
 | Which container images an install pulls, and their pins  | `images.json`                                |
 | The install procedure (self-contained, agent-executable) | `INSTALL.md`                                 |
-| The commands behind the pull-request rules below         | `docs/pull-request-workflow.md`              |
+| The commands behind this file's pull-request rules       | `docs/pull-request-workflow.md`              |
 | What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
 | How to develop a specific directory                      | that directory's `README.md` (keep it short) |
 
@@ -319,13 +319,13 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations). Two
   things that make a branch look clear when it is not: a thread whose line fell out of the diff
   reads as outdated, which says the code moved and nothing about whether the finding still holds,
-  so read it; and the query returns the first hundred threads, so a long-lived pull request needs
-  paging before you can call it clear rather than say you looked at a hundred.
+  so read it; and the listing stops at the first hundred threads, so a long-lived pull request
+  needs paging before you can call it clear rather than say you looked at a hundred.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
-  on changed Markdown/JSON/YAML, a local Docker build of the agent runner, the image-layer budget if
+  on changed Markdown and YAML, a local Docker build of the agent runner, the image-layer budget if
   you added a `RUN` or `COPY` to `deploy/docker/Dockerfile`, and `go build` inside `k8s-operator/`.
   Each has a constraint that costs a CI run to rediscover — the pinned prettier version, the
-  mandatory `--platform linux/amd64`, the 128-layer ceiling that only fails after merge. The
+  mandatory `--platform linux/amd64`, the layer ceiling that only fails after merge. The
   commands and those reasons are in
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#local-validation-before-committing).
 
@@ -337,7 +337,8 @@ Opening a pull request is therefore not the end of the task. The bot introduces 
 on every pull request it picks up, and that comment states its current contract; if it disagrees
 with what follows, believe the comment and fix this section.
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#the-automated-review) holds the
-mechanics: how long a review takes, the commands to poll for it, and how to reply and resolve.
+mechanics: how long a review takes, the commands to poll for one, and how to reply to a finding —
+with [resolving the threads](docs/pull-request-workflow.md#resolving-conversations) alongside it.
 
 **What any reviewer reads first — human or agent, this bot included.** Read the pull request's
 **Self-Review** section before the diff. It tells you what the author already looked for, what they
