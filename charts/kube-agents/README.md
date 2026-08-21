@@ -45,8 +45,9 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   by hand. Given the public half, the chart
   also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
   Secret the sandbox mounts — the sandbox never mounts the credential Secret
-  itself. Without the pair nothing breaks today, because the sandbox is not yet
-  reconciled; see
+  itself. Without the pair nothing breaks on an install that leaves
+  `harness.experimental.shellSandbox` off, which is the default; with it on, the
+  agent has no key to dial the sandbox with. See
   [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
 
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`

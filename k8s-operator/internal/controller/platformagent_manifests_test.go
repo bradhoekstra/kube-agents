@@ -4905,7 +4905,7 @@ func TestImagePullSecretsReachThePodSpec(t *testing.T) {
 }
 
 // The read-only kill switch. Unlike the two above it is not appended by
-// buildCredentialProxySidecar afterwards, so an unreserved name here does not
+// buildCredentialProxyContainer afterwards, so an unreserved name here does not
 // duplicate or lose a race — it is simply accepted, and the proxy reads the
 // user's value. `CREDENTIAL_PROXY_ENFORCE_READ_ONLY: "false"` under
 // spec.deployment.env turned off every refusal in the policy: all commands,
@@ -4925,9 +4925,16 @@ func TestDeploymentEnvCannotDisableReadOnlyEnforcement(t *testing.T) {
 				Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_ENFORCE_READ_ONLY", Value: userValue}},
 			}
 
-			for _, e := range buildCredentialProxySidecar(agent, "/opt/data").Env {
-				if e.Name == "CREDENTIAL_PROXY_ENFORCE_READ_ONLY" {
-					t.Fatalf("spec.deployment.env set the read-only kill switch to %q; it must be dropped as reserved", e.Value)
+			// Both placements, because the proxy now renders in two: a
+			// container of the sandbox pod when the shell sandbox is on, and
+			// a Deployment of its own otherwise. The reserved-name drop is in
+			// the env merge both share, and a regression that reached only one
+			// of them would still leave the switch reachable on real installs.
+			for _, colocated := range []bool{false, true} {
+				for _, e := range buildCredentialProxyContainer(agent, colocated).Env {
+					if e.Name == "CREDENTIAL_PROXY_ENFORCE_READ_ONLY" {
+						t.Fatalf("spec.deployment.env set the read-only kill switch to %q (colocated=%v); it must be dropped as reserved", e.Value, colocated)
+					}
 				}
 			}
 		})

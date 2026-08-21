@@ -163,7 +163,7 @@ of its own, so the only occurrence of the word `env` in the file is in a docstri
 also defines no `_wrap_command`, which leaves it inheriting a command preamble
 `base.py` wrote for a filesystem the caller shares with the shell.
 
-Every defect found so far has the same shape: a host-side operation performed on a
+Most defects found so far have the same shape: a host-side operation performed on a
 guest path, or a feature the local and Docker backends implement that the SSH backend
 does not. Below the environment layer Hermes has two filesystems; above it, everything
 still assumes one. Three instances are confirmed, each found by running real work
@@ -184,6 +184,10 @@ through the sandbox rather than by reading:
   `kanban_db.py` resolves each declared artifact with `pathlib` and calls `is_file()`
   in the gateway process, so a file that exists in the sandbox is reported as
   unavailable.
+
+A fourth is a different shape, and worse, because it fails work that was
+otherwise succeeding — see [One connection under every
+environment](#one-connection-under-every-environment) below.
 
 Three workarounds carry the design past them. The sandbox image's
 [`ForceCommand`](#the-working-directory-has-to-exist-on-the-far-side-and-hermes-does-not-create-it)
@@ -211,6 +215,44 @@ handoff and the MCP server's kubeconfig are all unexercised and all sit on that 
 It is not a reason to reverse the decision, since the alternatives lose more (below),
 but it does mean a Hermes version bump is a re-test of this surface rather than a
 dependency update.
+
+#### One connection under every environment
+
+The fourth defect is not a path or an environment variable. Hermes gives every
+task its own `SSHEnvironment`, but derives the `ssh` `ControlPath` from
+`sha256(user@host:port)` — and this design fixes all three of those, since the
+operator publishes one host, one user and one port for the whole agent. Every
+concurrent task therefore multiplexes over a single master connection.
+
+Teardown is per environment and not per connection. `cleanup()` runs
+`ssh -O exit` against that shared path, which drops the master and kills every
+session riding it. A sibling task that was mid-command loses it: exit 255, empty
+stderr, no indication that another task's teardown is what ended it. Three things
+call `cleanup()` — the idle reaper, `close_environment` when the agent closes,
+and the environment's `__del__` — and with `delegation.max_concurrent_children`
+at 3, the reaper reaches that state whenever one child idles while another works.
+
+The operator's managed terminal block sets `lifetime_seconds` to 30 days, which
+takes the reaper out of the picture. It is a number and not an off switch
+because Hermes takes an int here and has no sentinel for never; at that size the
+only environments the reaper can still collect are ones whose process has
+outlived a month of rollouts, which nothing here does. Nothing is reclaimed by
+reaping in this topology anyway — the far side is a StatefulSet pod that stays up
+either way — so the timeout was buying nothing and costing the race.
+
+Two ways of breaking the sharing itself were tried and rejected. Pointing
+`ControlPath` at somewhere unbindable fails hard rather than falling back to a
+direct connection: `ssh` exits 255 with `unix_listener: cannot bind`. Planting a
+root-owned file at the socket path so the socket can never be created fails
+because `cleanup()` unlinks that path, and the sandbox entrypoint runs as an
+unprivileged uid that cannot write a file the shell user could not then remove.
+
+What remains is the other two triggers. A process that exits still tears down
+its environment and still drops the shared master, so a delegated worker
+finishing while a sibling works can still cut the sibling's command — kanban
+workers are subprocesses that share the same socket directory, so they are the
+realistic case. Closing that needs a per-environment `ControlPath` in Hermes,
+which is an upstream change and not one this repository will carry as a patch.
 
 ### What the credential proxy is for
 
@@ -473,9 +515,45 @@ and skills are executable content the gateway loads. A sandbox that writes
 a write channel from the untrusted side into the trusted side, by design and by
 default.
 
-Any implementation must decide what to do about this. The options are to disable
-`sync_back`, to restrict the sync set to non-executable paths, or to accept it and
-say so explicitly. Silently inheriting the default is not one of them.
+The choice here is to disable the channel, and to disable it at the sandbox end
+rather than the gateway end.
+
+The sandbox image creates `/home/agent/.hermes` ahead of time as
+`0555 root:root`. The shell user is `agent`, uid 1000, so the push that opens the
+channel cannot land: `FileSyncManager._ensure_remote_dirs` fails to `mkdir -p`
+underneath it, and the initial `sync(force=True)` the SSH backend runs at
+environment setup writes nothing. `sync_back()` then early-returns on its own
+guard — it does nothing when there is no prior push state to reverse — so the
+writeback is a no-op rather than a failure. Nothing in the sandbox reads the
+pushed copy of the agent's Hermes home, so denying it costs no working
+behaviour.
+
+Both halves of that path degrade quietly by design in Hermes:
+`_ensure_remote_dirs` runs its `mkdir` without checking the exit status, `sync`
+catches and rolls back, and `sync_back` returns early. A directory the sync
+cannot write is therefore the one lever that closes the channel without a code
+change on either side, and without a failure mode that takes a task down with
+it. The cost is that the closure is silent in both directions: an operator
+reading Hermes' logs sees no refusal, only an absence, which is why the
+`Dockerfile` carries the explanation next to the `install -d` line rather than
+leaving a bare mode to be read as tidiness.
+
+The alternative considered and rejected was making the gateway's own
+`skills/` tree read-only, which would deny the write at the destination instead.
+It cannot distinguish the sandbox's writeback from a legitimate write by the
+agent's own `skill_manage` tool, which runs in-process in the gateway and
+targets the same directory. Closing the channel there would take the agent's
+ability to author a skill with it. Denying at the source is the narrower cut:
+it is scoped to code the model ran in the sandbox, which is the thing the
+sandbox exists to distrust.
+
+Two things this does not close. Skills are not the only executable content under
+`~/.hermes`, so the guarantee rests on the directory being unwritable rather
+than on an enumeration of paths — a future Hermes that creates the parent
+itself, or syncs to a different root, would reopen it and nothing here would
+notice. And an install that runs a different sandbox image gets the default
+behaviour back; the closure is a property of the image, not of the operator's
+reconciliation.
 
 ### Rejected alternatives for the credential path
 
@@ -740,9 +818,28 @@ because the sandbox is opt-in and an install without a keypair is not broken.
 Built in
 [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)
 as `buildShellSandboxClientKeyVolumes`, `buildShellSandboxClientKeyInitContainer` and
-`buildShellSandboxClientKeyMount`. Like the rest of that file they are builders with
-tests and no caller — the agent Deployment does not mount the key yet, because
-nothing reads it until `terminal.backend` is switched to `ssh`.
+`buildShellSandboxClientKeyMount`, and mounted into the agent pod whenever the
+sandbox is on — which is the same condition under which `terminal.backend` becomes
+`ssh`.
+
+#### What the operator publishes as `terminal`
+
+The managed scope carries the whole block or none of it. With the sandbox off the
+key is absent, Hermes' own default (`local`) applies, and nothing about an existing
+install changes. With it on, six keys are Hermes' and one is this design's:
+
+| Key                                | Value                                                                                           |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `backend`                          | `ssh`                                                                                           |
+| `ssh_host`, `ssh_user`, `ssh_port` | the sandbox's Service, `agent`, 2222                                                            |
+| `ssh_key`                          | where the init container stages the private half                                                |
+| `lifetime_seconds`                 | 30 days — see [One connection under every environment](#one-connection-under-every-environment) |
+| `workspace_root`                   | `/opt/data`, the sandbox's data path                                                            |
+
+`workspace_root` is not a Hermes key. It is published so that the agent-side
+helpers which shell into the sandbox read the sandbox's layout from one place
+instead of each hard-coding it, which is the same reason `sandbox_exec.py` reads
+`ssh_host` from the managed config rather than re-deriving the Service name.
 
 #### Two sharp edges left
 
@@ -1545,10 +1642,10 @@ issue. The proxy policy is a denylist of credential-disclosure patterns rather t
 allowlist of subcommands, so these tools wrap commands the model can already run from the
 shell, and they may be worth less than the surface they add.
 
-#### Two problems deferred, and what has already been ruled out for them
+#### Three problems deferred, and what has already been ruled out for them
 
-Neither blocks the work above. Both are recorded here so the dead ends are not
-re-walked.
+None of them blocks the work above. All three are recorded here so the dead ends
+are not re-walked.
 
 **Reaching `kanban.db`.** Two scripts touch the board.
 [`kanban_board_health.py`](../../agents/chat/scripts/kanban_board_health.py) never
@@ -1593,6 +1690,48 @@ needing gateway-side state has to execute there.
 `AGENTS.md:37` records that in several runtimes it executes the job synchronously
 inside the calling session, which is the behaviour `hermes cron run` was chosen to
 avoid.
+
+**A file written in the shell is not a file the agent can read.** The shell runs
+in the sandbox pod, which has its own `/opt/data`; the gateway has a different
+`/opt/data` on its PVC. A task that writes a scratch artifact — an audit CSV, a
+rendered manifest, a diff staged for a PR — writes it on the sandbox's volume,
+and every agent-side reader looks on the gateway's. Nothing errors. The file is
+simply not there, and the failure reads as the task having produced nothing.
+
+This one has no workaround in this design and is not a defect in it: it is the
+split doing what the split does. Naming it as deferred rather than solving it
+here is deliberate, because the shape of the fix is a decision about what is
+allowed to cross the boundary, and that is worth its own design rather than a
+mechanism chosen inside an isolation change. The options:
+
+- **A ReadWriteMany volume mounted at the same path in both pods.** Everything
+  works unchanged. It also re-establishes a filesystem shared between the
+  trusted and untrusted sides, which is most of what the split just removed —
+  narrower than the whole PVC, but the same class of channel, and it costs a
+  Filestore instance or a GCS Fuse mount on every install.
+- **Fetch on demand.** Agent-side readers fall back to pulling the file over the
+  existing SSH connection when it is absent locally. No new mount and no new
+  trust, but it needs a hook in every reader, and the count of independent path
+  resolvers above is the reason to expect that list to be wrong.
+- **Declared writeback (preferred).** The task names what should cross, and
+  those files — and only those — are copied back over the connection that is
+  already there. This is the shape `kanban_attach` already has and already
+  works with, generalised beyond kanban. Nothing crosses implicitly, the
+  crossing is auditable, and the content can be treated as untrusted at the
+  point it lands because there is a point where it lands.
+- **Accept it.** Document that artifacts do not survive the shell and require
+  content to come back through tool return values. Free, and wrong for anything
+  larger than a return value comfortably carries.
+
+Re-enabling Hermes' own `sync_back` is not on the list: it is the channel
+[closed above](#the-residual-channel-sync_back), and reopening it to move a CSV
+would also reopen the write path into the agent's skills tree.
+
+Declared writeback is preferred, but a design is still owed before anything is
+built: who triggers the copy and at what point in a task's life, where the files
+land on the agent side and who cleans them up, what the size and count limits
+are, and whether the landing directory is treated as untrusted input by whatever
+reads it next.
 
 ### Three of the proxy's five roles move
 
@@ -1743,19 +1882,26 @@ satisfies this by construction; the standalone Deployment pins it explicitly. Ei
 the credential broker cannot be made highly available while it is fused with an inbound
 event pump, and splitting them is the obvious follow-up.
 
-### The proxy image is built on the Envoy base, not the agent image
+### The proxy image is not the agent image
 
-Nothing the proxy runs is a Hermes process — the credential runtime is one stdlib-heavy
-Python file, and the CLIs come from apt — so building `credential-proxy` on the agent image
-would ship the model's personas, skills, plugins and the Hermes harness into the one
-container whose purpose is to be where credentials live. It is built on the Envoy base
-instead.
+Building `credential-proxy` on the `platform` image would ship the model's personas,
+skills, plugins and cluster templates into the one container whose purpose is to be
+where credentials live. It builds on `agent-base` instead, through a `proxy-tools`
+stage that adds the credential-aware CLIs, the Envoy binary and the entrypoint, and a
+final stage that copies in the scripts directory. What it inherits from `agent-base`
+is the Hermes venv, the `k8s-event-watcher` binary and `/opt/defaults` — none of the
+agent's own content.
 
-Two consequences. Its Python environment is an explicit list in the Dockerfile rather than
-something inherited, and every third-party import in `credential_proxy.py` is lazy, so a
-new one that is not added to that list fails at the point of use rather than at start. And
-the image is off the layer-budget chain, so `scripts/check_image_layers.py` measures
-`platform` instead.
+Two consequences. `/opt/defaults/scripts` is now filled by two separate lists that
+have to agree rather than by one image being the other, which
+`scripts/test_check_prompt_assets.py` asserts. And `platform`, not
+`credential-proxy`, is the deepest chain shipped, so `scripts/check_image_layers.py`
+measures that one.
+
+The federated credential path is written against the standard library alone for this
+reason: it runs in a container whose package set is inherited rather than declared for
+it, and a dependency added upstream to serve the agent is not a dependency the proxy
+should come to rely on.
 
 ### Names and selectors
 
