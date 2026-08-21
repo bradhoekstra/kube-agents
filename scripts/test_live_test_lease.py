@@ -206,6 +206,30 @@ class ConfigFile(unittest.TestCase):
                              known=resolved, ambient=None)
         self.assertEqual(name_of(target), "agents-cluster")
 
+    def test_aliases_reach_an_install_the_checkout_already_found(self):
+        """The install most likely to be renamed is the one you have a checkout of.
+
+        Discovery and the config file agreeing on a context is not a duplicate
+        to drop: the checkout knows the coordinates and the config knows what
+        the kubeconfig calls it. Skipping the entry whole leaves the alias
+        unknown, and `kubectl --context <alias> delete` reads as a cluster
+        nobody protects.
+        """
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp, "envs.json")
+            _write_vars_sh(tmp)
+            config.write_text(json.dumps({"installs": [
+                {"context": CTX, "aliases": ["agents-prod"]}]}))
+            with mock.patch.dict(os.environ,
+                                 {"KUBE_AGENTS_LIVE_TEST_ENVS": str(config)}):
+                resolved = lease.resolve_installs(tmp)
+        self.assertEqual(list(resolved), ["agents-cluster"])
+        # The checkout still wins the fields it discovered.
+        self.assertTrue(resolved["agents-cluster"].source.endswith("vars.sh"))
+        target, _ = classify("kubectl --context agents-prod delete ns x",
+                             known=resolved, ambient=None)
+        self.assertEqual(name_of(target), "agents-cluster")
+
     def test_missing_config_is_not_an_error(self):
         with TemporaryDirectory() as tmp:
             with mock.patch.dict(
@@ -715,6 +739,34 @@ class WhereAMutationHides(unittest.TestCase):
         self.guarded("cat > notes.md <<'EOF'\nnothing to see\nEOF\n"
                      "kubectl --context %s delete ns x" % CTX)
 
+    def test_a_mutation_on_the_heredocs_own_line(self):
+        """The introducer's line is command text; only the body is data.
+
+        `cat <<EOF | kubectl apply -f -` is one of the two ways an inline
+        manifest is written, and the mutation sits *after* the `<<EOF`. Cutting
+        the whole introducer line to reach the body deletes it, and the line
+        that applies an arbitrary manifest to a shared install then classifies
+        as `cat`.
+        """
+        self.guarded("cat <<EOF | kubectl --context %s apply -f -\n"
+                     "apiVersion: v1\nkind: Namespace\nEOF" % CTX)
+        self.guarded("kubectl --context %s apply -f - <<EOF\n"
+                     "apiVersion: v1\nEOF" % CTX)
+        # No body in the string at all: what follows is still command text.
+        self.guarded("cat <<EOF | kubectl --context %s delete -f -" % CTX)
+
+    def test_a_here_string_is_not_a_heredoc(self):
+        """`<<<` must not be read as `<<` at the next offset.
+
+        Rejecting the here-string only at the `<` it starts on is not enough:
+        a plain search retries one character in, finds `<<` followed by a word
+        that looks exactly like a delimiter, and swallows the rest of the line
+        -- including whatever the `&&` was guarding.
+        """
+        self.guarded("grep -q ready <<<yes && kubectl --context %s delete ns x"
+                     % CTX)
+        self.guarded("kubectl --context %s delete ns x <<<confirm" % CTX)
+
     def test_helm_naming_the_cluster_before_the_subcommand(self):
         """`--kube-context` is a helm global: it may precede the subcommand,
         and its value is not a positional."""
@@ -879,6 +931,34 @@ class Acquisition(unittest.TestCase):
         with mock.patch.object(lease, "kubectl", unreachable):
             with self.assertRaises(lease.Unreachable):
                 lease.do_acquire(self.install)
+
+    def test_only_the_configmaps_own_absence_means_the_lease_is_free(self):
+        """"not found" is said by far more failures than a missing ConfigMap.
+
+        A missing namespace, an absent auth plugin, and this module's own
+        "kubectl not found on PATH" all contain the phrase, and reading any of
+        them as an unheld lease turns a cluster nobody can see into one the
+        tool reports idle -- then hands out.
+        """
+        for stderr in (
+            "kubectl not found on PATH",
+            'Error from server (NotFound): namespaces "kubeagents-system" '
+            'not found',
+            "no Auth Provider found for name gcp: plugin not found",
+        ):
+            with self.subTest(stderr=stderr):
+                with mock.patch.object(
+                        lease, "kubectl",
+                        lambda i, a, stdin=None, e=stderr: (1, "", e)):
+                    with self.assertRaises(lease.Unreachable):
+                        lease.get_lease(self.install)
+
+        with mock.patch.object(
+                lease, "kubectl",
+                lambda i, a, stdin=None: (
+                    1, "", 'Error from server (NotFound): configmaps '
+                           '"live-test-lease" not found')):
+            self.assertEqual(lease.get_lease(self.install), (None, None))
 
 
 class HookEntryPoints(unittest.TestCase):
@@ -1088,8 +1168,34 @@ class HookEntryPoints(unittest.TestCase):
         self._sessionend(fake)
         self.assertEqual(_verbs(fake), [])
 
-    def _sessionend(self, fake):
-        with mock.patch.object(lease.sys, "stdin", io.StringIO(json.dumps({}))):
+    def test_sessionend_on_a_clear_keeps_the_lease(self):
+        """Not every SessionEnd ends the session.
+
+        `/clear` and `/resume` fire it on a process that carries straight on
+        with the same holder key, very possibly mid-live-test. Releasing there
+        hands the install to the next agent while this one is still writing to
+        it -- and quietly, because the session sees nothing.
+        """
+        for reason in ("clear", "resume"):
+            with self.subTest(reason=reason):
+                lease.write_local_token(self.install, "mine")
+                fake = _fake_kubectl(_lease_data(token="mine", minutes=30))
+                self._sessionend(fake, reason=reason)
+                self.assertEqual(_verbs(fake), [])
+                self.assertTrue(os.path.exists(self.install.token_file()))
+
+    def test_sessionend_on_a_real_exit_still_releases(self):
+        for reason in ("prompt_input_exit", "logout", "other"):
+            with self.subTest(reason=reason):
+                lease.write_local_token(self.install, "mine")
+                fake = _fake_kubectl(_lease_data(token="mine", minutes=30))
+                self._sessionend(fake, reason=reason)
+                self.assertIn("delete", _verbs(fake))
+
+    def _sessionend(self, fake, reason=None):
+        payload = {"reason": reason} if reason else {}
+        with mock.patch.object(lease.sys, "stdin",
+                               io.StringIO(json.dumps(payload))):
             with mock.patch.object(lease, "resolve_installs",
                                    return_value={self.install.name: self.install}):
                 with mock.patch.object(lease, "kubectl", fake):

@@ -68,6 +68,13 @@ DEFAULT_TTL_MIN = 60
 # compound line would otherwise pay for one probe per segment.
 KUBECTL_TIMEOUT = 8
 
+# SessionEnd `reason` values that do not end the session. Claude Code fires the
+# event for `/clear` and `/resume` too, on a process that carries on with the
+# same holder key -- so these are the two cases where the hook must leave the
+# lease alone. Everything else (`prompt_input_exit`, `logout`, `other`) is a
+# real exit.
+SESSION_CONTINUES = frozenset({"clear", "resume"})
+
 # The namespace an install uses unless its vars.sh says otherwise. Source of
 # truth: NAMESPACE in k8s-operator/scripts/common.sh.
 DEFAULT_NAMESPACE = "kubeagents-system"
@@ -151,6 +158,11 @@ class Install:
         self.registry = registry
         self.label = label or context
         self.source = source
+
+    def add_aliases(self, aliases):
+        """Extra names the classifier should read as this install."""
+        self.contexts += tuple(a for a in aliases
+                               if a and a not in self.contexts)
 
     def token_file(self):
         return os.path.join(state_dir(), "token-%s-%s" % (self.context, holder_key()))
@@ -304,7 +316,7 @@ def resolve_installs(cwd=None, also=None):
     of them -- unprotected, unnameable by `--env`, and silent about it. The
     loser of a name collision is renamed to `<project>/<name>` instead.
     """
-    installs, contexts = {}, set()
+    installs, by_context = {}, {}
     discovered = []
     for where in (cwd or os.environ.get("CLAUDE_CWD") or os.getcwd(), also):
         vars_sh = find_vars_sh(where) if where else None
@@ -312,9 +324,16 @@ def resolve_installs(cwd=None, also=None):
         if found:
             discovered.append(found)
     for install in discovered + _installs_from_config():
-        if install.context in contexts:
+        seen = by_context.get(install.context)
+        if seen is not None:
+            # The checkout wins every field it discovered, but a config entry
+            # for the same install still contributes its aliases. Dropping the
+            # entry whole is how the documented remedy for a locally renamed
+            # context stopped working for the install most likely to need it:
+            # the one you have a checkout of.
+            seen.add_aliases(install.contexts[1:])
             continue
-        contexts.add(install.context)
+        by_context[install.context] = install
         if install.name in installs:
             project = _split_context(install.context)[0]
             install.name = "%s/%s" % (project or install.context, install.name)
@@ -378,13 +397,22 @@ class Unreachable(Exception):
     """The cluster could not be consulted -- distinct from 'lease is free'."""
 
 
+# The one failure that means the lease is free, and nothing else. A substring
+# scan for "not found" is far wider than it looks: a missing namespace, an
+# absent gke-gcloud-auth-plugin, and this module's own "kubectl not found on
+# PATH" all say it, and reading any of them as an unheld lease turns a cluster
+# we cannot see into one we believe is idle -- the single answer this tool
+# must never give by accident.
+CM_ABSENT_RE = re.compile(r'configmaps?\s+"%s"\s+not found' % re.escape(CM_NAME))
+
+
 def get_lease(install):
     """Returns (data_dict, resource_version) or (None, None) if unheld."""
     rc, out, err = kubectl(install, ["get", "configmap", CM_NAME, "-o", "json"])
     if rc == 0:
         obj = json.loads(out)
         return obj.get("data", {}), obj["metadata"]["resourceVersion"]
-    if "NotFound" in err or "not found" in err:
+    if CM_ABSENT_RE.search(err):
         return None, None
     raise Unreachable(err.strip().splitlines()[-1] if err.strip() else "rc=%d" % rc)
 
@@ -651,8 +679,12 @@ DASH_C_RE = re.compile(r"^-[a-zA-Z]*c$")
 # the substitution is pulled out and classified in its own right.
 SUBSTITUTION_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
 CD_RE = re.compile(r"^\s*cd\s")
-# `<<EOF`, `<<-'EOF'`, `<<"EOF"` -- but not `<<<`, a here-string.
-HEREDOC_RE = re.compile(r"<<-?[ \t]*(?![<(])(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+# `<<EOF`, `<<-'EOF'`, `<<"EOF"` -- but not `<<<`, a here-string. Both guards
+# are needed: the lookahead rejects `<<<yes` at the `<` it starts on, and the
+# lookbehind rejects the same string at the next offset, where a plain search
+# retries and finds a `<<` followed by a perfectly good delimiter word.
+HEREDOC_RE = re.compile(
+    r"(?<!<)<<-?[ \t]*(?![<(])(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 # `bash -c "bash -c ..."` terminates on its own because the payload shrinks,
 # but a hostile or generated line should not be able to spin the hook.
@@ -670,6 +702,11 @@ def strip_heredocs(command):
     hour-long lease on a shared cluster, or being denied while somebody else
     holds one, for a command that touches nothing.
 
+    Only the body goes. What follows the introducer on its own line is
+    command text, and the pipeline `kubectl apply` is most often written into
+    is exactly that: `kubectl apply -f -` sits after the `<<EOF`, not before
+    it. Cutting the introducer's whole line loses the mutation.
+
     `<<<` is a here-string, not a heredoc, and is left alone.
     """
     while True:
@@ -678,14 +715,15 @@ def strip_heredocs(command):
             return command
         nl = command.find("\n", m.end())
         if nl == -1:
-            # An introducer with no body: the payload is somewhere we cannot
-            # see, so drop the rest of the line rather than read it as one.
-            return command[:m.start()]
+            # An introducer whose body is not in this string at all. Everything
+            # after it is still command text, so drop the introducer alone.
+            command = command[:m.start()] + command[m.end():]
+            continue
         rest = command[nl + 1:]
         term = re.search(r"^[ \t]*%s[ \t]*$" % re.escape(m.group(2)), rest,
                          re.MULTILINE)
         end = nl + 1 + (term.end() if term else len(rest))
-        command = command[:m.start()] + command[nl:nl + 1] + command[end:]
+        command = command[:m.start()] + command[m.end():nl + 1] + command[end:]
 
 
 def split_segments(command):
@@ -1400,6 +1438,14 @@ def hook_sessionend():
             os.environ["CLAUDE_CWD"] = payload["cwd"]
     except (json.JSONDecodeError, ValueError):
         payload = {}
+    if payload.get("reason") in SESSION_CONTINUES:
+        # Not every SessionEnd ends the session. `/clear` and `/resume` fire it
+        # on a process that keeps running under the same holder key, still in
+        # the middle of whatever it was live-testing; releasing there hands the
+        # install to the next agent while this one is still writing to it. The
+        # lease survives, the next mutating command renews it as usual, and the
+        # real exit -- which reports one of the other reasons -- releases it.
+        sys.exit(0)
     try:
         installs = resolve_installs(payload.get("cwd"))
     except Exception:  # noqa: BLE001 -- nothing to release if we cannot look

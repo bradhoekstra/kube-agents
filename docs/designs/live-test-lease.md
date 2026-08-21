@@ -57,7 +57,9 @@ has" and send you to `steal` rather than to a wait that will never end.
 
 Leases expire after 60 minutes and renew lazily past the halfway mark, so an active session keeps
 its claim and an abandoned one does not hold the install hostage. `SessionEnd` releases whatever
-the session holds.
+the session holds — except when its `reason` is `clear` or `resume`, which Claude Code reports on a
+process that carries straight on under the same holder key. Releasing there would hand the install
+to the next agent mid-test, and silently: the session that gave it up sees nothing.
 
 ## Why a hook, not an instruction
 
@@ -165,7 +167,9 @@ every contributor who has not opted in is in.
 
 - **The cluster cannot be consulted.** The hook asks rather than deciding. Treating an unreachable
   cluster as an unheld lease is how the mechanism fails open at exactly the wrong moment; treating
-  it as held blocks work over a flaky network.
+  it as held blocks work over a flaky network. Only one error means the lease is free — the
+  ConfigMap's own `not found` — and the read matches that message rather than the phrase, which a
+  missing namespace, an absent auth plugin, and a `kubectl` that is not on `PATH` all also say.
 - **The target cannot be resolved.** For an installer, a `helm upgrade`, or a `terraform apply` —
   commands that reconfigure an install wholesale — the hook asks. For an ordinary `kubectl` it does
   not: protected installs are in the kubeconfig by construction, `kubectl` runs constantly, and a
@@ -218,7 +222,10 @@ be taken over. Take a longer one by hand first: `acquire --ttl 180`.
 A context renamed locally is invisible to discovery: `vars.sh` records what the install _is_, and
 `gke_<project>_<location>_<cluster>` is the name `gcloud` writes, so a `kubectl config
 rename-context` leaves commands naming the short form unresolvable. Add the new name to that
-install's `aliases` in the config file. Nothing detects the rename for you.
+install's `aliases` in the config file, keying the entry on the context the kubeconfig actually
+answers to — that is the one the tool's own `kubectl` calls are made under, and `aliases` are the
+further names the classifier recognises, not names it can reach the cluster by. Nothing detects the
+rename for you.
 
 The lease record is readable by anyone with `get configmap` in the install's namespace, and it
 names the holder's `user@host`, their branch, and their working directory — enough to identify a
