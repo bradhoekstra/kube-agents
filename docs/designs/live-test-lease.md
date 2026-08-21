@@ -131,7 +131,9 @@ running install:
   the install is running is how one agent's image became another's, which is the incident this
   exists to prevent. A stock install records the public
   [`DEFAULT_REGISTRY_PREFIX`](../../k8s-operator/scripts/installer_common.sh) rather than a private
-  one, so this guard is only as specific as the prefix the install was given.
+  one, so this guard is only as specific as the prefix the install was given. A push whose image ref
+  did not expand — `docker push $(cat last-image)` — names no registry the hook can read, so it asks
+  rather than passing: an unreadable ref and an absent one are different answers.
 
 `scripts/live_test_lease.py` is the source of truth for the membership of each family — the
 constants at the top of it, not this list. Its tests re-derive the `make` targets from the two
@@ -147,9 +149,17 @@ segments, but not inside quotes or a heredoc body, where they are text — `AGEN
 `kubectl patch` on a line of its own. Wrappers (`sudo`, `env`, `timeout`, `xargs`) and the shell
 keywords that stand in front of a command word (`do`, `then`, a subshell's parenthesis) are
 stripped, so the `kubectl delete` in a cleanup loop is still a `kubectl delete`. `bash -c "…"`
-payloads and `$(…)` substitutions are classified as the shell will actually run them. And a `cd`
+payloads, `eval`'s arguments, and `$(…)` substitutions are classified as the shell will actually run
+them, and a function definition's `f() {` is stepped over the way a wrapper is. And a `cd`
 changes the checkout, and so the `vars.sh`, that the segments after it resolve against — including
 when the install it lands on is one this session had not otherwise heard of.
+
+It does not follow the shell everywhere. A `case` arm hides the command word behind its pattern
+label — `case $E in prod) kubectl delete ns x;;` classifies as nothing — because the parsing that
+would find it is the same widening of "skip tokens until something looks like a command" that makes
+a real argument readable as one, and a false mutation denies an agent the cluster for an hour. The
+gap is a silent pass on a form nobody writes by accident; if you are scripting one against a shared
+install, take the lease by hand first.
 
 Which install a segment acts on is settled by the most direct evidence available. For a command
 that takes them — `kubectl`, `helm`, a plugin installer — an explicit `--context`, or the
@@ -242,10 +252,14 @@ be taken over. Take a longer one by hand first: `acquire --ttl 180`.
 A context renamed locally is invisible to discovery: `vars.sh` records what the install _is_, and
 `gke_<project>_<location>_<cluster>` is the name `gcloud` writes, so a `kubectl config
 rename-context` leaves commands naming the short form unresolvable. Add the new name to that
-install's `aliases` in the config file, keying the entry on the context the kubeconfig actually
-answers to — that is the one the tool's own `kubectl` calls are made under, and `aliases` are the
-further names the classifier recognises, not names it can reach the cluster by. Nothing detects the
-rename for you.
+install's `aliases` in the config file, keyed on the **canonical** context. Aliases are further
+names the classifier recognises and nothing more: every `kubectl` the tool runs itself goes through
+`--context <install.context>`, so keying the entry on the renamed name instead yields two installs
+for one cluster and still leases under the name the rename removed. That is also the limit of the
+remedy — it restores classification, not the lease. For the lease to work the canonical name has to
+be back in the kubeconfig, which `gcloud container clusters get-credentials` does, adding it
+alongside the renamed one; without it every lease call answers `Unreachable` and the hook asks
+about every mutating command. Nothing detects the rename for you.
 
 The lease record is readable by anyone with `get configmap` in the install's namespace, and it
 names the holder's `user@host`, their branch, and their working directory — enough to identify a

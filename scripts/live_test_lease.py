@@ -770,6 +770,9 @@ SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "for",
                   "!", "{", "}"}
 SHELL_WORDS = {"bash", "sh", "zsh", "dash", "ksh", "busybox"}
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# `f() { kubectl delete ns x; }; f` -- the definition's name is where the
+# command word would otherwise be, and `{` right behind it is already a keyword.
+FUNCTION_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
 DASH_C_RE = re.compile(r"^-[a-zA-Z]*c$")
 # `OUT=$(kubectl apply ...)` -- the assignment swallows the command word, so
 # the substitution is pulled out and classified in its own right.
@@ -936,8 +939,14 @@ def strip_wrappers(tokens):
     i = 0
     while i < len(tokens):
         tok = tokens[i]
-        if ASSIGNMENT_RE.match(tok) or tok in SHELL_KEYWORDS:
+        if (ASSIGNMENT_RE.match(tok) or tok in SHELL_KEYWORDS
+                or FUNCTION_DEF_RE.match(tok)):
             i += 1
+            continue
+        # `function f { ... }` and `function f() { ... }` are the other two
+        # spellings; the name is a bare word the loop would otherwise stop on.
+        if tok == "function":
+            i += 2 if i + 1 < len(tokens) else 1
             continue
         base = os.path.basename(tok)
         if base == "env":
@@ -970,12 +979,22 @@ def strip_wrappers(tokens):
 
 
 def shell_payloads(head):
-    """The command strings a `bash -c '...'` wrapper will go on to run.
+    """The command strings a `bash -c '...'` or `eval` wrapper will go on to run.
 
     shlex collapses the payload into a single token, so without this a shell
     wrapper hides every marker and verb inside it from the classifier.
+
+    `eval` is the same hiding place reached without a flag: it takes no `-c`,
+    and everything after it is the command whether it arrived as one quoted
+    token or as several bare ones. Joining covers both -- the recursive
+    `classify` re-splits what it is handed, so the quoting lost here is
+    quoting it was going to redo anyway.
     """
-    if not head or os.path.basename(head[0]) not in SHELL_WORDS:
+    if not head:
+        return []
+    if os.path.basename(head[0]) == "eval":
+        return [" ".join(head[1:])] if len(head) > 1 else []
+    if os.path.basename(head[0]) not in SHELL_WORDS:
         return []
     out = []
     for i, tok in enumerate(head):
@@ -1060,6 +1079,34 @@ def positional(args):
     """The subcommand: first positional argument, or None."""
     found = positionals(args)
     return found[0] if found else None
+
+
+def image_refs(subs, args):
+    """The image references a docker push acts on.
+
+    Both spellings: the positionals after `push`, and the `-t` values a
+    `docker buildx build --push` tags instead.
+    """
+    refs = []
+    if "push" in subs[:2]:
+        refs += subs[subs.index("push") + 1:]
+    for i, tok in enumerate(args):
+        if tok in ("-t", "--tag") and i + 1 < len(args):
+            refs.append(args[i + 1])
+        elif tok.startswith("--tag="):
+            refs.append(tok.split("=", 1)[1])
+    return refs
+
+
+def unreadable_registry(ref):
+    """Does this ref hide the registry it pushes to?
+
+    Only the host matters. `ghcr.io/x/y:$(git rev-parse HEAD)` computes its
+    tag and still says plainly that it is not going to a protected registry,
+    so treating any `$` in the ref as unreadable would prompt on ordinary
+    pushes elsewhere -- the false positive that costs an agent an hour.
+    """
+    return unexpanded(ref.split("/", 1)[0])
 
 
 def install_from_markers(installs, text):
@@ -1365,6 +1412,22 @@ def classify(command, installs, cwd=None, _depth=0):
                     if install.registry and install.registry in command:
                         return install, ("docker push to the %s registry"
                                          % install.name)
+                # No registry on the line, and the ref does not say where it
+                # is going -- `docker push $(cat last-image)`, or the `IMG=` a
+                # `source .env` two segments back set. A registry that is
+                # absent and one the hook cannot read are different answers,
+                # and reading the second as the first is how the incident this
+                # exists to prevent gets through: the tag the shared install
+                # is running, overwritten with no lease taken and no deny.
+                # `resolve` already treats an unexpanded `--context "$CTX"`
+                # this way. Pushes are rare, so the prompt is cheap -- the
+                # same asymmetry the installer branch argues. Silent when no
+                # protected install records a registry at all, since then
+                # there is nothing the push could be overwriting.
+                if (any(i.registry for i in installs.values())
+                        and any(unreadable_registry(ref)
+                                for ref in image_refs(subs, args))):
+                    return UNKNOWN, "docker push whose registry could not be read"
             continue
 
         # ---- gcloud --------------------------------------------------------

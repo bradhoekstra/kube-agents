@@ -232,6 +232,51 @@ class ConfigFile(unittest.TestCase):
                              known=resolved, ambient=None)
         self.assertEqual(name_of(target), "agents-cluster")
 
+    def test_an_alias_never_becomes_the_context_the_lease_runs_under(self):
+        """Aliases widen classification and nothing else.
+
+        Every cluster call goes through `--context install.context`, so an
+        alias cannot reach a cluster the canonical name no longer names. The
+        design doc's Limits says so because the two halves look
+        interchangeable from the config file: an entry keyed on the renamed
+        name resolves commands correctly and then leases against a context
+        the rename removed, which answers `Unreachable` forever.
+        """
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp, "envs.json")
+            _write_vars_sh(tmp)
+            config.write_text(json.dumps({"installs": [
+                {"context": CTX, "aliases": ["agents-prod"]}]}))
+            with mock.patch.dict(os.environ,
+                                 {"KUBE_AGENTS_LIVE_TEST_ENVS": str(config)}):
+                resolved = lease.resolve_installs(tmp)
+        install = resolved["agents-cluster"]
+        with mock.patch.object(lease.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0, stdout="{}", stderr="")
+            lease.kubectl(install, ["get", "configmap", lease.CM_NAME])
+        argv = run.call_args[0][0]
+        self.assertIn(CTX, argv)
+        self.assertNotIn("agents-prod", argv)
+
+    def test_keying_a_config_entry_on_the_renamed_name_splits_the_install(self):
+        """Which is why Limits tells you to key on the canonical context.
+
+        The renamed name is a context of its own, so it does not merge -- one
+        cluster becomes two installs, and the checkout's installers still
+        resolve to the canonical one the rename made unreachable.
+        """
+        with TemporaryDirectory() as tmp:
+            config = Path(tmp, "envs.json")
+            _write_vars_sh(tmp)
+            config.write_text(json.dumps({"installs": [
+                {"context": "agents-prod"}]}))
+            with mock.patch.dict(os.environ,
+                                 {"KUBE_AGENTS_LIVE_TEST_ENVS": str(config)}):
+                resolved = lease.resolve_installs(tmp)
+            self.assertEqual(sorted(resolved), ["agents-cluster", "agents-prod"])
+            self.assertEqual(
+                lease.install_from_vars_sh(resolved, tmp).context, CTX)
+
     def test_missing_config_is_not_an_error(self):
         with TemporaryDirectory() as tmp:
             with mock.patch.dict(
@@ -327,6 +372,43 @@ class MutationsAreGuarded(unittest.TestCase):
 
     def test_docker_push_elsewhere(self):
         target, _ = classify("docker push ghcr.io/someone/platform:dev")
+        self.assertIsNone(target)
+
+    def test_a_push_whose_ref_did_not_expand_asks(self):
+        """A registry the hook cannot read is not a registry that is absent.
+
+        The match is a literal substring, so every ref that arrives through a
+        variable or a substitution names no registry -- and reading that as
+        "pushes somewhere else" is a silent pass on the exact command the
+        incident was: the tag the shared install runs, overwritten with no
+        lease taken. UNKNOWN makes the hook ask instead.
+        """
+        for command in ("docker push $(cat /tmp/last-image)",
+                        'source .env && docker push "$IMG"',
+                        "docker push $IMG",
+                        "docker buildx build --push -t $IMG ."):
+            with self.subTest(command=command):
+                target, reason = classify(command)
+                self.assertIs(target, lease.UNKNOWN, reason)
+
+    def test_a_readable_registry_is_an_answer_however_computed(self):
+        """Only the host decides. A ref that names where it is going and
+        computes its tag has answered the question -- prompting on it is the
+        false positive that costs an agent an hour on a push to their own
+        registry."""
+        for command in ("docker push ghcr.io/someone/platform:$(git rev-parse HEAD)",
+                        'docker push ghcr.io/someone/platform:"$TAG"',
+                        "docker buildx build --push -t ghcr.io/someone/x:$TAG ."):
+            with self.subTest(command=command):
+                target, reason = classify(command)
+                self.assertIsNone(target, reason)
+
+    def test_no_recorded_registry_means_nothing_to_overwrite(self):
+        """An install with no registry prefix cannot be pushed over, so an
+        unreadable ref is not worth a prompt there."""
+        bare = lease.Install(name="no-registry", context="some-context")
+        target, _ = classify("docker push $IMG",
+                             known={bare.name: bare})
         self.assertIsNone(target)
 
     def test_pubsub_publish_needs_a_marker(self):
@@ -645,6 +727,47 @@ class WhereAMutationHides(unittest.TestCase):
     def test_a_backgrounded_segment(self):
         """A lone `&` separates commands the way `;` does."""
         self.guarded("sleep 1 & kubectl --context %s delete ns x" % CTX)
+
+    def test_eval_is_a_shell_wrapper_that_takes_no_flag(self):
+        """`eval` hides a command word the way `bash -c` does, without a `-c`.
+
+        Two spellings, and they fail differently. Bare, `eval` is read as the
+        command word and the classifier stops there. Quoted, shlex collapses
+        the payload into one argument, so there is no command word to find at
+        all. Joining the arguments back together covers both, because the
+        recursive classify re-splits what it is handed.
+        """
+        self.guarded("eval kubectl --context %s delete ns x" % CTX)
+        self.guarded('eval "kubectl --context %s delete ns x"' % CTX)
+        self.guarded("sudo eval kubectl --context %s delete ns x" % CTX)
+
+    def test_a_function_definition_holds_the_command_word(self):
+        """`f() {` sits exactly where the command word goes.
+
+        `{` was already a stripped keyword; the name in front of it was not,
+        so `strip_wrappers` stopped one token early and the body went unread.
+        All three spellings bash accepts.
+        """
+        self.guarded("f() { kubectl --context %s delete ns x; }; f" % CTX)
+        self.guarded("function f() { kubectl --context %s delete ns x; }; f" % CTX)
+        self.guarded("function f { kubectl --context %s delete ns x; }; f" % CTX)
+
+    def test_a_case_arm_is_a_gap_the_design_doc_owns(self):
+        """The one hiding place here that is documented rather than parsed.
+
+        Finding the command word behind `prod)` means skipping tokens until
+        one looks like a command, and that same widening is what lets a real
+        argument be read as one -- a false mutation costs an agent the cluster
+        for an hour. So the gap stays, and Limits says so. Closing it later is
+        a fine change: delete this test with the paragraph it guards.
+        """
+        target, _ = classify(
+            "case $E in prod) kubectl --context %s delete ns x;; esac" % CTX)
+        self.assertIsNone(target)
+        doc = (Path(__file__).resolve().parent.parent / "docs" / "designs"
+               / "live-test-lease.md").read_text()
+        self.assertIn("case $E in", doc,
+                      "the case-arm gap is unparsed and undocumented")
 
     def test_a_redirections_ampersand_does_not_end_the_command(self):
         """`2>&1` is one token of a redirection, not a background operator.
