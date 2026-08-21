@@ -4,10 +4,16 @@
 finding work already in flight, measuring drift from `main`, validating locally, and working the
 automated review.
 
-**Owns:** the mechanics only. Every _requirement_ — that you scan for duplicate work, run the pre-PR
+**Owns:** the mechanics. Every _requirement_ — that you scan for duplicate work, run the pre-PR
 review passes, live-test the change, resolve every thread — is stated in
 [`AGENTS.md`](../AGENTS.md) and stays there. This page is what you open at the moment you carry one
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
+
+A few rules about how to run a command correctly sit here rather than there, because they mean
+nothing until you have the command in front of you — that a contributor on a fork cannot self-assign
+an issue, that the review clock does not start while a pull request is still a draft. `AGENTS.md` is
+loaded into every session and this page is not, so anything that has to fire before an agent thinks
+to open a link belongs on that side of the line, not this one.
 
 Related: [`.agents/skills/review-preflight/SKILL.md`](../.agents/skills/review-preflight/SKILL.md)
 owns the pre-PR review plumbing, and
@@ -41,13 +47,14 @@ Claiming an unassigned issue, once the user has agreed:
 gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me
 ```
 
-`@me` is the account whose token you hold — a person — so you are volunteering them, not yourself.
-Contributors working from a fork without write access cannot self-assign; offer a comment instead.
+`@me` is the account whose token you hold, and `AGENTS.md` is explicit that this makes it a person
+you are volunteering. A contributor working from a fork without write access cannot self-assign at
+all; offer a comment instead.
 
 ## Measure how far a branch has drifted from `main`
 
-Being behind is not itself the problem — forty commits touching nothing you care about cost you
-nothing. What wastes work is `main` moving _underneath the files you are changing_:
+The files you are changing that `main` has also changed since you diverged — the list `AGENTS.md`
+sends you here for:
 
 ```bash
 # Fetch again before measuring anything. Every command below compares against the
@@ -81,14 +88,12 @@ comm -12 <( { git diff --no-renames --name-only upstream/main...HEAD
          <(git diff --no-renames --name-only HEAD...upstream/main | sort)
 ```
 
-Anything listed there, rebase onto `upstream/main` (commit or stash first — rebase refuses on a
-dirty tree) and re-read those files before you write more, because what you have already read about
-them may no longer be true. Nothing listed, and being behind is a merge-conflict risk to settle
-later, not a reason to stop.
+`AGENTS.md` says what to do with the result. The one mechanical detail it leaves out: rebase refuses
+on a dirty tree, so commit or stash before you start one.
 
 ## Local validation before committing
 
-`AGENTS.md` names these four checks; the detail is here.
+`AGENTS.md` names these checks; the detail is here.
 
 **Formatting.** Run `prettier --write <files>` on changed Markdown, JSON, or YAML files.
 `make prettier-check` checks all files — note that this covers files outside your PR scope, while CI
@@ -121,10 +126,8 @@ ensure compilation succeeds.
 
 ## The automated review
 
-`kube-agents-bot` is a GitHub App that runs a coding agent over the branch diff. It only comments —
-it never pushes commits and never merges. It introduces itself in a comment on every pull request it
-picks up, and that comment states its current contract; if it disagrees with this page, believe the
-comment and fix this page.
+`AGENTS.md`, "Automated Review After Opening a Pull Request", says what `kube-agents-bot` is, when
+it runs, and what you owe its findings. This section is how you watch for one and answer it.
 
 ### How to read it
 
@@ -191,9 +194,8 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 
 ## Resolving conversations
 
-Reply first, always. A resolved thread collapses, so the reviewer who opened it may never expand it
-again, and the reply is the only record of what happened. Name what changed and the commit that
-changed it. Then resolve:
+Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
+resolve:
 
 ```bash
 # Every unresolved thread, with both ids you need: resolveReviewThread takes the

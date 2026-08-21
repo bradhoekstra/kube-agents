@@ -56,7 +56,8 @@ kube-agents/
 │   ├── architecture/                              END-STATE spec set 01–08 + README
 │   ├── designs/                                   per-feature design documents
 │   ├── contributing.md, security-requirements.md,
-│   │   credential-isolation-design.md             standalone docs
+│   │   credential-isolation-design.md,
+│   │   pull-request-workflow.md                   standalone docs
 │   └── site/                                      Astro + Starlight site: README +
 │                                                  the published pages
 ├── examples/                                      gitops-repo template + inference/
@@ -113,6 +114,9 @@ CI enforcement: `make docs-check` runs the same checks as
   not inventory them and the check does not require them — the map and the
   check share one scope. A dot-directory nested inside a documented area
   (`examples/gitops-repo/.github/`) is example content and stays in scope.
+- `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
+  plus `CLAUDE.md` are loaded into every agent session before the first prompt,
+  and their combined size must stay inside the `BUDGET` that file sets.
 
 ### Identifier sources
 
@@ -280,7 +284,7 @@ pull request:
 | `docs/designs/semver-deployment-versioning.md` | Feature design | Design rationale for adopting SemVer 2.0.0 across container images, the Helm chart, Terraform modules, release docs, and governance playbooks — decisions, shipped mechanisms, and deliberate exceptions. | OCI Helm charts, Git ref TF modules, version-injection defaults | Implemented; exceptions declared inline |
 | `docs/contributing.md` | Contributor guide | Short entry point: Google CLA and community guidelines, deferring everything else to the site's contributing page and `AGENTS.md`. | CLA, pointers | Human contributors |
 | `docs/credential-isolation-design.md` | Feature design | Design keeping API keys, tokens, and SA credentials out of the agent sandbox container; credentialed operations proxied through an Envoy credential-proxy sidecar. | Pod anatomy, CLI forwarding, guarantee and stated limitation | Canonical design; site `reference/credential-isolation.md` defers here |
-| `docs/pull-request-workflow.md` | Contributor guide | The commands behind `AGENTS.md`'s pull-request rules: the duplicate-work scan, the branch-drift check against `upstream/main`, the four local validation checks and the constraint each one exists for, and the `kube-agents-bot` review — how long it takes, how to poll for it, how to reply and resolve. | `gh` and GraphQL recipes, drift `comm` check, prettier/Docker/layer-budget detail, bot timing and failure modes | AI coding agents and human contributors; mechanics only, `AGENTS.md` owns the rules |
+| `docs/pull-request-workflow.md` | Contributor guide | The commands behind `AGENTS.md`'s pull-request rules: the duplicate-work scan, the branch-drift check against `upstream/main`, the local validation checks and the constraint each one exists for, and the `kube-agents-bot` review — how long it takes, how to poll for it, how to reply and resolve. | `gh` and GraphQL recipes, drift `comm` check, prettier/Docker/layer-budget detail, bot timing and failure modes | AI coding agents and human contributors; mechanics only, `AGENTS.md` owns the rules |
 | `docs/security-requirements.md` | Requirements | Provider-neutral security configuration model across three dimensions (permission, interaction, authorization), explicitly distinguishing current behavior from planned capabilities. | Permission sets, credential-isolation requirements, attribution requirements | Referenced by the site's security pages; current-vs-planned marked inline |
 | `docs/site/README.md` | Component README | How to develop the docs site: local preview/build, layout, adding a page, CI build/deploy workflows, publishing from a fork. | `npm run dev`, frontmatter, GitHub Pages base | Site contributors |
 

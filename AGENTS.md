@@ -133,6 +133,7 @@ adding a paragraph, check whether the topic already has an owner:
 | Shared installer defaults and the `vars.sh` state model  | `k8s-operator/scripts/README.md`             |
 | Which container images an install pulls, and their pins  | `images.json`                                |
 | The install procedure (self-contained, agent-executable) | `INSTALL.md`                                 |
+| The commands behind the pull-request rules below         | `docs/pull-request-workflow.md`              |
 | What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
 | How to develop a specific directory                      | that directory's `README.md` (keep it short) |
 
@@ -312,9 +313,14 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   for what it does and what you are expected to do with its findings.
 - **Leave no conversation unresolved.** `main` will not merge while a review thread is open, and
   the open thread also keeps the pull request counted as its author's outstanding work.
-  Reply, then resolve every thread you are confident is addressed — commands and the bar for
-  "confident" are in
-  [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request).
+  Reply, then resolve every thread you are confident is addressed — the bar for "confident" is in
+  [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request),
+  and the commands are in
+  [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations). Two
+  things that make a branch look clear when it is not: a thread whose line fell out of the diff
+  reads as outdated, which says the code moved and nothing about whether the finding still holds,
+  so read it; and the query returns the first hundred threads, so a long-lived pull request needs
+  paging before you can call it clear rather than say you looked at a hundred.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
   on changed Markdown/JSON/YAML, a local Docker build of the agent runner, the image-layer budget if
   you added a `RUN` or `COPY` to `deploy/docker/Dockerfile`, and `go build` inside `k8s-operator/`.

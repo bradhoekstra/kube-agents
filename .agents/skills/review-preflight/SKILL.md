@@ -77,8 +77,9 @@ make docs-check
 
 Every time, whatever the range touches: CI runs it unfiltered on every pull request. It is cheap, it
 is deterministic, and its output is a fact the passes would otherwise re-derive, so hand the result
-on. It does not substitute for its pass — it covers generated regions, links, terminology, and map
-coverage, but not whether the prose is still true, which is the whole of what `review-docs-drift`
+on. It does not substitute for its pass — it covers generated regions, links, terminology, map
+coverage, and the always-loaded instruction files' context budget, but not whether the prose is
+still true, which is the whole of what `review-docs-drift`
 asks.
 
 It is here because the passes want its output, not because it is the local check you owe.

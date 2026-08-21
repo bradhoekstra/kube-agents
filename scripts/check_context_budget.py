@@ -8,10 +8,10 @@ on every task done in this repository, and nothing about paying it is visible
 at review time: a pull request that adds a well-argued paragraph to ``AGENTS.md``
 looks exactly like one that does not.
 
-That is how this file came to exist. ``AGENTS.md`` went from 14.5k to 42.7k
-characters in nine days -- eleven separate pull requests, each adding a rule
-that deserved to be there -- and the first anyone noticed was Claude Code
-printing ``AGENTS.md is over the 40.0k-char limit`` at startup. The warning is
+That is how this file came to exist. ``AGENTS.md`` went from 14.5k to 42.6k
+characters in nine days, across a run of pull requests each adding a rule that
+deserved to be there, and the first anyone noticed was Claude Code printing
+``AGENTS.md is over the 40.0k-char limit`` at startup. The warning is
 only a warning: the file is still loaded whole, so nothing breaks loudly. It
 just gets more expensive, indefinitely, until someone re-reads the whole file
 and splits it again.
@@ -33,6 +33,7 @@ Usage::
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -49,15 +50,23 @@ BUDGET = 38_000
 # are dropped instead, so the total is what actually lands in the window.
 FILES = ("AGENTS.md", "CLAUDE.md")
 
+# A bare `@` followed by something path-shaped, alone on its line. The extension
+# is required deliberately: `@me` and `@platform-agent` are handles that could
+# plausibly appear here one day, and dropping them from the count would shrink
+# the budget's idea of the file without anyone seeing it. Matching too narrowly
+# fails in the safe direction instead -- an unrecognised import is charged as
+# content, so the total is too high and the check complains rather than passing
+# a file that had already outgrown the window.
+IMPORT_RE = re.compile(r"@[\w./-]+\.[A-Za-z0-9]+")
+
 
 def is_import(line: str) -> bool:
     """True for a harness import directive (``@AGENTS.md``) on its own line.
 
-    Only a bare ``@path`` counts. A line that merely mentions an ``@`` inside
-    prose is content and is charged as such.
+    Only a bare ``@path`` counts. A line that mentions an ``@`` inside prose,
+    or carries a handle rather than a path, is content and is charged as such.
     """
-    stripped = line.strip()
-    return stripped.startswith("@") and " " not in stripped and len(stripped) > 1
+    return IMPORT_RE.fullmatch(line.strip()) is not None
 
 
 def loaded_size(path: Path) -> int:
@@ -81,10 +90,14 @@ def main() -> int:
     breakdown = ", ".join(f"{name} {size / 1000:.1f}k" for name, size in sizes.items())
 
     if total > BUDGET:
+        # Raw counts, not the rounded k figures used elsewhere. Growth arrives a
+        # few hundred chars at a time, so the first failure is usually a couple
+        # of hundred over -- and "0.0k over the 38k budget" reads as a check that
+        # has miscounted rather than one that has just fired.
         over = total - BUDGET
         print(
-            f"FAIL: the always-loaded instruction files total {total / 1000:.1f}k chars "
-            f"({breakdown}), {over / 1000:.1f}k over the {BUDGET / 1000:.0f}k budget.\n"
+            f"FAIL: the always-loaded instruction files total {total:,} chars "
+            f"({breakdown}), {over:,} over the {BUDGET:,}-char budget.\n"
             "\n"
             "These files are loaded into every session in every checkout, so this is a\n"
             "cost paid by every task in the repository. Prefer moving mechanics out over\n"
