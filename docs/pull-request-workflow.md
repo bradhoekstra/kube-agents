@@ -9,11 +9,13 @@ review passes, live-test the change, resolve every thread — is stated in
 [`AGENTS.md`](../AGENTS.md) and stays there. This page is what you open at the moment you carry one
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
 
-A few rules about how to run a command correctly sit here rather than there, because they mean
-nothing until you have the command in front of you — that a contributor on a fork cannot self-assign
-an issue, that the review clock does not start while a pull request is still a draft. `AGENTS.md` is
-loaded into every session and this page is not, so anything that has to fire before an agent thinks
-to open a link belongs on that side of the line, not this one.
+A rule about how to run a command correctly can sit here rather than in `AGENTS.md`, because it
+means nothing until you have the command in front of you — that a contributor on a fork cannot
+self-assign an issue is the example. The test is when a rule has to fire, though, not how
+procedural it sounds: that a draft is not in the review queue reads like mechanics, but it has to
+reach an agent before it decides to wait, so `AGENTS.md` states it and only the measurement behind
+it is here. `AGENTS.md` is loaded into every session and this page is not, so anything that has to
+fire before an agent thinks to open a link belongs on that side of the line, not this one.
 
 Related: [`.agents/skills/review-preflight/SKILL.md`](../.agents/skills/review-preflight/SKILL.md)
 owns the pre-PR review plumbing, and
