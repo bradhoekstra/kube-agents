@@ -53,10 +53,7 @@ ARG ENVOY_VERSION=v1.39.0
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.26-alpine
-
-# ENVOY_IMAGE is not consumed here — it is the base of the `credential-proxy`
-# stage at the end of the file, which is where the credential runtime and the
-# CLIs it wraps are installed on top of it.
+FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 
 # Every binary in the final image must match the architecture the image ships
 # as, and nothing in this Dockerfile can pin that: the runtime base
