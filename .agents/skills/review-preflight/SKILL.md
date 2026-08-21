@@ -182,7 +182,13 @@ finding as CONFIRMED to make one column of it; the pass did not do the verificat
 claims.
 
 Every survivor gets a disposition either way: fixed, or deliberately not, with a reason that argues
-about this change.
+about this change. "Out of scope", "pre-existing", and "will fix later" are not reasons on their
+own; the separate issue you filed is.
+
+Report what a pass only suspects rather than acting on it. A finding it could not pin down is an
+open question for the pull request's **Self-Review** section, not a licence to rewrite working code
+— chasing an uncertain finding on your own change is how a self-review makes it worse than it
+started.
 
 ## 7. Re-runs
 
@@ -204,7 +210,9 @@ CONFIRMED/PLAUSIBLE verdict or triage says how sure the pass was. Name which pas
 a reader can tell what kind of check stands behind it. Above the list, three lines the reviewer
 cannot reconstruct from the findings:
 
-- which passes ran, and which were skipped and why;
+- which passes ran, and which were skipped and why. A pass that found nothing reports what it
+  looked for — its angles are the vocabulary for that, and a clean result naming none of them is
+  indistinguishable from no pass having run;
 - for each, what kind of context it ran in — subagent, fresh session, or the one that wrote the code;
 - what the passes could not cover: suites not run, infrastructure absent, angles refused.
 
