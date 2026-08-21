@@ -766,13 +766,19 @@ WRAPPER_VALUE_FLAGS = {
 # Shell syntax that precedes a command word without being one. `for ns in a b;
 # do kubectl delete ns $ns; done` splits into a segment whose first token is
 # `do`, and the bulk-cleanup loop is the most ordinary thing an agent writes.
+# `()` is here for `function f () {`, where the space leaves the parens as a
+# token of their own once the `function` branch has consumed the name.
 SHELL_KEYWORDS = {"do", "then", "else", "elif", "if", "while", "until", "for",
-                  "!", "{", "}"}
+                  "!", "{", "}", "()"}
 SHELL_WORDS = {"bash", "sh", "zsh", "dash", "ksh", "busybox"}
 ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # `f() { kubectl delete ns x; }; f` -- the definition's name is where the
 # command word would otherwise be, and `{` right behind it is already a keyword.
 FUNCTION_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+# The same definition with a space in it, which POSIX also allows: `f () {`.
+# shlex hands back `f` and `()` separately, so the name has to be recognised
+# by what follows it rather than by its own shape.
+FUNCTION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 DASH_C_RE = re.compile(r"^-[a-zA-Z]*c$")
 # `OUT=$(kubectl apply ...)` -- the assignment swallows the command word, so
 # the substitution is pulled out and classified in its own right.
@@ -943,6 +949,11 @@ def strip_wrappers(tokens):
                 or FUNCTION_DEF_RE.match(tok)):
             i += 1
             continue
+        # `f () { ... }` -- one token later the parens say this was a
+        # definition, not the command word it otherwise looks exactly like.
+        if (tokens[i + 1:i + 2] == ["()"] and FUNCTION_NAME_RE.match(tok)):
+            i += 2
+            continue
         # `function f { ... }` and `function f() { ... }` are the other two
         # spellings; the name is a bare word the loop would otherwise stop on.
         if tok == "function":
@@ -1098,15 +1109,35 @@ def image_refs(subs, args):
     return refs
 
 
-def unreadable_registry(ref):
-    """Does this ref hide the registry it pushes to?
+def unreadable_registry(ref, registries):
+    """Does this ref hide which protected registry it pushes to?
 
-    Only the host matters. `ghcr.io/x/y:$(git rev-parse HEAD)` computes its
-    tag and still says plainly that it is not going to a protected registry,
-    so treating any `$` in the ref as unreadable would prompt on ordinary
-    pushes elsewhere -- the false positive that costs an agent an hour.
+    A recorded registry prefix is more than a host -- `us-central1-docker.pkg
+    .dev/acme-prod`, host and project -- so judging the host alone leaves the
+    spelling an agent is most likely to write wide open. `vars.sh` exports
+    `PROJECT_ID`, and one that sourced it writes `docker push
+    us-central1-docker.pkg.dev/$PROJECT_ID/platform:dev`: the literal
+    substring match below finds no registry on the line, the host expanded
+    fine, and the push overwrites the tag the shared install runs with no
+    lease taken and no deny.
+
+    So the question is asked of everything the ref spells out, not of its
+    first segment: unreadable when the literal half -- up to the first token
+    that did not expand -- is still on the path to a protected registry.
+    `ghcr.io/x/y:$(git rev-parse HEAD)` computes its tag and still says
+    plainly it is going elsewhere, and no protected registry starts with
+    `ghcr.io/x/y:`, so it stays silent. Prompting on that instead is the
+    false positive that costs an agent an hour.
     """
-    return unexpanded(ref.split("/", 1)[0])
+    if unexpanded(ref.split("/", 1)[0]):
+        return True
+    if not unexpanded(ref):
+        # Fully readable. Whether it is a protected registry is then the
+        # literal match's question, and answering it here would prompt on a
+        # ref that names one outright.
+        return False
+    literal = re.split(r"[$`]", ref, maxsplit=1)[0]
+    return any(registry.startswith(literal) for registry in registries)
 
 
 def install_from_markers(installs, text):
@@ -1413,8 +1444,10 @@ def classify(command, installs, cwd=None, _depth=0):
                         return install, ("docker push to the %s registry"
                                          % install.name)
                 # No registry on the line, and the ref does not say where it
-                # is going -- `docker push $(cat last-image)`, or the `IMG=` a
-                # `source .env` two segments back set. A registry that is
+                # is going -- `docker push $(cat last-image)`, the `IMG=` a
+                # `source .env` two segments back set, or the half-spelled
+                # `.../$PROJECT_ID/...` that `unreadable_registry` owns. A
+                # registry that is
                 # absent and one the hook cannot read are different answers,
                 # and reading the second as the first is how the incident this
                 # exists to prevent gets through: the tag the shared install
@@ -1424,9 +1457,9 @@ def classify(command, installs, cwd=None, _depth=0):
                 # same asymmetry the installer branch argues. Silent when no
                 # protected install records a registry at all, since then
                 # there is nothing the push could be overwriting.
-                if (any(i.registry for i in installs.values())
-                        and any(unreadable_registry(ref)
-                                for ref in image_refs(subs, args))):
+                registries = [i.registry for i in installs.values() if i.registry]
+                if registries and any(unreadable_registry(ref, registries)
+                                      for ref in image_refs(subs, args)):
                     return UNKNOWN, "docker push whose registry could not be read"
             continue
 

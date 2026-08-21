@@ -392,16 +392,40 @@ class MutationsAreGuarded(unittest.TestCase):
                 self.assertIs(target, lease.UNKNOWN, reason)
 
     def test_a_readable_registry_is_an_answer_however_computed(self):
-        """Only the host decides. A ref that names where it is going and
-        computes its tag has answered the question -- prompting on it is the
-        false positive that costs an agent an hour on a push to their own
-        registry."""
+        """A ref that names where it is going and computes its tag has
+        answered the question -- prompting on it is the false positive that
+        costs an agent an hour on a push to their own registry. The last two
+        expand inside a registry the recorded prefixes do not reach: the host
+        matches, the project does not, so nothing protected is on that path.
+        """
         for command in ("docker push ghcr.io/someone/platform:$(git rev-parse HEAD)",
                         'docker push ghcr.io/someone/platform:"$TAG"',
-                        "docker buildx build --push -t ghcr.io/someone/x:$TAG ."):
+                        "docker buildx build --push -t ghcr.io/someone/x:$TAG .",
+                        "docker push us-central1-docker.pkg.dev/other-proj/x:$TAG",
+                        "docker push us-central1-docker.pkg.dev/other-proj/x:$(date +%s)"):
             with self.subTest(command=command):
                 target, reason = classify(command)
                 self.assertIsNone(target, reason)
+
+    def test_a_ref_that_expands_inside_the_registry_prefix_asks(self):
+        """The recorded prefix is host *and* project, so judging the host
+        alone leaves the likeliest spelling wide open.
+
+        `vars.sh` exports `PROJECT_ID`; an agent that sourced it writes the
+        region literally and the project through the variable. The literal
+        substring match finds no registry on the line and the host expanded
+        fine, so before this the push classified as nothing -- the tag the
+        shared install runs, overwritten with no lease and no deny. It is the
+        motivating incident, in the spelling most likely to produce it.
+        """
+        for command in ("docker push us-central1-docker.pkg.dev/$PROJECT_ID/platform:dev",
+                        "docker push us-central1-docker.pkg.dev/${PROJECT_ID}/x:dev",
+                        "docker push $REGION-docker.pkg.dev/acme-prod/x:dev",
+                        "docker buildx build --push "
+                        "-t us-central1-docker.pkg.dev/$PROJECT_ID/x:dev ."):
+            with self.subTest(command=command):
+                target, reason = classify(command)
+                self.assertIs(target, lease.UNKNOWN, reason)
 
     def test_no_recorded_registry_means_nothing_to_overwrite(self):
         """An install with no registry prefix cannot be pushed over, so an
@@ -746,11 +770,15 @@ class WhereAMutationHides(unittest.TestCase):
 
         `{` was already a stripped keyword; the name in front of it was not,
         so `strip_wrappers` stopped one token early and the body went unread.
-        All three spellings bash accepts.
+        All four spellings bash accepts -- the two with a space between the
+        name and the parens split into `f` and `()`, which is a different
+        shape from the `f()` one token the first two produce.
         """
         self.guarded("f() { kubectl --context %s delete ns x; }; f" % CTX)
         self.guarded("function f() { kubectl --context %s delete ns x; }; f" % CTX)
         self.guarded("function f { kubectl --context %s delete ns x; }; f" % CTX)
+        self.guarded("f () { kubectl --context %s delete ns x; }; f" % CTX)
+        self.guarded("function f () { kubectl --context %s delete ns x; }; f" % CTX)
 
     def test_a_case_arm_is_a_gap_the_design_doc_owns(self):
         """The one hiding place here that is documented rather than parsed.

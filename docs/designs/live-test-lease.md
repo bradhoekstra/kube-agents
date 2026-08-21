@@ -132,8 +132,13 @@ running install:
   exists to prevent. A stock install records the public
   [`DEFAULT_REGISTRY_PREFIX`](../../k8s-operator/scripts/installer_common.sh) rather than a private
   one, so this guard is only as specific as the prefix the install was given. A push whose image ref
-  did not expand — `docker push $(cat last-image)` — names no registry the hook can read, so it asks
-  rather than passing: an unreadable ref and an absent one are different answers.
+  did not expand asks rather than passing, because an unreadable ref and an absent one are different
+  answers. That covers the ref that says nothing at all — `docker push $(cat last-image)` — and the
+  half-spelled one, where what the ref does say is still on the path to a protected registry:
+  `vars.sh` exports `PROJECT_ID`, so `docker push $REGION-docker.pkg.dev/$PROJECT_ID/platform:dev`
+  and `docker push us-central1-docker.pkg.dev/$PROJECT_ID/platform:dev` both ask, while
+  `us-central1-docker.pkg.dev/some-other-project/x:$TAG` has already answered the question and stays
+  silent.
 
 `scripts/live_test_lease.py` is the source of truth for the membership of each family — the
 constants at the top of it, not this list. Its tests re-derive the `make` targets from the two
