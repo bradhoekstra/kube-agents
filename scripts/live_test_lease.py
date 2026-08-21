@@ -343,6 +343,19 @@ def resolve_installs(cwd=None, also=None):
     return installs
 
 
+def _resolvable_installs(cwd=None):
+    """`resolve_installs`, for callers that have something to do either way.
+
+    Release is the case: an unreadable config file or a malformed vars.sh is a
+    reason to lose the nicer labels, not a reason to leave a held lease on a
+    shared cluster until it expires.
+    """
+    try:
+        return resolve_installs(cwd)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 # --------------------------------------------------------------------------
 # Local holder token. Keyed on the session so subagents share the claim.
 # --------------------------------------------------------------------------
@@ -352,18 +365,50 @@ def holder_key():
             or ("nopid-%d" % os.getppid()))
 
 
-def read_local_token(install):
+def _decode_token(raw):
+    """The token file's contents as a dict.
+
+    Older files held the bare token hex and nothing else. One left behind by a
+    session that is still running has to keep working, so a payload that is not
+    JSON is read as the token alone -- which is all `do_release` strictly needs
+    once the install is in hand, and the only thing the reader can be sure of.
+    """
+    if raw.startswith("{"):
+        try:
+            record = json.loads(raw)
+        except ValueError:
+            return {}
+        return record if isinstance(record, dict) else {}
+    return {"token": raw}
+
+
+def _read_token_record(install):
     try:
         with open(install.token_file()) as fh:
-            return fh.read().strip()
+            return _decode_token(fh.read().strip())
     except OSError:
-        return None
+        return {}
+
+
+def read_local_token(install):
+    return _read_token_record(install).get("token")
 
 
 def write_local_token(install, token):
     os.makedirs(state_dir(), mode=0o700, exist_ok=True)
-    with open(install.token_file(), "w") as fh:
-        fh.write(token)
+    # Where the lease was taken, not just what it was taken with. The session
+    # that has to release it may no longer be standing anywhere that can
+    # discover this install, and a reconstruction that guessed DEFAULT_NAMESPACE
+    # would delete nothing while reporting success.
+    record = {"token": token, "context": install.context, "name": install.name,
+              "namespace": install.namespace}
+    if install.kubeconfig:
+        record["kubeconfig"] = install.kubeconfig
+    path = install.token_file()
+    with open(path, "w") as fh:
+        json.dump(record, fh)
+    # The token is a capability: whoever reads it can renew or drop the lease.
+    os.chmod(path, 0o600)
 
 
 def clear_local_token(install):
@@ -371,6 +416,57 @@ def clear_local_token(install):
         os.remove(install.token_file())
     except OSError:
         pass
+
+
+def held_installs(known=None):
+    """The installs this session holds a token for, keyed by name.
+
+    `resolve_installs` answers a different question -- what the directory you
+    are standing in protects. A session that ran `cd ../other-checkout &&
+    ./upgrade.sh` took a lease the hook discovered from *there*, and by
+    `SessionEnd` the cwd is back to somewhere that cannot see it. Iterating the
+    resolvable installs releases the wrong set: the one you are standing in
+    (which you may not hold) and not the one you do, which then sits held until
+    it expires an hour later and blocks every other agent in the meantime.
+
+    The token files are the record of what was actually claimed, so they are
+    what this reads. `known` supplies the discovered Install where the checkout
+    has one and it agrees with where the lease was taken.
+    """
+    suffix = "-%s" % holder_key()
+    by_context = {i.context: i for i in (known or {}).values()}
+    out = {}
+    try:
+        names = sorted(os.listdir(state_dir()))
+    except OSError:
+        return out
+    for filename in names:
+        if not filename.startswith("token-") or not filename.endswith(suffix):
+            continue
+        try:
+            with open(os.path.join(state_dir(), filename)) as fh:
+                record = _decode_token(fh.read().strip())
+        except OSError:
+            continue
+        if not record.get("token"):
+            continue
+        context = record.get("context") or filename[len("token-"):-len(suffix)]
+        if not context:
+            continue
+        namespace = record.get("namespace") or DEFAULT_NAMESPACE
+        seen = by_context.get(context)
+        # The discovered Install carries a label and markers the reconstruction
+        # cannot, but only where it points at the same namespace the lease was
+        # taken in. Where they disagree the record wins: it says where the
+        # ConfigMap really is.
+        if seen is not None and seen.namespace == namespace:
+            out[seen.name] = seen
+            continue
+        install = _install_from_context(
+            context, name=record.get("name") or None, namespace=namespace,
+            kubeconfig=record.get("kubeconfig") or None, source="token")
+        out[install.name] = install
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -740,9 +836,29 @@ def split_segments(command):
 
     Grouping syntax is stripped from the ends, so the command word of
     `(cd /tmp && ./install.sh)` is the installer rather than `./install.sh)`.
+
+    A `$(...)` is one piece, however many separators are inside it. Splitting
+    through it strands the opening `$(` on a fragment that `SUBSTITUTION_RE`
+    can no longer match, and the `VAR=$(cmd` left at the front is an assignment
+    as far as `strip_wrappers` is concerned -- so the command word goes with
+    it. `OUT=$(kubectl delete ns x 2>&1)` classified as nothing that way, and
+    `VAR=$(cmd 2>&1 || echo "")` is an idiom this repository's own scripts are
+    full of. The contents are still classified: `classify` recurses into the
+    substitution once the segment survives whole.
+
+    An `&` that belongs to a redirection is not a separator either -- `2>&1`
+    ends a command, it does not background one.
     """
-    out, buf, quote, i = [], [], None, 0
+    out, buf, quote, depth, i = [], [], None, 0, 0
     command = strip_heredocs(command)
+
+    def redirection_ampersand(at):
+        """Is the `&` at `at` part of `2>&1`, `>&2`, or `&>log`?"""
+        if command[at + 1:at + 2] == ">":
+            return True
+        before = "".join(buf).rstrip()
+        return before.endswith(">") or before.endswith("<")
+
     while i < len(command):
         ch = command[i]
         if ch == "\\" and quote != "'" and i + 1 < len(command):
@@ -761,10 +877,29 @@ def split_segments(command):
             buf.append(ch)
             i += 1
             continue
+        if command[i:i + 2] == "$(":
+            depth += 1
+            buf.append(command[i:i + 2])
+            i += 2
+            continue
+        if depth:
+            # Inside a substitution nothing separates, but the parens still
+            # have to be counted so `$(a $(b) c)` ends where it really ends.
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
         if command[i:i + 2] in ("&&", "||"):
             out.append("".join(buf))
             buf = []
             i += 2
+            continue
+        if ch == "&" and redirection_ampersand(i):
+            buf.append(ch)
+            i += 1
             continue
         if ch in ";\n|&":
             out.append("".join(buf))
@@ -1447,15 +1582,14 @@ def hook_sessionend():
         # real exit -- which reports one of the other reasons -- releases it.
         sys.exit(0)
     try:
-        installs = resolve_installs(payload.get("cwd"))
+        # What this session holds, not what the exit directory can see. A
+        # token file exists only where this session's holder key claimed a
+        # lease, so releasing somebody else's on the way out -- the failure the
+        # whole mechanism exists to prevent -- is not reachable from here.
+        installs = held_installs(_resolvable_installs(payload.get("cwd")))
     except Exception:  # noqa: BLE001 -- nothing to release if we cannot look
         sys.exit(0)
     for install in installs.values():
-        # No local token means this session never claimed this install, and
-        # releasing somebody else's lease on the way out is the failure the
-        # whole mechanism exists to prevent.
-        if not read_local_token(install):
-            continue
         try:
             do_release(install)
         except Exception:  # noqa: BLE001 -- one install must not strand the rest
@@ -1515,6 +1649,13 @@ def main():
         return hook_sessionend()
 
     installs = resolve_installs()
+    # An install this session holds a lease on belongs in every answer below,
+    # whether or not this directory can see it. Otherwise `status` reports a
+    # cluster you are holding as none of your business and `release --all`
+    # cannot reach it -- which is precisely the lease taken from a checkout the
+    # session has since left.
+    for name, install in held_installs(installs).items():
+        installs.setdefault(name, install)
     if not installs:
         print("No protected install found. This checkout has no "
               "k8s-operator/scripts/vars.sh and %s does not list one."
@@ -1532,13 +1673,11 @@ def main():
         elif args.action == "renew":
             ok, msg = do_renew(pick(installs, args.env), args.ttl)
         elif args.action == "release":
-            targets = (list(installs.values()) if args.all
+            targets = (list(held_installs(installs).values()) if args.all
                        else [pick(installs, args.env)])
             ok = True
             msgs = []
             for install in targets:
-                if args.all and not read_local_token(install):
-                    continue
                 good, m = do_release(install)
                 ok = ok and good
                 msgs.append("%s: %s" % (install.name, m))

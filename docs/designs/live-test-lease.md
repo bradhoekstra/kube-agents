@@ -1,7 +1,7 @@
 # Live-Test Lease
 
-> **STATUS — design of record; implemented.** `scripts/live_test_lease.py` and the hooks in
-> `.claude/settings.json` are what the repository ships.
+> **STATUS — design of record; implemented.** `scripts/live_test_lease.py` and the hook wiring in
+> `.claude/settings.json.example` are what the repository ships.
 
 **Scope:** How several agents share one running kube-agents installation without overwriting each
 other's live validation.
@@ -55,6 +55,13 @@ Losing the local token does not lose the install. The record also carries the se
 hook can tell "another agent holds this" from "you hold this, under a token this machine no longer
 has" and send you to `steal` rather than to a wait that will never end.
 
+The local file records the context, namespace, and kubeconfig the lease was taken against, not just
+the token. Those files are how `release --all` and `SessionEnd` decide what to release: the set of
+installs a directory can discover is a different set from the ones a session actually claimed. `cd
+../other-checkout && ./upgrade.sh` takes a lease on that checkout's install, and by the time the
+session ends the working directory is back somewhere that cannot see it. Releasing what the exit
+directory resolves to would drop nothing and leave the real lease standing for the rest of its hour.
+
 Leases expire after 60 minutes and renew lazily past the halfway mark, so an active session keeps
 its claim and an abandoned one does not hold the install hostage. `SessionEnd` releases whatever
 the session holds — except when its `reason` is `clear` or `resume`, which Claude Code reports on a
@@ -72,7 +79,19 @@ So enforcement sits in a `PreToolUse` hook, which is the only place a mutating c
 stopped before it runs. The hook denies the command while another agent holds the lease — naming
 the holder, their branch, and the expiry, so the blocked agent knows whether to wait or to
 coordinate — and **auto-acquires when the lease is free**, so nobody has to know the protocol
-exists. Doing it by hand stays available for the cases the classifier cannot see:
+exists.
+
+The wiring ships as an example you copy into place, once per checkout:
+
+```bash
+cp .claude/settings.json.example .claude/settings.json
+```
+
+`.claude/settings.json` is gitignored, so the copy is yours to edit and never turns up in a diff.
+It is not committed for the reason under [Limits](#limits) — a tracked settings file is branch
+content that Claude Code runs unprompted, and this repository's own review workflow checks out fork
+branches. Merge the two `hooks` entries by hand if you already keep a `settings.json`. Doing the
+lease by hand stays available for the cases the classifier cannot see:
 
 ```bash
 python3 scripts/live_test_lease.py status                    # every protected install
@@ -196,24 +215,25 @@ Enforcement is Claude Code-specific — the CLI is harness-agnostic and can be r
 a plain shell, but only the hook makes it mandatory. An agent working through another harness, or a
 human running `kubectl` directly, is on the honour system.
 
-`.claude/settings.json` is committed, so cloning the repository and running Claude Code in it runs
-`scripts/live_test_lease.py` on every Bash tool call. That is the point — a hook nobody opts into
-is a hook nobody has — but it is repository-controlled code executing on a contributor's machine,
-and it is the reason the script reads `vars.sh` with a regex over an allowlist rather than sourcing
-it, exits before any cluster round-trip when nothing is configured, and shells out to nothing but
-`kubectl` and `git`. A contributor who already keeps a local `.claude/settings.json` gets the file
-in their way rather than overwritten — git refuses to check the tracked one out over an untracked
-one and aborts the pull with "The following untracked working tree files would be overwritten" —
-and after that their edits to it are edits to a tracked file, which is the harder problem. Personal
-hooks belong in `.claude/settings.local.json`, which stays ignored.
+**The hook is opt-in, and that is a real gap.** A contributor who never runs the `cp` above has no
+enforcement at all — which is the failure mode a committed `.claude/settings.json` would have
+closed, and closing it is not worth what it costs. A tracked settings file is branch content that
+Claude Code executes without being asked. A pull request can change both it and the script it runs,
+so checking out a fork's branch into an already-trusted checkout — or into a worktree of one, which
+is how `.claude/commands/pr-review-batch.md` reviews every open pull request — would arm whatever
+that branch says on the reviewer's next Bash call, with their kubeconfigs and their mode-600
+`vars.sh` in reach. Workspace trust is granted per directory and is not re-asked when the branch
+changes, so the reviewing case is exactly the one it does not cover. Shipping an example keeps the
+reviewer's execution path free of fork content; the cost is that the protection has to be asked
+for.
 
-Being branch content is the sharper end of that. A pull request can change both the settings file
-and the script it runs, so checking out a fork's branch into an already-trusted checkout — or into
-a worktree of one, which is how `.claude/commands/pr-review-batch.md` reviews — arms whatever that
-branch says on the reviewer's next Bash call, with their kubeconfigs and their mode-600 `vars.sh`
-in reach. Claude Code skips hooks until workspace trust is accepted, which covers a fresh clone in
-a new directory and not this case. Read the diff of `.claude/` and `scripts/live_test_lease.py`
-before running an agent over an untrusted branch.
+Once copied, the file is repository-controlled code running on a contributor's machine on every
+Bash tool call, and the script is written for that: it reads `vars.sh` with a regex over an
+allowlist rather than sourcing it, exits before any cluster round-trip when nothing is configured,
+and shells out to nothing but `kubectl` and `git`. Read the diff of `scripts/live_test_lease.py`
+before pulling a branch you do not trust, since the copy points at the working tree's script.
+Personal hooks unrelated to the lease belong in `.claude/settings.local.json`, which stays ignored
+either way.
 
 The lease renews only when another Bash call passes through the hook, so a single unattended run
 longer than the TTL — `install.sh` against a fresh GKE cluster — expires mid-run and can legitimately

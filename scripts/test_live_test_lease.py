@@ -30,6 +30,8 @@ import live_test_lease as lease
 CTX = "gke_acme-prod_us-central1_agents-cluster"
 OTHER_CTX = "gke_acme-prod_us-central1_unrelated-cluster"
 
+_UNSET = object()
+
 
 def installs(*extra):
     """The one protected install these tests use, plus any extras."""
@@ -450,12 +452,17 @@ class InstallerEntryPoints(unittest.TestCase):
 
 
 class HookWiring(unittest.TestCase):
-    """`.claude/settings.json` has to declare budgets the hooks can meet."""
+    """The shipped hook wiring has to declare budgets the hooks can meet.
+
+    `.claude/settings.json.example` is what a contributor copies into place,
+    so it is the file these assertions have to hold for; the copy itself is
+    gitignored and this suite cannot see it on anyone else's machine.
+    """
 
     def setUp(self):
         root = Path(__file__).resolve().parent.parent
         self.hooks = json.loads(
-            (root / ".claude" / "settings.json").read_text())["hooks"]
+            (root / ".claude" / "settings.json.example").read_text())["hooks"]
 
     def _timeouts(self, event):
         return [h.get("timeout") for entry in self.hooks[event]
@@ -638,6 +645,39 @@ class WhereAMutationHides(unittest.TestCase):
     def test_a_backgrounded_segment(self):
         """A lone `&` separates commands the way `;` does."""
         self.guarded("sleep 1 & kubectl --context %s delete ns x" % CTX)
+
+    def test_a_redirections_ampersand_does_not_end_the_command(self):
+        """`2>&1` is one token of a redirection, not a background operator.
+
+        These pass whether or not the split honours that, because the command
+        word sits at the front of the bad split and classifies from there.
+        That is luck, not design -- the boundary the shell does not have is
+        invented one token after everything this classifier reads. The
+        assertion is here so the luck is not load-bearing.
+        """
+        self.guarded("kubectl --context %s delete ns x 2>&1" % CTX)
+        self.guarded("kubectl --context %s delete ns x >&2" % CTX)
+        self.guarded("kubectl --context %s delete ns x &>/tmp/log" % CTX)
+        self.assertEqual(
+            lease.split_segments("kubectl delete ns x 2>&1 && echo done"),
+            ["kubectl delete ns x 2>&1", "echo done"])
+
+    def test_a_substitution_is_one_piece_however_many_separators_it_holds(self):
+        """`VAR=$(cmd 2>&1 || true)` is the idiom this repository's own
+        scripts capture output with, and splitting through it left
+        `VAR=$(cmd 2>` at the front -- an assignment, which strip_wrappers
+        discards along with the command word it was hiding."""
+        self.guarded("OUT=$(kubectl --context %s delete ns x 2>&1)" % CTX)
+        self.guarded('OUT=$(kubectl --context %s apply -f cr.yaml 2>&1 '
+                     '|| echo "")' % CTX)
+        self.guarded("OUT=$(echo $(kubectl --context %s patch cm x -p '{}'))"
+                     % CTX)
+
+    def test_an_installer_whose_output_is_captured(self):
+        with TemporaryDirectory() as tmp:
+            _write_vars_sh(tmp)
+            self.guarded("LOG=$(./upgrade.sh 2>&1 | tail -20)", cwd=tmp)
+            self.guarded("R=$(make deploy || true)", cwd=tmp)
         self.guarded("kubectl --context %s apply -f cr.yaml &" % CTX)
 
     def test_a_cd_into_another_checkout(self):
@@ -1192,16 +1232,128 @@ class HookEntryPoints(unittest.TestCase):
                 self._sessionend(fake, reason=reason)
                 self.assertIn("delete", _verbs(fake))
 
-    def _sessionend(self, fake, reason=None):
+    def test_sessionend_releases_a_lease_the_exit_directory_cannot_see(self):
+        """The install you hold is not always the install you are standing in.
+
+        `cd ../other-checkout && ./upgrade.sh` takes a lease the hook
+        discovered from there; by SessionEnd the cwd is back somewhere that
+        cannot see it. Iterating the resolvable installs releases the wrong
+        set, and the real one sits held for the rest of its hour.
+        """
+        lease.write_local_token(self.install, "mine")
+        fake = _fake_kubectl(_lease_data(token="mine", minutes=30))
+        self._sessionend(fake, resolvable={})
+        self.assertIn("delete", _verbs(fake))
+        self.assertFalse(os.path.exists(self.install.token_file()))
+
+    def test_sessionend_survives_discovery_blowing_up(self):
+        """A broken config file is a reason to lose the labels, not the lease."""
+        lease.write_local_token(self.install, "mine")
+        fake = _fake_kubectl(_lease_data(token="mine", minutes=30))
+        with mock.patch.object(lease, "resolve_installs",
+                               side_effect=RuntimeError("boom")):
+            self._sessionend(fake, resolvable=None)
+        self.assertIn("delete", _verbs(fake))
+
+    def _sessionend(self, fake, reason=None, resolvable=_UNSET):
         payload = {"reason": reason} if reason else {}
-        with mock.patch.object(lease.sys, "stdin",
-                               io.StringIO(json.dumps(payload))):
-            with mock.patch.object(lease, "resolve_installs",
-                                   return_value={self.install.name: self.install}):
-                with mock.patch.object(lease, "kubectl", fake):
-                    with self.assertRaises(SystemExit) as exit:
-                        lease.hook_sessionend()
+        if resolvable is _UNSET:
+            resolvable = {self.install.name: self.install}
+        stack = [
+            mock.patch.object(lease.sys, "stdin", io.StringIO(json.dumps(payload))),
+            mock.patch.object(lease, "kubectl", fake),
+        ]
+        if resolvable is not None:
+            stack.append(mock.patch.object(lease, "resolve_installs",
+                                           return_value=resolvable))
+        with contextlib.ExitStack() as es:
+            for ctx in stack:
+                es.enter_context(ctx)
+            with self.assertRaises(SystemExit) as exit:
+                lease.hook_sessionend()
         self.assertEqual(exit.exception.code, 0)
+
+
+class WhatTheSessionActuallyHolds(unittest.TestCase):
+    """`held_installs` reads the token files, not the current directory.
+
+    Everything that releases a lease goes through it, so a reconstruction that
+    is subtly wrong -- the wrong namespace, the wrong kubeconfig -- reports a
+    release that deleted nothing while dropping the local token that was the
+    only remaining way to find the lease again.
+    """
+
+    def setUp(self):
+        self.tmp = TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        patcher = mock.patch.dict(os.environ, {
+            "XDG_STATE_HOME": self.tmp.name,
+            "KUBE_AGENTS_LEASE_SESSION": "test-session",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_nothing_held_is_an_empty_answer_not_a_crash(self):
+        self.assertEqual(lease.held_installs(), {})
+        self.assertEqual(lease.held_installs(installs()), {})
+
+    def test_a_token_reaches_an_install_no_checkout_can_see(self):
+        held = lease._install_from_context(CTX)
+        lease.write_local_token(held, "mine")
+        found = lease.held_installs({})
+        self.assertEqual(list(found), ["agents-cluster"])
+        self.assertEqual(found["agents-cluster"].context, CTX)
+        self.assertEqual(lease.read_local_token(found["agents-cluster"]), "mine")
+
+    def test_the_record_carries_where_the_lease_was_taken(self):
+        """A reconstruction that guessed DEFAULT_NAMESPACE would delete a
+        ConfigMap in the wrong namespace -- reporting success, clearing the
+        token, and stranding the real lease with no local record of it."""
+        held = lease._install_from_context(
+            CTX, namespace="agents-staging", kubeconfig="/tmp/other.config")
+        lease.write_local_token(held, "mine")
+        found = lease.held_installs({})["agents-cluster"]
+        self.assertEqual(found.namespace, "agents-staging")
+        self.assertEqual(found.kubeconfig, "/tmp/other.config")
+
+    def test_a_discovered_install_wins_only_where_it_agrees(self):
+        held = lease._install_from_context(CTX, namespace="agents-staging")
+        lease.write_local_token(held, "mine")
+        # The checkout points at the same context in a different namespace, so
+        # it describes a different ConfigMap than the one that was claimed.
+        self.assertEqual(
+            lease.held_installs(installs())["agents-cluster"].namespace,
+            "agents-staging")
+        # Agreeing, it contributes its label and markers.
+        agreeing = lease._install_from_context(CTX, namespace="agents-staging",
+                                               label="from the checkout")
+        self.assertEqual(
+            lease.held_installs({"agents-cluster": agreeing})["agents-cluster"].label,
+            "from the checkout")
+
+    def test_another_sessions_token_is_not_yours_to_release(self):
+        held = lease._install_from_context(CTX)
+        lease.write_local_token(held, "mine")
+        with mock.patch.dict(os.environ,
+                             {"KUBE_AGENTS_LEASE_SESSION": "someone-else"}):
+            self.assertEqual(lease.held_installs({}), {})
+
+    def test_a_legacy_bare_token_file_still_releases(self):
+        """A file written by a build that predates the JSON record belongs to
+        a session that may still be running. Its namespace is unrecoverable,
+        so the default is all there is -- but the token is not lost."""
+        held = lease._install_from_context(CTX)
+        os.makedirs(lease.state_dir(), mode=0o700, exist_ok=True)
+        Path(held.token_file()).write_text("deadbeef\n")
+        self.assertEqual(lease.read_local_token(held), "deadbeef")
+        found = lease.held_installs({})
+        self.assertEqual(found["agents-cluster"].context, CTX)
+        self.assertEqual(found["agents-cluster"].namespace, lease.DEFAULT_NAMESPACE)
+
+    def test_the_token_file_is_not_world_readable(self):
+        held = lease._install_from_context(CTX)
+        lease.write_local_token(held, "mine")
+        self.assertEqual(os.stat(held.token_file()).st_mode & 0o077, 0)
 
 
 # --------------------------------------------------------------------------
