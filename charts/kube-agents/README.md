@@ -272,11 +272,19 @@ node's cache. The two install surfaces agree on `Always` for the mutable-tag
 case they were both written for, and `make iac-parity-check` holds them there;
 an install at a pinned release tag is the case that wants the override.
 
-Two knobs have no Terraform or chart-side infrastructure behind them:
+Three knobs have no Terraform or chart-side infrastructure behind them:
 
 - `deployment.availability.runtimeClassName: gvisor` needs the GKE Sandbox node
   pool that [`provision_02_gvisor_nodepool.sh`](../../k8s-operator/scripts/provision_02_gvisor_nodepool.sh)
   creates; the Autopilot `gke-cluster` module has no equivalent.
+- `security.workloadIdentityFederation` needs a Workload Identity pool and
+  provider trusting the cluster's OIDC issuer, and one
+  `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
+  them: the three `gcloud` commands are in
+  [`designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md#setting-up-the-pool).
+  Set it with `harness.experimental.shellSandbox.enabled` — the chart fails the
+  render if you set one without the other, since federation only takes effect
+  when the credential proxy runs beside the sandbox.
 - `harness.hermes.dashboardEnabled` is the one field where the two install paths
   disagree by default: the CRD defaults it to `true`, the script path to
   `false`. Set it explicitly when the two installs must match.

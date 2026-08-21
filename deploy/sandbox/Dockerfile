@@ -115,9 +115,29 @@ RUN pip install --no-cache-dir pyyaml requests
 # different volume from the one above. The model owns /opt/data's mount point, so
 # it can rename any entry there — a private key on that volume is one the model
 # can read today or displace tomorrow, whatever the mode on the file itself.
+#
+# /home/agent/.hermes is root-owned and unwritable, and that is what closes the
+# sandbox's one write channel back into the agent pod. Hermes' ssh backend keeps
+# a file sync over this directory: it pushes at connect and, in
+# FileSyncManager.sync_back, tars the whole tree back and copies anything new or
+# changed onto the agent pod's Hermes home. Skills are in that tree, so a file
+# the model writes here lands in the gateway's skills/ — instructions the next
+# session loads into context, on a volume that outlives this pod. Making the
+# directory unwritable is what stops it, and it costs nothing: nothing in this
+# image reads the pushed copy. The sandbox's authoritative skills come from
+# /opt/defaults/skills (see the note further down), and what Hermes pushes here
+# is the wrong profile's tree anyway.
+#
+# The far end degrades quietly, which is why this works from one side.
+# _ensure_remote_dirs runs `mkdir -p` and ignores the exit status; the push then
+# fails inside FileSyncManager.sync, which catches it, rolls its state back and
+# logs a warning; and sync_back returns early on `not self._pushed_hashes and
+# not self._synced_files` without opening a connection at all. The cost is that
+# warning, once per sync cycle.
 RUN useradd --create-home --home-dir /home/agent --shell /bin/bash --uid 1000 agent && \
     usermod -p '*' agent && \
     install -d -m 0700 -o agent -g agent /home/agent/.ssh && \
+    install -d -m 0555 -o root -g root /home/agent/.hermes && \
     install -d -m 0755 /run/sshd && \
     install -d -m 0755 -o agent -g agent /opt/data && \
     install -d -m 0700 -o root -g root /var/lib/sandbox-sshd
@@ -174,12 +194,13 @@ RUN groupadd --gid 1001 hermes && \
 # later command (tools/environments/base.py), so a file in /etc/profile.d is
 # read exactly the way it is for the local backend.
 #
-# The wrappers need CREDENTIAL_PROXY_URL to point at a reachable proxy. In the
-# agent pod that is loopback; a sandbox in its own pod needs the proxy to be
-# addressable over the network, which is Part C of #737 and is not done yet
-# (docs/designs/credential-proxy-placement.md). Until it lands these wrappers
-# resolve, run, and report "credential proxy unavailable" — which is the honest
-# answer, and a much better one than a kubectl that is silently absent.
+# The wrappers need CREDENTIAL_PROXY_URL to point at a reachable proxy. That is
+# this pod's loopback when the proxy is a container of the sandbox StatefulSet,
+# which the operator does when Workload Identity Federation is configured
+# (docs/designs/agent-shell-sandboxing.md). Without it the variable is unset and
+# these wrappers resolve, run, and report "credential proxy unavailable" — which
+# is the honest answer, and a much better one than a kubectl that is silently
+# absent.
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
 COPY --chmod=0644 deploy/sandbox/sshd_config /etc/ssh/sshd_config
@@ -230,6 +251,9 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   forge.py               GitHub REST client, imported by pr_conversation
 #   pr_triggers.py         imported by pr_conversation, imports forge
 #   github_token_refresh.py  invoked directly by submit-suggestion Step 5
+#   wif_credentials.py     imported by github_token_refresh, and reached only by
+#                          the branch the proxy container takes; here so that the
+#                          import at the top of that script resolves
 #   gitops_workspace.py    the leased clone every write skill uses
 #   gke_endpoint.py        the DNS-endpoint decision gke-networking sends the model
 #                          to read; stdlib only, and nothing in it is agent-pod-bound
@@ -251,6 +275,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/forge.py \
      agents/platform/scripts/pr_triggers.py \
      agents/platform/scripts/github_token_refresh.py \
+     agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \

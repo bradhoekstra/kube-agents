@@ -40,8 +40,8 @@ def shares_filesystem_with_proxy(endpoint: str) -> bool:
 
     The cost is that `git` cannot be driven from another pod — the lease check
     it runs is a statement about a directory the proxy can see, and there is no
-    such directory. See docs/designs/credential-proxy-placement.md, "What
-    shipped ahead of #720".
+    such directory. See docs/designs/agent-shell-sandboxing.md, "The workspace
+    check".
     """
     return (urllib.parse.urlsplit(endpoint).hostname or "") in LOOPBACK_HOSTS
 

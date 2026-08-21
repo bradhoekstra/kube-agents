@@ -219,6 +219,18 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Unsupported switches. Nothing under here carries a compatibility promise:
+    # a field may change meaning, change default, or be removed between
+    # releases, and an install that sets one is expected to re-check it at every
+    # upgrade. The CRD says the same in ExperimentalSpec.
+    experimental:
+      # Moves the agent's shell into a pod of its own (#737 Part B), reached
+      # over SSH with the keypair in credentials.secretName. Off by default.
+      shellSandbox:
+        enabled: null # CRD default: false
+        # Overrides the sandbox image. Empty takes the operator's default,
+        # which comes from the same tag inventory as every other image.
+        image: ""
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent
@@ -291,6 +303,36 @@ platformAgent:
     # Annotations applied to that KSA, e.g. for Workload Identity:
     #   iam.gke.io/gcp-service-account: <GSA>@<project>.iam.gserviceaccount.com
     serviceAccountAnnotations: {}
+    # Gives the credential proxy a GCP identity that does not come from the
+    # metadata server, which is what lets it run beside the shell sandbox.
+    #
+    # GKE resolves Workload Identity by POD IP, so every container in a pod
+    # shares one cloud identity: a proxy sitting next to the agent's shell under
+    # plain Workload Identity would let that shell mint the proxy's tokens
+    # straight from 169.254.169.254, with no policy layer in between. Federation
+    # replaces that with a projected token mounted into the proxy container
+    # alone. Mounts are per-container where pod identity is not.
+    #
+    # Set both fields or neither — the operator reads a half-filled block as
+    # absent, and the chart refuses it outright. Setting them without
+    # harness.experimental.shellSandbox.enabled leaves the proxy in its own
+    # Deployment on the metadata server, which is the default arrangement, so
+    # the chart refuses that combination too.
+    #
+    # NOTHING CREATES THE POOL. Neither this chart, the Terraform modules, nor
+    # the provisioning scripts run the three gcloud commands; they are in
+    # docs/designs/agent-shell-sandboxing.md#setting-up-the-pool.
+    workloadIdentityFederation:
+      # The pool provider's full resource name, exactly as STS wants it as `aud`:
+      #   //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+      # A mismatch is rejected at exchange time, not at admission, so it shows up
+      # as a proxy that starts and then fails every credentialed command.
+      audience: ""
+      # The GSA the federated principal impersonates — the same one
+      # serviceAccountAnnotations names, since it already holds the agent's
+      # roles. The federated principal needs only roles/iam.workloadIdentityUser
+      # on it.
+      serviceAccountEmail: ""
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

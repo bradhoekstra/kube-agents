@@ -617,7 +617,7 @@ func TestBuildDeployment(t *testing.T) {
 	// The state directory belongs to the credential runtime, which now runs in a
 	// pod of its own; the same merge protects it there.
 	credentialEnv := make(map[string]corev1.EnvVar)
-	for _, env := range buildCredentialProxyContainer(agent).Env {
+	for _, env := range buildCredentialProxyContainer(agent, false).Env {
 		credentialEnv[env.Name] = env
 	}
 	if credentialEnv["CREDENTIAL_PROXY_STATE_DIR"].Value != "/var/lib/credential-proxy" {
@@ -675,7 +675,7 @@ func TestBuildDeployment(t *testing.T) {
 		}
 	}
 	proxyHasTokenMount := false
-	for _, mount := range buildCredentialProxyContainer(agent).VolumeMounts {
+	for _, mount := range buildCredentialProxyContainer(agent, false).VolumeMounts {
 		if mount.Name == "credential-proxy-ksa-token" && mount.ReadOnly {
 			proxyHasTokenMount = true
 		}
@@ -1075,7 +1075,7 @@ func TestBuildCredentialProxySidecar(t *testing.T) {
 		t.Fatalf("unexpected credential proxy policy: %#v", policy)
 	}
 
-	container := buildCredentialProxyContainer(agent)
+	container := buildCredentialProxyContainer(agent, false)
 	if container.Name != "envoy-credential-proxy" || container.Image != "example/credential-proxy:v1" {
 		t.Errorf("unexpected proxy container: %#v", container)
 	}
@@ -1547,7 +1547,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 
 	proxyEnv := make(map[string]corev1.EnvVar)
-	for _, env := range buildCredentialProxyContainer(agent).Env {
+	for _, env := range buildCredentialProxyContainer(agent, false).Env {
 		proxyEnv[env.Name] = env
 	}
 	if proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {

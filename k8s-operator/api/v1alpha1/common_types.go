@@ -482,6 +482,58 @@ type SecuritySpec struct {
 	// ServiceAccountAnnotations specifies custom annotations to apply to the generated ServiceAccount.
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
+
+	// WorkloadIdentityFederation gives the credential proxy a GCP identity that
+	// does not come from the metadata server.
+	//
+	// Set this when the proxy runs beside the shell sandbox. GKE resolves
+	// Workload Identity by pod IP, so every container in a pod shares one cloud
+	// identity — co-locating the proxy with the sandbox under plain Workload
+	// Identity would let the sandbox mint the proxy's tokens directly from
+	// 169.254.169.254, with no policy layer in the way. Federation replaces that
+	// with a projected service-account token mounted into the proxy container
+	// alone, exchanged for a GCP access token over STS. Mounts are per-container
+	// where pod identity is not, which is the whole reason this field exists.
+	//
+	// Absent means the proxy keeps using the metadata server, which is correct
+	// for the standalone-Deployment arrangement where it has a pod to itself.
+	// +optional
+	WorkloadIdentityFederation *WorkloadIdentityFederationSpec `json:"workloadIdentityFederation,omitempty"`
+}
+
+// WorkloadIdentityFederationSpec names the pool the proxy federates through and
+// the service account it impersonates once it gets there.
+//
+// The Helm chart sets both fields from
+// platformAgent.security.workloadIdentityFederation, and refuses a half-filled
+// block rather than relying on the fail-safe below. What no install surface
+// does is create the pool itself: the runnable pool, provider and
+// roles/iam.workloadIdentityUser commands are in
+// docs/designs/agent-shell-sandboxing.md.
+type WorkloadIdentityFederationSpec struct {
+	// Audience is the provider's full resource name, in the form STS expects as
+	// the `aud` claim:
+	//
+	//	//iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+	//
+	// The projected token's audience is set from this verbatim. A mismatch is
+	// rejected by STS at exchange time with `invalid_target`, not at admission,
+	// so it surfaces as a proxy that starts and then fails every command.
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[^/]+/providers/[^/]+$`
+	// +optional
+	Audience string `json:"audience,omitempty"`
+
+	// ServiceAccountEmail is the GSA the federated principal impersonates.
+	//
+	// Impersonation rather than direct grants: the agent's roles are already
+	// attached to this service account by every install surface, and rebuilding
+	// that grant set against a federated principal would mean maintaining it
+	// twice. The federated principal therefore needs exactly one permission —
+	// roles/iam.workloadIdentityUser on this account — and nothing else moves.
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.

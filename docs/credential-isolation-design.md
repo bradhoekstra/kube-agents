@@ -28,8 +28,8 @@ The credential runtime is no longer among them. `envoy-credential-proxy` — Env
 the real CLIs, and the Slack and Google Chat relays — runs in a Deployment of its
 own, `<agent>-credential-proxy`, reached over a ClusterIP Service on port 8765
 instead of loopback. See
-[`designs/credential-proxy-placement.md`](designs/credential-proxy-placement.md)
-for why it moved and what the move does not yet deliver.
+[`designs/agent-shell-sandboxing.md`](designs/agent-shell-sandboxing.md#the-standalone-fallback)
+for why it moved and what that placement does not deliver.
 
 The sandbox calls wrappers for `gcloud`, `kubectl`, `gh`, and `git`. Wrappers
 send a structured argument vector to Envoy at `CREDENTIAL_PROXY_URL`. Envoy
@@ -74,6 +74,13 @@ cannot block metadata for one container while allowing it for another.
 This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
+
+Setting `spec.harness.experimental.shellSandbox.enabled` with `spec.security.workloadIdentityFederation`
+removes that assumption: the Pod holding the shell has no Workload Identity
+binding, and the proxy beside it federates a projected token mounted in its own
+container. Mounts are per-container where Pod identity is not.
+[`designs/agent-shell-sandboxing.md`](designs/agent-shell-sandboxing.md)
+is canonical for that arrangement.
 
 ## Scope
 

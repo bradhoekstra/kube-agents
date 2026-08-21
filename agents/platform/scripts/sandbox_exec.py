@@ -64,6 +64,23 @@ TERMINAL_PRINCIPAL = "agent"
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
 
+# Where a command runs in the sandbox when the caller names no directory.
+#
+# It has to be inside the credential proxy's workspace root or every proxied
+# command fails before it starts: the shim posts its own `os.getcwd()`, and the
+# proxy raises "working directory is outside the shared workspace" for anything
+# outside (credential_proxy.py, `_execute`). sshd would otherwise drop this
+# module's login in /home/hermes, which is outside it — so the four credentialed
+# binaries are unreachable from the agent pod without this.
+#
+# The operator publishes the real value as `terminal.workspace_root`, because it
+# is the only party that knows both sides. This constant is the fallback for a
+# managed config written before that key existed, and matches what the operator
+# sets. Deliberately NOT `HERMES_HOME`: that names a directory in the agent pod,
+# and this one is in the sandbox. They are the same string today only because
+# deploy/sandbox/Dockerfile creates /opt/data in the sandbox on purpose.
+DEFAULT_SANDBOX_CWD = "/opt/data"
+
 # ssh reserves 255 for its own failures, and a remote command is free to exit
 # 255 as well. The two are told apart by what ssh says on stderr when it is the
 # one failing, which is the only signal available: a wrapper that appended its
@@ -198,6 +215,12 @@ def ssh_argv(argv: list[str], *, remote_env: dict[str, str] | None = None,
     if principal not in (SANDBOX_PRINCIPAL, TERMINAL_PRINCIPAL):
         raise ValueError(f"not a sandbox login: {principal!r}")
     command.append(f"{principal}@{host}")
+    # A caller that named a directory gets it; everyone else gets the workspace
+    # root rather than wherever sshd happens to drop the login. See
+    # DEFAULT_SANDBOX_CWD for why the difference is load-bearing.
+    if cwd is None:
+        published = terminal.get("workspace_root")
+        cwd = str(published) if published else DEFAULT_SANDBOX_CWD
     command.append(_remote_command(argv, remote_env, cwd))
     return command
 

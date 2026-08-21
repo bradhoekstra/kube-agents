@@ -1135,17 +1135,49 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 // maps each one onto the TERMINAL_* environment variable tools/terminal_tool.py
 // reads, and tools/environments/ssh.py turns them into an ssh command line.
 //
-// Five keys and no more. `cwd` is absent on purpose — it is per-profile, and a
-// value here would replace each profile's own (see the note on renderConfigYAML).
-// `ssh_persistent` is absent because Hermes has no env var for it, so rendering it
-// would look like a setting and be one only for in-process callers.
+// Six of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
+// and a value here would replace each profile's own (see the note on
+// renderConfigYAML). `ssh_persistent` is absent because Hermes has no env var for
+// it, so rendering it would look like a setting and be one only for in-process
+// callers.
+//
+// `lifetime_seconds` is the reaper's idle timeout, and it is here to keep the
+// reaper from firing at all. Hermes gives every task its own SSHEnvironment but
+// derives the ssh ControlPath from sha256(user@host:port) — all three fixed by
+// this block — so every concurrent task multiplexes over ONE master connection.
+// Teardown is per environment and not per connection: cleanup() runs
+// `ssh -O exit` on that shared path, which drops the master and kills every
+// session riding it. A sibling task loses its in-flight command with exit 255
+// and an empty stderr. At the 300s default and delegation.max_concurrent_children
+// of 3, the reaper reaches that state whenever one child idles while another
+// works. Nothing is reclaimed by reaping here — the far side is a StatefulSet pod
+// that stays up either way — so the timeout buys nothing and costs the race.
+//
+// `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
+// is agents/platform/scripts/sandbox_exec.py, which already parses this block for
+// ssh_host and needs one more fact about the far side — the directory a proxied
+// command must run in, which is credentialProxyWorkspaceRoot on the co-located
+// proxy. It is published rather than hardcoded in the script because it describes
+// the sandbox, and the script runs in the agent pod: the two filesystems agree
+// only because deploy/sandbox/Dockerfile creates /opt/data to match, and a script
+// that reads its own HERMES_HOME to name a path in another container is relying on
+// that coincidence rather than on the operator that set both.
 type managedTerminalConfig struct {
-	Backend string `json:"backend"`
-	SSHHost string `json:"ssh_host"`
-	SSHUser string `json:"ssh_user"`
-	SSHPort int    `json:"ssh_port"`
-	SSHKey  string `json:"ssh_key"`
+	Backend         string `json:"backend"`
+	SSHHost         string `json:"ssh_host"`
+	SSHUser         string `json:"ssh_user"`
+	SSHPort         int    `json:"ssh_port"`
+	SSHKey          string `json:"ssh_key"`
+	LifetimeSeconds int    `json:"lifetime_seconds"`
+	WorkspaceRoot   string `json:"workspace_root"`
 }
+
+// shellSandboxEnvLifetimeSeconds is what the operator publishes as
+// terminal.lifetime_seconds — see the note above. 30 days, not "off": Hermes
+// takes an int and has no sentinel for never, and a number this size means the
+// only environments the reaper can still collect are ones whose process has
+// outlived a month of rollouts, which nothing here does.
+const shellSandboxEnvLifetimeSeconds = 2592000
 
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
@@ -1230,11 +1262,13 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// fleet changes.
 	if shellSandboxEnabled(agent) {
 		cfg.Terminal = &managedTerminalConfig{
-			Backend: "ssh",
-			SSHHost: shellSandboxHost(agent),
-			SSHUser: shellSandboxUser,
-			SSHPort: shellSandboxPort,
-			SSHKey:  shellSandboxClientKeyFilePath(),
+			Backend:         "ssh",
+			SSHHost:         shellSandboxHost(agent),
+			SSHUser:         shellSandboxUser,
+			SSHPort:         shellSandboxPort,
+			SSHKey:          shellSandboxClientKeyFilePath(),
+			LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
+			WorkspaceRoot:   shellSandboxDataPath,
 		}
 	}
 

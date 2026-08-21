@@ -39,10 +39,10 @@ case "${CREDENTIAL_PROXY_ROLE}" in
 esac
 
 # Which interface Envoy's credential listener binds. Loopback is the default and
-# was the only option while the proxy was a sidecar: it authenticates no caller,
-# so being unreachable off the pod was the whole access control. The standalone
+# is what both co-located placements use: the listener authenticates no caller,
+# so being unreachable off the pod is the whole access control. The standalone
 # pod sets 0.0.0.0 and gives that up — see the caveat in
-# docs/designs/credential-proxy-placement.md, "What shipped ahead of #720".
+# docs/designs/agent-shell-sandboxing.md, "Caller authentication".
 CREDENTIAL_PROXY_LISTEN_ADDRESS="${CREDENTIAL_PROXY_LISTEN_ADDRESS:-127.0.0.1}"
 
 # Watcher restart policy. The watcher is retried in place rather than being
@@ -124,6 +124,17 @@ terminate() {
   [[ -z "${envoy_pid}" ]] || kill "${envoy_pid}" 2>/dev/null || true
 }
 trap terminate EXIT INT TERM
+
+# Workload Identity Federation, when the proxy shares a pod with the shell
+# sandbox. It has to run before anything that authenticates to GCP: the
+# credential runtime's bootstrap command is `gcloud container clusters
+# get-credentials`, and gcloud reads CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE at
+# invocation. A no-op in the standalone placement, where the metadata server
+# still answers. Not backgrounded and not tolerant of failure — a container that
+# comes up without an identity serves nothing but errors.
+write_wif_credentials() {
+  /opt/credential-proxy-venv/bin/python3 /opt/defaults/scripts/wif_credentials.py
+}
 
 start_credential_runtime() {
   # The proxy's own interpreter, not Hermes'. This image is no longer built on
@@ -275,6 +286,7 @@ start_event_watcher() {
   watcher_pid=$!
 }
 
+write_wif_credentials
 start_credential_runtime
 if [[ "${CREDENTIAL_PROXY_ROLE}" != "agent-api" ]]; then
   start_envoy

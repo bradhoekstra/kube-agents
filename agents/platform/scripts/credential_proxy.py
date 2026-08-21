@@ -771,6 +771,107 @@ _GIT_GLOBAL_WITH_VALUE = frozenset(
     {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
 )
 
+# Config git must not be able to have overridden, applied to every proxied git
+# invocation.
+#
+# The working tree git runs in is writable by the agent — that is the whole
+# reason git works through the proxy at all, and it has been true in every
+# placement that supported it. So `.git/hooks/*` and `.git/config` are
+# agent-authored files that git executes in *this* process's container, next to
+# the credentials the sandbox exists to keep away from it. A `post-checkout` hook
+# planted in a clone runs on the next checkout with the proxy's kubeconfig, its
+# gcloud configuration and its federated token all readable.
+#
+# GIT_CONFIG_COUNT and its numbered pairs are exactly `git -c`, which outranks
+# every config file, so a repository cannot undo these by writing its own
+# `.git/config`. Each setting below closes one way a repository names a program
+# for git to run:
+#
+#   core.hooksPath=/dev/null   no hook in any repository is ever executed
+#   protocol.ext.allow=never   `ext::sh -c …` URLs cannot run a command
+#   core.fsmonitor=false       no query-watchman program on status/diff
+#   core.gitProxy=             no proxy command on a git:// fetch
+#   core.askPass=              no credential prompt program
+#   core.sshCommand=ssh        pinned to the real client, not a repo's choice
+#   diff.external=             no diff driver on show/diff/log -p
+#   gpg.program=               no signing program on --show-signature
+#
+# Hooks and `ext::` were pinned first because they are the two that need no
+# argument from the caller at all. The rest need a particular subcommand, which
+# made them look less reachable than they are: `git status` in a planted
+# repository is enough for core.fsmonitor, and the agent chooses the directory
+# every proxied git command runs in.
+#
+# `filter.<driver>.clean/smudge` is the one exec key that CANNOT be closed this
+# way — the driver name is arbitrary, so there is no key to pin — and a
+# `.gitattributes` in a planted repository can still name one on `add` or
+# `checkout`. Closing that needs a different mechanism than this tuple.
+#
+# GIT_CONFIG_NOSYSTEM drops /etc/gitconfig, which nothing in this image writes
+# and which is one more file to reason about. GIT_CONFIG_GLOBAL is deliberately
+# left alone: ~/.gitconfig is the proxy's own, inside its container, and pointing
+# it at /dev/null would take any credential helper configured there with it.
+# `credential.helper` is left unpinned for the same reason.
+_GIT_HARDENING_CONFIG = (
+    ("core.hooksPath", "/dev/null"),
+    ("protocol.ext.allow", "never"),
+    ("core.fsmonitor", "false"),
+    ("core.gitProxy", ""),
+    ("core.askPass", ""),
+    ("core.sshCommand", "ssh"),
+    ("diff.external", ""),
+    ("gpg.program", ""),
+)
+
+
+def _git_hardening_environment() -> dict[str, str]:
+    """Render _GIT_HARDENING_CONFIG as the env form of `git -c`."""
+    environment = {
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_COUNT": str(len(_GIT_HARDENING_CONFIG)),
+    }
+    for index, (key, value) in enumerate(_GIT_HARDENING_CONFIG):
+        environment[f"GIT_CONFIG_KEY_{index}"] = key
+        environment[f"GIT_CONFIG_VALUE_{index}"] = value
+    return environment
+
+
+def _git_config_override_violation(argv: list[str]) -> str | None:
+    """Refuse a caller's attempt to unset the hardening above, or None if clean.
+
+    GIT_CONFIG_COUNT and `-c` occupy the same precedence level, and within it the
+    command line is read after the environment — so `git -c core.hooksPath=…`
+    would win against _GIT_HARDENING_CONFIG. `--config-env` is the same option
+    reading its value from a variable name. Both are refused for the two hardened
+    keys and left alone for every other key, since `-c` is otherwise ordinary and
+    audit_report already uses the neighbouring global flags.
+    """
+    hardened = {key.lower() for key, _ in _GIT_HARDENING_CONFIG}
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if not token.startswith("-"):
+            return None
+        name, sep, inline = token.partition("=")
+        setting = None
+        if name in ("-c", "--config-env"):
+            setting = inline if sep else (argv[index + 1] if index + 1 < len(argv) else "")
+        if setting is not None and setting.partition("=")[0].strip().lower() in hardened:
+            return (
+                f"`git {name} {setting}` is refused: the credential proxy pins "
+                "core.hooksPath and protocol.ext.allow so that a repository the "
+                "agent can write cannot execute code in the container holding the "
+                "credentials."
+            )
+        # --config-env is not in _GIT_GLOBAL_WITH_VALUE, which exists to find the
+        # subcommand rather than to enumerate options. Consuming its argument here
+        # matters: skipping it would leave the scan pointing at a bare `key=value`,
+        # which reads as the subcommand and ends the loop before a later `-c`.
+        if (name in _GIT_GLOBAL_WITH_VALUE or name == "--config-env") and not sep:
+            index += 1
+        index += 1
+    return None
+
 
 def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
     """The subcommand in `argv`, plus every directory its `-C` flags select.
@@ -899,6 +1000,7 @@ class CommandExecutor:
             "GIT_COMMITTER_NAME": author_name,
             "GIT_COMMITTER_EMAIL": author_email,
         }
+        self.git_identity.update(_git_hardening_environment())
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -963,6 +1065,10 @@ class CommandExecutor:
         executable_path = self.executables.get(executable)
         if not executable_path:
             raise RuntimeError(f"supported executable is unavailable: {executable}")
+        if executable == "git":
+            violation = _git_config_override_violation(argv)
+            if violation is not None:
+                raise ValueError(violation)
         command = [executable_path, *argv[1:]]
 
         # `get-credentials` is the one command that legitimately authors a
@@ -1732,8 +1838,8 @@ def serve(args: argparse.Namespace) -> None:
     # install ran before the split and remains the default, so an image paired
     # with an operator that predates the flag behaves as it always did.
     #
-    # See docs/designs/credential-proxy-placement.md, "What shipped ahead of
-    # #720" — the arrangement is temporary and #720 reworks it.
+    # See docs/designs/agent-shell-sandboxing.md, "Three of the proxy's five
+    # roles move".
     if args.role not in ("full", "credentials", "agent-api"):
         raise SystemExit(f"unknown --role {args.role!r}")
     if args.role == "agent-api":

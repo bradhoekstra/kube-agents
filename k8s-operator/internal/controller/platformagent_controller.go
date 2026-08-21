@@ -256,19 +256,20 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 10b. Reconcile the credential proxy before both of its clients. Neither the
-	// sandbox nor the gateway blocks on it — the wrapped CLIs report the proxy as
-	// unavailable and the chat relay retries its poll — but starting it first
-	// keeps the first minute after a fresh install from looking broken.
-	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash); err != nil {
+	// 10b. Reconcile the shell sandbox before the credential proxy, and both before
+	// the workload that connects to them. Neither client blocks on the proxy — the
+	// wrapped CLIs report it unavailable and the chat relay retries its poll — but
+	// this order narrows the one case where that shows: when the proxy runs in the
+	// sandbox pod, reconcileCredentialProxy deletes the standalone Deployment, and
+	// doing that before the StatefulSet exists leaves a window with no credential
+	// runtime at all.
+	if err := r.reconcileShellSandbox(ctx, instance, settingsHash, proxyPolicyHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 11. Reconcile the shell sandbox before the workload that connects to it. The
-	// order is not load-bearing — ssh retries and Hermes rebuilds a failed backend
-	// on the next call — but it keeps a cold-start sandbox from being the first
-	// thing an agent waits on.
-	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
+	// 11. Reconcile the credential proxy: its Service always, its own pod only when
+	// the sandbox is not hosting it.
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -561,18 +562,20 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 // own claims and because its retention policy says Retain — so a toggle off and
 // back on returns to the same host keys.
 //
-// The credential proxy now runs in a pod of its own, so the sandbox is handed
-// its Service URL — that is what makes kubectl, gcloud, git and gh work inside
-// the sandbox at all. See credential_proxy_manifests.go for why the arrangement
-// is temporary.
-func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
+// Where the credential proxy runs decides what the sandbox is handed here.
+// Co-located it is a second container of this StatefulSet and the wrappers post
+// to loopback, which is what makes git work; otherwise the proxy has a pod of its
+// own and the sandbox gets its Service URL. credentialProxySandboxURL picks, and
+// credential_proxy_manifests.go carries the reasoning for both.
+func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash, policyHash string) error {
 	if !shellSandboxEnabled(agent) {
 		return r.deleteShellSandbox(ctx, agent)
 	}
 
 	objs := []client.Object{
+		buildShellSandboxServiceAccount(agent),
 		buildShellSandboxService(agent),
-		buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxyURL(agent), settingsHash),
+		buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash, policyHash),
 		buildShellSandboxNetworkPolicy(agent),
 	}
 	for _, obj := range objs {
@@ -603,6 +606,10 @@ func (r *PlatformAgentReconciler) deleteShellSandbox(ctx context.Context, agent 
 		&appsv1.StatefulSet{ObjectMeta: objMeta},
 		&corev1.Service{ObjectMeta: objMeta},
 		&networkingv1.NetworkPolicy{ObjectMeta: objMeta},
+		// Last. Deleting the identity before the workload that runs under it
+		// leaves the pod unable to refresh its projected token while it is
+		// still terminating.
+		&corev1.ServiceAccount{ObjectMeta: objMeta},
 	} {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			if client.IgnoreNotFound(err) != nil {
@@ -622,15 +629,32 @@ func (r *PlatformAgentReconciler) deleteShellSandbox(ctx context.Context, agent 
 	return nil
 }
 
-// reconcileCredentialProxy creates the standalone credential-proxy pod, the
-// Service its two clients reach it through, and the NetworkPolicy that narrows
-// who those clients may be. credential_proxy_manifests.go carries the reasoning,
-// including what the move costs and why it is temporary.
+// reconcileCredentialProxy creates the Service the proxy's remote callers reach
+// it through, and — unless it lives in the sandbox pod — the Deployment that runs
+// it and the NetworkPolicy that narrows who may connect.
+//
+// The Service is applied in both placements and keeps its name in both, because
+// the gateway's chat relay clients dial it and have no business knowing where the
+// relays run. buildCredentialProxyService swings its selector; nothing else moves.
+//
+// Co-located, the workload and its policy belong to the sandbox: the pod is the
+// sandbox's StatefulSet, and the NetworkPolicy that governs it is
+// buildShellSandboxNetworkPolicy, which has to cover the shell container in the
+// same rules anyway. Applying this file's NetworkPolicy as well would leave an
+// object whose podSelector matches nothing — harmless until someone reads it as
+// the policy in force. credential_proxy_manifests.go carries the placement
+// reasoning.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
-	objs := []client.Object{
-		buildCredentialProxyService(agent),
-		buildCredentialProxyDeployment(agent, policyHash),
-		buildCredentialProxyNetworkPolicy(agent),
+	objs := []client.Object{buildCredentialProxyService(agent)}
+	if credentialProxyColocated(agent) {
+		if err := r.deleteStandaloneCredentialProxy(ctx, agent); err != nil {
+			return err
+		}
+	} else {
+		objs = append(objs,
+			buildCredentialProxyDeployment(agent, policyHash),
+			buildCredentialProxyNetworkPolicy(agent),
+		)
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -638,6 +662,43 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 		}
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// deleteStandaloneCredentialProxy removes the proxy's own pod once it has moved
+// into the sandbox.
+//
+// Without this, turning federation on leaves two credential runtimes: the old
+// Deployment keeps its metadata-server identity and keeps pulling the Google Chat
+// subscription, so the Service — whose selector has just swung to the sandbox —
+// load-balances nothing to it while it quietly buffers messages nobody fetches.
+// That is the failure buildCredentialProxyDeployment's Recreate strategy exists to
+// avoid, arriving by a different route.
+//
+// Unowned objects are left alone and logged rather than erroring, for the reason
+// deleteShellSandbox gives: a hand-applied object of the same name must not be
+// able to stop the reconcile before the agent's own Deployment.
+func (r *PlatformAgentReconciler) deleteStandaloneCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	objMeta := metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace}
+	for _, obj := range []client.Object{
+		&appsv1.Deployment{ObjectMeta: objMeta},
+		&networkingv1.NetworkPolicy{ObjectMeta: objMeta},
+	} {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			if client.IgnoreNotFound(err) != nil {
+				return err
+			}
+			continue
+		}
+		if !metav1.IsControlledBy(obj, agent) {
+			logf.FromContext(ctx).Info("Leaving unowned credential proxy object in place",
+				"kind", fmt.Sprintf("%T", obj), "namespace", obj.GetNamespace(), "name", obj.GetName())
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
+			return err
 		}
 	}
 	return nil

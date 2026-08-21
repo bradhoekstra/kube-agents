@@ -1088,11 +1088,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 #
 # Their absence is what makes the sandbox load-bearing rather than optional. A
 # `git` or `gh` issued in this container gets "command not found", which is the
-# honest answer for an install that turned the sandbox off — and until #737
-# Part C gives the proxy an address the sandbox can reach, the sandbox's own
-# shims answer "CREDENTIAL_PROXY_URL is not configured", so the GitHub paths are
-# down either way. That is a known cost of taking the credential out of reach of
-# the container the model's code used to run in.
+# honest answer for an install that turned the sandbox off. That is a known cost
+# of taking the credential out of reach of the container the model's code used
+# to run in.
 
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher

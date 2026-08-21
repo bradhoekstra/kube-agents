@@ -2,6 +2,7 @@ import io
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -428,6 +429,93 @@ class GitLeaseGateTest(unittest.TestCase):
         import gitops_workspace
 
         self.assertEqual(credential_proxy.GIT_LEASE_MARKER, gitops_workspace.LEASE_FILENAME)
+
+
+class GitHooksHardeningTest(unittest.TestCase):
+    """The tree git runs in is agent-writable, so its hooks are agent-authored.
+
+    They execute in the proxy's container, beside the kubeconfig, the gcloud
+    configuration and — once the proxy is a sidecar of the shell sandbox — the
+    federated token that is the pod's only cloud identity. The hazard predates
+    that placement and was never closed; co-location is what makes closing it a
+    precondition rather than a cleanup.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.executor = CommandExecutor(
+            timeout_seconds=5, max_output_bytes=1024, state_dir=self.temp_dir.name
+        )
+
+    def test_every_git_invocation_carries_the_pinned_config(self):
+        environment = self.executor.git_identity
+        self.assertEqual("1", environment["GIT_CONFIG_NOSYSTEM"])
+        count = int(environment["GIT_CONFIG_COUNT"])
+        pinned = {
+            environment[f"GIT_CONFIG_KEY_{index}"]: environment[f"GIT_CONFIG_VALUE_{index}"]
+            for index in range(count)
+        }
+        self.assertEqual(
+            {
+                # The two that need no argument from the caller at all.
+                "core.hooksPath": "/dev/null",
+                "protocol.ext.allow": "never",
+                # The rest need a particular subcommand, which is not the same
+                # as needing the caller's cooperation: the agent picks the
+                # directory every proxied git command runs in, so `git status`
+                # in a repository it planted reaches core.fsmonitor.
+                "core.fsmonitor": "false",
+                "core.gitProxy": "",
+                "core.askPass": "",
+                "core.sshCommand": "ssh",
+                "diff.external": "",
+                "gpg.program": "",
+            },
+            pinned,
+        )
+
+    def test_git_actually_reads_it(self):
+        # The env-var form is easy to get subtly wrong — an off-by-one in the
+        # count silently drops the last pair — so this asserts against git
+        # itself rather than against the dict above.
+        git = shutil.which("git")
+        if not git:
+            self.skipTest("git is not installed")
+        result = subprocess.run(
+            [git, "config", "--get", "core.hooksPath"],
+            cwd=self.temp_dir.name,
+            env={"PATH": os.environ.get("PATH", ""), **self.executor.git_identity},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual("/dev/null", result.stdout.strip())
+
+    def test_a_caller_cannot_unpin_it_with_dash_c(self):
+        # `-c` and GIT_CONFIG_COUNT share a precedence level, and the command
+        # line is read second, so this would win if it were allowed through.
+        for argv in (
+            ["git", "-c", "core.hooksPath=/opt/data/hooks", "status"],
+            ["git", "-c", "core.hooksPath", "/opt/data/hooks", "status"],
+            ["git", "-c", "CORE.HooksPath=/opt/data/hooks", "status"],
+            ["git", "--config-env=protocol.ext.allow=EVIL", "clone", "ext::sh -c id"],
+            # The value of an earlier, permitted --config-env must not be
+            # mistaken for the subcommand and end the scan.
+            ["git", "--config-env", "user.name=WHO", "-c", "core.hooksPath=/x", "status"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    self.executor.execute(argv)
+
+    def test_other_config_overrides_are_left_alone(self):
+        # audit_report passes global flags of its own, and the gate is about two
+        # keys rather than about `-c`.
+        self.assertIsNone(
+            credential_proxy._git_config_override_violation(
+                ["git", "-c", "user.name=fleet-audit", "--literal-pathspecs", "add", "x"]
+            )
+        )
 
 
 class GitLeaseGateWiringTest(unittest.TestCase):

@@ -107,6 +107,23 @@ class ArgvTestCase(unittest.TestCase):
         remote = self.argv(["kubectl"], cwd="/work space")[-1]
         self.assertTrue(remote.startswith("cd '/work space' &&"))
 
+    def test_the_published_workspace_root_is_the_default_cwd(self):
+        """Without this the login lands in /home/hermes and every proxied
+        command fails the credential proxy's workspace check."""
+        config = write_config(SANDBOX_CONFIG + "  workspace_root: /opt/elsewhere\n")
+        remote = sandbox_exec.ssh_argv(["kubectl"], path=config)[-1]
+        self.assertTrue(remote.startswith("cd /opt/elsewhere && kubectl"))
+
+    def test_the_default_cwd_falls_back_when_the_operator_published_none(self):
+        remote = self.argv(["kubectl"])[-1]
+        self.assertTrue(remote.startswith("cd /opt/data && kubectl"))
+
+    def test_the_default_cwd_does_not_come_from_hermes_home(self):
+        """HERMES_HOME names a directory in the agent pod, not in the sandbox."""
+        with patch.dict(os.environ, {"HERMES_HOME": "/opt/somewhere-else"}):
+            remote = self.argv(["kubectl"])[-1]
+        self.assertTrue(remote.startswith("cd /opt/data && kubectl"))
+
     def test_no_host_is_reported_as_unavailable(self):
         empty = write_config("terminal:\n  backend: ssh\n")
         with self.assertRaises(sandbox_exec.SandboxUnavailable):
@@ -151,7 +168,7 @@ class RunTestCase(unittest.TestCase):
         self.assertEqual(result.returncode, 255)
 
     def test_the_unconfigured_proxy_arrives_as_an_ordinary_failure(self):
-        """The state every call is in until #737 Part C lands.
+        """What an install with no reachable proxy gets.
 
         Exit 1 with the message on stderr and nothing on stdout, so a caller
         cannot mistake the error text for output.

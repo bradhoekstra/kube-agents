@@ -359,6 +359,13 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
   which includes `cluster-agent-reconcile`, so a cluster onboarded while the flag is on gets no
   profile until the flag goes back off.
 
+#### `shellSandbox`
+
+- `enabled` — moves the agent's shell into a StatefulSet of its own, reached over SSH with the keypair in the agent's credential Secret (`SANDBOX_SSH_PRIVATE_KEY` and its public half in `<name>-shell-authorized-keys`). Defaults to `false`. With the toggle on and no key, the sandbox runs and the agent cannot log into it.
+- `image` — overrides the sandbox image. Empty takes the operator's default.
+
+Paired with [`spec.security.workloadIdentityFederation`](#specsecurity), the credential proxy moves into this Pod as a second container, on loopback and sharing the shell's working tree — which is what makes proxied `git` and `kubectl -f FILE` work. Without federation the proxy stays in a Deployment of its own and those paths are refused.
+
 ## `spec.deployment`
 
 Abstracts the pod/deployment configuration. The controller synthesises a `Deployment` from these plus the workspace ConfigMaps. Available fields:
@@ -381,6 +388,7 @@ Default image: `ghcr.io/gke-labs/kube-agents/platform-agent:<operator release ve
 
 - `serviceAccountName` — the KSA the pod runs as. `kubeagents-platform-agent` by convention.
 - `serviceAccountAnnotations` — passed through to the KSA. Typically holds `iam.gke.io/gcp-service-account` for Workload Identity binding.
+- `workloadIdentityFederation` — `audience` (the pool provider's full resource name) and `serviceAccountEmail` (the GSA to impersonate). Set both, or neither: a half-filled block is read as absent. With them set and `spec.harness.experimental.shellSandbox.enabled` true, the credential proxy moves into the shell sandbox Pod and takes its GCP identity from a projected token file rather than the metadata server, which is what lets that Pod's KSA stay unbound. The chart sets both from `platformAgent.security.workloadIdentityFederation`; nothing creates the pool, and those commands are in [`designs/agent-shell-sandboxing.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/agent-shell-sandboxing.md#setting-up-the-pool).
 
 The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gserviceaccount.com`) is created and bound by `provision_04_gcp_iam.sh` with one of these permission sets:
 
