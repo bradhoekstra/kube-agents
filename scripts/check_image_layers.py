@@ -2,13 +2,20 @@
 """Fail when a built image is close to Docker's 128-layer ceiling.
 
 Docker's overlay2 storage driver refuses to mount a stack deeper than 128
-layers and reports ``max depth exceeded``. The longest chain in
-``deploy/docker/Dockerfile`` -- ``agent-base`` -> ``platform`` -- runs close to
-that ceiling, and nothing in an ordinary build tells you how close.
+layers and reports ``max depth exceeded``. The deepest chain that
+``deploy/docker/Dockerfile`` ships -- ``agent-base`` -> ``platform`` -- runs
+close to that ceiling, and nothing in an ordinary build tells you how close.
 
-``credential-proxy`` used to sit at the end of that chain and was the image
-this checked. It is built on the Envoy base now and is nowhere near the
-ceiling, so ``platform`` is both the deepest image and the one to measure.
+This module owns the question of which image the gate points at, and the
+Dockerfile's layer-budget note defers to it. That chain used to end at
+``credential-proxy``, which is why this checked the sidecar image; the sidecar
+now builds from ``agent-base`` through a short ``proxy-tools`` stage instead, so
+``platform`` is the deepest thing shipped and is what the default below names.
+Move ``DEFAULT_IMAGE`` if that ever stops being true -- a gate pointed at the
+shallower chain reports headroom that is not the headroom at risk. The one
+stage deeper than ``platform``, ``entrypoint-gate-test``, is out of scope on
+purpose: buildx alone builds it, buildx has no depth limit, and no daemon ever
+mounts it.
 
 Why a check rather than a comment: the limit belongs to the classic Docker
 daemon, not to the image format. BuildKit has no equivalent limit, so an image
@@ -31,9 +38,13 @@ land a fix.
 
 Usage::
 
-    # after `make build-platform`, or any build that loads the image
+    # build the target the default names, then check it
+    docker build --platform linux/amd64 -f deploy/docker/Dockerfile \
+        --target platform -t platform-agent:latest .
     python3 scripts/check_image_layers.py
-    python3 scripts/check_image_layers.py --image platform-agent:latest --max 120
+
+    # or point it at any other image already loaded into the daemon
+    python3 scripts/check_image_layers.py --image credential-proxy:latest --max 120
 
 Standard library only, but it does shell out to ``docker image inspect``, so it
 needs a Docker daemon and an image that has been loaded into it. A buildx build

@@ -14,7 +14,7 @@ import urllib.error
 import urllib.request
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from contextlib import closing
 
 import logging
@@ -52,6 +52,20 @@ CLEANUP_TTL_DAYS = int(os.getenv("SESSION_KV_CLEANUP_TTL_DAYS", "14"))
 # the reports themselves weigh.
 RECENT_REPORTS_WINDOW_HOURS = int(os.getenv("SESSION_KV_RECENT_REPORTS_HOURS", "24"))
 RECENT_REPORTS_LIMIT = int(os.getenv("SESSION_KV_RECENT_REPORTS_LIMIT", "8"))
+# The two bounds on the event ledger, which is the only table here whose write
+# rate the cluster sets rather than an operator; `cleanup_old_records` explains
+# why the TTL above cannot hold it on its own. At the cap a row averaging half
+# a kilobyte occupies on the order of a hundred megabytes of the shared session
+# PVC — enough to survive a storm without being the reason the volume fills.
+LEDGER_MAX_ROWS = int(os.getenv("SESSION_KV_LEDGER_MAX_ROWS", "200000"))
+# Longest event message the ledger stores. `sanitize_chat_message` in
+# `eod_report_generator.py` cuts every message to 120 characters before it is
+# rendered, so nothing beyond this is ever displayed — but the untruncated text
+# is what occupies the row, and a `FailedScheduling` message that names one
+# predicate per node runs to a kilobyte or more on a large cluster. 512 keeps
+# the failing container and the leading predicate, which is more than the
+# reader shows.
+LEDGER_MESSAGE_MAX_CHARS = int(os.getenv("SESSION_KV_LEDGER_MESSAGE_MAX_CHARS", "512"))
 
 # Deliberately not API_SERVER_KEY. That value is the loopback sentinel
 # `cluster-internal-trusted` — a marker, not a secret — so reusing it here would
@@ -252,18 +266,9 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 # answer; they just have to ask.
 #
 # Severities come from get_severity_details, and every one of them is capped.
-# Info is not a hypothetical: nothing between the kubelet and this function
-# filters on Event.Type. The watcher's filter matches reason, namespace and
-# repeat count only, and its informer runs without a field selector, so an
-# allowlisted reason arriving as `type: Normal` is forwarded like any other,
-# classified Info here, and — left out of this dict — would post to chat and
-# start an agent turn outside every ceiling. `BackOff` is on the watcher's
-# default reason list and the kubelet emits it as Normal for image-pull
-# back-off, which is exactly the storm the cap exists for.
-#
-# Covering all three also means the `.get(severity, 0)` default in
-# _claim_alert_quota is now reached only by a severity this module cannot
-# produce, rather than by a routine one.
+# Covering all three means the `.get(severity, 0)` default in
+# _claim_alert_quota is reached only by a severity this module cannot produce,
+# rather than by a routine one.
 #
 # Counts are fleet-wide rather than per-cluster, matching the ceiling as
 # specified. The trade-off is that one collapsing cluster can exhaust the day's
@@ -271,7 +276,13 @@ def _alert_daily_limit(env_var: str, default: int) -> int:
 ALERT_DAILY_LIMITS = {
     "Critical": _alert_daily_limit("ALERT_DAILY_LIMIT_CRITICAL", 10),
     "Warning": _alert_daily_limit("ALERT_DAILY_LIMIT_WARNING", 5),
-    # Capped, not exempt: see above — Normal-type events land here.
+    # Unreachable, and kept anyway. Every Info event is dropped by the gate in
+    # inject_message before it can claim, so nothing bills this bucket today.
+    # Deleting it would not leave a default behind: a `.get(severity, 0)` miss
+    # takes the same `limit <= 0` branch a limit of 0 takes and is allowed
+    # through uncapped. So narrowing that gate afterwards would put an unbounded
+    # Info stream into chat — the flood the ceiling exists to bound — rather
+    # than a ceiling anyone chose. test_a_missing_severity_is_uncapped pins it.
     "Info": _alert_daily_limit("ALERT_DAILY_LIMIT_INFO", 5),
 }
 
@@ -303,6 +314,55 @@ def init_db() -> None:
                 )
                 """
             )
+            # Every event the watcher forwards, whether or not it was announced
+            # in chat. This is the only durable record of one: the watcher's
+            # dedup snapshot is a rolling window of *active* incidents keyed by
+            # (uid, reason), it carries no namespace or workload name, and its
+            # `count` resets whenever a window rolls over — so it cannot answer
+            # "what happened today". `notified` is what lets the daily recap
+            # report suppressed Info events as a number instead of losing them.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intercepted_events (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    cluster     TEXT NOT NULL DEFAULT '',
+                    namespace   TEXT NOT NULL DEFAULT '',
+                    workload    TEXT NOT NULL DEFAULT '',
+                    object_uid  TEXT NOT NULL DEFAULT '',
+                    object_kind TEXT NOT NULL DEFAULT '',
+                    reason      TEXT NOT NULL DEFAULT '',
+                    message     TEXT NOT NULL DEFAULT '',
+                    severity    TEXT NOT NULL DEFAULT '',
+                    occurrences INTEGER NOT NULL DEFAULT 1,
+                    notified    INTEGER NOT NULL DEFAULT 0,
+                    delivery_error TEXT NOT NULL DEFAULT '',
+                    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            # No ALTER TABLE migration accompanies the `cluster` and
+            # `delivery_error` columns: this table has never been in a release,
+            # so the only databases carrying an older shape are pre-release dev
+            # installs. `DROP TABLE intercepted_events` on one of those is the
+            # fix, and it is mandatory rather than a tidy-up. Skipping it is
+            # silent in both directions and worst on `cluster`, which
+            # `record_intercepted_event` names in every INSERT: each write
+            # raises `no such column`, the blanket except below the call
+            # swallows it, and the table stays empty forever. The recap reads
+            # that shape as a read failure rather than a quiet day, which is
+            # the only warning the condition produces. A missing
+            # `delivery_error` costs only the write-back, leaving an
+            # undelivered alert recorded as delivered.
+            # `session_management.md`, "A pre-release table, and no migration",
+            # is the operator-facing version.
+            #
+            # The recap queries one day at a time; without this it is a full
+            # scan of a table that grows with every event in the retention
+            # window.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_created_at "
+                "ON intercepted_events (created_at)"
+            )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
             # the session server goes down with its container, and an in-memory
@@ -325,22 +385,138 @@ def init_db() -> None:
             _purge_plaintext_identities(conn)
 
 
-
-
-
-
 def cleanup_old_records(conn: sqlite3.Connection) -> None:
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
         conn.execute("DELETE FROM incidents WHERE created_at < datetime('now', ?)", (param,))
         conn.execute("DELETE FROM session_metadata WHERE updated_at < datetime('now', ?)", (param,))
+        conn.execute("DELETE FROM intercepted_events WHERE created_at < datetime('now', ?)", (param,))
+        # A row cap beside the TTL, because a time bound alone does not bound
+        # the file. The ledger is the one table here whose write rate is set by
+        # the cluster rather than by an operator: once the day's ceiling for a
+        # severity is spent the watcher rolls its dedup entry back on every
+        # `suppressed`, so a hundred pods failing at kubelet's repeat cadence
+        # write a row per sighting rather than a row per incident, all day, for
+        # CLEANUP_TTL_DAYS. This database also holds thread routing and
+        # triage context on a shared PVC, so the ledger filling it takes those
+        # down with it.
+        #
+        # `MAX(id) - ?` rather than an `ORDER BY ... LIMIT ? OFFSET ?` subquery:
+        # this runs on `POST /sessions`, which is the same per-sighting path the
+        # storm floods, and MAX over an AUTOINCREMENT primary key is a single
+        # index seek where the offset form scans the whole retained window. Ids
+        # never repeat, so the arithmetic keeps at most LEDGER_MAX_ROWS; gaps
+        # left by the TTL delete above can make it fewer, and they sit at the
+        # old end that delete has already cleared. `<=` rather than `<`: the
+        # boundary id is the (LEDGER_MAX_ROWS + 1)-th newest and goes. MAX over
+        # an empty table is NULL, and `id <= NULL` matches nothing.
+        conn.execute(
+            "DELETE FROM intercepted_events WHERE id <= (SELECT MAX(id) - ? FROM intercepted_events)",
+            (LEDGER_MAX_ROWS,),
+        )
         # Spent quota is only meaningful for the day it belongs to; the history
         # is kept the same 14 days as everything else so an operator asked
         # "what did we drop last week" still has an answer.
         conn.execute("DELETE FROM alert_quota WHERE day < date('now', ?)", (param,))
     except Exception as exc:
         logger.error(f"Failed to clean up old DB records: {exc}")
+
+
+def record_intercepted_event(
+    cluster: str,
+    namespace: str,
+    workload: str,
+    object_uid: str,
+    object_kind: str,
+    reason: str,
+    message: str,
+    severity: str,
+    occurrences: int,
+    notified: bool,
+) -> Optional[int]:
+    """Append one forwarded event to the ledger the daily recap reads.
+
+    `cluster` is recorded because this server is shared: one session KV
+    database backs every cluster profile in the pod, which is the same reason
+    the daily ceiling is fleet-wide. Without it the recap cannot tell two
+    same-named workloads in two clusters apart, and would merge `prod/api` on
+    one cluster with `prod/api` on another into a single line.
+
+    Best-effort on purpose. This runs on the path that announces a live
+    incident, and a recap that misses a row is a smaller failure than an alert
+    that never reaches chat because the bookkeeping raised.
+
+    Returns the row id so the delivery attempt can correct `notified` when the
+    post fails, or None when the write itself did not land. `notified=True`
+    here is an *intent* — the row is written before anything is sent, because
+    the send happens in a background task and a row written afterwards would be
+    lost entirely if the process died mid-flight. `mark_delivery_failed` is what
+    turns that intent back into an observation.
+
+    `object_uid` is the involved object's UID, stored because `workload` cannot
+    substitute for it: `clean_workload_name` strips the replica suffix, so every
+    pod of one Deployment shares a `workload`. The recap counts alerts the daily
+    ceiling withheld, and a ceiling refusal makes the watcher forget its dedup
+    entry — so the same incident writes a row per sighting while N replicas write
+    rows that look alike. Only the UID separates those two cases, and it is the
+    watcher's own dedup key.
+
+    `message` is truncated to `LEDGER_MESSAGE_MAX_CHARS` on the way in rather
+    than on the way out. The reader's 120-character cut is a display choice and
+    leaves the row itself unbounded, and the row is what the shared session PVC
+    has to hold once a storm is writing one per sighting.
+    """
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                cursor = conn.execute(
+                    "INSERT INTO intercepted_events "
+                    "(cluster, namespace, workload, object_uid, object_kind, reason, message, severity, occurrences, notified) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        cluster,
+                        namespace,
+                        workload,
+                        object_uid,
+                        object_kind,
+                        reason,
+                        message[:LEDGER_MESSAGE_MAX_CHARS],
+                        severity,
+                        int(occurrences),
+                        1 if notified else 0,
+                    ),
+                )
+                return cursor.lastrowid
+    except Exception as exc:
+        logger.error(f"Failed to record intercepted event for {namespace}/{workload}: {exc}")
+    return None
+
+
+def mark_delivery_failed(event_row_id: Optional[int], detail: str) -> None:
+    """Correct a ledger row whose alert was never delivered to chat.
+
+    Without this the recap reads `notified = 1` as "chat has already seen it",
+    counts the row into `alerts_posted`, and — under the default Info-only
+    selection — leaves the workload out of the body on the strength of that.
+    A broken chat platform is the one condition in which the recap is the only
+    surviving channel, so it is the one condition in which it must not claim
+    the alert was already read.
+
+    Best-effort for the same reason as the insert: a failed correction must not
+    raise into the background task and abandon the triage turn that follows it.
+    """
+    if not event_row_id:
+        return
+    try:
+        with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE intercepted_events SET notified = 0, delivery_error = ? WHERE id = ?",
+                    (detail[:500], int(event_row_id)),
+                )
+    except Exception as exc:
+        logger.error(f"Failed to record delivery failure for ledger row {event_row_id}: {exc}")
 
 
 @app.get("/healthz")
@@ -400,13 +576,13 @@ def clean_event_message(message: str) -> str:
 def get_severity_details(event_type: str, reason: str) -> tuple[str, str]:
     event_lower = event_type.lower()
     reason_lower = reason.lower()
-    
+
     # Blocker if it blocks drain, eviction, or scheduling
     is_blocker = (
-        event_lower == "warning" and 
-        any(x in reason_lower for x in ("drain", "evict", "schedul", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
+        event_lower == "warning"
+        and any(x in reason_lower for x in ("drain", "evict", "schedul", "capacity", "oomkilled", "crashloopbackoff", "failedmount"))
     )
-    
+
     if is_blocker:
         return "🔴", "Critical"
     elif event_lower == "warning":
@@ -517,7 +693,24 @@ def _claim_alert_quota(severity: str) -> tuple[bool, int]:
 
 
 def _register_session_routing(session_id: str, platform: str, thread_id: str) -> None:
-    """Save thread configurations in session_metadata SQLite table."""
+    """Save thread configurations in session_metadata SQLite table.
+
+    These three fields — `platform`, `chat_id`, `thread_id` — are the address
+    the event-triage card's report is delivered to.
+    `deploy/docker/patches/kanban_event_routing.py` reads the row back by
+    session id when the front door files that card, and substitutes them for the
+    `api_server` origin the REST gateway would otherwise stamp on the
+    subscription. Writing this row is therefore ordered before the agent turn is
+    started, not merely before the reply arrives.
+
+    `platform` is what this function adds to the row, and the substitution needs
+    it: a thread belongs to exactly one chat platform, and `hermes send` refuses
+    a Google Chat thread addressed as Slack rather than degrading it to the home
+    channel. A row without it carries `k8s-watcher` from `POST /sessions`, which
+    the patch treats as non-chat and declines to substitute — so a session that
+    never reached this function keeps today's behaviour instead of being
+    re-addressed to a guess.
+    """
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
             with conn:
@@ -528,6 +721,7 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
                 if row:
                     meta = json.loads(row[0])
                     meta["thread_id"] = thread_id
+                    meta["platform"] = platform
                     if platform == "slack":
                         meta["chat_id"] = os.environ.get("SLACK_HOME_CHANNEL", "")
                     else:
@@ -543,7 +737,15 @@ def _register_session_routing(session_id: str, platform: str, thread_id: str) ->
 
 
 def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, str]) -> bool:
-    """POST request to local gateway API to initialize the troubleshooting session ID."""
+    """POST request to local gateway API to initialize the troubleshooting session ID.
+
+    The session lands on the gateway's default profile — the Planning Agent — and
+    there is no way to ask for another one here. Hermes selects a profile by URL
+    prefix (`/p/<profile>/api/sessions`), only when `gateway.multiplex_profiles`
+    is enabled, and only against that profile's own `API_SERVER_KEY`; a `profile`
+    key in this body is accepted with a 201 and dropped. See
+    `_build_agent_query`, which delegates from the front door instead.
+    """
     try:
         req = urllib.request.Request(
             f"{api_url}/api/sessions",
@@ -562,20 +764,45 @@ def _create_gateway_session(api_url: str, session_id: str, headers: Dict[str, st
     return False
 
 
-def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
-    """Format a detailed Markdown diagnostic query for the Platform Agent.
+def _triage_task_body(payload: Dict[str, Any]) -> str:
+    """The kanban card body the front door files for the failing cluster's agent.
+
+    Written to be copied verbatim rather than summarised, because a paraphrase
+    is how the front door turned one instruction into three on 2026-08-17.
+
+    The delivery is `kanban_complete` and nothing else. The card carries a
+    subscription pointing at the chat thread the alert was posted in — see
+    `deploy/docker/patches/kanban_event_routing.py`, which resolves that thread
+    from the routing this module records — so the notifier posts the `result`
+    when the card turns terminal. That is why this body asks for the whole
+    report in `result` rather than a summary of it: `result` is the message the
+    human reads.
 
     The report template below is a second instruction channel alongside the
     persona, and says "formatted exactly like this" — so it wins any
-    disagreement with SOUL.md §7, which governs the same output. Keep the two
-    in step: §7 permits exactly the three ``##`` sections this template uses,
-    and a fourth labelled block added here silently overrides the policy rather
-    than extending it. The GitOps call-to-action lives inside **What to do**
-    because it is an action, and because §7 rule 3 cuts trailing lines that
-    read as an offer rather than a finding. It shares a list with the Option
-    bullets now that the old ``👉`` block is gone, so it carries a
-    ``To authorize:`` label and the instruction above the template says it is
-    not an option — without both, the fourth bullet reads as Option C.
+    disagreement with the Platform Agent's SOUL.md §7 (Incident Triage
+    Communication Policy), which governs the same output. Keep the two in step:
+    §7 permits exactly the three ``##`` sections this template uses, and a
+    fourth labelled block added here silently overrides the policy rather than
+    extending it. The template states that shape itself rather than citing the
+    section, because the reader is a Cluster Agent, whose persona has no §7 —
+    the delegation to that persona is what makes the citation unresolvable for
+    the agent being asked to obey it.
+
+    The report used to end by inviting the reader to reply ``apply``, and that
+    invitation is withheld here until something honours it. The agent that acts
+    on such a reply reads the report back from the ``incidents`` table through
+    the ``incident_context`` plugin, and the only writer of that table is
+    ``platform_mcp_server.send_notification`` — the egress call this delivery
+    path replaced. So the row is never written, ``_lookup`` returns ``None``,
+    and the front door receives the bare word ``apply`` with no report, no
+    options and no cluster. Nothing unsafe happens; the front door holds no
+    write path and simply cannot act. It is a promise the system cannot keep,
+    and on ``main`` it was never tested because no report reached a human to
+    reply to. Storing the report on the delivery path is issue #802; the
+    bullet comes back with it. §7 rule 3 — "no offer to help further" — is on the
+    side of the removal, which is why the docstring here used to have to argue
+    the call-to-action past it.
 
     The report template below is STANDARD markdown, and must stay that way.
     Every chat platform's adapter translates the agent's markdown on the way
@@ -599,21 +826,27 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
     logs_project_query = f";project={gcp_project}" if gcp_project else ""
 
     return (
-        f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}' "
-        f"for the active session '{session_id}'.\n\n"
+        f"Analyze the following Kubernetes event warning on GKE cluster '{cluster_name}'.\n\n"
         f"**Event Details:**\n"
         f"- **Resource:** {namespace}/{object_kind}/{object_name}\n"
         f"- **Event Reason:** {event_reason}\n"
         f"- **Warning Message:** {message}\n\n"
-        f"When calling your send_notification tool to report findings, you MUST pass this exact session ID: '{session_id}' as the session_id argument so it routes as a threaded reply to the warning alert.\n\n"
+        f"**Finish by calling `kanban_complete(result=<your full report>, summary=<one line>)`.** "
+        f"Pass the entire report as `result`, not a summary of it: this card is subscribed to the chat thread where the "
+        f"alert was raised, and `result` is what gets posted there. A card completed with a one-line `result` delivers "
+        f"one line to the person waiting for the diagnosis.\n\n"
+        f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
+        f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list. "
         f"Label them 'Option A', 'Option B', ... in order. When you propose more than one, mark exactly one of them '✅ **Recommended: Option <letter>**' — the safest, most durable fix for the root cause "
-        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line and drop the 'apply Option <letter>' override from the call-to-action, since a bare 'apply' is unambiguous.\n\n"
-        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose, and name those same letters in the call-to-action. "
+        f"(favor correctness and least blast radius over quick mitigations). When there is only one option, omit the Recommended line.\n\n"
+        f"The template below shows two Option lines as an example of the shape — repeat or drop that line to match the number of options you actually propose. "
         f"Every <...> in the template is a placeholder: fill each one in. The posted report must never contain a literal '<letter>'.\n\n"
-        f"The last bullet under '## What to do' is the call to action, not another option: keep its 'To authorize:' label, never give it an Option letter, and never count it when you number the options.\n\n"
-        f"When done, post your final diagnostic report to the chat platform (using your notification tool) formatted exactly like this — "
-        f"the three `##` sections are the ones SOUL.md §7 permits, and there is no fourth:\n\n"
+        f"**Do not end the report by inviting a reply.** No 'To authorize:', no 'reply apply', no offer to open the Pull Request "
+        f"if the reader asks — a reply to this thread reaches an agent that cannot see your report, so the offer would not be honoured. "
+        f"The Recommended line is the last bullet you write.\n\n"
+        f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
+        f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
         f"<Short 1-sentence description of the problem>\n\n"
         f"## Why\n\n"
@@ -621,16 +854,64 @@ def _build_agent_query(session_id: str, payload: Dict[str, Any]) -> str:
         f"## What to do\n\n"
         f"- **Option A (<Action Title>):** <1-sentence description of Option A GitOps fix>.\n"
         f"- **Option B (<Action Title>):** <1-sentence description of Option B GitOps fix>.\n"
-        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n"
-        f"- **To authorize:** reply **'apply'** to open a GitOps Pull Request with the recommended fix, or name one directly with **'apply Option A'** / **'apply Option B'**.\n\n"
+        f"- ✅ **Recommended: Option <letter>** — <1-sentence why this is the safer/better choice>.\n\n"
         f"🔗 [GKE Workloads](https://console.cloud.google.com/kubernetes/workload/overview{workloads_project_query}) | "
         f"[Cloud Logs](https://console.cloud.google.com/logs/query;query=resource.type%3D%22k8s_container%22{logs_project_query})\n\n"
         f"---"
-        f"\n\n**GitOps PR Instructions (For subsequent turns if the user replies):**\n"
-        f"If the user replies to the thread with 'apply' or 'apply Option <letter>':\n"
-        f"1. A bare 'apply' (or 'apply recommended') means apply the option you marked '✅ **Recommended: Option <letter>**', or the only option you proposed if there was just one. You are explicitly authorized to create a new branch, modify the resource manifests in the local checkout, commit, push, and open a GitHub Pull Request matching the selected option.\n"
-        f"2. Post a threaded response confirming the PR was created and include the clickable PR link.\n"
-        f"3. Do not execute any write mutations (kubectl scale, patch, or apply) directly on the live cluster."
+        f"\n\n**Who acts on this:**\n"
+        f"A human reads your options and the agent that holds the GitOps write path opens the Pull Request — not you, and not from this card. "
+        f"Your job is to make that possible: name the manifest change each option needs precisely enough that someone can open the Pull Request from your report alone. "
+        f"Two things are true whoever acts on it — the fix ships as a Pull Request against the GitOps repository, and nothing is written to the live cluster directly "
+        f"(no `kubectl scale`, `patch`, or `apply`)."
+    )
+
+
+def _build_agent_query(payload: Dict[str, Any]) -> str:
+    """The turn sent to the gateway, which is always the Planning Agent's.
+
+    `_create_gateway_session` cannot choose a profile, so the reader is the
+    `default` front door: an agent with no cluster access and no chat egress of
+    its own, whose one job and one tool is `kanban_create`. Everything here is
+    therefore addressed to a router, and the diagnostic brief travels through it
+    as an opaque payload between markers rather than as instructions the router
+    is meant to act on. The rules are numbered and short because the failure this
+    replaces was not a refusal — it was a helpful front door improvising: on
+    2026-08-17 it summarised the brief into one card for the Cluster Agent,
+    dropped the delivery instruction on the way, filed a second card asking the
+    Platform Agent to deliver instead, and leaked a "This is a test notification"
+    probe into the user's incident thread from a third.
+
+    Nothing about where the answer goes travels through this text. The card the
+    front door files inherits the alert's chat route from the session it is
+    filed in, so a paraphrase can cost the report's shape but not its address.
+    """
+    event_reason = payload.get("reason") or "Unknown"
+    namespace = payload.get("namespace") or "default"
+    object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
+    object_name = payload.get("name") or ""
+    cluster_name = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "platform-agent-host")
+
+    return (
+        f"A Kubernetes Warning event needs triage on GKE cluster '{cluster_name}'. "
+        f"The alert is already posted in the user's chat thread; your job is to route the diagnosis and nothing else.\n\n"
+        f"Make exactly one `kanban_create` call:\n\n"
+        f"- `assignee`: the `cluster-*` agent scoped to **{cluster_name}** — take its exact name from your "
+        f"`[SPECIALIST AGENTS AVAILABLE NOW]` block, and call `list_agents` once to refresh if none is listed for that cluster.\n"
+        f"- `title`: `Triage {namespace}/{object_kind}/{object_name} ({event_reason}) on {cluster_name}`\n"
+        f"- `body`: everything between the two markers below, **copied verbatim**.\n\n"
+        f"Three rules, and they are why this text spells the call out:\n\n"
+        f"1. **Copy the body exactly.** Do not summarise it, shorten it, reformat it, or restate it in your own words. "
+        f"It carries the report format and the delivery instruction the diagnosis depends on, and on 2026-08-17 a "
+        f"paraphrase dropped both.\n"
+        f"2. **One card, to the Cluster Agent.** Not `platform` — this is one named cluster's live runtime state, which is "
+        f"exactly what a Cluster Agent is for. Assign to `platform` only if that cluster genuinely has no agent after a "
+        f"`list_agents` refresh.\n"
+        f"3. **Do nothing else.** Do not diagnose the event, do not post anything to chat, and do not file a second card to "
+        f"have someone else deliver the answer. Completing the card is the delivery: this one is subscribed to the thread "
+        f"the alert was posted in, and the report reaches the user from there.\n\n"
+        f"--- BEGIN TASK BODY (copy verbatim) ---\n"
+        f"{_triage_task_body(payload)}\n"
+        f"--- END TASK BODY ---"
     )
 
 
@@ -650,16 +931,46 @@ def _start_agent_turn(api_url: str, session_id: str, query: str, headers: Dict[s
         logger.error(f"Failed to call gateway API chat execution: {exc}")
 
 
-def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[str, Any]) -> None:
+def trigger_agent_troubleshooter(
+    session_id: str,
+    alert_msg: str,
+    payload: Dict[str, Any],
+    event_row_id: Optional[int] = None,
+) -> None:
     """Post warning alert to Chat, configure thread mapping, and trigger the agent loop in background."""
     active_platform = get_active_platform()
-    
+
     # 1. Post initial warning notification to Google Chat or Slack
     thread_id = _post_initial_alert(active_platform, alert_msg)
     
-    # 2. Register thread-to-session mappings for two-way chat routing
+    # 2. Register thread-to-session mappings for two-way chat routing. This has
+    #    to happen before the turn in step 5: the card that turn files reads
+    #    this row to address its completion back to the alert's thread (see
+    #    deploy/docker/patches/kanban_event_routing.py).
     if thread_id:
         _register_session_routing(session_id, active_platform, thread_id)
+    else:
+        # The ledger row already says this alert was announced; it was written
+        # before the post was attempted. Correct it now, or the daily recap
+        # counts a message nobody received into "went to chat as it happened"
+        # and drops the workload from the body.
+        #
+        # Only this branch. A failure further down means chat *did* get the
+        # alert and the triage turn did not start, which is a different defect
+        # and leaves `notified` correctly set: the reader saw the alert, just
+        # never the follow-up. `_post_initial_alert` also lands here when the
+        # send succeeded but returned no parseable `message_id`, so the record
+        # says the delivery is unconfirmed rather than certainly lost — the
+        # honest reading, and the safe direction for a report whose failure
+        # mode is false reassurance.
+        mark_delivery_failed(
+            event_row_id,
+            f"no message id from '{active_platform}'; see the session server log",
+        )
+        logger.error(
+            f"Alert for session {session_id} was not delivered to '{active_platform}'; "
+            "the daily recap will report it as undelivered"
+        )
 
     # 3. Configure HTTP authentication headers for Hermes REST gateway
     api_url = os.environ.get("PLATFORM_API_URL", "http://127.0.0.1:8642")
@@ -668,14 +979,16 @@ def trigger_agent_troubleshooter(session_id: str, alert_msg: str, payload: Dict[
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # 4. Instantiate the session in Platform Gateway
+    # 4. Instantiate the session in Platform Gateway. It lands on the default
+    #    profile — the front door — which delegates it to the failing cluster's
+    #    own agent; see _build_agent_query.
     session_created = _create_gateway_session(api_url, session_id, headers)
     if not session_created:
         logger.error(f"Aborting troubleshooting trigger: session creation failed for {session_id}")
         return
 
     # 5. Formulate instructions query and execute the agent turn
-    agent_query = _build_agent_query(session_id, payload)
+    agent_query = _build_agent_query(payload)
     _start_agent_turn(api_url, session_id, agent_query, headers)
 
 
@@ -1154,10 +1467,30 @@ def submit_cron_report(request_data: Dict[str, Any]) -> Dict[str, str]:
         "session_id": session_id,
         "relay": "degraded" if degraded else "ok",
     }
+def _watcher_features(header_value: str) -> set:
+    """The response behaviours the calling watcher said it understands.
+
+    ``X-Watcher-Features`` is a comma-separated list the watcher sets on every
+    inject (``injectFeaturesHeader`` in ``injector.go``). An absent or empty
+    header means a watcher old enough not to send one, which is the case this
+    exists to detect — so the empty set is the safe answer and every
+    feature-gated branch has to treat it as "not supported".
+
+    Tokens are lowercased and stripped. Deliberately no version number: a
+    version would make the daemon track which build learned which behaviour,
+    and the question at each branch is only whether this caller handles this
+    one status.
+    """
+    return {token.strip().lower() for token in (header_value or "").split(",") if token.strip()}
 
 
 @app.post("/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])
-def inject_message(session_id: str, request_data: Dict[str, Any], background_tasks: BackgroundTasks) -> Dict[str, str]:
+def inject_message(
+    session_id: str,
+    request_data: Dict[str, Any],
+    background_tasks: BackgroundTasks,
+    x_watcher_features: str = Header(default=""),
+) -> Dict[str, str]:
     """Receive the event payload and notify the Platform Agent via Google Chat."""
     raw_message = request_data.get("message", "")
     if not raw_message:
@@ -1172,11 +1505,32 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     namespace = payload.get("namespace") or "default"
     object_kind = payload.get("kind_of_object") or payload.get("kindOfObject") or "Pod"
     object_name = payload.get("name") or ""
+    object_uid = payload.get("uid") or ""
     message = payload.get("message") or ""
     count = payload.get("count") if payload.get("count") is not None else 1
     event_type = payload.get("type") or "Warning"
+    # Falls back to this pod's own cluster the way _build_agent_query does, so
+    # a payload from an older watcher lands under a name rather than under ''.
+    event_cluster = payload.get("cluster") or os.environ.get("GKE_CLUSTER_NAME", "")
 
     severity_emoji, severity_label = get_severity_details(event_type, event_reason)
+
+    clean_name = clean_workload_name(object_kind, object_name)
+    clean_reason = clean_reason_label(event_reason)
+    clean_msg = clean_event_message(message)
+
+    # Info means Kubernetes did not consider the event a warning. The watcher
+    # filters on `reason` alone and never on `Event.Type`, so a Normal-type
+    # event whose reason is on its list arrives here like any other — and used
+    # to cost a chat post and a full triage session each. Neither is worth
+    # spending on routine image-pull churn: the post is noise in the middle of
+    # someone's day, and the triage is an agent turn spent on a non-problem.
+    #
+    # Suppressed here rather than in the watcher so the event is still counted.
+    # The ledger row below is written either way, so the daily recap can report
+    # what was held back; dropping these at the source would make them
+    # invisible to it. See the "Suppressed" line in eod_report_generator.py.
+    suppressed = severity_label == "Info"
 
     # The daily ceiling is enforced here rather than at /sessions because
     # severity is not known until the payload arrives, and here is the single
@@ -1184,6 +1538,78 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     # session row created for an alert that never posts; those age out under
     # CLEANUP_TTL_DAYS like any other.
     #
+    # Claimed *after* the gate above, and only when something is actually going
+    # to be posted: a budget is a count of alerts sent, so an event that was
+    # never going to post must not spend one. Claiming first would bill the
+    # Info bucket for every suppressed image-pull `BackOff` and leave
+    # `GET /v1/alert-quota` reporting a day's worth of alerts nobody received.
+    #
+    # The ordering is also what keeps `ALERT_DAILY_LIMIT_INFO` from being spent
+    # by the churn it is meant to bound. Grading is on `Event.Type` alone, so a
+    # Normal-typed `NodeNotReady` and a Normal-typed `BackOff` are both Info and
+    # would draw on the same budget; because the gate above suppresses every
+    # Info event before this line, neither reaches the claim and the bucket is
+    # never drawn down at all. Move the claim above the gate and five suppressed
+    # `BackOff`s can exhaust it and cap-drop the node event behind them.
+    quota_denied = False
+    suppressed_today = 0
+    if not suppressed:
+        allowed, suppressed_today = _claim_alert_quota(severity_label)
+        quota_denied = not allowed
+
+    # One ledger row per forwarded event, whatever became of it, with
+    # `notified` carrying the outcome — that invariant is what lets the daily
+    # recap report a suppressed event as a number rather than lose it. A
+    # cap-dropped alert is written here too: it is the case the recap most
+    # needs to show, since nothing about it reaches chat at all.
+    event_row_id = record_intercepted_event(
+        cluster=event_cluster,
+        namespace=namespace,
+        workload=clean_name,
+        object_uid=object_uid,
+        object_kind=object_kind,
+        reason=event_reason,
+        message=clean_msg,
+        severity=severity_label,
+        occurrences=count,
+        notified=not (suppressed or quota_denied),
+    )
+
+    if suppressed:
+        # "filtered", deliberately not the "suppressed" the ceiling answers
+        # below. The watcher rolls back its dedup entry for a "suppressed" so
+        # the workload is re-offered, which is right for a ceiling that resets
+        # at 00:00 UTC and wrong for this: an Info event will still be Info on
+        # its next sighting, so rolling back would re-offer the same routine
+        # churn at the event's own repeat cadence — a session, an inject and a
+        # ledger row every kubelet resync, all day, for every quiet workload.
+        #
+        # Only for a watcher that said it understands the status. One that did
+        # not also keeps its entry, but it has no way to flag it and so can
+        # never reopen it, and the dedup key is canonical — so the entry is held
+        # on behalf of the family's one Info member and the real `Failed` behind
+        # it is deduplicated into silence for as long as the workload keeps
+        # emitting. Answering such a watcher "suppressed" hands it a status it
+        # already knows how to roll back, so the key is released and the
+        # family's Warnings still reach chat. It does not restore the pre-gate
+        # chat post for the Info event itself — nothing here should, that is the
+        # change — and it costs one redundant session per sighting, which is the
+        # price of not silencing a real failure. See the skew paragraph in
+        # k8s-operator/cmd/k8s-event-watcher/README.md, which owns that
+        # contract, and injectFeaturesHeader in injector.go for why the two
+        # halves cannot be assumed to roll together.
+        if "policy-filtered" not in _watcher_features(x_watcher_features):
+            logger.info(
+                f"Suppressed {severity_label} event {event_reason} for {namespace}/{clean_name}; "
+                "answering 'suppressed' because the watcher did not claim policy-filtered support"
+            )
+            return {"status": "suppressed"}
+        logger.info(
+            f"Suppressed {severity_label} event {event_reason} for {namespace}/{clean_name} "
+            f"(no chat alert, no triage session); it will appear in the daily recap"
+        )
+        return {"status": "filtered"}
+
     # The reply is 200 with status "suppressed", not an error code, and the
     # difference matters at both ends. The watcher reads the status and drops
     # its dedup entry, so the workload is re-offered on its next sighting
@@ -1194,18 +1620,13 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
     # row behind. Answering 200 rather than 4xx/5xx keeps those attempts out of
     # the watcher's inject-error metric, which is there to say the daemon is
     # broken; refusing an alert over a configured ceiling is it working.
-    allowed, suppressed_today = _claim_alert_quota(severity_label)
-    if not allowed:
+    if quota_denied:
         logger.warning(
             f"Suppressed {severity_label} alert for {namespace}/{object_kind}/{object_name} "
             f"({event_reason}): daily limit of {ALERT_DAILY_LIMITS[severity_label]} reached, "
             f"{suppressed_today} suppressed today"
         )
         return {"status": "suppressed", "severity": severity_label, "suppressed_today": str(suppressed_today)}
-
-    clean_name = clean_workload_name(object_kind, object_name)
-    clean_reason = clean_reason_label(event_reason)
-    clean_msg = clean_event_message(message)
 
     # Construct a pretty notification alert. Standard markdown, not Slack
     # mrkdwn: SlackAdapter.format_message runs over everything on its way out,
@@ -1217,10 +1638,10 @@ def inject_message(session_id: str, request_data: Dict[str, Any], background_tas
         f"{severity_emoji} **{severity_label}:** {clean_reason} `{namespace}/{clean_name}` — {clean_msg}\n"
         f"🌱 _Digging down to the root cause..._"
     )
-    
+
     # Delegate the heavy REST API call to FastAPI BackgroundTasks to keep response times sub-millisecond
-    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload)
-    
+    background_tasks.add_task(trigger_agent_troubleshooter, session_id, alert_msg, payload, event_row_id)
+
     return {"status": "injected"}
 
 

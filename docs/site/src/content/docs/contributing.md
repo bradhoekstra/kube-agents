@@ -89,9 +89,21 @@ What that section should say:
 
 Some changes can't reach a running installation — docs-only edits, CI workflow changes, code paths that need infrastructure you don't have. Write "Not live-tested" and say why. An empty section is not an answer.
 
+If your team shares one installation, take the lease before you mutate it: `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy `.claude/settings.json.example` to `.claude/settings.json` once per checkout, and its `PreToolUse` hook claims the lease on your first mutating command and blocks the command while another agent holds it. Read-only commands are never blocked, and nothing is protected until a checkout has a `vars.sh` or you configure an install. The hook is not committed — it would be branch content Claude Code runs unprompted — and it is Claude Code-specific, so from any other harness, or a plain shell, run `acquire` and `release` yourself:
+
+```bash
+cp .claude/settings.json.example .claude/settings.json   # opt into the hook
+python3 scripts/live_test_lease.py status
+python3 scripts/live_test_lease.py acquire --env my-cluster --pr 123 --note "why"
+python3 scripts/live_test_lease.py release --env my-cluster
+```
+
+`--env` picks the install when more than one resolves, and the commands that act on one require it
+there; `status` reports all of them either way. [`docs/designs/live-test-lease.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/live-test-lease.md) has the details.
+
 ## Self-review
 
-Nobody reads a change as cheaply as the person who wrote it, and right now the first hostile reader of most pull requests here is a reviewer who has never seen the code. So every pull request is reviewed by its author first, and the template's **Self-Review** section says what that pass found.
+Nobody reads a change as cheaply as the person who wrote it, and right now the first hostile reader of most pull requests here is a reviewer who has never seen the code. So every pull request is reviewed by its author first, and the template's **Self-Review** section carries what those passes found — merged into one list, since more than one pass is required.
 
 [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) states this requirement in full and is canonical; what follows summarises it, so trust it over this page if the two ever differ.
 
@@ -99,9 +111,12 @@ The method is the repository's own review skill, [`.agents/skills/review-adversa
 
 Give the pass a context that did not write the change — a subagent, or a fresh session, handed the diff range and nothing else. An agent asked to review a diff in the same conversation that produced it mostly restates why the code is right, because the reasoning that produced the code is still in front of it. If your harness will not start a subagent without a human's approval, ask for the approval — that setting blocks this step rather than waiving it.
 
+This pass is not the only one [`AGENTS.md`](https://github.com/gke-labs/kube-agents/blob/main/AGENTS.md) requires before a pull request opens: the docs-drift pass runs on every change as well. In Claude Code, `/pr-preflight` covers both — a subagent per pass, one merged list back — and its plumbing lives in [`.agents/skills/review-preflight/SKILL.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/skills/review-preflight/SKILL.md) for any harness without slash commands. Reach for it rather than the session you are already in: coding agents are typically told not to spawn subagents unless asked, and invoking the command is that ask.
+
 What the section should say:
 
 - **What you looked for**, in the skill's terms — which angles you ran, and which you could not.
+- **What kind of context each pass ran in** — a subagent, a fresh session, or the one that wrote the change. A reviewer weighs the rest of the section against that answer.
 - **What it found, and where each finding ended up.** Fixed, naming the commit or hunk; or deliberately not fixed, with a reason. A reason is an argument about this change — the path is unreachable for a stated invariant, the fix belongs to the issue you just filed. "Out of scope" or "will fix later" alone is not.
 - **Nothing you cannot back.** A self-review the diff contradicts is worse than no self-review: it spends the reviewer's trust before they reach the code. Fix what the pass confirms and report what it only suspects; a finding it could not pin down is an open question for the section, not a licence to rewrite working code.
 

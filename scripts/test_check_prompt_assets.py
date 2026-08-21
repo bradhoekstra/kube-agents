@@ -31,32 +31,36 @@ import check_prompt_assets as cpa
 REPO = Path(__file__).resolve().parents[1]
 
 
-def _stage_ancestry(dockerfile: Path, target: str) -> set[str]:
-    """`target` and every stage it is built on, by name.
+def _stage_parents(text: str) -> dict[str, str]:
+    """Each named build stage mapped to what it is built `FROM`."""
+    parents = {}
+    for line in text.splitlines():
+        tokens = line.split()
+        if not tokens or tokens[0].upper() != "FROM":
+            continue
+        arguments = [token for token in tokens[1:] if not token.startswith("--")]
+        if len(arguments) >= 3 and arguments[-2].upper() == "AS":
+            parents[arguments[-1]] = arguments[0]
+    return parents
 
-    A Dockerfile with more than one target describes more than one image, and
-    a path means whatever the stage it appears in says it means. The
-    credential-proxy stage is the case that forced this: it is built on the
-    Envoy image and puts the credential runtime under /opt/defaults/scripts
-    too, but nothing there is a Hermes profile default and no entrypoint ever
-    copies it over a profile home. Reading its COPY lines into the model below
-    describes an image that does not exist.
+
+def _stage_chain(text: str, target: str) -> set[str]:
+    """`target` and every stage it is built on top of, within this Dockerfile.
+
+    The walk stops at the first parent that is not a stage defined here -- an
+    external base image -- and at a cycle, which a Dockerfile cannot express but
+    a typo in this parser could.
     """
-    parents: dict[str, str] = {}
-    for line in dockerfile.read_text(encoding="utf-8").splitlines():
-        match = re.match(r"FROM\s+(?:--\S+\s+)*(\S+)\s+AS\s+(\S+)", line)
-        if match:
-            parents[match.group(2)] = match.group(1)
-
-    ancestry = set()
+    parents = _stage_parents(text)
+    chain: set[str] = set()
     stage = target
-    while stage in parents and stage not in ancestry:
-        ancestry.add(stage)
+    while stage in parents and stage not in chain:
+        chain.add(stage)
         stage = parents[stage]
-    return ancestry
+    return chain
 
 
-def _copy_instructions(dockerfile: Path, stages: set[str] | None = None) -> list[list[str]]:
+def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list[str]]:
     """Every build-context COPY in a Dockerfile, as its argument list.
 
     Continuations and the multi-source form both matter here: the lines this
@@ -72,21 +76,25 @@ def _copy_instructions(dockerfile: Path, stages: set[str] | None = None) -> list
     one aimed at an asset directory would otherwise be read as a repo path and
     quietly agree with a model that is wrong.
 
-    `stages`, when given, restricts the result to COPYs inside those build
-    stages. Instructions before the first FROM belong to no stage and are
-    dropped with it.
+    `target` narrows the result to the stages that build one image. A COPY in a
+    sibling stage lands in a different image and says nothing about this one --
+    `credential-proxy` writes its own /opt/defaults/scripts from the same
+    sources, and counting both would have the caller's model claim the agent
+    image copies each of them twice.
     """
     text = re.sub(r"\\\n", " ", dockerfile.read_text(encoding="utf-8"))
+    chain = _stage_chain(text, target) if target else None
     instructions = []
-    stage: str | None = None
+    stage = None
     for line in text.splitlines():
-        from_match = re.match(r"FROM\s+(?:--\S+\s+)*\S+\s+AS\s+(\S+)", line)
-        if from_match:
-            stage = from_match.group(1)
+        tokens = line.split()
+        if tokens and tokens[0].upper() == "FROM":
+            arguments = [token for token in tokens[1:] if not token.startswith("--")]
+            stage = arguments[-1] if len(arguments) >= 3 and arguments[-2].upper() == "AS" else None
             continue
         if not line.startswith("COPY "):
             continue
-        if stages is not None and stage not in stages:
+        if chain is not None and stage not in chain:
             continue
         flags = [argument for argument in line.split()[1:] if argument.startswith("--")]
         if any(flag.startswith("--from=") for flag in flags):
@@ -441,13 +449,14 @@ class ResolutionModelTests(unittest.TestCase):
         that adding one to the Dockerfile fails here, at the one place that has
         to know.
 
-        Only the stages the agent image is built from count -- see
-        `_stage_ancestry`.
+        Derived from the ``platform`` chain alone. ``credential-proxy`` fills
+        its own /opt/defaults/scripts from the same five sources, but it is a
+        different image and the entrypoint this table models never runs there.
         """
         dockerfile = REPO / "deploy/docker/Dockerfile"
         expected: list[tuple[str, str]] = []
         for arguments in _copy_instructions(
-            dockerfile, stages=_stage_ancestry(dockerfile, "platform")
+            REPO / "deploy/docker/Dockerfile", target="platform"
         ):
             *sources, destination = arguments
             if not destination.startswith("/opt/defaults/"):
@@ -466,6 +475,41 @@ class ResolutionModelTests(unittest.TestCase):
             expected,
             list(cpa.OPT_DEFAULTS),
             "check_prompt_assets.OPT_DEFAULTS has drifted from the Dockerfile",
+        )
+
+    def test_the_two_images_fill_opt_defaults_scripts_from_the_same_sources(self):
+        """The sidecar's /opt/defaults/scripts must match the agent's.
+
+        credential_proxy.py runs from there, imports gke_endpoint from beside
+        it and execs github_token_refresh.py, and the sidecar has no other copy
+        of any of them. While it built FROM platform the two directories were
+        the same directory and could not disagree. It builds FROM agent-base
+        now and fills its own, so the only thing holding them together is that
+        both COPY lists name the same sources -- which is a convention until
+        something checks it.
+
+        Divergence is silent in every other gate: both images build, the layer
+        budget passes, entrypoint-gate-test covers the platform image only, and
+        the first signal is a CrashLooping sidecar taking every proxied gcloud,
+        kubectl, gh and git call in the agent container down with it.
+        """
+        dockerfile = REPO / "deploy/docker/Dockerfile"
+
+        def scripts_sources(target: str) -> set[str]:
+            sources: set[str] = set()
+            for *paths, destination in _copy_instructions(dockerfile, target=target):
+                if destination.rstrip("/") == "/opt/defaults/scripts":
+                    sources.update(path.rstrip("/") for path in paths)
+            return sources
+
+        platform = scripts_sources("platform")
+        self.assertTrue(platform, "no COPY into /opt/defaults/scripts; parser is stale")
+        self.assertEqual(
+            platform,
+            scripts_sources("credential-proxy"),
+            "the platform and credential-proxy stages fill /opt/defaults/scripts "
+            "from different sources; the sidecar runs credential_proxy.py out of "
+            "that directory and has no other copy of it",
         )
 
     def test_the_defaults_layer_reaches_the_default_profile_and_no_other(self):
