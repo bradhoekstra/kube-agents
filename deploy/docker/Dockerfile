@@ -1499,42 +1499,7 @@ COPY --chown=hermes:hermes --chmod=0755 \
      deploy/shared/otel_config.py \
      /opt/defaults/scripts/
 
-# Every third-party import in credential_proxy.py, and only those: google-* for
-# the Google Chat relay, slack_sdk for the Slack relay, pyyaml for the policy
-# file. All of them are imported inside the function that needs them, so a
-# missing one surfaces as a failed relay rather than a failed start.
-RUN python3 -m venv /opt/credential-proxy-venv && \
-    /opt/credential-proxy-venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /opt/credential-proxy-venv/bin/pip install --no-cache-dir \
-      google-api-python-client \
-      google-auth \
-      google-auth-httplib2 \
-      google-cloud-pubsub \
-      pyyaml \
-      slack_sdk
-
-# The pod runs as 10000:10000. The uid does not have to exist for the container
-# to start, but gcloud and git both look the caller up and misbehave when the
-# lookup fails, so it is created here to match the agent image's `hermes`.
-# No home directory is baked: HOME is set by the operator to a path under the
-# writable /tmp emptyDir, because the root filesystem here is read-only.
-#
-# Not named `proxy`: Debian ships a system group by that name (gid 13) and
-# groupadd fails the build on the collision.
-RUN groupadd -g 10000 credproxy && \
-    useradd -u 10000 -g 10000 -M -d /tmp/credential-proxy/home -s /bin/bash credproxy
-
 USER 10000:10000
-
-EXPOSE 8765
-
-# The operator sets `command` on both containers that run this image, which
-# overrides ENTRYPOINT either way. These are here so a plain `docker run` does
-# the same thing, and so the Envoy base's own entrypoint and CMD — which would
-# otherwise start a bare proxy with no credential runtime behind it, or append
-# `-c /etc/envoy/envoy.yaml` to this one as arguments — do not survive.
-ENTRYPOINT ["/usr/local/bin/start-services"]
-CMD []
 
 
 # --- ENTRYPOINT GATE TEST TARGET ---

@@ -2013,6 +2013,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
             max_request_bytes=1 << 20,
             max_output_bytes=1 << 20,
             state_dir=str(Path(self.tmp.name) / "state"),
+            # `full` rather than `credentials`: the read-only gate guards the
+            # exec path, and `credentials` is the one role that does not serve
+            # it. A namespace missing the attribute would fail at serve()'s
+            # role check before reaching the gate this asserts on.
+            role="full",
         )
         environment = {
             "API_SERVER_EXTERNAL_KEY": "external",
