@@ -633,7 +633,12 @@ inside the container that holds the token. The proxy pins `core.hooksPath=/dev/n
 and refuses any argv that tries to override either key with `-c` or `--config-env` — the
 command line outranks the environment form, so the argv guard is not redundant.
 `GIT_CONFIG_GLOBAL` is deliberately left alone: the proxy's own author identity lives
-there.
+there. Those pins close the routes they name and cannot close the class, because the class is
+"anything `.git/config` can make git execute" and it does not enumerate. What closes it is the
+agent not having a `.git` at all — see
+[Content-passing removes the shared tree](#content-passing-removes-the-shared-tree), which is
+partly delivered: the two write skills have migrated, the volume is still mounted for the
+skills that have not.
 
 **Every install needs a Workload Identity pool.** Three `gcloud` commands, below, that no
 install surface runs.
@@ -1944,6 +1949,73 @@ mount the same data volume, and `shares_filesystem_with_proxy()` sends the `cwd`
 The `cwd` is **self-reported by the caller**. It is a guardrail against the agent wandering
 out of its workspace by accident, not a control against one that intends to. Anything
 relying on it as a security boundary should stop.
+
+### Content-passing removes the shared tree
+
+The shared writable tree is what
+[What co-location costs](#what-co-location-costs) is mostly about. The agent writes
+`.git/hooks/pre-commit`, the broker runs `git commit` in that tree, and the hook executes in
+the container holding the token. The proxy answers by pinning `core.hooksPath=/dev/null` and
+`protocol.ext.allow=never` and refusing an argv that overrides either — which closes the two
+routes it names, and leaves open the question of how many there are.
+
+That question does not terminate. Git's exec surface is a feature surface: aliases, the
+editor and the pager, credential helpers, clean and smudge filters, `ext::` transports,
+`core.fsmonitor`, submodule commands. An overnight enumeration pass found sixteen distinct
+paths; a second pass over already-reviewed code found nine more. Every one of them is
+configured, and configuration for a repository lives in `.git/config` — which is why the
+class closes when the agent stops having a `.git`, and not when the list of pinned keys gets
+longer. A `.gitattributes` naming `filter=evil` is a file the agent can still write; without
+`filter.evil.clean` in `.git/config` it names a driver that does not exist, and git leaves the
+content alone.
+
+So the exchange stops being a directory and starts being content. The agent hands the broker
+`{path, contentBase64}` pairs and a commit message; the broker owns the only checkout, on a
+volume the agent does not mount, and commits and pushes there. `content_workspace.py` holds
+the six verbs — `open`, `read`, `list`, `commit`, `push`, `close` — reached over the same
+loopback endpoint as `/v1/exec`, and `credential_proxy_client.Workspace` is the client. The
+broker refuses a path that is absolute, contains `..`, or sits behind a symlink, and it
+answers `list` from `git ls-files` rather than from a filesystem walk, so its own `.git` is
+not nameable. `commit` continues `origin/<branch>` when the remote already has it rather than
+recutting from the base, because recutting is how a second round of review feedback silently
+deletes the reviewed commits; `push` uses `--force-with-lease` and does not fetch immediately
+before it, since fetching first moves the very ref the lease compares against.
+
+`assert_disjoint_roots` runs at construction and refuses to start the broker if its tree root
+sits inside the agent-shared workspace, and `validateExtraVolumeMounts` in the operator
+refuses a CR that mounts a broker-owned volume into the agent container. Neither is an
+escape the agent could attempt — both are configuration mistakes that would apply cleanly and
+produce no symptom.
+
+**Where git is issued from today.** Auditing this before building it mattered, because a
+broker that ran git of its own would have had the same problem one container over. Every git
+in the product is agent-issued: the skills call `gitops_workspace.run_git`, which posts to
+`/v1/exec`, which reaches `CommandExecutor.execute`. The broker's own non-agent-selectable
+path is `execute_internal`, and its only caller is `/v1/github/refresh`, which runs
+`git config --get remote.origin.url` and nothing else. The content workspaces run their git
+through `execute_workspace_git`, which shares `_execute` with the agent-facing path — so it
+inherits the same hardened environment — but is not reachable from `/v1/exec` and takes no
+agent-supplied argv: the subcommands are literals in `content_workspace.py`, and the only
+caller-supplied strings in them are a validated branch name and validated repository-relative
+paths. That separation is what lets the agent-facing git surface go to zero once the skills
+migrate, rather than going to zero by accident.
+
+**What runs which way.** Both mechanisms are live at once, because a fleet does not upgrade
+atomically. `CREDENTIAL_PROXY_CONTENT_WORKSPACES` arms the broker; a skill asks it once per
+process whether the routes exist and takes the same fork for the whole run. An unreachable
+broker answers "no" and the run publishes through the leased clone, which is the one question
+in a run where falling back beats failing — every other call still fails loudly. The
+migrated skills are `submit-suggestion` and `fleet-audit`, and `fleet-audit` needed two new
+commands to replace what the clone used to answer: `list` names the repository's tracked
+files and `fetch` copies named files into the workspace, which is how a remediation path stays
+something discovered rather than invented when there is nothing local to grep.
+
+What content-passing does not remove is the volume itself. The clone path still needs it, so
+the mount stays until the last skill has migrated and directory mode is deleted; the
+restriction of the agent-facing git allowlist to the verbs nothing needs any more is the step
+after that. Nor does it change the exec path for `kubectl`, `gcloud` or `gh`, which never
+needed a shared filesystem — except that `gh` did, for `--body-file`, and now takes its
+documents on stdin instead.
 
 ### One replica
 
