@@ -373,6 +373,7 @@ leave the Platform Agent unable to do the work the flag exists to let it do.
 
 - `enabled` — moves the agent's shell into a StatefulSet of its own, reached over SSH with the keypair in the agent's credential Secret (`SANDBOX_SSH_PRIVATE_KEY` and its public half in `<name>-shell-authorized-keys`). Defaults to `false`. With the toggle on and no key, the sandbox runs and the agent cannot log into it.
 - `image` — overrides the sandbox image. Empty takes the operator's default.
+- `runtimeClassName` — runs the sandbox Pod under a sandboxed container runtime, `gvisor` being the one GKE offers. Unset by default. Separate from [`spec.deployment.availability.runtimeClassName`](#specdeployment), which governs the agent Pod: that Pod holds WAL-mode SQLite, which gVisor corrupts on the gofer-backed mount ([#610](https://github.com/gke-labs/kube-agents/issues/610)), and the sandbox Pod holds none — so an install can sandbox the untrusted Pod without sandboxing the trusted one. On GKE Standard the cluster needs a node pool created with `--sandbox type=gvisor`; Autopilot ships the RuntimeClass natively. A RuntimeClass the cluster does not have leaves the CR `Degraded` naming it, rather than a Pod sitting `Pending`.
 
 Paired with [`spec.security.workloadIdentityFederation`](#specsecurity), the credential proxy moves into this Pod as a second container, on loopback and sharing the shell's working tree — which is what makes proxied `git` and `kubectl -f FILE` work. Without federation the proxy stays in a Deployment of its own and those paths are refused.
 
@@ -388,7 +389,7 @@ Abstracts the pod/deployment configuration. The controller synthesises a `Deploy
   scheduled. Pod-scoped, so it covers the agent, both injected sidecars, anything in
   `initContainers`/`sidecars`, and the OCI image volumes `AgentPlugin`s mount.
 - `browserArgs` — extra command-line args for the agent's browser (e.g. `--no-sandbox`).
-- `runtimeClassName` — pod runtime class (e.g. `gvisor`).
+- `availability.runtimeClassName` — pod runtime class (e.g. `gvisor`) for the agent Pod. Nested under `availability` alongside `replicas`, `nodeSelector`, `tolerations` and `affinity`.
 - `env` — additional container environment variables.
 - `initContainers` / `sidecars` — standard init and sidecar containers.
 - `extraVolumes` / `extraVolumeMounts` — custom volumes and mounts for the main container.
