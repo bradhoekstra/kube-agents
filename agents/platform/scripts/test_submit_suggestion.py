@@ -29,6 +29,8 @@ from unittest.mock import patch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+import content_workspace  # noqa: E402
+import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
 
 SUBJECT = (
@@ -98,6 +100,11 @@ class SubmitSuggestionTestCase(unittest.TestCase):
                 "HERMES_KANBAN_TASK": "t_card",
                 "HERMES_SESSION_ID": "",
                 "GITOPS_BASE_BRANCH": "",
+                # Directory mode, explicitly. `prepare` asks the broker whether
+                # it has content workspaces armed, and an inherited
+                # CREDENTIAL_PROXY_URL from the developer's shell would send
+                # that question somewhere real.
+                "CREDENTIAL_PROXY_URL": "",
             },
         )
         env.start()
@@ -533,6 +540,319 @@ class TestArgvCompatibility(unittest.TestCase):
         for argv in ([], ["-h"], ["--help"]):
             with self.subTest(argv=argv):
                 self.assertEqual(submit_suggestion.normalise_argv(argv), argv)
+
+
+# --------------------------------------------------------------------------- #
+# Content mode — the broker owns the checkout
+# --------------------------------------------------------------------------- #
+
+
+@unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
+class TestContentMode(SubmitSuggestionTestCase):
+    """The same two commands, against a real broker-side store.
+
+    The store is the real `ContentWorkspaceStore` rather than a recording of it,
+    for the reason the module docstring gives about `--force-with-lease`: the
+    properties worth testing here — that the agent never receives a path, that a
+    moved base is refused — are properties of what git does, and a stub would
+    assert only that this test agrees with itself.
+
+    What is stubbed is the HTTP hop, at `_workspace_call`. It raises the same
+    two exception types the real transport raises for the same two conditions,
+    which is what the skill branches on.
+    """
+
+    def setUp(self):
+        super().setUp()
+        origin = self.origin
+        # `open` composes https://github.com/<owner>/<name>.git itself and takes
+        # no caller-supplied URL, by design — so the redirect to the local bare
+        # repo goes in at the runner, below the code under test.
+        url = "https://github.com/acme/fleet.git"
+
+        def runner(argv, cwd, check=True):
+            argv = [str(origin) if token == url else token for token in argv]
+            return subprocess.run(
+                argv, cwd=str(cwd), capture_output=True, text=True, check=check
+            )
+
+        self.store = content_workspace.ContentWorkspaceStore(
+            self.tmp_path / "broker" / "trees",
+            self.tmp_path / "agent-workspace",
+            runner=runner,
+        )
+        self.verbs = []
+
+        def call(endpoint, verb, payload):
+            self.verbs.append(verb)
+            try:
+                return getattr(self.store, verb)(payload)
+            except content_workspace.WorkspaceError as exc:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    exc.status, {"error": str(exc), **exc.fields}
+                ) from exc
+
+        self.patch_attr(credential_proxy_client, "_workspace_call", call)
+        endpoint = patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}
+        )
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
+
+    def scratch(self, files: dict) -> Path:
+        directory = self.tmp_path / "scratch"
+        for name, text in files.items():
+            path = directory / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return directory
+
+    def prepare_content(self, branch="platform-agent/fix-netpol"):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch(["prepare", "--branch", branch])
+        return json.loads(out.getvalue())
+
+    def submit_content(self, prepared, source, title="t", body="b", deletes=()):
+        argv = [
+            "submit",
+            "--branch", prepared["branch"],
+            "--title", title,
+            "--body", body,
+            "--handle", prepared["handle"],
+            "--from", str(source),
+            "--base-sha", prepared["baseSha"],
+            "--repo", "acme/fleet",
+        ]
+        for path in deletes:
+            argv += ["--delete", path]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch(argv)
+        return out.getvalue().strip()
+
+    def test_prepare_hands_back_a_handle_and_no_path(self):
+        payload = self.prepare_content()
+        self.assertEqual(payload["mode"], "content")
+        self.assertEqual(payload["repo"], "acme/fleet")
+        self.assertEqual(payload["base"], "main")
+        self.assertEqual(len(payload["handle"]), 32)
+        # The whole point. A path in this JSON is a directory the agent can be
+        # told to `cd` into, and `.git` is inside it.
+        self.assertNotIn("workspace", payload)
+        self.assertNotIn("lease", payload)
+        for value in payload.values():
+            self.assertNotIn("/tmp", str(value))
+            self.assertFalse(str(value).startswith("/"))
+
+    def test_prepare_then_submit_lands_the_branch_and_opens_the_pr(self):
+        prepared = self.prepare_content()
+        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
+        url = self.submit_content(prepared, source)
+
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/1")
+        self.assertIn("platform-agent/fix-netpol", self.origin_branches())
+        files = self.origin_git(
+            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
+        ).split()
+        self.assertIn("clusters/prod/netpol.yaml", files)
+        self.assertEqual(
+            self.verbs, ["open", "open", "commit", "push", "close"]
+        )  # the first `open` is the availability probe
+
+    def test_the_pull_request_body_travels_on_stdin(self):
+        prepared = self.prepare_content()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        self.submit_content(prepared, source, body="a body\nover two lines\n")
+        argv, cwd = self.gh_calls[0]
+        self.assertEqual(argv[argv.index("--body-file") + 1], "-")
+        self.assertNotIn("--body", argv)
+        # No cwd either: in content mode there is no directory in this container
+        # for `gh` to run in, and it does not need one — every call names --repo.
+        self.assertIsNone(cwd)
+
+    def test_a_delete_reaches_the_commit(self):
+        prepared = self.prepare_content()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        self.submit_content(prepared, source, deletes=["README.md"])
+        files = self.origin_git(
+            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
+        ).split()
+        self.assertNotIn("README.md", files)
+
+    def test_a_symlink_in_the_scratch_directory_is_not_followed(self):
+        """A link resolves against the *agent's* filesystem.
+
+        Following one would read whatever it points at into a commit — the
+        agent's own token file included — while every string in the request
+        still looked like ordinary repository-relative content.
+        """
+        secret = self.tmp_path / "token"
+        secret.write_text("ghs_not_yours\n", encoding="utf-8")
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        (source / "stolen.txt").symlink_to(secret)
+
+        changes = submit_suggestion.collect_changes(str(source), None)
+        self.assertEqual(list(changes), ["a.yaml"])
+
+    def test_submit_refuses_a_handle_with_nothing_to_send(self):
+        prepared = self.prepare_content()
+        with self.assertRaises(ValueError) as caught:
+            submit_suggestion.dispatch([
+                "submit",
+                "--branch", prepared["branch"],
+                "--title", "t", "--body", "b",
+                "--handle", prepared["handle"],
+            ])
+        self.assertIn("--from is required", str(caught.exception))
+        self.assertEqual(self.gh_calls, [])
+
+    def test_a_protected_branch_is_refused_before_the_broker_is_touched(self):
+        prepared = self.prepare_content()
+        self.verbs.clear()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        with self.assertRaises(ValueError) as caught:
+            self.submit_content({**prepared, "branch": "main"}, source)
+        self.assertIn("CRITICAL SECURITY REFUSAL", str(caught.exception))
+        self.assertEqual(self.verbs, [])
+
+    def test_a_base_that_moved_under_the_same_file_is_refused(self):
+        """`--base-sha` is what makes a ten-minute suggestion safe to land."""
+        prepared = self.prepare_content()
+        # Someone else lands a change to the same file on main meanwhile.
+        seed = self.tmp_path / "meanwhile"
+        subprocess.run(
+            ["git", "clone", "--quiet", str(self.origin), str(seed)],
+            check=True, capture_output=True,
+        )
+        (seed / "clusters/prod").mkdir(parents=True)
+        (seed / "clusters/prod/netpol.yaml").write_text("kind: Other\n", encoding="utf-8")
+        for argv in (
+            ["config", "user.email", "o@example.com"],
+            ["config", "user.name", "O"],
+            ["add", "-A"],
+            ["commit", "--quiet", "-m", "theirs"],
+            ["push", "--quiet", "origin", "main"],
+        ):
+            git(argv, seed)
+
+        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
+        with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
+            self.submit_content(prepared, source)
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(
+            caught.exception.payload["paths"], ["clusters/prod/netpol.yaml"]
+        )
+        self.assertEqual(self.gh_calls, [])
+
+    def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
+        """The data loss directory mode already shipped once, in the new path.
+
+        `commit` used to check out `origin/<base>` unconditionally, so round two
+        replaced every reviewed commit with one that no longer contained them —
+        and `--force-with-lease` could not object, because `commit` fetches the
+        very ref the lease compares against moments earlier.
+        """
+        first = self.prepare_content()
+        self.assertEqual(first["started_from"], "origin/main")
+        self.submit_content(first, self.scratch({"a.yaml": "kind: X\n"}))
+
+        second = self.prepare_content()
+        self.assertEqual(second["started_from"], "origin/platform-agent/fix-netpol")
+        self.submit_content(second, self.scratch({"b.yaml": "kind: Y\n"}))
+
+        files = self.origin_git(
+            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
+        ).split()
+        self.assertIn("b.yaml", files)
+        self.assertIn("a.yaml", files, "round one's reviewed work was erased")
+
+    def test_a_reopened_workspace_reads_the_branch_not_the_base(self):
+        """Otherwise round two edits the file as `main` has it.
+
+        Same failure as above by another route: the content is right on disk but
+        the agent was shown the wrong starting text, so its edit writes the
+        reviewed change back out of the file.
+        """
+        first = self.prepare_content()
+        self.submit_content(first, self.scratch({"README.md": "seed\nround one\n"}))
+
+        second = self.prepare_content()
+        scratch = self.tmp_path / "again"
+        with redirect_stdout(io.StringIO()):
+            submit_suggestion.dispatch([
+                "fetch",
+                "--handle", second["handle"],
+                "--path", "README.md",
+                "--to", str(scratch),
+                "--repo", "acme/fleet",
+            ])
+        self.assertEqual(
+            (scratch / "README.md").read_text(encoding="utf-8"), "seed\nround one\n"
+        )
+
+    def test_list_and_fetch_are_how_an_existing_file_gets_edited(self):
+        """There is no `cat` that reaches the checkout, so the skill carries one.
+
+        Without this the agent's only way to change an existing file would be to
+        rewrite it from memory.
+        """
+        prepared = self.prepare_content()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch(
+                ["list", "--handle", prepared["handle"], "--repo", "acme/fleet"]
+            )
+        self.assertEqual(
+            [entry["path"] for entry in json.loads(out.getvalue())["entries"]],
+            ["README.md"],
+        )
+
+        scratch = self.tmp_path / "scratch"
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch([
+                "fetch",
+                "--handle", prepared["handle"],
+                "--path", "README.md",
+                "--to", str(scratch),
+                "--repo", "acme/fleet",
+            ])
+        self.assertEqual((scratch / "README.md").read_text(encoding="utf-8"), "seed\n")
+
+        (scratch / "README.md").write_text("seed\nand a line\n", encoding="utf-8")
+        self.submit_content(prepared, scratch)
+        landed = self.origin_git(
+            ["show", "platform-agent/fix-netpol:README.md"]
+        )
+        self.assertEqual(landed, "seed\nand a line\n")
+
+    def test_fetch_will_not_write_outside_the_scratch_directory(self):
+        # `--path` is repository-relative and the broker validates it, so the
+        # traversal is refused before anything is read rather than being
+        # normalised into something that lands somewhere unexpected here.
+        prepared = self.prepare_content()
+        scratch = self.tmp_path / "scratch"
+        with self.assertRaises(credential_proxy_client.WorkspaceRequestError):
+            submit_suggestion.dispatch([
+                "fetch",
+                "--handle", prepared["handle"],
+                "--path", "../../etc/passwd",
+                "--to", str(scratch),
+                "--repo", "acme/fleet",
+            ])
+        self.assertFalse(scratch.exists())
+
+    def test_a_missing_broker_falls_back_to_the_directory_path(self):
+        """Both mechanisms are live at once, and the agent asks rather than assumes."""
+
+        def unavailable(endpoint, verb, payload):
+            raise credential_proxy_client.WorkspaceUnavailable("not enabled")
+
+        with patch.object(credential_proxy_client, "_workspace_call", unavailable):
+            payload = self.prepare_content()
+        self.assertEqual(payload["mode"], "directory")
+        self.assertIn("workspace", payload)
 
 
 class _GhStub:
