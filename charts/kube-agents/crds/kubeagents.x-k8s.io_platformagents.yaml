@@ -8754,6 +8754,30 @@ spec:
                             cannot read the agent's own filesystem, environment or credentials. See
                             docs/designs/agent-shell-sandboxing.md.
                           properties:
+                            contentWorkspaces:
+                              default: false
+                              description: |-
+                                ContentWorkspaces arms the broker's content-passing routes, so a skill
+                                that writes to GitHub hands the credential proxy file content and a commit
+                                message instead of a directory the two containers share. The proxy keeps
+                                its git checkout on its own state volume, which the shell does not mount,
+                                and the agent never holds a `.git`.
+
+                                What that closes is git's exec surface. `.git/config` can name a pager, a
+                                credential helper, a `filter.*.clean`, an `ext::` transport or a hook, and
+                                each is a way for something the agent wrote to run inside the container
+                                holding the credentials. Pinning the keys closes the routes named; it does
+                                not close the class, because the class is "anything `.git/config` can make
+                                git execute" and that list grows with git. Taking the repository out of
+                                the shared tree closes it.
+
+                                Off by default, and the directory-passing path keeps working beside it: a
+                                skill probes the broker once per run and takes the same fork for the whole
+                                run, so an image paired with an operator that predates this behaves as it
+                                always did. The shared volume stays mounted while any skill still needs
+                                it. See docs/designs/agent-shell-sandboxing.md, "Content-passing removes
+                                the shared tree".
+                              type: boolean
                             enabled:
                               default: false
                               description: |-

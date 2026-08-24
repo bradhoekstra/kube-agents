@@ -38,10 +38,21 @@ spec:
       {{- . | nindent 6 }}
     {{- end }}
     {{- $sandbox := (.Values.platformAgent.harness.experimental | default dict).shellSandbox | default dict }}
+    {{- /*
+      Same shape as the workloadIdentityFederation check below and for the same
+      reason: the flag reaches the credential proxy only through its co-located
+      placement, so with the sandbox off it renders onto the CR, changes no
+      manifest, and the skills keep passing directories. An install that asked
+      for content-passing and did not get it has no symptom to notice.
+    */}}
+    {{- if and $sandbox.contentWorkspaces (not $sandbox.enabled) }}
+    {{- fail "platformAgent.harness.experimental.shellSandbox.contentWorkspaces has no effect without shellSandbox.enabled: the content-passing routes are served by the credential proxy that runs beside the sandbox" }}
+    {{- end }}
     {{- with include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
-          "runtimeClassName" $sandbox.runtimeClassName) }}
+          "runtimeClassName" $sandbox.runtimeClassName
+          "contentWorkspaces" $sandbox.contentWorkspaces) }}
     experimental:
       shellSandbox:
         {{- . | nindent 8 }}

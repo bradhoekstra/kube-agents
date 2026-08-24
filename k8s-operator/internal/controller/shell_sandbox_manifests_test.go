@@ -846,6 +846,43 @@ func TestColocatedProxyRunsAsTheSandboxLogin(t *testing.T) {
 	}
 }
 
+func TestContentWorkspacesReachTheColocatedProxyOnly(t *testing.T) {
+	// The flag is the only deploy-time surface the content-passing protocol
+	// has: the agent side decides nothing, it probes the broker and takes
+	// whichever fork answers. So an install that sets the field and gets a
+	// broker without the routes is an install where every skill silently keeps
+	// writing into the shared tree, which is the property the field was set to
+	// remove.
+	env := func(c corev1.Container) (string, bool) {
+		for _, e := range c.Env {
+			if e.Name == "CREDENTIAL_PROXY_CONTENT_WORKSPACES" {
+				return e.Value, true
+			}
+		}
+		return "", false
+	}
+
+	off := colocatedTestAgent()
+	if _, ok := env(buildCredentialProxyContainer(off, true)); ok {
+		t.Error("content workspaces must be off unless asked for: the field defaults to false")
+	}
+
+	on := colocatedTestAgent()
+	on.Spec.Harness.Experimental.ShellSandbox.ContentWorkspaces = ptr.To(true)
+	value, ok := env(buildCredentialProxyContainer(on, true))
+	if !ok || value != "1" {
+		t.Errorf("CREDENTIAL_PROXY_CONTENT_WORKSPACES = %q present=%v, want \"1\"", value, ok)
+	}
+
+	// Standalone the proxy is a pod of its own with no agent sharing its
+	// filesystem, so the routes would guard nothing. Setting it there is a
+	// configuration mistake the chart refuses; the manifest builder is the
+	// second half of that, since a hand-applied CR skips the chart.
+	if _, ok := env(buildCredentialProxyContainer(on, false)); ok {
+		t.Error("the standalone proxy must not serve content workspaces: nothing shares a volume with it")
+	}
+}
+
 func TestColocatedTokenProjectionIsAudienceScoped(t *testing.T) {
 	agent := colocatedTestAgent()
 	volumes := buildCredentialProxyRuntimeVolumes(agent)

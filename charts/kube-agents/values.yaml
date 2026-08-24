@@ -383,6 +383,13 @@ platformAgent:
         # reports Degraded rather than leaving the pod Pending if the named
         # class does not exist.
         runtimeClassName: ""
+        # Makes the GitHub-writing skills hand the credential proxy file
+        # content and a commit message instead of a directory both containers
+        # mount, so the agent never holds a `.git` and cannot reach git's
+        # config-driven exec surface. The proxy keeps the checkout on its own
+        # state volume. Off by default; the directory path keeps working beside
+        # it, and a skill picks one per run by probing the proxy.
+        contentWorkspaces: null # CRD default: false
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent

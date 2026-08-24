@@ -253,6 +253,18 @@ func shellSandboxRuntimeClassName(agent *agentv1alpha1.PlatformAgent) *string {
 	return ptr.To(*spec.RuntimeClassName)
 }
 
+// shellSandboxContentWorkspaces reports whether the broker should serve the
+// content-passing routes, which is what lets a skill publish to GitHub without
+// a `.git` on the volume it shares with the credential proxy.
+//
+// Independent of runtimeClassName and of everything else here, and gated on the
+// sandbox only because the flag reaches the proxy through its co-located
+// placement. See the field comment on ShellSandboxSpec.ContentWorkspaces.
+func shellSandboxContentWorkspaces(agent *agentv1alpha1.PlatformAgent) bool {
+	spec := shellSandboxSpec(agent)
+	return spec != nil && spec.ContentWorkspaces != nil && *spec.ContentWorkspaces
+}
+
 // shellSandboxName is the name of every object in this file: the StatefulSet, its
 // governing Service, and the NetworkPolicy. One name, because they are one thing,
 // and because the DNS record the agent dials is built from it.

@@ -275,6 +275,14 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent, colocated
 			corev1.VolumeMount{Name: credentialProxyWIFTokenVolume, MountPath: credentialProxyWIFTokenPath, ReadOnly: true},
 		)
 		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: shellSandboxDataPath})
+		if shellSandboxContentWorkspaces(agent) {
+			// Only ever set co-located. The broker keeps its checkouts under the
+			// state dir, which is this container's own emptyDir either way, but
+			// content-passing exists to stop the agent reaching a `.git` — and
+			// standalone there is no agent container sharing a filesystem with
+			// this one, so the flag would arm routes nothing calls.
+			envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACES", Value: "1"})
+		}
 		// The sandbox login's uid, from deploy/sandbox/Dockerfile, because the
 		// entrypoint chowns the data volume to it and a shared tree neither side
 		// can fully write is not shared.

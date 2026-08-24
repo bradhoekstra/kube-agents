@@ -2001,14 +2001,18 @@ paths. That separation is what lets the agent-facing git surface go to zero once
 migrate, rather than going to zero by accident.
 
 **What runs which way.** Both mechanisms are live at once, because a fleet does not upgrade
-atomically. `CREDENTIAL_PROXY_CONTENT_WORKSPACES` arms the broker; a skill asks it once per
+atomically. `harness.experimental.shellSandbox.contentWorkspaces` arms the broker, by way of
+`CREDENTIAL_PROXY_CONTENT_WORKSPACES` on the co-located container; a skill asks it once per
 process whether the routes exist and takes the same fork for the whole run. An unreachable
 broker answers "no" and the run publishes through the leased clone, which is the one question
 in a run where falling back beats failing — every other call still fails loudly. The
 migrated skills are `submit-suggestion` and `fleet-audit`, and `fleet-audit` needed two new
 commands to replace what the clone used to answer: `list` names the repository's tracked
 files and `fetch` copies named files into the workspace, which is how a remediation path stays
-something discovered rather than invented when there is nothing local to grep.
+something discovered rather than invented when there is nothing local to grep. The field is
+only meaningful beside the sandbox, since the routes are served by the co-located proxy, so
+the chart refuses it with `shellSandbox.enabled` false rather than rendering a CR that changes
+no manifest.
 
 What content-passing does not remove is the volume itself. The clone path still needs it, so
 the mount stays until the last skill has migrated and directory mode is deleted; the

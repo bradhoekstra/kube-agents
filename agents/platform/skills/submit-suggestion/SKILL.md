@@ -239,6 +239,7 @@ When you are asked to **address review comments / reviewer feedback** on an exis
    being asked to change, and rewriting it from memory loses the rest of the
    file. Directory mode is unchanged: edit in the `workspace`, stage only the
    specific files (**never `git add .` / `-A`**), and commit.
+
 4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
 
 Never ask the requester to paste the comment text — fetching it from GitHub and addressing it is your job.
