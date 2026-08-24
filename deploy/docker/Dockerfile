@@ -1473,6 +1473,16 @@ COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
 # of the whole platform chain.
 FROM proxy-tools AS credential-proxy
 
+# agent-base leaves /opt/defaults at 0700 hermes:hermes. Co-located with the
+# shell sandbox this container runs as uid 1000 — the sandbox login, so that the
+# two containers can share a working tree — and 0700 makes everything under the
+# directory unreachable for it. What that looks like is the container exiting on
+# its first line with "Permission denied" against a path whose own mode is 0755,
+# and no indication that the parent is the problem. Nothing below here is a
+# secret: it is the same scripts the agent image ships, world-readable one level
+# down. Ahead of the COPY so an agent source edit does not invalidate it.
+RUN chmod 0755 /opt/defaults
+
 # The same set the `platform` stage lays down at /opt/defaults/scripts, with the
 # same ownership and mode, so the directory is identical in both images. That
 # used to be structural — the sidecar WAS the platform image — and is now two
@@ -1497,6 +1507,7 @@ COPY --chown=hermes:hermes --chmod=0755 \
      deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
+     deploy/shared/sandbox_mirror.py \
      /opt/defaults/scripts/
 
 USER 10000:10000

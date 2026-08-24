@@ -406,11 +406,13 @@ class ResolutionModelTests(unittest.TestCase):
     def test_a_copy_in_an_unrelated_stage_is_not_part_of_the_agent_image(self):
         """Two images, one Dockerfile, and /opt/defaults in both of them.
 
-        The credential-proxy stage is built on the Envoy image and puts the
-        credential runtime under /opt/defaults/scripts as well. It shares no
-        layer with the agent image and has no profile homes, so counting its
-        COPY lines would put a second `scripts` entry in the model for a
-        directory the entrypoint never sees.
+        The credential-proxy stage puts the credential runtime under
+        /opt/defaults/scripts as well. It is a sibling of the agent image rather
+        than a layer of it and has no profile homes, so counting its COPY lines
+        would put a second `scripts` entry in the model for a directory the
+        entrypoint never sees. The fixture branches the two off a shared
+        agent-base, which is what the real file does: a parser that keyed on the
+        base image rather than on the stage graph would read them as one image.
         """
         with TemporaryDirectory() as directory:
             dockerfile = Path(directory) / "Dockerfile"
@@ -420,16 +422,13 @@ class ResolutionModelTests(unittest.TestCase):
                 "COPY agents/chat/SOUL.md /opt/defaults/\n"
                 "FROM agent-base AS platform\n"
                 "COPY agents/platform/scripts/ /opt/defaults/scripts/\n"
-                "FROM ${ENVOY_IMAGE}:${V} AS credential-proxy\n"
+                "FROM agent-base AS credential-proxy\n"
                 "COPY agents/platform/scripts/ /opt/defaults/scripts/\n",
                 encoding="utf-8",
             )
-            self.assertEqual(
-                _stage_ancestry(dockerfile, "platform"), {"platform", "agent-base"}
-            )
-            parsed = _copy_instructions(
-                dockerfile, stages=_stage_ancestry(dockerfile, "platform")
-            )
+            text = dockerfile.read_text(encoding="utf-8")
+            self.assertEqual(_stage_chain(text, "platform"), {"platform", "agent-base"})
+            parsed = _copy_instructions(dockerfile, target="platform")
         self.assertEqual(
             parsed,
             [
@@ -510,6 +509,43 @@ class ResolutionModelTests(unittest.TestCase):
             "the platform and credential-proxy stages fill /opt/defaults/scripts "
             "from different sources; the sidecar runs credential_proxy.py out of "
             "that directory and has no other copy of it",
+        )
+
+    def test_the_sidecar_leaves_opt_defaults_traversable(self):
+        """/opt/defaults must be traversable by a uid other than hermes.
+
+        agent-base leaves it 0700 hermes:hermes. Co-located with the shell
+        sandbox the sidecar runs as uid 1000, the sandbox login, so that the two
+        containers can share a working tree -- and 0700 there makes every script
+        under it unreachable however permissive the scripts' own modes are.
+
+        The symptom is a container that exits on its first line with "Permission
+        denied" against a path whose mode is 0755, which sends the reader to the
+        file rather than to its parent. It survives no other gate: the image
+        builds, the COPY comparison above passes, and the standalone placement
+        runs as hermes and never notices.
+        """
+        text = re.sub(r"\\\n", " ", (REPO / "deploy/docker/Dockerfile").read_text(encoding="utf-8"))
+        chain = _stage_chain(text, "credential-proxy")
+        stage = None
+        widened = False
+        for line in text.splitlines():
+            tokens = line.split()
+            if tokens and tokens[0].upper() == "FROM":
+                arguments = [token for token in tokens[1:] if not token.startswith("--")]
+                stage = arguments[-1] if len(arguments) >= 3 and arguments[-2].upper() == "AS" else None
+                continue
+            if stage not in chain or not line.startswith("RUN "):
+                continue
+            # Any mode whose world digit carries execute. Traversal is the
+            # requirement; read on the directory itself is not.
+            if re.search(r"chmod\s+0?[0-7][0-7][1357]\s+/opt/defaults(\s|$)", line):
+                widened = True
+        self.assertTrue(
+            widened,
+            "no RUN in the credential-proxy chain makes /opt/defaults traversable; "
+            "co-located with the sandbox the sidecar runs as uid 1000 and cannot "
+            "reach the scripts it is started with",
         )
 
     def test_the_defaults_layer_reaches_the_default_profile_and_no_other(self):

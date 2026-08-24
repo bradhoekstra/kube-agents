@@ -109,6 +109,14 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 # mirror will rarely see it apply at all. Set to 1 to disable.
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
 
+# The agent image's interpreter. The credential-proxy image is built on
+# agent-base by way of proxy-tools, so this is the same venv the agent runs
+# from; the two proxy scripts import nothing outside the standard library, so
+# what is in it does not matter, only that it exists. Named once because a wrong
+# path here is a container that exits 127 with one line of output and no
+# indication of which of the two callers below asked for it.
+PROXY_PYTHON="${PROXY_PYTHON:-/opt/hermes/.venv/bin/python3}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -133,14 +141,11 @@ trap terminate EXIT INT TERM
 # still answers. Not backgrounded and not tolerant of failure — a container that
 # comes up without an identity serves nothing but errors.
 write_wif_credentials() {
-  /opt/credential-proxy-venv/bin/python3 /opt/defaults/scripts/wif_credentials.py
+  "${PROXY_PYTHON}" /opt/defaults/scripts/wif_credentials.py
 }
 
 start_credential_runtime() {
-  # The proxy's own interpreter, not Hermes'. This image is no longer built on
-  # the agent image, so /opt/hermes does not exist in it — see the
-  # credential-proxy stage in deploy/docker/Dockerfile.
-  /opt/credential-proxy-venv/bin/python3 /opt/defaults/scripts/credential_proxy.py \
+  "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py \
     --role "${CREDENTIAL_PROXY_ROLE}" &
   runtime_pid=$!
 }
