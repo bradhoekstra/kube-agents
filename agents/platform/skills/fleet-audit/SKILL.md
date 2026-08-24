@@ -84,14 +84,27 @@ own `deliver` setting; repeating them here sends the same content twice.
 ## The two-command lifecycle
 
 Run both commands from your normal working directory — the profile directory, where `./skills/...`
-resolves. **You are not in a git checkout, and you do not need to be.** The
-audit crons start in the profile directory; the harness clones the GitOps repository itself, into
-`/opt/data/gitops/<audit-id>/<owner>__<name>` on the shared volume, and runs every git and gh call
-inside it. The clone is keyed by audit id because the audit streams share the volume with each other
-and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
-can no longer reset another stream's working copy out from under it. The repository comes from the
+resolves. **You are not in a git checkout, and you do not need to be.** The audit crons start in the
+profile directory; the harness establishes its own workspace at
+`/opt/data/gitops/<audit-id>/<owner>__<name>` and resolves every `remediation.path` against it. The
+workspace is keyed by audit id because the audit streams share the volume with each other and with
+every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule can no
+longer reset another stream's working copy out from under it. The repository comes from the
 `Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
-which is readable before any clone exists.
+which is readable before any workspace exists.
+
+What that workspace contains depends on the install, and `start` tells you which one you have as its
+`mode` field:
+
+- **`content`** — the workspace is an empty directory. The repository lives in the credential broker,
+  which owns the only checkout; you write manifests into the directory and the harness hands the
+  bytes over. Nothing on your side is a git repository, so there is nothing here to read the
+  repository out of: use `list` and `fetch` (below) for that.
+- **`directory`** — the workspace is a clone of the GitOps repository on the shared volume, and the
+  harness runs `checkout`, `add`, `commit` and `push` inside it.
+
+Everything else is identical, including where you write manifests and what `finish` publishes. Where
+the two differ, this file says which mode it is talking about.
 
 ### Step 1 — `start`
 
@@ -101,15 +114,16 @@ Before inspecting anything, claim the workspace:
 ./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
 ```
 
-This resolves the target repository, mints a repo-scoped GitHub token, clones or refreshes the
-GitOps workspace and leaves it on a clean `main`, ensures the audit's labels exist, locates the
-stream's open ledger issue, and clears any findings document a crashed run left behind. It creates
-**no branch** — there is no report branch. It prints exactly one JSON line:
+This resolves the target repository, mints a repo-scoped GitHub token, establishes a clean
+workspace, ensures the audit's labels exist, locates the stream's open ledger issue, and clears any
+findings document a crashed run left behind. It creates **no branch** — there is no report branch.
+It prints exactly one JSON line:
 
 ```json
 {
   "issue": 128,
   "repo": "acme/fleet",
+  "mode": "content",
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
@@ -126,10 +140,13 @@ you read. **It is the work list, not a substitute for the SOP** — the slug say
 says what the check _is_ and what counts as a violation, so read the whole file before you start.
 `sop` names it.
 
-`workspace` is the clone. **Every `remediation.path` is resolved against it**, so a manifest written
-anywhere else is a file the harness will never find — the finding degrades to a manual one and no
-pull request opens. `start` scrubs that directory before handing it to you; `finish` does not, which
-is what lets the files you write in between survive.
+`workspace` is where your manifests go. **Every `remediation.path` is resolved against it**, so a
+manifest written anywhere else is a file the harness will never find — the finding degrades to a
+manual one and no pull request opens. `start` scrubs that directory before handing it to you;
+`finish` does not, which is what lets the files you write in between survive.
+
+`mode` is `content` or `directory`, and it changes one thing you can see: in `content` mode the
+workspace is empty rather than a checkout. Read it rather than guessing from what is on disk.
 
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
@@ -152,10 +169,28 @@ If a remediation is a declarative file, write that file **under the `workspace` 
 reported** and name its repo-relative path in the finding. The harness puts it on a branch of its
 own.
 
-**Do not leave unrelated uncommitted work in that tree during an audit.** Opening a remediation pull
-request requires switching branches, and the harness forces the switch. It snapshots and restores
-every path you declared, and returns you to the branch you started on — but a file it was never told
-about is not covered by that guarantee.
+**Directory mode only: do not leave unrelated uncommitted work in that tree during an audit.**
+Opening a remediation pull request there requires switching branches, and the harness forces the
+switch. It snapshots and restores every path you declared, and returns you to the branch you started
+on — but a file it was never told about is not covered by that guarantee. Content mode switches no
+branch and writes nothing back into the workspace, so this does not apply.
+
+#### Reading the repository in content mode
+
+There is no clone to grep, so two commands stand in for one. `list` names the tracked files, and
+`fetch` copies the ones you name into the workspace:
+
+```bash
+./skills/fleet-audit/scripts/audit_report.py list  --audit <audit-id> --prefix clusters/prod-us-east
+./skills/fleet-audit/scripts/audit_report.py fetch --audit <audit-id> --path clusters/prod-us-east/payments-netpol.yaml
+```
+
+`list` answers with paths and sizes, never content, and the broker caps how many entries it returns
+— **pass `--prefix`**, or a large repository comes back silently truncated. `fetch` writes each file
+into the workspace at its repo-relative path, which is exactly where a remediation editing that file
+has to end up; fetch it, edit it in place, and name the same path in the finding.
+
+Both commands exit 2 in directory mode, where the clone already holds the file.
 
 ### Step 3 — `finish`
 
@@ -179,7 +214,7 @@ JSON line with nine fields — `status`, `issue_url`, `new`, `resolved`, `prs_op
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
 to stdout with **zero** git or gh side effects. It applies the same grouping and the same
 degradation as the real run, so the branch names it names are the branch names it would create. It
-resolves every `remediation.path` against the same `workspace` clone the real run uses, not against
+resolves every `remediation.path` against the same `workspace` directory the real run uses, not against
 the directory you happen to be standing in, so "the manifest is missing" is a finding of the dry run
 and not a surprise at publish time. Use it whenever you are unsure your document is well formed.
 
@@ -377,10 +412,13 @@ field, and publishes nothing:
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
-  namespace — grep the clone for `namespace: <namespace>`, then **open the hits and confirm one
-  declares an object you observed on the target cluster** before writing beside it. A `grep` for a
-  name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
-  until you have read it. **The parent directory must already exist in the clone**; if no sibling
+  namespace — search the repository for `namespace: <namespace>`, then **open the hits and confirm
+  one declares an object you observed on the target cluster** before writing beside it. A `grep` for
+  a name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
+  until you have read it. In directory mode that search is a `grep` over the clone; in content mode
+  it is `list --prefix` to narrow to the directory and `fetch` to read the candidates, which does not
+  search inside files — so narrow by path and read, rather than expecting a content match.
+  **The parent directory must already exist in the repository**; if no sibling
   can be confirmed, or the hits straddle two directories you cannot tell apart, the finding is
   `kind: manual` with no path. The harness cannot check this for
   you: it validates the shape of a path, not whether anything reconciles it, and it will create
@@ -591,7 +629,7 @@ subcommand does not re-propose them. Revival belongs to the write-gated `/remedi
 which exists for the person at the terminal who could have written that comment themselves. An
 agent relaying an ask it cannot tie to a GitHub identity never passes that flag.
 
-`refused` names the targets whose remediation is not a readable file inside the clone — either the
+`refused` names the targets whose remediation is not a readable file inside the workspace — either the
 audit promised a manifest and never wrote it, or the path does not resolve inside the repository at
 all. Both leave nothing to put in a diff; a `SECURITY:` line in the log says which one happened. The
 other targets still open — `/remediate all` expands to every **manifest-remediation** id in the
@@ -600,7 +638,7 @@ none. Say which were refused when you acknowledge the command.
 
 Exit 2 means nothing was published, for one of three reasons — read the message before reporting
 which: a named id is not in the document at all, a named target is not a `manifest`, or _every_
-named target was refused because its file is not readable inside the clone. The first two are fixed
+named target was refused because its file is not readable inside the workspace. The first two are fixed
 by dropping the bad id and asking again; only the third is about writing manifests.
 
 **Findings whose remediation paths intersect share one pull request.** They have to: separate
@@ -705,16 +743,16 @@ rewritten correctly — the issue carries the truth either way.
 - **Never `git add .` or `git add -A`.** The harness stages only the distinct paths you named in
   `remediation.path`, through `git --literal-pathspecs`, and refuses glob metacharacters in a path
   outright. Do not run your own `git add`.
-- **Every `remediation.path` stays inside the clone, and the harness proves it twice.** The string
+- **Every `remediation.path` stays inside the workspace, and the harness proves it twice.** The string
   must be repo-relative with no `..`, no glob metacharacter, and no leading `:` — and before the
   file is read or staged it is re-resolved against the `workspace` root, where no path component may
   be a symlink and the resolved path must sit under the resolved root. Do not create a symlink in
-  the clone and point a remediation through it: `manifests/vendor/x.yaml` is beyond reproach until
+  the workspace and point a remediation through it: `manifests/vendor/x.yaml` is beyond reproach until
   `manifests/vendor` is a link to `/etc`, and then the contents of a file outside the repository are
   committed to a public pull request. Nothing is read from a path that fails either test. The
   finding degrades to `manual` with a note saying so, the run logs a `SECURITY:` line naming the
   path, and the report still publishes — but no pull request opens for that finding until the path
-  is a real file inside the clone.
+  is a real file inside the workspace.
 - **Never open a second ledger issue for a stream.** Do not call `gh issue create`. If the stream
   already has an open ledger, `finish` rewrites it in place; that is the whole point.
 - **Never open a remediation pull request yourself**, and never for a non-`manifest` finding.

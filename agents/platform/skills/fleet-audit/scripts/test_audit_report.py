@@ -34,6 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
+import content_workspace  # noqa: E402
+import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
 
 AUDIT = "compliance-audit"
@@ -379,9 +381,11 @@ class Recorder:
         self.calls: list[list[str]] = []
         self.cwds: list[str | None] = []
         # Body-file contents, one entry per call, None when the call had no
-        # `--body-file`. Captured here because the harness unlinks each temp
-        # file the moment `gh` returns — read it later and there is nothing to
-        # read. See `bodies_for` for why the seam has to exist at all.
+        # `--body-file`. The bodies now arrive on stdin rather than in a temp
+        # file, so this list is what `stdin` carried; it stays because
+        # `bodies_for` is the seam that proves something was published, and
+        # what a caller asserts about a body should not change with how the
+        # body reaches `gh`. See `bodies_for` for why the seam exists at all.
         self.bodies: list[str | None] = []
         self.replies = replies or {}
         self.failures = failures or {}
@@ -396,10 +400,10 @@ class Recorder:
         # describe a clone with no origin/HEAD recorded (rc 1).
         self.origin_head = "origin/main"
 
-    def __call__(self, cmd, *, check=True, capture=True, cwd=None):
+    def __call__(self, cmd, *, check=True, capture=True, cwd=None, stdin=None):
         self.calls.append(list(cmd))
         self.cwds.append(None if cwd is None else str(cwd))
-        self.bodies.append(self._read_body_file(cmd))
+        self.bodies.append(self._read_body(cmd, stdin))
         joined = " ".join(cmd)
         for key, code in self.failures.items():
             if key in joined:
@@ -434,13 +438,21 @@ class Recorder:
         (destination / ".git").mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _read_body_file(cmd):
-        """The contents of this call's body file, or None if it has none.
+    def _read_body(cmd, stdin):
+        """The body this call published, or None if it has none.
 
         Both spellings: `gh issue/pr create|edit` takes `--body-file`, while
         `gh issue/pr comment` takes `-F`. Recognising only one silently returns
         None for the other, which reads as "nothing was published" — the exact
         blind spot this seam exists to close.
+
+        The flag's value is `-` and the document arrives on stdin, so the check
+        is that the two agree: an argv naming stdin with nothing on it, or a
+        body handed over with no flag to receive it, is a call that publishes
+        nothing however it reads. A path is still recognised, because a call
+        that names one is a call that needs the two containers to share a
+        filesystem, and the assertion that no such call is left is one this
+        list has to be able to fail.
         """
         cmd = list(cmd)
         flag = next((f for f in ("--body-file", "-F") if f in cmd), None)
@@ -449,6 +461,8 @@ class Recorder:
         index = cmd.index(flag) + 1
         if index >= len(cmd):
             return None
+        if cmd[index] == "-":
+            return stdin
         try:
             return Path(cmd[index]).read_text(encoding="utf-8")
         except OSError:
@@ -511,9 +525,20 @@ class BaseTestCase(unittest.TestCase):
         # tests ran before it.
         audit_report.set_workspace(None)
         self.addCleanup(audit_report.set_workspace, None)
+        # Same reason, one global further: the mode a run resolved outlives the
+        # process only in a test suite, and a content-mode test leaking into a
+        # directory-mode one would look like the fallback failing.
+        audit_report.set_content_mode(False)
+        self.addCleanup(audit_report.set_content_mode, False)
         gitops_workspace.forget_base_branch()
         self.addCleanup(gitops_workspace.forget_base_branch)
-        env = patch.dict(os.environ, {"GITOPS_BASE_BRANCH": ""})
+        # CREDENTIAL_PROXY_URL is emptied, not left alone: it is what decides
+        # whether the run asks the broker at all, so a developer who exports it
+        # would otherwise put the whole suite on a different code path than CI.
+        # Directory mode has to be the explicit state, not the ambient one.
+        env = patch.dict(
+            os.environ, {"GITOPS_BASE_BRANCH": "", "CREDENTIAL_PROXY_URL": ""}
+        )
         env.start()
         self.addCleanup(env.stop)
 
@@ -2606,15 +2631,15 @@ class TestFinishWithFindings(HarnessTestCase):
 
 
 class TestPublishedBodies(HarnessTestCase):
-    """What reaches GitHub, read back off the `--body-file` the harness wrote.
+    """What reaches GitHub, read back off the body each `gh` call carried.
 
     Every other end-to-end test asserts that `gh` was called with the right
     flags, and every rendering test asserts that a renderer returns the right
-    string. Neither connects the two. Replacing `_write_temp`'s payload with an
-    empty string — blanking the ledger, every comment and every pull request —
-    left the whole suite green, so the feature's actual output was untested.
-    These tests are the wire, and they belong to the artifacts rather than to
-    the code paths, so a rewrite of the publish path cannot quietly drop them.
+    string. Neither connects the two. Publishing an empty string — blanking the
+    ledger, every comment and every pull request — left the whole suite green,
+    so the feature's actual output was untested. These tests are the wire, and
+    they belong to the artifacts rather than to the code paths, so a rewrite of
+    the publish path cannot quietly drop them.
     """
 
     def test_the_created_ledger_carries_the_report(self):
@@ -2711,6 +2736,33 @@ class TestPublishedBodies(HarnessTestCase):
         for index, body in enumerate(published):
             with self.subTest(body=index):
                 self.assertTrue(body.strip())
+
+    def test_no_body_reaches_gh_as_a_filesystem_path(self):
+        # A `--body-file /some/path` works only while the container running
+        # this code and the container running the real `gh` can see the same
+        # filesystem, and removing that shared tree is the point of the change
+        # this test guards. `-` is the only value that crosses the boundary,
+        # because a document on stdin needs nowhere to live.
+        previous_body = published_body(
+            make_doc(findings=[make_finding(fid="a")]), generated_at=NOW
+        )
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json body": json.dumps({"body": previous_body}),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        carriers = 0
+        for call in self.harness.calls:
+            for flag in ("--body-file", "-F"):
+                if flag not in call:
+                    continue
+                carriers += 1
+                with self.subTest(call=" ".join(call)):
+                    self.assertEqual(call[call.index(flag) + 1], "-")
+        self.assertTrue(carriers, "the run published nothing at all")
 
 
 class TestFinishClean(HarnessTestCase):
@@ -2858,6 +2910,9 @@ class TestStart(HarnessTestCase):
             {
                 "issue": 42,
                 "repo": "acme/fleet",
+                # The harness describes a pod with no broker, which is the
+                # directory path. `TestContentMode` asserts the other value.
+                "mode": "directory",
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
@@ -7959,6 +8014,396 @@ class TestDispatchAndHandover(unittest.TestCase):
                 text = self.read(f"governance/{audit_report.audit_sop(audit_id)}")
                 self.assertIn("silent_ok", text)
                 self.assertIn("on-demand", text.lower())
+
+
+class TestReadCommandsInDirectoryMode(HarnessTestCase):
+    """`fetch` and `list` are refused where the clone already answers them.
+
+    Emulating them instead would teach an agent to call them in both modes and
+    believe it had refreshed something; the clone's copy of the file can be
+    arbitrarily old, and a `fetch` that returned it would be a lie about which
+    bytes the fix started from.
+    """
+
+    def test_fetch_is_refused(self):
+        self.assertEqual(
+            self.run_main(["fetch", "--audit", AUDIT, "--path", "README.md"]), 2
+        )
+        self.assertIn("directory mode", self.err)
+
+    def test_list_is_refused(self):
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 2)
+        self.assertIn("directory mode", self.err)
+
+
+class ContentModeTestCase(BaseTestCase):
+    """The same commands with the broker armed, against a real broker-side store.
+
+    `ContentWorkspaceStore` runs for real rather than as a recording. The
+    properties this class exists to hold — that no path and no `git` leaves this
+    container, that a second run does not obliterate the first — are properties
+    of what git does with the bytes, and a stubbed store would only prove that
+    the test agrees with itself. What is stubbed is the HTTP hop, at
+    `_workspace_call`, which raises the same exception type the real transport
+    raises for the same conditions.
+
+    `run_cmd` is still the Recorder, so every `gh` call is captured and any
+    `git` the run tries to issue is visible. There should not be one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.origin = self.seed_origin()
+        self.harness = Recorder()
+        self.gitops_root = self.tmp_path / "gitops"
+        self.workspace = self.gitops_root / AUDIT / "acme__fleet"
+        self.patch_attr("GITOPS_WORKSPACE", str(self.gitops_root))
+        self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
+        self.patch_attr("run_cmd", self.harness)
+        self.patch_attr("refresh_credentials", lambda repo=None: None)
+        self.patch_attr("resolve_repo", lambda: "acme/fleet")
+
+        # `open` composes https://github.com/<owner>/<name>.git itself and takes
+        # no caller-supplied URL, by design — so the redirect to the local bare
+        # repo goes in at the runner, below the code under test.
+        url = "https://github.com/acme/fleet.git"
+        origin = self.origin
+
+        # The identity and the empty config files are the test's, not the
+        # broker's: the broker inherits whatever the container gives it, and a
+        # developer whose global config sets `commit.gpgsign` or nothing at all
+        # would otherwise get a different answer from CI.
+        env = dict(
+            os.environ,
+            GIT_AUTHOR_NAME="Test",
+            GIT_AUTHOR_EMAIL="test@example.com",
+            GIT_COMMITTER_NAME="Test",
+            GIT_COMMITTER_EMAIL="test@example.com",
+            GIT_CONFIG_GLOBAL=os.devnull,
+            GIT_CONFIG_SYSTEM=os.devnull,
+        )
+
+        def runner(argv, cwd, check=True):
+            argv = [str(origin) if token == url else token for token in argv]
+            return subprocess.run(
+                argv,
+                cwd=str(cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=check,
+            )
+
+        # The second argument is the agent's volume, and it is the real one:
+        # `assert_disjoint_roots` is the construction-time check that the
+        # broker's trees do not sit inside it, and handing it a placeholder
+        # would assert that against a directory nothing uses.
+        self.store = content_workspace.ContentWorkspaceStore(
+            self.tmp_path / "broker" / "trees",
+            self.gitops_root,
+            runner=runner,
+        )
+        self.verbs = []
+
+        def call(endpoint, verb, payload):
+            self.verbs.append(verb)
+            try:
+                return getattr(self.store, verb)(payload)
+            except content_workspace.WorkspaceError as exc:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    exc.status, {"error": str(exc), **exc.fields}
+                ) from exc
+
+        patcher = patch.object(credential_proxy_client, "_workspace_call", call)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        endpoint = patch.dict(
+            os.environ, {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"}
+        )
+        endpoint.start()
+        self.addCleanup(endpoint.stop)
+
+    def seed_origin(self) -> Path:
+        origin = self.tmp_path / "origin.git"
+        seed = self.tmp_path / "seed"
+        seed.mkdir()
+        for cmd in (
+            ["git", "init", "--quiet", "--bare", "--initial-branch=main", str(origin)],
+            ["git", "init", "--quiet", "--initial-branch=main", str(seed)],
+        ):
+            subprocess.run(cmd, check=True, capture_output=True)
+        (seed / "README.md").write_text("seed\n", encoding="utf-8")
+        for argv in (
+            ["config", "user.email", "t@example.com"],
+            ["config", "user.name", "T"],
+            ["add", "README.md"],
+            ["commit", "--quiet", "-m", "seed"],
+            ["remote", "add", "origin", str(origin)],
+            ["push", "--quiet", "origin", "main"],
+        ):
+            subprocess.run(
+                ["git", *argv], cwd=str(seed), check=True, capture_output=True
+            )
+        return origin
+
+    def origin_git(self, argv: list[str]) -> str:
+        """Ask the bare origin what it now has.
+
+        `--git-dir` rather than running from inside it: a developer with
+        `safe.bareRepository = explicit` set globally — which is the hardening
+        advice — cannot use a bare repository as a working directory, and the
+        whole class would fail on their machine and pass in CI.
+        """
+        return subprocess.run(
+            ["git", "--git-dir", str(self.origin), *argv],
+            cwd=str(self.tmp_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+
+    def write_manifest(self, relative: str, text: str) -> Path:
+        target = self.workspace / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+        return target
+
+    def start(self, audit=AUDIT) -> dict:
+        self.harness.replies = {"issue list": "[]"}
+        self.assertEqual(self.run_main(["start", "--audit", audit]), 0)
+        return json.loads(self.out.strip())
+
+    def branch_for(self, doc) -> str:
+        """The branch the run will use, derived the same way the run derives it.
+
+        Through `validate_findings`, because that is what rewrites each id into
+        its derived spelling, and `group_branch_for` digests the group — a
+        hard-coded name here would pass while naming a branch nothing pushed.
+        """
+        data = audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+        group = audit_report.remediation_groups(data["findings"])[0]
+        return audit_report.group_branch_for(AUDIT, group)
+
+    # -- the properties the change exists for ----------------------------- #
+
+    def test_start_reports_content_mode_and_hands_over_a_directory(self):
+        payload = self.start()
+        self.assertEqual(payload["mode"], "content")
+        self.assertEqual(payload["workspace"], str(self.workspace))
+        self.assertTrue(self.workspace.is_dir())
+        # The whole point of the mode. A `.git` here is where a filter driver,
+        # an alias or a hook path would have to be defined for the known
+        # code-execution routes through the credential container to work.
+        self.assertFalse((self.workspace / ".git").exists())
+
+    def test_no_git_command_is_issued_from_this_container(self):
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        git_calls = [call for call in self.harness.calls if call[0] == "git"]
+        self.assertEqual(git_calls, [])
+
+    def test_the_fix_lands_on_its_branch_through_the_broker(self):
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        branch = self.branch_for(make_doc())
+        files = self.origin_git(["ls-tree", "-r", "--name-only", branch]).split()
+        self.assertIn("clusters/prod-us-east/payments-netpol.yaml", files)
+        self.assertEqual(
+            self.origin_git(
+                ["show", f"{branch}:clusters/prod-us-east/payments-netpol.yaml"]
+            ),
+            "kind: NetworkPolicy\n",
+        )
+        self.assertEqual(self.stdout_json()["prs_opened"], [
+            "https://github.com/acme/fleet/pull/8"
+        ])
+        self.assertIn("commit", self.verbs)
+        self.assertIn("push", self.verbs)
+        # A workspace the broker still holds is a clone nothing will collect.
+        self.assertEqual(self.store._workspaces, {})
+
+    def test_the_manifest_survives_the_run_that_published_it(self):
+        # Directory mode force-switches branches and restores the file
+        # afterwards. Content mode never touches the tree, and the assertion
+        # that matters to the agent is the same either way: the file it wrote
+        # is still where it wrote it.
+        self.start()
+        target = self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(target.read_text(encoding="utf-8"), "kind: NetworkPolicy\n")
+
+    def test_a_fix_already_on_the_base_opens_nothing(self):
+        self.start()
+        self.write_manifest("README.md", "seed\n")
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+        }
+        doc = make_doc(
+            findings=[
+                make_finding(
+                    remediation={
+                        "kind": "manifest",
+                        "path": "README.md",
+                        "note": "Already applied.",
+                    }
+                )
+            ]
+        )
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertFalse(self.harness.gh_calls("pr", "create"))
+
+    def test_a_second_run_adds_to_the_branch_rather_than_replacing_it(self):
+        # The clone path recuts the branch from the base every run, which
+        # discards anything a reviewer pushed to it. The broker continues the
+        # branch, and the branch name is a digest of the path set, so there is
+        # no stale-file risk in doing so.
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        branch = self.branch_for(make_doc())
+        first = self.origin_git(["rev-parse", branch]).strip()
+
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml",
+            "kind: NetworkPolicy\nspec: {}\n",
+        )
+        self.assertEqual(self.run_finish(make_doc()), 0)
+
+        history = self.origin_git(["rev-list", branch]).split()
+        self.assertIn(first, history)
+        self.assertEqual(history[0], self.origin_git(["rev-parse", branch]).strip())
+        self.assertNotEqual(history[0], first)
+
+    def test_an_unchanged_second_run_still_reports_the_pull_request(self):
+        # EMPTY_COMMIT on a branch that already exists is "nothing to push",
+        # not "nothing to propose" — reporting the second as the first would
+        # lose a pull request that is open and waiting for a reviewer.
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 2)
+
+    def test_fetch_brings_a_repository_file_into_the_workspace(self):
+        self.start()
+        self.assertEqual(
+            self.run_main(["fetch", "--audit", AUDIT, "--path", "README.md"]), 0
+        )
+        self.assertEqual(
+            json.loads(self.out.strip()),
+            {"workspace": str(self.workspace), "files": ["README.md"]},
+        )
+        self.assertEqual(
+            (self.workspace / "README.md").read_text(encoding="utf-8"), "seed\n"
+        )
+
+    def test_list_names_the_repository_files(self):
+        self.start()
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 0)
+        payload = json.loads(self.out.strip())
+        self.assertEqual(payload["repo"], "acme/fleet")
+        self.assertEqual([e["path"] for e in payload["entries"]], ["README.md"])
+
+    def test_list_answers_with_names_only_and_never_a_dot_git(self):
+        # `git ls-files` rather than a walk, so the broker cannot leak its own
+        # `.git` — the one directory whose contents are the reason the agent
+        # does not have a clone.
+        self.start()
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 0)
+        for entry in json.loads(self.out.strip())["entries"]:
+            self.assertFalse(entry["path"].startswith(".git"))
+            self.assertNotIn("content", entry)
+            self.assertNotIn("contentBase64", entry)
+
+    def test_fetch_will_not_write_outside_the_workspace(self):
+        self.start()
+        self.assertEqual(
+            self.run_main(
+                ["fetch", "--audit", AUDIT, "--path", "../../../etc/passwd"]
+            ),
+            2,
+        )
+        self.assertFalse((self.tmp_path / "etc").exists())
+        # Refused before anything was read. The only verb either command sent
+        # is the availability probe, which is an `open` with no repository in
+        # it; a `read` here would mean the path was resolved after the fetch
+        # rather than before it.
+        self.assertEqual(set(self.verbs), {"open"})
+
+    def test_the_pull_request_body_still_travels_on_stdin(self):
+        self.start()
+        self.write_manifest(
+            "clusters/prod-us-east/payments-netpol.yaml", "kind: NetworkPolicy\n"
+        )
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        bodies = self.harness.bodies_for("pr", "create")
+        self.assertEqual(len(bodies), 1)
+        self.assertIn("clusters/prod-us-east/payments-netpol.yaml", bodies[0])
+
+    def test_an_unreachable_broker_falls_back_to_the_leased_clone(self):
+        # The probe is the only question in the run that answers "carry on the
+        # old way" when it cannot be answered. Everything else fails loudly.
+        def unavailable(endpoint, verb, payload):
+            raise credential_proxy_client.WorkspaceUnavailable("not enabled")
+
+        patcher = patch.object(
+            credential_proxy_client, "_workspace_call", unavailable
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        payload = self.start()
+        self.assertEqual(payload["mode"], "directory")
+        self.assertTrue(
+            [c for c in self.harness.calls if c[:2] == ["git", "clone"]]
+        )
 
 
 if __name__ == "__main__":

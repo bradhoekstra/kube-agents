@@ -553,6 +553,57 @@ def ensure_workspace(
     return target
 
 
+def ensure_scratch_workspace(
+    repo: str,
+    *,
+    lease: str,
+    root: str | Path | None = None,
+    reset: bool = False,
+    owner: str | None = None,
+) -> Path:
+    """The same leased path as `ensure_workspace`, with no clone in it.
+
+    What a caller gets is a directory and nothing else: no `.git`, no remote, no
+    checkout. It is for the content-passing path, where the repository lives in
+    the broker and the agent's side of the exchange is a pile of files it wrote.
+    Removing the clone is the point — a `.git` the agent can write is where a
+    filter driver, an alias or a hook path would have to be defined for the
+    known code-execution routes through the credential container to work, and
+    an agent that never has one cannot define any of them.
+
+    Everything else about the lease is unchanged, deliberately. The path is the
+    same function of repository and lease, so `start` and `finish` still find
+    each other with no lookup state; the marker is still written, so the reaper
+    still collects the directory when the stream stops running; and the reap
+    still happens here, so a fleet that migrates does not leave its old clones
+    behind forever.
+
+    `reset` empties the directory. Same rule as the clone path: only the command
+    that runs *before* the agent writes anything may ask for it.
+    """
+    root = Path(root if root is not None else default_root())
+    lease = sanitize_lease(lease)
+    holder = lease_dir(root, lease)
+    target = workspace_path(repo, root, lease=lease)
+
+    with workspace_lock(root):
+        root.mkdir(parents=True, exist_ok=True)
+        reap_stale_leases(root, keep={lease})
+        write_lease(holder, lease, repo, owner=owner)
+
+    # `reset` is the only thing that deletes, including when what is there is a
+    # clone left by the directory path. A stream whose broker was armed between
+    # `start` and `finish` finds one, and clearing it then would delete the
+    # manifests the agent wrote in between — the same data loss `reset=False`
+    # exists to prevent on the clone path. Nothing runs `git` here, so an
+    # unwanted `.git` sitting in the directory for one run is inert; the next
+    # `start` takes it away.
+    if reset and target.exists():
+        _remove_tree(target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
