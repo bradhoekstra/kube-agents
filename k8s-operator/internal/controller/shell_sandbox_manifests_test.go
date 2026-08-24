@@ -1021,3 +1021,57 @@ func TestRequestedRuntimeClassesCoversBothPodsAndDeduplicates(t *testing.T) {
 		t.Errorf("an install that asks for no runtime must skip the check entirely, got %v", got)
 	}
 }
+
+func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
+	// The sidecar analogue of TestSandboxSharesOnlyTheDataVolumeWithTheProxy
+	// above. That one asserts the split pod carries none of the broker's
+	// volumes in the shell container; nothing asserted the same for a CR that
+	// asks for one by name, and spec.deployment.extraVolumeMounts is appended
+	// to the agent container with no validation at all.
+	for _, name := range []string{
+		"credential-proxy-state",
+		"credential-proxy-policy",
+		"credential-proxy-runtime",
+		"credential-proxy-ksa-token",
+	} {
+		t.Run(name, func(t *testing.T) {
+			agent := colocatedTestAgent()
+			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				ExtraVolumeMounts: []corev1.VolumeMount{
+					{Name: name, MountPath: "/opt/data/state"},
+				},
+			}
+			msg := validateExtraVolumeMounts(agent)
+			if msg == "" {
+				t.Fatalf("mounting %q into the agent container was accepted", name)
+			}
+			if !strings.Contains(msg, name) {
+				t.Errorf("the degraded message must name the offending volume; got %q", msg)
+			}
+		})
+	}
+}
+
+func TestExtraVolumeMountsAllowsAnOrdinaryVolume(t *testing.T) {
+	// The field is a documented extension point and stays one. A guard that
+	// refuses more than the broker's own volumes is a regression dressed as a
+	// control.
+	agent := colocatedTestAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		ExtraVolumeMounts: []corev1.VolumeMount{
+			{Name: "customer-ca-bundle", MountPath: "/etc/ssl/extra"},
+			{Name: "credential-proxy-state-of-my-own", MountPath: "/opt/data/mine"},
+		},
+	}
+	if msg := validateExtraVolumeMounts(agent); msg != "" {
+		t.Fatalf("an ordinary extra mount was refused: %s", msg)
+	}
+}
+
+func TestExtraVolumeMountsGuardToleratesAnEmptyDeployment(t *testing.T) {
+	agent := colocatedTestAgent()
+	agent.Spec.Deployment = nil
+	if msg := validateExtraVolumeMounts(agent); msg != "" {
+		t.Fatalf("a CR with no deployment block was refused: %s", msg)
+	}
+}

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -455,6 +456,21 @@ var (
 		"event-watcher-kubeconfig": true,
 		"event-watcher-ksa-token":  true,
 	}
+	// Volumes the agent container must never mount, whatever the CR says.
+	// `credential-proxy-state` is the sharp one: it holds $HOME/.gitconfig, the
+	// regenerated kubeconfigs the agent is specifically not supposed to hold,
+	// and the content workspaces. Three separate controls in credential_proxy.py
+	// rest on the agent not seeing that directory, and each of their comments
+	// says the protection is deployment geometry rather than a check — this is
+	// the check. The CR is authored by an operator rather than by the agent, so
+	// this is a configuration hazard and not an escape; it is guarded because
+	// nothing else would notice.
+	agentForbiddenVolumeNames = map[string]bool{
+		"credential-proxy-state":     true,
+		"credential-proxy-policy":    true,
+		"credential-proxy-runtime":   true,
+		"credential-proxy-ksa-token": true,
+	}
 	credentialProxyRuntimeVolumeNames = map[string]bool{
 		"credential-proxy-policy":    true,
 		"credential-proxy-tmp":       true,
@@ -515,4 +531,34 @@ func filterVolumes(volumes []corev1.Volume, keep map[string]bool) []corev1.Volum
 		}
 	}
 	return out
+}
+
+// validateExtraVolumeMounts refuses a CR that would mount a broker-owned volume
+// into the agent container, returning the message for a degraded condition or
+// "" when the CR is acceptable.
+//
+// It reports rather than silently dropping the mount. A dropped mount is a CR
+// whose author believes it took effect, and the failure this guards against is
+// one nobody looks for: the manifest applies cleanly and the agent quietly gains
+// read access to the credentials the proxy exists to keep from it.
+func validateExtraVolumeMounts(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Deployment == nil {
+		return ""
+	}
+	var forbidden []string
+	for _, mount := range agent.Spec.Deployment.ExtraVolumeMounts {
+		if agentForbiddenVolumeNames[mount.Name] {
+			forbidden = append(forbidden, fmt.Sprintf("%s (at %s)", mount.Name, mount.MountPath))
+		}
+	}
+	if len(forbidden) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"spec.deployment.extraVolumeMounts names volumes owned by the credential proxy: %s. "+
+			"Those hold the broker's home directory, its generated kubeconfigs and its git "+
+			"workspaces, and mounting them into the agent container defeats the credential "+
+			"isolation the proxy provides. Remove them, or use a volume of your own.",
+		strings.Join(forbidden, ", "),
+	)
 }

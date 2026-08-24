@@ -250,6 +250,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 9b. Refuse a CR that mounts the broker's own volumes into the agent container.
+	if msg := validateExtraVolumeMounts(instance); msg != "" {
+		log.Info(msg)
+		if statusErr := r.updateStatusDegraded(ctx, instance, "ForbiddenVolumeMount", msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// 10. Validate RuntimeClass if specified
 	if rcName, err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {

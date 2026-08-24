@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any
 
 import command_policy
+import content_workspace
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -932,6 +933,13 @@ class CommandExecutor:
         # no window in which the document can change between validation and use,
         # because the agent never had a handle on the document at all.
         self.kubeconfig_dir = self.state_dir / "kubeconfigs"
+        # Resolved, unlike its siblings above, and the difference is load-bearing
+        # rather than tidiness. Containment compares this against a cwd that has
+        # been through `Path.resolve()`, so on any filesystem with a symlinked
+        # prefix -- /var -> /private/var, or a subPath mount -- an unresolved
+        # root matches nothing and the broker refuses every legitimate call. A
+        # test found this; reading the code did not.
+        self.content_root = (self.state_dir / "content-workspaces").resolve()
         for path in (
             self.home_dir,
             self.workspace_dir,
@@ -1108,7 +1116,38 @@ class CommandExecutor:
         return self._execute(argv, cwd=cwd)
 
     def _within_workspace(self, candidate: Path) -> bool:
-        return candidate == self.workspace_dir or self.workspace_dir in candidate.parents
+        return self._within(candidate, self.workspace_dir)
+
+    @staticmethod
+    def _within(candidate: Path, root: Path) -> bool:
+        return candidate == root or root in candidate.parents
+
+    def execute_workspace_git(
+        self, argv: list[str], cwd: Path, check: bool = True
+    ) -> subprocess.CompletedProcess:
+        """Run the broker's own git, inside a tree the agent cannot name.
+
+        This exists so the content workspaces get the credential environment
+        `_execute` assembles -- HOME on the sidecar-only state dir, the gh
+        credential helper, the pinned `GIT_CONFIG_*` hardening -- without a
+        second copy of that assembly drifting away from the first.
+
+        It is deliberately not reachable from `/v1/exec`. Nothing agent-issued
+        chooses this argv: the subcommands are literals in `content_workspace`
+        and the only caller-supplied strings in them are a validated branch name
+        and validated repository-relative paths. That separation is what keeps
+        the agent-facing git surface at zero after the skills migrate, rather
+        than at zero by accident.
+        """
+        result = self._execute(argv, cwd=str(cwd), containment_root=self.content_root)
+        completed = subprocess.CompletedProcess(
+            argv, result.exit_code, result.stdout, result.stderr
+        )
+        if check and result.exit_code != 0:
+            raise subprocess.CalledProcessError(
+                result.exit_code, argv, result.stdout, result.stderr
+            )
+        return completed
 
     def _lease_holder(self, candidate: Path) -> Path | None:
         """The nearest ancestor of `candidate` that holds a lease marker."""
@@ -1382,19 +1421,31 @@ class CommandExecutor:
         stdin: str | None = None,
         cwd: str | None = None,
         kubeconfig_path: Path | None = None,
+        containment_root: Path | None = None,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
         Callers hand this an absolute path the proxy itself owns; containment and
         regeneration happen in `execute` so that nothing reaching this point is
         still caller-controlled.
+
+        `containment_root` defaults to the agent-shared workspace, which is the
+        only value any agent-reachable path supplies -- `execute` and
+        `execute_internal` never pass it. The one caller that does is
+        `execute_workspace_git`, whose trees are on a volume the agent does not
+        mount. Widening containment for the broker's own git is the one thing in
+        this change that could hand the agent a way out of its workspace, so
+        there is a test asserting the agent-facing path still cannot reach the
+        broker's root, and it is written to fail if this argument ever acquires
+        a second caller.
         """
         started = time.monotonic()
         timed_out = False
-        command_cwd = self.workspace_dir
+        root = self.workspace_dir if containment_root is None else containment_root
+        command_cwd = root
         if cwd:
             requested_cwd = Path(cwd).resolve()
-            if not self._within_workspace(requested_cwd):
+            if not self._within(requested_cwd, root):
                 raise ValueError("working directory is outside the shared workspace")
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
@@ -1537,6 +1588,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
+    workspace_store: content_workspace.ContentWorkspaceStore | None = None
+    workspace_lock: threading.Lock = threading.Lock()
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.startswith("/v1/chat/slack/events"):
@@ -1578,6 +1631,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/v1/github/refresh":
             self._handle_github_refresh()
+            return
+        if self.path.startswith("/v1/workspace/"):
+            self._handle_workspace_post()
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -1791,6 +1847,70 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             raise ValueError("request body must be an object")
         return payload
 
+    def _handle_workspace_post(self) -> None:
+        """The content-passing routes: open, read, list, commit, push, close.
+
+        Serialised on one lock. The trees are shared mutable state and a commit
+        is a sequence of git invocations that assume nothing moved underneath
+        them, so two concurrent requests on one handle would interleave a
+        checkout with another request's writes. Throughput is not the constraint
+        here -- an audit publishes one pull request at a time.
+        """
+        if self.workspace_store is None:
+            self._json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": "content workspaces are not enabled on this broker",
+                    "code": "CONTENT_WORKSPACES_DISABLED",
+                },
+            )
+            return
+        verb = self.path[len("/v1/workspace/"):]
+        route = {
+            "open": self.workspace_store.open,
+            "read": self.workspace_store.read,
+            "list": self.workspace_store.list,
+            "commit": self.workspace_store.commit,
+            "push": self.workspace_store.push,
+            "close": self.workspace_store.close,
+        }.get(verb)
+        if route is None:
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        try:
+            payload = self._read_json_body()
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        try:
+            with self.workspace_lock:
+                result = route(payload)
+        except content_workspace.WorkspaceError as exc:
+            self._json(HTTPStatus(exc.status), {"error": str(exc), **exc.fields})
+            return
+        except subprocess.CalledProcessError as exc:
+            # git's stderr can carry the remote URL with a credential in it, so
+            # it goes to the log through the same redactor the exec path uses
+            # and never into the response.
+            LOGGER.warning(
+                "workspace %s failed rc=%s: %s",
+                verb,
+                exc.returncode,
+                redact_credentials(str(exc.stderr or "")[:2000]),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": f"git {verb} failed", "code": "GIT_FAILED"},
+            )
+            return
+        except Exception as exc:
+            LOGGER.warning("workspace %s error: %s", verb, type(exc).__name__)
+            self._json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "workspace request failed"}
+            )
+            return
+        self._json(HTTPStatus.OK, result)
+
     def _handle_chat_post(self) -> None:
         if self.chat_relay is None:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
@@ -1969,6 +2089,18 @@ def serve(args: argparse.Namespace) -> None:
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
+    if content_workspace.content_workspaces_enabled():
+        # Constructed rather than caught: `assert_disjoint_roots` raises when
+        # the broker's trees would sit inside the volume the agent writes, and
+        # the broker then fails to start. Starting with the feature quietly off
+        # would be a broker whose operator believes content-passing is armed.
+        CredentialProxyHandler.workspace_store = content_workspace.ContentWorkspaceStore(
+            executor.content_root,
+            executor.workspace_dir,
+            runner=executor.execute_workspace_git,
+            timeout_seconds=args.timeout_seconds,
+        )
+        LOGGER.info("content workspaces enabled root=%s", executor.content_root)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)

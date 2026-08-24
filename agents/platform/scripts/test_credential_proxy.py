@@ -2166,5 +2166,101 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
         self.assertEqual([], self.executed)
 
 
+class BrokerRootContainmentTest(unittest.TestCase):
+    """The one thing `containment_root` could break, asserted directly.
+
+    Widening containment so the broker's own git can run outside the shared
+    workspace is the only part of content-passing that could hand the agent a
+    way *out* of its workspace. It is safe exactly while no agent-reachable
+    caller passes the parameter, which is a claim about call sites rather than
+    about logic -- so it is asserted twice: once behaviourally, and once by
+    counting the callers.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.executor = CommandExecutor(
+            timeout_seconds=5, max_output_bytes=4096, state_dir=self.temp_dir.name
+        )
+        self.executor.content_root.mkdir(parents=True, exist_ok=True)
+
+    def test_the_agent_facing_path_cannot_reach_the_broker_root(self):
+        tree = self.executor.content_root / "deadbeef"
+        tree.mkdir()
+        for cwd in (str(self.executor.content_root), str(tree)):
+            with self.subTest(cwd=cwd), self.assertRaises(ValueError) as caught:
+                self.executor.execute(["git", "status"], cwd=cwd)
+            self.assertIn("outside the shared workspace", str(caught.exception))
+
+    def test_the_broker_root_is_not_inside_the_agent_workspace(self):
+        self.assertFalse(
+            self.executor._within_workspace(self.executor.content_root),
+            "content workspaces must not live under the volume the agent writes",
+        )
+
+    def test_containment_root_has_exactly_one_caller(self):
+        """A behavioural test cannot see a *new* caller added later. This can.
+
+        If this fails because someone added a legitimate second caller, read
+        `_execute`'s docstring before raising the number: the argument is safe
+        because of who passes it, not because of what it does.
+        """
+        source = Path(credential_proxy.__file__).read_text(encoding="utf-8")
+        callers = [
+            line.strip()
+            for line in source.splitlines()
+            if "containment_root=" in line and "def _execute" not in line
+        ]
+        self.assertEqual(
+            callers,
+            ["result = self._execute(argv, cwd=str(cwd), containment_root=self.content_root)"],
+            f"unexpected containment_root callers: {callers}",
+        )
+
+    def test_the_default_is_still_the_agent_workspace(self):
+        outside = Path(self.temp_dir.name) / "elsewhere"
+        outside.mkdir()
+        with self.assertRaises(ValueError):
+            self.executor._execute(["/bin/true"], cwd=str(outside))
+
+
+class WorkspaceRouteTest(unittest.TestCase):
+    """The routes are absent, not merely inert, when the feature is off."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        CredentialProxyHandler.workspace_store = None
+        CredentialProxyHandler.max_request_bytes = 1 << 20
+        self.addCleanup(setattr, CredentialProxyHandler, "workspace_store", None)
+
+    def test_disabled_broker_answers_404_with_a_reason(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/workspace/open"
+        answered = {}
+        handler._json = lambda status, payload: answered.update(
+            status=status, payload=payload
+        )
+        handler._handle_workspace_post()
+        self.assertEqual(answered["status"], HTTPStatus.NOT_FOUND)
+        self.assertEqual(
+            answered["payload"]["code"], "CONTENT_WORKSPACES_DISABLED"
+        )
+
+    def test_an_unknown_verb_is_not_routed(self):
+        store = mock.Mock()
+        CredentialProxyHandler.workspace_store = store
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.path = "/v1/workspace/exec"
+        answered = {}
+        handler._json = lambda status, payload: answered.update(
+            status=status, payload=payload
+        )
+        handler._handle_workspace_post()
+        self.assertEqual(answered["status"], HTTPStatus.NOT_FOUND)
+        self.assertFalse(store.method_calls)
+
+
 if __name__ == "__main__":
     unittest.main()

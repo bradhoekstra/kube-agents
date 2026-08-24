@@ -255,6 +255,15 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          the branch the proxy container takes; here so that the
 #                          import at the top of that script resolves
 #   gitops_workspace.py    the leased clone every write skill uses
+#   credential_proxy_client.py  imported by submit-suggestion for the content
+#                          workspace client. The same file is also COPYed to
+#                          /usr/local/bin/credential-proxy-exec above, as the
+#                          kubectl/git/gh shim; that copy is not importable by
+#                          module name, so it is staged here as well. Content
+#                          mode is the one that works from this container at
+#                          all: no path crosses the protocol, so nothing depends
+#                          on the two ends sharing a filesystem, which they do
+#                          not.
 #   gke_endpoint.py        the DNS-endpoint decision gke-networking sends the model
 #                          to read; stdlib only, and nothing in it is agent-pod-bound
 #   cluster_preflight.sh   the Cluster Agent's first command on every kanban task
@@ -277,6 +286,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
+     agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      /opt/defaults/scripts/
