@@ -251,9 +251,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// 10. Validate RuntimeClass if specified
-	if err := r.validateRuntimeClass(ctx, instance); err != nil {
+	if rcName, err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {
-			rcName := *instance.Spec.Deployment.Availability.RuntimeClassName
+			// The name comes back from the check rather than being read off
+			// spec.deployment here: the sandbox has a RuntimeClass field of its
+			// own, and dereferencing the agent's would panic on a CR that names
+			// only the sandbox one.
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
 			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
@@ -1293,9 +1296,20 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse && cond.Reason == "Unschedulable" {
 				phase = "Degraded"
 				reason = "PodUnschedulable"
-				if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil && agent.Spec.Deployment.Availability.RuntimeClassName != nil && *agent.Spec.Deployment.Availability.RuntimeClassName != "" {
-					rcName := *agent.Spec.Deployment.Availability.RuntimeClassName
-					message = fmt.Sprintf("Pod %s is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass '%s'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool.", pod.Name, rcName)
+				if requested := requestedRuntimeClasses(agent); len(requested) > 0 {
+					// Plural only when the CR really does name two, which takes
+					// the agent pod and the sandbox having deliberately been
+					// given different runtimes. Every other install reads the
+					// sentence this condition has always produced.
+					noun := "RuntimeClass"
+					if len(requested) > 1 {
+						noun = "RuntimeClasses"
+					}
+					quoted := make([]string, 0, len(requested))
+					for _, name := range requested {
+						quoted = append(quoted, fmt.Sprintf("'%s'", name))
+					}
+					message = fmt.Sprintf("Pod %s is waiting to be scheduled because no nodes in the cluster match the requested %s %s. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool.", pod.Name, noun, strings.Join(quoted, ", "))
 				} else {
 					cleanMsg := strings.TrimSuffix(strings.TrimSpace(cond.Message), ".")
 					message = fmt.Sprintf("Pod %s cannot be scheduled onto any available node: %s.", pod.Name, cleanMsg)
@@ -1308,18 +1322,45 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	return phase, reason, message
 }
 
-func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if agent.Spec.Deployment == nil || agent.Spec.Deployment.Availability == nil || agent.Spec.Deployment.Availability.RuntimeClassName == nil || *agent.Spec.Deployment.Availability.RuntimeClassName == "" {
-		return nil
+// validateRuntimeClass returns the name it could not resolve alongside the
+// error, because the caller's Degraded message names it and the error alone
+// does not carry it back.
+func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+	for _, rcName := range requestedRuntimeClasses(agent) {
+		rc := &nodev1.RuntimeClass{}
+		if err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc); err != nil {
+			return rcName, err
+		}
 	}
+	return "", nil
+}
 
-	rcName := *agent.Spec.Deployment.Availability.RuntimeClassName
-	rc := &nodev1.RuntimeClass{}
-	err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc)
-	if err != nil {
-		return err
+// requestedRuntimeClasses is every RuntimeClass this CR asks for, deduplicated.
+//
+// Two pods can name one now — the agent's, and the sandbox's, which is a
+// separate field because the two workloads do not want the same runtime. Both
+// are checked here rather than each at its own builder because the failure is
+// the same failure and the operator already has one message for it: a
+// RuntimeClass that does not exist leaves the pod Pending with nothing in the CR
+// that explains why, and that is worth catching before either object is applied.
+func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
+	var names []string
+	add := func(name *string) {
+		if name == nil || *name == "" {
+			return
+		}
+		if slices.Contains(names, *name) {
+			return
+		}
+		names = append(names, *name)
 	}
-	return nil
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {
+		add(agent.Spec.Deployment.Availability.RuntimeClassName)
+	}
+	if shellSandboxEnabled(agent) {
+		add(shellSandboxRuntimeClassName(agent))
+	}
+	return names
 }
 
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {

@@ -165,10 +165,7 @@ type ExperimentalSpec struct {
 // shell — terminal, the four file tools, and execute_code — follows the backend,
 // so turning this on moves the agent's whole execution surface into that pod.
 //
-// Experimental for two reasons. Until #737 Part C makes the credential proxy
-// reachable from outside the gateway pod, kubectl, gcloud, gh and git report that
-// they are not configured, which is a usable state for testing and not one to ship
-// an agent in. And the shape of the spec is still open — whether the sandbox
+// Experimental because the shape of the spec is still open — whether the sandbox
 // belongs to this operator at all is listed as unresolved in the design.
 type ShellSandboxSpec struct {
 	// Enabled turns the sandbox on. Absent means off: an install that says
@@ -189,6 +186,27 @@ type ShellSandboxSpec struct {
 	// image (AGENT_SANDBOX_IMAGE).
 	// +optional
 	Image string `json:"image,omitempty"`
+
+	// RuntimeClassName runs the sandbox pod under a sandboxed container runtime,
+	// `gvisor` being the one GKE offers. This is a second boundary and not the
+	// one the sandbox is built on: unbinding the ServiceAccount is what takes the
+	// cloud credential away, and a shell running as a different pod is what takes
+	// the agent's filesystem away. What this adds is protection of the node from
+	// the code the model runs, by putting a user-space kernel between that code
+	// and the host's syscall surface.
+	//
+	// Separate from deployment.availability.runtimeClassName, which governs the
+	// agent pod, because the two pods do not want the same answer. The agent pod
+	// holds WAL-mode SQLite, which gVisor corrupts on the gofer-backed mount
+	// (#610); the sandbox pod holds none. Splitting the field is what lets an
+	// install sandbox the untrusted pod without sandboxing the trusted one.
+	//
+	// On GKE Standard this needs a node pool created with `--sandbox
+	// type=gvisor`; the operator reports Degraded rather than leaving the pod
+	// Pending if the named RuntimeClass does not exist. GKE adds the node pool's
+	// taint toleration itself, so nothing else has to be set here.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service

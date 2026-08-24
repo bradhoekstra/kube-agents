@@ -327,10 +327,12 @@ tag is the case that wants the override.
 
 Three knobs need context beyond the chart:
 
-- `deployment.availability.runtimeClassName: gvisor` needs a GKE Sandbox node
-  pool on a Standard cluster — the `gke-cluster` module's
+- `deployment.availability.runtimeClassName: gvisor` and
+  `harness.experimental.shellSandbox.runtimeClassName: gvisor` each need a GKE
+  Sandbox node pool on a Standard cluster — the `gke-cluster` module's
   `enable_gvisor_node_pool` creates one; Autopilot ships the RuntimeClass
-  natively.
+  natively. They are separate keys because the agent pod holds WAL-mode SQLite,
+  which gVisor corrupts, and the sandbox pod holds none.
 - `security.workloadIdentityFederation` needs a Workload Identity pool and
   provider trusting the cluster's OIDC issuer, and one
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates

@@ -938,3 +938,86 @@ func TestColocatedSandboxAdmitsTheGatewayOnTheProxyPort(t *testing.T) {
 		}
 	}
 }
+
+// The sandbox's runtime is its own field, and the default install must render as
+// though the field did not exist. Both halves matter: an install that never asks
+// for gVisor and starts emitting `runtimeClassName` gets an object diff on every
+// reconcile, and an install that does ask for it and does not get the field runs
+// the model's code on the host kernel while the CR says otherwise.
+func TestShellSandboxRuntimeClassIsOptOnly(t *testing.T) {
+	runtimeOf := func(agent *agentv1alpha1.PlatformAgent) *string {
+		return buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash").
+			Spec.Template.Spec.RuntimeClassName
+	}
+
+	if got := runtimeOf(shellSandboxAgent(true)); got != nil {
+		t.Errorf("a sandbox that names no RuntimeClass must leave the field out, got %q", *got)
+	}
+
+	// An empty string is the value Helm sends for an unset chart key, and
+	// Kubernetes reads it as the default runtime — the same thing nil means. Only
+	// nil keeps it out of the rendered object, so it is what an empty string has
+	// to become.
+	blank := shellSandboxAgent(true)
+	blank.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("")
+	if got := runtimeOf(blank); got != nil {
+		t.Errorf("an empty runtimeClassName must render as absent, got %q", *got)
+	}
+
+	named := shellSandboxAgent(true)
+	named.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("gvisor")
+	if got := runtimeOf(named); got == nil || *got != "gvisor" {
+		t.Errorf("expected the sandbox pod to run under gvisor, got %v", got)
+	}
+
+	// Off means off, including for this. A CR that names a runtime under a
+	// disabled sandbox builds no sandbox pod at all, so the only way the name
+	// could escape is through the agent pod, which has its own field.
+	offButNamed := shellSandboxAgent(false)
+	offButNamed.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("gvisor")
+	if got := requestedRuntimeClasses(offButNamed); len(got) != 0 {
+		t.Errorf("a disabled sandbox must request no RuntimeClass, got %v", got)
+	}
+}
+
+// The pre-flight check is what turns a missing RuntimeClass into a Degraded CR
+// instead of a pod that sits Pending with nothing to read. It has to see both
+// pods' fields, and it has to name each class once: the message it feeds joins
+// the list, and `gvisor, gvisor` reads like two different problems.
+func TestRequestedRuntimeClassesCoversBothPodsAndDeduplicates(t *testing.T) {
+	agentPodOnly := shellSandboxAgent(false)
+	agentPodOnly.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
+	}
+	if got := requestedRuntimeClasses(agentPodOnly); len(got) != 1 || got[0] != "gvisor" {
+		t.Errorf("the agent pod's runtime must still be checked with the sandbox off, got %v", got)
+	}
+
+	sandboxOnly := shellSandboxAgent(true)
+	sandboxOnly.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("gvisor")
+	if got := requestedRuntimeClasses(sandboxOnly); len(got) != 1 || got[0] != "gvisor" {
+		t.Errorf("the sandbox's runtime must be checked on its own, got %v", got)
+	}
+
+	both := shellSandboxAgent(true)
+	both.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("gvisor")
+	both.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
+	}
+	if got := requestedRuntimeClasses(both); len(got) != 1 {
+		t.Errorf("one name asked for by both pods is one name to check, got %v", got)
+	}
+
+	differing := shellSandboxAgent(true)
+	differing.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("gvisor")
+	differing.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("kata")},
+	}
+	if got := requestedRuntimeClasses(differing); len(got) != 2 {
+		t.Errorf("two different runtimes are two checks, got %v", got)
+	}
+
+	if got := requestedRuntimeClasses(shellSandboxAgent(true)); len(got) != 0 {
+		t.Errorf("an install that asks for no runtime must skip the check entirely, got %v", got)
+	}
+}

@@ -40,7 +40,8 @@ spec:
     {{- $sandbox := (.Values.platformAgent.harness.experimental | default dict).shellSandbox | default dict }}
     {{- with include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
-          "image" $sandbox.image) }}
+          "image" $sandbox.image
+          "runtimeClassName" $sandbox.runtimeClassName) }}
     experimental:
       shellSandbox:
         {{- . | nindent 8 }}

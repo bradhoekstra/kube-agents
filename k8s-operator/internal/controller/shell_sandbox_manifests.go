@@ -237,6 +237,22 @@ func shellSandboxEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return spec != nil && spec.Enabled != nil && *spec.Enabled
 }
 
+// shellSandboxRuntimeClassName is the sandbox pod's runtime, or nil for the
+// node's default.
+//
+// An empty string is treated as unset rather than passed through. Kubernetes
+// reads `runtimeClassName: ""` as the default runtime, so the two mean the same
+// thing to the API server — but only nil leaves the field out of the manifest,
+// and a rendered `runtimeClassName: ""` on every install that never asked for
+// one is noise in every diff of the object.
+func shellSandboxRuntimeClassName(agent *agentv1alpha1.PlatformAgent) *string {
+	spec := shellSandboxSpec(agent)
+	if spec == nil || spec.RuntimeClassName == nil || *spec.RuntimeClassName == "" {
+		return nil
+	}
+	return ptr.To(*spec.RuntimeClassName)
+}
+
 // shellSandboxName is the name of every object in this file: the StatefulSet, its
 // governing Service, and the NetworkPolicy. One name, because they are one thing,
 // and because the DNS record the agent dials is built from it.
@@ -412,6 +428,11 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// credential proxy by an explicit URL, so it needs no
 					// service discovery at all.
 					EnableServiceLinks: ptr.To(false),
+					// nil unless the CR names one, so the default install is
+					// byte-identical to what it rendered before the field
+					// existed. See ShellSandboxSpec.RuntimeClassName for why
+					// this is not the agent's field.
+					RuntimeClassName: shellSandboxRuntimeClassName(agent),
 					// No securityContext, and that is a decision rather than an
 					// omission. sshd's privilege separation forks as uid 0 and
 					// drops to the unprivileged `agent` user for the session, and

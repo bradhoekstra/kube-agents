@@ -563,12 +563,14 @@ hold](#which-credentials-a-sidecar-can-still-hold) — which is why #720 pairs i
 hardening with a Pod split rather than relying on it. This design keeps the hardening and
 removes the ADC identity instead.
 
-**gVisor for the sandbox pod.** gVisor's boundary is the host kernel, not the network. Its
-sentry implements the syscall surface, but a socket to `169.254.169.254` is a socket, and
-GKE's metadata server serves it for the pod's IP the same as under runc.
+**gVisor as the credential boundary.** gVisor's boundary is the host kernel, not the
+network. Its sentry implements the syscall surface, but a socket to `169.254.169.254` is a
+socket, and GKE's metadata server serves it for the pod's IP the same as under runc.
 `runtimeClassName` is pod-scoped besides, so it cannot be applied to one container and not
-the other. (It is separately blocked on SQLite; see
-[Prerequisites](#gvisor-breaks-wal-sqlite--a-real-blocker).)
+the other — it would put the proxy inside the sentry alongside the shell it is supposed to
+be separated from. It buys a different thing entirely, which is worth having and which the
+sandbox now ships as an opt-in: see [Running the sandbox under
+gVisor](#running-the-sandbox-under-gvisor).
 
 **A NetworkPolicy denying the shell egress to the metadata server.** Pod-scoped, like
 everything else in the network namespace, so it denies the proxy at the same time. And on
@@ -645,13 +647,18 @@ operator's fail-safe silently keep the proxy on the metadata server — an insta
 asked for federation and did not get it has no symptom except a placement nobody looks at.
 The Terraform composition reaches the same values through `extra_helm_values`.
 
-What no surface does is **create the pool**. This is the same shape as
-`runtimeClassName: gvisor`, which the chart can set and no Terraform module can provision
-a node pool for: a knob the config layer owns and the infrastructure layer does not. The
-chart README lists both under "knobs with no infrastructure behind them", and a
-`kube-agents-iam` addition that creates the pool, the provider and the
-`roles/iam.workloadIdentityUser` grant is the obvious next step — it needs the cluster's
-OIDC issuer, which that module does not have today.
+What no surface does is **create the Workload Identity pool**: a knob the config layer owns
+and the infrastructure layer does not. The chart README lists it under the knobs that need
+context beyond the chart, and a `kube-agents-iam` addition that creates the pool, the
+provider and the `roles/iam.workloadIdentityUser` grant is the obvious next step — it needs
+the cluster's OIDC issuer, which that module does not have today.
+
+The gVisor node pool is the opposite case: `gke-cluster` has `enable_gvisor_node_pool`, and
+the composition passes it through. What the composition then does with it is point the
+_agent_ pod at `gvisor`, which is the pod holding the WAL-mode SQLite that gVisor corrupts
+— see [Running the sandbox under gVisor](#running-the-sandbox-under-gvisor). Turning the
+sandbox on through Terraform should point the sandbox's field there instead, and that
+rewiring is not in this change.
 
 ---
 
@@ -718,6 +725,45 @@ Secret other than the public half of the agent's SSH key. The proxy container's 
 token is a volume of its own, mounted there and nowhere else. If a future change needs one
 of those in the shell container, that is the boundary moving, and it should be argued for
 here first.
+
+### Running the sandbox under gVisor
+
+`harness.experimental.shellSandbox.runtimeClassName` puts the sandbox pod on a sandboxed
+container runtime, `gvisor` being the one GKE offers. It is unset by default, and an
+install that does not name it renders exactly the object it rendered before the field
+existed.
+
+This is a second boundary and not the one the rest of this design is built on. Unbinding
+the ServiceAccount is what takes the cloud credential away; running the shell as a
+different pod is what takes the agent's filesystem away. Neither has anything to say about
+the node. gVisor's sentry does: it puts a user-space kernel between the code the model runs
+and the host's syscall surface, so a kernel bug the model finds gets the sentry rather than
+the machine every other pod on that node is sharing. That is worth having precisely because
+the shell container is the one place in this system where arbitrary code is expected to run.
+
+The field is the sandbox's own rather than a reuse of
+`deployment.availability.runtimeClassName`, because the two pods do not want the same
+answer. The agent pod holds `session_kv.db`, WAL-mode SQLite, which gVisor corrupts on the
+gofer-backed mount ([#610](https://github.com/gke-labs/kube-agents/issues/610)); the sandbox
+pod holds no SQLite at all. One field would force the WAL hazard and the node protection to
+be taken together or not at all, and the install that wants them is the one that wants the
+untrusted pod sandboxed and the trusted one left alone. Splitting them is what makes that
+expressible.
+
+The pod-scoped nature of `runtimeClassName` — the reason it is no use as the credential
+boundary — costs nothing here. Both containers of the sandbox pod go inside the sentry,
+including the credential proxy, and the proxy's separation from the shell was never the
+sentry's job: it is the mount namespace, `shareProcessNamespace: false`, and the fact that
+the token file is mounted in one container and not the other.
+
+On GKE Standard this needs a node pool created with `--sandbox type=gvisor`; the
+`gke-cluster` module's `enable_gvisor_node_pool` creates one, and GKE adds the pool's
+`sandbox.gke.io/runtime=gvisor:NoSchedule` toleration to pods naming the RuntimeClass
+itself, so no toleration plumbing is needed here. Autopilot ships the RuntimeClass natively.
+A name the cluster does not have leaves the pod Pending with nothing in the CR that explains
+why, so the operator checks every RuntimeClass the CR asks for — the agent's and the
+sandbox's, deduplicated — before applying anything, and reports `Degraded` naming the one it
+could not resolve.
 
 ### Key management
 
@@ -2061,18 +2107,24 @@ which argues for doing it early regardless of where it sits in the threat model.
 
 ## Prerequisites
 
-### gVisor breaks WAL SQLite — a real blocker
+### gVisor breaks WAL SQLite, which is why the runtime is per-pod
 
 An earlier claim that `runtimeClassName: gvisor` is "nearly free" was wrong.
 [#610](https://github.com/gke-labs/kube-agents/issues/610) records gVisor corrupting
 WAL-mode SQLite on the gofer-backed mount, and `session_kv.db` is WAL-mode SQLite.
 
-This does not block the design — the session DB should not be in the sandbox at all —
-but it does mean the sandbox's own storage must be audited for SQLite before gVisor
-is enabled, and that the isolation tier is a decision with a cost rather than a free
-upgrade. Starting on the default runtime and moving to gVisor as a second step is
-legitimate; most of the value here comes from the pod boundary, not the syscall
-filter.
+That is a fact about the agent pod, which is where the session DB lives. The sandbox
+pod holds no SQLite, so it can run under the sentry while the agent pod does not —
+which is the argument for the separate field, and the reason this is a prerequisite
+for the runtime rather than for the design. What it does still mean is that the
+sandbox's storage has to be re-audited for SQLite whenever something new is written
+to `/opt/data`: the safety of the setting is a property of what the image puts there,
+not of the setting.
+
+Most of the value in this design comes from the pod boundary, not the syscall filter,
+so an install starting on the default runtime and turning gVisor on later loses
+nothing in the meantime. See [Running the sandbox under
+gVisor](#running-the-sandbox-under-gvisor) for what the setting is and is not.
 
 ### Egress
 
@@ -2220,7 +2272,7 @@ Allowlist`. It reaches the pod-scoped-identity finding independently and answers
 - [#674](https://github.com/gke-labs/kube-agents/pull/674) — read-only root
   filesystem. Complementary.
 - [#610](https://github.com/gke-labs/kube-agents/issues/610) — the gVisor/WAL SQLite
-  corruption. A gate on the isolation tier.
+  corruption. Why the sandbox's runtime is a field of its own.
 - [`gchat-session-metadata-data-flow.md`](gchat-session-metadata-data-flow.md) — what
   actually flows through the Session KV.
 

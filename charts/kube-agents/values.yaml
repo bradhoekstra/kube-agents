@@ -367,6 +367,22 @@ platformAgent:
         # Overrides the sandbox image. Empty takes the operator's default,
         # which comes from the same tag inventory as every other image.
         image: ""
+        # Runs the sandbox pod under a sandboxed container runtime — `gvisor`
+        # on GKE. Empty leaves the node's default runtime, which is what every
+        # install renders today.
+        #
+        # Separate from deployment.availability.runtimeClassName, and
+        # deliberately: the agent pod holds WAL-mode SQLite, which gVisor
+        # corrupts, and the sandbox pod holds none. This is the field that lets
+        # an install put a user-space kernel between the model's code and the
+        # node without doing the same to the agent.
+        #
+        # On Standard, needs a node pool created with `--sandbox type=gvisor`;
+        # the gke-cluster module's enable_gvisor_node_pool creates one.
+        # Autopilot ships the RuntimeClass natively. Either way the operator
+        # reports Degraded rather than leaving the pod Pending if the named
+        # class does not exist.
+        runtimeClassName: ""
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent
