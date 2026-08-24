@@ -1888,6 +1888,26 @@ its own interface. It keeps the `iam.gke.io/gcp-service-account` annotation on
 `kubeagents-platform-agent`, which is the remaining gap: no process in that pod uses it,
 but it is still mintable from `169.254.169.254` by anything that gets execution there.
 
+### Cron jobs that authenticate without a model turn
+
+Emptying the gateway pod of credentials breaks the one class of work that still needs them
+there. A roster entry marked `no_agent` runs as a Python subprocess on the gateway rather
+than as a model turn, so it never touches the terminal backend and never reaches the
+sandbox. `refresh_git_credentials` in `agents/platform/scripts/github_token_refresh.py`
+prefers `CREDENTIAL_PROXY_URL` and falls back to `gcloud auth print-identity-token`; with
+the variable gone from the gateway and no `gcloud` in the agent image, both branches are
+now dead and the job fails with `No such file or directory: 'gcloud'`. On the reference
+install this surfaced as the shipped GitHub repo watcher failing on every ten-minute tick
+from the moment these images went live. Model-driven crons are unaffected: their shell work
+runs on the sandbox terminal backend, where the proxy is co-located and answers on loopback.
+
+Restoring `CREDENTIAL_PROXY_URL` on the gateway would fix it and undo the change — it puts a
+credential path back in the pod this design exists to empty. The fix is to give the
+subprocess jobs the same route the model's shell already takes and mint through the sandbox,
+which also settles what `no_agent` should mean once the gateway holds nothing: either the
+entry declares that it needs credentials and is scheduled into the sandbox, or it is
+restricted to work that needs none. That is not implemented here.
+
 ### Caller authentication
 
 Co-located, the exec path is back on `127.0.0.1:8765` and needs no bearer token: the one
