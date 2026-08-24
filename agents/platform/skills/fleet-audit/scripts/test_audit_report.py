@@ -1681,14 +1681,16 @@ class TestAuditCatalogue(unittest.TestCase):
 
         A `no_agent` entry is excluded from the equality rather than added to
         the expected set: it prompts no model, so none of the above applies to
-        it and it has no stream in `AUDITS` to pair with. It is on this roster
-        for what it reads, not for what it runs — `eod-event-watcher-daily-report`
-        renders the event-watcher recap from this profile's session database.
-        The equality still binds every entry that does prompt a model, which is
-        the case this test exists for.
+        it and it has no stream in `AUDITS` to pair with. Each is on this
+        roster for what it reads rather than for what it runs:
+        `eod-event-watcher-daily-report` renders the event-watcher recap from
+        this profile's session database, and `kanban-workspace-gc` reconciles
+        abandoned scratch workspaces against the board database that lives
+        beside it. The equality still binds every entry that does prompt a
+        model, which is the case this test exists for.
 
         Excluded from one equality, pinned by another. `github-repo-watcher`
-        was named in the expected set before this roster carried a second
+        was named in the expected set before this roster carried any other
         `no_agent` entry, and the reason it was named survives the split:
         adding a job to this roster must stay a deliberate act rather than
         something a set comparison absorbs quietly. So the `no_agent` ids are
@@ -1703,10 +1705,14 @@ class TestAuditCatalogue(unittest.TestCase):
             "set; a stream switched off here simply stops running",
         )
         self.assertEqual(
-            {"github-repo-watcher", "eod-event-watcher-daily-report"},
+            {
+                "github-repo-watcher",
+                "eod-event-watcher-daily-report",
+                "kanban-workspace-gc",
+            },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
-            "pair; a subprocess job added here fires on every tick without "
+            "set; a subprocess job added here fires on every tick without "
             "any of the review a governance stream gets",
         )
         # Resolved to a file, not merely non-empty. Nothing else in the tree
