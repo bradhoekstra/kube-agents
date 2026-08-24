@@ -653,12 +653,17 @@ context beyond the chart, and a `kube-agents-iam` addition that creates the pool
 provider and the `roles/iam.workloadIdentityUser` grant is the obvious next step — it needs
 the cluster's OIDC issuer, which that module does not have today.
 
-The gVisor node pool is the opposite case: `gke-cluster` has `enable_gvisor_node_pool`, and
-the composition passes it through. What the composition then does with it is point the
-_agent_ pod at `gvisor`, which is the pod holding the WAL-mode SQLite that gVisor corrupts
-— see [Running the sandbox under gVisor](#running-the-sandbox-under-gvisor). Turning the
-sandbox on through Terraform should point the sandbox's field there instead, and that
-rewiring is not in this change.
+The gVisor node pool is the opposite case — it has a full surface, pointed at the wrong
+pod. `install.sh --gvisor` sets `enable_gvisor_node_pool` on Standard, or on Autopilot
+takes the built-in RuntimeClass and no pool, and the composition renders the result into
+`deployment.availability.runtimeClassName`. That is the _agent_ pod, the one holding the
+WAL-mode SQLite that gVisor corrupts — see
+[Running the sandbox under gVisor](#running-the-sandbox-under-gvisor). The sandbox pod,
+which holds no SQLite and is the one running code the model wrote, is left on the default
+runtime. Turning the sandbox on through Terraform should point
+`harness.experimental.shellSandbox.runtimeClassName` at the pool as well, and that rewiring
+is not in this change: the flag predates the sandbox and repointing it is a behaviour change
+for installs that already pass `--gvisor`.
 
 ---
 
