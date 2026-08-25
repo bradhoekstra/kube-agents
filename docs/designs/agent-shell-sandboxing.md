@@ -1972,8 +1972,8 @@ content alone.
 So the exchange stops being a directory and starts being content. The agent hands the broker
 `{path, contentBase64}` pairs and a commit message; the broker owns the only checkout, on a
 volume the agent does not mount, and commits and pushes there. `content_workspace.py` holds
-the six verbs — `open`, `read`, `list`, `commit`, `push`, `close` — reached over the same
-loopback endpoint as `/v1/exec`, and `credential_proxy_client.Workspace` is the client. The
+the seven verbs — `open`, `read`, `list`, `grep`, `commit`, `push`, `close` — reached over the
+same loopback endpoint as `/v1/exec`, and `credential_proxy_client.Workspace` is the client. The
 broker refuses a path that is absolute, contains `..`, or sits behind a symlink, and it
 answers `list` from `git ls-files` rather than from a filesystem walk, so its own `.git` is
 not nameable. `commit` continues `origin/<branch>` when the remote already has it rather than
@@ -2013,6 +2013,41 @@ something discovered rather than invented when there is nothing local to grep. T
 only meaningful beside the sandbox, since the routes are served by the co-located proxy, so
 the chart refuses it with `shellSandbox.enabled` false rather than rendering a CR that changes
 no manifest.
+
+**Reading is the half that nearly went missing.** Writing was the visible use of the shared
+tree, so the write skills were migrated first and the protocol was sized for them: a commit
+carries a handful of manifests, and a listing capped at 256 entries covers a GitOps directory.
+Reading an unfamiliar repository is a different shape of request, and under the write-shaped
+protocol the capability regressed — directory mode let a skill `git clone` anything through
+the shim and grep it locally, and content mode answered `list` with a silently truncated page,
+had no search at all, and cloned full-depth into an `emptyDir` sized for manifests. The
+acceptance test that surfaced it is the one the change is now held to: clone a public
+repository and analyse the code in it, using no file access to a repository.
+
+What that took is four things, none of them a new trust boundary. `list` pages: it reports
+`total` and `truncated`, and takes an `after` cursor so a caller can walk a tree larger than
+the ceiling instead of guessing at names beyond it. `grep` runs `git grep` over the tracked
+files, fixed-string unless the caller asks for a regular expression, with the pattern carried
+as the argument of `-e` so one beginning with `-` is a pattern rather than an option; because
+git greps tracked files, no pattern reaches `.git`. `read` takes a list of paths as well as a
+single one, since materialising a tree one round trip per file is a reader that reads less
+than it should, and it answers with what it skipped and why rather than dropping files
+quietly. And `open` takes a `depth`, which makes a shallow single-branch clone — refused
+together with `branch`, since a single-branch clone cannot see whether the working branch
+exists on the remote and would answer from the base instead, and read-only, since `commit`
+refuses on a shallow workspace rather than failing later at a push the remote rejects. A
+clone that does not fit `CREDENTIAL_PROXY_MAX_CLONE_BYTES` is removed and refused; the ceiling
+bounds what stays on the volume, not what a clone transiently writes.
+
+The agent-facing surface for all of it is the `inspect-repository` skill, which is the thing a
+list of protocol verbs does not give you: without a skill naming the capability, the agent has
+no way to know that reading somebody else's code is still possible. Its `clone` subcommand
+pages the listing, batches the reads and writes the files into a scratch directory; what lands
+is source with no repository around it, which is the same property the write path has for the
+same reason. Its `open`/`grep`/`fetch`/`close` sequence is for repositories too large to copy,
+and the handle rather than a directory is what travels between the agent's turns. On a broker
+that has not been armed, `clone` falls back to the leased checkout and says `"mode":
+"directory"`; the handle subcommands say they cannot serve the request instead of pretending.
 
 What content-passing does not remove is the volume itself. The clone path still needs it, so
 the mount stays until the last skill has migrated and directory mode is deleted; the

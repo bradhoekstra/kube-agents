@@ -137,6 +137,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Meta": [
         "fleet-audit",
         "github-issue-resolver",
+        "inspect-repository",
         "pr-conversation",
     ],
 }
