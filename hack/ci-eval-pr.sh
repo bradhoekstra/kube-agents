@@ -31,6 +31,45 @@ gcloud container clusters get-credentials "$HOST_CLUSTER_NAME" --region "$REGION
   $GKE_DNS_ENDPOINT_FLAG
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
+# 2b. Seeded-fleet credentials, one kubeconfig per fixture ROLE.
+#
+# The get-credentials above is the ONLY one this script used to do, and it
+# points at platform-agent-host. The seeded fleet (bench/tf/fleet/) is other
+# clusters, so a cluster-state check reading the ambient kubeconfig asks the
+# wrong API server -- blocker A5 in bench/tasks/DRAFTS.md. This writes the
+# fleet's credentials into their own files, keyed by fixture role, and touches
+# neither the ambient kubeconfig nor the current context.
+#
+# Clusters are found by label rather than by name, so this does not need to
+# know the leased project's cluster prefix or region.
+#
+# Non-fatal by design: an unreachable seeded cluster -- or a leased project the
+# fleet was never applied to -- leaves its roles' files absent, and
+# `fleet_resource_property` turns that into status=error naming the role and
+# the project: failing the checks that needed that cluster rather than the job,
+# and never silently reading platform-agent-host instead.
+#
+# It runs on every presubmit even though every task that consumes it is still
+# commented out of TASKS below, and that is deliberate rather than an oversight.
+# The six fleet tasks cannot be switched on until this step is known to work in
+# whichever project Boskos leases, and the only way to know that is to run it:
+# its per-project warnings ("carries no clusters labelled environment=seeded")
+# are the signal that a pool project still needs bench/tf/fleet applied, and
+# they are wanted BEFORE those tasks start gating PRs, not after. It costs one
+# clusters.list, one get-credentials per seeded cluster, and one namespace read
+# per probe -- seconds, against a job measured in tens of minutes.
+#
+# The `||` catches a REPOSITORY bug only: a missing or malformed
+# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
+# environmental failure -- no fleet in this project, a cluster that will not
+# answer, a fixture that was never planted -- returns 0 with a warning of its
+# own and leaves the affected roles' files absent, which is the whole design.
+STEP_START=$SECONDS
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
+
 # 3. Agent & Harness Configuration
 # Configures devops-bench runner to target deployed platform-agent service
 export BENCH_AGENT_TYPE="cli"
@@ -155,16 +194,30 @@ TASKS=(
   #       honoured, so the value alone only moves the failure to the clone.
   #   A3  fleet-cost-idle-pool is date-gated by the SOP's own age rules
   #       (2026-08-28 for the pool, 2026-09-20 for the disks).
-  #   A4  the six audit scenarios' objectives read the final message, which
-  #       the SOPs keep to one line -- they need an artifact verifier first.
-  #   A5  every resource_property safeguard in the corpus (six scenarios,
-  #       cluster-agent-crashloop-debug included) reads the ambient
-  #       kubeconfig, and the only get-credentials above is for
-  #       platform-agent-host. The seeded namespaces are on seeded cluster A,
-  #       so those catastrophic safeguards error and red the presubmit for
-  #       every PR in the repo. Needs the runner to fetch the seeded
-  #       clusters' credentials and each check to name one via the
-  #       verifier's `kubeconfig` field.
+  #   A4  cleared in the code, open on one credential. The six audit
+  #       scenarios' objectives no longer read the final message (which the
+  #       SOPs keep to one line); they use ledger_issue_contains, which reads
+  #       the GitHub ledger issue the run published and proves it is THIS
+  #       run's by the generated-at stamp audit_report.py renders into it.
+  #       That verifier needs BENCH_GITHUB_TOKEN (or GITHUB_TOKEN) with
+  #       issues:read on the eval GitOps repos, which this script does not
+  #       export and Prow does not supply -- provision it with A1's minter
+  #       work. Until then those checks return status=error, which drops
+  #       VerificationCoverage below the gate's 1.0 floor by design.
+  #   A5  cleared in the code, open on the fleet itself. Step 2b above now
+  #       writes one kubeconfig per seeded-fleet fixture ROLE, and the six
+  #       fleet safeguards use `fleet_resource_property` with a
+  #       `fixture_role:` instead of reading the ambient kubeconfig (which
+  #       is platform-agent-host and carries no seeded namespace). What is
+  #       left is operational, not code. The fleet must be applied in EVERY
+  #       project the Boskos pool can lease, with each planted defect
+  #       verified present; that is true of all three as of 2026-08-24 --
+  #       step 2b reports "7 role(s) written ... 0 whose fixtures were not
+  #       present" against each. What is still missing is
+  #       FLEET_READONLY_SA. The run holds a cluster-admin
+  #       credential on a fleet every open PR shares until it is --
+  #       roles/container.admin via the GKE IAM webhook, with nothing to
+  #       narrow in-cluster. bench/tf/fleet/README.md has both.
   #
   # Two entries are not activatable by uncommenting at all:
   #   autoops-warning-event-triage -- its prompt is a meta-note and nothing

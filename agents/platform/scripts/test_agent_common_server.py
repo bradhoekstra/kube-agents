@@ -245,7 +245,10 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
             f"{[d['metadata']['name'] for d in docs if d.get('kind') == 'Deployment']}. "
             "If it was renamed, update the constant on this class — do not delete "
             "this test.")
-        containers = deployments[0]["spec"]["template"]["spec"]["containers"]
+        pod = deployments[0]["spec"]["template"]["spec"]
+        # Both lists: the credential proxy is a native sidecar, so it lives in
+        # initContainers with restartPolicy: Always rather than in containers.
+        containers = pod.get("containers", []) + pod.get("initContainers", [])
         for container in containers:
             if container.get("name") == name:
                 return container

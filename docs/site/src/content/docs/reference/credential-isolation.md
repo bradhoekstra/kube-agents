@@ -12,6 +12,9 @@ This page summarizes the architecture. The canonical design — including scope,
 ## Pod anatomy
 
 Each PlatformAgent runs as one long-lived gateway Pod plus a credential-proxy Pod of its own.
+`agent-api-auth` is a **native sidecar** — an `initContainers` entry with `restartPolicy: Always`,
+needing Kubernetes 1.29+ — so it starts before the gateway's other containers and does not appear
+in `spec.containers`:
 
 | Container                  | Pod              | Trust level | Role                                                                                                                                                                   |
 | -------------------------- | ---------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

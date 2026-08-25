@@ -17,7 +17,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 - `docs/`: Documentation.
   - `site/`: The published documentation site (Astro + Starlight) — the canonical home for
     user-facing docs.
-  - `architecture/`: The end-state architecture specification (`01`–`08`). Describes the target, not
+  - `architecture/`: The end-state architecture specification (`01`–`09`). Describes the target, not
     what ships today.
   - `designs/`: Per-feature design documents.
 - `k8s-operator/`: Go/Kubebuilder operator reconciling `PlatformAgent` Custom Resources, plus the shared installer helpers under `scripts/`.
@@ -277,6 +277,10 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
     confirm it goes back.
   - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
     artifacts, restore prior state, and note anything left behind.
+  - **Screenshots of graphical surfaces go through `scripts/pr_evidence_screenshot.sh`**, which
+    publishes the image where a PR body can render it and prints Markdown stamped with the
+    commit and capture time. Command output stays as fenced text transcripts — a screenshot of a
+    terminal is evidence degraded, not evidence.
   - **If the install is shared with other agents, take the lease.**
     `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy
     `.claude/settings.json.example` to `.claude/settings.json` once per checkout and its

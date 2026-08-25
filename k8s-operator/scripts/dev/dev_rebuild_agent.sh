@@ -233,12 +233,15 @@ execute_redeploy() {
         # Set image in case it's a standalone deployment not managed by a CR
         local container_name
         local container_names
-        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
+        # Both lists: the credential proxy is a native sidecar, so it is an
+        # initContainer. Querying only .containers[] silently skips its image
+        # update and leaves the dev loop running a stale proxy.
+        container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
         # Both containers built from the credential-proxy image, wherever they
-        # turn up: `envoy-credential-proxy` is the credential runtime, which has
-        # its own Deployment now, and `agent-api-auth` is what is left of it in
-        # the gateway pod. Matching by name rather than by Deployment is what
-        # keeps this working across the split.
+        # turn up: `envoy-credential-proxy` is the credential runtime, now a
+        # native sidecar in the agent pod, and `agent-api-auth` is what is left
+        # of it in the gateway pod. Matching by name rather than by Deployment
+        # or by which list it sits in is what keeps this working across both.
         local image_updates=()
         local proxy_container
         for proxy_container in envoy-credential-proxy agent-api-auth; do

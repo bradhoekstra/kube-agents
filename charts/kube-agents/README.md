@@ -4,7 +4,7 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
 
 ## Prerequisites
 
-- Kubernetes 1.28+ (GKE Autopilot or Standard)
+- Kubernetes 1.29+ (GKE Autopilot or Standard) — the credential proxy is a native sidecar, and `SidecarContainers` is beta and on by default from 1.29 (alpha and off in 1.28, GA in 1.33)
 - A Google Service Account (GSA) with a Workload Identity binding to the agent's
   Kubernetes ServiceAccount — `kubeagents-platform-agent` in the release
   namespace by default (`platformAgent.security.serviceAccountName`):
@@ -237,8 +237,11 @@ ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/ku
 
 Vertex AI has no API key. The gateway calls
 `projects/<litellm.vertex.projectId>/locations/<litellm.vertex.location>`
-(both default to `platformAgent.harness.projectId`/`.location`) as a Google
-Service Account reached through Workload Identity. That GSA, its
+as a Google Service Account reached through Workload Identity. `projectId`
+defaults to `platformAgent.harness.projectId`; `location` defaults to `global`
+rather than the harness location, since a model is only callable from a
+location that serves it. Set a region for a data-residency requirement or a
+Model Garden partner model: [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vertex-ai-and-model-garden). That GSA, its
 `roles/aiplatform.user` grant, and its binding to the gateway's KSA are not
 chart resources — see
 [Security & IAM](https://gke-labs.github.io/kube-agents/reference/security-and-iam/).
