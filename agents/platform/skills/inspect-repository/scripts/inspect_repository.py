@@ -56,9 +56,9 @@ sys.path.append("/opt/data/scripts")
 # The same directory in a source checkout, where nothing is staged into /opt.
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
-import content_workspace
 import credential_proxy_client
 import gitops_workspace
+import workspace_paths
 
 OWNER = "inspect-repository"
 
@@ -127,7 +127,7 @@ def write_files(into: Path, files: dict[str, bytes]) -> int:
     """
     written = 0
     for path, data in files.items():
-        relative = content_workspace.validate_path(path)
+        relative = workspace_paths.validate_path(path)
         target = into / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)

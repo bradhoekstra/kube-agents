@@ -264,6 +264,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          all: no path crosses the protocol, so nothing depends
 #                          on the two ends sharing a filesystem, which they do
 #                          not.
+#   workspace_paths.py     the workspace protocol's path validator, imported by
+#                          inspect-repository to re-check every name at the point
+#                          it becomes a write. The broker's content_workspace
+#                          re-exports the same file, so the two ends cannot drift
+#                          into disagreeing about what is under `.git`
 #   gke_endpoint.py        the DNS-endpoint decision gke-networking sends the model
 #                          to read; stdlib only, and nothing in it is agent-pod-bound
 #   cluster_preflight.sh   the Cluster Agent's first command on every kanban task
@@ -287,6 +292,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \
      agents/platform/scripts/credential_proxy_client.py \
+     agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
      /opt/defaults/scripts/

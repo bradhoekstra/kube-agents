@@ -42,8 +42,19 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable
+
+# The path rule is shared with the reader, which does not ship this module --
+# see workspace_paths for why it is a file of its own. Re-exported so that
+# `content_workspace.validate_path` and `content_workspace.WorkspaceError` stay
+# where every caller already looks for them.
+from workspace_paths import (  # noqa: F401
+    WorkspaceError,
+    _HFS_IGNORABLE,
+    _looks_like_dotgit,
+    validate_path,
+)
 
 LOGGER = logging.getLogger("credential-proxy.workspace")
 
@@ -76,54 +87,6 @@ _HANDLE_BYTES = 16
 
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
-
-# Codepoints HFS+ drops when it compares names, so `.gi<U+200C>t` opens `.git`
-# on a Mac. Git carries its own copy of this list in `is_hfs_dotgit`; this one
-# is deliberately not a port of it. See `_looks_like_dotgit`.
-_HFS_IGNORABLE = {
-    0x200C, 0x200D, 0x200E, 0x200F,
-    0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
-    0x206A, 0x206B, 0x206C, 0x206D, 0x206E, 0x206F,
-    0xFEFF,
-}
-
-
-def _looks_like_dotgit(segment: str) -> bool:
-    """True for anything a filesystem might open as `.git`.
-
-    This refuses more spellings than git itself accepts, on purpose. Git has two
-    functions for the same question -- `is_ntfs_dotgit` and `is_hfs_dotgit` --
-    and matching them exactly would mean porting both and then betting the port
-    agrees with whichever git version is in the image. That is the bet this
-    project keeps losing: a check written against a different parser than the
-    enforcer fails silently, and it fails permissive.
-
-    Over-refusing is free here. The repositories this carries hold Kubernetes
-    manifests, and none of them contains a file called `.git.` or `git~1`.
-
-    Covered: case (`.GIT`, case-insensitive filesystems fold it); the NTFS 8.3
-    short name (`git~1`, and any `git~<n>`); trailing dots and spaces, which
-    Windows strips before it opens the name; the NTFS alternate-data-stream
-    suffix (`.git::$DATA`); and HFS+ ignorable codepoints anywhere inside.
-    """
-    text = "".join(ch for ch in segment if ord(ch) not in _HFS_IGNORABLE)
-    text = text.split(":", 1)[0]
-    text = text.rstrip(". ").lower()
-    if text == ".git":
-        return True
-    # `git~1`, the short name Windows generates for `.git`, and every numbered
-    # sibling of it.
-    return text.startswith("git~") and text[4:].isdigit()
-
-
-class WorkspaceError(Exception):
-    """A request the broker refuses. Carries the HTTP status to answer with."""
-
-    def __init__(self, message: str, status: int = 400, **fields: Any) -> None:
-        super().__init__(message)
-        self.status = status
-        self.fields = fields
-
 
 def _positive_int(name: str, default: int) -> int:
     """An operator-set ceiling, or the default when it is not usable.
@@ -219,56 +182,6 @@ def validate_depth(raw: Any) -> int | None:
     if raw < 1:
         raise WorkspaceError("depth must be a positive integer number of commits")
     return raw
-
-
-def validate_path(raw: Any) -> str:
-    """A repository-relative name, or a refusal. One validator, both directions.
-
-    Refuses, in order: a non-string; an empty name; a NUL or newline; an
-    absolute path; a Windows drive or backslash separator; any `.` or `..`
-    segment; and any path whose first segment is `.git`. The `..` rejection is
-    outright rather than normalising, because normalising means reimplementing
-    another library's edge cases and betting the two agree -- refusing the
-    ambiguous form is the rule that does not depend on that bet.
-    """
-    if not isinstance(raw, str):
-        raise WorkspaceError("path must be a string")
-    text = raw.strip()
-    if not text:
-        raise WorkspaceError("path must not be empty")
-    if "\x00" in text or "\n" in text or "\r" in text:
-        raise WorkspaceError("path must not contain control characters")
-    if "\\" in text:
-        raise WorkspaceError(f"path {raw!r} must use / as its separator")
-    if text.startswith("/") or (len(text) > 1 and text[1] == ":"):
-        raise WorkspaceError(f"path {raw!r} must be repository-relative, not absolute")
-    # Split by hand rather than through PurePosixPath. pathlib *normalises*:
-    # it drops `.` segments and collapses `//`, so `./manifests/app.yaml` and
-    # `manifests//app.yaml` arrive here looking clean. Normalising is the D15
-    # defect -- this validator would be answering a different question from the
-    # one the filesystem later answers. Refuse the ambiguous spelling instead.
-    parts = text.split("/")
-    if not parts:
-        raise WorkspaceError("path must not be empty")
-    for part in parts:
-        if not part:
-            raise WorkspaceError(
-                f"path {raw!r} has an empty segment; write it without the extra /"
-            )
-        if part in (".", ".."):
-            raise WorkspaceError(f"path {raw!r} must not contain . or .. segments")
-        # Every segment, not just the first. A nested `.git` is inert in the
-        # outer repository but is a live config directory for anything that
-        # later treats that subdirectory as a repository of its own, and the
-        # cost of refusing it is zero.
-        if _looks_like_dotgit(part):
-            raise WorkspaceError(
-                f"path {raw!r} names a git directory. Nothing the agent authors "
-                "belongs there: `.git/config` is where a filter driver, an alias "
-                "or a hook path would be defined, and content-passing exists so "
-                "that the agent cannot define one."
-            )
-    return str(PurePosixPath(*parts))
 
 
 @dataclass
