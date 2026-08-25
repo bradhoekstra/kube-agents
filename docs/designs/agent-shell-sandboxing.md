@@ -2056,6 +2056,20 @@ after that. Nor does it change the exec path for `kubectl`, `gcloud` or `gh`, wh
 needed a shared filesystem — except that `gh` did, for `--body-file`, and now takes its
 documents on stdin instead.
 
+**The deny policy does not see the workspace verbs.** The proxy's policy matches on argv, and
+the workspace protocol has none: `commit` and `push` are JSON bodies on their own routes, not
+commands submitted to `/v1/exec`. So the rules that stop the agent merging its own pull
+request — no `gh pr merge`, no `gh pr review --approve`, no mutating `gh api`, no repository
+administration (#725) — do not apply to them. That is intended. `push` is the sanctioned
+write, the thing the write skills exist to do, and what it can do is bounded by the verb
+rather than by a pattern: it updates a branch, and it cannot merge, cannot approve or dismiss
+a review, and cannot change repository settings or branch protection, because there is no
+argv through which a caller could ask it to. It does trigger whatever CI the repository runs
+on a push, the same as any other push and bounded by the installation token's scope. The line
+worth writing down is that `commit` and `push` are a GitHub write path those `gh` rules do not
+cover, so reading the deny policy as the complete set of writes the agent can perform gives
+the wrong answer.
+
 ### One replica
 
 The Slack relay holds a socket-mode WebSocket. Two replicas means two connections and
