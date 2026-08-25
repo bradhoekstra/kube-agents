@@ -54,6 +54,20 @@ DEFAULT_MAX_FILE_BYTES = 1 << 20  # 1 MiB
 DEFAULT_MAX_REQUEST_BYTES = 8 << 20  # 8 MiB
 DEFAULT_MAX_ENTRIES = 256
 
+# Reading is a different shape of request from writing. A commit carries a
+# handful of manifests; searching a repository the agent has never seen returns
+# whatever the pattern hits, and the number that matters is how many matches a
+# reader can act on rather than how many bytes a tree holds.
+DEFAULT_MAX_MATCHES = 200
+DEFAULT_MAX_MATCH_CHARS = 512
+
+# The broker's trees live on its own volume, which is an emptyDir sized for
+# Kubernetes manifests. A clone that does not fit is refused and removed rather
+# than left to fill the disk out from under every other handle. The ceiling
+# bounds what stays, not what a clone transiently touches -- git has already
+# written the objects by the time this is measured.
+DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
+
 # A handle is 128 bits from os.urandom and lives only in this process's memory.
 # The agent cannot fabricate one, which is the property the `.lease` file it
 # replaces never had -- that was a file on a shared volume, and creating it
@@ -190,6 +204,23 @@ def validate_branch(branch: Any, field_name: str = "branch") -> str:
     return branch
 
 
+def validate_depth(raw: Any) -> int | None:
+    """A positive commit count, or `None` for the full history.
+
+    `True` is an `int` in Python and would otherwise reach git as `--depth 1`
+    from a caller that meant "yes, shallow" without saying how shallow. Refuse
+    it: a boolean where a count belongs is a caller whose next request will
+    disagree with what it got.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise WorkspaceError("depth must be a positive integer number of commits")
+    if raw < 1:
+        raise WorkspaceError("depth must be a positive integer number of commits")
+    return raw
+
+
 def validate_path(raw: Any) -> str:
     """A repository-relative name, or a refusal. One validator, both directions.
 
@@ -248,6 +279,7 @@ class _Workspace:
     base: str
     base_sha: str
     branch: str | None = None
+    shallow: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -283,6 +315,15 @@ class ContentWorkspaceStore:
         )
         self.max_entries = _positive_int(
             "CREDENTIAL_PROXY_MAX_ENTRIES", DEFAULT_MAX_ENTRIES
+        )
+        self.max_matches = _positive_int(
+            "CREDENTIAL_PROXY_MAX_MATCHES", DEFAULT_MAX_MATCHES
+        )
+        self.max_match_chars = _positive_int(
+            "CREDENTIAL_PROXY_MAX_MATCH_CHARS", DEFAULT_MAX_MATCH_CHARS
+        )
+        self.max_clone_bytes = _positive_int(
+            "CREDENTIAL_PROXY_MAX_CLONE_BYTES", DEFAULT_MAX_CLONE_BYTES
         )
         self.timeout_seconds = timeout_seconds
         self._environment = dict(environment or {})
@@ -327,8 +368,28 @@ class ContentWorkspaceStore:
     # ---- routes -------------------------------------------------------
 
     def open(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Clone a repository into a tree only this process can name.
+
+        `depth` makes it a shallow single-branch clone, which is what reading an
+        unfamiliar repository wants: the history is not what is being analysed
+        and a full clone of a large one does not fit the broker's volume. It is
+        a read-only workspace — `commit` refuses on it, for the reasons in that
+        method — and it is refused together with `branch`, because a
+        single-branch clone cannot see whether the branch exists on the remote
+        and would silently answer from the base instead.
+        """
         owner, name = validate_repo(payload.get("repo"))
         repo = f"{owner}/{name}"
+        depth = validate_depth(payload.get("depth"))
+        requested = payload.get("branch")
+        if depth is not None and requested is not None:
+            raise WorkspaceError(
+                "depth and branch cannot be combined: a shallow clone fetches "
+                "one branch, so the check for whether the working branch "
+                "already exists on the remote would always answer no"
+            )
+        base = payload.get("base")
+        base = validate_branch(base, "base") if base is not None else None
         handle = os.urandom(_HANDLE_BYTES).hex()
         root = self.tree_root / handle
         root.mkdir(parents=True, exist_ok=False)
@@ -336,35 +397,86 @@ class ContentWorkspaceStore:
         # --no-recurse-submodules: a .gitmodules in the remote would otherwise
         # fetch a second repository whose content nobody validated, and
         # submodule plumbing reads config keys this tree is not hardened for.
-        self._git(root, "clone", "--quiet", "--no-recurse-submodules", url, ".")
-        base = payload.get("base")
-        base = validate_branch(base, "base") if base is not None else self._origin_head(root)
-        self._git(root, "checkout", "--force", "-B", base, f"origin/{base}")
-        base_sha = self._git(root, "rev-parse", "HEAD").stdout.strip()
-        # An optional working branch, and the reason it is worth the parameter:
-        # `read` and `list` answer from the tree that is checked out. Left on
-        # the base, a second round of review feedback would be written against
-        # the file as `main` has it rather than as the pull request has it, and
-        # the reviewed work would be silently rewritten out of the file.
-        requested = payload.get("branch")
-        started_from = f"origin/{base}"
-        if requested is not None:
-            head = validate_branch(requested, "branch")
-            if self._remote_branch_exists(root, head):
-                self._git(root, "checkout", "--force", "-B", head, f"origin/{head}")
-                started_from = f"origin/{head}"
+        argv = ["clone", "--quiet", "--no-recurse-submodules"]
+        if depth is not None:
+            argv += ["--depth", str(depth), "--single-branch"]
+            if base is not None:
+                argv += ["--branch", base]
+        argv += [url, "."]
+        try:
+            self._git(root, *argv)
+            if base is None:
+                base = self._origin_head(root)
+            self._enforce_clone_ceiling(root, repo)
+            self._git(root, "checkout", "--force", "-B", base, f"origin/{base}")
+            base_sha = self._git(root, "rev-parse", "HEAD").stdout.strip()
+            # An optional working branch, and the reason it is worth the
+            # parameter: `read` and `list` answer from the tree that is checked
+            # out. Left on the base, a second round of review feedback would be
+            # written against the file as `main` has it rather than as the pull
+            # request has it, and the reviewed work would be silently rewritten
+            # out of the file.
+            started_from = f"origin/{base}"
+            if requested is not None:
+                head = validate_branch(requested, "branch")
+                if self._remote_branch_exists(root, head):
+                    self._git(root, "checkout", "--force", "-B", head, f"origin/{head}")
+                    started_from = f"origin/{head}"
+        except BaseException:
+            # A clone that failed halfway, or one refused by the ceiling, leaves
+            # objects on the broker's volume that no handle names. Nothing would
+            # ever collect them: `close` works from the handle, and this request
+            # is not going to return one.
+            _remove_tree(root)
+            raise
         workspace = _Workspace(
-            handle=handle, repo=repo, root=root, base=base, base_sha=base_sha
+            handle=handle,
+            repo=repo,
+            root=root,
+            base=base,
+            base_sha=base_sha,
+            shallow=depth is not None,
         )
         self._workspaces[handle] = workspace
-        LOGGER.info("workspace opened repo=%s base=%s from=%s", repo, base, started_from)
+        LOGGER.info(
+            "workspace opened repo=%s base=%s from=%s depth=%s",
+            repo,
+            base,
+            started_from,
+            depth if depth is not None else "full",
+        )
         return {
             "handle": handle,
             "repo": repo,
             "base": base,
             "baseSha": base_sha,
             "startedFrom": started_from,
+            "shallow": depth is not None,
         }
+
+    def _enforce_clone_ceiling(self, root: Path, repo: str) -> None:
+        """Refuse a clone that will not fit beside the others.
+
+        Measured after the fact, which is the honest description of what this
+        bounds: git has already written the objects, so the ceiling stops a
+        large repository from *staying* on the volume rather than from touching
+        it. `open` removes the tree on the way out, so the peak is one clone.
+        """
+        total = 0
+        for directory, _subdirectories, filenames in os.walk(root):
+            for filename in filenames:
+                try:
+                    total += os.lstat(os.path.join(directory, filename)).st_size
+                except OSError:
+                    continue
+                if total > self.max_clone_bytes:
+                    raise WorkspaceError(
+                        f"{repo} is larger than the {self.max_clone_bytes}-byte "
+                        "ceiling for a broker-side clone. Reopen it with a "
+                        "smaller depth.",
+                        status=413,
+                        code="CLONE_TOO_LARGE",
+                    )
 
     def _remote_branch_exists(self, root: Path, branch: str) -> bool:
         """Whether `origin/<branch>` is a ref this clone has.
@@ -394,11 +506,34 @@ class ContentWorkspaceStore:
         ref = (result.stdout or "").strip()
         if result.returncode == 0 and ref:
             return ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+        # `clone --single-branch` does not always leave `origin/HEAD` behind,
+        # and the branch it checked out is the remote's default by definition.
+        # Guessing `main` at a repository whose trunk is `master` fails at the
+        # checkout below with a message about a ref, not about a default.
+        local = self._git(
+            root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False
+        )
+        head = (local.stdout or "").strip()
+        if local.returncode == 0 and head:
+            return head
         return "main"
 
     def read(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """One file by `path`, or several by `paths`.
+
+        The batched form exists because materialising a repository the agent
+        wants to analyse is otherwise one round trip per file, and a reader that
+        pays a request per file reads fewer files than it should. Its response
+        is a different shape on purpose — a batch reports what it did not return
+        alongside what it did, and folding that into the single-file shape would
+        mean either a 404 that carries content or content that carries a 404.
+        """
         workspace = self._resolve(payload.get("handle"))
-        path = validate_path(payload.get("path"))
+        if payload.get("paths") is None:
+            return self._read_one(workspace, validate_path(payload.get("path")))
+        return self._read_many(workspace, payload.get("paths"))
+
+    def _read_one(self, workspace: _Workspace, path: str) -> dict[str, Any]:
         target = workspace.root / path
         if target.is_symlink() or not target.is_file():
             raise WorkspaceError(f"{path} is not a readable file in this repository", 404)
@@ -415,10 +550,70 @@ class ContentWorkspaceStore:
             "size": len(data),
         }
 
+    def _read_many(self, workspace: _Workspace, raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, list) or not raw:
+            raise WorkspaceError("paths must be a non-empty list")
+        if len(raw) > self.max_entries:
+            raise WorkspaceError(
+                f"{len(raw)} paths is over the {self.max_entries}-path ceiling",
+                status=413,
+            )
+        # Every name validated before the first byte is read, on the same
+        # principle as `_validate_changes`: a request that names `.git/config`
+        # in its last entry is refused rather than answered for the first
+        # ninety-nine.
+        paths = [validate_path(entry) for entry in raw]
+        files: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        total = 0
+        exhausted = False
+        for path in paths:
+            if exhausted:
+                skipped.append({"path": path, "reason": "requestBudget"})
+                continue
+            target = workspace.root / path
+            if target.is_symlink() or not target.is_file():
+                skipped.append({"path": path, "reason": "notAFile"})
+                continue
+            size = target.stat().st_size
+            if size > self.max_file_bytes:
+                skipped.append({"path": path, "reason": "tooLarge", "size": size})
+                continue
+            if total + size > self.max_request_bytes:
+                # Not an error. A caller asking for a directory's worth of files
+                # cannot know the total in advance, and the answer it can act on
+                # is "here is what fits, ask again for the rest" -- which is why
+                # the remainder is named rather than dropped.
+                exhausted = True
+                skipped.append({"path": path, "reason": "requestBudget"})
+                continue
+            data = target.read_bytes()
+            total += len(data)
+            files.append(
+                {
+                    "path": path,
+                    "contentBase64": base64.b64encode(data).decode("ascii"),
+                    "size": len(data),
+                }
+            )
+        return {"files": files, "skipped": skipped}
+
     def list(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Tracked names, a page at a time.
+
+        `after` is a cursor: the last path of the previous page, and the next
+        page starts strictly after it. `git ls-files` sorts by byte value and
+        UTF-8 preserves code-point order, so the comparison here agrees with the
+        order the names arrive in. Paging is what makes a repository the agent
+        has never seen readable at all -- a listing that stops at the ceiling
+        and says `truncated` is honest, but a caller with no way to ask for the
+        rest still ends up guessing at names.
+        """
         workspace = self._resolve(payload.get("handle"))
         prefix = payload.get("prefix")
         prefix = validate_path(prefix) if prefix else ""
+        after = payload.get("after")
+        after = validate_path(after) if after else ""
         # `git ls-files` rather than a filesystem walk: it answers with tracked
         # names, which is what the agent is entitled to know, and it cannot
         # surface `.git` because git does not track its own directory.
@@ -427,19 +622,111 @@ class ContentWorkspaceStore:
             args += ["--", prefix]
         raw = self._git(workspace, *args).stdout
         entries = []
+        total = 0
         for name in filter(None, raw.split("\0")):
+            if after and name <= after:
+                continue
             candidate = workspace.root / name
             try:
                 size = candidate.stat().st_size
             except OSError:
                 continue
-            entries.append({"path": name, "size": size})
-            if len(entries) >= self.max_entries:
-                break
-        return {"entries": entries}
+            total += 1
+            # Counted past the ceiling rather than stopped at it. A listing that
+            # silently ends at the cap is the reason `read` gets asked for paths
+            # that were invented: the caller saw a complete-looking answer, did
+            # not find what it wanted in it, and guessed. `total` is what remains
+            # in scope, so a caller can page or narrow the prefix instead.
+            if len(entries) < self.max_entries:
+                entries.append({"path": name, "size": size})
+        return {
+            "entries": entries,
+            "total": total,
+            "truncated": total > len(entries),
+        }
+
+    def grep(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """`git grep` over the checked-out tree.
+
+        Reading a repository nobody here has seen before starts with a search,
+        and without one the alternatives are both bad: fetch files by guessing
+        at their names, or fetch the whole tree to search it locally. Neither
+        the pattern nor the prefix can reach outside the tree -- `git grep`
+        searches tracked files, so `.git` is not in scope however the pattern is
+        written, and the pattern travels as the argument of `-e` so one starting
+        with `-` is a pattern rather than an option.
+
+        Fixed-string by default. A caller that wants a regular expression asks
+        for one, which keeps a `.` in a filename from quietly matching more than
+        the caller meant and keeps a pathological pattern behind a deliberate
+        choice.
+        """
+        workspace = self._resolve(payload.get("handle"))
+        pattern = payload.get("pattern")
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise WorkspaceError("pattern must be a non-empty string")
+        if "\x00" in pattern or "\n" in pattern or "\r" in pattern:
+            raise WorkspaceError("pattern must not contain control characters")
+        prefix = payload.get("prefix")
+        prefix = validate_path(prefix) if prefix else ""
+        # -I skips binary files, -n numbers the lines, -z puts a NUL after the
+        # file name so a name carrying a colon cannot be misread as one.
+        args = ["grep", "--no-color", "-I", "-n", "-z"]
+        args.append("-E" if payload.get("regex") is True else "-F")
+        if payload.get("ignoreCase") is True:
+            args.append("-i")
+        args += ["-e", pattern]
+        if prefix:
+            args += ["--", prefix]
+        result = self._git(workspace, *args, check=False)
+        if result.returncode not in (0, 1):
+            # 1 is "no match". Anything else is a pattern git would not take,
+            # which is only reachable with regex=True; its stderr quotes the
+            # pattern back and is not returned, for the same reason no other
+            # git stderr in this module is.
+            raise WorkspaceError(
+                "git could not search for that pattern; check the expression",
+                status=400,
+                code="BAD_PATTERN",
+            )
+        matches: list[dict[str, Any]] = []
+        total = 0
+        for record in (result.stdout or "").split("\n"):
+            if not record:
+                continue
+            path, _, remainder = record.partition("\0")
+            line, _, text = remainder.partition("\0")
+            total += 1
+            if len(matches) >= self.max_matches:
+                continue
+            match: dict[str, Any] = {
+                "path": path,
+                "line": int(line) if line.isdigit() else 0,
+                "text": text[: self.max_match_chars],
+            }
+            if len(text) > self.max_match_chars:
+                match["truncated"] = True
+            matches.append(match)
+        return {
+            "matches": matches,
+            "total": total,
+            "truncated": total > len(matches),
+        }
 
     def commit(self, payload: dict[str, Any]) -> dict[str, Any]:
         workspace = self._resolve(payload.get("handle"))
+        if workspace.shallow:
+            # Refused here rather than left to fail at `push`. A shallow clone
+            # has no history to answer `_collisions` from, so every commit with
+            # an `expectedBaseSha` would take the unanswerable-sha branch and
+            # read as a conflict; and a remote may reject the push outright.
+            # Both are failures a long way from the request that caused them.
+            raise WorkspaceError(
+                "this workspace was opened shallow, which makes it read-only. "
+                "Open the repository again without depth to commit to it.",
+                status=409,
+                code="SHALLOW_WORKSPACE",
+            )
         branch = validate_branch(payload.get("branch"))
         message = payload.get("message")
         if not isinstance(message, str) or not message.strip():

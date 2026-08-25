@@ -5495,7 +5495,20 @@ def handle_list(args: argparse.Namespace) -> None:
 
     with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
         entries = workspace.list(args.prefix)
-    print(json.dumps({"repo": repo, "entries": entries}))
+    # `truncated` travels with the entries. A listing that stopped at the
+    # broker's ceiling looks complete otherwise, and the audit's next move is to
+    # read a path — one it saw, or one it inferred from a listing that ended
+    # early without saying so.
+    print(
+        json.dumps(
+            {
+                "repo": repo,
+                "entries": entries,
+                "total": entries.total,
+                "truncated": entries.truncated,
+            }
+        )
+    )
 
 
 def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:

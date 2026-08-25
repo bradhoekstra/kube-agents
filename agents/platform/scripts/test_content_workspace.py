@@ -31,6 +31,7 @@ from content_workspace import (
     WorkspaceError,
     assert_disjoint_roots,
     validate_branch,
+    validate_depth,
     validate_path,
     validate_repo,
 )
@@ -259,8 +260,10 @@ class OpenTest(StoreTestCase):
     def test_open_returns_a_handle_and_no_filesystem_path(self):
         result = self.open_workspace()
         self.assertEqual(
-            set(result), {"handle", "repo", "base", "baseSha", "startedFrom"}
+            set(result),
+            {"handle", "repo", "base", "baseSha", "startedFrom", "shallow"},
         )
+        self.assertFalse(result["shallow"])
         self.assertEqual(result["repo"], "acme/infra")
         self.assertEqual(result["base"], "main")
         self.assertEqual(result["startedFrom"], "origin/main")
@@ -333,6 +336,290 @@ class ReadAndListTest(StoreTestCase):
         handle = self.open_workspace()["handle"]
         entries = self.store.list({"handle": handle, "prefix": "manifests"})["entries"]
         self.assertEqual([entry["path"] for entry in entries], ["manifests/app.yaml"])
+
+
+class ListTruncationTest(StoreTestCase):
+    """A listing says when it is not the whole listing.
+
+    The reason this is a test rather than a comment: `read` takes a path, and a
+    caller that cannot tell a complete listing from a capped one supplies paths
+    it inferred instead of paths it saw. That failure has no symptom on the
+    broker side -- it answers 404 for a file that exists.
+    """
+
+    def test_a_complete_listing_says_so(self):
+        handle = self.open_workspace()["handle"]
+        result = self.store.list({"handle": handle})
+        self.assertEqual(result["total"], 2)
+        self.assertFalse(result["truncated"])
+
+    def test_a_cursor_pages_through_the_whole_tree(self):
+        """What makes the cap survivable: the caller can ask for the rest."""
+        handle = self.open_workspace()["handle"]
+        self.store.max_entries = 1
+        seen = []
+        cursor = ""
+        while True:
+            page = self.store.list({"handle": handle, "after": cursor} if cursor else {"handle": handle})
+            seen += [entry["path"] for entry in page["entries"]]
+            if not page["truncated"]:
+                break
+            cursor = page["entries"][-1]["path"]
+        self.assertEqual(seen, ["README.md", "manifests/app.yaml"])
+
+    def test_the_cursor_counts_only_what_remains(self):
+        handle = self.open_workspace()["handle"]
+        page = self.store.list({"handle": handle, "after": "README.md"})
+        self.assertEqual(page["total"], 1)
+        self.assertEqual([entry["path"] for entry in page["entries"]], ["manifests/app.yaml"])
+
+    def test_a_capped_listing_reports_the_full_count(self):
+        handle = self.open_workspace()["handle"]
+        self.store.max_entries = 1
+        result = self.store.list({"handle": handle})
+        self.assertEqual(len(result["entries"]), 1)
+        self.assertEqual(result["total"], 2)
+        self.assertTrue(result["truncated"])
+
+
+class BatchReadTest(StoreTestCase):
+    def test_several_files_in_one_call(self):
+        handle = self.open_workspace()["handle"]
+        result = self.store.read(
+            {"handle": handle, "paths": ["README.md", "manifests/app.yaml"]}
+        )
+        self.assertEqual(result["skipped"], [])
+        self.assertEqual(
+            {entry["path"]: base64.b64decode(entry["contentBase64"]) for entry in result["files"]},
+            {"README.md": b"seed\n", "manifests/app.yaml": b"replicas: 1\n"},
+        )
+
+    def test_a_missing_path_is_named_rather_than_fatal(self):
+        """One absent file must not cost the caller the other ninety-nine."""
+        handle = self.open_workspace()["handle"]
+        result = self.store.read({"handle": handle, "paths": ["README.md", "gone.yaml"]})
+        self.assertEqual([entry["path"] for entry in result["files"]], ["README.md"])
+        self.assertEqual(result["skipped"], [{"path": "gone.yaml", "reason": "notAFile"}])
+
+    def test_a_dotgit_path_refuses_the_whole_request(self):
+        """Validated before the first read, like the write path."""
+        handle = self.open_workspace()["handle"]
+        with self.assertRaises(WorkspaceError):
+            self.store.read({"handle": handle, "paths": ["README.md", ".git/config"]})
+
+    def test_an_oversized_file_is_skipped_and_the_rest_returned(self):
+        handle = self.open_workspace()["handle"]
+        self.store.max_file_bytes = 5
+        result = self.store.read(
+            {"handle": handle, "paths": ["README.md", "manifests/app.yaml"]}
+        )
+        self.assertEqual([entry["path"] for entry in result["files"]], ["README.md"])
+        self.assertEqual(result["skipped"][0]["path"], "manifests/app.yaml")
+        self.assertEqual(result["skipped"][0]["reason"], "tooLarge")
+
+    def test_the_request_budget_names_what_it_did_not_send(self):
+        handle = self.open_workspace()["handle"]
+        self.store.max_request_bytes = 6
+        result = self.store.read(
+            {"handle": handle, "paths": ["README.md", "manifests/app.yaml"]}
+        )
+        self.assertEqual([entry["path"] for entry in result["files"]], ["README.md"])
+        self.assertEqual(
+            result["skipped"], [{"path": "manifests/app.yaml", "reason": "requestBudget"}]
+        )
+
+    def test_the_path_count_is_capped(self):
+        handle = self.open_workspace()["handle"]
+        self.store.max_entries = 1
+        with self.assertRaises(WorkspaceError) as caught:
+            self.store.read({"handle": handle, "paths": ["README.md", "README.md"]})
+        self.assertEqual(caught.exception.status, 413)
+
+    def test_an_empty_list_is_refused_rather_than_read_as_no_paths(self):
+        handle = self.open_workspace()["handle"]
+        with self.assertRaises(WorkspaceError):
+            self.store.read({"handle": handle, "paths": []})
+
+
+class GrepTest(StoreTestCase):
+    def test_a_match_carries_path_line_and_text(self):
+        handle = self.open_workspace()["handle"]
+        result = self.store.grep({"handle": handle, "pattern": "replicas"})
+        self.assertEqual(
+            result["matches"],
+            [{"path": "manifests/app.yaml", "line": 1, "text": "replicas: 1"}],
+        )
+        self.assertEqual(result["total"], 1)
+        self.assertFalse(result["truncated"])
+
+    def test_no_match_is_an_empty_answer_rather_than_an_error(self):
+        handle = self.open_workspace()["handle"]
+        result = self.store.grep({"handle": handle, "pattern": "nothing-here"})
+        self.assertEqual(result["matches"], [])
+        self.assertEqual(result["total"], 0)
+
+    def test_a_prefix_narrows_the_search(self):
+        handle = self.open_workspace()["handle"]
+        result = self.store.grep(
+            {"handle": handle, "pattern": "e", "prefix": "manifests"}
+        )
+        self.assertEqual({m["path"] for m in result["matches"]}, {"manifests/app.yaml"})
+
+    def test_a_pattern_starting_with_a_dash_is_a_pattern(self):
+        """`-e` carries it, so `--untracked` cannot arrive as an option."""
+        handle = self.open_workspace()["handle"]
+        root = self.store._workspaces[handle].root
+        (root / "manifests" / "app.yaml").write_text("--untracked: yes\n")
+        result = self.store.grep({"handle": handle, "pattern": "--untracked"})
+        self.assertEqual(
+            [m["path"] for m in result["matches"]], ["manifests/app.yaml"]
+        )
+
+    def test_fixed_string_by_default_and_regex_on_request(self):
+        handle = self.open_workspace()["handle"]
+        fixed = self.store.grep({"handle": handle, "pattern": "replicas: ."})
+        self.assertEqual(fixed["matches"], [])
+        expression = self.store.grep(
+            {"handle": handle, "pattern": "replicas: .", "regex": True}
+        )
+        self.assertEqual(len(expression["matches"]), 1)
+
+    def test_an_unparseable_expression_is_a_400_and_not_a_crash(self):
+        handle = self.open_workspace()["handle"]
+        with self.assertRaises(WorkspaceError) as caught:
+            self.store.grep({"handle": handle, "pattern": "replicas[", "regex": True})
+        self.assertEqual(caught.exception.status, 400)
+        self.assertEqual(caught.exception.fields.get("code"), "BAD_PATTERN")
+
+    def test_case_folding_is_opt_in(self):
+        handle = self.open_workspace()["handle"]
+        self.assertEqual(self.store.grep({"handle": handle, "pattern": "REPLICAS"})["total"], 0)
+        self.assertEqual(
+            self.store.grep(
+                {"handle": handle, "pattern": "REPLICAS", "ignoreCase": True}
+            )["total"],
+            1,
+        )
+
+    def test_the_match_count_is_capped_and_says_so(self):
+        handle = self.open_workspace()["handle"]
+        root = self.store._workspaces[handle].root
+        (root / "many.txt").write_text("hit\n" * 10)
+        self.store._git(self.store._workspaces[handle], "add", "-A")
+        self.store.max_matches = 3
+        result = self.store.grep({"handle": handle, "pattern": "hit"})
+        self.assertEqual(len(result["matches"]), 3)
+        self.assertEqual(result["total"], 10)
+        self.assertTrue(result["truncated"])
+
+    def test_a_long_line_is_cut_and_flagged(self):
+        handle = self.open_workspace()["handle"]
+        root = self.store._workspaces[handle].root
+        (root / "manifests" / "app.yaml").write_text("replicas: " + "9" * 4000 + "\n")
+        self.store.max_match_chars = 20
+        match = self.store.grep({"handle": handle, "pattern": "replicas"})["matches"][0]
+        self.assertEqual(len(match["text"]), 20)
+        self.assertTrue(match["truncated"])
+
+    def test_the_git_directory_is_never_searched(self):
+        """`git grep` reads tracked files, so no pattern reaches `.git/config`."""
+        handle = self.open_workspace()["handle"]
+        result = self.store.grep({"handle": handle, "pattern": "url", "regex": True})
+        self.assertFalse(any(m["path"].startswith(".git") for m in result["matches"]))
+
+    def test_a_pattern_must_be_a_non_empty_string(self):
+        handle = self.open_workspace()["handle"]
+        for pattern in (None, "", "   ", 17, "two\nlines"):
+            with self.subTest(pattern=pattern), self.assertRaises(WorkspaceError):
+                self.store.grep({"handle": handle, "pattern": pattern})
+
+
+class DepthTest(StoreTestCase):
+    """Shallow clones, which is what reading an unfamiliar repository takes.
+
+    The remote is addressed as `file://` here rather than as a path: git ignores
+    `--depth` on a local-path clone and says so on stderr, so a test written
+    against a path would assert the protocol while exercising a full clone.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.url_map = {"https://github.com/acme/infra.git": f"file://{self.remote}"}
+
+    def _seed_a_second_commit(self) -> None:
+        seed = self.tmp / "seed"
+        (seed / "README.md").write_text("seed two\n")
+        self._git(seed, "commit", "--quiet", "-am", "second")
+        self._git(seed, "push", "--quiet", str(self.remote), "main")
+
+    def test_depth_opens_one_commit_and_marks_the_workspace_shallow(self):
+        self._seed_a_second_commit()
+        result = self.store.open({"repo": "acme/infra", "depth": 1})
+        self.assertTrue(result["shallow"])
+        self.assertEqual(result["base"], "main")
+        root = self.store._workspaces[result["handle"]].root
+        history = self._git(root, "rev-list", "--count", "HEAD").stdout.strip()
+        self.assertEqual(history, "1")
+
+    def test_a_shallow_workspace_reads_like_any_other(self):
+        handle = self.store.open({"repo": "acme/infra", "depth": 1})["handle"]
+        self.assertEqual(
+            base64.b64decode(
+                self.store.read({"handle": handle, "path": "README.md"})["contentBase64"]
+            ),
+            b"seed\n",
+        )
+        self.assertEqual(self.store.list({"handle": handle})["total"], 2)
+        self.assertEqual(self.store.grep({"handle": handle, "pattern": "seed"})["total"], 1)
+
+    def test_a_shallow_workspace_refuses_to_commit(self):
+        """Refused at the request that is wrong, not three verbs later."""
+        handle = self.store.open({"repo": "acme/infra", "depth": 1})["handle"]
+        with self.assertRaises(WorkspaceError) as caught:
+            self.store.commit(
+                {
+                    "handle": handle,
+                    "branch": "fix/x",
+                    "message": "m",
+                    "changes": [{"path": "a.yaml", "contentBase64": b64("x\n")}],
+                }
+            )
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "SHALLOW_WORKSPACE")
+
+    def test_depth_and_branch_are_refused_together(self):
+        with self.assertRaises(WorkspaceError):
+            self.store.open({"repo": "acme/infra", "depth": 1, "branch": "fix/x"})
+
+    def test_depth_must_be_a_positive_integer(self):
+        for value in (0, -1, "1", True, 1.5):
+            with self.subTest(value=value), self.assertRaises(WorkspaceError):
+                validate_depth(value)
+        self.assertIsNone(validate_depth(None))
+        self.assertEqual(validate_depth(5), 5)
+
+    def test_a_named_base_is_honoured_on_a_shallow_clone(self):
+        result = self.store.open({"repo": "acme/infra", "base": "main", "depth": 1})
+        self.assertEqual(result["base"], "main")
+        self.assertEqual(result["startedFrom"], "origin/main")
+
+
+class CloneCeilingTest(StoreTestCase):
+    def test_a_clone_over_the_ceiling_is_refused_and_leaves_nothing_behind(self):
+        self.store.max_clone_bytes = 1
+        with self.assertRaises(WorkspaceError) as caught:
+            self.store.open({"repo": "acme/infra"})
+        self.assertEqual(caught.exception.status, 413)
+        self.assertEqual(caught.exception.fields.get("code"), "CLONE_TOO_LARGE")
+        self.assertEqual(list(self.trees.iterdir()), [])
+        self.assertEqual(self.store._workspaces, {})
+
+    def test_a_clone_that_fails_leaves_nothing_behind(self):
+        """No handle comes back, so nothing would ever collect the debris."""
+        self.url_map["https://github.com/acme/missing.git"] = str(self.tmp / "absent.git")
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.store.open({"repo": "acme/missing"})
+        self.assertEqual(list(self.trees.iterdir()), [])
 
 
 class CommitTest(StoreTestCase):
@@ -769,7 +1056,9 @@ class ResponseShapeTest(StoreTestCase):
         handle = self.open_workspace()["handle"]
         responses = [
             self.store.read({"handle": handle, "path": "README.md"}),
+            self.store.read({"handle": handle, "paths": ["README.md", "nope"]}),
             self.store.list({"handle": handle}),
+            self.store.grep({"handle": handle, "pattern": "replicas"}),
             self.store.commit(
                 {
                     "handle": handle,

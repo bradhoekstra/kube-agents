@@ -162,6 +162,21 @@ class WorkspaceRequestError(RuntimeError):
         self.payload = payload
 
 
+class Listing(list):
+    """The entries `list` returned, plus what it did not return.
+
+    A plain list, so every existing caller keeps working, carrying the two
+    fields that say whether it is the whole answer. A listing that stops at the
+    broker's ceiling and looks complete is how a caller ends up asking `read`
+    for a path it inferred rather than one it saw.
+    """
+
+    def __init__(self, entries, total: int = 0, truncated: bool = False) -> None:
+        super().__init__(entries)
+        self.total = total or len(self)
+        self.truncated = truncated
+
+
 class Workspace:
     """A git repository the broker owns and this process cannot see.
 
@@ -191,6 +206,7 @@ class Workspace:
         self.base = opened["base"]
         self.base_sha = opened["baseSha"]
         self.started_from = opened.get("startedFrom", "")
+        self.shallow = bool(opened.get("shallow", False))
         self.branch: str | None = None
         self._closed = False
 
@@ -201,6 +217,7 @@ class Workspace:
         repo: str,
         base: str | None = None,
         branch: str | None = None,
+        depth: int | None = None,
     ) -> "Workspace":
         """`branch` names the branch this session will commit to, if known.
 
@@ -208,12 +225,17 @@ class Workspace:
         already exists on the remote -- a second round of review feedback -- the
         broker checks that out rather than the base, so a file read here is the
         file as the pull request has it.
+
+        `depth` opens a shallow single-branch clone for reading. The broker
+        refuses `commit` on one and refuses `depth` together with `branch`.
         """
         payload = {"repo": repo}
         if base:
             payload["base"] = base
         if branch:
             payload["branch"] = branch
+        if depth:
+            payload["depth"] = depth
         return cls(endpoint, _workspace_call(endpoint, "open", payload))
 
     def read(self, path: str) -> bytes:
@@ -225,11 +247,62 @@ class Workspace:
     def read_text(self, path: str, encoding: str = "utf-8") -> str:
         return self.read(path).decode(encoding)
 
-    def list(self, prefix: str | None = None) -> list[dict]:
+    def read_many(self, paths: list[str]) -> tuple[dict[str, bytes], list[dict]]:
+        """Several files in one round trip.
+
+        Returns what came back and what did not, the second as the broker's own
+        `{path, reason}` records. A caller that ignores the second half will
+        materialise a partial tree and not know it -- `requestBudget` means ask
+        again for the rest, and `tooLarge` means that file is never coming.
+        """
+        result = _workspace_call(
+            self.endpoint, "read", {"handle": self.handle, "paths": list(paths)}
+        )
+        files = {
+            entry["path"]: base64.b64decode(entry["contentBase64"])
+            for entry in result.get("files", [])
+        }
+        return files, result.get("skipped", [])
+
+    def list(self, prefix: str | None = None, after: str | None = None) -> Listing:
+        """One page of tracked names. `after` is the last path of the page before.
+
+        `total` on the result counts what is still in scope after the cursor, so
+        a caller pages until `truncated` is false.
+        """
         payload = {"handle": self.handle}
         if prefix:
             payload["prefix"] = prefix
-        return _workspace_call(self.endpoint, "list", payload)["entries"]
+        if after:
+            payload["after"] = after
+        result = _workspace_call(self.endpoint, "list", payload)
+        return Listing(
+            result.get("entries", []),
+            total=result.get("total", 0),
+            truncated=bool(result.get("truncated")),
+        )
+
+    def grep(
+        self,
+        pattern: str,
+        prefix: str | None = None,
+        regex: bool = False,
+        ignore_case: bool = False,
+    ) -> dict:
+        """Search the checked-out tree. Fixed-string unless `regex` is set.
+
+        The whole answer, `{matches, total, truncated}`, rather than the matches
+        alone: a search that hit the broker's ceiling and looks complete sends a
+        reader off with a wrong conclusion about the repository.
+        """
+        payload = {"handle": self.handle, "pattern": pattern}
+        if prefix:
+            payload["prefix"] = prefix
+        if regex:
+            payload["regex"] = True
+        if ignore_case:
+            payload["ignoreCase"] = True
+        return _workspace_call(self.endpoint, "grep", payload)
 
     def commit(
         self,

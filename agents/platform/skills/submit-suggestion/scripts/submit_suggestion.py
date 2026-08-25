@@ -201,7 +201,18 @@ def open_handle(args) -> "credential_proxy_client.Workspace":
 def handle_list(args) -> int:
     """What the repository holds, without a checkout to look in."""
     entries = open_handle(args).list(args.prefix)
-    print(json.dumps({"entries": entries}))
+    # `truncated` is reported rather than swallowed. A listing that stopped at
+    # the broker's ceiling and looks complete is how the next `fetch` ends up
+    # naming a path nobody saw.
+    print(
+        json.dumps(
+            {
+                "entries": entries,
+                "total": entries.total,
+                "truncated": entries.truncated,
+            }
+        )
+    )
     return 0
 
 

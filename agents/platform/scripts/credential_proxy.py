@@ -1848,7 +1848,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return payload
 
     def _handle_workspace_post(self) -> None:
-        """The content-passing routes: open, read, list, commit, push, close.
+        """The content-passing routes: open, read, list, grep, commit, push, close.
 
         Serialised on one lock. The trees are shared mutable state and a commit
         is a sequence of git invocations that assume nothing moved underneath
@@ -1870,6 +1870,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             "open": self.workspace_store.open,
             "read": self.workspace_store.read,
             "list": self.workspace_store.list,
+            "grep": self.workspace_store.grep,
             "commit": self.workspace_store.commit,
             "push": self.workspace_store.push,
             "close": self.workspace_store.close,
