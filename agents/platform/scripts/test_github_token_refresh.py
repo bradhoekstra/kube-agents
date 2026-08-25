@@ -75,6 +75,9 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         # avoid, and it must not be reached at all.
         fetch.return_value = "an.id.token"
         response = MagicMock()
+        # status is compared against 500 before the body is read, so a bare
+        # MagicMock here is a TypeError rather than a 200.
+        response.__enter__.return_value.status = 200
         response.__enter__.return_value.read.return_value = b"ghs_installation_token"
         urlopen.return_value = response
 
@@ -98,6 +101,9 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         fetch.return_value = None
         run.return_value = MagicMock(stdout="gcloud.id.token\n")
         response = MagicMock()
+        # status is compared against 500 before the body is read, so a bare
+        # MagicMock here is a TypeError rather than a 200.
+        response.__enter__.return_value.status = 200
         response.__enter__.return_value.read.return_value = b"ghs_installation_token"
         urlopen.return_value = response
 
