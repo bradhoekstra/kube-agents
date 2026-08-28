@@ -898,6 +898,76 @@ func TestSandboxWrappersPostToLoopbackWhenColocated(t *testing.T) {
 	}
 }
 
+func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testing.T) {
+	// The standalone pod holds every credential the install has, and its endpoint
+	// authenticates no caller — so this policy is the whole boundary in front of
+	// it. Untested, a refactor can widen it back to the namespace and nothing
+	// fails.
+	agent := shellSandboxTestAgent()
+	if credentialProxyColocated(agent) {
+		t.Fatal("this agent is meant to exercise the standalone proxy placement")
+	}
+	np := buildCredentialProxyNetworkPolicy(agent)
+
+	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
+		t.Fatalf("expected ingress-only, got %v — egress is #720's, but naming it here without rules would cut the proxy off from GKE and the token broker", np.Spec.PolicyTypes)
+	}
+	if len(np.Spec.PodSelector.MatchLabels) == 0 {
+		t.Fatal("an empty podSelector applies the policy to every pod in the namespace")
+	}
+
+	if len(np.Spec.Ingress) != 1 {
+		t.Fatalf("expected exactly one ingress rule, got %d", len(np.Spec.Ingress))
+	}
+	in := np.Spec.Ingress[0]
+	if len(in.From) != 2 {
+		t.Fatalf("expected exactly two peers (sandbox, gateway), got %#v", in.From)
+	}
+	// A peer with a nil PodSelector matches every pod, and a NamespaceSelector
+	// widens it past this namespace. Either reads as a peer list in `kubectl get`.
+	for i, peer := range in.From {
+		if peer.PodSelector == nil || len(peer.PodSelector.MatchLabels) == 0 {
+			t.Fatalf("peer %d has no pod selector, which admits every pod", i)
+		}
+		if peer.NamespaceSelector != nil || peer.IPBlock != nil {
+			t.Errorf("peer %d reaches outside the namespace: %#v", i, peer)
+		}
+	}
+	if got := in.From[0].PodSelector.MatchLabels; got["app"] != shellSandboxSelector(agent)["app"] {
+		t.Errorf("first peer = %v, want the sandbox pod", got)
+	}
+	if got := in.From[1].PodSelector.MatchLabels["app"]; got != "test-agent-gateway" {
+		t.Errorf("second peer app = %q, want the gateway pod", got)
+	}
+
+	if len(in.Ports) != 1 || in.Ports[0].Port.IntValue() != credentialProxyPort {
+		t.Errorf("expected ingress only on %d, got %#v", credentialProxyPort, in.Ports)
+	}
+}
+
+func TestCredentialProxyNetworkPolicySelectsItsOwnPod(t *testing.T) {
+	// The policy, the Service, and the Deployment agree on one label set, or the
+	// policy constrains a pod that does not exist while the real one is open.
+	agent := shellSandboxTestAgent()
+	deploy := buildCredentialProxyDeployment(agent, "policy-hash")
+	podLabels := deploy.Spec.Template.ObjectMeta.Labels
+
+	for name, selector := range map[string]map[string]string{
+		"NetworkPolicy.podSelector": buildCredentialProxyNetworkPolicy(agent).Spec.PodSelector.MatchLabels,
+		"Service.spec.selector":     buildCredentialProxyService(agent).Spec.Selector,
+		"Deployment.spec.selector":  deploy.Spec.Selector.MatchLabels,
+	} {
+		if len(selector) == 0 {
+			t.Errorf("%s is empty, which selects every pod in the namespace", name)
+		}
+		for k, v := range selector {
+			if podLabels[k] != v {
+				t.Errorf("%s wants %s=%s, which the pod template does not carry (%v)", name, k, v, podLabels)
+			}
+		}
+	}
+}
+
 func TestColocatedSandboxAdmitsTheGatewayOnTheProxyPort(t *testing.T) {
 	// The relay clients are the one caller that is genuinely remote: the shell
 	// reaches the proxy on loopback, which no NetworkPolicy sees.
