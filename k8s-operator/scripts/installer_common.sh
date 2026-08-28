@@ -16,6 +16,17 @@
 # one home here so the entry points cannot drift apart.
 DEFAULT_CLUSTER_NAME="platform-agent-host"
 DEFAULT_REGION="us-central1"
+# Autopilot, because it is the shape this project is developed and validated
+# against: the autopush and staging installs already run it, the chart needs no
+# node pool, and gVisor comes from Autopilot's built-in RuntimeClass rather than
+# a dedicated pool. Standard remains a first-class choice and is what
+# --cluster-mode=standard, CLUSTER_MODE=standard, or a hand-written tfvars
+# selects; it is also required for a zonal install, which Autopilot cannot do.
+#
+# This decides ONE thing: the shape a FRESH install creates. It never reaches a
+# cluster that already exists -- see write_tfvars_from_state, where every branch
+# with a live cluster takes its mode from the probe instead.
+DEFAULT_CLUSTER_MODE="autopilot"
 # Vertex serves each model from its own subset of locations, and the cluster's
 # region is usually not one of them -- gemini-3.5-flash, the vertex_ai default,
 # is not served from us-central1 (DEFAULT_REGION), so a region-derived default
@@ -50,7 +61,96 @@ is_valid_model_provider() {
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
 # read-only in every one of them; see the site's reference/security-and-iam.
 is_valid_permission_set() {
-  [[ "${1:-}" =~ ^(read-only|gke-admin|custom)$ ]]
+  [[ "${1:-}" =~ ^(read-only|custom)$ ]]
+}
+
+# Accept a permission set, or report why not and return non-zero. Every front
+# door routes its check through here so the three of them cannot drift into
+# accepting different vocabularies -- and so the one value that needs an
+# explanation gets the same one everywhere.
+#
+# `gke-admin` was removed rather than deprecated because it did not merely widen
+# the ceiling, it removed one. GKE authorizes an action if EITHER IAM or
+# Kubernetes RBAC allows it, so a GSA holding roles/container.admin is authorized
+# by IAM no matter how narrow the KSA's RBAC is -- and roles/container.admin is
+# the one predefined GKE role carrying container.clusters.impersonate. GKE grants
+# IAM roles at the project level (a cluster is not a resource an IAM policy can
+# attach to), so that impersonation covers every cluster in the project and the
+# grant cannot be narrowed to one. An operator who genuinely needs broad roles
+# uses `custom` and lists them, which makes the grant explicit and reviewable
+# instead of hiding it behind one word.
+#
+# The removed value is named separately from the generic error so that a cached
+# vars.sh, a GitHub environment variable, or a --permission-set flag written
+# before the removal fails with an explanation rather than a bare "invalid".
+# Follows this file's contract: the caller defines print_error.
+require_supported_permission_set() {
+  # Normalised here rather than left to the caller. common.sh trims and
+  # lowercases before calling; install.sh passes --permission-set through raw,
+  # so without this `--permission-set=GKE-ADMIN` fell past the named arm and
+  # got the generic "invalid" instead of the explanation this function exists
+  # to give. The uppercase spelling is not hypothetical: it is what a GitHub
+  # environment variable or a hand-edited vars.sh tends to carry.
+  local value
+  value=$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+  if [ "$value" = "gke-admin" ]; then
+    print_error "The 'gke-admin' permission set has been removed: roles/container.admin authorizes the agent through IAM regardless of its Kubernetes RBAC, and the container.clusters.impersonate it carries applies to every cluster in the project. Use 'read-only', or 'custom' with an explicit role list if you accept that risk."
+    return 1
+  fi
+  if ! is_valid_permission_set "$value"; then
+    print_error "Invalid Platform Agent Permission Set '$value'. Must be one of: read-only, custom."
+    return 1
+  fi
+  return 0
+}
+
+# Roles that hand the agent the authority the removed `gke-admin` bundle did.
+# Kept in step with FORBIDDEN_ROLES in tests/test_agent_iam_ceiling.py, which is
+# what asserts no built-in set grants any of them.
+OVERREACHING_AGENT_ROLES="roles/container.admin roles/container.clusterAdmin roles/container.developer roles/container.hostServiceAgentUser roles/monitoring.admin roles/logging.admin roles/owner roles/editor roles/iam.serviceAccountTokenCreator"
+
+# Warn when a `custom` role list reaches the ceiling `gke-admin` was removed for.
+#
+# `custom` is the supported way to widen, and the argument for it is that naming
+# each role puts the grant somewhere a reviewer sees it. That argument does not
+# hold on the installer path: --custom-roles goes into a machine-generated
+# terraform.tfvars nobody opens, so `--permission-set=custom
+# --custom-roles="roles/container.admin"` reaches IAM-identical authority to the
+# bundle that was removed, silently. This does not refuse it -- an operator who
+# means it is entitled to it -- it just declines to let it happen quietly.
+#
+# Returns 0 always: this is a warning, not a gate. Caller defines print_warning.
+warn_on_overreaching_custom_roles() {
+  local roles="${1:-}"
+  local found=""
+  local role listed
+  for role in $OVERREACHING_AGENT_ROLES; do
+    for listed in ${roles//,/ }; do
+      if [ "$listed" = "$role" ]; then
+        found="${found}${found:+, }${role}"
+      fi
+    done
+  done
+  if [ -n "$found" ]; then
+    print_warning "The custom role list grants ${found}. GKE authorizes on either IAM or Kubernetes RBAC, so a role like roles/container.admin authorizes the agent through IAM regardless of how narrow its Kubernetes RBAC is -- this is the authority the removed 'gke-admin' set granted, reached the long way round. Continuing; grant it only if you mean to."
+  fi
+  return 0
+}
+
+# The cluster shapes the gke-cluster module can build. Matches the module's own
+# variable validation, so a bad value fails at the interview rather than at
+# terraform validate with the cluster interview already paid for.
+# True when a location names a region (us-central1) rather than a zone
+# (us-central1-a). Autopilot clusters are regional, so this is what decides
+# whether the default shape is creatable at a given location. One home for the
+# pattern: install.sh both demotes the default and validates an explicit
+# --cluster-mode against it, and the two must agree.
+location_is_region() {
+  [[ "${1:-}" =~ ^[a-z]+-[a-z]+[0-9]+$ ]]
+}
+
+is_valid_cluster_mode() {
+  [[ "${1:-}" =~ ^(autopilot|standard)$ ]]
 }
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────
@@ -371,8 +471,20 @@ write_tfvars_from_state() {
   # install the moment a front door regenerated tfvars against it — the
   # autopilot resource's count went to 0, so uninstall's targeted
   # deletion-protection apply and upgrade's full apply both became cluster
-  # replacements. A fresh create keeps "standard", the installer's default shape.
-  local create_cluster="true" cluster_mode="standard" autopilot_enabled=""
+  # replacements.
+  #
+  # CLUSTER_MODE (install.sh --cluster-mode, persisted to vars.sh) therefore
+  # decides ONE case: the fresh create, where the probe found no cluster and
+  # the interview is the only information there is. Every branch on which a
+  # cluster exists assigns cluster_mode from the probe, so a stale or
+  # hand-edited CLUSTER_MODE cannot reach a live cluster's tfvars — which
+  # matters because uninstall.sh and upgrade.sh also regenerate through here
+  # and have no flag to correct a wrong value with.
+  # The initialiser is never the answer: both probe branches below assign, and
+  # the fresh-create branch assigns from CLUSTER_MODE. It tracks
+  # DEFAULT_CLUSTER_MODE only so the default has one spelling.
+  local create_cluster="true" cluster_mode="${DEFAULT_CLUSTER_MODE}" autopilot_enabled=""
+  local cluster_exists="false"
   # `trap - ERR` inside the substitution: under bash 3.2 (macOS's default)
   # the caller's inherited ERR trap fires in this subshell even though the
   # failure is the tested condition, printing an abort banner and writing a
@@ -380,9 +492,14 @@ write_tfvars_from_state() {
   if autopilot_enabled=$(trap - ERR; gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(autopilot.enabled)" 2>/dev/null); then
+    cluster_exists="true"
+    # Both branches assign: the probe is the answer, not a chance to override
+    # the initialiser.
     if [ "$autopilot_enabled" = "True" ]; then
       cluster_mode="autopilot"
       print_info "Cluster '${CLUSTER_NAME}' is an Autopilot cluster; generating cluster_mode = \"autopilot\"."
+    else
+      cluster_mode="standard"
     fi
     if tf_state_has_cluster; then
       print_info "Cluster '${CLUSTER_NAME}' exists and is managed by this install's Terraform state."
@@ -392,9 +509,11 @@ write_tfvars_from_state() {
     fi
   else
     # Only a genuine NOT_FOUND means "create it". Reading any other failure —
-    # auth expiry, a network blip — as absence would regenerate
-    # cluster_mode="standard"/create_cluster=true against a live Autopilot
-    # install and plan its replacement under -auto-approve. Refuse to guess.
+    # auth expiry, a network blip — as absence would regenerate the configured
+    # shape with create_cluster=true against a live cluster of the OTHER shape
+    # and plan its replacement under -auto-approve. That is a risk in both
+    # directions and does not depend on which mode is the default. Refuse to
+    # guess.
     local describe_err
     describe_err="$({ gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
@@ -404,6 +523,16 @@ write_tfvars_from_state() {
       print_info "Refusing to guess between creating and adopting — a wrong guess can plan a live cluster's replacement. Fix the gcloud error and re-run."
       return 1
     fi
+    # Confirmed absent, so nothing live can be reshaped by getting this wrong:
+    # the interview's choice is the only shape on offer.
+    cluster_mode="${CLUSTER_MODE:-$DEFAULT_CLUSTER_MODE}"
+    if ! is_valid_cluster_mode "$cluster_mode"; then
+      print_error "CLUSTER_MODE='${cluster_mode}' is not a cluster shape this install can create. Use autopilot or standard."
+      return 1
+    fi
+    # Not "creating a cluster": uninstall.sh reaches this branch too, on an
+    # install whose cluster is already gone.
+    print_info "Cluster '${CLUSTER_NAME}' does not exist; generating cluster_mode = \"${cluster_mode}\" from the configured shape."
   fi
 
   # The generator's create/adopt decision, exported for the callers that need
@@ -411,6 +540,11 @@ write_tfvars_from_state() {
   # cluster this install created, never on an adopted one it does not own.
   TFVARS_CREATE_CLUSTER="$create_cluster"
   export TFVARS_CREATE_CLUSTER
+  # The shape the apply will actually use — probed when a cluster exists, the
+  # requested one only on a fresh create. install.sh reports this rather than
+  # the flag, so an adoption never claims to have built what it did not.
+  TFVARS_CLUSTER_MODE="$cluster_mode"
+  export TFVARS_CLUSTER_MODE
 
   # Installing onto an existing cluster: fetch its credentials now, before the
   # recovery loop below — adoption is exactly the case where the credentials
@@ -528,6 +662,13 @@ write_tfvars_from_state() {
     agent_runtime_class="gvisor"
     if [ "$cluster_mode" = "standard" ]; then
       gvisor_node_pool="true"
+    elif [ "$cluster_exists" = "false" ]; then
+      # An Autopilot cluster this run is about to create comes up on its
+      # release channel's current version, which has been past the floor since
+      # 2023. There is nothing to describe yet, so checking would only produce
+      # the "could not read the version" warning below on every fresh
+      # --cluster-mode=autopilot --gvisor=true install.
+      print_info "Creating Autopilot cluster '${CLUSTER_NAME}': using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     else
       # Autopilot's gvisor RuntimeClass arrived in a specific GKE version, and
       # asking an older cluster for it fails late and unrecognisably: the
@@ -539,8 +680,8 @@ write_tfvars_from_state() {
       # KMS, cert-manager and the release have all been applied, naming
       # nothing about a RuntimeClass. Refuse here instead, which is where the
       # gke-cluster module's precondition refuses the equivalent Standard
-      # mistake. cluster_mode is only "autopilot" because the describe above
-      # succeeded, so there is always a live cluster to ask.
+      # mistake. This branch is reached only when the describe above found a
+      # live Autopilot cluster, so there is always one to ask.
       #
       # `trap - ERR` as well as `|| true`, for the bash 3.2 reason the probe
       # above gives: a gcloud failure here is a best-effort miss, not an abort.
@@ -570,9 +711,9 @@ write_tfvars_from_state() {
     echo "cluster_name = $(hcl_str "${CLUSTER_NAME}")"
     echo "location     = $(hcl_str "${REGION}")"
     echo ""
-    echo "# The installer's default shape: a Standard cluster with the DNS endpoint"
-    echo "# open and no deletion protection. An existing cluster keeps its own"
-    echo "# mode — the generator probes the live cluster before writing this."
+    echo "# The DNS endpoint is open and deletion protection is off. cluster_mode is"
+    echo "# the live cluster's own shape whenever there is one to probe, and the"
+    echo "# --cluster-mode the install asked for only on a create."
     echo "cluster_mode               = $(hcl_str "${cluster_mode}")"
     echo "create_cluster             = ${create_cluster}"
     echo "allow_external_dns_traffic = true"

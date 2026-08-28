@@ -4804,15 +4804,12 @@ def _land_group_via_broker(
         proxy_endpoint(), repo, branch=branch
     ) as workspace:
         continuing = workspace.started_from == f"origin/{branch}"
-        try:
-            workspace.commit(
-                branch=branch,
-                message=group_commit_subject(audit_id, group),
-                changes=changes,
-            )
-        except credential_proxy_client.WorkspaceRequestError as exc:
-            if exc.payload.get("code") != "EMPTY_COMMIT":
-                raise
+        result = workspace.commit(
+            branch=branch,
+            message=group_commit_subject(audit_id, group),
+            changes=changes,
+        )
+        if not result["committed"]:
             # Nothing to commit means two different things, and reporting the
             # wrong one either hides a fix that is already up for review or
             # claims one that was never opened.

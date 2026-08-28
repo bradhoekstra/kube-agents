@@ -38,21 +38,10 @@ spec:
       {{- . | nindent 6 }}
     {{- end }}
     {{- $sandbox := (.Values.platformAgent.harness.experimental | default dict).shellSandbox | default dict }}
-    {{- /*
-      Same shape as the workloadIdentityFederation check below and for the same
-      reason: the flag reaches the credential proxy only through its co-located
-      placement, so with the sandbox off it renders onto the CR, changes no
-      manifest, and the skills keep passing directories. An install that asked
-      for content-passing and did not get it has no symptom to notice.
-    */}}
-    {{- if and $sandbox.contentWorkspaces (not $sandbox.enabled) }}
-    {{- fail "platformAgent.harness.experimental.shellSandbox.contentWorkspaces has no effect without shellSandbox.enabled: the content-passing routes are served by the credential proxy that runs beside the sandbox" }}
-    {{- end }}
     {{- with include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
-          "runtimeClassName" $sandbox.runtimeClassName
-          "contentWorkspaces" $sandbox.contentWorkspaces) }}
+          "runtimeClassName" $sandbox.runtimeClassName) }}
     experimental:
       shellSandbox:
         {{- . | nindent 8 }}
@@ -81,8 +70,10 @@ spec:
       The operator applies spec.deployment.env AFTER its own container env, so
       anything set here wins. That is the only way to reach settings the operator
       computes rather than exposes — OTEL_SDK_DISABLED being the one that matters
-      in practice, since the telemetry ladder always resolves to some endpoint and
-      a cluster with no collector otherwise retries a dead one forever.
+      in practice. The operator now sets it itself when discovery establishes the
+      cluster has no collector, so this is for the cases it will not decide:
+      discovery switched off, a pinned endpoint, or a collector you would rather
+      this agent did not export to.
     */}}
     {{- with .Values.platformAgent.deployment.env }}
     env:
@@ -135,6 +126,10 @@ spec:
   {{- with .Values.telemetry.otlpEndpoint }}
   telemetry:
     otlpEndpoint: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.platformAgent.networkPolicy }}
+  networkPolicy:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
   {{- if or $integ.github.gitRepo $integ.googleChat.enabled $integ.slack.enabled }}

@@ -307,6 +307,16 @@ def handle_submit_content(args) -> int:
         changes=changes,
         expected_base_sha=args.base_sha or None,
     )
+    if not result["committed"]:
+        # A submission whose files already match the branch. Refused rather
+        # than reported as success: the caller asked for a pull request, and
+        # answering "done" for a branch that may not have one is the wrong
+        # half of the ambiguity to guess at.
+        raise ValueError(
+            f"the files in {args.source} are already what '{branch}' holds, so "
+            "there is nothing to commit; check whether the pull request is "
+            "already open before submitting again"
+        )
     log(f"Committed {result['commit'][:12]} on '{branch}'; pushing...")
     workspace.push(branch)
 

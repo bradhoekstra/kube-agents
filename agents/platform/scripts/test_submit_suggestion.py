@@ -13,6 +13,7 @@ make most of this vacuous — `--force-with-lease` either refuses a diverged
 remote or it does not, and only a real push can tell you which.
 """
 
+import dataclasses
 import importlib.util
 import io
 import json
@@ -30,7 +31,17 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import content_workspace  # noqa: E402
+import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
+
+
+@dataclasses.dataclass
+class GitResult:
+    """What the broker's `_git` reads off a run: an exit code, not a returncode."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
 import gitops_workspace  # noqa: E402
 
 SUBJECT = (
@@ -570,27 +581,42 @@ class TestContentMode(SubmitSuggestionTestCase):
         # repo goes in at the runner, below the code under test.
         url = "https://github.com/acme/fleet.git"
 
-        def runner(argv, cwd, check=True):
+        def runner(argv, cwd):
             argv = [str(origin) if token == url else token for token in argv]
-            return subprocess.run(
-                argv, cwd=str(cwd), capture_output=True, text=True, check=check
+            completed = subprocess.run(
+                argv, cwd=str(cwd), capture_output=True, text=True
             )
+            return GitResult(completed.returncode, completed.stdout, completed.stderr)
 
         self.store = content_workspace.ContentWorkspaceStore(
             self.tmp_path / "broker" / "trees",
             self.tmp_path / "agent-workspace",
-            runner=runner,
+            runner,
         )
         self.verbs = []
+
+        # Routed through the broker's own handler rather than straight at the
+        # store, so the translation from payload to arguments is under test too.
+        route = credential_proxy.CredentialProxyHandler._workspace_route
+        store = self.store
+
+        class Router:
+            workspaces = store
 
         def call(endpoint, verb, payload):
             self.verbs.append(verb)
             try:
-                return getattr(self.store, verb)(payload)
-            except content_workspace.WorkspaceError as exc:
+                body = route(Router(), verb, payload)
+            except content_workspace.ContentWorkspaceError as exc:
                 raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status, {"error": str(exc), **exc.fields}
+                    exc.status,
+                    {"status": "blocked", "code": exc.code, "message": str(exc)},
                 ) from exc
+            if body is None:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    404, {"status": "not_found"}
+                )
+            return body
 
         self.patch_attr(credential_proxy_client, "_workspace_call", call)
         endpoint = patch.dict(
@@ -740,8 +766,11 @@ class TestContentMode(SubmitSuggestionTestCase):
         with self.assertRaises(credential_proxy_client.WorkspaceRequestError) as caught:
             self.submit_content(prepared, source)
         self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(
-            caught.exception.payload["paths"], ["clusters/prod/netpol.yaml"]
+        # The broker names the colliding files in the refusal itself rather than
+        # in a field of its own, so a caller that only prints the message still
+        # tells its reader which file to re-read.
+        self.assertIn(
+            "clusters/prod/netpol.yaml", caught.exception.payload["message"]
         )
         self.assertEqual(self.gh_calls, [])
 

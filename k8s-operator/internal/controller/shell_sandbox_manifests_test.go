@@ -846,43 +846,6 @@ func TestColocatedProxyRunsAsTheSandboxLogin(t *testing.T) {
 	}
 }
 
-func TestContentWorkspacesReachTheColocatedProxyOnly(t *testing.T) {
-	// The flag is the only deploy-time surface the content-passing protocol
-	// has: the agent side decides nothing, it probes the broker and takes
-	// whichever fork answers. So an install that sets the field and gets a
-	// broker without the routes is an install where every skill silently keeps
-	// writing into the shared tree, which is the property the field was set to
-	// remove.
-	env := func(c corev1.Container) (string, bool) {
-		for _, e := range c.Env {
-			if e.Name == "CREDENTIAL_PROXY_CONTENT_WORKSPACES" {
-				return e.Value, true
-			}
-		}
-		return "", false
-	}
-
-	off := colocatedTestAgent()
-	if _, ok := env(buildCredentialProxyContainer(off, true)); ok {
-		t.Error("content workspaces must be off unless asked for: the field defaults to false")
-	}
-
-	on := colocatedTestAgent()
-	on.Spec.Harness.Experimental.ShellSandbox.ContentWorkspaces = ptr.To(true)
-	value, ok := env(buildCredentialProxyContainer(on, true))
-	if !ok || value != "1" {
-		t.Errorf("CREDENTIAL_PROXY_CONTENT_WORKSPACES = %q present=%v, want \"1\"", value, ok)
-	}
-
-	// Standalone the proxy is a pod of its own with no agent sharing its
-	// filesystem, so the routes would guard nothing. Setting it there is a
-	// configuration mistake the chart refuses; the manifest builder is the
-	// second half of that, since a hand-applied CR skips the chart.
-	if _, ok := env(buildCredentialProxyContainer(on, false)); ok {
-		t.Error("the standalone proxy must not serve content workspaces: nothing shares a volume with it")
-	}
-}
-
 func TestColocatedTokenProjectionIsAudienceScoped(t *testing.T) {
 	agent := colocatedTestAgent()
 	volumes := buildCredentialProxyRuntimeVolumes(agent)
@@ -1110,5 +1073,82 @@ func TestExtraVolumeMountsGuardToleratesAnEmptyDeployment(t *testing.T) {
 	agent.Spec.Deployment = nil
 	if msg := validateExtraVolumeMounts(agent); msg != "" {
 		t.Fatalf("a CR with no deployment block was refused: %s", msg)
+	}
+}
+
+// The gateway Pod's own containers under the sandbox layout. Both of these
+// properties are asserted for the sidecar layout in platformagent_manifests_test.go
+// — against buildCredentialProxySidecar, which is not what renders here. The
+// switch in buildPodTemplateSpec means a regression in one branch leaves the
+// other's test green, so each branch needs its own.
+
+// TestShellSandboxAgentAPIAuthIsANativeSidecar is the sandbox half of
+// TestCredentialProxyBindsBeforeTheSandboxExists. The credential runtime leaves
+// this Pod, but the agent-API front door does not, and it inherits the port the
+// Service targets along with the race for it.
+func TestShellSandboxAgentAPIAuthIsANativeSidecar(t *testing.T) {
+	dep := buildDeployment(shellSandboxAgent(true), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
+	spec := dep.Spec.Template.Spec
+
+	if _, found := findContainer(spec, "envoy-credential-proxy"); found {
+		t.Error("the credential runtime is still in the gateway Pod; the sandbox layout moves it to the sandbox's")
+	}
+
+	auth, found := findContainer(spec, "agent-api-auth")
+	if !found {
+		t.Fatal("agent-api-auth is missing entirely; nothing is holding 8643 in this Pod")
+	}
+
+	inInit := false
+	for _, c := range spec.InitContainers {
+		if c.Name == "agent-api-auth" {
+			inInit = true
+		}
+	}
+	if !inInit {
+		t.Error("agent-api-auth is an ordinary container; it races the agent for port 8643")
+	}
+	if auth.RestartPolicy == nil || *auth.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Error("agent-api-auth lacks restartPolicy: Always, so it is not a native sidecar " +
+			"-- either it races the agent, or the kubelet waits forever for it to exit")
+	}
+
+	holds8643 := false
+	for _, p := range auth.Ports {
+		if p.ContainerPort == 8643 {
+			holds8643 = true
+		}
+	}
+	if !holds8643 {
+		t.Error("agent-api-auth no longer declares 8643; re-check what the Service targets")
+	}
+}
+
+// The event watcher stays in this Pod under the sandbox layout — it posts to the
+// Session KV server on loopback and has nowhere else to deliver — so the switch
+// that turns it off has to reach the container that now hosts it.
+func TestShellSandboxCarriesTheEventWatcherSwitch(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		enabled *bool
+		want    string
+	}{
+		{"unset", nil, "true"},
+		{"emergency stop", ptr.To(false), "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := shellSandboxAgent(true)
+			agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: tc.enabled}
+
+			var found []string
+			for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+				if e.Name == "EVENT_WATCHER_ENABLED" {
+					found = append(found, e.Value)
+				}
+			}
+			if len(found) != 1 || found[0] != tc.want {
+				t.Errorf("EVENT_WATCHER_ENABLED = %v, want exactly one %q", found, tc.want)
+			}
+		})
 	}
 }

@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
@@ -35,8 +36,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import audit_report  # noqa: E402
 import content_workspace  # noqa: E402
+import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+
+
+@dataclass
+class GitResult:
+    """What the broker's `_git` reads off a run: an exit code, not a returncode."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
+
 
 AUDIT = "compliance-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
@@ -8083,15 +8095,17 @@ class ContentModeTestCase(BaseTestCase):
             GIT_CONFIG_SYSTEM=os.devnull,
         )
 
-        def runner(argv, cwd, check=True):
+        def runner(argv, cwd):
             argv = [str(origin) if token == url else token for token in argv]
-            return subprocess.run(
+            completed = subprocess.run(
                 argv,
                 cwd=str(cwd),
                 env=env,
                 capture_output=True,
                 text=True,
-                check=check,
+            )
+            return GitResult(
+                completed.returncode, completed.stdout, completed.stderr
             )
 
         # The second argument is the agent's volume, and it is the real one:
@@ -8101,18 +8115,33 @@ class ContentModeTestCase(BaseTestCase):
         self.store = content_workspace.ContentWorkspaceStore(
             self.tmp_path / "broker" / "trees",
             self.gitops_root,
-            runner=runner,
+            runner,
         )
         self.verbs = []
+
+        # Through the broker's own router rather than straight at the store, so
+        # the payload-to-argument translation the real endpoint performs is the
+        # one under test here too. Only the socket is stubbed.
+        route = credential_proxy.CredentialProxyHandler._workspace_route
+        store = self.store
+
+        class Router:
+            workspaces = store
 
         def call(endpoint, verb, payload):
             self.verbs.append(verb)
             try:
-                return getattr(self.store, verb)(payload)
-            except content_workspace.WorkspaceError as exc:
+                body = route(Router(), verb, payload)
+            except content_workspace.ContentWorkspaceError as exc:
                 raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status, {"error": str(exc), **exc.fields}
+                    exc.status,
+                    {"status": "blocked", "code": exc.code, "message": str(exc)},
                 ) from exc
+            if body is None:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    404, {"status": "not_found"}
+                )
+            return body
 
         patcher = patch.object(credential_proxy_client, "_workspace_call", call)
         patcher.start()

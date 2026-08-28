@@ -191,6 +191,16 @@ opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
 collector, since without one the otel callback aborts every LLM request on DNS
 failure.
 
+`litellm.rollingUpdate.maxUnavailable` defaults to `1` so that a rollout can
+replace a Pod in place. Set it to `0` for a zero-downtime rollout, but only
+where the namespace has quota headroom for one more LiteLLM Pod: at `0` the
+surge Pod is mandatory, and a `ResourceQuota` with no room for it stalls the
+rollout instead of completing it. At the default `litellm.replicaCount` of 2 one
+replica keeps serving either way; at `replicaCount: 1` the default of `1` means
+a rollout drops the only Pod before its replacement is ready, so LiteLLM is
+unreachable for up to the three minutes its `startupProbe` allows. `values.yaml`
+states the trade in full.
+
 ### Hindsight memory store
 
 `hindsight.*` renders the agents' long-term memory store — the Hindsight API
@@ -263,15 +273,18 @@ the annotated KSA.
 
 ### Turning telemetry off
 
-The operator's endpoint ladder always resolves to something — a collector it
-discovers in the cluster, otherwise the GKE Managed OpenTelemetry collector — so
-`telemetry.otlpEndpoint` can move the exporter but cannot switch it off. On a
-cluster running neither (a plain `gke-cluster` module cluster has no
-`gke-managed-otel` namespace) the exporter then retries a hostname that never
-resolves, for the life of the pod.
+A cluster with no collector needs nothing done: when discovery completes and
+finds none — a plain `gke-cluster` module cluster has no `gke-managed-otel`
+namespace — the operator gives the agent no endpoint and sets
+`OTEL_SDK_DISABLED=true` itself. `status.telemetry.otlpEndpointSource` reads
+`None`, and the operator re-probes every 15 minutes, so installing a collector
+later turns export back on without a restart.
 
-`platformAgent.deployment.env` is the off switch. The operator applies it after
-its own container environment, so it wins:
+The manual switch is still there for the cases the operator will not decide:
+discovery switched off with `OTEL_COLLECTOR_DISCOVERY=false`, an endpoint pinned
+through `telemetry.otlpEndpoint`, or a collector that exists but that you do not
+want this agent exporting to. `platformAgent.deployment.env` is applied after the
+operator's own container environment, so it wins either way:
 
 ```yaml
 platformAgent:
@@ -280,6 +293,13 @@ platformAgent:
       - name: OTEL_SDK_DISABLED
         value: "true"
 ```
+
+Setting that value to `"false"` re-enables the SDK on a cluster where discovery
+found nothing, but on its own it does not produce a working exporter: the
+operator emitted no endpoint, so the SDK falls back to `http://localhost:4318`,
+and the NetworkPolicy it renders for a `None` agent carries no collector egress
+rule. Pair it with `telemetry.otlpEndpoint` if you want the export to land
+somewhere.
 
 Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
 
@@ -358,6 +378,26 @@ Exactly one owner creates the agent's KSA, depending on
 - **No annotations**: the operator treats the named KSA as user-managed and
   does not create it — the **chart** renders it instead, so a default install
   still starts.
+
+### Agent-RBAC admission policies
+
+`admissionPolicy.enabled` (default `true`) installs two cluster-scoped
+`ValidatingAdmissionPolicy` objects and their bindings, generated from
+`k8s-operator/config/admission/agent-rbac-policy.yaml`. They deny agent RBAC
+that grants a write or privilege-escalation verb, grants Secrets, or gives a
+namespace-tier agent ServiceAccount a cluster-scoped binding. They do **not**
+check the rules of a role a binding _references_ — CEL cannot read another
+object — and the content policy only selects manifests carrying the
+`kube-agents/tier` label; see that file's header.
+
+The template checks `.Capabilities.KubeVersion` as well as this value, so on a
+cluster below Kubernetes 1.30 — where the policy API is not yet `v1` — it
+renders nothing instead of failing the install. `Chart.yaml` accepts `>=1.29.0-0`,
+so that case is inside the supported range and has to work.
+
+Set `admissionPolicy.enabled=false` for a second kube-agents release in a cluster
+that already has them: the objects are cluster singletons with fixed names, so
+Helm refuses the second install on ownership rather than duplicating them.
 
 ## Uninstalling
 
@@ -456,8 +496,8 @@ helm uninstall kube-agents -n kubeagents-system
   manually when upgrading across CRD changes. Automating this (pre-upgrade
   hook) is deliberate follow-up scope; it first matters when upgrading between
   two published releases.
-- The CRD and RBAC manifests under this chart are generated copies of
-  `k8s-operator/config/` — edit the source and run `make chart-sync` (CI
-  enforces this via `make chart-check`).
+- The CRD, RBAC and admission-policy manifests under this chart are generated
+  copies of `k8s-operator/config/` — edit the source and run `make chart-sync`
+  (CI enforces this via `make chart-check`).
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.

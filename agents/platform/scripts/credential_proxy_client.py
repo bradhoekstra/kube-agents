@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import sys
@@ -12,6 +13,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from pathlib import Path
 
 
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
@@ -19,6 +21,94 @@ SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
 # Hostnames that mean "the proxy is in this pod", and therefore that a local
 # path means the same thing on both sides of the call.
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
+
+# How long to wait to reach the broker. Bounds the connect only — see
+# BrokerConnection.
+BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
+
+
+class BrokerConnection(http.client.HTTPConnection):
+    """Bound how long we wait to reach the broker, not how long it works.
+
+    A plain ``urlopen(request, timeout=N)`` sets one socket timeout for the
+    whole exchange, which would put a ceiling on the command as well as on the
+    connect. That ceiling must not exist: Envoy routes /v1/exec with
+    ``timeout: 0s`` deliberately, because a proxied ``gcloud container clusters
+    get-credentials`` or a large ``git clone`` legitimately runs for minutes.
+
+    Before the split there was no need for either — the broker was on the Pod's
+    own loopback, so a connect either succeeded or was refused at once. Now the
+    call crosses a Service. A Pending broker still fails fast, with
+    ``[Errno 111] Connection refused`` from a Service that has no endpoints;
+    what hangs is a SYN that is dropped rather than rejected, which is exactly
+    what a default-deny egress policy does. So: a timeout while connecting, and
+    none once connected.
+    """
+
+    def connect(self) -> None:
+        self.timeout = BROKER_CONNECT_TIMEOUT_SECONDS
+        super().connect()
+        self.sock.settimeout(None)
+
+
+class _BrokerHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(BrokerConnection, req)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect out of the broker.
+
+    urllib re-sends the Authorization header across a cross-host redirect, so
+    a 302 in a broker response would hand the projected token to wherever the
+    Location points. Only reachable by something that already controls the
+    broker's responses, but the header is the one thing worth not leaking on
+    the way out.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002
+        return None
+
+
+# A private opener rather than urllib.request.install_opener: this module is
+# imported by github_token_refresh and the two relay patches, and a global
+# opener would strip the total timeouts their own urlopen calls rely on.
+_BROKER_OPENER = urllib.request.build_opener(_BrokerHTTPHandler, _NoRedirect())
+
+
+def open_broker_request(request: urllib.request.Request):
+    """Send `request` to the broker with a bounded connect."""
+    return _BROKER_OPENER.open(request)
+
+
+class TokenUnavailable(Exception):
+    """The configured caller token could not be read."""
+
+
+def authorization_headers() -> dict[str, str]:
+    """Return the credential that identifies this caller to the broker.
+
+    Empty when CREDENTIAL_PROXY_TOKEN_FILE is unset, which is the sidecar
+    deployment: there the broker is reachable only on the Pod's own loopback,
+    behind a socket only its own container can open, and it asks for no
+    credential. When the broker runs in its own Pod the operator projects a
+    ServiceAccount token with the broker's audience into this container and
+    points this variable at it.
+
+    Read on every invocation, never cached: the kubelet rewrites a projected
+    token in place as it approaches expiry, and this process is short-lived
+    enough that re-reading costs nothing.
+    """
+    token_file = os.environ.get("CREDENTIAL_PROXY_TOKEN_FILE", "").strip()
+    if not token_file:
+        return {}
+    try:
+        token = Path(token_file).read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise TokenUnavailable(f"{token_file}: {exc.strerror or exc}") from exc
+    if not token:
+        raise TokenUnavailable(f"{token_file} is empty")
+    return {"Authorization": f"Bearer {token}"}
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. `git` and `gh` ignore the variable, so
@@ -107,14 +197,22 @@ def execute(
         request_payload,
         separators=(",", ":"),
     ).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers.update(authorization_headers())
+    except TokenUnavailable as exc:
+        # Sending the request anyway would earn an undifferentiated 401 and
+        # hide the real fault, which is a broken token projection.
+        print(f"credential proxy token unavailable: {exc}", file=sys.stderr)
+        return 1
     request = urllib.request.Request(
         endpoint.rstrip("/") + "/v1/exec",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request) as response:
+        with open_broker_request(request) as response:
             payload = json.load(response)
     except urllib.error.HTTPError as exc:
         # The proxy's own errors are JSON, but the error can also come from
@@ -157,7 +255,17 @@ class WorkspaceRequestError(RuntimeError):
     """The broker refused. `status` and `payload` carry its answer verbatim."""
 
     def __init__(self, status: int, payload: dict) -> None:
-        super().__init__(payload.get("error", f"workspace request failed ({status})"))
+        # Two spellings of the same field, because the broker has two error
+        # shapes: a refusal from `ContentWorkspaceError` answers `{status,
+        # code, message}`, while a malformed body answers `{error}`. Reading
+        # only one of them would render half the broker's refusals as the
+        # generic fallback below, which is the sentence that tells a caller
+        # nothing.
+        super().__init__(
+            payload.get("message")
+            or payload.get("error")
+            or f"workspace request failed ({status})"
+        )
         self.status = status
         self.payload = payload
 
@@ -339,7 +447,13 @@ class Workspace:
             payload["expectedBaseSha"] = expected_base_sha
         result = _workspace_call(self.endpoint, "commit", payload)
         self.branch = result["branch"]
-        self.base_sha = result["baseSha"]
+        # `committed: false` is an ordinary answer rather than an error -- a
+        # re-run whose fix is already on the branch has nothing to add -- and it
+        # carries neither a sha nor a commit. Callers read the flag; reading
+        # `result["commit"]` unconditionally is how that case turns into a
+        # KeyError several frames from the decision that produced it.
+        if result.get("baseSha"):
+            self.base_sha = result["baseSha"]
         return result
 
     def push(self, branch: str | None = None) -> dict:
@@ -389,14 +503,21 @@ def workspaces_available(endpoint: str) -> bool:
 
 def _workspace_call(endpoint: str, verb: str, payload: dict) -> dict:
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    # The same credential and the same opener `execute` uses. These routes
+    # spend the broker's GitHub token exactly as /v1/exec does, so a
+    # cross-Pod call that omitted the header would earn a 401, and one that
+    # went through the stock opener would carry a total socket timeout onto a
+    # clone that legitimately runs for minutes.
+    headers.update(authorization_headers())
     request = urllib.request.Request(
         endpoint.rstrip("/") + f"/v1/workspace/{verb}",
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request) as response:
+        with open_broker_request(request) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
         try:

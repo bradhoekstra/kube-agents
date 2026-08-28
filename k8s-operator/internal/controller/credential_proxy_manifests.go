@@ -252,14 +252,12 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent, colocated
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
+	// The role, the listen address and the caller authentication come from
+	// buildCredentialProxyEnv, which sets them for either way of moving the
+	// broker off the agent's Pod. Still 0.0.0.0 when co-located: the sandbox
+	// reaches the proxy on loopback, but the gateway reaches the chat relays
+	// hosted in the same process over the Service, and one listener serves both.
 	envVars := buildCredentialProxyEnv(agent)
-	envVars = append(envVars,
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "credentials"},
-		// Still 0.0.0.0 when co-located: the sandbox reaches the proxy on
-		// loopback, but the gateway reaches the chat relays hosted in the same
-		// process over the Service, and one listener serves both.
-		corev1.EnvVar{Name: "CREDENTIAL_PROXY_LISTEN_ADDRESS", Value: "0.0.0.0"},
-	)
 	volumeMounts := buildCredentialProxyVolumeMounts()
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
@@ -275,14 +273,6 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent, colocated
 			corev1.VolumeMount{Name: credentialProxyWIFTokenVolume, MountPath: credentialProxyWIFTokenPath, ReadOnly: true},
 		)
 		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: shellSandboxDataPath})
-		if shellSandboxContentWorkspaces(agent) {
-			// Only ever set co-located. The broker keeps its checkouts under the
-			// state dir, which is this container's own emptyDir either way, but
-			// content-passing exists to stop the agent reaching a `.git` — and
-			// standalone there is no agent container sharing a filesystem with
-			// this one, so the flag would arm routes nothing calls.
-			envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACES", Value: "1"})
-		}
 		// The sandbox login's uid, from deploy/sandbox/Dockerfile, because the
 		// entrypoint chowns the data volume to it and a shared tree neither side
 		// can fully write is not shared.
@@ -353,6 +343,15 @@ func buildCredentialProxyVolumeMounts() []corev1.VolumeMount {
 		// kubeconfig did not.
 		{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
 		{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
+		// The default-audience token and the cluster CA, which is what the
+		// TokenReview call needs — a broker off the agent's Pod authenticates
+		// its callers, and it authenticates itself to the API server with this.
+		// A different token from the one above: that one is audience-bound to
+		// the broker and is what the proxy *presents*, and an audience-bound
+		// token is not accepted as a client credential by the API server.
+		// AutomountServiceAccountToken is false on both Pods, so nothing
+		// projects this bundle unless it is asked for.
+		{Name: "event-watcher-ksa-token", MountPath: kubeAPIAccessMountPath, ReadOnly: true},
 	}
 }
 
@@ -486,6 +485,11 @@ var (
 		"credential-proxy-runtime":   true,
 		"event-watcher-kubeconfig":   true,
 		"credential-proxy-ksa-token": true,
+		// On both sides, and deliberately: it is a projection rather than a
+		// shared object, so each Pod gets its own. The watcher authenticates to
+		// the API server with it in the agent Pod, and the broker makes its
+		// TokenReview call with it here.
+		"event-watcher-ksa-token": true,
 	}
 )
 

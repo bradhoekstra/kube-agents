@@ -10,14 +10,17 @@
 #   k8s-event-watcher     watches cluster API servers and reports events
 #
 # CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
-# run in the same pod. `credentials` is the standalone credential-proxy pod:
-# Envoy and the credential runtime, which the sandbox reaches over a Service.
-# `agent-api` is what is left in the gateway pod — the watcher, which posts to
-# the Session KV server on that pod's loopback, and the API authenticator, which
-# forwards to the Hermes gateway on the same loopback. Neither of those is a
-# credential path the agent container can drive, which is the point of the
-# split. `full` is the pre-split arrangement and stays the default so an image
-# paired with an older operator behaves as it did.
+# run in the same pod. It is the same variable and the same three values
+# credential_proxy.py's resolve_role() reads; this script decides which
+# processes to launch and that function decides which halves of the runtime to
+# serve. `broker` is the credential pod: Envoy and the credential runtime, which
+# the sandbox reaches over a Service. `api-proxy` is what is left in the gateway
+# pod — the watcher, which posts to the Session KV server on that pod's
+# loopback, and the API authenticator, which forwards to the Hermes gateway on
+# the same loopback. Neither of those is a credential path the agent container
+# can drive, which is the point of the split. `combined` is the sidecar
+# arrangement and stays the default so an image paired with an older operator
+# behaves as it did.
 #
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
@@ -29,21 +32,30 @@
 # emergency stop for an event storm. See event_watcher_disabled below.
 set -euo pipefail
 
-CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-full}"
+# The sandbox runs as a different user (see the UID constants in the operator's
+# platformagent_manifests.go) and shares only the agent PVC with this container.
+# Proxied commands run here but write there — a clone, a commit, a kubeconfig pin
+# in a profile home — and the sandbox has to be able to change what they leave
+# behind. The shared fsGroup gives it the group; this gives the group write.
+# Credential state lives on this container's own emptyDir volumes, which nothing
+# else mounts, so the wider mode does not widen who can read a credential.
+umask 0002
+
+# Below the umask, and nothing goes above it: `tests/test_startup_umask.py`
+# asserts the umask is the first line here that could create a file, because one
+# sitting under a `mkdir` reads as the control while doing none of its job.
+#
+# Exported, not just assigned: the runtime reads the same variable, and an
+# unset one would otherwise reach it as its own default rather than as the one
+# defaulted here. Two defaults that have to agree is a way for them not to.
+export CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-combined}"
 case "${CREDENTIAL_PROXY_ROLE}" in
-  full | credentials | agent-api) ;;
+  combined | broker | api-proxy) ;;
   *)
     echo "start-services: unknown CREDENTIAL_PROXY_ROLE=${CREDENTIAL_PROXY_ROLE}" >&2
     exit 1
     ;;
 esac
-
-# Which interface Envoy's credential listener binds. Loopback is the default and
-# is what both co-located placements use: the listener authenticates no caller,
-# so being unreachable off the pod is the whole access control. The standalone
-# pod sets 0.0.0.0 and gives that up — see the caveat in
-# docs/designs/agent-shell-sandboxing.md, "Caller authentication".
-CREDENTIAL_PROXY_LISTEN_ADDRESS="${CREDENTIAL_PROXY_LISTEN_ADDRESS:-127.0.0.1}"
 
 # Watcher restart policy. The watcher is retried in place rather than being
 # allowed to end the container, so these bound how hard a permanently broken
@@ -145,28 +157,37 @@ write_wif_credentials() {
 }
 
 start_credential_runtime() {
-  "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py \
-    --role "${CREDENTIAL_PROXY_ROLE}" &
+  # The role reaches the runtime as the environment variable it already reads
+  # (resolve_role), not as a flag: one spelling, and a container that sets the
+  # variable without going through this script still gets the role it asked for.
+  "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py &
   runtime_pid=$!
 }
 
 start_envoy() {
-  local config=/etc/envoy/envoy-credential-proxy.yaml
-  if [[ "${CREDENTIAL_PROXY_LISTEN_ADDRESS}" != "127.0.0.1" ]]; then
-    # The shipped config is baked into the image at a read-only path, and Envoy's
-    # --config-yaml overlay appends to `listeners` rather than replacing the entry,
-    # so a rewritten copy in the container's writable /tmp is the way to move the
-    # bind address. The substitution is anchored to the listener's own key: the
-    # only other address in the file is the backend, which is a pipe.
-    config=/tmp/envoy-credential-proxy.yaml
-    sed "s|^\( *\)address: 127\.0\.0\.1$|\1address: ${CREDENTIAL_PROXY_LISTEN_ADDRESS}|" \
-      /etc/envoy/envoy-credential-proxy.yaml >"${config}"
-    if ! grep -q "address: ${CREDENTIAL_PROXY_LISTEN_ADDRESS}" "${config}"; then
-      echo "start-services: could not rewrite the Envoy listener address to ${CREDENTIAL_PROXY_LISTEN_ADDRESS}; the credential proxy would come up unreachable" >&2
+  # The baked config binds 127.0.0.1, which is the access control for as long as
+  # the broker is a sidecar in the agent's Pod. When the operator puts the broker
+  # in a Pod of its own the listener has to accept the Pod IP, and the config is
+  # baked into the image rather than rendered by the operator -- so the one line
+  # that has to differ is substituted here rather than by shipping two configs
+  # that would drift. The value is checked against a character class first: it
+  # reaches sed, and sed would happily accept a replacement carrying its own
+  # delimiter or newline.
+  local envoy_config=/etc/envoy/envoy-credential-proxy.yaml
+  if [[ -n "${CREDENTIAL_PROXY_ENVOY_ADDRESS:-}" ]]; then
+    if [[ ! "${CREDENTIAL_PROXY_ENVOY_ADDRESS}" =~ ^[0-9a-fA-F.:]+$ ]]; then
+      echo "CREDENTIAL_PROXY_ENVOY_ADDRESS is not an IP address" >&2
       exit 1
     fi
+    local rendered=/tmp/envoy-credential-proxy.yaml
+    sed "s|address: 127\.0\.0\.1|address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}|" \
+      "${envoy_config}" >"${rendered}"
+    # A substitution that silently matched nothing would leave the broker bound
+    # to loopback in a Pod nothing else can reach, which reads as a hang.
+    grep -q "address: ${CREDENTIAL_PROXY_ENVOY_ADDRESS}" "${rendered}"
+    envoy_config="${rendered}"
   fi
-  /usr/local/bin/envoy --config-path "${config}" --log-level info &
+  /usr/local/bin/envoy --config-path "${envoy_config}" --log-level info &
   envoy_pid=$!
 }
 
@@ -293,15 +314,15 @@ start_event_watcher() {
 
 write_wif_credentials
 start_credential_runtime
-if [[ "${CREDENTIAL_PROXY_ROLE}" != "agent-api" ]]; then
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
   start_envoy
 fi
-if [[ "${CREDENTIAL_PROXY_ROLE}" != "credentials" ]]; then
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]]; then
   start_event_watcher
 fi
 
 # Only the credential-path services are waited on. The watcher is absent from
-# this list deliberately — see the header. envoy_pid is empty in the agent-api
+# this list deliberately — see the header. envoy_pid is empty in the api-proxy
 # role, and `wait -n` rejects an empty argument, so it is expanded unquoted.
 # shellcheck disable=SC2086
 wait -n "${runtime_pid}" ${envoy_pid}

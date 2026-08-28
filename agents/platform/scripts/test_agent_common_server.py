@@ -209,12 +209,14 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
     # one whose Secret-backed env this class is about.
     AGENT_DEPLOYMENT = "platformagent-gateway"
     AGENT_CONTAINER = "platform-agent"
-    # The credential proxy is a Deployment of its own, so the two halves of this
-    # contract now live in different pods. Both are named because the golden
-    # holds several Deployments and picking one by position is how this test
-    # would start asserting against whichever the operator happens to render
-    # first.
-    PROXY_DEPLOYMENT = "platformagent-credential-proxy"
+    # The same Deployment in this golden: the default layout keeps the proxy as
+    # a native sidecar beside the agent. It is named separately anyway because
+    # the other two layouts move it -- `spec.security.splitCredentialBrokerPod`
+    # gives it a Deployment of its own, and the shell sandbox moves the runtime
+    # into the sandbox Pod -- and because picking a Deployment by position is
+    # how this test would start asserting against whichever the operator
+    # happens to render first.
+    PROXY_DEPLOYMENT = "platformagent-gateway"
     PROXY_CONTAINER = "envoy-credential-proxy"
     # A credential the proxy holds and the agent must never see. Named rather
     # than counted: SESSION_KV_API_KEY is on both containers, so "the proxy has

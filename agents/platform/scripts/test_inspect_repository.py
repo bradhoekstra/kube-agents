@@ -23,6 +23,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
 
@@ -30,7 +31,9 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
 import content_workspace  # noqa: E402
+import credential_proxy  # noqa: E402
 import credential_proxy_client  # noqa: E402
+import workspace_paths  # noqa: E402
 
 SUBJECT = (
     HERE.parent / "skills" / "inspect-repository" / "scripts" / "inspect_repository.py"
@@ -46,6 +49,15 @@ GIT_ENV = {
 }
 
 URL = "https://github.com/acme/public.git"
+
+
+@dataclass
+class GitResult:
+    """What the broker's `_git` reads off a run: an exit code, not a returncode."""
+
+    exit_code: int
+    stdout: str
+    stderr: str
 
 
 def _load_subject():
@@ -78,28 +90,45 @@ class InspectRepositoryTestCase(unittest.TestCase):
 
         origin = self.origin
 
-        def runner(argv, cwd, check=True):
+        def runner(argv, cwd):
             argv = [str(origin) if token == URL else token for token in argv]
             env = dict(os.environ)
             env.update(GIT_ENV)
-            return subprocess.run(
-                argv, cwd=str(cwd), env=env, capture_output=True, text=True, check=check
+            completed = subprocess.run(
+                argv, cwd=str(cwd), env=env, capture_output=True, text=True
             )
+            return GitResult(completed.returncode, completed.stdout, completed.stderr)
 
         self.store = content_workspace.ContentWorkspaceStore(
-            self.tmp / "broker" / "trees", self.tmp / "agent", runner=runner
+            self.tmp / "broker" / "trees", self.tmp / "agent", runner
         )
         self.available = True
+
+        # Through the broker's own route rather than straight at the store. The
+        # translation from a JSON payload to the store's arguments is where a
+        # verb goes missing, so a harness that reimplemented it would assert
+        # that this file agrees with itself.
+        route = credential_proxy.CredentialProxyHandler._workspace_route
+        store = self.store
+
+        class Router:
+            workspaces = store
 
         def call(endpoint, verb, payload):
             if not self.available:
                 raise credential_proxy_client.WorkspaceUnavailable("not armed")
             try:
-                return getattr(self.store, verb)(payload)
-            except content_workspace.WorkspaceError as exc:
+                body = route(Router(), verb, payload)
+            except content_workspace.ContentWorkspaceError as exc:
                 raise credential_proxy_client.WorkspaceRequestError(
-                    exc.status, {"error": str(exc), **exc.fields}
+                    exc.status,
+                    {"status": "blocked", "code": exc.code, "message": str(exc)},
                 ) from exc
+            if body is None:
+                raise credential_proxy_client.WorkspaceRequestError(
+                    404, {"status": "not_found"}
+                )
+            return body
 
         patched = patch.object(credential_proxy_client, "_workspace_call", call)
         patched.start()
@@ -154,7 +183,7 @@ class TestClone(InspectRepositoryTestCase):
 
     def test_paging_gets_the_whole_tree_when_the_listing_is_capped(self):
         """The listing ceiling must not silently become the copy's ceiling."""
-        self.store.max_entries = 1
+        self.enterContext(patch.object(content_workspace, "max_entries", lambda: 1))
         into = self.tmp / "copy"
         result = self.run_command(
             ["clone", "--repo", "acme/public", "--into", str(into)]
@@ -286,14 +315,14 @@ class TestSearchThenFetch(InspectRepositoryTestCase):
         into.mkdir()
         for hostile in ("../escape", "/etc/passwd", ".git/config"):
             with self.subTest(path=hostile), self.assertRaises(
-                content_workspace.WorkspaceError
+                workspace_paths.WorkspaceError
             ):
                 inspect_repository.write_files(into, {hostile: b"x"})
         self.assertEqual(list(into.rglob("*")), [])
 
     def test_a_listing_page_names_its_own_cursor(self):
         handle = self.open_handle()
-        self.store.max_entries = 1
+        self.enterContext(patch.object(content_workspace, "max_entries", lambda: 1))
         page = self.run_command(["list", "--handle", handle])
         self.assertTrue(page["truncated"])
         self.assertEqual(page["next"], page["entries"][-1]["path"])

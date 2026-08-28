@@ -1,1080 +1,1578 @@
-"""Tests for the content-passing workspace store.
+"""Tests for broker-owned, content-passed git workspaces.
 
-Two things these tests are deliberately careful about.
-
-The store is exercised against a real `git` and a real local bare repository
-rather than a mock, because the controls being asserted are properties of what
-git does with the tree, and a mock would assert what this test file believes git
-does. Where a case cannot be reached that way -- a push the remote rejects -- the
-runner is swapped for a recorder, and the test says so.
-
-Several test names describe what is *not* proven. `test_a_handle_is_unguessable
-_and_minted_here` is not called `test_handle_proves_ownership` because it does
-not: the broker cannot tell two sessions in the agent container apart, so a
-handle is a bearer capability. A test whose name overstates its assertion is how
-a gap gets closed on paper.
+Every hardening test here is paired with an ordinary-use assertion, usually in
+the same method and always adjacent. That pairing is a requirement rather than a
+courtesy: a refusal test passes just as well against a control that refuses
+*everything*, so mutation coverage on its own proves the check is load-bearing
+without proving the product still works. Both halves have to fail for different
+reasons before the control is believable.
 """
 
 from __future__ import annotations
 
 import base64
+import faulthandler
 import os
 import subprocess
 import tempfile
+import threading
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from unittest import mock
 
 import content_workspace
 from content_workspace import (
+    Change,
+    Conflict,
+    ContentWorkspaceError,
     ContentWorkspaceStore,
-    WorkspaceError,
+    NoSuchHandle,
+    PathRefused,
+    TooLarge,
+    Workspace,
     assert_disjoint_roots,
-    validate_branch,
-    validate_depth,
-    validate_path,
-    validate_repo,
+    check_branch,
+    parse_changes,
+    repo_relative,
 )
 
-GIT_ENV = {
-    "GIT_AUTHOR_NAME": "Test",
-    "GIT_AUTHOR_EMAIL": "test@example.com",
-    "GIT_COMMITTER_NAME": "Test",
-    "GIT_COMMITTER_EMAIL": "test@example.com",
-    "GIT_CONFIG_GLOBAL": "/dev/null",
-    "GIT_CONFIG_SYSTEM": "/dev/null",
-}
+
+@dataclass
+class FakeResult:
+    exit_code: int = 0
+    stdout: str = ""
+    stderr: str = ""
 
 
-def b64(text: str) -> str:
-    return base64.b64encode(text.encode()).decode()
+class RecordingRunner:
+    """Stands in for the executor, recording the argv it was handed."""
+
+    def __init__(self, responses: dict[str, FakeResult] | None = None) -> None:
+        self.calls: list[tuple[list[str], Path]] = []
+        self.responses = responses or {}
+
+    def __call__(self, argv, cwd):
+        self.calls.append((list(argv), Path(cwd)))
+        for key, response in self.responses.items():
+            if key in " ".join(argv):
+                return response
+        return FakeResult()
+
+    @property
+    def subcommands(self) -> list[str]:
+        return [argv[1] for argv, _ in self.calls]
 
 
-class PathValidatorTest(unittest.TestCase):
-    """One validator serves reads and writes, so these cases bind both."""
+def git_available() -> bool:
+    try:
+        subprocess.run(["git", "--version"], capture_output=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    return True
 
-    def test_accepts_a_repository_relative_name(self):
-        self.assertEqual(validate_path("manifests/app.yaml"), "manifests/app.yaml")
-        self.assertEqual(validate_path("  README.md  "), "README.md")
 
-    def test_refuses_absolute_and_traversal(self):
-        for bad in (
-            "/etc/passwd",
-            "../outside",
-            "manifests/../../outside",
-            "./manifests/app.yaml",
-            "C:/windows",
-            "manifests\\app.yaml",
-        ):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                validate_path(bad)
+def real_git_runner(argv, cwd):
+    """A plain runner, for the tests that need git's real answers."""
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": str(cwd),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+    }
+    completed = subprocess.run(
+        argv, cwd=str(cwd), env=environment, capture_output=True, text=True
+    )
+    return FakeResult(completed.returncode, completed.stdout, completed.stderr)
 
-    def test_refuses_empty_and_control_characters(self):
-        for bad in ("", "   ", "a\x00b", "a\nb", "a\rb", 17, None):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                validate_path(bad)
 
-    def test_refuses_every_spelling_of_dotgit(self):
-        """Over-refusal is the point; see `_looks_like_dotgit`."""
-        for bad in (
-            ".git",
+class RepoRelativeTest(unittest.TestCase):
+    """What a path may name. One validator, used by reads and writes alike."""
+
+    def test_paths_into_the_git_directory_are_refused(self):
+        # The whole reason content-passing exists: `.git/config` and
+        # `.git/hooks/pre-commit` are code execution in the credential holder,
+        # and neither is content.
+        for path in (
             ".git/config",
+            ".git/hooks/pre-commit",
+            "manifests/.git/config",
+            ".git",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(PathRefused):
+                    repo_relative(path)
+
+        # Paired ordinary use: the paths a GitOps repository is actually made
+        # of, including the ones that merely start with the same four letters.
+        for path in (
+            "manifests/prod/deployment.yaml",
+            ".gitignore",
+            ".gitkeep",
+            ".gitattributes",
+            "gitops/cluster.yaml",
+            "charts/kube-agents/values.yaml",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(path, str(repo_relative(path)))
+
+    def test_every_spelling_of_dot_git_that_a_filesystem_accepts(self):
+        """Match git's own equivalences, not just the ASCII one.
+
+        git refuses these in a tree because NTFS strips trailing dots and offers
+        an 8.3 shortname, and HFS+ ignores zero-width codepoints inside a name.
+        A checker that knows only `.git` is a checker that disagrees with the
+        thing it is protecting, which is the defect class this codebase keeps
+        producing.
+        """
+        for spelling in (
             ".GIT/config",
-            ".Git/hooks/pre-commit",
+            ".Git/config",
             ".git./config",
             ".git /config",
             "git~1/config",
-            "GIT~2/config",
-            ".git::$DATA/config",
-            ".gi\u200ct/config",
-            ".g\ufeffit/config",
+            "GIT~1/config",
+            ".g‌it/config",  # zero-width non-joiner, ignored by HFS+
         ):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                validate_path(bad)
+            with self.subTest(spelling=spelling):
+                with self.assertRaises(PathRefused):
+                    repo_relative(spelling)
 
-    def test_refuses_dotgit_at_any_depth(self):
-        """A first-segment-only check would let this through."""
-        with self.assertRaises(WorkspaceError):
-            validate_path("charts/vendored/.git/config")
+        # Paired: names that only resemble one. Over-refusal here would break
+        # ordinary repositories, so the boundary has to be in the right place.
+        for ordinary in ("gitops/x.yaml", "git/x.yaml", "digit/x.yaml", ".gitmodules"):
+            with self.subTest(ordinary=ordinary):
+                self.assertEqual(ordinary, str(repo_relative(ordinary)))
 
-    def test_allows_names_that_merely_start_with_git(self):
-        for good in (".gitignore", ".gitattributes", "gitops/app.yaml", "git"):
-            with self.subTest(good=good):
-                self.assertEqual(validate_path(good), good)
+    def test_traversal_and_ambiguous_spellings_are_refused_not_normalised(self):
+        for path in (
+            "../etc/passwd",
+            "manifests/../../etc/passwd",
+            "/etc/passwd",
+            "manifests//deployment.yaml",
+            "manifests/./deployment.yaml",
+            "manifests\\deployment.yaml",
+            "manifests/dep\x00loyment.yaml",
+            "",
+        ):
+            with self.subTest(path=path):
+                with self.assertRaises(PathRefused):
+                    repo_relative(path)
+
+        # Paired: the unambiguous spelling of the same depth of nesting works.
+        self.assertEqual(
+            "manifests/prod/deployment.yaml",
+            str(repo_relative("manifests/prod/deployment.yaml")),
+        )
 
 
-class RepoAndBranchValidatorTest(unittest.TestCase):
-    def test_repo_is_two_segments(self):
-        self.assertEqual(validate_repo("acme/infra"), ("acme", "infra"))
+class SymlinkTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name) / "repo"
+        (self.root / "manifests").mkdir(parents=True)
+        self.addCleanup(self.tmp.cleanup)
 
-    def test_repo_refuses_a_url(self):
-        """There is no caller-supplied remote URL anywhere in this protocol.
+    def test_a_write_never_follows_a_symbolic_link(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (self.root / "vendor").symlink_to(outside)
+        (self.root / "manifests" / "escape.yaml").symlink_to(outside / "escape.yaml")
 
-        A URL chosen by the caller decides where the minted token is sent.
+        # A repository may legitimately contain symlinks; writing *through* one
+        # lands the bytes where the name did not say.
+        with self.assertRaises(PathRefused):
+            content_workspace._no_symlink_on_the_way(
+                self.root, repo_relative("vendor/x.yaml")
+            )
+        with self.assertRaises(PathRefused):
+            content_workspace._no_symlink_on_the_way(
+                self.root, repo_relative("manifests/escape.yaml")
+            )
+
+        # Paired ordinary use: an ordinary nested path, existing or not,
+        # resolves to exactly the file its name describes.
+        self.assertEqual(
+            self.root / "manifests" / "deployment.yaml",
+            content_workspace._no_symlink_on_the_way(
+                self.root, repo_relative("manifests/deployment.yaml")
+            ),
+        )
+
+    def test_a_symbolic_link_that_stays_inside_the_repository_is_refused_too(self):
+        """The case a containment check alone does not see.
+
+        Comparing the *resolved* path against the root catches a link pointing
+        out of the tree and nothing else. A link whose target is inside the root
+        passes that check and still writes somewhere the name did not say — and
+        the target that matters is `.git`, which `repo_relative` refuses by name
+        and a symlink reintroduces by reference. Found by mutation: deleting the
+        symlink check left every other assertion in this file green.
         """
-        for bad in (
-            "https://evil.example/acme/infra.git",
-            "git@github.com:acme/infra.git",
-            "acme",
-            "acme/infra/extra",
-            "../../acme/infra",
-            "-acme/infra",
-            42,
-        ):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                validate_repo(bad)
+        (self.root / ".git").mkdir()
+        (self.root / "config-link").symlink_to(self.root / ".git")
+        (self.root / "manifests" / "alias.yaml").symlink_to(
+            self.root / "manifests" / "real.yaml"
+        )
 
-    def test_branch_refuses_option_and_revision_syntax(self):
-        self.assertEqual(validate_branch("fix/thing-1"), "fix/thing-1")
-        for bad in ("--force", "-x", "a..b", "HEAD@{1}", "a b", "x.lock", "", None):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                validate_branch(bad)
+        for path in ("config-link/config", "manifests/alias.yaml"):
+            with self.subTest(path=path):
+                with self.assertRaises(PathRefused):
+                    content_workspace._no_symlink_on_the_way(
+                        self.root, repo_relative(path)
+                    )
+
+        # Paired: the file the link pointed at is writable under its own name.
+        self.assertEqual(
+            self.root / "manifests" / "real.yaml",
+            content_workspace._no_symlink_on_the_way(
+                self.root, repo_relative("manifests/real.yaml")
+            ),
+        )
 
 
 class DisjointRootsTest(unittest.TestCase):
-    def test_refuses_when_the_trees_sit_inside_the_agent_volume(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            agent = Path(tmp) / "shared"
-            agent.mkdir()
-            with self.assertRaises(RuntimeError):
-                assert_disjoint_roots(agent / "content-workspaces", agent)
-
-    def test_refuses_the_other_direction_too(self):
-        """Containment is not symmetric and only one mistake is the obvious one."""
-        with tempfile.TemporaryDirectory() as tmp:
-            trees = Path(tmp) / "trees"
-            trees.mkdir()
-            with self.assertRaises(RuntimeError):
-                assert_disjoint_roots(trees, trees / "shared")
-
-    def test_refuses_when_they_are_the_same_directory(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(RuntimeError):
-                assert_disjoint_roots(Path(tmp), Path(tmp))
-
-    def test_accepts_siblings(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            assert_disjoint_roots(Path(tmp) / "trees", Path(tmp) / "shared")
-
-    def test_a_symlinked_prefix_does_not_read_as_disjoint(self):
-        """/var -> /private/var on macOS, or any subPath mount.
-
-        Comparing an unresolved root against a resolved one silently passes this
-        check and then refuses every legitimate call at containment time.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            real = Path(tmp) / "real"
-            (real / "trees").mkdir(parents=True)
-            link = Path(tmp) / "link"
-            link.symlink_to(real)
-            with self.assertRaises(RuntimeError):
-                assert_disjoint_roots(link / "trees", real)
-
-
-class LimitParsingTest(unittest.TestCase):
-    def test_a_misconfigured_ceiling_reads_as_the_default(self):
-        """Not as unbounded. That failure mode is silent and permissive."""
-        for raw in ("0", "-1", "banana", "  "):
-            with self.subTest(raw=raw), mock.patch.dict(
-                os.environ, {"CREDENTIAL_PROXY_MAX_FILE_BYTES": raw}
-            ):
-                self.assertEqual(
-                    content_workspace._positive_int(
-                        "CREDENTIAL_PROXY_MAX_FILE_BYTES",
-                        content_workspace.DEFAULT_MAX_FILE_BYTES,
-                    ),
-                    content_workspace.DEFAULT_MAX_FILE_BYTES,
-                )
-
-    def test_an_operator_may_lower_or_raise_it(self):
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_MAX_FILE_BYTES": "4096"}):
-            self.assertEqual(
-                content_workspace._positive_int("CREDENTIAL_PROXY_MAX_FILE_BYTES", 1), 4096
-            )
-
-    def test_the_feature_is_off_unless_armed(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(content_workspace.content_workspaces_enabled())
-        for raw in ("1", "true", "YES", "on"):
-            with self.subTest(raw=raw), mock.patch.dict(
-                os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACES": raw}
-            ):
-                self.assertTrue(content_workspace.content_workspaces_enabled())
-
-
-class StoreTestCase(unittest.TestCase):
-    """Base: a real bare repository, a real git, a real store."""
+    """The structural check: the agent must not be able to name the tree."""
 
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        self.tmp = Path(self._tmp.name).resolve()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
 
-        self.remote = self.tmp / "remote.git"
-        seed = self.tmp / "seed"
-        seed.mkdir()
-        self._git(seed, "init", "--quiet", "--initial-branch=main")
-        (seed / "README.md").write_text("seed\n")
-        (seed / "manifests").mkdir()
-        (seed / "manifests" / "app.yaml").write_text("replicas: 1\n")
-        self._git(seed, "add", "-A")
-        self._git(seed, "commit", "--quiet", "-m", "seed")
-        self._git(self.tmp, "clone", "--quiet", "--bare", str(seed), str(self.remote))
+    def test_overlapping_roots_refuse_to_arm(self):
+        agent = self.base / "opt" / "data"
+        agent.mkdir(parents=True)
 
-        self.trees = self.tmp / "trees"
-        self.agent_workspace = self.tmp / "shared"
-        self.agent_workspace.mkdir()
-        self.store = ContentWorkspaceStore(
-            self.trees, self.agent_workspace, runner=self._runner
+        # The tree inside the agent's volume: every finding content-passing
+        # closes would be open again, and the code would claim otherwise.
+        with self.assertRaises(RuntimeError):
+            assert_disjoint_roots(agent / "content-workspaces", agent)
+        # The agent's volume inside the tree: same property, other direction.
+        with self.assertRaises(RuntimeError):
+            assert_disjoint_roots(self.base / "opt", agent)
+        # Identical.
+        with self.assertRaises(RuntimeError):
+            assert_disjoint_roots(agent, agent)
+
+        # Paired ordinary use: the shipped layout -- the tree on the broker's
+        # own state dir, the workspace on the shared volume -- arms cleanly.
+        state = self.base / "var" / "lib" / "credential-proxy"
+        state.mkdir(parents=True)
+        assert_disjoint_roots(state / "content-workspaces", agent)
+
+    def test_the_store_refuses_to_construct_on_overlapping_roots(self):
+        agent = self.base / "data"
+        agent.mkdir()
+        with self.assertRaises(RuntimeError):
+            ContentWorkspaceStore(agent / "trees", agent, RecordingRunner())
+
+        # Paired: the disjoint layout constructs and creates its root.
+        state = self.base / "state"
+        store = ContentWorkspaceStore(state / "trees", agent, RecordingRunner())
+        self.assertTrue(store.tree_root.is_dir())
+
+
+class ParseChangesTest(unittest.TestCase):
+    def test_limits_are_enforced_and_the_whole_payload_is_refused(self):
+        big = base64.b64encode(b"x" * (content_workspace.max_file_bytes() + 1)).decode()
+        with self.assertRaises(TooLarge):
+            parse_changes([{"path": "a.yaml", "contentBase64": big}])
+
+        with mock.patch.object(content_workspace, "max_entries", lambda: 2):
+            with self.assertRaises(TooLarge):
+                parse_changes(
+                    [{"path": f"{n}.yaml", "contentBase64": ""} for n in range(3)]
+                )
+
+        with mock.patch.object(content_workspace, "max_total_bytes", lambda: 8):
+            with self.assertRaises(TooLarge):
+                parse_changes(
+                    [
+                        {"path": "a.yaml", "contentBase64": base64.b64encode(b"12345").decode()},
+                        {"path": "b.yaml", "contentBase64": base64.b64encode(b"12345").decode()},
+                    ]
+                )
+
+        # Paired ordinary use: a two-file manifest change of ordinary size, and
+        # binary content, both parse and survive the encoding intact.
+        binary = bytes(range(256))
+        changes = parse_changes(
+            [
+                {
+                    "path": "manifests/deployment.yaml",
+                    "contentBase64": base64.b64encode(b"kind: Deployment\n").decode(),
+                },
+                {"path": "assets/logo.png", "contentBase64": base64.b64encode(binary).decode()},
+            ]
         )
-        # `open` composes https://github.com/<owner>/<name>.git and there is no
-        # way for a caller to override it, which is the property being kept. The
-        # test redirects that one URL at the git layer instead.
-        self.url_map = {"https://github.com/acme/infra.git": str(self.remote)}
+        self.assertEqual(b"kind: Deployment\n", changes[0].content)
+        self.assertEqual(binary, changes[1].content)
 
-    def _git(self, cwd, *args):
-        env = dict(os.environ)
-        env.update(GIT_ENV)
-        return subprocess.run(
-            ["git", *args], cwd=str(cwd), env=env, capture_output=True, text=True, check=True
+    def test_ambiguous_and_duplicated_entries_are_refused(self):
+        for payload in (
+            [{"path": "a.yaml"}],  # neither content nor a deletion
+            [{"path": "a.yaml", "content": "plain"}],  # no plaintext form exists
+            [{"path": "a.yaml", "contentBase64": "not base64!"}],
+            [{"path": "a.yaml", "contentBase64": "", "delete": True}],
+            [
+                {"path": "a.yaml", "contentBase64": ""},
+                {"path": "a.yaml", "contentBase64": ""},
+            ],
+            [],
+            "not a list",
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ContentWorkspaceError):
+                    parse_changes(payload)
+
+        # Paired: the two forms that are defined -- write and delete.
+        changes = parse_changes(
+            [
+                {"path": "a.yaml", "contentBase64": base64.b64encode(b"a").decode()},
+                {"path": "b.yaml", "delete": True},
+            ]
         )
-
-    def _runner(self, argv, cwd, check=True):
-        env = dict(os.environ)
-        env.update(GIT_ENV)
-        argv = [self.url_map.get(token, token) for token in argv]
-        return subprocess.run(
-            ["git", *argv[1:]] if argv[0] == "git" else argv,
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            check=check,
-        )
-
-    def open_workspace(self):
-        return self.store.open({"repo": "acme/infra"})
+        self.assertEqual(b"a", changes[0].content)
+        self.assertTrue(changes[1].deletes)
 
 
-class OpenTest(StoreTestCase):
-    def test_open_returns_a_handle_and_no_filesystem_path(self):
-        result = self.open_workspace()
+class CheckBranchTest(unittest.TestCase):
+    def test_a_branch_that_could_be_read_as_an_option_is_refused_first(self):
+        # `--upload-pack=<cmd>` names a program git runs. Reaching
+        # `check-ref-format` with this string would validate it as a flag.
+        for name in ("--upload-pack=/bin/sh", "-x", "--force"):
+            with self.subTest(name=name):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_branch(name)
+
+        for protected in ("main", "master", "production", "MAIN"):
+            with self.subTest(protected=protected):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_branch(protected)
+
+        # Paired ordinary use: the branch names the product actually authors.
         self.assertEqual(
-            set(result),
-            {"handle", "repo", "base", "baseSha", "startedFrom", "shallow"},
+            "platform-agent/provision-mercury-09",
+            check_branch("platform-agent/provision-mercury-09"),
         )
-        self.assertFalse(result["shallow"])
-        self.assertEqual(result["repo"], "acme/infra")
-        self.assertEqual(result["base"], "main")
-        self.assertEqual(result["startedFrom"], "origin/main")
-        self.assertRegex(result["baseSha"], r"^[0-9a-f]{40}$")
-        # Two values carry a slash and are meant to: `owner/name` and
-        # `origin/<ref>`. Neither names a directory, which is the property under
-        # test -- a path here is somewhere the agent can be told to `cd`.
-        for key, value in result.items():
-            self.assertNotIn(str(self.trees), str(value))
-            self.assertFalse(str(value).startswith("/"))
-            if key not in ("repo", "startedFrom"):
-                self.assertNotIn("/", str(value))
+        self.assertEqual("fix/cve-2026-1234", check_branch("  fix/cve-2026-1234  "))
+
+
+class StoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, runner=None):
+        return ContentWorkspaceStore(self.base / "trees", self.agent, runner or RecordingRunner())
+
+    def test_the_remote_url_is_composed_here_and_never_supplied(self):
+        runner = RecordingRunner()
+        store = self.store(runner)
+        # A caller-supplied URL is `url.<host>.insteadOf` by another route: it
+        # chooses where the minted GitHub token is sent.
+        for repo in (
+            "https://attacker.invalid/x/y.git",
+            "ext::sh -c id",
+            "../../etc",
+            "owner",
+            "owner/name/extra",
+            "owner/na me",
+        ):
+            with self.subTest(repo=repo):
+                with self.assertRaises(ContentWorkspaceError):
+                    store.open(repo)
+        self.assertEqual([], runner.calls, "nothing should have run")
+
+        # Paired ordinary use: a real repository clones from a URL this module
+        # built, not one the caller chose.
+        workspace = store.open("acme/fleet")
+        clone = runner.calls[0][0]
+        self.assertEqual(["git", "clone", "--quiet"], clone[:3])
+        self.assertEqual("https://github.com/acme/fleet.git", clone[3])
+        self.assertRegex(workspace.handle, r"\A[0-9a-f]{32}\Z")
 
     def test_a_handle_is_unguessable_and_minted_here(self):
-        """Unguessable and broker-minted. Deliberately not "proves ownership".
+        """What the handle is actually for.
 
-        The broker cannot distinguish two sessions inside the agent container,
-        so this is a bearer capability -- strictly better than the `.lease` file
-        it replaces, which the agent could create, and still not an owner check.
+        It is a bearer capability, not an ownership check — the broker cannot
+        tell two sessions in the agent container apart, because everything on
+        the socket arrives with the same identity. What it does buy is that one
+        session cannot *name* another's tree, and that only holds while the
+        handle is unpredictable.
+        A sequential id would look identical to every other test here.
         """
-        first = self.open_workspace()["handle"]
-        second = self.open_workspace()["handle"]
-        self.assertNotEqual(first, second)
-        self.assertRegex(first, r"^[0-9a-f]{32}$")
-        for forged in ("", "x" * 32, first[:-1] + ("0" if first[-1] != "0" else "1")):
-            with self.subTest(forged=forged), self.assertRaises(WorkspaceError) as caught:
-                self.store.read({"handle": forged, "path": "README.md"})
-            self.assertEqual(caught.exception.status, 404)
+        store = self.store()
+        # Above the workspace ceiling on purpose: the ceiling is a resource
+        # control and this test is about entropy, so raise it rather than
+        # measure sixteen handles against a limit of eight.
+        with mock.patch.object(content_workspace, "max_workspaces", lambda: 64):
+            handles = {store.open("acme/fleet").handle for _ in range(16)}
+        self.assertEqual(16, len(handles), "handles must not repeat")
+        for handle in handles:
+            self.assertRegex(handle, r"\A[0-9a-f]{32}\Z")
+        # 128 bits of entropy, so no two differ in only their last characters
+        # the way a counter would.
+        prefixes = {handle[:8] for handle in handles}
+        self.assertEqual(16, len(prefixes), "handles must not share a prefix")
 
-    def test_an_unknown_and_a_malformed_handle_answer_alike(self):
-        """Distinguishing them would make this an oracle."""
-        malformed = self.assertRaises(WorkspaceError)
-        with malformed as caught_a:
-            self.store.read({"handle": 17, "path": "README.md"})
-        with self.assertRaises(WorkspaceError) as caught_b:
-            self.store.read({"handle": "0" * 32, "path": "README.md"})
-        self.assertEqual(str(caught_a.exception), str(caught_b.exception))
-        self.assertEqual(caught_a.exception.status, caught_b.exception.status)
+    def test_a_clone_that_fails_leaves_no_tree_behind(self):
+        """A tree with no handle is a tree `close` can never reach.
 
-
-class ReadAndListTest(StoreTestCase):
-    def test_read_returns_base64_content(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.read({"handle": handle, "path": "manifests/app.yaml"})
-        self.assertEqual(base64.b64decode(result["contentBase64"]), b"replicas: 1\n")
-        self.assertEqual(result["size"], len(b"replicas: 1\n"))
-        self.assertEqual(result["path"], "manifests/app.yaml")
-
-    def test_read_refuses_the_git_directory(self):
-        """The same validator the write path uses, which is the point of sharing it."""
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError):
-            self.store.read({"handle": handle, "path": ".git/config"})
-
-    def test_read_refuses_a_symlink_out_of_the_tree(self):
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        (root / "escape").symlink_to("/etc/passwd")
-        with self.assertRaises(WorkspaceError):
-            self.store.read({"handle": handle, "path": "escape"})
-
-    def test_list_returns_tracked_names_only(self):
-        handle = self.open_workspace()["handle"]
-        entries = self.store.list({"handle": handle})["entries"]
-        names = {entry["path"] for entry in entries}
-        self.assertEqual(names, {"README.md", "manifests/app.yaml"})
-        self.assertFalse(any(name.startswith(".git/") for name in names))
-
-    def test_list_honours_a_prefix(self):
-        handle = self.open_workspace()["handle"]
-        entries = self.store.list({"handle": handle, "prefix": "manifests"})["entries"]
-        self.assertEqual([entry["path"] for entry in entries], ["manifests/app.yaml"])
-
-
-class ListTruncationTest(StoreTestCase):
-    """A listing says when it is not the whole listing.
-
-    The reason this is a test rather than a comment: `read` takes a path, and a
-    caller that cannot tell a complete listing from a capped one supplies paths
-    it inferred instead of paths it saw. That failure has no symptom on the
-    broker side -- it answers 404 for a file that exists.
-    """
-
-    def test_a_complete_listing_says_so(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.list({"handle": handle})
-        self.assertEqual(result["total"], 2)
-        self.assertFalse(result["truncated"])
-
-    def test_a_cursor_pages_through_the_whole_tree(self):
-        """What makes the cap survivable: the caller can ask for the rest."""
-        handle = self.open_workspace()["handle"]
-        self.store.max_entries = 1
-        seen = []
-        cursor = ""
-        while True:
-            page = self.store.list({"handle": handle, "after": cursor} if cursor else {"handle": handle})
-            seen += [entry["path"] for entry in page["entries"]]
-            if not page["truncated"]:
-                break
-            cursor = page["entries"][-1]["path"]
-        self.assertEqual(seen, ["README.md", "manifests/app.yaml"])
-
-    def test_the_cursor_counts_only_what_remains(self):
-        handle = self.open_workspace()["handle"]
-        page = self.store.list({"handle": handle, "after": "README.md"})
-        self.assertEqual(page["total"], 1)
-        self.assertEqual([entry["path"] for entry in page["entries"]], ["manifests/app.yaml"])
-
-    def test_a_capped_listing_reports_the_full_count(self):
-        handle = self.open_workspace()["handle"]
-        self.store.max_entries = 1
-        result = self.store.list({"handle": handle})
-        self.assertEqual(len(result["entries"]), 1)
-        self.assertEqual(result["total"], 2)
-        self.assertTrue(result["truncated"])
-
-
-class BatchReadTest(StoreTestCase):
-    def test_several_files_in_one_call(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.read(
-            {"handle": handle, "paths": ["README.md", "manifests/app.yaml"]}
-        )
-        self.assertEqual(result["skipped"], [])
+        `open` makes the directory before the clone that fills it, so a clone
+        that cannot authenticate would otherwise leave one directory per attempt
+        on the broker's volume, permanent for the life of the container.
+        Measured against a real install before it was fixed: a private
+        repository with no credential available left exactly that.
+        """
+        runner = RecordingRunner({"clone": FakeResult(128, "", "could not read Username")})
+        store = self.store(runner)
+        with self.assertRaises(content_workspace.GitFailed):
+            store.open("acme/fleet")
         self.assertEqual(
-            {entry["path"]: base64.b64decode(entry["contentBase64"]) for entry in result["files"]},
-            {"README.md": b"seed\n", "manifests/app.yaml": b"replicas: 1\n"},
+            [], list(store.tree_root.iterdir()), "a failed open must leave nothing"
         )
+        self.assertEqual({}, store._workspaces)
 
-    def test_a_missing_path_is_named_rather_than_fatal(self):
-        """One absent file must not cost the caller the other ninety-nine."""
-        handle = self.open_workspace()["handle"]
-        result = self.store.read({"handle": handle, "paths": ["README.md", "gone.yaml"]})
-        self.assertEqual([entry["path"] for entry in result["files"]], ["README.md"])
-        self.assertEqual(result["skipped"], [{"path": "gone.yaml", "reason": "notAFile"}])
+        # Paired ordinary use: a clone that succeeds keeps its tree, and the
+        # handle the store minted reaches it.
+        store = self.store()
+        workspace = store.open("acme/fleet")
+        self.assertEqual([workspace.handle], [p.name for p in store.tree_root.iterdir()])
 
-    def test_a_dotgit_path_refuses_the_whole_request(self):
-        """Validated before the first read, like the write path."""
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError):
-            self.store.read({"handle": handle, "paths": ["README.md", ".git/config"]})
+    def test_an_unknown_or_malformed_handle_is_refused(self):
+        store = self.store()
+        for handle in ("", "../../etc", "z" * 32, None, 42, "0" * 32):
+            with self.subTest(handle=handle):
+                with self.assertRaises(NoSuchHandle):
+                    store.get(handle)
 
-    def test_an_oversized_file_is_skipped_and_the_rest_returned(self):
-        handle = self.open_workspace()["handle"]
-        self.store.max_file_bytes = 5
-        result = self.store.read(
-            {"handle": handle, "paths": ["README.md", "manifests/app.yaml"]}
+        # Paired: the handle the store minted resolves to the workspace.
+        workspace = store.open("acme/fleet")
+        self.assertIs(workspace, store.get(workspace.handle))
+
+
+class ListAndOpenArgumentTest(unittest.TestCase):
+    """Two arguments that looked validated and were not."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, RecordingRunner()
         )
-        self.assertEqual([entry["path"] for entry in result["files"]], ["README.md"])
-        self.assertEqual(result["skipped"][0]["path"], "manifests/app.yaml")
-        self.assertEqual(result["skipped"][0]["reason"], "tooLarge")
-
-    def test_the_request_budget_names_what_it_did_not_send(self):
-        handle = self.open_workspace()["handle"]
-        self.store.max_request_bytes = 6
-        result = self.store.read(
-            {"handle": handle, "paths": ["README.md", "manifests/app.yaml"]}
+        self.workspace = Workspace(
+            handle="f" * 32,
+            repo="acme/fleet",
+            tree=self.store.tree_root / ("f" * 32) / "repo",
+            base="main",
+            base_sha="0" * 40,
         )
-        self.assertEqual([entry["path"] for entry in result["files"]], ["README.md"])
+        for relative in ("a/y.yaml", "ab/x.yaml", "a/deep/z.yaml", "b/w.yaml"):
+            target = self.workspace.tree / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("kind: ConfigMap\n")
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def test_a_list_prefix_names_a_directory_not_a_string(self):
+        """`prefix="a"` must not return `ab/x.yaml`.
+
+        A string comparison reads as a filter and behaves as a glob without the
+        star, so a caller asking for one directory pages through its siblings.
+        """
+        paths = [
+            entry["path"]
+            for entry in self.store.list(self.workspace.handle, "a")["entries"]
+        ]
+        self.assertEqual(["a/deep/z.yaml", "a/y.yaml"], paths)
+        self.assertNotIn("ab/x.yaml", paths)
+
+        # Paired ordinary use: the sibling is reachable under its own name, and
+        # no prefix still lists everything.
         self.assertEqual(
-            result["skipped"], [{"path": "manifests/app.yaml", "reason": "requestBudget"}]
+            ["ab/x.yaml"],
+            [e["path"] for e in self.store.list(self.workspace.handle, "ab")["entries"]],
         )
+        self.assertEqual(4, self.store.list(self.workspace.handle)["total"])
 
-    def test_the_path_count_is_capped(self):
-        handle = self.open_workspace()["handle"]
-        self.store.max_entries = 1
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.read({"handle": handle, "paths": ["README.md", "README.md"]})
-        self.assertEqual(caught.exception.status, 413)
+    def test_the_base_branch_is_checked_the_way_the_commit_branch_is(self):
+        """`base` reached git unvalidated while `branch` went through the check.
 
-    def test_an_empty_list_is_refused_rather_than_read_as_no_paths(self):
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError):
-            self.store.read({"handle": handle, "paths": []})
+        Not reachable as an option today -- every use of it is prefixed with
+        `origin/` first -- but the asymmetry is the kind a later caller removes
+        without noticing, and a reader comparing the two assumes it is not
+        there.
+        """
+        for name in ("--upload-pack=/bin/sh", "-x", "--force"):
+            with self.subTest(name=name):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store.open("acme/fleet", name)
 
-
-class GrepTest(StoreTestCase):
-    def test_a_match_carries_path_line_and_text(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.grep({"handle": handle, "pattern": "replicas"})
+        # Paired ordinary use: an ordinary base branch is accepted, and so is a
+        # protected one. Reading `main` is not authoring onto it, and basing a
+        # workspace on the rollout branch is the normal case -- the write path
+        # is where `PROTECTED_BRANCHES` belongs, and this is the read side.
         self.assertEqual(
-            result["matches"],
-            [{"path": "manifests/app.yaml", "line": 1, "text": "replicas: 1"}],
+            "release/2026-08",
+            self.store.open("acme/fleet", "release/2026-08").base,
         )
-        self.assertEqual(result["total"], 1)
-        self.assertFalse(result["truncated"])
-
-    def test_no_match_is_an_empty_answer_rather_than_an_error(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.grep({"handle": handle, "pattern": "nothing-here"})
-        self.assertEqual(result["matches"], [])
-        self.assertEqual(result["total"], 0)
-
-    def test_a_prefix_narrows_the_search(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.grep(
-            {"handle": handle, "pattern": "e", "prefix": "manifests"}
-        )
-        self.assertEqual({m["path"] for m in result["matches"]}, {"manifests/app.yaml"})
-
-    def test_a_pattern_starting_with_a_dash_is_a_pattern(self):
-        """`-e` carries it, so `--untracked` cannot arrive as an option."""
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        (root / "manifests" / "app.yaml").write_text("--untracked: yes\n")
-        result = self.store.grep({"handle": handle, "pattern": "--untracked"})
-        self.assertEqual(
-            [m["path"] for m in result["matches"]], ["manifests/app.yaml"]
-        )
-
-    def test_fixed_string_by_default_and_regex_on_request(self):
-        handle = self.open_workspace()["handle"]
-        fixed = self.store.grep({"handle": handle, "pattern": "replicas: ."})
-        self.assertEqual(fixed["matches"], [])
-        expression = self.store.grep(
-            {"handle": handle, "pattern": "replicas: .", "regex": True}
-        )
-        self.assertEqual(len(expression["matches"]), 1)
-
-    def test_an_unparseable_expression_is_a_400_and_not_a_crash(self):
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.grep({"handle": handle, "pattern": "replicas[", "regex": True})
-        self.assertEqual(caught.exception.status, 400)
-        self.assertEqual(caught.exception.fields.get("code"), "BAD_PATTERN")
-
-    def test_case_folding_is_opt_in(self):
-        handle = self.open_workspace()["handle"]
-        self.assertEqual(self.store.grep({"handle": handle, "pattern": "REPLICAS"})["total"], 0)
-        self.assertEqual(
-            self.store.grep(
-                {"handle": handle, "pattern": "REPLICAS", "ignoreCase": True}
-            )["total"],
-            1,
-        )
-
-    def test_the_match_count_is_capped_and_says_so(self):
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        (root / "many.txt").write_text("hit\n" * 10)
-        self.store._git(self.store._workspaces[handle], "add", "-A")
-        self.store.max_matches = 3
-        result = self.store.grep({"handle": handle, "pattern": "hit"})
-        self.assertEqual(len(result["matches"]), 3)
-        self.assertEqual(result["total"], 10)
-        self.assertTrue(result["truncated"])
-
-    def test_a_long_line_is_cut_and_flagged(self):
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        (root / "manifests" / "app.yaml").write_text("replicas: " + "9" * 4000 + "\n")
-        self.store.max_match_chars = 20
-        match = self.store.grep({"handle": handle, "pattern": "replicas"})["matches"][0]
-        self.assertEqual(len(match["text"]), 20)
-        self.assertTrue(match["truncated"])
-
-    def test_the_git_directory_is_never_searched(self):
-        """`git grep` reads tracked files, so no pattern reaches `.git/config`."""
-        handle = self.open_workspace()["handle"]
-        result = self.store.grep({"handle": handle, "pattern": "url", "regex": True})
-        self.assertFalse(any(m["path"].startswith(".git") for m in result["matches"]))
-
-    def test_a_pattern_must_be_a_non_empty_string(self):
-        handle = self.open_workspace()["handle"]
-        for pattern in (None, "", "   ", 17, "two\nlines"):
-            with self.subTest(pattern=pattern), self.assertRaises(WorkspaceError):
-                self.store.grep({"handle": handle, "pattern": pattern})
+        self.assertEqual("main", self.store.open("acme/fleet", "main").base)
+        # And the write path still refuses to author onto it.
+        with self.assertRaises(ContentWorkspaceError):
+            check_branch("main")
 
 
-class DepthTest(StoreTestCase):
-    """Shallow clones, which is what reading an unfamiliar repository takes.
+class ConcurrencyTest(unittest.TestCase):
+    """Two requests naming one handle, which `ThreadingHTTPServer` produces.
 
-    The remote is addressed as `file://` here rather than as a path: git ignores
-    `--depth` on a local-path clone and says so on stderr, so a test written
-    against a path would assert the protocol while exercising a full clone.
+    Every verb here is a read-then-act on a working tree another verb is
+    entitled to delete or reset underneath it. Both interleavings below were
+    reproduced against the unlocked store before the lock went in; the
+    injection is single-threaded on purpose, because it pins the exact
+    interleaving rather than hoping a race scheduler finds it.
     """
 
     def setUp(self):
-        super().setUp()
-        self.url_map = {"https://github.com/acme/infra.git": f"file://{self.remote}"}
+        # A deadlock here does not fail, it hangs -- and a hang in CI is a job
+        # timeout with no test named and nothing pointing at this file. Arm a
+        # watchdog for the duration of this class only: if any method in it
+        # stops making progress, the process dumps every thread's stack, which
+        # names the exact line holding the lock, and dies. Scoped rather than
+        # module-level because the rest of the suite runs alongside longer
+        # ones and must not inherit a deadline.
+        faulthandler.dump_traceback_later(60, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
 
-    def _seed_a_second_commit(self) -> None:
-        seed = self.tmp / "seed"
-        (seed / "README.md").write_text("seed two\n")
-        self._git(seed, "commit", "--quiet", "-am", "second")
-        self._git(seed, "push", "--quiet", str(self.remote), "main")
-
-    def test_depth_opens_one_commit_and_marks_the_workspace_shallow(self):
-        self._seed_a_second_commit()
-        result = self.store.open({"repo": "acme/infra", "depth": 1})
-        self.assertTrue(result["shallow"])
-        self.assertEqual(result["base"], "main")
-        root = self.store._workspaces[result["handle"]].root
-        history = self._git(root, "rev-list", "--count", "HEAD").stdout.strip()
-        self.assertEqual(history, "1")
-
-    def test_a_shallow_workspace_reads_like_any_other(self):
-        handle = self.store.open({"repo": "acme/infra", "depth": 1})["handle"]
-        self.assertEqual(
-            base64.b64decode(
-                self.store.read({"handle": handle, "path": "README.md"})["contentBase64"]
-            ),
-            b"seed\n",
+    def store_with_workspace(self):
+        # `diff --cached --quiet` exits 1 when something is staged, which is
+        # what makes these commits reach the `commit` call at all.
+        runner = RecordingRunner({"diff --cached": FakeResult(1)})
+        store = ContentWorkspaceStore(self.base / "trees", self.agent, runner)
+        workspace = Workspace(
+            handle="d" * 32,
+            repo="acme/fleet",
+            tree=store.tree_root / ("d" * 32) / "repo",
+            base="main",
+            base_sha="0" * 40,
         )
-        self.assertEqual(self.store.list({"handle": handle})["total"], 2)
-        self.assertEqual(self.store.grep({"handle": handle, "pattern": "seed"})["total"], 1)
+        workspace.tree.mkdir(parents=True, exist_ok=True)
+        store._workspaces[workspace.handle] = workspace
+        return store, workspace, runner
 
-    def test_a_shallow_workspace_refuses_to_commit(self):
-        """Refused at the request that is wrong, not three verbs later."""
-        handle = self.store.open({"repo": "acme/infra", "depth": 1})["handle"]
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/x",
-                    "message": "m",
-                    "changes": [{"path": "a.yaml", "contentBase64": b64("x\n")}],
-                }
-            )
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(caught.exception.fields.get("code"), "SHALLOW_WORKSPACE")
+    def commit_with(self, store, workspace, interleaved):
+        """Run `interleaved` from another thread once the commit is mid-flight.
 
-    def test_depth_and_branch_are_refused_together(self):
-        with self.assertRaises(WorkspaceError):
-            self.store.open({"repo": "acme/infra", "depth": 1, "branch": "fix/x"})
-
-    def test_depth_must_be_a_positive_integer(self):
-        for value in (0, -1, "1", True, 1.5):
-            with self.subTest(value=value), self.assertRaises(WorkspaceError):
-                validate_depth(value)
-        self.assertIsNone(validate_depth(None))
-        self.assertEqual(validate_depth(5), 5)
-
-    def test_a_named_base_is_honoured_on_a_shallow_clone(self):
-        result = self.store.open({"repo": "acme/infra", "base": "main", "depth": 1})
-        self.assertEqual(result["base"], "main")
-        self.assertEqual(result["startedFrom"], "origin/main")
-
-
-class CloneCeilingTest(StoreTestCase):
-    def test_a_clone_over_the_ceiling_is_refused_and_leaves_nothing_behind(self):
-        self.store.max_clone_bytes = 1
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.open({"repo": "acme/infra"})
-        self.assertEqual(caught.exception.status, 413)
-        self.assertEqual(caught.exception.fields.get("code"), "CLONE_TOO_LARGE")
-        self.assertEqual(list(self.trees.iterdir()), [])
-        self.assertEqual(self.store._workspaces, {})
-
-    def test_a_clone_that_fails_leaves_nothing_behind(self):
-        """No handle comes back, so nothing would ever collect the debris."""
-        self.url_map["https://github.com/acme/missing.git"] = str(self.tmp / "absent.git")
-        with self.assertRaises(subprocess.CalledProcessError):
-            self.store.open({"repo": "acme/missing"})
-        self.assertEqual(list(self.trees.iterdir()), [])
-
-
-class CommitTest(StoreTestCase):
-    def test_commit_writes_content_the_agent_never_placed_on_disk(self):
-        handle = self.open_workspace()["handle"]
-        result = self.store.commit(
-            {
-                "handle": handle,
-                "branch": "fix/replicas",
-                "message": "raise replicas",
-                "changes": [
-                    {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")},
-                    {"path": "manifests/new.yaml", "contentBase64": b64("kind: X\n")},
-                ],
-            }
-        )
-        self.assertTrue(result["committed"])
-        self.assertEqual(result["branch"], "fix/replicas")
-        root = self.store._workspaces[handle].root
-        self.assertEqual((root / "manifests" / "app.yaml").read_text(), "replicas: 3\n")
-        show = self._git(root, "show", "--name-only", "--format=", "HEAD").stdout.split()
-        self.assertEqual(sorted(show), ["manifests/app.yaml", "manifests/new.yaml"])
-
-    def test_commit_deletes(self):
-        handle = self.open_workspace()["handle"]
-        self.store.commit(
-            {
-                "handle": handle,
-                "branch": "fix/drop",
-                "message": "drop it",
-                "changes": [{"path": "README.md", "delete": True}],
-            }
-        )
-        root = self.store._workspaces[handle].root
-        self.assertFalse((root / "README.md").exists())
-
-    def test_commit_refuses_a_dotgit_path_before_writing_anything(self):
-        """Fail closed means before the side effects."""
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        with self.assertRaises(WorkspaceError):
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/evil",
-                    "message": "no",
-                    "changes": [
-                        {"path": "manifests/ok.yaml", "contentBase64": b64("a: 1\n")},
-                        {"path": ".git/config", "contentBase64": b64("[filter]\n")},
-                    ],
-                }
-            )
-        self.assertFalse((root / "manifests" / "ok.yaml").exists())
-        self.assertEqual(
-            (root / ".git" / "config").read_text().count("filter"),
-            0,
-            "the broker's own git config must be untouched",
-        )
-
-    def test_an_oversized_entry_leaves_the_tree_alone(self):
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        self.store.max_file_bytes = 16
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/big",
-                    "message": "too big",
-                    "changes": [
-                        {"path": "small.yaml", "contentBase64": b64("a: 1\n")},
-                        {"path": "big.yaml", "contentBase64": b64("x" * 64)},
-                    ],
-                }
-            )
-        self.assertEqual(caught.exception.status, 413)
-        self.assertFalse((root / "small.yaml").exists())
-
-    def test_the_request_total_is_capped_independently_of_the_per_file_cap(self):
-        handle = self.open_workspace()["handle"]
-        self.store.max_file_bytes = 64
-        self.store.max_request_bytes = 100
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/many",
-                    "message": "sum too big",
-                    "changes": [
-                        {"path": f"f{i}.yaml", "contentBase64": b64("x" * 50)}
-                        for i in range(3)
-                    ],
-                }
-            )
-        self.assertEqual(caught.exception.status, 413)
-
-    def test_entry_count_is_capped(self):
-        handle = self.open_workspace()["handle"]
-        self.store.max_entries = 2
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/many",
-                    "message": "too many",
-                    "changes": [
-                        {"path": f"f{i}.yaml", "contentBase64": b64("a")} for i in range(3)
-                    ],
-                }
-            )
-        self.assertEqual(caught.exception.status, 413)
-
-    def test_a_duplicate_path_is_refused_rather_than_resolved(self):
-        """Which write wins would otherwise depend on iteration order."""
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError):
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/dup",
-                    "message": "dup",
-                    "changes": [
-                        {"path": "a.yaml", "contentBase64": b64("1")},
-                        {"path": "a.yaml", "contentBase64": b64("2")},
-                    ],
-                }
-            )
-
-    def test_content_must_be_base64(self):
-        """One encoding, never "base64 or plaintext"."""
-        handle = self.open_workspace()["handle"]
-        for bad in ("not valid base64!!", 17, None):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                self.store.commit(
-                    {
-                        "handle": handle,
-                        "branch": "fix/enc",
-                        "message": "m",
-                        "changes": [{"path": "a.yaml", "contentBase64": bad}],
-                    }
-                )
-
-    def test_a_symlink_in_the_tree_is_not_followed_out_of_it(self):
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        outside = self.tmp / "outside"
-        outside.mkdir()
-        (root / "link").symlink_to(outside)
-        with self.assertRaises(WorkspaceError):
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/link",
-                    "message": "m",
-                    "changes": [{"path": "link/escaped.yaml", "contentBase64": b64("x")}],
-                }
-            )
-        self.assertFalse((outside / "escaped.yaml").exists())
-
-    def test_an_empty_commit_is_refused(self):
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/noop",
-                    "message": "m",
-                    "changes": [
-                        {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 1\n")}
-                    ],
-                }
-            )
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(caught.exception.fields.get("code"), "EMPTY_COMMIT")
-
-    def test_a_message_is_required(self):
-        handle = self.open_workspace()["handle"]
-        for bad in ("", "   ", None, 3):
-            with self.subTest(bad=bad), self.assertRaises(WorkspaceError):
-                self.store.commit(
-                    {
-                        "handle": handle,
-                        "branch": "fix/m",
-                        "message": bad,
-                        "changes": [{"path": "a.yaml", "contentBase64": b64("x")}],
-                    }
-                )
-
-
-class ConflictTest(StoreTestCase):
-    def _land_on_base(self, path: str, text: str) -> None:
-        """Move the remote's base branch, the way another PR merging would."""
-        scratch = self.tmp / f"scratch-{path.replace('/', '-')}"
-        self._git(self.tmp, "clone", "--quiet", str(self.remote), str(scratch))
-        target = scratch / path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text)
-        self._git(scratch, "add", "-A")
-        self._git(scratch, "commit", "--quiet", "-m", f"land {path}")
-        self._git(scratch, "push", "--quiet", "origin", "main")
-
-    def test_an_unrelated_advance_of_the_base_is_not_a_conflict(self):
-        """Refusing every moved base would fail behind any unrelated merge."""
-        opened = self.open_workspace()
-        self._land_on_base("docs/notes.md", "unrelated\n")
-        result = self.store.commit(
-            {
-                "handle": opened["handle"],
-                "branch": "fix/replicas",
-                "message": "raise replicas",
-                "expectedBaseSha": opened["baseSha"],
-                "changes": [
-                    {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                ],
-            }
-        )
-        self.assertTrue(result["committed"])
-        self.assertNotEqual(result["baseSha"], opened["baseSha"])
-
-    def test_a_collision_on_a_written_path_is_a_409_naming_the_files(self):
-        opened = self.open_workspace()
-        self._land_on_base("manifests/app.yaml", "replicas: 9\n")
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": opened["handle"],
-                    "branch": "fix/replicas",
-                    "message": "raise replicas",
-                    "expectedBaseSha": opened["baseSha"],
-                    "changes": [
-                        {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                    ],
-                }
-            )
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(caught.exception.fields.get("code"), "BASE_MOVED")
-        self.assertEqual(caught.exception.fields.get("paths"), ["manifests/app.yaml"])
-
-    def test_an_unanswerable_expected_sha_counts_as_a_collision(self):
-        """Not as consent. The sha names an object this clone does not have."""
-        opened = self.open_workspace()
-        self._land_on_base("docs/notes.md", "unrelated\n")
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.commit(
-                {
-                    "handle": opened["handle"],
-                    "branch": "fix/x",
-                    "message": "m",
-                    "expectedBaseSha": "0" * 40,
-                    "changes": [
-                        {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                    ],
-                }
-            )
-        self.assertEqual(caught.exception.status, 409)
-
-    def test_no_expected_sha_means_no_conflict_check(self):
-        opened = self.open_workspace()
-        self._land_on_base("manifests/app.yaml", "replicas: 9\n")
-        result = self.store.commit(
-            {
-                "handle": opened["handle"],
-                "branch": "fix/replicas",
-                "message": "m",
-                "changes": [
-                    {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                ],
-            }
-        )
-        self.assertTrue(result["committed"])
-
-
-class PushTest(StoreTestCase):
-    def test_push_lands_the_branch_on_the_remote(self):
-        handle = self.open_workspace()["handle"]
-        self.store.commit(
-            {
-                "handle": handle,
-                "branch": "fix/replicas",
-                "message": "m",
-                "changes": [
-                    {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                ],
-            }
-        )
-        result = self.store.push({"handle": handle, "branch": "fix/replicas"})
-        self.assertTrue(result["pushed"])
-        remote_refs = self._git(self.tmp, "ls-remote", "--heads", str(self.remote)).stdout
-        self.assertIn("refs/heads/fix/replicas", remote_refs)
-
-    def test_push_refuses_a_branch_this_handle_never_committed(self):
-        handle = self.open_workspace()["handle"]
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.push({"handle": handle, "branch": "fix/never"})
-        self.assertEqual(caught.exception.status, 409)
-
-    def test_a_rejected_push_is_a_409_and_not_a_retry(self):
-        handle = self.open_workspace()["handle"]
-        self.store.commit(
-            {
-                "handle": handle,
-                "branch": "fix/replicas",
-                "message": "m",
-                "changes": [
-                    {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                ],
-            }
-        )
-        calls: list[list[str]] = []
-        real = self.store._runner
-
-        def rejecting(argv, cwd, check=True):
-            calls.append(list(argv))
-            if argv[:2] == ["git", "push"]:
-                return subprocess.CompletedProcess(argv, 1, "", "stale info")
-            return real(argv, cwd, check)
-
-        self.store._runner = rejecting
-        with self.assertRaises(WorkspaceError) as caught:
-            self.store.push({"handle": handle, "branch": "fix/replicas"})
-        self.assertEqual(caught.exception.status, 409)
-        self.assertEqual(caught.exception.fields.get("code"), "LEASE_REJECTED")
-
-    def test_push_uses_force_with_lease_and_does_not_fetch_first(self):
-        """Fetching immediately before the push is how a lease gets defeated."""
-        handle = self.open_workspace()["handle"]
-        self.store.commit(
-            {
-                "handle": handle,
-                "branch": "fix/replicas",
-                "message": "m",
-                "changes": [
-                    {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                ],
-            }
-        )
-        calls: list[list[str]] = []
-        real = self.store._runner
-
-        def recording(argv, cwd, check=True):
-            calls.append(list(argv))
-            return real(argv, cwd, check)
-
-        self.store._runner = recording
-        self.store.push({"handle": handle, "branch": "fix/replicas"})
-        push_calls = [call for call in calls if call[:2] == ["git", "push"]]
-        self.assertEqual(len(push_calls), 1)
-        self.assertIn("--force-with-lease", push_calls[0])
-        self.assertNotIn("--force", push_calls[0])
-        index = calls.index(push_calls[0])
-        self.assertNotIn("fetch", calls[index - 1])
-
-
-class SecondRoundTest(StoreTestCase):
-    """A branch that already exists on the remote is continued, not replaced."""
-
-    def _round(self, branch, path, text, base_sha=None):
-        opened = self.store.open({"repo": "acme/infra", "branch": branch})
-        payload = {
-            "handle": opened["handle"],
-            "branch": branch,
-            "message": "m",
-            "changes": [{"path": path, "contentBase64": b64(text)}],
-        }
-        committed = self.store.commit(payload)
-        self.store.push({"handle": opened["handle"], "branch": branch})
-        return opened, committed
-
-    def test_the_reviewed_commits_survive_the_second_round(self):
-        """Directory mode already shipped this data loss once.
-
-        Checking out `origin/<base>` unconditionally makes round two a single
-        commit that does not contain round one, and `--force-with-lease` cannot
-        object: `commit` fetches the very ref the lease compares against.
+        The victim point is the first write of the payload loop, i.e. after
+        `checkout` and `clean` and before anything is staged.
         """
-        first, _ = self._round("fix/replicas", "manifests/app.yaml", "replicas: 3\n")
-        self.assertEqual(first["startedFrom"], "origin/main")
+        arrived = threading.Event()
+        finished = threading.Event()
+        original = content_workspace._no_symlink_on_the_way
 
-        second, committed = self._round("fix/replicas", "notes.md", "round two\n")
-        self.assertEqual(second["startedFrom"], "origin/fix/replicas")
-        self.assertEqual(committed["startedFrom"], "origin/fix/replicas")
+        def once(root, relative):
+            if not arrived.is_set():
+                arrived.set()
+                thread = threading.Thread(
+                    target=lambda: (interleaved(), finished.set())
+                )
+                thread.start()
+                # If the lock works, the other verb cannot finish while this
+                # commit holds it. A generous wait keeps the assertion about
+                # the lock rather than about scheduling.
+                thread.join(timeout=2)
+                # Snapshot it *here*. Read after the commit returns, this is
+                # always true -- the other verb runs the moment the lock is
+                # released -- and the test would pass against no lock at all.
+                self.finished_during_commit = finished.is_set()
+                self.other = thread
+            return original(root, relative)
 
-        files = self._git(
-            self.tmp, f"--git-dir={self.remote}", "ls-tree", "-r", "--name-only",
-            "fix/replicas",
-        ).stdout.split()
-        self.assertIn("notes.md", files)
-        self.assertIn("manifests/app.yaml", files)
-        content = self._git(
-            self.tmp, f"--git-dir={self.remote}", "show", "fix/replicas:manifests/app.yaml"
-        ).stdout
-        self.assertEqual(content, "replicas: 3\n", "round one's reviewed work was erased")
-
-    def test_reopening_reads_the_branch_rather_than_the_base(self):
-        self._round("fix/replicas", "manifests/app.yaml", "replicas: 3\n")
-        opened = self.store.open({"repo": "acme/infra", "branch": "fix/replicas"})
-        read = self.store.read(
-            {"handle": opened["handle"], "path": "manifests/app.yaml"}
+        content_workspace._no_symlink_on_the_way = once
+        self.addCleanup(
+            setattr, content_workspace, "_no_symlink_on_the_way", original
         )
-        self.assertEqual(base64.b64decode(read["contentBase64"]), b"replicas: 3\n")
+        try:
+            outcome = store.commit(
+                workspace.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [Change(repo_relative("manifests/mine.yaml"), b"kind: Mine\n")],
+            )
+        finally:
+            content_workspace._no_symlink_on_the_way = original
+        self.other.join(timeout=10)
+        return outcome, self.finished_during_commit
 
-    def test_an_unknown_branch_still_opens_on_the_base(self):
-        opened = self.store.open({"repo": "acme/infra", "branch": "fix/never-pushed"})
-        self.assertEqual(opened["startedFrom"], "origin/main")
-        read = self.store.read(
-            {"handle": opened["handle"], "path": "manifests/app.yaml"}
-        )
-        self.assertEqual(base64.b64decode(read["contentBase64"]), b"replicas: 1\n")
+    def test_a_close_cannot_land_inside_a_commit(self):
+        """Unlocked, this left a tree on disk with no handle pointing at it.
 
-    def test_a_branch_name_that_is_not_a_ref_name_is_refused_at_open(self):
-        for branch in ("-delete-everything", "fix/..", "fix/x@{0}"):
-            with self.subTest(branch=branch), self.assertRaises(WorkspaceError):
-                self.store.open({"repo": "acme/infra", "branch": branch})
-
-
-class CloseTest(StoreTestCase):
-    def test_close_removes_the_tree_and_the_handle(self):
-        handle = self.open_workspace()["handle"]
-        root = self.store._workspaces[handle].root
-        self.assertTrue(root.exists())
-        self.assertEqual(self.store.close({"handle": handle}), {"closed": True})
-        self.assertFalse(root.exists())
-        with self.assertRaises(WorkspaceError):
-            self.store.read({"handle": handle, "path": "README.md"})
-
-
-class ResponseShapeTest(StoreTestCase):
-    def test_no_response_carries_a_filesystem_path(self):
-        """The invariant, written as something a test can check.
-
-        A path handed back is a directory the agent can be told to `cd` into,
-        and the whole design is that it has no name for these trees.
+        `close` pops the handle and removes the tree; the commit already past
+        `get` then re-creates it with `mkdir(parents=True)` and writes into it.
+        Nothing can reach the result afterwards, and the trees live on the
+        broker's ephemeral storage -- so a `close`/`commit` loop is node disk
+        pressure, through the new surface, with the flag on.
         """
-        handle = self.open_workspace()["handle"]
-        responses = [
-            self.store.read({"handle": handle, "path": "README.md"}),
-            self.store.read({"handle": handle, "paths": ["README.md", "nope"]}),
-            self.store.list({"handle": handle}),
-            self.store.grep({"handle": handle, "pattern": "replicas"}),
-            self.store.commit(
-                {
-                    "handle": handle,
-                    "branch": "fix/x",
-                    "message": "m",
-                    "changes": [
-                        {"path": "manifests/app.yaml", "contentBase64": b64("replicas: 3\n")}
-                    ],
-                }
-            ),
-            self.store.push({"handle": handle, "branch": "fix/x"}),
-            self.store.close({"handle": handle}),
+        store, workspace, _ = self.store_with_workspace()
+        outcome, finished_during_commit = self.commit_with(
+            store, workspace, lambda: store.close(workspace.handle)
+        )
+
+        self.assertFalse(
+            finished_during_commit,
+            "close() completed while a commit held the workspace",
+        )
+        self.assertTrue(outcome["committed"])
+        # close() ran after the commit released, so it removed a tree that was
+        # whole. Nothing is registered and nothing is left behind.
+        self.assertEqual({}, store._workspaces)
+        self.assertEqual(
+            [], list(store.tree_root.iterdir()), "a tree was orphaned on disk"
+        )
+
+    def test_a_second_commit_cannot_land_inside_the_first(self):
+        """Unlocked, the second commit's `clean -fdxq` deleted the first's files.
+
+        The first then either failed on a pathspec that no longer matched or
+        landed its commit on the other's branch while reporting its own -- and
+        the response still said `committed: true`, so a caller could push a
+        branch whose content is not what it sent.
+        """
+        store, workspace, runner = self.store_with_workspace()
+
+        def other_commit():
+            store.commit(
+                workspace.handle,
+                "platform-agent/theirs",
+                "feat: theirs",
+                [Change(repo_relative("manifests/theirs.yaml"), b"kind: Theirs\n")],
+            )
+
+        outcome, finished_during_commit = self.commit_with(
+            store, workspace, other_commit
+        )
+
+        self.assertFalse(
+            finished_during_commit,
+            "a second commit completed while the first held the workspace",
+        )
+        self.assertTrue(outcome["committed"])
+        self.assertEqual("platform-agent/change", outcome["branch"])
+        # The two commits ran end to end, so each staged its own path and
+        # neither saw the other's checkout.
+        staged = [
+            argv for argv, _ in runner.calls if argv[1:3] == ["--literal-pathspecs", "add"]
         ]
-        blob = repr(responses)
-        for secret in (str(self.trees), str(self.tmp), str(self.remote)):
-            self.assertNotIn(secret, blob)
+        self.assertEqual(
+            [
+                ["git", "--literal-pathspecs", "add", "--", "manifests/mine.yaml"],
+                ["git", "--literal-pathspecs", "add", "--", "manifests/theirs.yaml"],
+            ],
+            staged,
+        )
+
+    def test_ordinary_sequential_use_is_not_slowed_to_a_stop(self):
+        """Paired ordinary use: the lock is reentrant and does not self-deadlock.
+
+        Every verb takes it and every verb calls `get`, which takes it too, so
+        a plain `Lock` deadlocks on the first request.
+
+        Run on a worker with a bounded join rather than inline, because the
+        failure mode here is a *hang*, not an exception. Inline, swapping
+        `RLock` for `Lock` does not turn this red -- it stops the suite dead,
+        which in CI is a job timeout with no failing test named and nothing
+        pointing at this file. A deadlock the test cannot report is a test that
+        only works when someone is watching.
+        """
+        store, workspace, _ = self.store_with_workspace()
+        done = []
+
+        def sequence():
+            done.append(store.get(workspace.handle))
+            done.append(store.list(workspace.handle))
+            done.append(
+                store.commit(
+                    workspace.handle,
+                    "platform-agent/change",
+                    "feat: a change",
+                    [Change(repo_relative("a.yaml"), b"a\n")],
+                )
+            )
+            store.close(workspace.handle)
+            done.append("closed")
+
+        worker = threading.Thread(target=sequence, daemon=True)
+        worker.start()
+        worker.join(timeout=20)
+        self.assertFalse(
+            worker.is_alive(),
+            "a verb deadlocked: every verb takes the store lock and every verb "
+            "calls get(), which takes it too, so it has to be reentrant",
+        )
+        self.assertIs(workspace, done[0])
+        self.assertEqual([], done[1]["entries"])
+        self.assertTrue(done[2]["committed"])
+        self.assertEqual("closed", done[3])
+        self.assertEqual({}, store._workspaces)
+
+
+class ResourceCeilingTest(unittest.TestCase):
+    """Nothing bounded how much disk the trees could take between them."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, runner=None):
+        return ContentWorkspaceStore(
+            self.base / "trees", self.agent, runner or RecordingRunner()
+        )
+
+    def test_the_number_of_open_workspaces_is_capped(self):
+        store = self.store()
+        with mock.patch.object(content_workspace, "max_workspaces", lambda: 3):
+            for _ in range(3):
+                store.open("acme/fleet")
+            with self.assertRaises(TooLarge):
+                store.open("acme/fleet")
+
+            # Paired ordinary use: closing one makes room for the next, so the
+            # ceiling is a ceiling and not a lifetime quota.
+            store.close(next(iter(store._workspaces)))
+            self.assertIsNotNone(store.open("acme/fleet"))
+        self.assertEqual(3, len(store._workspaces))
+        self.assertEqual(3, len(list(store.tree_root.iterdir())))
+
+    def test_a_clone_over_the_byte_ceiling_is_removed_not_kept(self):
+        """A repository the broker cannot afford is not one to hold half of."""
+
+        class FatCloneRunner(RecordingRunner):
+            def __call__(self, argv, cwd):
+                result = super().__call__(argv, cwd)
+                if argv[1] == "clone":
+                    target = Path(argv[-1])
+                    target.mkdir(parents=True, exist_ok=True)
+                    (target / "blob.bin").write_bytes(b"x" * 4096)
+                return result
+
+        store = self.store(FatCloneRunner())
+        with mock.patch.object(content_workspace, "max_clone_bytes", lambda: 1024):
+            with self.assertRaises(TooLarge):
+                store.open("acme/fleet")
+        self.assertEqual({}, store._workspaces)
+        self.assertEqual(
+            [], list(store.tree_root.iterdir()), "the oversized tree was kept"
+        )
+
+        # Paired: under the ceiling the same clone is accepted and stays.
+        with mock.patch.object(content_workspace, "max_clone_bytes", lambda: 1 << 20):
+            workspace = store.open("acme/fleet")
+        self.assertEqual([workspace.handle], [p.name for p in store.tree_root.iterdir()])
+
+
+class ErrorRedactionTest(unittest.TestCase):
+    """The invariant three docstrings assert: no response carries a path.
+
+    `GitFailed` puts git's stderr on the wire, and git quotes absolute paths in
+    its errors without being asked. Until this was enforced, the claim was a
+    sentence with nothing behind it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_git_stderr_reaches_the_caller_without_the_tree_root_in_it(self):
+        handle = "e" * 32
+        runner = RecordingRunner()
+        store = ContentWorkspaceStore(self.base / "trees", self.agent, runner)
+        # Built from the store's own root, because git prints the path it
+        # actually used and git resolves. A fixture using the unresolved
+        # spelling tests a string the broker never emits.
+        runner.responses = {
+            "clone": FakeResult(
+                128,
+                "",
+                f"fatal: could not create work tree dir "
+                f"'{store.tree_root}/{handle}/repo': Permission denied",
+            )
+        }
+
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        message = str(caught.exception)
+
+        self.assertNotIn(str(store.tree_root), message)
+        self.assertNotIn(str(self.base), message)
+        # Root and tail collapse to one marker rather than leaving a shredded
+        # path behind.
+        self.assertIn("'<workspace-root>'", message)
+        # And no handle survives in any spelling. It is a bearer capability,
+        # and the handle whose `open` just failed is not registered yet, so it
+        # has to be caught by shape.
+        self.assertNotRegex(message, r"[0-9a-f]{32}")
+
+        # Paired: a handle quoted on its own, outside any path, still goes.
+        runner.responses = {"clone": FakeResult(128, "", f"fatal: bad object {handle}")}
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        self.assertIn("<handle>", str(caught.exception))
+        self.assertNotRegex(str(caught.exception), r"[0-9a-f]{32}")
+
+        # Paired ordinary use: the part of the message that helps a caller
+        # debug is still there. Redaction that removes everything is just a
+        # worse error.
+        self.assertIn("could not create work tree dir", message)
+        self.assertIn("Permission denied", message)
+        self.assertIn("exit code 128", message)
+
+    def test_the_root_is_resolved_so_a_symlinked_prefix_still_matches(self):
+        """git prints the path it used, and git resolves. So must the root.
+
+        Constructed with an unresolved, symlinked spelling -- which is what a
+        caller hands over -- while git's stderr names the real path underneath.
+        Unresolved, the substitution matches only the tail and the message goes
+        out as `/private<workspace-root>/...`. That is how it surfaced: in a
+        real run on a machine where the temp directory is behind a symlink.
+
+        It is unreachable in production only because `CommandExecutor` happens
+        to resolve the root before handing it over, which makes this module's
+        invariant depend on a caller somewhere else. Resolving here is what
+        makes it this module's property.
+        """
+        real = self.base / "real"
+        real.mkdir()
+        linked = self.base / "linked"
+        linked.symlink_to(real)
+
+        runner = RecordingRunner()
+        store = ContentWorkspaceStore(linked / "trees", self.agent, runner)
+        self.assertEqual(
+            (real / "trees").resolve(), store.tree_root, "the root was not resolved"
+        )
+
+        # The path git would actually print, from under the symlink.
+        runner.responses = {
+            "clone": FakeResult(
+                128,
+                "",
+                f"fatal: could not create work tree dir "
+                f"'{(real / 'trees').resolve()}/{'e' * 32}/repo': Permission denied",
+            )
+        }
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        message = str(caught.exception)
+        self.assertIn("'<workspace-root>'", message)
+        self.assertNotIn(str(real), message)
+        self.assertNotIn("/private", message)
+
+    def test_an_absolute_path_that_is_not_the_tree_root_goes_too(self):
+        """The claim is "no filesystem path", not "not that one path".
+
+        Knowing only the tree root and the handle grammar left every other
+        absolute path in git's stderr on the wire. These two the broker really
+        can produce: `$HOME` is deliberately pointed at the broker's own state
+        dir, so a config it cannot read names that dir, and a lock failure
+        names wherever the config lives.
+        """
+        leaky = (
+            "warning: unable to access '/var/run/broker-state/.gitconfig': "
+            "Permission denied\n"
+            "error: could not lock config file /tmp/xyz/.git/config: Permission denied"
+        )
+        runner = RecordingRunner({"clone": FakeResult(128, "", leaky)})
+        store = ContentWorkspaceStore(self.base / "trees3", self.agent, runner)
+
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        message = str(caught.exception)
+
+        self.assertNotIn("/var/run/broker-state", message)
+        self.assertNotIn("/tmp/xyz", message)
+        self.assertNotIn(".gitconfig", message)
+        self.assertEqual(2, message.count("<path>"))
+
+        # Paired: the reason survives, and a ref is not a path -- `origin/main`
+        # and `refs/heads/x` are most of what a git error is about and must
+        # come through intact.
+        self.assertIn("unable to access", message)
+        self.assertIn("could not lock config file", message)
+        self.assertIn("Permission denied", message)
+
+        refs = RecordingRunner(
+            {"clone": FakeResult(1, "", "error: failed to push some refs to origin/main")}
+        )
+        store = ContentWorkspaceStore(self.base / "trees4", self.agent, refs)
+        with self.assertRaises(content_workspace.GitFailed) as caught:
+            store.open("acme/fleet")
+        self.assertIn("origin/main", str(caught.exception))
+        self.assertNotIn("<path>", str(caught.exception))
+
+
+class IndexUnreadableTest(unittest.TestCase):
+    """`git diff --cached --quiet` has three answers, not two.
+
+    0 is "nothing staged", 1 is "something staged", and anything else means the
+    index could not be read at all — a missing object store, a corrupt index, a
+    failed hook. `audit_report` read every non-zero exit as "already fixed on
+    main", logged a reassuring line and opened no pull request. The same mistake
+    here would report a commit that never happened.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store_with(self, diff_exit_code):
+        runner = RecordingRunner({"diff --cached": FakeResult(diff_exit_code)})
+        store = ContentWorkspaceStore(self.base / "trees", self.agent, runner)
+        workspace = Workspace(
+            handle="b" * 32,
+            repo="acme/fleet",
+            tree=self.base / "trees" / "repo",
+            base="main",
+            base_sha="0" * 40,
+        )
+        workspace.tree.mkdir(parents=True, exist_ok=True)
+        store._workspaces[workspace.handle] = workspace
+        return store, workspace, runner
+
+    def commit(self, store, workspace):
+        return store.commit(
+            workspace.handle,
+            "platform-agent/change",
+            "feat: a change",
+            [Change(repo_relative("a.yaml"), b"a\n")],
+        )
+
+    def test_an_index_that_cannot_be_read_is_an_error_not_an_empty_commit(self):
+        for exit_code in (2, 128, 129):
+            with self.subTest(exit_code=exit_code):
+                store, workspace, runner = self.store_with(exit_code)
+                with self.assertRaises(content_workspace.GitFailed):
+                    self.commit(store, workspace)
+                self.assertNotIn(
+                    "commit", runner.subcommands, "nothing should have been committed"
+                )
+
+        # Paired ordinary use: the two answers that do mean something.
+        store, workspace, runner = self.store_with(1)
+        self.assertTrue(self.commit(store, workspace)["committed"])
+        self.assertIn("commit", runner.subcommands)
+
+        store, workspace, runner = self.store_with(0)
+        self.assertFalse(self.commit(store, workspace)["committed"])
+        self.assertNotIn("commit", runner.subcommands)
+
+
+@unittest.skipUnless(git_available(), "git is not installed")
+class RealGitTest(unittest.TestCase):
+    """The commit path against real git, in a real tree.
+
+    `open` is bypassed deliberately: it composes an https URL by design, and a
+    test-only escape hatch for that would be a hole in the control the test
+    above exists to prove. Constructing the `Workspace` directly exercises
+    everything after the clone, which is where the interesting behaviour is.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.remote = self.base / "remote.git"
+        subprocess.run(
+            ["git", "init", "--bare", "--initial-branch=main", str(self.remote)],
+            capture_output=True,
+            check=True,
+        )
+        seed = self.base / "seed"
+        real_git_runner(["git", "clone", str(self.remote), str(seed)], self.base)
+        (seed / "manifests").mkdir()
+        (seed / "manifests" / "existing.yaml").write_text("kind: ConfigMap\n")
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "seed"], seed)
+        real_git_runner(["git", "push", "origin", "main"], seed)
+
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.store = ContentWorkspaceStore(self.base / "trees", self.agent, real_git_runner)
+        self.tree = self.base / "trees" / "work" / "repo"
+        self.tree.parent.mkdir(parents=True)
+        real_git_runner(["git", "clone", str(self.remote), str(self.tree)], self.base)
+        self.workspace = Workspace(
+            handle="a" * 32,
+            repo="acme/fleet",
+            tree=self.tree,
+            base="main",
+            base_sha=real_git_runner(
+                ["git", "rev-parse", "--verify", "origin/main"], self.tree
+            ).stdout.strip(),
+        )
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def commit(self, changes, **kwargs):
+        return self.store.commit(
+            self.workspace.handle, "platform-agent/change", "feat: a change", changes, **kwargs
+        )
+
+    def test_a_commit_lands_the_bytes_and_nothing_else(self):
+        result = self.commit(
+            [
+                Change(repo_relative("manifests/new.yaml"), b"kind: Deployment\n"),
+                Change(repo_relative("manifests/existing.yaml"), None),
+            ]
+        )
+        self.assertTrue(result["committed"])
+        self.assertEqual("platform-agent/change", result["branch"])
+
+        listed = real_git_runner(
+            ["git", "show", "--name-status", "--format=", "HEAD"], self.tree
+        ).stdout
+        self.assertIn("A\tmanifests/new.yaml", listed)
+        self.assertIn("D\tmanifests/existing.yaml", listed)
+
+        content = real_git_runner(
+            ["git", "show", "HEAD:manifests/new.yaml"], self.tree
+        ).stdout
+        self.assertEqual("kind: Deployment\n", content)
+
+    def test_an_empty_change_is_reported_rather_than_committed(self):
+        # The bytes already on the base: there is nothing to propose, and that
+        # is a fact to report, not a failure to raise.
+        existing = (self.tree / "manifests" / "existing.yaml").read_bytes()
+        result = self.commit([Change(repo_relative("manifests/existing.yaml"), existing)])
+        self.assertFalse(result["committed"])
+
+        # Paired: one byte different and it is a commit.
+        result = self.commit(
+            [Change(repo_relative("manifests/existing.yaml"), existing + b"# changed\n")]
+        )
+        self.assertTrue(result["committed"])
+
+    def test_a_base_that_moved_under_the_same_file_is_a_conflict(self):
+        opened_at = self.workspace.base_sha
+        # Somebody else changes the same file on the base branch.
+        seed = self.base / "seed"
+        (seed / "manifests" / "existing.yaml").write_text("kind: ConfigMap  # theirs\n")
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "theirs"], seed)
+        real_git_runner(["git", "push", "origin", "main"], seed)
+
+        with self.assertRaises(Conflict) as caught:
+            self.commit(
+                [Change(repo_relative("manifests/existing.yaml"), b"kind: ConfigMap  # ours\n")],
+                expected_base_sha=opened_at,
+            )
+        self.assertIn("existing.yaml", str(caught.exception))
+
+        # Paired ordinary use: the base moving under a file this commit does
+        # *not* write is not a conflict. Refusing that would fail every commit
+        # that raced any unrelated merge, which is most of them.
+        result = self.commit(
+            [Change(repo_relative("manifests/unrelated.yaml"), b"kind: Service\n")],
+            expected_base_sha=opened_at,
+        )
+        self.assertTrue(result["committed"])
+
+    def test_a_read_returns_content_and_a_list_never_shows_the_git_directory(self):
+        self.assertEqual(
+            b"kind: ConfigMap\n",
+            self.store.read(self.workspace.handle, "manifests/existing.yaml"),
+        )
+        with self.assertRaises(PathRefused):
+            self.store.read(self.workspace.handle, ".git/config")
+
+        paths = [
+            entry["path"]
+            for entry in self.store.list(self.workspace.handle)["entries"]
+        ]
+        self.assertIn("manifests/existing.yaml", paths)
+        self.assertFalse([path for path in paths if path.startswith(".git/")])
+
+    def test_a_payload_over_the_limit_writes_nothing_at_all(self):
+        """Fail closed means before the side effects, not after some of them."""
+        before = (self.tree / "manifests" / "existing.yaml").read_bytes()
+        with mock.patch.object(content_workspace, "max_file_bytes", lambda: 4):
+            with self.assertRaises(TooLarge):
+                parse_changes(
+                    [
+                        {
+                            "path": "manifests/existing.yaml",
+                            "contentBase64": base64.b64encode(b"ok").decode(),
+                        },
+                        {
+                            "path": "manifests/huge.yaml",
+                            "contentBase64": base64.b64encode(b"far too long").decode(),
+                        },
+                    ]
+                )
+        self.assertEqual(before, (self.tree / "manifests" / "existing.yaml").read_bytes())
+        self.assertFalse((self.tree / "manifests" / "huge.yaml").exists())
+
+        # Paired: under the limit, both files land.
+        changes = parse_changes(
+            [
+                {"path": "manifests/a.yaml", "contentBase64": base64.b64encode(b"a").decode()},
+                {"path": "manifests/b.yaml", "contentBase64": base64.b64encode(b"b").decode()},
+            ]
+        )
+        self.assertTrue(self.commit(changes)["committed"])
+        self.assertEqual(b"a", (self.tree / "manifests" / "a.yaml").read_bytes())
+
+    def seed_a_symlink_into_the_base(self, name, target):
+        """Commit a symlink onto the base branch and refresh the workspace.
+
+        Committed, not merely written. `commit` does `checkout --force` and
+        `clean -fdxq` before it applies anything, so a symlink only written
+        into the working tree is gone by the time the write loop runs and the
+        test would pass for the wrong reason -- the same fixture trap as
+        attributes that have to live in the merge base.
+        """
+        seed = self.base / "seed"
+        real_git_runner(["git", "rm", "-r", "--cached", "-q", "--ignore-unmatch", name], seed)
+        path = seed / name
+        if path.is_dir() and not path.is_symlink():
+            for child in sorted(path.rglob("*"), reverse=True):
+                child.unlink() if child.is_file() else child.rmdir()
+            path.rmdir()
+        path.symlink_to(target)
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "symlink"], seed)
+        real_git_runner(["git", "push", "origin", "main"], seed)
+        real_git_runner(["git", "fetch", "--quiet", "origin"], self.tree)
+        real_git_runner(["git", "checkout", "--force", "-B", "main", "origin/main"], self.tree)
+        # The fixture is only worth anything if git really restored a symlink.
+        self.assertTrue(
+            (self.tree / name).is_symlink(), "fixture did not produce a symlink"
+        )
+
+    def test_a_commit_refuses_to_write_through_a_symlink_in_the_base(self):
+        """The symlink check, reached the way a request reaches it.
+
+        The unit tests above call `_no_symlink_on_the_way` directly, which
+        proves the function and not the wiring. Bypassing the call at both of
+        its sites left every one of those tests green, so this one goes through
+        `store.commit` instead.
+        """
+        outside = self.base / "outside"
+        outside.mkdir()
+        self.seed_a_symlink_into_the_base("manifests", outside)
+
+        with self.assertRaises(PathRefused):
+            self.commit([Change(repo_relative("manifests/pwned.yaml"), b"kind: Pwned\n")])
+        self.assertFalse(
+            (outside / "pwned.yaml").exists(), "the write escaped through the link"
+        )
+
+        # Paired ordinary use: a path that does not cross the link still commits.
+        self.assertTrue(
+            self.commit([Change(repo_relative("charts/values.yaml"), b"replicas: 1\n")])[
+                "committed"
+            ]
+        )
+
+    def test_a_read_refuses_to_follow_a_symlink_in_the_base(self):
+        """Same wiring question on the read path, which has its own call site."""
+        outside = self.base / "outside"
+        outside.mkdir()
+        (outside / "secret.yaml").write_text("kind: Secret\n")
+        self.seed_a_symlink_into_the_base("manifests", outside)
+
+        with self.assertRaises(PathRefused):
+            self.store.read(self.workspace.handle, "manifests/secret.yaml")
+
+        # Paired: an ordinary tracked file still reads.
+        (self.tree / "plain.yaml").write_bytes(b"kind: ConfigMap\n")
+        self.assertEqual(
+            b"kind: ConfigMap\n", self.store.read(self.workspace.handle, "plain.yaml")
+        )
+
+    def test_a_commit_cannot_write_the_repository_configuration(self):
+        """Repo-local config as code execution, refused where it can be."""
+        # Distinctive enough that finding it proves the payload landed. A single
+        # character would not: the repository path itself is in `.git/config`,
+        # so a one-byte needle matches whatever the temporary directory is
+        # called and the test passes or fails by luck.
+        payload = b"[url]\n\tinsteadOf = PAYLOAD-c0ffee\n"
+        for path in (".git/config", ".git/hooks/pre-commit"):
+            with self.subTest(path=path):
+                with self.assertRaises(PathRefused):
+                    parse_changes(
+                        [{"path": path, "contentBase64": base64.b64encode(payload).decode()}]
+                    )
+                self.assertNotIn(
+                    b"PAYLOAD-c0ffee", (self.tree / ".git" / "config").read_bytes()
+                )
+        self.assertFalse((self.tree / ".git" / "hooks" / "pre-commit").exists())
+
+        # Paired ordinary use: a file whose name begins the same way is content
+        # like any other, and it commits.
+        self.assertTrue(
+            self.commit([Change(repo_relative(".gitignore"), b"*.tmp\n")])["committed"]
+        )
+
+
+class ReadVerbCeilingTest(unittest.TestCase):
+    """The batched read and the paged listing, which answer partially by design.
+
+    Both report what they left out. A caller that cannot tell a complete answer
+    from a truncated one materialises part of a repository, does not find what
+    it wanted, and goes on to `read` paths it invented -- which is the failure
+    the ceilings are there to make visible rather than the one they cause.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, RecordingRunner()
+        )
+        self.workspace = Workspace(
+            handle="e" * 32,
+            repo="acme/fleet",
+            tree=self.store.tree_root / ("e" * 32) / "repo",
+            base="main",
+            base_sha="0" * 40,
+        )
+        for index in range(5):
+            target = self.workspace.tree / "manifests" / f"{index}.yaml"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("kind: ConfigMap\n")
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def handle(self) -> str:
+        return self.workspace.handle
+
+    def test_a_batch_read_names_what_it_did_not_return(self):
+        with mock.patch.object(content_workspace, "max_total_bytes", lambda: 20):
+            answer = self.store.read_many(
+                self.handle(),
+                ["manifests/0.yaml", "manifests/1.yaml", "manifests/2.yaml"],
+            )
+        # 16 bytes each, so the second exhausts the budget and the third is
+        # named rather than dropped -- `requestBudget` means ask again.
+        self.assertEqual(["manifests/0.yaml"], [f["path"] for f in answer["files"]])
+        self.assertEqual(
+            [("manifests/1.yaml", "requestBudget"), ("manifests/2.yaml", "requestBudget")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # A file that is not there is skipped, not fatal, and one over the
+        # per-file ceiling reports its size so a caller stops asking for it.
+        with mock.patch.object(content_workspace, "max_file_bytes", lambda: 4):
+            answer = self.store.read_many(
+                self.handle(), ["manifests/0.yaml", "manifests/absent.yaml"]
+            )
+        self.assertEqual([], answer["files"])
+        self.assertEqual(
+            [("manifests/0.yaml", "tooLarge"), ("manifests/absent.yaml", "notAFile")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # Paired ordinary use: within the ceilings every file comes back, as
+        # bytes, in the order it was asked for.
+        answer = self.store.read_many(
+            self.handle(), ["manifests/1.yaml", "manifests/0.yaml"]
+        )
+        self.assertEqual([], answer["skipped"])
+        self.assertEqual(
+            ["manifests/1.yaml", "manifests/0.yaml"],
+            [f["path"] for f in answer["files"]],
+        )
+        self.assertEqual(
+            b"kind: ConfigMap\n",
+            base64.b64decode(answer["files"][0]["contentBase64"]),
+        )
+
+    def test_a_batch_read_refuses_the_whole_request_for_one_bad_path(self):
+        """`.git/config` in the last entry does not get the others answered.
+
+        The same fail-before-side-effects rule `parse_changes` follows. A path
+        that is not a path is the caller being wrong about what it may name,
+        which is not the same class of thing as a file that is missing.
+        """
+        with self.assertRaises(PathRefused):
+            self.store.read_many(
+                self.handle(), ["manifests/0.yaml", ".git/config"]
+            )
+        with self.assertRaises(PathRefused):
+            self.store.read_many(self.handle(), ["../etc/passwd"])
+        for bad in ([], "manifests/0.yaml", None):
+            with self.subTest(paths=bad):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store.read_many(self.handle(), bad)
+        with mock.patch.object(content_workspace, "max_entries", lambda: 1):
+            with self.assertRaises(TooLarge):
+                self.store.read_many(
+                    self.handle(), ["manifests/0.yaml", "manifests/1.yaml"]
+                )
+
+        # Paired ordinary use: the same call with only nameable paths is served.
+        self.assertEqual(
+            2,
+            len(
+                self.store.read_many(
+                    self.handle(), ["manifests/0.yaml", "manifests/1.yaml"]
+                )["files"]
+            ),
+        )
+
+    def test_a_truncated_listing_says_so_and_pages_from_its_last_entry(self):
+        with mock.patch.object(content_workspace, "max_entries", lambda: 2):
+            first = self.store.list(self.handle())
+            self.assertTrue(first["truncated"])
+            self.assertEqual(5, first["total"])
+            self.assertEqual(
+                ["manifests/0.yaml", "manifests/1.yaml"],
+                [e["path"] for e in first["entries"]],
+            )
+
+            # The cursor is the last path of the page before, and the next page
+            # starts strictly after it -- no repeat, no gap.
+            second = self.store.list(
+                self.handle(), after=first["entries"][-1]["path"]
+            )
+            self.assertEqual(
+                ["manifests/2.yaml", "manifests/3.yaml"],
+                [e["path"] for e in second["entries"]],
+            )
+            self.assertEqual(3, second["total"])
+
+            last = self.store.list(
+                self.handle(), after=second["entries"][-1]["path"]
+            )
+            self.assertEqual(["manifests/4.yaml"], [e["path"] for e in last["entries"]])
+            self.assertFalse(last["truncated"])
+
+        # Paired ordinary use: under the ceiling one page is the whole answer
+        # and it does not claim to be truncated.
+        whole = self.store.list(self.handle())
+        self.assertFalse(whole["truncated"])
+        self.assertEqual(5, len(whole["entries"]))
+
+        # And the cursor is a path like any other, so it is validated like one.
+        with self.assertRaises(PathRefused):
+            self.store.list(self.handle(), after="../etc/passwd")
+
+
+class ShallowAndBranchOpenTest(unittest.TestCase):
+    """`open`'s two read-side arguments, and what each one commits the caller to."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, responses=None):
+        self.runner = RecordingRunner(responses)
+        return ContentWorkspaceStore(self.base / "trees", self.agent, self.runner)
+
+    def test_a_depth_is_a_commit_count_and_not_a_yes(self):
+        store = self.store()
+        for depth in (True, False, 0, -1, "1", 1.0):
+            with self.subTest(depth=depth):
+                with self.assertRaises(ContentWorkspaceError):
+                    store.open("acme/fleet", None, None, depth)
+        # Refused together with `branch`: a single-branch clone cannot see
+        # whether the working branch exists, so the check would answer no and
+        # the caller would be told it had looked.
+        with self.assertRaises(ContentWorkspaceError):
+            store.open("acme/fleet", None, "platform-agent/fix", 1)
+
+        # Paired ordinary use: a count reaches git as a shallow single-branch
+        # clone, and the workspace says so.
+        workspace = store.open("acme/fleet", "main", None, 5)
+        self.assertTrue(workspace.shallow)
+        clone = next(argv for argv, _ in self.runner.calls if argv[1] == "clone")
+        self.assertEqual(
+            ["git", "clone", "--quiet", "--depth", "5", "--single-branch", "--branch", "main"],
+            clone[:8],
+        )
+        # And a full clone still is one.
+        before = len(self.runner.calls)
+        self.assertFalse(store.open("acme/fleet").shallow)
+        full = next(
+            argv for argv, _ in self.runner.calls[before:] if argv[1] == "clone"
+        )
+        self.assertNotIn("--depth", full)
+
+    def test_a_shallow_workspace_refuses_to_author(self):
+        """Refused at `commit` rather than discovered at `push`.
+
+        A shallow clone shares no merge base with the remote branch, so the push
+        is either rejected as unrelated or, on a remote configured to take it,
+        lands a history that discards everything before the depth.
+        """
+        store = self.store()
+        shallow = store.open("acme/fleet", "main", None, 1)
+        with self.assertRaises(ContentWorkspaceError):
+            store.commit(
+                shallow.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [Change(repo_relative("a.yaml"), b"a\n")],
+            )
+
+        # Paired ordinary use: the same commit on a full clone gets as far as
+        # git, which is all this fake runner can show.
+        full = store.open("acme/fleet", "main")
+        result = store.commit(
+            full.handle,
+            "platform-agent/change",
+            "feat: a change",
+            [Change(repo_relative("a.yaml"), b"a\n")],
+        )
+        self.assertEqual("platform-agent/change", result["branch"])
+        self.assertIn("checkout", self.runner.subcommands)
+
+    def test_a_branch_that_exists_is_what_reads_answer_from(self):
+        """Second-round feedback is written against the pull request, not the base.
+
+        Left on the base, a re-read would return the file as `main` has it, the
+        caller would patch that, and the first round's reviewed work would be
+        silently rewritten out of the commit.
+        """
+        store = self.store()
+        workspace = store.open("acme/fleet", "main", "platform-agent/fix")
+        self.assertEqual("origin/platform-agent/fix", workspace.started_from)
+        checkout = next(argv for argv, _ in self.runner.calls if argv[1] == "checkout")
+        self.assertEqual(
+            ["checkout", "--force", "-B", "platform-agent/fix", "origin/platform-agent/fix"],
+            checkout[1:],
+        )
+
+        # Paired ordinary use: the first round names the same branch, the remote
+        # does not have it yet, and that is not an error -- the workspace opens
+        # on the base and says so.
+        absent = self.store({"refs/remotes/origin/": FakeResult(exit_code=1)})
+        first = absent.open("acme/fleet", "main", "platform-agent/fix")
+        self.assertEqual("origin/main", first.started_from)
+        self.assertNotIn("checkout", self.runner.subcommands)
+
+        # And the branch is a name in an argv like any other.
+        with self.assertRaises(ContentWorkspaceError):
+            store.open("acme/fleet", "main", "--upload-pack=/bin/sh")
+
+
+class GrepTest(unittest.TestCase):
+    """`git grep` over a real tree, because the argv is the whole control."""
+
+    def setUp(self):
+        if not git_available():
+            self.skipTest("git is not available")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, real_git_runner
+        )
+        self.tree = self.base / "trees" / "work" / "repo"
+        (self.tree / "manifests").mkdir(parents=True)
+        real_git_runner(["git", "init", "--quiet", "--initial-branch=main", "."], self.tree)
+        (self.tree / "manifests" / "app.yaml").write_text(
+            "kind: Service\nreplicas: 2\n"
+        )
+        (self.tree / "other.yaml").write_text("kind: Service\n")
+        real_git_runner(["git", "add", "-A"], self.tree)
+        real_git_runner(["git", "commit", "-m", "seed"], self.tree)
+        self.workspace = Workspace(
+            handle="d" * 32,
+            repo="acme/fleet",
+            tree=self.tree,
+            base="main",
+            base_sha="0" * 40,
+        )
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def test_a_pattern_is_never_read_as_an_option_or_reaches_the_git_directory(self):
+        handle = self.workspace.handle
+        # `.git` is not in scope however the pattern is written: git grep
+        # searches tracked files, and git does not track its own directory.
+        # `core.repositoryformatversion` is in every `.git/config` there is.
+        self.assertEqual(
+            0, self.store.grep(handle, "repositoryformatversion")["total"]
+        )
+        # A pattern beginning with a dash is a pattern. `-O<file>` is the pager
+        # vector the executor's own allowlist tests cover from the other side.
+        self.assertEqual(0, self.store.grep(handle, "-O/tmp/payload.sh")["total"])
+        # Fixed-string unless asked: a regular expression given by accident
+        # matches itself rather than more than the caller meant.
+        self.assertEqual(0, self.store.grep(handle, "kind: S.rvice")["total"])
+        for bad in ("", "   ", None, 7, "two\nlines"):
+            with self.subTest(pattern=bad):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store.grep(handle, bad)
+        # An expression git will not parse is a 400 about the expression, and
+        # git's stderr -- which quotes the tree's path -- is not in it.
+        with self.assertRaises(ContentWorkspaceError) as refused:
+            self.store.grep(handle, "a[", regex=True)
+        self.assertNotIn(str(self.base), str(refused.exception))
+
+        # Paired ordinary use: the search a reader actually runs.
+        answer = self.store.grep(handle, "kind: Service")
+        self.assertEqual(
+            [("manifests/app.yaml", 1), ("other.yaml", 1)],
+            sorted((m["path"], m["line"]) for m in answer["matches"]),
+        )
+        self.assertFalse(answer["truncated"])
+        # The prefix narrows it, the regex flag turns the expression on, and
+        # ignoreCase does what it says.
+        self.assertEqual(
+            1, self.store.grep(handle, "kind: Service", "manifests")["total"]
+        )
+        self.assertEqual(2, self.store.grep(handle, "kind: S.rvice", regex=True)["total"])
+        self.assertEqual(2, self.store.grep(handle, "KIND: SERVICE", ignore_case=True)["total"])
+
+    def test_a_search_that_hit_the_ceiling_does_not_look_complete(self):
+        handle = self.workspace.handle
+        with mock.patch.object(content_workspace, "max_matches", lambda: 1):
+            answer = self.store.grep(handle, "kind: Service")
+        self.assertEqual(1, len(answer["matches"]))
+        self.assertEqual(2, answer["total"])
+        self.assertTrue(answer["truncated"])
+
+        # A long line is cut at the width and the match says it was.
+        with mock.patch.object(content_workspace, "max_match_chars", lambda: 4):
+            match = self.store.grep(handle, "replicas")["matches"][0]
+        self.assertEqual("repl", match["text"])
+        self.assertTrue(match["truncated"])
+
+        # Paired ordinary use: under both ceilings nothing claims to be cut.
+        answer = self.store.grep(handle, "replicas")
+        self.assertFalse(answer["truncated"])
+        self.assertNotIn("truncated", answer["matches"][0])
+        self.assertEqual("replicas: 2", answer["matches"][0]["text"])
 
 
 if __name__ == "__main__":

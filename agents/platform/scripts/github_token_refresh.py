@@ -20,6 +20,8 @@ import urllib.request
 # Ships alongside this script in the same directory, which is sys.path[0] both
 # when the shell runs it and when the credential proxy execs it by absolute path.
 import wif_credentials
+from credential_proxy_client import authorization_headers
+
 
 def log(msg: str):
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -75,7 +77,9 @@ def refresh_git_credentials(
         request = urllib.request.Request(
             url,
             data=json.dumps({"repository": repository}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            # Empty in the sidecar deployment; carries the caller's projected
+            # ServiceAccount token when the broker runs in its own Pod.
+            headers={"Content-Type": "application/json", **authorization_headers()},
             method="POST",
         )
         try:
