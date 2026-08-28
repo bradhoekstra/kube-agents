@@ -34,6 +34,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -643,21 +644,105 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 		return r.deleteShellSandbox(ctx, agent)
 	}
 
+	// Before the StatefulSet, because an install that predates agentDataStorageSize
+	// has a claim the template can no longer resize.
+	r.growShellSandboxDataClaim(ctx, agent)
+
+	sts := buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash, policyHash)
 	objs := []client.Object{
 		buildShellSandboxServiceAccount(agent),
 		buildShellSandboxService(agent),
-		buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash, policyHash),
+		sts,
 		buildShellSandboxNetworkPolicy(agent),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on shell sandbox %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
-		if err := r.applyManaged(ctx, agent, obj); err != nil {
+		apply := r.applyManaged
+		if obj == sts {
+			apply = r.applyShellSandboxStatefulSet
+		}
+		if err := apply(ctx, agent, obj); err != nil {
 			return fmt.Errorf("failed to apply shell sandbox %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
 	}
 	return nil
+}
+
+// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+//
+// A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
+// install from before agentDataStorageSize keeps the 5Gi it was given however the
+// template changes — and that claim is the destination sandbox_mirror.py copies
+// the agent's working directories into. Expansion is online; the volume stays
+// mounted and the shell keeps running.
+//
+// Best-effort and logged rather than returned. A StorageClass without
+// allowVolumeExpansion is how an administrator configured the cluster, and
+// failing the reconcile over it would take the whole agent down to fix a volume
+// that is merely smaller than we would like. The mirror already refuses to fill
+// the volume it is given, so the consequence is a bounded migration, not a broken
+// one.
+func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	log := logf.FromContext(ctx)
+	want := resource.MustParse(agentDataStorageSize)
+
+	name := shellSandboxDataClaimName(agent)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agent.Namespace}, pvc); err != nil {
+		// Not created yet on a first install: the template sizes it correctly.
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "could not read the sandbox data claim", "claim", name)
+		}
+		return
+	}
+
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if have.Cmp(want) >= 0 {
+		return
+	}
+
+	patched := pvc.DeepCopy()
+	patched.Spec.Resources.Requests[corev1.ResourceStorage] = want
+	if err := r.Patch(ctx, patched, client.MergeFrom(pvc)); err != nil {
+		log.Error(err, "could not grow the sandbox data claim; migration into it stays bounded by the space that is there",
+			"claim", name, "have", have.String(), "want", want.String())
+		return
+	}
+	log.Info("grew the sandbox data claim to match the agent's",
+		"claim", name, "from", have.String(), "to", want.String())
+}
+
+// applyShellSandboxStatefulSet applies the StatefulSet, recreating it when the
+// API server refuses the update.
+//
+// Only replicas, ordinals, template, updateStrategy,
+// persistentVolumeClaimRetentionPolicy and minReadySeconds are mutable on a
+// StatefulSet. Any change to volumeClaimTemplates therefore comes back 422
+// Invalid, which without this would error-loop the reconcile on every install
+// that already has a sandbox — and take the rest of the agent's reconcile with
+// it. Deleting with Orphan propagation leaves the pod and its claims running and
+// the replacement adopts the pod by selector, so the shell stays up across the
+// swap and the sandbox's disk is never at risk.
+func (r *PlatformAgentReconciler) applyShellSandboxStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	err := r.applyManaged(ctx, agent, obj)
+	if !errors.IsInvalid(err) {
+		return err
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("the sandbox StatefulSet needs an immutable field changed; recreating it with the pod left running",
+		"statefulset", obj.GetName(), "reason", err.Error())
+
+	orphan := metav1.DeletePropagationOrphan
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: obj.GetName(), Namespace: obj.GetNamespace()},
+	}
+	if delErr := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &orphan}); client.IgnoreNotFound(delErr) != nil {
+		return fmt.Errorf("failed to delete the sandbox StatefulSet for recreation: %w", delErr)
+	}
+	return r.applyManaged(ctx, agent, obj)
 }
 
 // deleteShellSandbox removes the sandbox for an agent that has it switched off,

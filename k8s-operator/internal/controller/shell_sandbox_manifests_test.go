@@ -358,6 +358,49 @@ func TestShellSandboxObjectsShareOneSelector(t *testing.T) {
 	}
 }
 
+func TestSandboxDataClaimIsNoSmallerThanTheAgentsOwn(t *testing.T) {
+	// sandbox_mirror.py copies a subset of the agent's /opt/data into the
+	// sandbox's on upgrade. Destination >= source is what makes that fit by
+	// construction, and it is the reason the mirror carries no byte cap of its
+	// own — size these apart again and the migration starts truncating silently.
+	agent := shellSandboxTestAgent()
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash")
+
+	var claim *corev1.PersistentVolumeClaim
+	for i := range sts.Spec.VolumeClaimTemplates {
+		if sts.Spec.VolumeClaimTemplates[i].Name == shellSandboxDataVolume {
+			claim = &sts.Spec.VolumeClaimTemplates[i]
+		}
+	}
+	if claim == nil {
+		t.Fatalf("no %q volumeClaimTemplate on the sandbox StatefulSet", shellSandboxDataVolume)
+	}
+
+	sandbox := claim.Spec.Resources.Requests[corev1.ResourceStorage]
+	agentData := buildPVC(agent).Spec.Resources.Requests[corev1.ResourceStorage]
+	if sandbox.Cmp(agentData) < 0 {
+		t.Errorf("sandbox data claim is %s against the agent's %s; the migration cannot be guaranteed to fit",
+			sandbox.String(), agentData.String())
+	}
+}
+
+func TestSandboxDataClaimNameMatchesWhatTheStatefulSetCreates(t *testing.T) {
+	// The operator patches this claim by name to widen it on upgrade. A name
+	// that does not exist is a Get that returns NotFound, which this code reads
+	// as "first install, nothing to do" — so a wrong name fails as a silent
+	// no-op rather than an error.
+	agent := shellSandboxTestAgent()
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash")
+
+	want := shellSandboxDataVolume + "-" + sts.Name + "-0"
+	if got := shellSandboxDataClaimName(agent); got != want {
+		t.Errorf("shellSandboxDataClaimName = %q, want %q", got, want)
+	}
+	if got := *sts.Spec.Replicas; got != 1 {
+		t.Errorf("replicas = %d; the claim name above assumes the single ordinal 0", got)
+	}
+}
+
 func TestResolveShellSandboxImageHonoursTheMirrorOverride(t *testing.T) {
 	agent := shellSandboxTestAgent()
 

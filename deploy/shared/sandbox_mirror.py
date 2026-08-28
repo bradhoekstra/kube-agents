@@ -248,7 +248,19 @@ RECURSIVE_EXCLUDES = (
 # The one cost is a dotfile the model *did* write at a home root, which this
 # leaves behind. That is logged as skipped rather than dropped silently.
 
-DEFAULT_MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+# No byte cap by default. The sandbox's volume is sized from the agent's
+# (agentDataStorageSize in the operator), and what crosses is a subset of the
+# agent's volume, so the copy fits by construction. A fixed cap here could only
+# do one thing the free-space floor below does not: silently truncate a migration
+# on an install whose working directories are larger than the guess, which is the
+# "upgraded and lost my files" outcome this whole path exists to prevent.
+DEFAULT_MAX_BYTES = 0  # 0 means unbounded; --max-bytes still overrides
+
+# The floor stays, and does the real work. Without it tar streams until ENOSPC,
+# which leaves a truncated file at the cut point *and* a volume at 100% — and
+# everything in the sandbox pod needs to write there: sshd, the shell's scratch,
+# the credential proxy's workspace. A full volume is a broken sandbox, which is
+# worse than a skipped directory.
 FREE_SPACE_HEADROOM = 512 * 1024 * 1024  # leave this much on the sandbox volume
 
 
@@ -505,10 +517,28 @@ def measure(agent_home: Path, paths: list[str]) -> dict[str, int]:
     return sizes
 
 
+def effective_budget(max_bytes: int, free: int | None) -> int | None:
+    """The byte ceiling for this copy, or None when nothing bounds it.
+
+    ``--max-bytes`` is an escape hatch and defaults to 0, meaning no cap of its
+    own — see DEFAULT_MAX_BYTES. The sandbox's free space less
+    FREE_SPACE_HEADROOM applies whenever it can be read, and it is the bound that
+    matters: it stops the copy filling the volume it is writing into.
+    """
+    limits = []
+    if max_bytes > 0:
+        limits.append(max_bytes)
+    if free is not None:
+        limits.append(max(0, free - FREE_SPACE_HEADROOM))
+    return min(limits) if limits else None
+
+
 def apply_budget(
-    sizes: dict[str, int], budget: int
+    sizes: dict[str, int], budget: int | None
 ) -> tuple[list[str], list[tuple[str, int]]]:
     """Fit as much as the budget allows, smallest first.
+
+    A budget of None is unbounded and everything is kept.
 
     Smallest first rather than largest: the point is to lose as few directories
     as possible, and the one directory that blows the budget is usually a clone
@@ -516,6 +546,8 @@ def apply_budget(
     migration that silently copies 90% of someone's work and reports success is
     worse than one that says which 10% it left.
     """
+    if budget is None:
+        return sorted(sizes), []
     kept: list[str] = []
     dropped: list[tuple[str, int]] = []
     running = 0
@@ -653,7 +685,8 @@ def main(argv: list[str] | None = None) -> int:
         "--max-bytes",
         type=int,
         default=DEFAULT_MAX_BYTES,
-        help="refuse to migrate more than this; the excess is named in the log",
+        help="refuse to migrate more than this; the excess is named in the log. "
+        "0 (the default) means no cap beyond leaving the sandbox volume some free space",
     )
     parser.add_argument(
         "--skeleton-only",
@@ -691,7 +724,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         include, skipped = migration_candidates(agent_home, homes)
         sizes = measure(agent_home, include)
-        kept, dropped = apply_budget(sizes, args.max_bytes)
+        # No ssh yet on this path, so no free-space reading: the dry run reports
+        # what --max-bytes alone would drop, which on the default of 0 is nothing.
+        kept, dropped = apply_budget(sizes, effective_budget(args.max_bytes, None))
         report = {
             "homes": homes,
             "skeleton_dirs": list(SKELETON_DIRS),
@@ -739,11 +774,10 @@ def main(argv: list[str] | None = None) -> int:
         log("nothing on the agent pod's home qualifies for migration")
     else:
         sizes = measure(agent_home, include)
-        budget = args.max_bytes
         free = remote_free_bytes(ssh, args.remote_root)
         if free is not None:
-            budget = min(budget, max(0, free - FREE_SPACE_HEADROOM))
             log(f"sandbox volume has {free // (1024 * 1024)} MiB free")
+        budget = effective_budget(args.max_bytes, free)
         kept, dropped = apply_budget(sizes, budget)
         for rel, size in dropped:
             log(

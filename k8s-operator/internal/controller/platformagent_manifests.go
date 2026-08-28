@@ -54,6 +54,16 @@ const (
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
+	// agentDataStorageSize sizes the agent's own /opt/data claim, and through
+	// shell_sandbox_manifests.go the sandbox's claim at the same path.
+	//
+	// The two are one constant on purpose. sandbox_mirror.py copies a subset of
+	// the agent's volume into the sandbox's on upgrade, so destination >= source
+	// makes the copy fit by construction and there is nothing left for a byte
+	// budget to decide. Sized apart, the sandbox was 5Gi against the agent's
+	// 10Gi and the mirror needed a cap that silently truncated the migration on
+	// any install whose working directories were larger than the guess.
+	agentDataStorageSize = "10Gi"
 	credentialProxyPort         = 8765
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
@@ -1497,7 +1507,7 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: resource.MustParse("10Gi"),
+					corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
 				},
 			},
 		},

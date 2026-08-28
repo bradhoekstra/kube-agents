@@ -260,6 +260,14 @@ func shellSandboxName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-shell"
 }
 
+// shellSandboxDataClaimName is the claim the StatefulSet controller derives from
+// the data volumeClaimTemplate: <template>-<statefulset>-<ordinal>. One replica,
+// so one ordinal, and it is spelled out here because the operator has to reach
+// the claim directly to widen it — the template sizes only claims it creates.
+func shellSandboxDataClaimName(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("%s-%s-0", shellSandboxDataVolume, shellSandboxName(agent))
+}
+
 // shellSandboxSelector is the pod label the Service, the StatefulSet and both
 // halves of the NetworkPolicy agree on. `app` rather than a kubeagents.x-k8s.io/
 // key to match the gateway's existing selector, which the ingress rule below has
@@ -457,12 +465,16 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// acceptable rather than a migration.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
+					// Sized from the agent's own /opt/data claim, not independently.
+					// sandbox_mirror.py copies a subset of that volume into this one
+					// on upgrade, so matching them makes the migration fit by
+					// construction — see agentDataStorageSize.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
 						Resources: corev1.VolumeResourceRequirements{
 							Requests: corev1.ResourceList{
-								corev1.ResourceStorage: resource.MustParse(defaultStorageSize),
+								corev1.ResourceStorage: resource.MustParse(agentDataStorageSize),
 							},
 						},
 					},

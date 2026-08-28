@@ -275,6 +275,37 @@ class Budget(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(dropped, [("scratch", 10)])
 
+    def test_no_budget_keeps_everything(self):
+        # The sandbox volume is sized from the agent's, so the default copy is
+        # bounded only by free space. A cap that reappears here truncates a
+        # migration silently, which is the failure this path exists to prevent.
+        sizes = {"scratch": 10, "gitops": 10**12}
+        kept, dropped = sm.apply_budget(sizes, None)
+        self.assertEqual(kept, ["gitops", "scratch"])
+        self.assertEqual(dropped, [])
+
+    def test_the_default_cap_is_off_and_free_space_is_what_bounds_the_copy(self):
+        self.assertIsNone(sm.effective_budget(sm.DEFAULT_MAX_BYTES, None))
+
+        # Free space always applies, less the headroom that keeps the volume
+        # writable for sshd and the shell.
+        free = 4 * 1024 * 1024 * 1024
+        self.assertEqual(
+            sm.effective_budget(sm.DEFAULT_MAX_BYTES, free),
+            free - sm.FREE_SPACE_HEADROOM,
+        )
+
+        # An explicit --max-bytes is an escape hatch, and the tighter of the two wins.
+        self.assertEqual(sm.effective_budget(1024, free), 1024)
+        self.assertEqual(sm.effective_budget(free, 1024 + sm.FREE_SPACE_HEADROOM), 1024)
+
+    def test_a_full_volume_yields_a_zero_budget_rather_than_a_negative_one(self):
+        kept, dropped = sm.apply_budget(
+            {"scratch": 10}, sm.effective_budget(sm.DEFAULT_MAX_BYTES, 0)
+        )
+        self.assertEqual(kept, [])
+        self.assertEqual(dropped, [("scratch", 10)])
+
 
 def gnu_tar() -> bool:
     try:
