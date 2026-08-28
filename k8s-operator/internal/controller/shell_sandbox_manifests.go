@@ -84,6 +84,12 @@ const (
 	shellSandboxKeysVolume     = "authorized-keys"
 	shellSandboxSettingsVolume = "settings"
 
+	// The token the shell presents to the credential runtime. It mounts at
+	// credentialProxyTokenMountPath, the same path the agent pod uses, because a
+	// script that reads CREDENTIAL_PROXY_TOKEN_FILE should not have to care which
+	// pod it is running in.
+	shellSandboxCredentialProxyTokenVolume = "credential-proxy-token" // #nosec G101 -- Volume name, not a credential
+
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
 	// that half works, which is the intended failure mode.
@@ -345,6 +351,20 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	env := []corev1.EnvVar{}
 	if credentialProxyURL != "" {
 		env = append(env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_URL", Value: credentialProxyURL})
+		// The shell is a caller of the credential runtime, and the runtime
+		// authenticates its callers whenever it is off the agent's Pod — which
+		// the sandbox being on already guarantees, at either placement. Without
+		// this the listener is reachable and answers 401 to everything, so every
+		// command the model runs fails at the point it needs a credential.
+		//
+		// Audience-bound, so what the shell holds is a credential for the broker
+		// and not for the Kubernetes API: the API server rejects a token minted
+		// for another audience, which is why mounting one here does not undo
+		// AutomountServiceAccountToken: false above.
+		env = append(env, corev1.EnvVar{
+			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
+			Value: credentialProxyTokenMountPath + "/token",
+		})
 	}
 
 	containers := buildShellSandboxContainers(agent, env)
@@ -551,11 +571,34 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 				Optional: ptr.To(true),
 			},
 		},
-	}}
+	}, buildShellSandboxCredentialProxyTokenVolume()}
 	if credentialProxyColocated(agent) {
 		volumes = append(volumes, buildCredentialProxyRuntimeVolumes(agent)...)
 	}
 	return volumes
+}
+
+// buildShellSandboxCredentialProxyTokenVolume projects the token the shell
+// presents to the credential runtime.
+//
+// The agent pod's equivalent is buildAgentCredentialProxyTokenVolume, and the two
+// differ in one thing: the mode. That one projects 0400 into a container running
+// as the uid kubelet writes the file as; here the file is read by uid 1000, the
+// login the model's commands run under, so 0400 would leave it unreadable by the
+// only process that needs it. 0444 gives away nothing this container is not
+// already holding — every process in it belongs to the model, and the credential
+// exists to be spent on the model's behalf. What keeps it from being a general
+// Kubernetes credential is the audience, not the mode.
+func buildShellSandboxCredentialProxyTokenVolume() corev1.Volume {
+	return corev1.Volume{
+		Name: shellSandboxCredentialProxyTokenVolume,
+		VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
+			DefaultMode: ptr.To(int32(0444)),
+			Sources: []corev1.VolumeProjection{{ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+				Audience: credentialProxyAudience, ExpirationSeconds: ptr.To(int64(3600)), Path: "token",
+			}}},
+		}},
+	}
 }
 
 func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1.EnvVar) corev1.Container {
@@ -596,6 +639,11 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 			{Name: shellSandboxKeysVolume, MountPath: shellSandboxKeysPath, ReadOnly: true},
 			{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
 			{Name: shellSandboxSshdVolume, MountPath: shellSandboxSshdPath},
+			{
+				Name:      shellSandboxCredentialProxyTokenVolume,
+				MountPath: credentialProxyTokenMountPath,
+				ReadOnly:  true,
+			},
 			{
 				// The one file in the delivery set the image cannot
 				// carry: SETTINGS.md is per-install, rendered by the

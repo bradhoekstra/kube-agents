@@ -52,6 +52,7 @@ package controller
 
 import (
 	"fmt"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -204,8 +205,26 @@ func credentialProxyBaseURL(agent *agentv1alpha1.PlatformAgent) string {
 
 // allowedBrokerCallers is the value of CREDENTIAL_PROXY_ALLOWED_CALLERS: the
 // TokenReview usernames the broker will serve.
+//
+// The sandbox's ServiceAccount joins the list when the sandbox is on, and it is
+// the caller that matters there: the shell is where every credentialed command
+// runs now, so a broker that served only the agent's identity would answer 401 to
+// all of them. The agent's stays because the gateway's chat relays still go
+// through the same listener from the agent Pod.
+//
+// Two identities rather than one is not a widening of who may call — both Pods
+// belong to this agent, and neither could reach the broker without a token this
+// namespace mints. What it does not give is a way to tell them apart at the
+// policy layer; the broker records the principal, and nothing yet varies on it.
 func allowedBrokerCallers(agent *agentv1alpha1.PlatformAgent) string {
-	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent))
+	callers := []string{
+		fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, agentServiceAccountName(agent)),
+	}
+	if shellSandboxEnabled(agent) {
+		callers = append(callers,
+			fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, shellSandboxServiceAccountName(agent)))
+	}
+	return strings.Join(callers, ",")
 }
 
 // buildAgentCredentialProxyTokenVolume projects the token the agent presents to

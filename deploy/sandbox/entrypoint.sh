@@ -197,11 +197,13 @@ done
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
 SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
-# A one-element allowlist is still an allowlist. It is written as a loop because
-# the next variable to cross this boundary should be added to a list, not have
-# a second copy of this block written for it.
-# shellcheck disable=SC2043
-for name in CREDENTIAL_PROXY_URL; do
+# CREDENTIAL_PROXY_TOKEN_FILE is a path, not a token: the file it names is a
+# projected volume, and forwarding the name is what lets the client read it. It
+# has to cross with the URL rather than after it, because the broker authenticates
+# every caller once it is off the agent's pod — which the sandbox being here
+# already means — so a session that has the URL and not this one reaches the
+# listener and is refused by it.
+for name in CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE; do
   value="${!name-}"
   if [ -z "$value" ]; then
     continue

@@ -93,6 +93,7 @@ start_sandbox() {
     -v "$DATA_VOL:/opt/data" \
     -v "$SSHD_VOL:/var/lib/sandbox-sshd" \
     -e CREDENTIAL_PROXY_URL=http://127.0.0.1:9999 \
+    -e CREDENTIAL_PROXY_TOKEN_FILE=/var/run/secrets/kubeagents/credential-proxy/token \
     "$IMAGE" >/dev/null
   for _ in $(seq 30); do
     ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 >/dev/null 2>&1 && return 0
@@ -439,6 +440,11 @@ check "CREDENTIAL_PROXY_URL crosses into a non-login session" "http://127.0.0.1:
   "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_URL"' 2>&1)"
 check "and into a login session" "http://127.0.0.1:9999" \
   "$("${SSH[@]}" 'bash -l -c "echo \$CREDENTIAL_PROXY_URL"' 2>&1)"
+# The URL alone is not enough to reach the broker: off the agent's pod it
+# authenticates every caller, so a session holding the address and not the token
+# path gets a 401 from every wrapper rather than a connection error.
+check "CREDENTIAL_PROXY_TOKEN_FILE crosses too" "/var/run/secrets/kubeagents/credential-proxy/token" \
+  "$("${SSH[@]}" 'echo "$CREDENTIAL_PROXY_TOKEN_FILE"' 2>&1)"
 check "the wrapper dispatches rather than refusing to start" "credential proxy" \
   "$("${SSH[@]}" 'kubectl version 2>&1' 2>&1)"
 check "the wrappers are ahead of anything else on PATH" "/opt/credential-proxy/bin:" \

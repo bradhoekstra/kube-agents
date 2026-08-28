@@ -492,10 +492,22 @@ def workspaces_available(endpoint: str) -> bool:
         _workspace_call(endpoint, "open", {"repo": ""})
     except WorkspaceUnavailable:
         return False
-    except WorkspaceRequestError:
-        # It answered about the payload rather than about the feature, so the
-        # route exists.
+    except WorkspaceRequestError as exc:
+        # 401 is the one status that says nothing about the route: the broker
+        # rejects the caller before it looks at the path, so a client with no
+        # token would read "workspaces are armed" off a broker that never
+        # reached the question. Every other status is an answer about the
+        # payload, and an answer about the payload means the route exists.
+        #
+        # Reported live: a sandbox with no CREDENTIAL_PROXY_TOKEN_FILE saw this
+        # return True and then failed on the first real verb.
+        if exc.status == 401:
+            return False
         return True
+    except TokenUnavailable:
+        # No token to present, so nothing here is reachable whatever the broker
+        # is serving.
+        return False
     except urllib.error.URLError:
         return False
     return True

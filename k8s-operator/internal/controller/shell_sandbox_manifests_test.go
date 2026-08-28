@@ -70,12 +70,20 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	}
 	// The whole list, by name, rather than a count: every volume here is a way to
 	// put bytes into the pod the agent can run arbitrary commands in, so adding one
-	// should be a decision someone makes on purpose. Exactly two are allowed — the
-	// authorized-keys Secret and the SETTINGS.md ConfigMap — and neither carries a
-	// credential. Anything else fails here and gets argued about in review.
+	// should be a decision someone makes on purpose. Exactly three are allowed —
+	// the authorized-keys Secret, the SETTINGS.md ConfigMap, and the token the
+	// shell presents to the credential runtime. Anything else fails here and gets
+	// argued about in review.
+	//
+	// The third one is a credential, unlike the other two, and it is here because
+	// the alternative is not "the sandbox holds nothing" but "the sandbox cannot
+	// run a command": the broker authenticates its callers at every placement the
+	// sandbox exists in. What keeps it from being the thing this test is named
+	// after is the audience, asserted below.
 	allowed := map[string]bool{
-		shellSandboxKeysVolume:     true,
-		shellSandboxSettingsVolume: true,
+		shellSandboxKeysVolume:                 true,
+		shellSandboxSettingsVolume:             true,
+		shellSandboxCredentialProxyTokenVolume: true,
 	}
 	byName := map[string]corev1.Volume{}
 	for _, v := range pod.Volumes {
@@ -100,6 +108,100 @@ func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
 	// here would be a credential arriving by the same route.
 	if settings, ok := byName[shellSandboxSettingsVolume]; ok && settings.ConfigMap == nil {
 		t.Errorf("expected %q to be a ConfigMap, got %#v", shellSandboxSettingsVolume, settings.VolumeSource)
+	}
+	// The broker token, and the audience is the whole of why mounting it does not
+	// contradict AutomountServiceAccountToken: false above. A token minted for
+	// this audience is refused by the Kubernetes API server, so what the shell
+	// holds opens the broker and nothing else.
+	token, ok := byName[shellSandboxCredentialProxyTokenVolume]
+	if !ok {
+		t.Fatalf("expected the %q volume, got %#v", shellSandboxCredentialProxyTokenVolume, pod.Volumes)
+	}
+	if token.Projected == nil || len(token.Projected.Sources) != 1 ||
+		token.Projected.Sources[0].ServiceAccountToken == nil {
+		t.Fatalf("expected a single projected ServiceAccount token, got %#v", token.VolumeSource)
+	}
+	projection := token.Projected.Sources[0].ServiceAccountToken
+	if projection.Audience != credentialProxyAudience {
+		t.Errorf("expected the token to be minted for %q, got %q — an unaudienced token is a Kubernetes API credential",
+			credentialProxyAudience, projection.Audience)
+	}
+	if projection.ExpirationSeconds == nil || *projection.ExpirationSeconds > 3600 {
+		t.Errorf("expected an expiry of at most an hour, got %v", projection.ExpirationSeconds)
+	}
+}
+
+func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
+	// The sandbox is where every credentialed command runs, and the broker
+	// authenticates its callers whenever it is off the agent's pod — which the
+	// sandbox being on already guarantees. Three things have to line up or every
+	// wrapper gets a 401 from a listener it can reach: the token is projected, the
+	// shell is told where to read it, and the broker's allowlist names the
+	// identity that minted it. They live in three files, so assert them together.
+	agent := shellSandboxAgent(true)
+	url := "http://test-agent-credential-proxy:8765"
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", url, "settings-hash", "policy-hash")
+
+	shell := sts.Spec.Template.Spec.Containers[0]
+	var tokenFile string
+	for _, env := range shell.Env {
+		if env.Name == "CREDENTIAL_PROXY_TOKEN_FILE" {
+			tokenFile = env.Value
+		}
+	}
+	want := credentialProxyTokenMountPath + "/token"
+	if tokenFile != want {
+		t.Errorf("expected the shell to read its token from %q, got %q", want, tokenFile)
+	}
+
+	var mounted bool
+	for _, mount := range shell.VolumeMounts {
+		if mount.Name == shellSandboxCredentialProxyTokenVolume {
+			mounted = true
+			if mount.MountPath != credentialProxyTokenMountPath {
+				t.Errorf("expected the token at %q, got %q", credentialProxyTokenMountPath, mount.MountPath)
+			}
+			if !mount.ReadOnly {
+				t.Error("the token mount must be read-only")
+			}
+		}
+	}
+	if !mounted {
+		t.Errorf("the shell container mounts no token, so the path in its env names nothing: %#v", shell.VolumeMounts)
+	}
+
+	// Readable by the login the model's commands run as. The agent pod projects
+	// the same token 0400 and gets away with it; here 0400 would leave the file
+	// unreadable by uid 1000 and the failure would look like a broker problem.
+	for _, volume := range sts.Spec.Template.Spec.Volumes {
+		if volume.Name != shellSandboxCredentialProxyTokenVolume {
+			continue
+		}
+		if volume.Projected == nil || volume.Projected.DefaultMode == nil ||
+			*volume.Projected.DefaultMode&0044 == 0 {
+			t.Errorf("expected a mode uid %d can read, got %#v", shellSandboxUID, volume.Projected)
+		}
+	}
+
+	callers := allowedBrokerCallers(agent)
+	sandboxCaller := "system:serviceaccount:" + agent.Namespace + ":" + shellSandboxServiceAccountName(agent)
+	if !strings.Contains(callers, sandboxCaller) {
+		t.Errorf("the broker must serve the sandbox's identity %q, got %q", sandboxCaller, callers)
+	}
+	// And still the agent's: the gateway's chat relays call the same listener.
+	agentCaller := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
+	if !strings.Contains(callers, agentCaller) {
+		t.Errorf("the broker must still serve the agent's identity %q, got %q", agentCaller, callers)
+	}
+}
+
+func TestBrokerServesOnlyTheAgentWithoutTheSandbox(t *testing.T) {
+	// The sandbox's identity is added by the sandbox being on, and by nothing
+	// else. An install without it must render the value it rendered before.
+	agent := shellSandboxAgent(false)
+	want := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
+	if got := allowedBrokerCallers(agent); got != want {
+		t.Errorf("expected %q, got %q", want, got)
 	}
 }
 

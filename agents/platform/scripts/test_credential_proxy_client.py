@@ -287,6 +287,31 @@ class WorkspaceClientTest(unittest.TestCase):
                 credential_proxy_client.Workspace.open(self.endpoint, "acme/infra")
             self.assertFalse(credential_proxy_client.workspaces_available(self.endpoint))
 
+    def test_an_unauthenticated_caller_is_not_told_workspaces_are_armed(self):
+        """401 answers about the caller, not about the route.
+
+        The broker rejects an unauthenticated request before it looks at the
+        path, so treating any non-404 as proof the feature exists reports armed
+        workspaces on a broker that never reached the question. A sandbox with no
+        token file did exactly that live, then failed on the first real verb.
+        """
+
+        def unauthorized(request, *args, **kwargs):
+            raise urllib.error.HTTPError(
+                request.full_url,
+                401,
+                "Unauthorized",
+                {},
+                io.BytesIO(
+                    json.dumps({"error": "caller could not be authenticated"}).encode()
+                ),
+            )
+
+        with patch.object(credential_proxy_client, "open_broker_request", unauthorized):
+            self.assertFalse(
+                credential_proxy_client.workspaces_available(self.endpoint)
+            )
+
     def test_a_refusal_carries_the_brokers_answer_through(self):
         def conflict(request, *args, **kwargs):
             raise urllib.error.HTTPError(
