@@ -584,3 +584,38 @@ func TestTheBrokerPodIsNotDeletedByTheLegacyCleanup(t *testing.T) {
 		}
 	}
 }
+
+func TestReconcileGrantsTokenReviewForTheSandboxPlacement(t *testing.T) {
+	// The sandbox moves the broker off the agent's Pod without setting the
+	// split, and this grant used to be keyed on the split alone. Live, that
+	// surfaced as every workspace call answering 401: the broker's TokenReview
+	// came back Forbidden, and a review that cannot be completed is a rejection
+	// rather than an allow.
+	agent := splitBrokerAgent(false)
+	agent.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{
+		ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(true)},
+	}
+	r, cl := newSplitReconciler(t, agent)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile failed: %v", err)
+	}
+
+	roleKey := types.NamespacedName{Name: "kubeagents:tokenreview:test-ns:test-agent"}
+	if err := cl.Get(ctx, roleKey, &rbacv1.ClusterRole{}); err != nil {
+		t.Errorf("the sandbox placement authenticates its callers, so the ClusterRole must exist: %v", err)
+	}
+	binding := &rbacv1.ClusterRoleBinding{}
+	if err := cl.Get(ctx, roleKey, binding); err != nil {
+		t.Fatalf("the sandbox placement authenticates its callers, so the ClusterRoleBinding must exist: %v", err)
+	}
+	// The binding has to name the identity the broker itself runs as, which is
+	// the agent's ServiceAccount at either placement — not the sandbox's, which
+	// is a caller of the broker and not the thing asking the question.
+	want := agentServiceAccountName(agent)
+	if len(binding.Subjects) != 1 || binding.Subjects[0].Name != want {
+		t.Errorf("the binding must name the ServiceAccount the broker runs as (%s), got %+v", want, binding.Subjects)
+	}
+}

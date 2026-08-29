@@ -64,7 +64,7 @@ const (
 	// 10Gi and the mirror needed a cap that silently truncated the migration on
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
-	credentialProxyPort         = 8765
+	credentialProxyPort  = 8765
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that

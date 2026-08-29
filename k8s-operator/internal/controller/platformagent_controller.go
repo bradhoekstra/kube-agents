@@ -291,6 +291,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 10b. Grant the broker the one verb it needs to authenticate its callers,
+	// before anything that runs it.
+	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	// 11. Reconcile the credential proxy: its Service always, its own pod only when
 	// the sandbox is not hosting it.
 	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash); err != nil {
@@ -868,6 +874,49 @@ func (r *PlatformAgentReconciler) deleteStandaloneCredentialProxy(ctx context.Co
 	return nil
 }
 
+// reconcileCredentialBrokerTokenReviewRBAC applies, or removes, the one verb the
+// broker needs to authenticate the callers it can no longer take on trust.
+//
+// Keyed on credentialBrokerOffPod rather than on either switch alone, because
+// that is the predicate which arms the authentication: off the agent's Pod the
+// broker stops treating loopback as the control and reviews every bearer token
+// it is handed. Gating the grant on the split alone was how it shipped, and the
+// sandbox moves the broker without setting the split — so the runtime asked the
+// API server a question it had no permission to ask. The TokenReview came back
+// 403, which the authenticator correctly treats as a rejection rather than an
+// allow, and every credentialed command in the sandbox failed with a 401 about
+// the caller instead of a message about the missing rule.
+//
+// It lives here rather than in either placement's reconciler for the same
+// reason: two owners applying and deleting one cluster-scoped object on
+// alternate passes is how the Deployment and Service went wrong first.
+func (r *PlatformAgentReconciler) reconcileCredentialBrokerTokenReviewRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
+
+	if !credentialBrokerOffPod(agent) {
+		for _, object := range []client.Object{
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
+		} {
+			if err := r.deleteIfManaged(ctx, object); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// One verb on one virtual resource, which grants no read access to anything.
+	role := buildCredentialBrokerTokenReviewRole(agent)
+	if err := r.applyManaged(ctx, agent, role); err != nil {
+		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRole: %w", err)
+	}
+	binding := buildClusterRoleBinding(agent, tokenReviewName, role.Name)
+	if err := r.applyManaged(ctx, agent, binding); err != nil {
+		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
+	}
+	return nil
+}
+
 // reconcileCredentialBroker renders, or removes, the broker's own Pod.
 //
 // It owns <name>-credential-proxy in both directions: applied when
@@ -885,7 +934,6 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 		return nil
 	}
 	log := logf.FromContext(ctx)
-	tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
 
 	if !credentialBrokerIsSplit(agent) {
 		owned := []client.Object{
@@ -897,29 +945,10 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 				return err
 			}
 		}
-		for _, object := range []client.Object{
-			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
-			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
-		} {
-			if err := r.deleteIfManaged(ctx, object); err != nil {
-				return err
-			}
-		}
 		return nil
 	}
 
 	r.warnSplitNeedsSharedFilesystem(ctx, agent)
-
-	// The broker verifies its callers with a TokenReview, which needs one verb
-	// on one virtual resource and grants no read access to anything.
-	role := buildCredentialBrokerTokenReviewRole(agent)
-	if err := r.applyManaged(ctx, agent, role); err != nil {
-		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRole: %w", err)
-	}
-	binding := buildClusterRoleBinding(agent, tokenReviewName, role.Name)
-	if err := r.applyManaged(ctx, agent, binding); err != nil {
-		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
-	}
 
 	homeDir := defaultAgentHome
 	if h := agent.Spec.Harness; h != nil && h.Hermes != nil && h.Hermes.AgentHome != "" {

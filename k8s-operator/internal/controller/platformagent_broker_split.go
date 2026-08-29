@@ -425,13 +425,13 @@ func buildCredentialBrokerService(agent *agentv1alpha1.PlatformAgent) *corev1.Se
 // SubjectAccessReview.
 //
 // The cost, named rather than hidden: the binding names the ServiceAccount the
-// agent Pod also runs as, so with the split on the sandbox can validate any
+// agent Pod also runs as, so wherever this is applied the agent can validate any
 // bearer token it gets hold of. It has no use for that. Narrowing it means
-// giving the two Pods separate ServiceAccounts — see agentServiceAccountName —
-// which is why this is a cost of enabling the flag rather than something the
-// flag can fix on its own. It is applied only under the split and deleted when
-// the split goes off (reconcileCredentialBroker), so an install with the flag
-// off never has it.
+// giving the Pods separate ServiceAccounts — see agentServiceAccountName —
+// which is why this is a cost of moving the broker rather than something the
+// move can fix on its own. reconcileCredentialBrokerTokenReviewRBAC applies it
+// whenever the broker is off the agent's Pod and deletes it when the broker
+// comes back, so an install running the sidecar layout never has it.
 func buildCredentialBrokerTokenReviewRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
