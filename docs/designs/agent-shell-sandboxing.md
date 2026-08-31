@@ -46,14 +46,27 @@ Tracked as [#737](https://github.com/gke-labs/kube-agents/issues/737), whose Par
 putting the Session KV behind its own interface — is the one piece still unbuilt.
 
 **The sandbox is not an opt-in feature.** An upgrade turns it on, and there is no
-configuration that keeps the shell in the agent pod. The reason is the first three
-paragraphs of this section: an agent whose shell shares a pod with the credential proxy
-can read the credentials, and that is a property of the arrangement rather than of any
-particular workload running in it. A switch to disable the sandbox would be a switch to
-restore that, so the design does not offer one — the same reasoning as any other hardening
-that removes a capability nobody should have had. Nothing an installation can do today is
-taken away: the shell still runs, the same commands still work, and the credentialed ones
-still reach the same identities through the proxy.
+configuration that keeps the shell in the agent pod.
+
+The reason needs stating precisely, because the obvious reading of it is wrong. The
+credential proxy already stops the agent from _holding_ a credential, and it does that:
+there is no token in the agent's environment, no key on its filesystem, and every
+credentialed command goes out through a shim that keeps the secret on the other side. What
+the proxy cannot do is stop a shell in the same pod from **asking Google for a token
+directly**, because that path never goes through the proxy at all. Workload Identity binds
+to the pod, so `169.254.169.254` answers every container in it with the platform service
+account, and one `curl` returns a Bearer token good for everything that account can do —
+verified again on a live install while this paragraph was written. [Workload Identity is
+scoped to the pod](#workload-identity-is-scoped-to-the-pod) is the mechanism in full, and
+[Which credentials a sidecar can still hold](#which-credentials-a-sidecar-can-still-hold)
+is what remains after it.
+
+That is a property of the arrangement rather than of any workload running in it, so no
+amount of hardening inside the agent closes it and a switch to disable the sandbox would
+be a switch to reopen it. Hence no switch — the same reasoning as any other hardening that
+removes a capability nobody should have had. Nothing an installation can do today is taken
+away: the shell still runs, the same commands still work, and the credentialed ones still
+reach the same identities through the proxy.
 
 Because an upgrade moves the shell rather than adding a second one, **the files the model
 has already written move with it.** `deploy/shared/sandbox_mirror.py` copies the working
