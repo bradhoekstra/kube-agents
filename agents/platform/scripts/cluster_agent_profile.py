@@ -27,7 +27,7 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import ensure_profile, overlay_template
+from profile_scaffold import HERMES_BIN, ensure_profile, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -362,7 +362,7 @@ def delete_profile(name: str) -> None:
         # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
         # the gateway on loopback, and the sandbox image does not carry it.
         subprocess.run(
-            ["hermes", "profile", "delete", name, "-y"],
+            [HERMES_BIN, "profile", "delete", name, "-y"],
             check=True, capture_output=True, text=True, timeout=30, env=_run_env(),
         )
     except Exception as e:  # noqa: BLE001 - tolerate an already-absent profile
