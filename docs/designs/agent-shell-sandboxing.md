@@ -39,12 +39,39 @@ through Workload Identity Federation. **A volumeMount is the one boundary a pod 
 container; the pod IP is not.**
 
 **Status:** the sandbox image ships ([`deploy/sandbox/`](../../deploy/sandbox/)) and the
-operator reconciles it behind `harness.experimental.shellSandbox`. Co-locating the proxy
-is gated on `spec.security.workloadIdentityFederation` naming a pool as well; without
-both, the proxy falls back to a Deployment of its own — reachable, but unable to run
-`git`, and unauthenticated on a ClusterIP. Tracked as
-[#737](https://github.com/gke-labs/kube-agents/issues/737), whose Part A — putting the
-Session KV behind its own interface — is the one piece still unbuilt.
+operator reconciles it. Co-locating the proxy is gated on
+`spec.security.workloadIdentityFederation` naming a pool; without it, the proxy runs in a
+Deployment of its own — reachable, and authenticated per caller rather than by loopback.
+Tracked as [#737](https://github.com/gke-labs/kube-agents/issues/737), whose Part A —
+putting the Session KV behind its own interface — is the one piece still unbuilt.
+
+**The sandbox is not an opt-in feature.** An upgrade turns it on, and there is no
+configuration that keeps the shell in the agent pod. The reason is the first three
+paragraphs of this section: an agent whose shell shares a pod with the credential proxy
+can read the credentials, and that is a property of the arrangement rather than of any
+particular workload running in it. A switch to disable the sandbox would be a switch to
+restore that, so the design does not offer one — the same reasoning as any other hardening
+that removes a capability nobody should have had. Nothing an installation can do today is
+taken away: the shell still runs, the same commands still work, and the credentialed ones
+still reach the same identities through the proxy.
+
+Because an upgrade moves the shell rather than adding a second one, **the files the model
+has already written move with it.** `deploy/shared/sandbox_mirror.py` copies the working
+directories from the agent's volume into the sandbox's on first start, skips Hermes' own
+state and anything credential-shaped, records what it copied and what it skipped in a
+marker on the far side, and does not run again. [Per-profile directories, and moving what
+is already there](#per-profile-directories-and-moving-what-is-already-there) is the
+detail, including the two-level exclusion a leaked token taught us. It is covered by
+`tests/test_sandbox_mirror.py` against the real `tar`, and it has run on a live install:
+293 MB across 29 top-level paths copied into the sandbox, 278 entries skipped with a
+recorded reason for each.
+
+A transitional note for anyone reading the code rather than the design: the CRD still
+carries `harness.experimental.shellSandbox.enabled`, and the operator still honours it.
+That flag exists so the sandbox could be rolled out and validated ahead of the
+version-control abstraction it depends on, and it is removed along with the last of the
+in-agent-pod execution path when that lands. Treat it as staging, not as a supported way
+to run without a sandbox.
 
 | Layer                          | Where it lives                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -372,6 +399,37 @@ spelling: sshd's **host keys**. Hermes connects with
 refuses one that changed. A sandbox that regenerates its host key on restart does
 not prompt anybody — it fails every command from then on until `known_hosts` is
 edited by hand. Stable identity is a correctness requirement here, not a nicety.
+
+### The interface is SSH, so the sandbox is replaceable
+
+Nothing in the sandbox is a Hermes component. What the agent pod holds is a private key
+and a hostname; what the sandbox exposes is `sshd` on port 22 with an `authorized_keys`
+file. Everything between them — the cwd marker, the `export -p` snapshot, the working
+directory — is written by the client over that connection and read back the same way, so
+the far end is an ordinary SSH host that happens to run in Kubernetes.
+
+Two things follow, and both are the point rather than a side effect.
+
+**The implementation of the far end is swappable.** This repository ships a StatefulSet
+and a first-party image because that is what the current runtime needs, but any process
+that answers SSH at a stable name, keeps its host key across restarts, and offers a
+durable working directory satisfies the same contract. [Agent
+Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is the case worth naming: it
+addresses the same problem from the platform side, and adopting it later is a change to
+what runs behind the hostname rather than a change to the agent, the proxy, or anything in
+this design above the transport. The `runtimeClassName` field is the smaller version of
+the same idea already in use — the pod's isolation technology is a parameter, not a
+premise.
+
+**The harness is swappable too.** Hermes' `ssh` terminal backend is not special here; it
+is one client of a protocol that predates it. An agentic harness with any SSH-based
+sandbox backend can be pointed at this pod and gets the same properties — a shell with no
+credentials, a proxy the shell reaches but cannot read, and files that outlive the
+connection — without adopting Hermes or the operator's other reconcilers. That is why the
+integration lives in `terminal.backend` and a keypair rather than in a plugin: the
+narrower the interface, the fewer assumptions travel across it. What such a harness would
+still need to supply is the credential proxy's client side, which is a shim on `PATH` and
+an HTTP endpoint, not a code dependency.
 
 ### The credential proxy is a container of that StatefulSet, and the pod is unbound
 
@@ -890,8 +948,11 @@ The way through is a copy. The Secret is mounted `0444` — world-readable _with
 pod that is the key's legitimate holder_, which concedes nothing — and a small init
 container running as the pod's own uid `install -m 0600`s it into an `emptyDir` the
 agent container mounts read-only. The copy is owned by the account that reads it, so
-`ssh` is satisfied. A missing key logs and exits 0 rather than failing the pod,
-because the sandbox is opt-in and an install without a keypair is not broken.
+`ssh` is satisfied. A missing key logs and exits 0 rather than failing the pod: an
+install mid-upgrade has not been given a keypair yet, and taking the agent down over
+it would turn a transient gap into an outage. `upgrade.sh` generates the pair for an
+install that predates the sandbox and never rewrites one that exists — replacing a key
+already in use would lock the agent out of its own shell until the sandbox restarted.
 
 Built in
 [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go)
@@ -2241,9 +2302,10 @@ cover.
 
 ## The standalone fallback
 
-Without both `shellSandbox.enabled` and a complete `workloadIdentityFederation` block, the
-proxy runs in a Deployment of its own on `kubeagents-platform-agent`, and reads the
-metadata server. That is what a default install gets. Three things it does not give you:
+Without a complete `workloadIdentityFederation` block the proxy is not co-located: it runs
+in a Deployment of its own on `kubeagents-platform-agent`, and reads the metadata server.
+That is what an install gets before it configures federation, and the shell is in the
+sandbox either way. Three things this placement does not give you:
 
 **Every pod under that service account keeps a cloud identity.** The gateway pod and the
 proxy pod both run as `kubeagents-platform-agent`, which carries the
