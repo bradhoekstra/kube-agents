@@ -163,7 +163,7 @@
       "name": "python",
       "origin": "build-time",
       "repository": "docker.io/library/python",
-      "tag": "3.11-slim",
+      "tag": "3.14-slim",
       "buildArg": "PYTHON_IMAGE",
       "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile.",
       "description": "Runtime base for the replay proxy."
