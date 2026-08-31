@@ -85,6 +85,27 @@ if [ -d "$DEFAULTS" ]; then
       home="$DATA/$root"
     fi
     install -d -o agent -g agent "$home"
+    # -o/-g reach the last component only. `profiles/platform` therefore leaves
+    # $DATA/profiles owned by root, and 0755 root:root is readable and traversable
+    # enough that nothing looks wrong: the platform profile is agent-owned, the
+    # shell works, every skill works. What fails is creating anything *beside*
+    # platform, which is exactly what sandbox_mirror.py does — it extracts one
+    # home per profile the agent pod has, and each cluster profile is a mkdir in
+    # this directory. tar exits 2, the mirror raises before writing its marker,
+    # and the model's pre-upgrade files stay on the agent's volume where the
+    # shell can no longer see them. The only trace is a line in
+    # logs/sandbox_mirror.log. Walk back up to $DATA so the parents match the leaf.
+    #
+    # The walk starts at $home and not at its parent, so that the `.` root --
+    # where $home IS $DATA -- runs zero iterations. Starting one level up instead
+    # sends that case climbing out of the volume: /opt next, which owns
+    # /opt/credential-proxy, and an agent-owned /opt is uid 1000 able to rename
+    # the shims aside and put its own there.
+    dir="$home"
+    while [ "$dir" != "$DATA" ] && [ "$dir" != "/" ] && [ "$dir" != "." ]; do
+      chown agent:agent "$dir"
+      dir="$(dirname "$dir")"
+    done
     for entry in "$DEFAULTS"/*; do
       [ -e "$entry" ] || continue
       name="$(basename "$entry")"
