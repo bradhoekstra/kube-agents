@@ -34,12 +34,22 @@ TOKEN_BROKER_URL = os.getenv(
 
 
 # Hosts this refresher will mint a token for. `ssh.github.com` is GitHub's
-# SSH-over-443 endpoint, a different hostname for the same repositories.
+# SSH-over-443 endpoint and `www.github.com` is the redirecting alias `git
+# clone` accepts, both naming the same repositories as `github.com`. An
+# enterprise host is deliberately absent: Minty issues tokens for github.com
+# installations only.
 GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 
 # scp-like remote syntax — `[user@]host:path` — which is not a URL and so has
 # to be split before the host can be compared.
 _SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
+
+# One `owner/name` slug, the shape `credential_proxy.is_valid_repository`
+# accepts on the sidecar path. Checked here because the other path — direct to
+# Minty, for the standalone deployments the module docstring names — has no
+# validator downstream, so a deep link's extra segments would be posted as a
+# repository name.
+_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
 
 
 def github_repo_from_remote(url: str) -> str | None:
@@ -60,13 +70,40 @@ def github_repo_from_remote(url: str) -> str | None:
             return None
         host, path = match.group("host"), match.group("path")
 
-    if not host or host.lower() not in GITHUB_HOSTS:
+    if not host:
+        return None
+    if host.lower() not in GITHUB_HOSTS:
+        # The host, never the URL: a remote can carry `user:token@` in front of
+        # it. Without this an operator whose clone uses an SSH host alias sees
+        # only the caller's "Could not identify target repository 'None'".
+        log(f"Ignoring git remote: host '{host}' is not a GitHub host.")
         return None
 
     path = path.strip("/")
     if path.endswith(".git"):
         path = path[:-4]
-    return path or None
+    owner, slash, name = path.partition("/")
+    if (
+        not slash
+        or not _valid_repository_segment(owner)
+        or not _valid_repository_segment(name)
+    ):
+        log(f"Ignoring git remote: path '{path}' is not an owner/repo slug.")
+        return None
+    return f"{owner}/{name}"
+
+
+def _valid_repository_segment(segment: str) -> bool:
+    """One half of an `owner/name` slug, with the traversal shapes rejected.
+
+    The character class permits `.` and `-`, so it matches `..` and a leading
+    dash as happily as a real name; neither is a repository.
+    """
+    return (
+        _REPOSITORY_SEGMENT.fullmatch(segment) is not None
+        and segment not in (".", "..")
+        and not segment.startswith("-")
+    )
 
 
 def get_current_git_repo() -> str | None:
