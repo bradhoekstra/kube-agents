@@ -11,11 +11,13 @@ import email.message
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 from credential_proxy_client import authorization_headers
 
@@ -31,6 +33,42 @@ TOKEN_BROKER_URL = os.getenv(
 )
 
 
+# Hosts this refresher will mint a token for. `ssh.github.com` is GitHub's
+# SSH-over-443 endpoint, a different hostname for the same repositories.
+GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+
+# scp-like remote syntax — `[user@]host:path` — which is not a URL and so has
+# to be split before the host can be compared.
+_SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
+
+
+def github_repo_from_remote(url: str) -> str | None:
+    """Return `owner/repo` when `url` is a GitHub remote, else None.
+
+    The host is compared against `GITHUB_HOSTS` after parsing rather than
+    searched for in the raw string: `https://evil.example/github.com/o/r.git`
+    and `https://github.com.evil.example/o/r.git` both contain `github.com`,
+    and a substring check would hand a token request for someone else's
+    repository to Minty.
+    """
+    if "://" in url:
+        parts = urlsplit(url)
+        host, path = parts.hostname, parts.path
+    else:
+        match = _SCP_REMOTE.match(url)
+        if not match:
+            return None
+        host, path = match.group("host"), match.group("path")
+
+    if not host or host.lower() not in GITHUB_HOSTS:
+        return None
+
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path or None
+
+
 def get_current_git_repo() -> str | None:
     try:
         res = subprocess.run(
@@ -39,12 +77,7 @@ def get_current_git_repo() -> str | None:
             text=True,
             check=True,
         )
-        url = res.stdout.strip()
-        if "github.com" in url:
-            path = url.split("github.com")[-1].lstrip(":").lstrip("/")
-            if path.endswith(".git"):
-                path = path[:-4]
-            return path
+        return github_repo_from_remote(res.stdout.strip())
     except Exception:
         pass
     return None
