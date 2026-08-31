@@ -338,8 +338,9 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
   filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
   file the container executing the command cannot open, and every refusal dies on "no such file" —
-  as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
-  the sort of thing a second implementation rediscovers the hard way.
+  as one did, live, before this moved. The fleet audit hit the same trap and took the other exit:
+  its bodies now go to `gh` on stdin (`audit_report.BODY_STDIN`), which needs no shared filesystem
+  at all. This gate has not been moved to it yet.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred

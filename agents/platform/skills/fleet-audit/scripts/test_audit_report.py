@@ -485,7 +485,7 @@ class Recorder:
 
         The one seam the suite was missing. Every other assertion checks either
         the *arguments* handed to `gh` or the *return value* of a renderer, and
-        nothing checked the wire between them: `_write_temp` could write an
+        nothing checked the wire between them: the body handoff could carry an
         empty string — blanking every issue, comment and pull request the
         feature exists to produce — and the whole suite stayed green. Anything
         asserting that something was *published* has to come through here.

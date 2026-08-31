@@ -411,10 +411,14 @@ def _post_body(provider, repo: str, pr, body: str) -> None:
     in its own filesystem; `/tmp` is a per-container emptyDir, so a
     `--body-file /tmp/…` path names a file the other container cannot open. The
     refusal then fails with "no such file" — observed live before this moved.
-    `audit_report._write_temp` documents the same trap, and a second one: since
-    #955 the sandbox (uid 10000) and the sidecar (uid 10001) are different
-    users, so the 0600 file `NamedTemporaryFile` creates must be `fchmod`ed
-    group-readable or the sidecar cannot open it even on the shared volume.
+    There is a second trap on top of it: since #955 the sandbox (uid 10000) and
+    the sidecar (uid 10001) are different users, so the 0600 file
+    `NamedTemporaryFile` creates must be `fchmod`ed group-readable or the
+    sidecar cannot open it even on the shared volume.
+
+    The fleet audit took the exit that removes both, and this should follow it:
+    `gh` reads a body from stdin when the flag's value is `-`, which needs no
+    shared filesystem and no agreement about uids. See `audit_report.BODY_STDIN`.
 
     NO fallback to the system temp directory when the volume is absent: the
     sidecar can never see this container's private tmp, so in-cluster that
