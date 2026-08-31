@@ -45,10 +45,26 @@ Deployment of its own — reachable, and authenticated per caller rather than by
 Tracked as [#737](https://github.com/gke-labs/kube-agents/issues/737), whose Part A —
 putting the Session KV behind its own interface — is the one piece still unbuilt.
 
-**The sandbox is not an opt-in feature.** An upgrade turns it on, and there is no
-configuration that keeps the shell in the agent pod.
+**The sandbox is opt-in for now, and is not meant to stay that way.**
+`spec.harness.experimental.shellSandbox.enabled` defaults to false, so upgrading to this
+version changes nothing until an install sets it. Setting it back to false is a real path
+rather than an unhandled one: the operator deletes the StatefulSet and hands
+`<name>-credential-proxy` back to `reconcileCredentialBroker`, and the sandbox's volumes are
+retained, so toggling off and on again returns to the same data and the same host keys. The
+flag is here so this can be rolled out and rolled back one install at a time while it is new.
+The version-control abstraction removes it, along with `shellSandbox.versionControl`,
+`credentialProxyColocated()`, and `spec.security.splitCredentialBrokerPod`.
 
-The reason needs stating precisely, because the obvious reading of it is wrong. The
+Be clear about what turning it off returns you to, because it is not the previous
+arrangement. The agent image no longer carries `kubectl`, `gcloud`, `gh`, or `git`, and it no
+longer carries the four credential-proxy shims that used to stand in for them; the agent-pod
+code that called one directly now goes through `sandbox_exec.py` over SSH. So with the flag
+off and this image running, the model's shell is back in the agent pod and every credentialed
+command in it answers "command not found". Rolling the change back means the flag and the
+image together.
+
+The flag expires rather than becoming a supported choice, and the reason needs stating
+precisely, because the obvious reading of it is wrong. The
 credential proxy already stops the agent from _holding_ a credential, and it does that:
 there is no token in the agent's environment, no key on its filesystem, and every
 credentialed command goes out through a shim that keeps the secret on the other side. What
@@ -62,11 +78,11 @@ scoped to the pod](#workload-identity-is-scoped-to-the-pod) is the mechanism in 
 is what remains after it.
 
 That is a property of the arrangement rather than of any workload running in it, so no
-amount of hardening inside the agent closes it and a switch to disable the sandbox would
-be a switch to reopen it. Hence no switch — the same reasoning as any other hardening that
-removes a capability nobody should have had. Nothing an installation can do today is taken
-away: the shell still runs, the same commands still work, and the credentialed ones still
-reach the same identities through the proxy.
+amount of hardening inside the agent closes it, and a switch to disable the sandbox is a
+switch to reopen it — the same reasoning as any other hardening that removes a capability
+nobody should have had. Nothing an installation can do today is taken away: the shell still
+runs, the same commands still work, and the credentialed ones still reach the same identities
+through the proxy.
 
 Because an upgrade moves the shell rather than adding a second one, **the files the model
 has already written move with it.** `deploy/shared/sandbox_mirror.py` copies the working
