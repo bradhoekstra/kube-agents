@@ -154,7 +154,7 @@
       "name": "golang",
       "origin": "build-time",
       "repository": "docker.io/library/golang",
-      "tag": "1.26-alpine",
+      "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
