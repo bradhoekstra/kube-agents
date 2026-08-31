@@ -1510,13 +1510,33 @@ fi
 # same script with --skeleton-only when it scaffolds one, so a profile created
 # between restarts does not wait for the next one.
 #
-# Backgrounded and non-fatal, for the reason step 5.6 gives and one more: the
-# sandbox is a separate StatefulSet with no start ordering against this
-# Deployment, so "not up yet" is an ordinary outcome rather than an error. The
-# script waits, gives up quietly, and both halves are idempotent — the layout is
-# re-pushed on every start and the copy is guarded by a marker on the sandbox's
-# own volume, so a fresh sandbox PVC gets a fresh copy and an existing one does
-# not.
+# Foreground, and fatal. It was neither, and the reason it was both is sound as
+# far as it goes: the sandbox is a separate StatefulSet with no start ordering
+# against this Deployment, so "not up yet" is an ordinary outcome rather than an
+# error. What that misses is that the script already draws the distinction. A
+# sandbox that never answers inside --wait returns 0 and leaves the marker
+# unwritten, so the next start retries; the only non-zero exits are a
+# --remote-root that is not the sandbox's volume, and a transfer that ran and
+# failed. Neither is survivable and neither is transient, so backgrounding them
+# bought nothing but silence: the agent came up healthy, the model's files were
+# still on this volume where its shell can no longer see them, and the sole
+# trace was a WARN line in a log file nobody reads. That happened on a live
+# upgrade — ten cluster profile homes, every one Permission denied — and it was
+# found by hand, days later.
+#
+# Exiting non-zero here is what makes it visible, and it needs no privilege the
+# agent does not have. The kubelet restarts the container, CrashLoopBackOff
+# follows, and getDeploymentStatusDetails in the operator already scans the
+# gateway pod's container statuses for a waiting reason and writes it into the
+# CR: phase Degraded, Ready=False, and a message naming this container. The
+# tail below puts the cause in `kubectl logs`, which is where the CR sends you.
+#
+# The cost is startup latency in the one case that blocks — a sandbox that is
+# slow rather than absent — bounded by --wait at 180s. The startupProbe budget
+# is agentAPIProbe(10, 60), 600s, and progressDeadlineSeconds is 1200, so the
+# wait fits with room over. The copy itself runs once: it is guarded by a marker
+# on the sandbox's own volume, so a fresh sandbox PVC gets a fresh copy and every
+# later start skips it and re-pushes only the layout.
 #
 # Gated on IS_BOOTSTRAP_PRIMARY: every replica can reach the sandbox, and two
 # tar streams extracting into the same directory would race. --skip-old-files
@@ -1526,12 +1546,13 @@ SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"
 [ -f "$SANDBOX_MIRROR_SCRIPT" ] || SANDBOX_MIRROR_SCRIPT="$TARGET_DIR/scripts/sandbox_mirror.py"
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SANDBOX_MIRROR_SCRIPT" ]; then
     echo "Mirroring the profile layout into the shell sandbox..."
-    (
-        HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
-            "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
-            >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1 \
-            || echo "WARN: sandbox mirror did not complete; the agent pod's files are untouched and the next start will retry (see logs/sandbox_mirror.log)" >&2
-    ) &
+    if ! HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
+        >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1; then
+        echo "FATAL: the shell sandbox migration failed. The model's files are still on this pod's volume, where its shell cannot reach them, so this container is refusing to start rather than come up looking healthy with the agent's work missing. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+        exit 1
+    fi
 fi
 
 # 6. Execute primary process from inside the agent's own directory.
