@@ -138,6 +138,8 @@ Re-running the pass folds into the section rather than stacking a round beneath 
 
 All submissions, including from project members, require review through GitHub pull requests. See [GitHub Help — About pull requests](https://help.github.com/articles/about-pull-requests/).
 
+Nobody merges by hand. This is a Prow repository: `google-oss-prow` squash-merges a pull request once it carries both the `lgtm` label — which a reviewer's "Approve" sets, and which Prow will not take from the author — and the `approved` label, which comes from an approver in the `OWNERS` file covering the changed paths. GitHub's own branch protection requires zero approving reviews, so the settings page is not where the review requirement lives. [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md) is canonical for this and has the rest: the labels that block a merge, `/hold`, which checks are required, and how to read what Tide is waiting for — including why `mergeStateStatus` cannot tell you.
+
 ### Automated review
 
 Every pull request is also reviewed by `kube-agents-bot`, a GitHub App that runs a coding agent over the branch diff. It only comments — it never pushes commits and never merges, and it does not replace the human review above. It introduces itself in a comment on every pull request it picks up; that comment states its current contract, so trust it over this page if the two ever differ. The timings below are rounded; [`docs/pull-request-workflow.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/pull-request-workflow.md) is where they are measured, alongside the commands to poll for a review and answer it.

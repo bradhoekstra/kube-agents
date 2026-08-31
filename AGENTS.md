@@ -351,15 +351,19 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request)
   for what it does and what you are expected to do with its findings.
 - **Leave no conversation unresolved.** `main` will not merge while a review thread is open, and
-  the open thread also keeps the pull request counted as its author's outstanding work.
+  the open thread also keeps the pull request counted as
+  [its author's outstanding work](docs/pull-request-workflow.md#who-owns-an-open-pull-request).
   Reply, then resolve every thread you are confident is addressed — the bar for "confident" is in
   [Automated Review After Opening a Pull Request](#automated-review-after-opening-a-pull-request),
-  and the commands are in
-  [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations). Two
-  things that make a branch look clear when it is not: a thread whose line fell out of the diff
-  reads as outdated, which says the code moved and nothing about whether the finding still holds,
-  so read it; and the listing stops at the first hundred threads, so a long-lived pull request
-  needs paging before you can call it clear rather than say you looked at a hundred.
+  and the commands, with the ways a thread listing reads clear when it is not, are in
+  [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#resolving-conversations).
+- **You do not merge it; Tide does.** Once a reviewer's `lgtm` label and an `OWNERS` approver's
+  `approved` are both on the pull request and the required checks are green, `google-oss-prow`
+  squash-merges it. Posting `/lgtm` or `/approve` is therefore merging the change, not reviewing
+  it: do not send either on someone's behalf unless they asked.
+  [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges) is canonical
+  — the labels, `OWNERS`, `/hold`, and why GitHub's settings page reads as though nothing is
+  required.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
   on changed Markdown and YAML, a local Docker build of the agent runner, the image-layer budget if
   you added a `RUN` or `COPY` to `deploy/docker/Dockerfile`, and `go build` inside `k8s-operator/`.
@@ -431,15 +435,12 @@ live test you re-ran to confirm them, belong in **Self-Review** and **Live valid
 into what is already there, per "Keep these sections current, not chronological" above. Do it once
 the last `/review` pass has settled, for the reason the next paragraph gives about threads: a fresh
 review brings fresh findings, and folding them in twice is the same wasted round. Nothing else in
-this workflow reopens the body, so a branch whose sections still describe the commit it was opened
-at is the normal outcome of skipping it here.
+this workflow reopens the body.
 
-**Then resolve the conversations.** `main` requires every conversation on a pull request to be
-resolved before it can merge, and the triage sweep counts an open thread as work outstanding on the
-author — so a branch whose fixes have all landed still sits blocked, and still shows up as the
-author's problem rather than the reviewers'. Clearing the threads is part of finishing the change,
-not a courtesy someone else will get to. Do it once the fixes are pushed and the last `/review` pass
-has settled: a fresh review opens fresh threads, so resolving before it lands means doing it twice.
+**Then resolve the conversations.** Pull Request Hygiene says why an open thread both blocks the
+merge and keeps the change counted as its author's outstanding work; what belongs here is the
+timing. Do it once the fixes are pushed and the last `/review` pass has settled: a fresh review
+opens fresh threads, so resolving before it lands means doing it twice.
 
 Resolve a thread — the bot's or a human's — when you are **fully confident the issue is addressed**:
 the fix is on the pull request head and you can name the commit, or the finding is factually wrong
