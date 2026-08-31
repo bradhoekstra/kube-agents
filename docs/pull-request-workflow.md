@@ -340,8 +340,9 @@ Four states that look like somebody else's problem and are not:
   Clearing the findings and commenting `/review` for a clean pass is what summons one;
   `/request-review` is the override. Answering every bot thread does not summon one by itself, so
   an author who has done everything asked of them can still be sitting with nobody assigned.
-- **A red check that is not required.** It blocks no merge and is not the author's problem. Check
-  the six contexts above before treating a failing job as work owed.
+- **A red check that is not required.** It blocks no merge and is not the author's problem — but
+  "required" means both lists above, not branch protection's six alone, and `tide` is what actually
+  knows. Ask it before treating a failing job as work owed, and before concluding one is not.
 - **`mergeable: UNKNOWN`.** GitHub computes mergeability lazily and the first query only triggers
   the job, so a conflict reads as conflict-free until you ask twice.
 
