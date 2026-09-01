@@ -42,10 +42,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # cache: pip mirrors what the setup-go step below already does for modules.
+      # It caches the pip download directory, not the installed environment, so
+      # the install step still runs -- what it removes is re-fetching every wheel
+      # in requirements-test.txt from PyPI on each run. Keyed on that file's hash,
+      # so the entry rotates when the dependency set changes and not before.
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
 
       # Not for a Go suite -- k8s-operator-test.yml owns those. `make
       # test-python` now sweeps tests/integration, and its injector seam
@@ -89,10 +96,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # bench/pyproject.toml rather than requirements-test.txt: this job installs
+      # `-e bench/`, so the pyproject is what pins its dependency set -- including
+      # the devops-bench git SHA the target's help text calls out.
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
+          cache: pip
+          cache-dependency-path: bench/pyproject.toml
 
       - name: Install bench and its test runner
         run: |
@@ -145,6 +157,8 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
 
       # Here for the mirroring the Makefile's coverage target is built around:
       # the meter runs the gate's suite, the same way, or it is measuring
