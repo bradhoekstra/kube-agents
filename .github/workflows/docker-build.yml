@@ -63,15 +63,35 @@ jobs:
       # context and shares no stage with this chain, so a cache would have to be its
       # own, and at ~7s of the job it is not worth one.
       #
-      # Write on push to main, read everywhere, because the two directions are not
-      # worth the same. A cache written on a pull request ref is visible only to that
-      # pull request, so PR writes help nothing on the next run and still consume the
-      # repository's shared budget -- which at the time of writing was already ~17 GB
-      # across ~378 entries, close enough to eviction that a mode=max export of an
-      # image this size from every open branch would push the setup-go and CodeQL
-      # entries out. One writer per merge keeps a single lineage every pull request
-      # restores from its base. Check
-      # `gh api /repos/gke-labs/kube-agents/actions/cache/usage` if hit rates drop.
+      # Read on the pull request, build fresh and write on the push to main. The two
+      # events want opposite things and the split is the point.
+      #
+      # A pull request wants speed, and a slightly stale base is fine there because
+      # nothing it builds ships. The push to main must not read the cache: this
+      # workflow's header says the layer budget and the entrypoint gate are checked
+      # only here, and the image they check has to be the one that ships. What ships
+      # is built by docker-publish-ghcr.yml, which carries no cache at all. Line 92's
+      # `apt-get install` and line 118's `uv pip install hermes-agent[...]` are
+      # unpinned, and buildkit keys those layers on the command string and parent
+      # digest, so neither key moves when upstream publishes. HERMES_AGENT_TAG is
+      # digest-pinned in tags.env, so the base image is not the exposure -- what is
+      # installed on top of it is. Restore that layer on main and the gate would
+      # validate one dependency set while the publish shipped another, which is the
+      # after-merge Cloud Build failure this job exists to prevent. Main pays for a
+      # full build today, so building fresh here costs nothing against the status quo
+      # and keeps each merge's export honest.
+      #
+      # Writing only on main is also a budget decision. A cache written on a pull
+      # request ref is restorable by later runs of that same pull request but is
+      # invisible to every other ref, so N branches exporting mode=max copies of an
+      # image this size compete for one repository budget -- already ~17 GB across
+      # ~378 entries when this was written, close enough to eviction to push the
+      # setup-go and CodeQL entries out. One writer per merge keeps a single lineage
+      # every pull request restores from its base. That write is not free either: the
+      # gha backend stores one entry per layer keyed by content digest, so unchanged
+      # layers cost nothing after the first export, but the first one is the whole
+      # lineage. Watch `gh api /repos/gke-labs/kube-agents/actions/cache/usage` after
+      # this merges -- if the total climbs rather than settling, this is why.
       #
       # scope= is explicit because buildkit's gha backend defaults every export to
       # the scope `buildkit`, where docker-publish-k8s-operator.yml already writes a
@@ -87,7 +107,7 @@ jobs:
           push: false
           load: true
           tags: platform-agent:latest
-          cache-from: type=gha,scope=platform-agent
+          cache-from: ${{ github.event_name == 'pull_request' && 'type=gha,scope=platform-agent' || '' }}
           cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=platform-agent' || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
