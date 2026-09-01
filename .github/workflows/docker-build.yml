@@ -51,6 +51,29 @@ jobs:
       # a transfer from the buildx cache into the daemon, which is why only this
       # build and the gate-test build below -- the two whose output a later step
       # runs or inspects -- pay for it.
+      #
+      # The only build here carrying a remote layer cache, and the only one that
+      # needs one: `platform` is the deepest chain the Dockerfile ships and nearly
+      # all of this job's ~5.5 minutes is spent on it. The three builds below reuse
+      # it without a cache of their own -- entrypoint-gate-test is FROM platform and
+      # credential-proxy reaches agent-base through proxy-tools, so both hit
+      # buildkit's local state from this step. Separate scopes for them would export
+      # the same layers again for no extra hit.
+      #
+      # Write on push to main, read everywhere, because the two directions are not
+      # worth the same. A cache written on a pull request ref is visible only to that
+      # pull request, so PR writes help nothing on the next run and still consume the
+      # repository's shared budget -- which at the time of writing was already ~17 GB
+      # across ~378 entries, close enough to eviction that a mode=max export of an
+      # image this size from every open branch would push the setup-go and CodeQL
+      # entries out. One writer per merge keeps a single lineage every pull request
+      # restores from its base. Check
+      # `gh api /repos/gke-labs/kube-agents/actions/cache/usage` if hit rates drop.
+      #
+      # scope= is explicit because buildkit's gha backend defaults every export to
+      # the scope `buildkit`, where docker-publish-k8s-operator.yml already writes a
+      # different image. Two images sharing a scope overwrite each other's index and
+      # both stop hitting.
       - name: Build Platform Agent
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -61,6 +84,8 @@ jobs:
           push: false
           load: true
           tags: platform-agent:latest
+          cache-from: type=gha,scope=platform-agent
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=platform-agent' || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
