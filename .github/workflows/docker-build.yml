@@ -54,11 +54,14 @@ jobs:
       #
       # The only build here carrying a remote layer cache, and the only one that
       # needs one: `platform` is the deepest chain the Dockerfile ships and nearly
-      # all of this job's ~5.5 minutes is spent on it. The three builds below reuse
-      # it without a cache of their own -- entrypoint-gate-test is FROM platform and
-      # credential-proxy reaches agent-base through proxy-tools, so both hit
-      # buildkit's local state from this step. Separate scopes for them would export
-      # the same layers again for no extra hit.
+      # all of this job's ~5.5 minutes is spent on it. The two builds below that
+      # share its lineage reuse it without a cache of their own --
+      # entrypoint-gate-test is FROM platform and credential-proxy reaches
+      # agent-base through proxy-tools, so both hit buildkit's local state from this
+      # step. Separate scopes for them would export the same layers again for no
+      # extra hit. Build Replay Proxy is not in that set: it builds from its own
+      # context and shares no stage with this chain, so a cache would have to be its
+      # own, and at ~7s of the job it is not worth one.
       #
       # Write on push to main, read everywhere, because the two directions are not
       # worth the same. A cache written on a pull request ref is visible only to that

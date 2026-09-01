@@ -45,14 +45,23 @@ jobs:
       # cache: pip mirrors what the setup-go step below already does for modules.
       # It caches the pip download directory, not the installed environment, so
       # the install step still runs -- what it removes is re-fetching every wheel
-      # in requirements-test.txt from PyPI on each run. Keyed on that file's hash,
-      # so the entry rotates when the dependency set changes and not before.
+      # in requirements-test.txt from PyPI on each run.
+      #
+      # Both files, because requirements-test.txt is not the whole dependency set:
+      # its last line is `-r admin_console/requirements.txt`, and the key is a hash
+      # of the paths named here rather than of what pip ends up resolving. Hashing
+      # only the outer file would leave the key unchanged when the included one is
+      # edited, which setup-python reads as an exact hit -- so it would restore the
+      # pre-edit wheels and then skip the save, and the new ones would never be
+      # cached at all.
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
           cache: pip
-          cache-dependency-path: requirements-test.txt
+          cache-dependency-path: |
+            requirements-test.txt
+            admin_console/requirements.txt
 
       # Not for a Go suite -- k8s-operator-test.yml owns those. `make
       # test-python` now sweeps tests/integration, and its injector seam
@@ -158,7 +167,10 @@ jobs:
         with:
           python-version-file: ".python-version"
           cache: pip
-          cache-dependency-path: requirements-test.txt
+          # Both files, for the reason given in the `test` job above.
+          cache-dependency-path: |
+            requirements-test.txt
+            admin_console/requirements.txt
 
       # Here for the mirroring the Makefile's coverage target is built around:
       # the meter runs the gate's suite, the same way, or it is measuring
