@@ -150,11 +150,13 @@ The manifest, not the checker, is what makes the check mandatory: a tree carryin
 
 ## Base image pin
 
-The Hermes base image tag is pinned in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) at the repo root:
+The Hermes base image tag is pinned in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) at the repo root, by tag and digest together:
 
 ```bash
-HERMES_AGENT_TAG=v2026.8.13@sha256:68e15ae2a6d894d0ccbd9f8aacbbe13d4d28fa5dc9b6a303970b67bb2499b1a6
+HERMES_AGENT_TAG=<tag>@sha256:<digest>
 ```
+
+That file holds the pin itself; this page does not repeat it, because a second copy of a digest is a second thing to forget.
 
 Docker builds source `tags.env` via the `HERMES_AGENT_TAG` build arg:
 
@@ -164,7 +166,9 @@ ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 ```
 
-Bumping Hermes = updating `tags.env` (a single-line change) and rebuilding.
+The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-platform` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
+
+Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
 
 ## Private / custom registry
 

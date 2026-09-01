@@ -622,7 +622,8 @@ def _one_call_response(output: Any, status: str | None = None) -> dict[str, Any]
     [
         ("Error executing tool 'terminal': boom", "error"),  # tool_executor.py
         ("Error executing tool: boom", "error"),  # conversation_loop.py
-        # mcp_tool.py on CallToolResult.isError, and registry.py tool_error()
+        # mcp_tool.py on CallToolResult.is_error (isError before mcp 2.0, and
+        # it still reads both), and registry.py tool_error()
         (json.dumps({"error": "MCP tool returned an error"}), "error"),
         (json.dumps({"error": "bad input", "success": False}), "error"),
         (json.dumps({"success": False, "transcript": ""}), "error"),
