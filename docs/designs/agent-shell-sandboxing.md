@@ -1523,7 +1523,7 @@ the agent image and not in this one, so `./audit_report.py` here died with `No s
 file or directory` naming an interpreter rather than the script. They now use
 `/usr/bin/env python3`, which is what the other 18 shared scripts already used. Nothing
 in the four imports a third-party module, so neither image cares which Python answers;
-`python:3.11-slim` has no `/usr/bin/python3` at all, so there was nothing to fall
+`python:3.14-slim` has no `/usr/bin/python3` at all, so there was nothing to fall
 through to.
 
 #### Cron scripts stay in the agent pod and reach into the sandbox from there

@@ -275,7 +275,7 @@ check "and so does a skill script that imports across trees" "ok" \
 # The failure this replaces named an interpreter, not a script: four of these
 # started `#!/opt/hermes/.venv/bin/python3`, a path that exists in the agent image
 # and not in this one, so `./audit_report.py` died with "no such file or
-# directory" pointing at a venv. python:3.11-slim has no /usr/bin/python3 either,
+# directory" pointing at a venv. python:3.14-slim has no /usr/bin/python3 either,
 # so there is nothing to fall through to.
 check_absent "no script names an interpreter this image does not have" "/opt/hermes/" \
   "$("${SSH[@]}" 'grep -rh "^#!" /opt/data/scripts /opt/data/skills | sort -u' 2>&1)"

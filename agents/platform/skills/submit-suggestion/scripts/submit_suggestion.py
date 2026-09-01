@@ -39,6 +39,7 @@ flag, so a session that started under one does not finish under the other.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -52,6 +53,8 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 import credential_proxy_client
 import gitops_workspace
 from github_token_refresh import refresh_git_credentials, log
+
+BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # Branches a suggestion may never target. `main` and `master` are the GitOps
 # rollout branches; `production` is the convention some fleets use instead.
@@ -88,6 +91,18 @@ def git(argv: list, workspace: str, check: bool = True) -> subprocess.CompletedP
     return gitops_workspace.run_git(argv, workspace, check=check)
 
 
+def validate_repo(repo: str) -> str:
+    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
+    if not repo or not gitops_workspace.is_valid_repo_slug(repo):
+        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
+    managed = gitops_workspace.get_managed_github_repos()
+    if managed and repo not in managed:
+        raise ValueError(
+            f"Repository {repo!r} is not in the managed repositories list: {managed}"
+        )
+    return repo
+
+
 def proxy_endpoint() -> str:
     return os.environ.get("CREDENTIAL_PROXY_URL", "").strip()
 
@@ -108,6 +123,10 @@ def content_mode_available() -> bool:
 def handle_prepare_content(args) -> int:
     branch = check_branch(args.branch)
     repo = gitops_workspace.resolve_repo()
+    # Same allowlist the directory path answers to. Content mode reaches the
+    # broker instead of a clone, and skipping the check here would make the
+    # managed-repos list depend on which transport the run happened to pick.
+    validate_repo(repo)
     refresh_git_credentials(repo)
     workspace = credential_proxy_client.Workspace.open(
         proxy_endpoint(), repo, branch=branch
@@ -135,7 +154,8 @@ def handle_prepare(args) -> int:
         return handle_prepare_content(args)
     branch = check_branch(args.branch)
     lease = gitops_workspace.lease_id(args.lease)
-    repo = gitops_workspace.resolve_repo()
+    repo = args.repo or gitops_workspace.resolve_repo()
+    validate_repo(repo)
 
     # Repo-scoped, and needed before the clone: the clone is what a token would
     # otherwise have to be derived from.
@@ -384,7 +404,8 @@ def handle_submit(args) -> int:
             "are actually on."
         )
 
-    repo = args.repo or gitops_workspace.resolve_repo()
+    repo = args.repo or gitops_workspace.resolve_repo(workspace=workspace)
+    validate_repo(repo)
     refresh_git_credentials(repo)
 
     push_branch(branch, workspace)
@@ -515,6 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument(
         "--lease", default=None, help="Lease id (defaults to the kanban task)"
     )
+    prepare.add_argument("--repo", default=None, help="Target repository as owner/name")
 
     submit = subparsers.add_parser("submit", help="Push the branch and open the PR")
     submit.add_argument("--branch", required=True, help="Active Git branch name")

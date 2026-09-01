@@ -32,9 +32,10 @@
 # It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
 # profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
 # shared pod-wide, so it operates on every profile regardless of which profile ticks it. It is
-# resilient (always exit 0 on the cron path) and posts a Google Chat summary only when it
-# created or pruned. `--require-create-pass` opts out of that for a caller that has to know
-# whether the roster is actually reconciled; the bootstrap scan gate is the only one.
+# resilient (always exit 0 on the cron path) and posts a summary to every configured chat
+# platform only when it created or pruned. `--require-create-pass` opts out of that for a caller
+# that has to know whether the roster is actually reconciled; the bootstrap scan gate is the only
+# one.
 
 import argparse
 import fcntl
@@ -47,6 +48,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import sandbox_exec
+from chat_platforms import enabled_chat_platforms
 from cluster_agent_profile import (
     HERMES_BIN,
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
@@ -350,19 +352,28 @@ def _format_notification(report: dict) -> str:
 
 
 def _notify(message: str) -> None:
-    """Post a summary to the user's Google Chat home channel (best-effort).
+    """Post a summary to each configured chat platform's home channel (best-effort).
 
     Stays in the agent pod. `hermes` is not cluster tooling: it needs the
     profiles on the data PVC and the gateway on loopback, neither of which the
     sandbox has, and the sandbox image does not carry the binary.
+
+    The target used to be the literal `google_chat`, which meant a Slack-only
+    install never heard that a Cluster Agent profile had been created or pruned:
+    the send failed on the missing Google Chat home channel and the `except`
+    below turned it into one line of stderr on a run that still exits 0. #989.
+
+    Each platform is sent to independently — a Google Chat outage must not cost
+    Slack the summary, and the reverse.
     """
-    try:
-        subprocess.run(
-            [HERMES_BIN, "send", "--to", "google_chat", message],
-            capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
-        )
-    except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
-        log(f"Failed to post reconcile notification: {e}")
+    for platform in enabled_chat_platforms():
+        try:
+            subprocess.run(
+                [HERMES_BIN, "send", "--to", platform, message],
+                capture_output=True, text=True, check=True, timeout=30, env=_run_env(),
+            )
+        except Exception as e:  # noqa: BLE001 - notification is best-effort; never fail the run
+            log(f"Failed to post reconcile notification to {platform}: {e}")
 
 
 def main() -> None:

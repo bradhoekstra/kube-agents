@@ -19,13 +19,13 @@
 # firewall from a mirrored base. The pins live in images.json and
 # hack/check-image-inventory.sh fails CI if the two drift apart.
 #
-# python:3.11-slim rather than a bare distro: execute_code runs `python3
+# python:3.14-slim rather than a bare distro: execute_code runs `python3
 # script.py` in the sandbox (tools/code_execution_tool.py probes for it with
 # `command -v python3` and refuses the environment without it), so a Python is
 # not optional here. Taking one that is already in the inventory costs nothing
 # and adds no new upstream to mirror.
 ARG PYTHON_IMAGE=python
-ARG PYTHON_VERSION=3.11-slim
+ARG PYTHON_VERSION=3.14-slim
 FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 
 # openssh-server is baked rather than installed by the startup command. The
@@ -311,7 +311,7 @@ COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/ka
 # `#!/opt/hermes/.venv/bin/python3` — a path that exists in the agent image and not
 # in this one, so `./audit_report.py` here died with "no such file or directory"
 # naming an interpreter rather than the script. They now use /usr/bin/env, and this
-# fails the build if one comes back. python:3.11-slim has no /usr/bin/python3 at
+# fails the build if one comes back. python:3.14-slim has no /usr/bin/python3 at
 # all, so there is no near-miss to fall through to.
 #
 # Then the executable bit, which `chmod -R u=rwX` does not set — X preserves an
