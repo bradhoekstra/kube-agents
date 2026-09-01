@@ -100,6 +100,10 @@ spec:
     serviceAccountAnnotations:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+    {{- with .Values.platformAgent.security.scopedServiceAccounts }}
+    scopedServiceAccounts:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
     {{- /*
       Both fields or neither. The operator reads a half-filled block as absent and
       keeps the proxy on the metadata server, which is safe but silent: the install

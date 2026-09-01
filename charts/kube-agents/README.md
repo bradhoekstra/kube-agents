@@ -75,6 +75,26 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 `platformAgent.harness.{clusterName,location,projectId}` are required and have
 no defaults — rendering fails until they are set.
 
+These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
+chart enables by default. On a cluster that has no such RuntimeClass the
+operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
+add `--set platformAgent.deployment.availability.runtimeClassName=""` to run on
+the standard container runtime. See
+[Agent runtime knobs](#agent-runtime-knobs) for what the sandbox needs.
+
+**Upgrading an existing release picks this up too.** Helm applies the new
+chart's defaults for any key your release does not already set, so a release
+installed before this default and upgraded without pinning the value starts
+asking for the sandbox. On a cluster with no `gvisor` RuntimeClass that upgrade
+is quiet rather than loud: the operator stops at its RuntimeClass check before
+touching the workload, so the agent Deployment from the previous reconcile keeps
+running on the standard runtime — and every later change to the CR goes
+unapplied — while `.status` reports `Degraded` with `RuntimeClassNotFound`.
+`helm upgrade` itself reports success. Pass the same `--set …runtimeClassName=""`
+to stay on the standard runtime, or check
+`kubectl get platformagent -n kubeagents-system -o jsonpath='{.items[0].status}'`
+after the upgrade.
+
 ### Installing from a repository checkout
 
 The `appVersion` in a checkout's `Chart.yaml` is a placeholder that never
@@ -356,14 +376,27 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Three knobs need context beyond the chart:
+Four knobs need context beyond the chart:
 
-- `deployment.availability.runtimeClassName: gvisor` and
-  `harness.experimental.shellSandbox.runtimeClassName: gvisor` each need a GKE
-  Sandbox node pool on a Standard cluster — the `gke-cluster` module's
-  `enable_gvisor_node_pool` creates one; Autopilot ships the RuntimeClass
-  natively. They are separate keys because the agent pod holds WAL-mode SQLite,
-  which gVisor corrupts, and the sandbox pod holds none.
+- `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
+  agent executes model-authored commands and an unsandboxed pod shares the node
+  kernel with everything else on the node. That needs a GKE Sandbox node pool on
+  a Standard cluster — the `gke-cluster` module's `enable_gvisor_node_pool`
+  creates one; Autopilot ships the RuntimeClass natively from GKE
+  `1.27.4-gke.800`. Where neither holds, the operator refuses to write the agent
+  Deployment and reports `RuntimeClassNotFound` on the PlatformAgent; set the
+  value to `""` to run on the standard container runtime instead. Installs
+  driven by the Terraform composition never see this default — it always renders
+  `runtimeClassName` explicitly, from its own `agent_runtime_class` variable,
+  which `install.sh` writes from `--gvisor`. That variable still defaults to
+  `""`, so a bare `terraform apply` against the composition leaves the agent
+  unsandboxed where a bare `helm install` sandboxes it.
+- `harness.experimental.shellSandbox.runtimeClassName` is the same choice for the
+  shell sandbox pod, and it is a separate key because the two pods are scheduled
+  and sized separately — a node pool that can run one need not be the pool the
+  other lands on. It has no default: unset leaves the sandbox on the node's
+  standard runtime, and `gvisor` needs the same GKE Sandbox node pool the agent's
+  key does.
 - `security.workloadIdentityFederation` needs a Workload Identity pool and
   provider trusting the cluster's OIDC issuer, and one
   `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
@@ -375,6 +408,20 @@ Three knobs need context beyond the chart:
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
+
+### Scoped service accounts
+
+`platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
+may read to the Google service account that reads it. Empty is the default and
+should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
+non-empty list arms the credential broker onto identities that can read
+nothing, and every cluster read fails — a mapped cluster gets a powerless
+token and a `Forbidden` from GKE, an unmapped one is refused by the broker
+before any GKE call. The
+`terraform/examples/full-install` composition fills it in from its
+`scoped_service_accounts` output when `scoped_clusters` is set. See the site's
+[security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
+for what the pool does and does not bound.
 
 ### ServiceAccount ownership
 
