@@ -20,16 +20,17 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
-5. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
+5. [Enabling the Shell Sandbox](#enabling-the-shell-sandbox)
+6. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
    - [Step 2: Create API Key & Access Secrets](#step-2-create-api-key--access-secrets)
    - [Step 3: Build & Push the Operator Image](#step-3-build--push-the-operator-image)
    - [Step 4: Deploy the Operator & CRDs](#step-4-deploy-the-operator--crds)
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
-6. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-7. [Teardown & Cleanup](#teardown--cleanup)
-8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+7. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
+8. [Teardown & Cleanup](#teardown--cleanup)
+9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -334,6 +335,63 @@ If you enabled Google Chat or Slack during the install, perform the following re
   ```bash
   ./scripts/print_instructions_slack.sh
   ```
+
+---
+
+## Enabling the Shell Sandbox
+
+The shell sandbox runs the agent's shell — every command the model writes — in a separate pod that
+holds no credentials, reached over SSH. It is off by default. Turning it on needs one Helm value; the
+SSH keypair it also needs is minted for you by both `install.sh` and the Terraform composition,
+whether or not the sandbox is on, so there is no key ceremony either way.
+
+`gvisor` for `runtimeClassName` puts a user-space kernel under the sandbox pod and needs a GKE
+Sandbox node pool. On Standard clusters `enable_gvisor_node_pool = true` builds one; Autopilot ships
+the `gvisor` RuntimeClass with no pool to manage. Omit the field to run the sandbox on the node's
+standard runtime.
+
+### On a new install
+
+Add this to `terraform.tfvars` before the first apply ([Method 1](#method-1-the-install-engine--terraform--helm), Step 2):
+
+```hcl
+cluster_mode            = "standard" # omit both lines on Autopilot, which
+enable_gvisor_node_pool = true       # provides the gvisor RuntimeClass natively
+
+extra_helm_values = {
+  platformAgent = { harness = { experimental = { shellSandbox = {
+    enabled          = true
+    runtimeClassName = "gvisor"
+  } } } }
+}
+```
+
+`install.sh` (Method 0) has no flag for the sandbox and does not pass `extra_helm_values` through, so
+an install driven by the one-liner cannot turn it on. Use Method 1 for a sandboxed install, or
+install with Method 0 and enable it afterwards as below.
+
+### On an existing install
+
+```bash
+helm upgrade kube-agents ./charts/kube-agents \
+  --namespace kubeagents-system --reuse-values \
+  --set platformAgent.harness.experimental.shellSandbox.enabled=true \
+  --set platformAgent.harness.experimental.shellSandbox.runtimeClassName=gvisor \
+  --wait --timeout 10m
+```
+
+Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system`.
+
+On an install that came from `install.sh`, put the same values in `extra_helm_values` in
+`terraform/examples/full-install/terraform.tfvars` as well. The next `upgrade.sh` or `install.sh`
+re-run regenerates that file from `k8s-operator/scripts/vars.sh`, which does not record this setting,
+and reverts a value set only on the Helm release.
+
+Installing the chart directly with `helm install` and these values does **not** work: the chart cannot
+generate an `authorized_keys`-form public key, so `platform-agent-shell-authorized-keys` renders empty
+and the agent cannot log into the sandbox it just started. Supply the keypair yourself in
+`platformAgent.credentials.data` (`SANDBOX_SSH_PRIVATE_KEY`, `SANDBOX_SSH_PUBLIC_KEY`) or use
+Method 1.
 
 ---
 
