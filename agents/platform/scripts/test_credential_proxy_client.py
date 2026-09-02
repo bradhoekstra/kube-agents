@@ -364,6 +364,63 @@ class WorkspaceClientTest(unittest.TestCase):
         self.assertTrue(entries["gone.yaml"]["delete"])
         self.assertNotIn("contentBase64", entries["gone.yaml"])
 
+    def test_the_branch_lease_follows_the_workspace_across_rounds(self):
+        """Round two must expect what round one pushed, not what `open` saw.
+
+        The broker defaults the expectation, so the client sends nothing; what
+        it owes is the tracked value, which a caller reads to decide whether
+        the branch it is about to write is the one it last saw.
+        """
+        answers = {
+            "open": {
+                "handle": "a" * 32,
+                "repo": "acme/infra",
+                "base": "main",
+                "baseSha": "b" * 40,
+                "branchSha": "e" * 40,
+            },
+            "commit": {
+                "committed": True,
+                "branch": "fix/x",
+                "base": "main",
+                "baseSha": "c" * 40,
+                "branchSha": "e" * 40,
+                "commit": "d" * 40,
+            },
+            "push": {
+                "pushed": True,
+                "branch": "fix/x",
+                "commit": "d" * 40,
+                "branchSha": "d" * 40,
+            },
+            "close": {"closed": True},
+        }
+        with self._serve(answers):
+            with credential_proxy_client.Workspace.open(
+                self.endpoint, "acme/infra", branch="fix/x"
+            ) as workspace:
+                self.assertEqual("e" * 40, workspace.branch_sha)
+                workspace.commit(
+                    branch="fix/x", message="m", changes={"a.yaml": b"kind: X\n"}
+                )
+                self.assertNotIn("expectedBranchSha", self.calls[1][1])
+                workspace.push()
+                self.assertEqual("d" * 40, workspace.branch_sha)
+
+        # A caller that learned the sha elsewhere overrides the broker's default.
+        self.calls.clear()
+        with self._serve(answers):
+            with credential_proxy_client.Workspace.open(
+                self.endpoint, "acme/infra"
+            ) as workspace:
+                workspace.commit(
+                    branch="fix/x",
+                    message="m",
+                    changes={"a.yaml": b"kind: X\n"},
+                    expected_branch_sha="f" * 40,
+                )
+        self.assertEqual("f" * 40, self.calls[1][1]["expectedBranchSha"])
+
     def test_a_disabled_broker_is_distinguishable_from_a_refusal(self):
         """Callers that can do either need to tell "off" from "no"."""
 

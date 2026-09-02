@@ -462,6 +462,16 @@ class Workspace:
     base_sha: str
     branch: str | None = None
     head: str | None = None
+    # The branch this workspace was opened against, and `origin/<branch>` as it
+    # stood when something in this workspace last looked. Separate from `branch`
+    # above, which `push` reads as "a commit exists on this handle" and so must
+    # stay unset until one does. `commit` compares against `branch_sha` for the
+    # same reason it compares against `base_sha`: a maintainer's hand-edit to the
+    # pull request between `open` and `commit` is a change the payload was not
+    # written against, and overwriting it is silent because `--force-with-lease`
+    # compares against the very tip being overwritten.
+    opened_branch: str | None = None
+    branch_sha: str = ""
     # What `read` and `list` are answering from. Reported to the caller because
     # a workspace opened for a second round of review feedback is checked out on
     # the pull request's branch rather than on the base, and a caller that
@@ -721,6 +731,8 @@ class ContentWorkspaceStore:
                         ["checkout", "--force", "-B", branch, f"origin/{branch}"],
                     )
                     workspace.started_from = f"origin/{branch}"
+                    workspace.opened_branch = branch
+                    workspace.branch_sha = self._sha(workspace, f"origin/{branch}")
             except BaseException:
                 _remove_tree(tree)
                 raise
@@ -999,6 +1011,7 @@ class ContentWorkspaceStore:
         message: str,
         changes: Iterable[Change],
         expected_base_sha: str | None = None,
+        expected_branch_sha: str | None = None,
     ) -> dict:
         """Apply the payload on a fresh branch off the base, and commit it."""
         with self._lock:
@@ -1022,10 +1035,34 @@ class ContentWorkspaceStore:
             self._git(workspace, ["fetch", "--quiet", "--prune", "origin"])
             current_base_sha = self._sha(workspace, f"origin/{workspace.base}")
             if expected_base_sha and expected_base_sha != current_base_sha:
-                self._raise_if_base_moved_under_us(
-                    workspace, expected_base_sha, current_base_sha, changes
+                self._raise_if_moved_under_us(
+                    workspace, "base", expected_base_sha, current_base_sha, changes
                 )
             workspace.base_sha = current_base_sha
+
+            # The same question about the branch, which the base check does not
+            # answer. Starting from `origin/<branch>` below keeps a maintainer's
+            # commit in the history; it does not keep their edit to a file this
+            # payload also writes, and nothing downstream objects — the push is
+            # a fast-forward, so `--force-with-lease` has nothing to refuse.
+            #
+            # The expectation defaults to what this workspace last saw rather
+            # than requiring the caller to carry it, because the broker owns the
+            # clone and the caller has no other way to learn the sha. A caller
+            # that read the branch elsewhere can override it.
+            branch_exists = self._remote_branch_exists(workspace, branch)
+            current_branch_sha = (
+                self._sha(workspace, f"origin/{branch}") if branch_exists else ""
+            )
+            expected = expected_branch_sha
+            if not expected and workspace.opened_branch == branch:
+                expected = workspace.branch_sha
+            if expected and current_branch_sha and expected != current_branch_sha:
+                self._raise_if_moved_under_us(
+                    workspace, "'" + branch + "'", expected, current_branch_sha, changes
+                )
+            workspace.opened_branch = branch
+            workspace.branch_sha = current_branch_sha
 
             # Continue the branch when the remote already has it; only cut a new
             # one from the base when it does not. Always starting from the base
@@ -1035,11 +1072,7 @@ class ContentWorkspaceStore:
             # object because the fetch above moved the very ref it compares
             # against. Resolved here rather than reused from `open`, because that
             # fetch may have brought the branch into existence since.
-            start = (
-                f"origin/{branch}"
-                if self._remote_branch_exists(workspace, branch)
-                else f"origin/{workspace.base}"
-            )
+            start = f"origin/{branch}" if branch_exists else f"origin/{workspace.base}"
             self._git(workspace, ["checkout", "--force", "-B", branch, start])
             # The tree is the broker's, so a leftover file from an earlier commit on
             # this handle is debris rather than someone's unsaved work. `-x` as well,
@@ -1065,7 +1098,12 @@ class ContentWorkspaceStore:
             staged = self._git(workspace, ["diff", "--cached", "--quiet"], check=False)
             code = getattr(staged, "exit_code", 1)
             if code == 0:
-                return {"committed": False, "branch": branch, "base": workspace.base}
+                return {
+                    "committed": False,
+                    "branch": branch,
+                    "base": workspace.base,
+                    "branchSha": workspace.branch_sha,
+                }
             if code != 1:
                 # Anything other than 0 or 1 means the index could not be read, and
                 # "no difference" is then a guess. `audit_report` learned this the
@@ -1083,21 +1121,30 @@ class ContentWorkspaceStore:
                 "branch": branch,
                 "base": workspace.base,
                 "baseSha": workspace.base_sha,
+                # What the commit was built on, not what it produced: this is
+                # the value a later `commit` on the same branch has to expect,
+                # and until the push lands the remote is still holding it.
+                "branchSha": workspace.branch_sha,
                 "commit": workspace.head,
             }
 
-    def _raise_if_base_moved_under_us(
+    def _raise_if_moved_under_us(
         self,
         workspace: Workspace,
+        label: str,
         expected: str,
         current: str,
         changes: list[Change],
     ) -> None:
-        """A moved base is only a conflict if it touched a path we are writing.
+        """A moved ref is only a conflict if it touched a path we are writing.
 
         Refusing every commit whose base advanced would mean a ten-minute audit
         fails behind any unrelated merge, which is most of them. Refusing only
-        when the same file moved is the answer a human reviewer would give.
+        when the same file moved is the answer a human reviewer would give. The
+        working branch gets the same treatment, so a maintainer pushing a
+        typo fix to an untouched file does not cost the agent its round.
+
+        `label` names the ref in the message — "base", or the branch in quotes.
         """
         touched = [str(change.path) for change in changes]
         diff = self._git(
@@ -1111,13 +1158,13 @@ class ContentWorkspaceStore:
             # any reading, and guessing otherwise would overwrite whatever
             # happened.
             raise Conflict(
-                f"the base branch moved from {expected} to {current} and the two "
+                f"the {label} branch moved from {expected} to {current} and the two "
                 "could not be compared; re-read the files and submit again",
             )
         collided = [line for line in self._out(diff).splitlines() if line.strip()]
         if collided:
             raise Conflict(
-                f"the base branch moved from {expected} to {current} and it "
+                f"the {label} branch moved from {expected} to {current} and it "
                 f"changed {len(collided)} file(s) this commit also writes: "
                 f"{', '.join(collided[:10])}. Re-read them and submit again."
             )
@@ -1152,7 +1199,16 @@ class ContentWorkspaceStore:
                 raise GitFailed(
                     f"push failed: {self._redact(getattr(result, 'stderr', ''))}"
                 )
-            return {"pushed": True, "branch": branch, "commit": workspace.head}
+            # The remote is now at what we pushed, so that is what the next
+            # `commit` on this handle must expect. Left at the pre-push value it
+            # would refuse the second round against our own work.
+            workspace.branch_sha = workspace.head or ""
+            return {
+                "pushed": True,
+                "branch": branch,
+                "commit": workspace.head,
+                "branchSha": workspace.branch_sha,
+            }
 
 
 def is_owner_name(value: str) -> bool:

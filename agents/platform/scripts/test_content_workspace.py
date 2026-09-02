@@ -1098,6 +1098,59 @@ class RealGitTest(unittest.TestCase):
         )
         self.assertTrue(result["committed"])
 
+    def test_a_working_branch_that_moved_under_the_same_file_is_a_conflict(self):
+        """The base check does not answer this one.
+
+        A second round of review starts from `origin/<branch>`, so a
+        maintainer's commit stays in the history -- but their edit to a file
+        this payload also writes is overwritten, and `--force-with-lease`
+        cannot object because it compares against the tip being overwritten.
+        """
+        branch = "platform-agent/change"
+        seed = self.base / "seed"
+        real_git_runner(["git", "checkout", "-b", branch], seed)
+        (seed / "manifests" / "proposal.yaml").write_text("kind: Deployment\n")
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "ours, round one"], seed)
+        real_git_runner(["git", "push", "origin", branch], seed)
+
+        # What `open` records when it checks the branch out.
+        real_git_runner(["git", "fetch", "--prune", "origin"], self.tree)
+        self.workspace.opened_branch = branch
+        self.workspace.branch_sha = real_git_runner(
+            ["git", "rev-parse", "--verify", f"origin/{branch}"], self.tree
+        ).stdout.strip()
+
+        # A maintainer hand-edits the proposal on the pull request.
+        (seed / "manifests" / "proposal.yaml").write_text("kind: Deployment  # theirs\n")
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "theirs"], seed)
+        real_git_runner(["git", "push", "origin", branch], seed)
+
+        with self.assertRaises(Conflict) as caught:
+            self.commit(
+                [Change(repo_relative("manifests/proposal.yaml"), b"kind: Deployment  # ours\n")]
+            )
+        self.assertIn("proposal.yaml", str(caught.exception))
+        self.assertIn(branch, str(caught.exception))
+
+        # Paired ordinary use: the branch moving under a file this commit does
+        # not write costs the agent nothing, and the maintainer's commit is
+        # still there afterwards.
+        result = self.commit(
+            [Change(repo_relative("manifests/another.yaml"), b"kind: Service\n")]
+        )
+        self.assertTrue(result["committed"])
+        self.assertEqual(
+            "kind: Deployment  # theirs\n",
+            real_git_runner(
+                ["git", "show", "HEAD:manifests/proposal.yaml"], self.tree
+            ).stdout,
+        )
+        # And the workspace now leases what it just saw, so the next round
+        # compares against the right sha rather than the sha `open` recorded.
+        self.assertEqual(result["branchSha"], self.workspace.branch_sha)
+
     def test_a_read_returns_content_and_a_list_never_shows_the_git_directory(self):
         self.assertEqual(
             b"kind: ConfigMap\n",

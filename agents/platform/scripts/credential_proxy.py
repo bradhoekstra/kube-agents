@@ -3107,6 +3107,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "repo": workspace.repo,
                 "base": workspace.base,
                 "baseSha": workspace.base_sha,
+                "branchSha": workspace.branch_sha,
                 "startedFrom": workspace.started_from,
                 "shallow": workspace.shallow,
             }
@@ -3144,6 +3145,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 payload.get("message"),
                 changes,
                 expected_base_sha=payload.get("expectedBaseSha") or None,
+                expected_branch_sha=payload.get("expectedBranchSha") or None,
             )
         if route == "push":
             return store.push(payload.get("handle"), payload.get("branch"))

@@ -3265,6 +3265,42 @@ class WorkspaceRouteTest(unittest.TestCase):
                     ).method_calls,
                 )
 
+    def test_the_branch_expectation_reaches_the_store(self):
+        # Dropped here, the lease on the working branch is silently absent and
+        # a maintainer's edit to the pull request is overwritten -- with
+        # `--force-with-lease` unable to object, because it compares against
+        # the tip being overwritten.
+        store = self._route(
+            "commit",
+            {
+                "handle": "h",
+                "branch": "fix/x",
+                "message": "m",
+                "changes": [{"path": "a.yaml", "delete": True}],
+                "expectedBaseSha": "b" * 40,
+                "expectedBranchSha": "e" * 40,
+            },
+        )
+        call = store.method_calls[0]
+        self.assertEqual("commit", call[0])
+        self.assertEqual(("h", "fix/x", "m"), call.args[:3])
+        self.assertEqual(
+            {"expected_base_sha": "b" * 40, "expected_branch_sha": "e" * 40},
+            dict(call.kwargs),
+        )
+        # Absent means absent, not the empty string: the broker's own default
+        # is what fills it in, and "" would read as "no expectation".
+        store = self._route(
+            "commit",
+            {
+                "handle": "h",
+                "branch": "fix/x",
+                "message": "m",
+                "changes": [{"path": "a.yaml", "delete": True}],
+            },
+        )
+        self.assertIsNone(store.method_calls[0].kwargs["expected_branch_sha"])
+
     def test_the_paging_and_search_arguments_reach_the_store(self):
         # Dropping `after` here would page forever on the first page, and
         # dropping `regex` would run a regex search as a fixed string and

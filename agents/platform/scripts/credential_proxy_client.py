@@ -521,6 +521,7 @@ class Workspace:
         self.repo = opened["repo"]
         self.base = opened["base"]
         self.base_sha = opened["baseSha"]
+        self.branch_sha = opened.get("branchSha", "")
         self.started_from = opened.get("startedFrom", "")
         self.shallow = bool(opened.get("shallow", False))
         self.branch: str | None = None
@@ -626,6 +627,7 @@ class Workspace:
         message: str,
         changes: dict[str, bytes | None],
         expected_base_sha: str | None = None,
+        expected_branch_sha: str | None = None,
     ) -> dict:
         """`changes` maps a repository-relative path to bytes, or to None to delete.
 
@@ -633,6 +635,11 @@ class Workspace:
         refuse with 409 when the base branch has moved under a file this commit
         also writes. Leaving it out means last-writer-wins against whatever
         landed in the meantime.
+
+        The working branch is checked the same way and needs no argument: the
+        broker compares against the sha it last saw for that branch, which is
+        the only place the value exists. `expected_branch_sha` overrides it for
+        a caller that learned the sha somewhere else.
         """
         entries = []
         for path, content in changes.items():
@@ -653,6 +660,8 @@ class Workspace:
         }
         if expected_base_sha:
             payload["expectedBaseSha"] = expected_base_sha
+        if expected_branch_sha:
+            payload["expectedBranchSha"] = expected_branch_sha
         result = _workspace_call(self.endpoint, "commit", payload)
         self.branch = result["branch"]
         # `committed: false` is an ordinary answer rather than an error -- a
@@ -662,15 +671,20 @@ class Workspace:
         # KeyError several frames from the decision that produced it.
         if result.get("baseSha"):
             self.base_sha = result["baseSha"]
+        if result.get("branchSha") is not None:
+            self.branch_sha = result["branchSha"]
         return result
 
     def push(self, branch: str | None = None) -> dict:
         branch = branch or self.branch
         if not branch:
             raise ValueError("nothing has been committed on this workspace yet")
-        return _workspace_call(
+        result = _workspace_call(
             self.endpoint, "push", {"handle": self.handle, "branch": branch}
         )
+        if result.get("branchSha"):
+            self.branch_sha = result["branchSha"]
+        return result
 
     def close(self) -> None:
         if self._closed:
