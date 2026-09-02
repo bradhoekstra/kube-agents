@@ -323,33 +323,37 @@ def handle_submit_content(args) -> int:
     repo = args.repo or gitops_workspace.resolve_repo()
     refresh_git_credentials(repo)
 
-    workspace = open_handle(args)
-    log(f"Sending {len(changes)} file(s) to the broker for branch '{branch}'...")
-    result = workspace.commit(
-        branch=branch,
-        message=args.title,
-        changes=changes,
-        expected_base_sha=args.base_sha or None,
-    )
-    if not result["committed"]:
-        # A submission whose files already match the branch. Refused rather
-        # than reported as success: the caller asked for a pull request, and
-        # answering "done" for a branch that may not have one is the wrong
-        # half of the ambiguity to guess at.
-        raise ValueError(
-            f"the files in {args.source} are already what '{branch}' holds, so "
-            "there is nothing to commit; check whether the pull request is "
-            "already open before submitting again"
+    # `with`, so the broker's clone is released on the failure paths too. A
+    # commit refused as a duplicate, a push that lost the lease, `gh` exiting
+    # non-zero -- each used to leave a checkout and its handle on the broker
+    # with nothing left that could name them, and the sidecar's disk is not
+    # something a retry loop should be able to fill.
+    with open_handle(args) as workspace:
+        log(f"Sending {len(changes)} file(s) to the broker for branch '{branch}'...")
+        result = workspace.commit(
+            branch=branch,
+            message=args.title,
+            changes=changes,
+            expected_base_sha=args.base_sha or None,
         )
-    log(f"Committed {result['commit'][:12]} on '{branch}'; pushing...")
-    workspace.push(branch)
+        if not result["committed"]:
+            # A submission whose files already match the branch. Refused rather
+            # than reported as success: the caller asked for a pull request, and
+            # answering "done" for a branch that may not have one is the wrong
+            # half of the ambiguity to guess at.
+            raise ValueError(
+                f"the files in {args.source} are already what '{branch}' holds, so "
+                "there is nothing to commit; check whether the pull request is "
+                "already open before submitting again"
+            )
+        log(f"Committed {result['commit'][:12]} on '{branch}'; pushing...")
+        workspace.push(branch)
 
-    pr_url = create_pull_request(
-        branch, args.title, args.body, None, repo, result["base"]
-    )
+        pr_url = create_pull_request(
+            branch, args.title, args.body, None, repo, result["base"]
+        )
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
     print(pr_url)
-    workspace.close()
     return 0
 
 

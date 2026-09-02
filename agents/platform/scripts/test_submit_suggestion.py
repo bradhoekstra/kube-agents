@@ -876,6 +876,25 @@ class TestContentMode(SubmitSuggestionTestCase):
         )
         self.assertEqual(self.gh_calls, [])
 
+    def test_a_failed_submit_still_releases_the_brokers_clone(self):
+        """The sidecar's disk is not something a retry loop may fill.
+
+        Every failure between `open` and the pull request used to leave a
+        checkout and a handle on the broker with nothing left that could name
+        them -- and the card that failed is the one an operator retries.
+        """
+        prepared = self.prepare_content()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        self.submit_content(prepared, source)
+        self.verbs.clear()
+
+        # The same bytes again: refused as a duplicate, mid-session.
+        again = self.prepare_content()
+        with self.assertRaises(ValueError):
+            self.submit_content(again, source)
+        self.assertIn("close", self.verbs)
+        self.assertEqual({}, self.store._workspaces)
+
     def test_a_second_round_of_review_feedback_keeps_the_first_round(self):
         """The data loss directory mode already shipped once, in the new path.
 
