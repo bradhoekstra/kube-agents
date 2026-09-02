@@ -257,6 +257,14 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 			why: "CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all address it (credentialProxyBaseURL)",
 		},
 		{
+			name: "the shell sandbox's sshd", ns: agent.Namespace,
+			labels: shellSandboxSelector(agent), port: shellSandboxPort,
+			why: "every command the model runs executes in the sandbox Pod, and this policy can be the " +
+				"only one rendered — networkPolicy.enabled: false with egressPolicy: Allowlist deletes " +
+				"the gateway policy that carries the matching rule, leaving an agent that reads Ready " +
+				"and cannot run anything",
+		},
+		{
 			name: "litellm on the port this repository's deployments listen on", ns: agent.Namespace,
 			labels: map[string]string{"app": "litellm"}, port: 8080,
 			why: "buildAgentConfig pins model base_url to http://litellm.<ns>.svc.cluster.local/v1 unconditionally, " +
@@ -273,7 +281,7 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 		{
 			name: "the Hindsight memory API", ns: agent.Namespace,
 			labels: map[string]string{"app.kubernetes.io/name": "hindsight", "app.kubernetes.io/component": "api"},
-			port:  8888,
+			port:   8888,
 			why: "buildPodEnv sets HINDSIGHT_API_URL on every agent container, and the install this rule " +
 				"saves is the one that enforces the policy — the same lesson buildNetworkPolicy's rule 10 " +
 				"records",

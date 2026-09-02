@@ -2874,8 +2874,8 @@ func buildAgentAPIAuthEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 		// itself runs --in-cluster and does not read it.
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-		{Name: "AGENT_API_UPSTREAM_KEY", Value: "cluster-internal-trusted"},
-		{Name: "API_SERVER_KEY", Value: "cluster-internal-trusted"},
+		{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
+		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 		// The key external callers present to the Service's api port. The
 		// authenticator compares against it and swaps in the loopback sentinel
 		// above before forwarding, so the gateway's own key never leaves this pod.

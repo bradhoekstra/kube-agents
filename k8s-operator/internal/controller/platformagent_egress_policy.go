@@ -268,6 +268,22 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 		},
 	})
 
+	// The shell sandbox's sshd. Every command the model runs executes there, so
+	// this rule is the difference between an agent that can act and one whose
+	// every tool call times out. It duplicates rule 11 of buildNetworkPolicy
+	// because the two policies are rendered independently and either can be the
+	// only one present: spec.networkPolicy.enabled: false with
+	// spec.security.egressPolicy: Allowlist deletes the gateway policy and leaves
+	// this one standing alone. That combination is also the one that fails
+	// silently — the CR reads Ready, the sandbox Pod is Running, and the ssh dial
+	// just never completes.
+	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(shellSandboxPort)},
+		To: []networkingv1.NetworkPolicyPeer{
+			namespacedPodPeer(agent.Namespace, shellSandboxSelector(agent)),
+		},
+	})
+
 	// The model gateway. buildAgentConfig pins the agent's model base_url to
 	// http://litellm.<namespace>.svc.cluster.local/v1 unconditionally, so the
 	// agent cannot think for a living without this rule. The port set matches
