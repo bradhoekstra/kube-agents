@@ -113,8 +113,9 @@ default install runs on. `spec.security.splitCredentialBrokerPod` moves the
 broker into a Pod of its own, and `spec.security.egressPolicy: Allowlist` then
 renders a default-deny egress NetworkPolicy on the agent Pod that leaves the
 metadata server's credential API off its allowlist — the address itself is
-permitted on port 53, where under Cloud DNS for GKE it is the Pod's resolver. Both default to false, and the second is
-refused outright without the first. Neither closes the path yet. Adding a
+permitted on port 53, where under Cloud DNS for GKE it is the Pod's resolver.
+Both default to false, and the second is refused outright without the first.
+Neither closes the path yet. Adding a
 NetworkPolicy is monotone — policies selecting one Pod are unioned and the API
 has no deny rule — and the agent Pod is already selected for egress by the
 `<agent>-gateway-netpol` this same operator renders (unless

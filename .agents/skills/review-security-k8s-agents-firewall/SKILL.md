@@ -8,7 +8,7 @@ Review network policies and firewall configs for AI agent control loops and exec
 # Checks
 ## 1. Egress Restrictions
 - **Sandbox Network**: Enforce default-deny egress. Allowlist absolute minimum required IPs/services.
-- **Internal APIs**: Block agent/sandbox access to internal cluster APIs, K8s services, and cloud metadata (e.g., `169.254.169.254`).
+- **Internal APIs**: Block agent/sandbox access to internal cluster APIs, K8s services, and cloud metadata (e.g., `169.254.169.254`) — on the credential ports (TCP `80` pre-NAT, `988` post-NAT), not on port `53`, which is the Pod's resolver under Cloud DNS for GKE and reaches no token.
 - **Exfiltration Vectors**: Flag broad egress (e.g., `0.0.0.0/0`) on agent pods.
 
 ## 2. Ingress & Invocation

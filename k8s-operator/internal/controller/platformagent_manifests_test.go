@@ -1597,8 +1597,6 @@ func TestKustomizeNetworkPolicies_PodSelectorMatchesCommonLabels(t *testing.T) {
 // textually comparable across a Go literal and a YAML document, and pinning
 // those would make the test fail on cosmetic edits rather than on drift.
 func TestKustomizeCoreEgressDNSPeersMatchTheOperator(t *testing.T) {
-	const dnsPort = 53
-
 	path := filepath.Join("..", "..", "..", "deploy", "kustomize", "platform", "networkpolicy-core-egress.yaml")
 	data, err := os.ReadFile(path)
 	if err != nil {

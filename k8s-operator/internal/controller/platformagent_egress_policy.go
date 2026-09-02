@@ -268,8 +268,11 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// pre-NAT and :988 post-NAT. No rule below permits this address on either —
 	// the only rule naming 80 is LiteLLM's, whose peer is a Pod selector that no
 	// link-local address matches, and extraRules refuses a metadata address
-	// outright on every port. Nor is this a new exfiltration channel, because
-	// the kube-dns peers above already resolve arbitrary external names.
+	// outright on every port. Nor is it a new exfiltration channel wherever
+	// CoreDNS forwards externally, as the stock configuration does: the kube-dns
+	// peers above already resolve arbitrary external names. The exception is a
+	// cluster that has removed that forwarding, where this peer does hand the
+	// sandbox a recursive resolver CoreDNS was withholding.
 	//
 	// So the invariant this policy holds is that no rule permits a metadata
 	// address on a *credential* port, and it is machine-checked at that scope by
@@ -297,9 +300,14 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	if len(dnsIPPeers) == 0 {
 		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
 	}
+	// formatCIDRPeers dedupes within one call, not against the fixed peers above.
+	// The metadata address cannot collide, having been filtered out already, but
+	// nodeLocalDNSCacheIP can: a cluster running NodeLocal DNSCache puts
+	// 169.254.20.10 in kubelet's --cluster-dns, so an operator naming the value
+	// their nodes use lands on the peer this rule already carries.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{udpPort(53), tcpPort(53)},
-		To:    append(dnsPeers, dnsIPPeers...),
+		To:    append(dnsPeers, peersNotAlreadyPresent(dnsPeers, dnsIPPeers)...),
 	})
 
 	// The credential broker. This is the agent's route to every credentialed

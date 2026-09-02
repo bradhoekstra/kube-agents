@@ -281,6 +281,10 @@ func TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree(t *testing.T) {
 		return &value
 	}
 	endPort := func(number int32) *int32 { return &number }
+	namedPort := func(name string) *intstr.IntOrString {
+		value := intstr.FromString(name)
+		return &value
+	}
 
 	for _, testCase := range []struct {
 		name  string
@@ -292,7 +296,8 @@ func TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree(t *testing.T) {
 		{"no ports permits everything", nil, false},
 		{"53 alongside the pre-NAT token port", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}, {Port: port(80)}}, false},
 		{"a range starting at 53 reaches the post-NAT token port", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort), EndPort: endPort(988)}}, false},
-		{"a named port cannot be read as 53", []networkingv1.NetworkPolicyPort{{Port: nil}}, false},
+		{"an entry with no port at all permits everything on its protocol", []networkingv1.NetworkPolicyPort{{Port: nil}}, false},
+		{"a named port is not 53, whatever it resolves to", []networkingv1.NetworkPolicyPort{{Port: namedPort("dns")}}, false},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			got := ruleIsDNSOnly(networkingv1.NetworkPolicyEgressRule{Ports: testCase.ports})
@@ -1575,6 +1580,32 @@ func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
 	if !permits(rendered, "34.118.230.7") {
 		t.Error("spec.networkPolicy.dnsClusterIPs reached the gateway policy but not the egress policy; " +
 			"the override must apply to both policies over the same Pod")
+	}
+}
+
+// TestTheDNSRuleDoesNotRepeatAPeerItAlreadyCarries guards the same duplication
+// the gateway policy's DNS rule guards against, on the builder next door. The
+// fixed peers here include nodeLocalDNSCacheIP, and a cluster running NodeLocal
+// DNSCache puts that address in kubelet's --cluster-dns, so an operator naming
+// the value their nodes use arrives at a peer the rule already has.
+func TestTheDNSRuleDoesNotRepeatAPeerItAlreadyCarries(t *testing.T) {
+	bareNodeLocalIP := strings.TrimSuffix(nodeLocalDNSCacheIP, "/32")
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{bareNodeLocalIP})
+
+	occurrences := 0
+	for _, rule := range policy.Spec.Egress {
+		if !ruleIsDNSOnly(rule) {
+			continue
+		}
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == nodeLocalDNSCacheIP {
+				occurrences++
+			}
+		}
+	}
+	if occurrences != 1 {
+		t.Errorf("the DNS rule names %s %d times, want 1; a duplicate ipBlock is no wider but leaves a "+
+			"reader of an auditable policy guessing which peer is doing the work", nodeLocalDNSCacheIP, occurrences)
 	}
 }
 

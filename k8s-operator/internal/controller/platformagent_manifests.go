@@ -4251,13 +4251,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// fetches; these two are the whole of the metadata server's reach from this
 	// Pod, and they are separate rules so that neither widens the other.
 	//
-	// Built separately from linkLocalPeers above rather than reusing that slice,
-	// and the difference is the point: this peer set is IPv4-only. fd20:ce::254
-	// is documented as a metadata endpoint rather than as a resolver, and no
-	// static copy in charts/ or deploy/kustomize names it in a DNS rule, so it
-	// stays out until a dual-stack Cloud DNS cluster is observed naming it in a
-	// Pod's resolv.conf. Reusing linkLocalPeers would pull it in silently the day
-	// that slice grows an IPv6 entry.
+	// This evaluates to the same peer as linkLocalPeers above, and is written out
+	// again rather than reusing that slice so the two can diverge. The DNS grant
+	// is IPv4-only on purpose: fd20:ce::254 is documented as a metadata endpoint
+	// rather than as a resolver, and no static copy in charts/ or
+	// deploy/kustomize names it in a DNS rule, so it stays out until a dual-stack
+	// Cloud DNS cluster is observed naming it in a Pod's resolv.conf. Reusing
+	// linkLocalPeers would grant it here the day that slice grows an IPv6 entry,
+	// which is a decision about the token rules and not about this one.
 	dnsPeers = append(dnsPeers, formatCIDRPeers([]string{metadataLinkLocalIP}, true)...)
 
 	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
@@ -4277,8 +4278,8 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// names the address this rule already grants. Without this filter that
 	// renders the same ipBlock twice — legal, and no wider, but a policy sold as
 	// auditable should not make a reader wonder which of the two is doing the
-	// work. buildAgentEgressNetworkPolicy drops the same input for its own
-	// reasons; both end up granting the resolver exactly once.
+	// work. buildAgentEgressNetworkPolicy calls the same helper on its own DNS
+	// rule, which is built from a different peer list.
 	dnsPeers = append(dnsPeers, peersNotAlreadyPresent(dnsPeers, dnsIPPeers)...)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
