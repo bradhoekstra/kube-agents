@@ -148,7 +148,9 @@ Against the credential requirements this mechanism is short-lived, audience-boun
 
 ## Denying the sandbox the metadata server
 
-`spec.security.egressPolicy: Allowlist` renders one NetworkPolicy on the agent Pod: default-deny egress, with rules for DNS, the credential broker, LiteLLM, the managed OpenTelemetry collector, and whatever `spec.security.egressAllowlist` adds. The metadata server is denied by not appearing on that list.
+`spec.security.egressPolicy: Allowlist` renders one NetworkPolicy on the agent Pod: default-deny egress, with rules for DNS, the credential broker, LiteLLM, the managed OpenTelemetry collector, and whatever `spec.security.egressAllowlist` adds. The metadata server's credential API is denied by not appearing on that list.
+
+The DNS rule is the one place a metadata address does appear, on port 53 alone. On a cluster using [Cloud DNS for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns) the node answers DNS at `169.254.169.254:53` and every Pod's `resolv.conf` names it, so withholding it is not a narrower credential path — it is no name resolution, and every destination in this allowlist is reached by name. The token is minted over TCP 80 pre-NAT and 988 post-NAT, neither of which the policy permits anywhere.
 
 ### This blocks nothing today
 
@@ -158,7 +160,7 @@ That holds wherever another policy still permits the wider egress, which is ever
 
 What `<name>-gateway-netpol` already permits, and this therefore cannot remove:
 
-- `169.254.169.254/32` on TCP 80, plus the discovered metadata-daemon port (`988` by default) to both link-local metadata addresses — the pre- and post-DNAT forms of a metadata request. The metadata path stays open.
+- `169.254.169.254/32` on TCP 80, plus the discovered metadata-daemon port (`988` by default) to both link-local metadata addresses — the pre- and post-DNAT forms of a metadata request. The metadata path stays open. (It also permits the same address on port 53, as this policy does, for the Cloud DNS reason above; that one is not part of the metadata path.)
 - TCP 443 to `0.0.0.0/0` minus the private ranges, unless FQDNNetworkPolicy is enabled. Every HTTPS destination on the public internet stays open, and with it the exfiltration half of what this is meant to be.
 
 `platform-agent-core-egress` from [`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) permits the same metadata path and selects the agent Pod by `app.kubernetes.io/name`. Kustomize installs have it; Helm installs do not. It changes nothing either way — the gateway policy alone settles the point.
@@ -237,7 +239,7 @@ The obvious shape — one broad rule with the metadata address in an `except` cl
 - **On GKE Dataplane V2 it is a near-total outage, not a permissive rule.** Google's documentation states that Pod traffic is never covered by an `ipBlock` rule, so a policy whose only peer is `0.0.0.0/0` permits no Pod-to-Pod traffic at all — not kube-dns, not LiteLLM, not the broker.
 - **On an iptables dataplane the `except` clause names an address the policy never sees.** A request to `169.254.169.254:80` is translated to the node-local metadata server at `169.254.169.252:988` in NAT PREROUTING, before the filter rules run. This is [kubernetes/kubernetes#68078](https://github.com/kubernetes/kubernetes/issues/68078), open since 2018 and titled "Network policy not properly blocking GKE metadata IP".
 
-Default-deny sidesteps both: it names Pods with selectors rather than CIDRs, and it does not have to predict which address the request was rewritten to, because neither address is permitted. For the same reason all three metadata addresses — `169.254.169.254`, `169.254.169.252` and the IPv6 `fd20:ce::254` — are refused in `extraRules`.
+Default-deny sidesteps both: it names Pods with selectors rather than CIDRs, and it does not have to predict which address the request was rewritten to, because no rule permits either address on a port the token can be minted over. For the same reason all three metadata addresses — `169.254.169.254`, `169.254.169.252` and the IPv6 `fd20:ce::254` — are refused in `extraRules`, on every port. The DNS rule's port-53 grant to `169.254.169.254` is the operator's alone; you cannot widen it from the spec.
 
 It is also why this is one policy object and not two. There is no deny rule in NetworkPolicy, so a separate "everything except metadata" policy would not subtract the metadata server from an allowlist. It would add the internet to it.
 

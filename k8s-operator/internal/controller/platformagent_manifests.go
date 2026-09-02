@@ -4203,6 +4203,28 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		},
 	}
 
+	// Cloud DNS for GKE. There the cluster does not resolve through kube-dns at
+	// all: the node answers DNS on the metadata address, and a Pod's resolv.conf
+	// names 169.254.169.254. So none of the peers above is the resolver, and
+	// without this one the Pod has no name resolution — which is a total outage,
+	// because every destination in the rules below is reached by name.
+	//
+	// Discovery cannot substitute for it. resolveNetpolProfile reads the
+	// kube-system/kube-dns Service ClusterIP, and under Cloud DNS that Service
+	// still exists and still answers nothing, so discovery succeeds and is wrong.
+	// That is the failure this rule is unconditional to avoid: a peer that is
+	// inert on a kube-dns cluster, where nothing listens on 53 at this address,
+	// costs nothing, while getting the detection wrong costs the install.
+	//
+	// Port 53 only. Rule 2 below grants the same address on TCP 80 for token
+	// fetches; these two are the whole of the metadata server's reach from this
+	// Pod, and they are separate rules so that neither widens the other.
+	//
+	// The IPv6 metadata address (fd20:ce::254) is deliberately absent: it is
+	// documented as a metadata endpoint, not as a resolver, and the static
+	// copies in charts/ and deploy/kustomize name only the IPv4 address here.
+	dnsPeers = append(dnsPeers, formatCIDRPeers([]string{metadataLinkLocalIP}, true)...)
+
 	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
 	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
 	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the

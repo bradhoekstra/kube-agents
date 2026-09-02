@@ -980,11 +980,20 @@ func TestBuildNetworkPolicy(t *testing.T) {
 		return nil
 	}
 
+	// 5 peers: the kube-dns and node-local-dns selectors, the NodeLocal DNSCache
+	// link-local address, the Cloud DNS resolver at 169.254.169.254, and the one
+	// resolved ClusterIP.
 	ruleDNS := findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.PodSelector != nil && p.PodSelector.MatchLabels["k8s-app"] == "kube-dns"
 	})
-	if ruleDNS == nil || len(ruleDNS.To) != 4 {
-		t.Errorf("expected 4 peers in DNS egress rule")
+	if ruleDNS == nil || len(ruleDNS.To) != 5 {
+		t.Errorf("expected 5 peers in DNS egress rule")
+	}
+	if findEgressRule(53, func(p networkingv1.NetworkPolicyPeer) bool {
+		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
+	}) == nil {
+		t.Error("the DNS rule does not name 169.254.169.254, so a Cloud DNS for GKE cluster " +
+			"cannot resolve and every named destination below becomes unreachable")
 	}
 	ruleMeta80 := findEgressRule(80, func(p networkingv1.NetworkPolicyPeer) bool {
 		return p.IPBlock != nil && p.IPBlock.CIDR == "169.254.169.254/32"
@@ -1482,8 +1491,13 @@ func TestBuildNetworkPolicy_MetadataDaemonPeers(t *testing.T) {
 	// reopens the DirectPath route the sandbox refuses. Asserted here rather than left
 	// to the platform goldens, which are snapshots that `go test -update` re-blesses
 	// from whatever the code emits.
+	//
+	// 53 is on the list and is not a credential port: under Cloud DNS for GKE the node
+	// answers DNS at this address, and the DNS rule names it for that and nothing else.
+	// This assertion is the guard on that — a change that widened the DNS rule to carry
+	// 80, or the port-80 rule to carry 53, fails here rather than in review.
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{80, 988}
+	wantPorts := []int32{53, 80, 988}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
@@ -1511,7 +1525,7 @@ func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
 	}
 
 	gotPorts := egressPortsForCIDR(netpol, metadataLinkLocalIP+"/32")
-	wantPorts := []int32{80, 1988}
+	wantPorts := []int32{53, 80, 1988}
 	if !reflect.DeepEqual(gotPorts, wantPorts) {
 		t.Errorf("expected the metadata server reachable on ports %v, got %v", wantPorts, gotPorts)
 	}
