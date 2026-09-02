@@ -66,7 +66,8 @@ def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
 
     Not for anything crossing into the sandbox. It carries the agent pod's whole
     environment, `API_SERVER_KEY` included; `sandbox_exec.run` takes the handful
-    of variables a remote command needs through `remote_env` instead.
+    of variables a remote command needs through `remote_env` instead — paths and
+    names only, since that route renders them into the sandbox's process table.
     """
     return {**os.environ, "HOME": "/tmp", "HERMES_HOME": str(HERMES_HOME), **(extra or {})}
 

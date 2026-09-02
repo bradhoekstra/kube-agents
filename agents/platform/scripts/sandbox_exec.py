@@ -34,6 +34,14 @@ sandbox's `sshd_config` sets `PermitUserEnvironment no` and `AcceptEnv LANG
 LC_*`, but that is the remote end declining what this end should not offer.
 Variables the remote command genuinely needs go through `remote_env`, which
 renders them into the command line rather than into the client's environment.
+
+`remote_env` is therefore for paths and names, never for secrets. A command
+line is the process's `/proc/<pid>/cmdline`, which every account in the sandbox
+can read — the model's own shell included, and it is the party this boundary
+exists to keep away from the agent pod's credentials. The two callers pass
+`KUBECONFIG`, a path to a file the sandbox already has. A caller with a secret
+to hand across has no route here and should not invent one: the credential
+proxy holds credentials so that the sandbox never does.
 """
 
 from __future__ import annotations
@@ -80,6 +88,16 @@ MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/
 # and this one is in the sandbox. They are the same string today only because
 # deploy/sandbox/Dockerfile creates /opt/data in the sandbox on purpose.
 DEFAULT_SANDBOX_CWD = "/opt/data"
+
+# This pod's own home, when HERMES_HOME is unset — the data volume the agent
+# container keeps its state on. The same string as DEFAULT_SANDBOX_CWD and a
+# separate constant on purpose: that one names a directory on the far side of
+# the connection, this one names a directory on this side.
+_DEFAULT_HERMES_HOME = "/opt/data"
+
+# Where the host key the sandbox presents is remembered, relative to that home.
+_KNOWN_HOSTS_DIR = ".ssh"
+_KNOWN_HOSTS_NAME = "known_hosts"
 
 # ssh reserves 255 for its own failures, and a remote command is free to exit
 # 255 as well. The two are told apart by what ssh says on stderr when it is the
@@ -194,6 +212,33 @@ def _control_path_dir() -> str:
     return directory
 
 
+def _known_hosts_file() -> str:
+    """The host-key store, and the directory it has to exist in.
+
+    `StrictHostKeyChecking=accept-new` writes the sandbox's key here the first
+    time and refuses a changed one after that. Nothing creates
+    `$HERMES_HOME/.ssh`, and with no directory to write into ssh prints
+    "Failed to add the host to the list of known hosts" and connects anyway:
+    every connection is then a first connection, and the option that reads
+    like host-key pinning pins nothing. The warning goes to stderr, which
+    `run()` returns to a caller reading it as the command's own output.
+
+    Falls back to the control-socket directory, which is in TMPDIR and so
+    remembers the key for the life of the pod rather than the life of the
+    volume. Less than the volume gives, more than nothing.
+    """
+    home = os.environ.get("HERMES_HOME", _DEFAULT_HERMES_HOME)
+    for directory in (os.path.join(home, _KNOWN_HOSTS_DIR), _control_path_dir()):
+        if not directory:
+            continue
+        try:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        except OSError:
+            continue
+        return os.path.join(directory, _KNOWN_HOSTS_NAME)
+    return ""
+
+
 def _remote_command(argv: list[str], remote_env: dict[str, str] | None, cwd: str | None) -> str:
     """Render argv into one string for the sandbox's login shell to parse.
 
@@ -225,10 +270,11 @@ def ssh_argv(argv: list[str], *, remote_env: dict[str, str] | None = None,
     if not host:
         raise SandboxUnavailable("managed config names no terminal.ssh_host")
 
-    known_hosts = os.path.join(os.environ.get("HERMES_HOME", "/opt/data"), ".ssh", "known_hosts")
     command = ["ssh", *_CONNECT_OPTIONS,
-               "-o", "StrictHostKeyChecking=accept-new",
-               "-o", f"UserKnownHostsFile={known_hosts}"]
+               "-o", "StrictHostKeyChecking=accept-new"]
+    known_hosts = _known_hosts_file()
+    if known_hosts:
+        command += ["-o", f"UserKnownHostsFile={known_hosts}"]
 
     control_dir = _control_path_dir()
     if control_dir:

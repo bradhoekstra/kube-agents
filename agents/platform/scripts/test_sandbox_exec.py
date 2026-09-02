@@ -143,6 +143,32 @@ class ArgvTestCase(unittest.TestCase):
             remote = self.argv(["kubectl"])[-1]
         self.assertTrue(remote.startswith("cd /opt/data && kubectl"))
 
+    def test_the_known_hosts_directory_is_created_not_assumed(self):
+        """Otherwise `accept-new` accepts anew on every connection.
+
+        ssh cannot write the file if its directory is missing. It says so on
+        stderr and connects regardless, so the host key is never remembered
+        and never compared -- the sandbox could be replaced by anything that
+        answers on the same service name and no connection would notice.
+        """
+        with tempfile.TemporaryDirectory() as home:
+            with patch.dict(os.environ, {"HERMES_HOME": home}):
+                argv = self.argv(["kubectl"])
+            expected = Path(home) / ".ssh" / "known_hosts"
+            self.assertIn(f"UserKnownHostsFile={expected}", argv)
+            self.assertTrue(expected.parent.is_dir())
+            self.assertEqual(expected.parent.stat().st_mode & 0o777, 0o700)
+
+    def test_an_unwritable_home_still_remembers_the_key_for_the_pod(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"HERMES_HOME": "/proc/nowhere",
+                                         "TMPDIR": tmp}):
+                argv = self.argv(["kubectl"])
+            option = [a for a in argv if a.startswith("UserKnownHostsFile=")]
+            self.assertEqual(len(option), 1)
+            self.assertTrue(option[0].endswith("/known_hosts"))
+            self.assertTrue(option[0].startswith(f"UserKnownHostsFile={tmp}"))
+
     def test_no_host_is_reported_as_unavailable(self):
         empty = write_config("terminal:\n  backend: ssh\n")
         with self.assertRaises(sandbox_exec.SandboxUnavailable):
