@@ -40,25 +40,25 @@ only renders its kubeconfig bootstrap (the `gcloud container clusters get-creden
 the agent a usable kubectl context) when it has the complete triple; with one missing, every
 `kubectl` the agent runs resolves to `localhost:8080` instead of a cluster.
 
-| Field                                          | Type   | Purpose                                                                                                                                                                                                             |
-| ---------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                |
-| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                |
-| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                            |
-| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                               |
-| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                 |
-| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                            |
-| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the credential-proxy sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
-| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                        |
-| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                            |
-| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                               |
-| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                             |
-| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                  |
-| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                        |
-| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                               |
-| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                    |
-| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                          |
-| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                    |
+| Field                                          | Type   | Purpose                                                                                                                                                                                                                           |
+| ---------------------------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `clusterName`                                  | string | Logical cluster name (e.g. `cluster-a`). Surfaces in observability and chat replies.                                                                                                                                              |
+| `location`                                     | string | Cloud region (e.g. `us-central1-a`).                                                                                                                                                                                              |
+| `projectId`                                    | string | GCP Project ID of the cluster. Required.                                                                                                                                                                                          |
+| `hermes.dashboardEnabled`                      | bool   | Toggle the Hermes dashboard endpoint. Default `true`.                                                                                                                                                                             |
+| `hermes.pluginsDebug`                          | bool   | Enable plugin-level debug logging. Default `false`.                                                                                                                                                                               |
+| `hermes.agentHome`                             | string | Path to the `AGENT_HOME` directory. Default `/opt/data`.                                                                                                                                                                          |
+| `hermes.apiServerSecretRef.name` + `key`       | string | `Secret` holding `API_SERVER_EXTERNAL_KEY`, the credential outside callers present to the gateway pod's `agent-api-auth` sidecar. Not `API_SERVER_KEY` — see [How config reaches each profile](#how-config-reaches-each-profile). |
+| `hermes.sessionKVApiKeySecretRef.name` + `key` | string | `Secret` holding the bearer token for the pod-local Session KV server (`SESSION_KV_API_KEY`). Optional; absent, the server rejects every request with `503`.                                                                      |
+| `hermes.sessionKVSaltSecretRef.name` + `key`   | string | `Secret` holding the HMAC salt used to pseudonymise chat identities (`SESSION_KV_SALT`). Optional; absent, the agent generates a per-pod salt and warns.                                                                          |
+| `memory.memoryEnabled`                         | bool   | Toggle framework memory persistence. Default `false`.                                                                                                                                                                             |
+| `memory.provider`                              | string | Memory provider implementation. Default `multiuser_memory`; `none` for none. See below.                                                                                                                                           |
+| `memory.userProfileEnabled`                    | bool   | Toggle per-user memory profiling. Default `false`.                                                                                                                                                                                |
+| `eventWatcher.enabled`                         | bool   | Start the `k8s-event-watcher`. Default `true`; `false` is the emergency stop for an event storm (see below).                                                                                                                      |
+| `tuning.<persona>.apiMaxRetries`               | int    | Model-call retries before a run gives up. Unset = Hermes default `3`.                                                                                                                                                             |
+| `tuning.<persona>.maxTurns`                    | int    | Iterations allowed in a single turn. Unset = Hermes default `90`, except `platform` (see below).                                                                                                                                  |
+| `tuning.maxInProgress`                         | int    | Board-wide cap on concurrent kanban workers. Unset = operator default `2`.                                                                                                                                                        |
+| `experimental.platformFrontDoor`               | bool   | **Unsupported.** Run the gateway as the Platform Agent, so chat reaches it directly. Default `false`. See below.                                                                                                                  |
 
 `dashboardEnabled` publishes port `9119` on the agent Service, but nothing answers there: `hermes
 dashboard` binds `127.0.0.1`, so a request arriving over the pod network gets connection refused.
@@ -73,7 +73,7 @@ shared with the E2E suite, which reaches the agent API the same way and for the 
 `tcpSocket` probe cannot work here: kubelet dials the pod IP, and nothing is listening on it.
 
 `sessionKVApiKeySecretRef` is optional in the API but not in practice, and the `503` above is the
-milder half of what its absence costs. The `k8s-event-watcher` in the credential sidecar
+milder half of what its absence costs. The `k8s-event-watcher` in the `agent-api-auth` sidecar
 authenticates to that same server, treats an empty `SESSION_KV_API_KEY` as fatal, and exits on every
 start — so no cluster events are watched at all, while the container stays Ready and the CR
 `.status` says nothing. An installation upgraded from before the key existed is the case that lands
@@ -119,9 +119,9 @@ when the provider is Hindsight-backed (`--memory=hindsight`), and nothing when i
 
 ### `spec.harness.eventWatcher`
 
-The `k8s-event-watcher` runs in the credential sidecar, streams warning events from every managed
-cluster, and posts each surviving incident to the pod-local Session KV server, which opens an
-autonomous triage session for it. `enabled: false` stops it from starting at all.
+The `k8s-event-watcher` runs in the gateway pod's `agent-api-auth` sidecar, streams warning events
+from every managed cluster, and posts each surviving incident to the pod-local Session KV server,
+which opens an autonomous triage session for it. `enabled: false` stops it from starting at all.
 
 ```bash
 kubectl patch platformagent platform-agent -n kubeagents-system --type merge \
