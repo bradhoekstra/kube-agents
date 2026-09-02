@@ -207,11 +207,19 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Affinity:     affinity,
-					NodeSelector: nodeSelector,
-					Tolerations:  tolerations,
-					Containers:   []corev1.Container{buildCredentialProxyContainer(agent)},
-					Volumes:      buildCredentialProxyRuntimeVolumes(agent),
+					// The same pull identity as the gateway pod. This used to come
+					// for free: the credential runtime was a sidecar in that pod,
+					// so it pulled under the pod's secrets. A pod of its own has
+					// to be told, and an install pulling from an authenticated
+					// registry has no other way to say it — both
+					// spec.deployment.imagePullSecrets and the operator-wide
+					// IMAGE_PULL_SECRETS resolve here.
+					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
+					Affinity:         affinity,
+					NodeSelector:     nodeSelector,
+					Tolerations:      tolerations,
+					Containers:       []corev1.Container{buildCredentialProxyContainer(agent)},
+					Volumes:          buildCredentialProxyRuntimeVolumes(agent),
 				},
 			},
 		},

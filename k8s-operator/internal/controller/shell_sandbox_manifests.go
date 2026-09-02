@@ -469,8 +469,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 					// question deploy/sandbox/smoke-test.sh can answer and nobody
 					// has asked it yet; guessing here would produce a pod that
 					// fails at login, which reads as a key problem.
-					Containers: containers,
-					Volumes:    volumes,
+					// The sandbox image is a fourth image, pulled by a pod that did
+					// not exist before this design. It needs the install's pull
+					// identity for the same reason the gateway does, and there is
+					// no separate field for it: spec.deployment.imagePullSecrets
+					// and IMAGE_PULL_SECRETS cover every pod the operator renders.
+					ImagePullSecrets: resolveImagePullSecrets(agent.Spec.Deployment),
+					Containers:       containers,
+					Volumes:          volumes,
 				},
 			},
 			// Two claims, because one of them must be unreachable from the account

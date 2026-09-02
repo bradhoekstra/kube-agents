@@ -5233,6 +5233,55 @@ func TestImagePullSecretsReachThePodSpec(t *testing.T) {
 			t.Errorf("StatefulSet pod spec imagePullSecrets = %v, want %v", got, want)
 		}
 	})
+
+	// The other two pods this operator renders. Splitting the credential runtime
+	// and the shell out of the agent pod took them out from under its pull
+	// identity: a sidecar pulled under the pod that hosted it, a pod of its own
+	// has to be told. Neither has a field of its own, so the CR's list and
+	// IMAGE_PULL_SECRETS are the only two ways to say it, and an install pulling
+	// from an authenticated registry gets ImagePullBackOff on both without this.
+	t.Run("on the broker Deployment", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		dep := buildCredentialProxyDeployment(agent(), "hash")
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"fleet-pull"}; !slices.Equal(got, want) {
+			t.Errorf("broker pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+
+		dep = buildCredentialProxyDeployment(agent("harbor-pull"), "hash")
+		if got, want := names(dep.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("broker pod spec imagePullSecrets = %v, want %v — the CR must win here too", got, want)
+		}
+	})
+
+	t.Run("on the shell sandbox StatefulSet", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "fleet-pull")
+
+		sts := buildShellSandboxStatefulSet(agent(), "keys", "http://proxy:8765", "hash")
+		if got, want := names(sts.Spec.Template.Spec.ImagePullSecrets), []string{"fleet-pull"}; !slices.Equal(got, want) {
+			t.Errorf("sandbox pod spec imagePullSecrets = %v, want %v", got, want)
+		}
+
+		sts = buildShellSandboxStatefulSet(agent("harbor-pull"), "keys", "http://proxy:8765", "hash")
+		if got, want := names(sts.Spec.Template.Spec.ImagePullSecrets), []string{"harbor-pull"}; !slices.Equal(got, want) {
+			t.Errorf("sandbox pod spec imagePullSecrets = %v, want %v — the CR must win here too", got, want)
+		}
+	})
+
+	// Same nil-not-empty-slice requirement the agent Deployment has, on both new
+	// pods: an empty slice renders `imagePullSecrets: []` into every manifest in
+	// the fleet and into the goldens.
+	t.Run("absent from the new pods when nothing is configured", func(t *testing.T) {
+		t.Setenv(imagePullSecretsEnvVar, "")
+
+		bare := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"}}
+		if got := buildCredentialProxyDeployment(bare, "hash").Spec.Template.Spec.ImagePullSecrets; got != nil {
+			t.Errorf("broker pod spec imagePullSecrets = %v, want nil", got)
+		}
+		if got := buildShellSandboxStatefulSet(bare, "keys", "http://proxy:8765", "hash").Spec.Template.Spec.ImagePullSecrets; got != nil {
+			t.Errorf("sandbox pod spec imagePullSecrets = %v, want nil", got)
+		}
+	})
 }
 
 // The read-only kill switch. Unlike the two above it is not appended by
