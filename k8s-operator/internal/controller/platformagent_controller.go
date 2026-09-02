@@ -1025,7 +1025,7 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 		buildShellSandboxServiceAccount(agent),
 		buildShellSandboxService(agent),
 		sts,
-		buildShellSandboxNetworkPolicy(agent),
+		buildShellSandboxNetworkPolicy(agent, r.shellSandboxDNSClusterIPs(ctx, agent)),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
@@ -1040,6 +1040,29 @@ func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, age
 		}
 	}
 	return nil
+}
+
+// shellSandboxDNSClusterIPs is the resolved cluster DNS VIP list for the sandbox
+// policy's DNS rule.
+//
+// Always ungated, unlike agentEgressDNSClusterIPs, which reads the profile first.
+// The sandbox policy renders on every reconcile — spec.networkPolicy.enabled
+// withholds the gateway policy and nothing else — so a profile that returned early
+// because that flag is false would hand this rule an empty list and pin it to the
+// fallback VIP, silently discarding the documented dnsClusterIPs override on the
+// one policy that is still enforcing. The flag gates the gateway policy, not DNS
+// resolution.
+//
+// The nil check below is not shared with agentEgressDNSClusterIPs: that one reaches
+// its copy only on a path where spec.networkPolicy is provably set, while this runs
+// on every reconcile, including the common CR that omits the block entirely.
+func (r *PlatformAgentReconciler) shellSandboxDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
+	if agent.Spec.NetworkPolicy == nil || agent.Spec.NetworkPolicy.Enabled == nil {
+		return r.resolveNetpolProfile(ctx, agent).DNSClusterIPs
+	}
+	ungated := agent.DeepCopy()
+	ungated.Spec.NetworkPolicy.Enabled = nil
+	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
 // growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.

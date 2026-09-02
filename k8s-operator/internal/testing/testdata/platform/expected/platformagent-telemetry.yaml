@@ -681,6 +681,16 @@ spec:
           podSelector:
             matchLabels:
               k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 10.96.0.10/32
     - ports:
         - port: 8765
           protocol: TCP
@@ -1718,6 +1728,13 @@ spec:
             matchLabels:
               app.kubernetes.io/component: api
               app.kubernetes.io/name: hindsight
+    - ports:
+        - port: 2222
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: platformagent-shell
   ingress:
     - from:
         - podSelector: {}

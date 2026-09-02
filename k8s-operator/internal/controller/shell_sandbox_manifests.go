@@ -669,7 +669,9 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 // a GKE control plane per registered cluster, googleapis.com, chat.googleapis.com,
 // slack.com, github.com, the token minter — an address the *shell* may reach.
 // Off-pod, the shell's whole outbound world is DNS and one ClusterIP.
-func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+// dnsIPs is the resolved Cluster DNS VIP list, the same one the gateway policy is
+// built from; an empty slice falls back to the standard VIP inside clusterDNSPeers.
+func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsIPs []string) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
 	gateway := map[string]string{"app": agent.Name + "-gateway"}
@@ -688,15 +690,11 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *network
 	egress := []networkingv1.NetworkPolicyEgressRule{{
 		// Cluster DNS. Without it the sandbox cannot resolve the credential
 		// proxy, and every wrapper fails with a name error that looks like the
-		// proxy being down.
-		To: []networkingv1.NetworkPolicyPeer{{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"kubernetes.io/metadata.name": "kube-system"},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"k8s-app": "kube-dns"},
-			},
-		}},
+		// proxy being down — which is exactly what a live install did when this
+		// rule named the kube-dns podSelector alone and the cluster ran NodeLocal
+		// DNSCache. clusterDNSPeers is the gateway policy's peer list, so the two
+		// policies cannot drift apart into that failure again.
+		To: clusterDNSPeers(dnsIPs),
 		Ports: []networkingv1.NetworkPolicyPort{
 			{Protocol: &udp, Port: ptr.To(intstr.FromInt32(53))},
 			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(53))},

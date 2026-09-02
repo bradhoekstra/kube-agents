@@ -18,6 +18,7 @@ package controller
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -383,7 +384,7 @@ func TestShellSandboxServiceIsHeadlessAndPublishesTheStableName(t *testing.T) {
 }
 
 func TestShellSandboxNetworkPolicyDeniesByDefault(t *testing.T) {
-	np := buildShellSandboxNetworkPolicy(shellSandboxTestAgent())
+	np := buildShellSandboxNetworkPolicy(shellSandboxTestAgent(), nil)
 
 	types := map[networkingv1.PolicyType]bool{}
 	for _, t := range np.Spec.PolicyTypes {
@@ -426,13 +427,45 @@ func TestShellSandboxNetworkPolicyDeniesByDefault(t *testing.T) {
 	}
 }
 
+func TestShellSandboxDNSEgressNamesEveryClusterDNSPeer(t *testing.T) {
+	// This rule named the kube-dns podSelector alone, and on a live cluster running
+	// NodeLocal DNSCache every lookup from the sandbox failed with "Temporary failure
+	// in name resolution" — reported as the credential proxy being down, because the
+	// proxy is the first name the sandbox resolves. The four peers below are what the
+	// gateway policy has always had; asserting them here is what keeps the two from
+	// drifting apart again, since only one of them is exercised by a golden file.
+	const resolvedVIP = "10.4.0.10"
+	np := buildShellSandboxNetworkPolicy(shellSandboxTestAgent(), []string{resolvedVIP})
+
+	dns := np.Spec.Egress[0]
+	var podSelectors, cidrs []string
+	for _, peer := range dns.To {
+		if peer.PodSelector != nil {
+			podSelectors = append(podSelectors, peer.PodSelector.MatchLabels["k8s-app"])
+		}
+		if peer.IPBlock != nil {
+			cidrs = append(cidrs, peer.IPBlock.CIDR)
+		}
+	}
+	for _, want := range []string{"kube-dns", "node-local-dns"} {
+		if !slices.Contains(podSelectors, want) {
+			t.Errorf("DNS egress does not select the %s pods, got %v", want, podSelectors)
+		}
+	}
+	for _, want := range []string{nodeLocalDNSCacheIP, resolvedVIP + "/32"} {
+		if !slices.Contains(cidrs, want) {
+			t.Errorf("DNS egress does not reach %s, got %v", want, cidrs)
+		}
+	}
+}
+
 func TestShellSandboxObjectsShareOneSelector(t *testing.T) {
 	// Three objects, one label set. A Service that selects nothing and a
 	// NetworkPolicy that constrains nothing both look healthy in `kubectl get`.
 	agent := shellSandboxTestAgent()
 	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 	svc := buildShellSandboxService(agent)
-	np := buildShellSandboxNetworkPolicy(agent)
+	np := buildShellSandboxNetworkPolicy(agent, nil)
 
 	podLabels := sts.Spec.Template.ObjectMeta.Labels
 	for name, selector := range map[string]map[string]string{
@@ -1070,10 +1103,20 @@ func TestSandboxEgressReachesNothingButDNSAndTheBroker(t *testing.T) {
 	// The narrow egress is what the broker's separate pod buys, and it is the
 	// half of the policy that is easy to widen by accident: a rule added for one
 	// skill's API is a rule the model's own code can use.
-	np := buildShellSandboxNetworkPolicy(federatedTestAgent())
+	np := buildShellSandboxNetworkPolicy(federatedTestAgent(), nil)
 	for _, rule := range np.Spec.Egress {
+		// A CIDR peer is allowed on the DNS rule alone, where the two of them are
+		// the NodeLocal DNSCache listener and the kube-dns VIP — addresses a
+		// resolver reaches, on port 53, not addresses the model's code can use.
+		// Anywhere else a CIDR is a hole straight past the broker.
+		dnsOnly := len(rule.Ports) > 0
+		for _, p := range rule.Ports {
+			if p.Port.IntValue() != 53 {
+				dnsOnly = false
+			}
+		}
 		for _, peer := range rule.To {
-			if peer.IPBlock != nil {
+			if peer.IPBlock != nil && !dnsOnly {
 				t.Errorf("the sandbox may reach %s directly; every remote address belongs to the broker", peer.IPBlock.CIDR)
 			}
 		}

@@ -4296,6 +4296,64 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 //
 // otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
 // collector, so there is no export to allow and the collector egress rule is left out.
+// clusterDNSPeers is every peer a pod's DNS egress rule has to name on GKE, and
+// the one definition both this file's gateway policy and the shell sandbox's own
+// policy use. Naming it once is not tidiness: the sandbox policy shipped with
+// only the kube-dns podSelector, and on a cluster running NodeLocal DNSCache
+// every lookup from the sandbox failed with "Temporary failure in name
+// resolution" — which reads as the credential broker being down rather than as a
+// policy drop, because the broker is the first thing the sandbox resolves.
+//
+// The four peers cover the three ways a lookup leaves the pod: the kube-dns Pods
+// themselves, the node-local-dns Pods, the link-local address NodeLocal DNSCache
+// listens on, and the kube-dns Service VIP for a dataplane that evaluates policy
+// before the ClusterIP is translated.
+func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "kube-dns",
+				},
+			},
+		},
+		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": "kube-system",
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"k8s-app": "node-local-dns",
+				},
+			},
+		},
+		{
+			IPBlock: &networkingv1.IPBlock{
+				CIDR: nodeLocalDNSCacheIP,
+			},
+		},
+	}
+
+	// Through formatCIDRPeers rather than another spelling of /32-or-/128 in this
+	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
+	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
+	// operator, which always widen to a single host. The default is the fallback for
+	// nothing surviving, not for each entry that does not parse -- two bad entries
+	// used to emit the default twice.
+	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
+	if len(dnsIPPeers) == 0 {
+		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
+	}
+	return append(peers, dnsIPPeers...)
+}
+
 func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, profile netpolProfile, fqdnEnabled bool, otlpEndpoint string, otlpDisabled bool) *networkingv1.NetworkPolicy {
 	udp := corev1.ProtocolUDP
 	tcp := corev1.ProtocolTCP
@@ -4347,49 +4405,7 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		})
 	}
 
-	dnsPeers := []networkingv1.NetworkPolicyPeer{
-		{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": "kube-system",
-				},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"k8s-app": "kube-dns",
-				},
-			},
-		},
-		{
-			NamespaceSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"kubernetes.io/metadata.name": "kube-system",
-				},
-			},
-			PodSelector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"k8s-app": "node-local-dns",
-				},
-			},
-		},
-		{
-			IPBlock: &networkingv1.IPBlock{
-				CIDR: "169.254.20.10/32",
-			},
-		},
-	}
-
-	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
-	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
-	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
-	// operator, which always widen to a single host. The default is the fallback for
-	// nothing surviving, not for each entry that does not parse -- two bad entries
-	// used to emit the default twice.
-	dnsIPPeers := formatCIDRPeers(dnsIPs, false)
-	if len(dnsIPPeers) == 0 {
-		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
-	}
-	dnsPeers = append(dnsPeers, dnsIPPeers...)
+	dnsPeers := clusterDNSPeers(dnsIPs)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
@@ -4577,6 +4593,27 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 						"app.kubernetes.io/name":      "hindsight",
 						"app.kubernetes.io/component": "api",
 					},
+				},
+			},
+		},
+	})
+
+	// 11. The shell sandbox's sshd. Everything the model runs executes there, so
+	//     without this rule the agent has no shell at all: buildShellSandboxNetworkPolicy
+	//     opens the matching ingress, and a one-sided pair still drops the packet.
+	//     A live install on a Dataplane V2 cluster is what surfaced it — the ssh
+	//     dial timed out while both policies read as though they permitted it.
+	//     Unconditional, like rules 9 and 10: the sandbox is not optional, and a
+	//     cluster that does not enforce NetworkPolicy connects either way, which is
+	//     exactly the install that would hide the omission again.
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(shellSandboxPort))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: shellSandboxSelector(agent),
 				},
 			},
 		},
