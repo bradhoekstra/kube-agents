@@ -746,7 +746,9 @@ class TestContentMode(SubmitSuggestionTestCase):
             submit_suggestion.dispatch(argv)
         return json.loads(out.getvalue())
 
-    def submit_content(self, prepared, source, title="t", body="b", deletes=()):
+    def submit_content(
+        self, prepared, source, title="t", body="b", deletes=(), repo="acme/fleet"
+    ):
         argv = [
             "submit",
             "--branch", prepared["branch"],
@@ -755,7 +757,7 @@ class TestContentMode(SubmitSuggestionTestCase):
             "--handle", prepared["handle"],
             "--from", str(source),
             "--base-sha", prepared["baseSha"],
-            "--repo", "acme/fleet",
+            "--repo", repo,
         ]
         for path in deletes:
             argv += ["--delete", path]
@@ -789,6 +791,33 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.patch_attr(gitops_workspace, "resolve_repo", lambda workspace=None: "acme/secondary-repo")
         payload = self.prepare_content(repo="acme/fleet")
         self.assertEqual("acme/fleet", payload["repo"])
+
+    def test_submit_refuses_a_repository_outside_the_allowlist(self):
+        """The allowlist is checked before the credential is minted, not after.
+
+        Content-mode `submit` resolved `--repo` and went straight to
+        `refresh_git_credentials`, so argv the model controls named a repository
+        the operator never allowed, an installation token was minted for it, and
+        `gh pr create --repo` opened a pull request against it. Directory mode
+        and content-mode `prepare` both check; this path did not.
+        """
+        prepared = self.prepare_content()
+        source = self.scratch({"clusters/prod/netpol.yaml": "kind: NetworkPolicy\n"})
+
+        minted = []
+        self.patch_attr(
+            submit_suggestion,
+            "refresh_git_credentials",
+            lambda repo=None: minted.append(repo) or "t",
+        )
+
+        with self.assertRaises(ValueError) as caught:
+            self.submit_content(prepared, source, repo="acme/not-managed")
+        self.assertIn("not in the managed repositories list", str(caught.exception))
+        # The refusal has to land before the token exists. Minting first and
+        # failing afterwards still hands out a credential scoped to a repository
+        # nobody allowed.
+        self.assertEqual([], minted)
 
     def test_prepare_then_submit_lands_the_branch_and_opens_the_pr(self):
         prepared = self.prepare_content()

@@ -321,6 +321,16 @@ def handle_submit_content(args) -> int:
         )
     changes = collect_changes(args.source, args.delete)
     repo = args.repo or gitops_workspace.resolve_repo()
+    # Before the credential is refreshed for it, not after. `--repo` is argv the
+    # model controls, and everything downstream spends the agent's GitHub
+    # credential on whatever it names: refresh_git_credentials mints an
+    # installation token *for this repo*, and create_pull_request runs
+    # `gh pr create --repo`. The allowlist is the boundary on where that
+    # credential may be spent, so a path that skips it is a way around the
+    # boundary rather than a missing convenience. Every sibling handler checks
+    # here -- see handle_prepare_content, which says why the check cannot depend
+    # on which transport the run picked.
+    validate_repo(repo)
     refresh_git_credentials(repo)
 
     # `with`, so the broker's clone is released on the failure paths too. A
