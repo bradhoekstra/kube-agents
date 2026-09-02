@@ -22,7 +22,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+import urllib.error
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -334,6 +335,57 @@ class TestSearchThenFetch(InspectRepositoryTestCase):
         self.run_command(["close", "--handle", handle])
         self.assertEqual(self.store._workspaces, {})
 
+    def test_close_does_not_ask_whether_the_broker_is_armed(self):
+        """The other handle commands probe first; this one must not.
+
+        A handle exists only because an `open` succeeded, so the probe can tell
+        the caller nothing it does not already know -- and a broker having a bad
+        few seconds answers it "unavailable", which refuses the one command that
+        releases the clone. The clone then sits on the broker's volume with
+        nothing left holding its handle.
+        """
+        handle = self.open_handle()
+        with patch.object(
+            inspect_repository,
+            "content_mode_available",
+            lambda: self.fail("close probed the broker before releasing the clone"),
+        ):
+            self.run_command(["close", "--handle", handle])
+        self.assertEqual(self.store._workspaces, {})
+
+
+class TestTheErrorContract(unittest.TestCase):
+    """main() turns every way a broker call fails into a sentence.
+
+    Not the two workspace exceptions -- those were always caught. These are the
+    two that reach main() from before the broker answers: no token to send, and
+    no connection to send it over. A traceback for either reads to the agent as
+    the script being broken and sends it to fix the wrong thing.
+    """
+
+    def run_main(self, raised: Exception) -> tuple[int, str]:
+        err = io.StringIO()
+        with patch.object(inspect_repository.sys, "argv", ["inspect_repository.py", "close"]):
+            with patch.object(
+                inspect_repository, "dispatch", side_effect=raised
+            ), redirect_stderr(err):
+                code = inspect_repository.main()
+        return code, err.getvalue()
+
+    def test_a_missing_caller_token_is_a_sentence(self):
+        code, message = self.run_main(
+            credential_proxy_client.TokenUnavailable("/var/run/token is empty")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("/var/run/token is empty", message)
+
+    def test_an_unreachable_broker_is_a_sentence(self):
+        code, message = self.run_main(
+            urllib.error.URLError("Connection refused")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("Connection refused", message)
+
 
 class TestDirectoryFallback(InspectRepositoryTestCase):
     def test_the_handle_commands_say_what_is_missing(self):
@@ -343,11 +395,11 @@ class TestDirectoryFallback(InspectRepositoryTestCase):
             ["list", "--handle", "x"],
             ["grep", "--handle", "x", "--pattern", "y"],
             ["fetch", "--handle", "x", "--into", str(self.tmp / "d"), "a"],
-            ["close", "--handle", "x"],
         ):
             with self.subTest(argv=argv[0]), self.assertRaises(SystemExit) as caught:
                 inspect_repository.dispatch(argv)
             self.assertIn("content-passing broker", str(caught.exception))
+
 
     def test_clone_falls_back_to_a_leased_checkout(self):
         self.available = False

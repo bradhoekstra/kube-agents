@@ -48,6 +48,7 @@ import json
 import os
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 # Append global scripts path to allow importing the shared helpers
@@ -231,7 +232,14 @@ def handle_fetch(args) -> int:
 
 
 def handle_close(args) -> int:
-    require_content_mode("close")
+    """No availability probe. This is the command that releases the clone.
+
+    A handle exists only because an `open` succeeded, so the probe can tell the
+    caller nothing it does not already know -- and a probe that fails on a
+    broker having a bad few seconds refuses the close, leaving the clone on the
+    broker's volume with nothing left holding its handle. Send the close and let
+    the broker answer.
+    """
     rebind(args.handle).close()
     print(json.dumps({"closed": True}))
     return 0
@@ -404,6 +412,16 @@ def dispatch(argv: list[str]) -> int:
 
 
 def main() -> int:
+    """Every way a broker call can fail, as a sentence and an exit code.
+
+    The two workspace exceptions are the broker answering. The other two are it
+    not answering at all: `TokenUnavailable` is the projected ServiceAccount
+    token missing or empty, which `_workspace_call` raises before it opens a
+    socket, and a bare `URLError` is the connection itself -- the broker Pod
+    down, the Service not resolving. Both used to reach the terminal as
+    tracebacks, which reads to the agent as this script being broken rather than
+    the broker being unreachable, and sends it to fix the wrong thing.
+    """
     try:
         return dispatch(sys.argv[1:])
     except credential_proxy_client.WorkspaceUnavailable as exc:
@@ -411,6 +429,12 @@ def main() -> int:
         return 1
     except credential_proxy_client.WorkspaceRequestError as exc:
         print(json.dumps({"error": str(exc), "status": exc.status}), file=sys.stderr)
+        return 1
+    except credential_proxy_client.TokenUnavailable as exc:
+        print(f"no credential to call the broker with: {exc}", file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"the broker is unreachable: {exc.reason}", file=sys.stderr)
         return 1
 
 
