@@ -60,7 +60,7 @@ const (
 	// are inside the proxy container's mount namespace and nowhere else — that
 	// containment is the control, so a mount added to the shell container at
 	// either path silently undoes this whole design.
-	credentialProxyWIFTokenVolume = "credential-proxy-wif-token" // #nosec G101 -- Volume name, not a credential
+	credentialProxyWIFTokenVolume = "credential-proxy-wif-token"      // #nosec G101 -- Volume name, not a credential
 	credentialProxyWIFTokenPath   = "/var/run/secrets/kubeagents/wif" // #nosec G101 -- Mount path, not a credential
 	credentialProxyWIFTokenFile   = credentialProxyWIFTokenPath + "/token"
 
