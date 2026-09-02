@@ -80,7 +80,8 @@ docker-push-sandbox: docker-build-sandbox ## Build and push the agent shell sand
 	docker push $(REPO)/agent-sandbox:latest
 
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
-	@$(MAKE) -C k8s-operator dev-rebuild-agent ARGS="$(ARGS)"
+	@chmod +x scripts/installer/*.sh scripts/dev/*.sh 2>/dev/null || true
+	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
 
 # Copy every image in images.json into a registry of your own, for installs
 # that may only pull from an approved one. Run `./scripts/mirror_images.sh

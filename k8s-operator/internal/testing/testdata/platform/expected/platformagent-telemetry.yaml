@@ -311,6 +311,7 @@ data:
       workspace_root: /opt/data
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
+    KUBEAGENTS_MODE=today
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
@@ -1261,7 +1262,7 @@ spec:
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.1.0
+          image: fluent/fluent-bit:5.1.1
           name: fluent-bit
           resources:
             limits:
