@@ -15,8 +15,9 @@ It lives in its own module because the two ends do not ship the same code. The
 broker's `content_workspace` drives git in a tree on its own volume and has no
 business in the sandbox image; this file is stdlib-only, has no idea a git
 exists, and is on the sandbox's shared-scripts allowlist. `content_workspace`
-re-exports what is here, so `content_workspace.validate_path` keeps working for
-everything that already called it.
+delegates to it, translating `WorkspaceError` into the `PathRefused` its own
+callers are written against, so `content_workspace.repo_relative` keeps working
+for everything that already called it.
 """
 
 from __future__ import annotations
@@ -75,18 +76,25 @@ class WorkspaceError(Exception):
 def validate_path(raw: Any) -> str:
     """A repository-relative name, or a refusal. One validator, both directions.
 
-    Refuses, in order: a non-string; an empty name; a NUL or newline; an
-    absolute path; a Windows drive or backslash separator; any `.` or `..`
-    segment; and any path whose first segment is `.git`. The `..` rejection is
-    outright rather than normalising, because normalising means reimplementing
-    another library's edge cases and betting the two agree -- refusing the
-    ambiguous form is the rule that does not depend on that bet.
+    Refuses, in order: a non-string; an empty name; surrounding whitespace; a
+    NUL or newline; an absolute path; a Windows drive or backslash separator;
+    any `.` or `..` segment; and any segment that spells `.git`. Every rejection
+    is outright rather than normalising, because normalising means
+    reimplementing another library's edge cases and betting the two agree --
+    refusing the ambiguous form is the rule that does not depend on that bet.
+    Surrounding whitespace is in that list for the same reason it would have
+    been stripped: ` a.yaml` and `a.yaml` are two names, and deciding they are
+    one is a normalisation the enforcer downstream does not make.
     """
     if not isinstance(raw, str):
         raise WorkspaceError("path must be a string")
-    text = raw.strip()
+    text = raw
     if not text:
         raise WorkspaceError("path must not be empty")
+    if text != text.strip():
+        raise WorkspaceError(
+            f"path {raw!r} has leading or trailing whitespace; write it without"
+        )
     if "\x00" in text or "\n" in text or "\r" in text:
         raise WorkspaceError("path must not contain control characters")
     if "\\" in text:

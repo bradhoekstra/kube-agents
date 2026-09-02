@@ -140,14 +140,17 @@ name only, matching the flat layout `mirror-images` writes. Set
 fluent-bit under a different path; it defaults to `global.imageRegistry`.
 
 It reaches more than the containers the chart renders. The operator resolves
-two images at reconcile time that appear in no chart template — the agent image
-for a `PlatformAgent` that omits `spec.deployment.image`, and the fluent-bit
-logging sidecar it injects into every agent pod — so the chart passes both to
-the operator as `PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE`. Without that a
-mirrored install reaches `ghcr.io` and Docker Hub minutes after `helm install`
-reported success. `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the
-operator derives that sidecar from the agent image by swapping the trailing
-name, so it follows the mirror on its own.
+three images at reconcile time that appear in no chart template — the agent
+image for a `PlatformAgent` that omits `spec.deployment.image`, the shell
+sandbox StatefulSet it renders beside every agent pod, and the fluent-bit
+logging sidecar it injects into that pod — so the chart passes all three to the
+operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
+`FLUENT_BIT_IMAGE`. Without that a mirrored install reaches `ghcr.io` and Docker
+Hub minutes after `helm install` reported success. `CREDENTIAL_PROXY_IMAGE` is
+deliberately not passed: the operator derives the broker image from the agent
+image by swapping the trailing name, so it follows the mirror on its own. The
+sandbox image cannot be derived that way — it is a separate repository — which
+is why it has to be named.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -156,8 +159,8 @@ path, keeping the trailing name, because that is the flat layout
 joined to, not where the image is pulled from. To place images individually —
 most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
 give each `*.image.repository` its full mirrored path instead; the operator's
-`PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE` are rendered from those values
-either way.
+`PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and `FLUENT_BIT_IMAGE` are
+rendered from those values either way.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.

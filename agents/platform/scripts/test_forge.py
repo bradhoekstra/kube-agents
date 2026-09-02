@@ -57,10 +57,15 @@ class FakeGh:
         self.responses = responses or {}
         self.default = default if default is not None else (0, "[]", "")
         self.calls: list[list[str]] = []
+        # What each call put on fd 0, positionally aligned with `calls`. The
+        # body of a comment travels this way now, so a test that only inspects
+        # argv can no longer see what was posted.
+        self.stdins: list[str | None] = []
 
-    def __call__(self, argv):
+    def __call__(self, argv, *, stdin=None):
         argv = list(argv)
         self.calls.append(argv)
+        self.stdins.append(stdin)
         joined = " ".join(argv)
         for key, value in self.responses.items():
             if key in joined:
@@ -73,6 +78,12 @@ class FakeGh:
         for argv in self.calls:
             if fragment in " ".join(argv):
                 return argv
+        raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
+
+    def stdin_of(self, fragment: str):
+        for argv, stdin in zip(self.calls, self.stdins):
+            if fragment in " ".join(argv):
+                return stdin
         raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
 
@@ -288,6 +299,15 @@ class RunGhTest(unittest.TestCase):
             result = forge.run_gh(["auth", "status"])
         self.assertEqual(result.stdout, "ok")
         self.assertEqual(ran.call_args.args[0], ["gh", "auth", "status"])
+
+    def test_stdin_reaches_the_sandbox(self):
+        """`--body-file -` is only half of it; the bytes have to be forwarded."""
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            return_value=_completed(["gh", "pr", "comment"], 0, "", ""),
+        ) as ran:
+            forge.run_gh(["pr", "comment", "1", "--body-file", "-"], stdin="hello")
+        self.assertEqual(ran.call_args.kwargs["stdin"], "hello")
 
     def test_an_unreachable_sandbox_is_not_a_quiet_repository(self):
         """A transport failure has to reach the caller, not become an empty result."""
@@ -838,24 +858,37 @@ class ListCommentsTest(unittest.TestCase):
 
 
 class PostCommentTest(unittest.TestCase):
-    def test_body_is_passed_as_a_file_never_on_the_command_line(self):
+    BODY = "Thanks — that is fixed in a1b2c3d.\n\n> your words back at you\n"
+
+    def _post(self, fake):
+        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+        forge.GitHubProvider(run=fake).post_comment("acme/toolkit", pr, self.BODY)
+
+    def test_body_travels_on_stdin_never_on_the_command_line(self):
         """A reviewer's words go back through a proxy and two shells' quoting."""
         fake = FakeGh(default=(0, "", ""))
-        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
-        forge.GitHubProvider(run=fake).post_comment(
-            "acme/toolkit", pr, "/opt/data/scratch/pr_12.md"
-        )
+        self._post(fake)
         argv = fake.argv_containing("pr comment")
         self.assertIn("--body-file", argv)
         self.assertNotIn("--body", argv)
-        self.assertEqual(argv[argv.index("--body-file") + 1], "/opt/data/scratch/pr_12.md")
+        self.assertEqual(argv[argv.index("--body-file") + 1], "-")
         self.assertEqual(argv[argv.index("-R") + 1], "acme/toolkit")
+        self.assertEqual(fake.stdin_of("pr comment"), self.BODY)
+
+    def test_no_argument_names_a_path(self):
+        """The three processes in this call have three different filesystems.
+
+        A path would name a file in the agent pod; `gh` runs in the broker pod.
+        """
+        fake = FakeGh(default=(0, "", ""))
+        self._post(fake)
+        for arg in fake.argv_containing("pr comment"):
+            self.assertFalse(arg.startswith("/"), arg)
 
     def test_a_failed_post_is_not_swallowed(self):
         fake = FakeGh(default=(1, "", "HTTP 403"))
-        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
         with self.assertRaises(forge.ForgeError):
-            forge.GitHubProvider(run=fake).post_comment("acme/toolkit", pr, "/tmp/x.md")
+            self._post(fake)
 
 
 class AcknowledgeTest(unittest.TestCase):

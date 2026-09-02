@@ -38,6 +38,16 @@ spec:
       {{- . | nindent 6 }}
     {{- end }}
     {{- $sandbox := (.Values.platformAgent.harness.experimental | default dict).shellSandbox | default dict }}
+    {{- /*
+      The shell sandbox is not optional. The operator refuses
+      shellSandbox.enabled: false with Degraded/ShellSandboxCannotBeDisabled and
+      leaves the running workload alone, so a chart that rendered it would install
+      cleanly and then sit Degraded with no Helm error to read. Fail at template
+      time instead, where the message reaches the person running the upgrade.
+    */}}
+    {{- if and (kindIs "bool" $sandbox.enabled) (not $sandbox.enabled) }}
+    {{- fail "platformAgent.harness.experimental.shellSandbox.enabled: false is not supported -- the operator refuses it. Remove the key or set it true." }}
+    {{- end }}
     {{- with include "kube-agents.compactFields" (dict
           "enabled" $sandbox.enabled
           "image" $sandbox.image
@@ -114,9 +124,6 @@ spec:
     {{- if or $wif.audience $wif.serviceAccountEmail }}
     {{- if not (and $wif.audience $wif.serviceAccountEmail) }}
     {{- fail "platformAgent.security.workloadIdentityFederation needs both audience and serviceAccountEmail, or neither" }}
-    {{- end }}
-    {{- if not $sandbox.enabled }}
-    {{- fail "platformAgent.security.workloadIdentityFederation has no effect without platformAgent.harness.experimental.shellSandbox.enabled: the credential proxy only federates when it runs beside the sandbox" }}
     {{- end }}
     workloadIdentityFederation:
       audience: {{ $wif.audience | quote }}

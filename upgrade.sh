@@ -225,14 +225,22 @@ backfill_session_kv_keys() {
 # absent rather than patched around — a private key whose public half was lost
 # authenticates nothing.
 #
-# The public half is written twice on purpose: into platform-agent-secrets so a
-# later run can recover the pair from one place, and into a Secret of its own
-# for the sandbox to mount. The sandbox must not mount the first one; see
-# docs/designs/agent-shell-sandboxing.md#key-management.
+# Only platform-agent-secrets is written here. The sandbox mounts a Secret of
+# its own, <name>-shell-authorized-keys, and the chart renders that one from
+# whatever public half it finds in platform-agent-secrets — so the step 4 helm
+# upgrade below picks the pair up on its own. Writing it here too would create
+# the object without Helm's ownership metadata, and that same helm upgrade would
+# then refuse to adopt it. The sandbox must not mount platform-agent-secrets
+# itself; see docs/designs/agent-shell-sandboxing.md#key-management.
+#
+# Set when this run wrote the pair, so the caller can roll the agent: the
+# private half reaches the gateway pod through a Secret volume that an init
+# container copies into place once at startup, so a pod that started before the
+# backfill keeps the empty directory it was given until it restarts.
+SANDBOX_KEYS_PATCHED="false"
 backfill_sandbox_ssh_key() {
   local namespace="$1"
   local secret_name="platform-agent-secrets"
-  local keys_secret="platform-agent-shell-authorized-keys"
 
   if ! command -v ssh-keygen >/dev/null 2>&1; then
     print_warning "ssh-keygen not found; skipping the shell sandbox keypair backfill."
@@ -263,30 +271,6 @@ backfill_sandbox_ssh_key() {
     return 0
   fi
 
-  # --from-file, not --from-literal: an OpenSSH private key is multi-line, and
-  # kubectl create secret is the shortest path to a correctly encoded value.
-  # The manifest stays on the pipe rather than being written to disk.
-  #
-  # The labels are the ones every install surface stamps on the Secrets it
-  # applies, so a later installer run over a backfilled install is a no-op
-  # rather than a relabelling.
-  #
-  # This Secret is written before the keypair is patched into "$secret_name",
-  # and the order matters: the guard above treats a half-written pair as
-  # absent, so a failure here leaves the next run free to regenerate both. The
-  # reverse order would record a complete pair and skip forever, leaving the
-  # sandbox with no authorized_keys.
-  kubectl create secret generic "$keys_secret" \
-    --namespace="$namespace" \
-    --from-file=authorized_keys="$key_dir/id_ed25519.pub" \
-    --dry-run=client -o yaml \
-    | kubectl label --local -f - -o yaml \
-        "app.kubernetes.io/name=platform-agent" \
-        "app.kubernetes.io/instance=${namespace}-platform-agent" \
-        "app.kubernetes.io/part-of=kube-agents" \
-        "app.kubernetes.io/managed-by=provisioner" \
-    | kubectl apply -f - >/dev/null
-
   # Patching `data` with base64 rather than `stringData` with the raw key, which
   # is what the Session KV backfill above does: a PEM contains newlines, and
   # this patch is built by string interpolation into JSON. base64's alphabet
@@ -299,7 +283,8 @@ backfill_sandbox_ssh_key() {
   kubectl patch secret "$secret_name" -n "$namespace" --type=merge \
     -p "{\"data\":{\"SANDBOX_SSH_PRIVATE_KEY\":\"$priv_b64\",\"SANDBOX_SSH_PUBLIC_KEY\":\"$pub_b64\"}}" >/dev/null
 
-  print_success "Shell sandbox keypair backfilled into '$secret_name' and '$keys_secret'."
+  SANDBOX_KEYS_PATCHED="true"
+  print_success "Shell sandbox keypair backfilled into '$secret_name'; the upgrade below renders the sandbox's authorized_keys from it."
 }
 
 verify_local_source_ref() {
@@ -560,9 +545,11 @@ main() {
   local target_namespace="${NAMESPACE:-kubeagents-system}"
   print_step "3. Reconciling Pod-Scoped Session Keys"
   backfill_session_kv_keys "$target_namespace"
-  # No rollout is triggered for this one, unlike the Session KV keys below:
-  # nothing mounts the keypair yet (#737 Part B is not reconciled), so an
-  # install that gains it gains a Secret and no behaviour change.
+  # Rolls the agent on the same terms as the Session KV keys, and for the same
+  # reason: the sandbox StatefulSet the operator renders mounts the public half,
+  # and the gateway pod stages the private half from a Secret volume in an init
+  # container that runs once. An install that gains the pair without a restart
+  # gains a sandbox it cannot ssh into.
   backfill_sandbox_ssh_key "$target_namespace"
 
   # Helm never touches the crds/ directory on upgrade — that is Helm's own
@@ -652,16 +639,18 @@ main() {
 
   # An operator-mode upgrade rolls the controller manager and nothing else, so a
   # Secret patched above would sit unread until some later harness upgrade —
-  # with the watcher dead in the meantime. The other two modes re-render the
-  # agent Deployment and pick the keys up on their own rollout.
+  # with the watcher dead, or the sandbox unreachable, in the meantime. The
+  # other two modes re-render the agent Deployment and pick the keys up on their
+  # own rollout.
   local restarted_agent="false"
-  if [ "$SESSION_KV_KEYS_PATCHED" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ] &&
+    { [ "$SESSION_KV_KEYS_PATCHED" = "true" ] || [ "$SANDBOX_KEYS_PATCHED" = "true" ]; }; then
     if kubectl get deployment platform-agent-gateway -n "$target_namespace" >/dev/null 2>&1; then
-      print_info "Restarting the Platform Agent so it reads the newly added Session KV keys..."
+      print_info "Restarting the Platform Agent so it reads the newly added Secret keys..."
       kubectl rollout restart deployment/platform-agent-gateway -n "$target_namespace"
       restarted_agent="true"
     else
-      print_warning "Session KV keys were added but Deployment 'platform-agent-gateway' was not found in '$target_namespace'; restart the agent yourself so it reads them."
+      print_warning "Secret keys were added but Deployment 'platform-agent-gateway' was not found in '$target_namespace'; restart the agent yourself so it reads them."
     fi
   fi
 

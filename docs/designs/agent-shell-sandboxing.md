@@ -16,60 +16,67 @@ Nothing was exploited. The design simply allows it.
 
 This document covers both halves of the separation. The shell runs in a **separate
 Kubernetes pod** — its own filesystem, its own identity, no credentials — reached over
-Hermes' existing `ssh` terminal backend. The **credential proxy runs in that same pod**,
-as a second container, because a shell with no credential path is not a shell anybody can
-operate a fleet from, and because the proxy cannot hold its own confidentiality property
-anywhere else.
+Hermes' existing `ssh` terminal backend. The **credential broker runs in a third pod of its
+own**, because a shell with no credential path is not a shell anybody can operate a fleet
+from, and because the broker cannot hold its own confidentiality property in a pod that
+also runs something else.
 
-That second half follows from the first. The proxy exists so that credentials are never
+That second half follows from the first. The broker exists so that credentials are never
 readable by the agent: the agent may **use** a credential — run `kubectl`, push a branch,
 post to Chat — but never hold one. **Workload Identity is scoped to the pod, not the
-container**, so a proxy sharing a pod with the agent hands the same GCP identity to
+container**, so a broker sharing a pod with the agent hands the same GCP identity to
 anything else in it. Verified on a live install: a shell in the agent container reads the
 pod's service-account identity and mints a full OAuth access token in one `curl`, with no
 shim involved. Moving the shell out of the agent pod does not fix that on its own — it
 relocates the problem to whichever pod the shell lands in.
 
-What fixes it is removing the identity rather than moving the proxy away from it. The
-sandbox pod's ServiceAccount carries no `iam.gke.io/gcp-service-account` annotation, so
-the metadata server answers both containers with an unbound `<project>.svc.id.goog`
-principal that IAM grants nothing, and the proxy's real identity is an audience-scoped
-projected service-account token mounted into the proxy container alone and exchanged
-through Workload Identity Federation. **A volumeMount is the one boundary a pod has per
-container; the pod IP is not.**
+Three pods, then. The sandbox — the one running code the model wrote — has a ServiceAccount
+with no `iam.gke.io/gcp-service-account` annotation, so the metadata server answers it with
+an unbound `<project>.svc.id.goog` principal that IAM grants nothing. **The pod is the
+smallest thing that has an identity, so the pod is the boundary a credential gets**, and
+taking the identity away from the pod the model's shell lands in is what this design is
+for.
+
+The gateway and the broker still share the annotated ServiceAccount, so the gateway pod
+retains an ambient cloud identity. That is the remaining gap, and it is what
+`spec.security.workloadIdentityFederation` closes: with it configured the broker reads an
+audience-scoped projected token mounted into its pod alone, and the annotation can come off
+the shared account. Federation is optional hardening rather than a precondition — the split
+is delivered without it — and giving the two workloads separate ServiceAccounts would close
+the same gap without a pool. Neither has been done. [What the gateway pod is left
+holding](#what-the-gateway-pod-is-left-holding) is the full accounting.
 
 **Status:** the sandbox image ships ([`deploy/sandbox/`](../../deploy/sandbox/)) and the
-operator reconciles it. Co-locating the proxy is gated on
-`spec.security.workloadIdentityFederation` naming a pool; without it, the proxy runs in a
-Deployment of its own — reachable, and authenticated per caller rather than by loopback.
+operator reconciles it. The broker always runs as its own Deployment; there is no placement
+to choose and no flag that chooses one.
 Tracked as [#737](https://github.com/gke-labs/kube-agents/issues/737), whose Part A —
 putting the Session KV behind its own interface — is the one piece still unbuilt.
 
-**The sandbox is opt-in for now, and is not meant to stay that way.**
-`spec.harness.experimental.shellSandbox.enabled` defaults to false, so upgrading to this
-version changes nothing until an install sets it. Setting it back to false is a real path
-rather than an unhandled one: the operator deletes the StatefulSet and hands
-`<name>-credential-proxy` back to `reconcileCredentialBroker`, and the sandbox's volumes are
-retained, so toggling off and on again returns to the same data and the same host keys. The
-flag is here so this can be rolled out and rolled back one install at a time while it is new.
-The version-control abstraction removes it, along with `shellSandbox.versionControl`,
-`credentialProxyColocated()`, and `spec.security.splitCredentialBrokerPod`.
+**The sandbox is mandatory, and turning it off is refused rather than honoured.**
+`spec.harness.experimental.shellSandbox.enabled: false` puts the `PlatformAgent` Degraded
+with reason `ShellSandboxCannotBeDisabled`; the operator does not silently render the old
+arrangement. This is hardening that removes a capability nobody should have had, and it
+takes nothing away that an installation can do today: the shell still runs, the same
+commands still work, and the credentialed ones still reach the same identities through the
+broker.
 
-Be clear about what turning it off returns you to, because it is not the previous
-arrangement. The agent image no longer carries `kubectl`, `gcloud`, `gh`, or `git`, and it no
-longer carries the four credential-proxy shims that used to stand in for them; the agent-pod
-code that called one directly now goes through `sandbox_exec.py` over SSH. So with the flag
-off and this image running, the model's shell is back in the agent pod and every credentialed
-command in it answers "command not found". Rolling the change back means the flag and the
-image together.
+There is no opt-in and no migration flag, because the agent image is the other half of the
+change and it has already moved. It no longer carries `kubectl`, `gcloud`, `gh`, or `git`,
+and it no longer carries the four credential-proxy shims that used to stand in for them;
+the agent-pod code that called one directly now goes through `sandbox_exec.py` over SSH. A
+flag that put the shell back in the agent pod would put it somewhere every credentialed
+command answers "command not found", so the flag could not have meant what it said.
 
-The flag expires rather than becoming a supported choice, and the reason needs stating
-precisely, because the obvious reading of it is wrong. The
-credential proxy already stops the agent from _holding_ a credential, and it does that:
+`spec.security.splitCredentialBrokerPod` is gone as part of the same change — a
+**breaking change** for any install that set it. It named a choice that no longer exists.
+
+The reason the sandbox is not optional needs stating precisely, because the obvious reading
+of it is wrong. The
+credential broker already stops the agent from _holding_ a credential, and it does that:
 there is no token in the agent's environment, no key on its filesystem, and every
 credentialed command goes out through a shim that keeps the secret on the other side. What
-the proxy cannot do is stop a shell in the same pod from **asking Google for a token
-directly**, because that path never goes through the proxy at all. Workload Identity binds
+the broker cannot do is stop a shell in the same pod from **asking Google for a token
+directly**, because that path never goes through the broker at all. Workload Identity binds
 to the pod, so `169.254.169.254` answers every container in it with the platform service
 account, and one `curl` returns a Bearer token good for everything that account can do —
 verified again on a live install while this paragraph was written. [Workload Identity is
@@ -78,11 +85,8 @@ scoped to the pod](#workload-identity-is-scoped-to-the-pod) is the mechanism in 
 is what remains after it.
 
 That is a property of the arrangement rather than of any workload running in it, so no
-amount of hardening inside the agent closes it, and a switch to disable the sandbox is a
-switch to reopen it — the same reasoning as any other hardening that removes a capability
-nobody should have had. Nothing an installation can do today is taken away: the shell still
-runs, the same commands still work, and the credentialed ones still reach the same identities
-through the proxy.
+amount of hardening inside the agent closes it, and a switch to disable the sandbox would be
+a switch to reopen it. That is why the switch is refused rather than offered.
 
 Because an upgrade moves the shell rather than adding a second one, **the files the model
 has already written move with it.** `deploy/shared/sandbox_mirror.py` copies the working
@@ -95,12 +99,11 @@ detail, including the two-level exclusion a leaked token taught us. It is covere
 293 MB across 29 top-level paths copied into the sandbox, 278 entries skipped with a
 recorded reason for each.
 
-A transitional note for anyone reading the code rather than the design: the CRD still
-carries `harness.experimental.shellSandbox.enabled`, and the operator still honours it.
-That flag exists so the sandbox could be rolled out and validated ahead of the
-version-control abstraction it depends on, and it is removed along with the last of the
-in-agent-pod execution path when that lands. Treat it as staging, not as a supported way
-to run without a sandbox.
+A note for anyone reading the code rather than the design: the CRD still carries
+`harness.experimental.shellSandbox.enabled`, but the only value it accepts is true.
+`validateShellSandbox` refuses false, and the field survives so that an install that set it
+gets a named refusal rather than a silently ignored setting. The field itself goes when the
+version-control abstraction lands.
 
 | Layer                          | Where it lives                                                                                                                                                                                                                                                                        |
 | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -125,17 +128,17 @@ to run without a sandbox.
 Each section goes a level deeper than the one before it, so a human reader can
 stop as soon as they have what they came for. An agent should read all of it.
 
-| Section                                             | What it gives you                                                         |
-| --------------------------------------------------- | ------------------------------------------------------------------------- |
-| [Background](#background)                           | the incident, what Hermes offers, and why the credentials cannot stay put |
-| [The decision](#the-decision)                       | what runs the sandbox pod, where the proxy lands, and what was rejected   |
-| [The design](#the-design)                           | a tool call traced end to end, and everything that breaks                 |
-| [Setting up the pool](#setting-up-the-pool)         | the GCP commands an install has to run once                               |
-| [The standalone fallback](#the-standalone-fallback) | what an install without federation gets instead                           |
-| [The Session KV store](#the-session-kv-store)       | Part A, and why the shell move does not fully replace it                  |
-| [Prerequisites](#prerequisites)                     | what has to land first, including one known blocker                       |
-| [What is still unproven](#what-is-still-unproven)   | the open questions, and what ships while each stays open                  |
-| [Related work](#related-work)                       | the overlapping pull requests and issues, and how each relates            |
+| Section                                                                           | What it gives you                                                         |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| [Background](#background)                                                         | the incident, what Hermes offers, and why the credentials cannot stay put |
+| [The decision](#the-decision)                                                     | what runs the sandbox pod, where the proxy lands, and what was rejected   |
+| [The design](#the-design)                                                         | a tool call traced end to end, and everything that breaks                 |
+| [Setting up the pool](#setting-up-the-pool)                                       | the GCP commands an install has to run once                               |
+| [What federation leaves open](#what-an-install-without-federation-still-has-open) | what an install without federation still has open                         |
+| [The Session KV store](#the-session-kv-store)                                     | Part A, and why the shell move does not fully replace it                  |
+| [Prerequisites](#prerequisites)                                                   | what has to land first, including one known blocker                       |
+| [What is still unproven](#what-is-still-unproven)                                 | the open questions, and what ships while each stays open                  |
+| [Related work](#related-work)                                                     | the overlapping pull requests and issues, and how each relates            |
 
 ---
 
@@ -255,7 +258,7 @@ creates the working directory and recovers the two `HERMES_KANBAN_*` variables t
 path can yield; the [skills tree is baked](#what-the-sandbox-needs-and-where-it-comes-from)
 into the image rather than left to the backend's profile-unaware sync; and workers use
 `kanban_attach` in place of declared artifacts. None of them are in Hermes source — see
-[Two problems deferred](#two-problems-deferred-and-what-has-already-been-ruled-out-for-them)
+[Three problems deferred](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
 for why the repository takes the parsing risk instead of a patch.
 
 The cost is functionality, not isolation. Every one of these failures is a command that
@@ -460,45 +463,69 @@ narrower the interface, the fewer assumptions travel across it. What such a harn
 still need to supply is the credential proxy's client side, which is a shim on `PATH` and
 an HTTP endpoint, not a code dependency.
 
-### The credential proxy is a container of that StatefulSet, and the pod is unbound
+### The credential broker is a Deployment of its own, and the sandbox pod is unbound
 
 Three parts:
 
-1. The sandbox pod's ServiceAccount carries no `iam.gke.io/gcp-service-account`
-   annotation. The metadata server then hands both containers the unbound
-   `<project>.svc.id.goog` principal, which IAM grants nothing.
-2. An audience-scoped projected service-account token is mounted into the proxy container
-   only, at `/var/run/secrets/kubeagents/wif/token`.
-3. The proxy exchanges that token for a GCP access token through Workload Identity
-   Federation, whose credential source is a **file path** rather than the metadata server,
-   then impersonates the existing GSA.
+1. The sandbox pod's ServiceAccount, `<agent>-shell`, carries no
+   `iam.gke.io/gcp-service-account` annotation. The metadata server then hands it the
+   unbound `<project>.svc.id.goog` principal, which IAM grants nothing, and
+   `automountServiceAccountToken` is false besides.
+2. The broker runs as `<agent>-credential-proxy`, its own Deployment, reached over a
+   ClusterIP Service. Nothing in that pod executes anything the model wrote, and neither
+   pod that calls it can see inside it.
+3. Optionally, an audience-scoped projected token at
+   `/var/run/secrets/kubeagents/wif/token`, mounted into the broker's pod alone and
+   exchanged through Workload Identity Federation — whose credential source is a **file
+   path** rather than the metadata server — for an impersonation of the existing GSA.
+   Configured through `spec.security.workloadIdentityFederation`; absent, the broker uses
+   the metadata server and the shared ServiceAccount, which the gateway also runs as.
 
-`shareProcessNamespace` stays `false`, pinned in `buildShellSandboxStatefulSet` and
-asserted by a test. It is load-bearing: with it true, `/proc/<pid>/root` and
-`/proc/<pid>/environ` reach into the proxy container's mount namespace and the file
-boundary this rests on is gone. The gateway pod sets it true, which is a finding of its
-own and is tracked outside this document.
+`shareProcessNamespace` stays `false` on the sandbox StatefulSet, pinned in
+`buildShellSandboxStatefulSet` and asserted by a test. With the broker in a pod of its own
+it no longer guards a credential, but it still separates the model's shell from the
+sandbox's own supervision, and turning it on would be a regression nobody meant to make.
 
 The success criterion is that **the pod running the agent's shell has no cloud identity
-worth stealing**. Removing the identity is what meets it; moving the proxy to a pod of its
-own does not, because the pod the shell lands in would keep one.
+worth stealing**. Removing the identity is what meets it.
 
-#### Why the same pod rather than a pod of its own
+#### Why a pod of its own rather than a container of the sandbox
 
-A separate Deployment satisfies the identity property just as well. It fails on `git`.
+The pod is the smallest thing that has an identity. GKE resolves Workload Identity by pod
+IP, an IAM binding names a Kubernetes ServiceAccount, and a projected token is a pod-level
+volume: nothing in that chain can tell two containers of one pod apart. So a broker
+co-located with the shell is separated from it by the container boundary alone, and a
+container boundary is not where a credential should sit. `shareProcessNamespace: false`,
+the read-only root filesystem, and the mount namespace are each one operator mistake away
+from being undone, and any one of them undone puts `/proc/<pid>/environ` and
+`/proc/<pid>/root` of the broker in front of the model's shell.
 
-`credential_proxy_client.py` sends `cwd` and `kubeconfig` only when
-`shares_filesystem_with_proxy()` says the endpoint is loopback. A cross-pod caller sends
-neither, and the proxy falls back to a workspace directory in its own emptyDir.
-`kubectl get` does not care. `git` does — its state _is_ the working tree — so proxied
-`git` from a separate pod is refused by the lease check, and so is every `kubectl -f FILE`
-write path, because the file is in the caller's filesystem. The sandbox's data volume is a
-ReadWriteOnce claim that only its own pod can mount, so there is no arrangement in which a
-second pod sees that tree.
+Co-location was the earlier answer, and it was chosen for a reason that no longer holds:
+proxied `git` needed a working tree, `kubectl apply -f manifest.yaml` needed the manifest,
+and both were files in the caller's filesystem. The shim forwarded the caller's `cwd`
+alongside them, so the broker could resolve those paths in a volume it also mounted, and
+only a loopback endpoint made that true.
 
-Co-location gives back both: the proxy is on loopback, and it mounts the same data volume
-the shell does. That is the property a sidecar in the agent pod has, without the shared
-cloud identity that comes with it.
+Nothing crosses as a path any more:
+
+- **`cwd` is not sent at all.** `credential_proxy_client.execute` says why — a directory
+  from the caller names either nothing in the broker's filesystem or, worse, a same-named
+  directory of the broker's. Every command runs at the broker's own workspace root.
+- **A kubeconfig crosses as a context name, not a file.** The shim reads `current-context`
+  in its own pod and sends the string; the broker validates it with `parse_gke_context` and
+  regenerates the file itself with `gcloud container clusters get-credentials`. Naming a
+  cluster is not choosing an account: `scoped_sa_pool` maps the name to a service account,
+  and a name with no entry is refused rather than falling back to the wide credential.
+- **A document crosses on fd 0.** `--body-file -` and `kubectl apply -f -` are what a
+  caller writes; `reads_stdin` in the shim matches the flag and forwards the stream.
+- **`git` crosses as content.** The broker owns the only checkout, and the agent hands it
+  `{path, bytes}` and a commit message. That is [Content-passing removes the shared
+  tree](#content-passing-removes-the-shared-tree) below, and it is what removed the last
+  thing a shared volume was for.
+
+Each of those is a smaller interface than the path it replaced — a name the broker
+validates instead of a path it opens — so the split is not a cost the design absorbs. It
+is what made the split available.
 
 #### Denying the route versus removing the identity
 
@@ -607,14 +634,14 @@ no more of a density layer than a `Sandbox` CR.
 credentials, per [Which credentials a sidecar can still
 hold](#which-credentials-a-sidecar-can-still-hold) — which is why the proxy-hardening work
 in flight pairs its namespace hardening with a Pod split rather than relying on it. This
-design keeps the hardening and removes the ADC identity instead.
+design does both: it keeps the hardening, removes the ADC identity from every pod the model
+can reach, and puts the broker in a pod of its own.
 
 **gVisor as the credential boundary.** gVisor's boundary is the host kernel, not the
 network. Its sentry implements the syscall surface, but a socket to `169.254.169.254` is a
 socket, and GKE's metadata server serves it for the pod's IP the same as under runc.
-`runtimeClassName` is pod-scoped besides, so it cannot be applied to one container and not
-the other — it would put the proxy inside the sentry alongside the shell it is supposed to
-be separated from. It buys a different thing entirely, which is worth having and which the
+`runtimeClassName` is pod-scoped besides, so it grades a whole pod or none of it and can
+never be the line between the shell and a credential. It buys a different thing entirely, which is worth having and which the
 sandbox now ships as an opt-in: see [Running the sandbox under
 gVisor](#running-the-sandbox-under-gvisor).
 
@@ -623,8 +650,8 @@ everything else in the network namespace, so it denies the proxy at the same tim
 does nothing wherever the CNI is not enforcing NetworkPolicy.
 
 **GKE metadata concealment.** Node-scoped, and deprecated in favour of Workload Identity.
-It would also break the proxy in the standalone placement, which still reads the metadata
-server.
+It would also break the broker on an install without federation, which still reads the
+metadata server.
 
 **`automountServiceAccountToken: false` alone.** Already set, and orthogonal: it withholds
 the Kubernetes API token, not the cloud one. GKE's Workload Identity path does not read
@@ -659,13 +686,13 @@ per-agent is the natural grain.
 
 ### What sandboxing does and does not close
 
-| Incident step                        | Closed by the sandbox?                                                    |
-| ------------------------------------ | ------------------------------------------------------------------------- |
-| 2 — `sqlite3` on the session DB      | Yes, if the DB volume is not mounted into the sandbox                     |
-| 3 — editing the harness working tree | Yes — the tree is not there                                               |
-| 4 — writing Hermes `config.yaml`     | Yes; `config.yaml` is not in the sync set (see below)                     |
-| 5 — restarting its own process       | Yes — the process is in another pod                                       |
-| Credential exfiltration              | Only with the proxy co-located and the pod unbound, per the section above |
+| Incident step                        | Closed by the sandbox?                                                |
+| ------------------------------------ | --------------------------------------------------------------------- |
+| 2 — `sqlite3` on the session DB      | Yes, if the DB volume is not mounted into the sandbox                 |
+| 3 — editing the harness working tree | Yes — the tree is not there                                           |
+| 4 — writing Hermes `config.yaml`     | Yes; `config.yaml` is not in the sync set (see below)                 |
+| 5 — restarting its own process       | Yes — the process is in another pod                                   |
+| Credential exfiltration              | Closed: the broker is a pod of its own and the sandbox pod is unbound |
 
 ### The residual channel: `sync_back`
 
@@ -720,46 +747,57 @@ notice. And an install that runs a different sandbox image gets the default
 behaviour back; the closure is a property of the image, not of the operator's
 reconciliation.
 
-### What co-location costs
+### What the split ends, and what it does not
 
-**The shell container inherits the proxy's egress.** A NetworkPolicy applies to the pod,
-so the rules that let the proxy reach STS, IAM, the Kubernetes API and
-`github-token-minter` also let the shell reach them. There is no way to narrow that while
-the two share a network namespace. What makes it acceptable is that reach is not
-possession: the shell arrives at those endpoints with the unbound `<project>.svc.id.goog`
-principal and no bearer token, and every one of them rejects it.
-`buildShellSandboxNetworkPolicy` excludes RFC1918 space and `169.254.169.254/32` from the
-`0.0.0.0/0:443` rule so the widened egress does not become in-cluster reach.
+The co-located design cost three things, and putting the broker in a pod of its own ends
+each of them.
 
-**Both containers run as uid 1000.** Required for the shared working tree, and the reason
-`shareProcessNamespace` has to stay false rather than merely defaulting to it.
+**The shell no longer inherits the broker's egress.** A NetworkPolicy applies to a pod, so
+while the two shared one, the rules that let the broker reach STS, IAM, the Kubernetes API
+and `github-token-minter` let the model's shell reach them too, and there was no way to
+narrow that inside a shared network namespace. Separate pods get separate policies. The
+sandbox's is the narrow one; `buildShellSandboxNetworkPolicy` still excludes RFC1918 space
+and `169.254.169.254/32` from its `0.0.0.0/0:443` rule, so a widened egress rule cannot
+become in-cluster reach.
 
-**Git hooks execute next to the credentials.** A shared writable tree means the shell can
-write `.git/hooks/pre-commit` and the proxy will run it during a proxied `git commit`,
-inside the container that holds the token. The proxy pins `core.hooksPath=/dev/null` and
-`protocol.ext.allow=never` through
-`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, sets `GIT_CONFIG_NOSYSTEM=1`,
-and refuses any argv that tries to override either key with `-c` or `--config-env` — the
-command line outranks the environment form, so the argv guard is not redundant.
-`GIT_CONFIG_GLOBAL` is deliberately left alone: the proxy's own author identity lives
-there. Those pins close the routes they name and cannot close the class, because the class is
-"anything `.git/config` can make git execute" and it does not enumerate. What closes it is the
-agent not having a `.git` at all — see
-[Content-passing removes the shared tree](#content-passing-removes-the-shared-tree), which is
-partly delivered: the two write skills have migrated, the volume is still mounted for the
-skills that have not.
+**The two workloads no longer have to agree on a uid.** Sharing a working tree meant
+sharing a user, which is why `shareProcessNamespace: false` had to be pinned rather than
+merely defaulted. With no shared tree the broker runs as its own non-root user and nothing
+about the sandbox's uid constrains it.
 
-**Every install needs a Workload Identity pool.** Three `gcloud` commands, below, that no
-install surface runs.
+**Git hooks no longer execute next to the credentials.** A shared writable tree meant the
+shell could write `.git/hooks/pre-commit` and the broker would run it during a proxied
+`git commit`, inside the container holding the token. The agent has no `.git` at all now —
+see [Content-passing removes the shared tree](#content-passing-removes-the-shared-tree) —
+so there is no tree to plant a hook in. The broker keeps its pins as defence in depth:
+`core.hooksPath=/dev/null` and `protocol.ext.allow=never` through
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, `GIT_CONFIG_NOSYSTEM=1`, and a
+refusal of any argv overriding either key with `-c` or `--config-env`, because the command
+line outranks the environment form. `GIT_CONFIG_GLOBAL` is deliberately left alone: the
+broker's own author identity lives there. Those pins close the routes they name and never
+could close the class, which is "anything `.git/config` can make git execute" and does not
+enumerate; removing the tree is what closes the class.
+
+What the split does not end is the extra hop. Every proxied command now crosses a Service
+rather than loopback, so a broker that is down is a broker the sandbox cannot reach and the
+command fails rather than degrading. That is the intended behaviour — a broker the sandbox
+cannot reach is a credential it must not proceed without — but it is a failure mode a
+co-located broker did not have.
+
+The Workload Identity pool the co-located design required of every install is now optional.
+The broker's own ServiceAccount can be bound the ordinary way; federation is hardening on
+top, for an install that wants the credential source to be a file rather than the metadata
+server.
 
 ### Where the install surfaces stand
 
-The Helm chart expresses both halves: `platformAgent.harness.experimental.shellSandbox`
-and `platformAgent.security.workloadIdentityFederation`. It refuses a half-filled
-federation block and refuses federation without the sandbox, rather than letting the
-operator's fail-safe silently keep the proxy on the metadata server — an install that
-asked for federation and did not get it has no symptom except a placement nobody looks at.
-The Terraform composition reaches the same values through `extra_helm_values`.
+The Helm chart expresses federation through
+`platformAgent.security.workloadIdentityFederation`, and refuses a half-filled block rather
+than letting the operator's fail-safe silently keep the broker on the metadata server — an
+install that asked for federation and did not get it has no symptom anyone looks at. The
+sandbox has no chart switch to express: it is unconditional, and the operator refuses a CR
+that tries to disable it. The Terraform composition reaches the federation values through
+`extra_helm_values`.
 
 What no surface does is **create the Workload Identity pool**: a knob the config layer owns
 and the infrastructure layer does not. The chart README lists it under the knobs that need
@@ -785,19 +823,20 @@ for installs that already pass `--gvisor`.
 
 ### Topology
 
-Two pods per agent instead of one:
+Three pods per agent instead of one:
 
 - **the agent pod** — Hermes, the gateway, the plugins, the cron scripts, the MCP server.
-  No shell of consequence, and no cloud identity that anything in it uses.
-- **the sandbox pod** — two containers sharing a data volume and a loopback interface, and
-  nothing else. One runs `sshd`, a durable `/opt/data`, the agent's tools and the
-  credential-proxy shims; the other is the credential proxy, holding the credentials and
-  running the credentialed commands. The shell container has no Kubernetes
-  service-account token, no real `kubectl`, and no identity the metadata server will
-  answer for.
+  No shell of consequence, and nothing in it that reaches the credential broker.
+- **the sandbox pod** — `sshd`, a durable `/opt/data`, the agent's tools and the
+  credential-proxy shims. This is the pod that runs code the model wrote. It has no
+  Kubernetes service-account token, no real `kubectl`, and no identity the metadata server
+  will answer for.
+- **the credential broker pod** — a Deployment of its own, reached over a ClusterIP
+  Service. It holds the credentials and runs the credentialed commands, and nothing in it
+  executes anything the model wrote.
 
-An install without federation has a third pod, the standalone proxy Deployment — see
-[The standalone fallback](#the-standalone-fallback).
+The broker is always its own pod. See
+[Why a pod of its own rather than a container of the sandbox](#why-a-pod-of-its-own-rather-than-a-container-of-the-sandbox).
 
 ### The sandbox workload
 
@@ -833,17 +872,16 @@ Five fields carry an argument rather than a default:
 - **`CREDENTIAL_PROXY_URL`, and nothing else, from the pod environment.** The image's
   entrypoint forwards an allowlist into the SSH session, because sshd does not pass
   its own environment to sessions. See
-  [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh). Co-located, the
-  value is `127.0.0.1:8765` again, from `credentialProxySandboxURL`.
+  [`deploy/sandbox/entrypoint.sh`](../../deploy/sandbox/entrypoint.sh). The value is the
+  broker's ClusterIP Service, from `credentialProxySandboxURL`.
 
 The ServiceAccount is the pod's identity and not a credential: it carries no annotation,
 so the metadata server answers every container in the pod with a principal IAM grants
 nothing, and `automountServiceAccountToken` is false on both the ServiceAccount and the
-pod. Notably absent from the shell container is any Role, any projected token, and any
-Secret other than the public half of the agent's SSH key. The proxy container's federation
-token is a volume of its own, mounted there and nowhere else. If a future change needs one
-of those in the shell container, that is the boundary moving, and it should be argued for
-here first.
+pod. Notably absent from this pod is any Role, any projected token, and any Secret other
+than the public half of the agent's SSH key — the broker's credentials are in the broker's
+own pod, which this one reaches only over HTTP. If a future change needs one of those in
+the sandbox, that is the boundary moving, and it should be argued for here first.
 
 ### Running the sandbox under gVisor
 
@@ -1592,9 +1630,7 @@ script under `github-issue-resolver/scripts/`, which Hermes' sync already places
 sandbox — so the split is one function, `run_resolver_poll`, becoming an `ssh` call.
 That split is now the smaller half of what has already happened. `resolver.py` reaches
 `gh` through `sandbox_exec.run`, so every `gh` call the poll makes executes in the
-sandbox today; what is left to move is the script around them. It waits on a working
-`gh` in the sandbox, which is what a co-located proxy provides — the next section states
-the cost of the interval before it.
+sandbox today; what is left to move is the script around them.
 
 #### Nothing collects the sandbox's finished workspaces, so a cron job does
 
@@ -1692,28 +1728,24 @@ it is false and `run()` executes locally.
 command's working directory to `CREDENTIAL_PROXY_WORKSPACE_ROOT` and re-runs it on the
 proxy's own filesystem, so a `git` in the sandbox image would need the proxy to see the
 same tree. It was removed rather than left as the one credentialed binary in the container
-this section exists to disarm, and the shim replaces it once the proxy is a container of
-the same pod.
+this section exists to disarm, and the shim replaces it.
 
-**What that costs on an install without federation.** The sandbox image ships the four
-proxy shims at `/opt/credential-proxy/bin/` and the entrypoint puts that directory first on
-`PATH`. They resolve and reach the broker at either placement: `buildShellSandboxStatefulSet`
-is handed `credentialProxySandboxURL`, which is loopback when the proxy is a container of
-this pod and the proxy's Service otherwise, so `CREDENTIAL_PROXY_URL` is set either way.
+**How a shim reaches a broker in another pod.** The sandbox image ships the four proxy
+shims at `/opt/credential-proxy/bin/` and the entrypoint puts that directory first on
+`PATH`. `buildShellSandboxStatefulSet` is handed `credentialProxySandboxURL` — the broker's
+ClusterIP Service — and sets `CREDENTIAL_PROXY_URL` from it.
 
-What the standalone placement costs is not reachability but context. `shares_filesystem_with_proxy`
-keys on the endpoint being a loopback host, and only then does the shim forward the caller's
-`cwd` and `kubeconfig`; across the Service the proxy sees neither the directory the command
-ran in nor the files the agent just wrote. Calls that are wholly described by their argv still
-work — a read-only `kubectl get`, a `gcloud` query, a `gh api` — while the ones that are not
-do not: shim-`git` has no tree to act on, and `kubectl apply -f manifest.yaml` cannot find the
-manifest. Co-location is what returns those, and it is the constraint
-[The standalone fallback](#the-standalone-fallback) exists to describe.
+Nothing in a request names a path in the caller's filesystem, which is what makes the hop
+survivable. `cwd` is not sent at all; a kubeconfig crosses as a context name the broker
+validates and regenerates; a document crosses on fd 0, so `kubectl apply -f -` and
+`gh pr comment --body-file -` work unchanged. What does not survive is a path: `kubectl
+apply -f manifest.yaml` names a file only the sandbox can open, and the caller has to pipe
+it instead.
 
-`git` and `gh` are the two the coming version-control abstraction takes back, by moving
-history over the broker's HTTP API as a bundle rather than over a shared volume. That
-removes the context dependency for the version-control paths specifically, and so removes
-the reason those paths need co-location; `gcloud` and `kubectl` keep the shim either way.
+`git` is the one that needed more than a pipe, and content-passing is the answer — the
+broker owns the only checkout and the agent hands it `{path, bytes}` rather than committing
+in a tree of its own. The coming version-control abstraction finishes that by moving
+history over the broker's HTTP API as a bundle. `gcloud` and `kubectl` keep the shim.
 
 Agent-side callers reach the tooling the same way everything else in this section does —
 by executing in the sandbox over SSH. `platform_mcp_server.py` (11 sites),
@@ -1750,18 +1782,17 @@ legitimately posts there. Reaching it requires arbitrary code execution in that 
 with the shell, the file tools and `execute_code` all in the sandbox the model has no path
 to that. What is left in the agent pod is trusted code: the MCP server, the cron scripts,
 the gateway. The point of the proxy is that raw credentials never reach the agent, not
-that no process can invoke a command, so this is the property that matters. Co-locating
-the proxy with the sandbox settles the rest of it: the exec listener is then on the
-sandbox pod's loopback, and the agent pod has no route to it at all.
+that no process can invoke a command, so this is the property that matters. What settles
+the rest of it is per-caller authentication: the broker is in a pod of its own, both
+callers reach it over a Service, and neither gets in without a bearer token.
 
-One entanglement moves with the proxy. `gcloud container clusters get-credentials` writes
-a kubeconfig that the proxy validates with `_within_workspace`
-(`credential_proxy.py:1044`), which needs proxy and caller to see the same file. `/opt/data`
-mounted `rw` into the gateway container and a sidecar is what used to make that true, and
-a `ReadWriteOnce` PVC cannot be stretched across two pods to keep it. Co-location restores
-it on the sandbox's own data volume, mounted into the shell container and the proxy
-container alike — which is the same fact that makes proxied `git` work, stated for
-`kubectl`.
+The kubeconfig entanglement that used to argue for a shared volume is gone. `gcloud
+container clusters get-credentials` writes a kubeconfig, and the broker used to validate
+the caller's copy with `_within_workspace`, which needed both to see the same file. Now the
+caller sends a context _name_ and the broker regenerates the file itself; the response
+carries the kubeconfig back when the caller asked for one. Nothing about it needs a volume
+the two pods share — which is the same fact that makes content-passing `git` work, stated
+for `kubectl`.
 
 #### The SSH principal cannot be the shell user
 
@@ -1993,7 +2024,7 @@ whose scope rule matches on `assertion.email`, and the broker answers with a
 repository-scoped installation token. Under the metadata server `gcloud auth
 print-identity-token` mints that ID token. Under an `external_account` credential the same
 command refuses outright — _Invalid account type for `--audiences`. Requires valid service
-account._ — so the co-located proxy could reach GCP and not GitHub, which surfaces as
+account._ — so a federated broker could reach GCP and not GitHub, which surfaces as
 `could not read Username for 'https://github.com'` from a `git` that never had a
 credential helper configured.
 
@@ -2039,7 +2070,7 @@ the variable gone from the gateway and no `gcloud` in the agent image, both bran
 now dead and the job fails with `No such file or directory: 'gcloud'`. On the reference
 install this surfaced as the shipped GitHub repo watcher failing on every ten-minute tick
 from the moment these images went live. Model-driven crons are unaffected: their shell work
-runs on the sandbox terminal backend, where the proxy is co-located and answers on loopback.
+runs on the sandbox terminal backend, where the shims reach the broker's Service.
 
 Restoring `CREDENTIAL_PROXY_URL` on the gateway would fix it and undo the change — it puts a
 credential path back in the pod this design exists to empty. The fix is to give the
@@ -2050,21 +2081,26 @@ restricted to work that needs none. That is not implemented here.
 
 ### Caller authentication
 
-Co-located, the exec path is back on `127.0.0.1:8765` and needs no bearer token: the one
-caller that can reach it is the container it exists to serve.
+Every caller is now remote, so nothing on the exec path is protected by being on loopback.
+The broker listens on `0.0.0.0` behind a ClusterIP, and both the sandbox and the gateway
+dial the Service by name.
 
-The proxy Service keeps its name and port across both placements, with only its selector
-swinging to the sandbox pod, because the gateway's relay clients dial it by name and
-should not have to know where the relays run.
+What replaced the loopback listener and the `0600` socket is a projected ServiceAccount
+token: audience `kubeagents-credential-proxy`, one hour, presented as a bearer header and
+verified with a `TokenReview` against the API server. Every path except `/healthz` requires
+it, and an unidentified caller gets an undifferentiated `401` rather than a reason.
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the two TokenReview usernames the broker will
+serve — the sandbox's ServiceAccount, which is where every credentialed command originates,
+and the gateway's, because the chat relays go through the same listener. The operator grants
+the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
-In the standalone fallback the exec path is on `0.0.0.0` behind a ClusterIP with nothing in
-front of it. A bearer token mirroring `API_SERVER_EXTERNAL_KEY` is the fix and is not
-implemented; the NetworkPolicy that ships instead is inert on a cluster that does not
-enforce policy (`addonsConfig.networkPolicyConfig.disabled: true`, no Dataplane V2). Be
-precise about
-what a bearer token would buy in any case: it is a **multi-tenancy control** that stops
-another workload borrowing the agent's credentials, and not an agent-containment control,
-because the agent's shell legitimately holds it.
+Be precise about what this buys: it is a **multi-tenancy control** that stops another
+workload in the cluster borrowing the agent's credentials, and not an agent-containment
+control, because the agent's shell legitimately holds a token. It records the principal and
+nothing yet varies on it, so it cannot tell the gateway from the sandbox at the policy
+layer. The token crosses the cluster network in cleartext, exactly as the Minty call does,
+so anyone who can observe pod-to-pod traffic in the namespace can replay it until it
+expires. mTLS is the fix and is not deployed.
 
 ### The relay path
 
@@ -2074,22 +2110,24 @@ Both Google Chat directions are gateway-initiated pulls against `/v1/chat/events
 relay, so moving the relay out of the gateway pod does not reverse the direction of any
 connection.
 
-### The workspace check
+### The workspace check, and why the `cwd` stopped being sent
 
-`credential_proxy_client.py` posts `"cwd": os.getcwd()` on every request, and the proxy
-refuses any cwd outside `CREDENTIAL_PROXY_WORKSPACE_ROOT`. That assumes proxy and caller
-see the same filesystem, and co-location is what makes it true again — the two containers
-mount the same data volume, and `shares_filesystem_with_proxy()` sends the `cwd` and
-`kubeconfig` because the endpoint is loopback.
+The shim used to post `"cwd": os.getcwd()` on every request, and the broker refused any cwd
+outside `CREDENTIAL_PROXY_WORKSPACE_ROOT`. That assumed broker and caller saw the same
+filesystem. They do not, so the field is gone: a directory sent from the sandbox names
+either nothing in the broker's filesystem or, worse, a same-named directory of the
+broker's, and the second is the dangerous one. Every command now runs at the broker's own
+workspace root.
 
-The `cwd` is **self-reported by the caller**. It is a guardrail against the agent wandering
-out of its workspace by accident, not a control against one that intends to. Anything
-relying on it as a security boundary should stop.
+Losing the check costs nothing, because it was never a control. The `cwd` was
+**self-reported by the caller** — a guardrail against the agent wandering out of its
+workspace by accident, not against one that intended to. Anything that relied on it as a
+security boundary was already wrong.
 
 ### Content-passing removes the shared tree
 
-The shared writable tree is what
-[What co-location costs](#what-co-location-costs) is mostly about. The agent writes
+The shared writable tree is what [What the split ends, and what it does
+not](#what-the-split-ends-and-what-it-does-not) is mostly about. The agent writes
 `.git/hooks/pre-commit`, the broker runs `git commit` in that tree, and the hook executes in
 the container holding the token. The proxy answers by pinning `core.hooksPath=/dev/null` and
 `protocol.ext.allow=never` and refusing an argv that overrides either — which closes the two
@@ -2210,10 +2248,9 @@ the wrong answer.
 ### One replica
 
 The Slack relay holds a socket-mode WebSocket. Two replicas means two connections and
-duplicate event delivery. The sandbox StatefulSet is one replica per agent, so co-location
-satisfies this by construction; the standalone Deployment pins it explicitly. Either way
-the credential broker cannot be made highly available while it is fused with an inbound
-event pump, and splitting them is the obvious follow-up.
+duplicate event delivery, so the broker Deployment pins `replicas: 1`. The credential
+broker cannot be made highly available while it is fused with an inbound event pump, and
+splitting the two is the obvious follow-up.
 
 ### The proxy image is not the agent image
 
@@ -2238,31 +2275,33 @@ should come to rely on.
 
 ### Names and selectors
 
-The standalone Deployment and the Service are called `<agent>-credential-proxy`, which an
-earlier standalone proxy also used, so an upgrade meets objects that already exist under
-those names. A Deployment's `spec.selector` is immutable, so `credentialProxySelector`
-reproduces the labels those objects carry rather than a fresh set, and the legacy-cleanup
-list must not name either object — deleting them each pass tears down the pod the same
-reconcile applied.
+The broker's Deployment and Service are called `<agent>-credential-proxy`, which an earlier
+standalone proxy also used, so an upgrade meets objects that already exist under those
+names. A Deployment's `spec.selector` is immutable, so `credentialProxySelector` reproduces
+the labels those objects carry rather than a fresh set, and the legacy-cleanup list must not
+name either object — deleting them each pass tears down the pod the same reconcile applied.
 
 The same immutability is why the sandbox StatefulSet's `spec.selector` does not gain a
 `has-credential-proxy` label. That label goes on the pod template alone, as a superset of
-the selector, so turning federation on does not require the StatefulSet to be deleted
-first.
+the selector, so a CR edit that touches the broker does not require the StatefulSet to be
+deleted first.
 
-### Switching placements
+### Turning federation on and off
 
-`credentialProxyColocated` is read fresh each reconcile, so a CR edit moves the proxy.
-Turning federation on swings the Service selector to the sandbox pod, adds the container
-and its two volumes to the StatefulSet, and deletes the standalone Deployment and its
-NetworkPolicy; turning it off does the reverse. The sandbox is reconciled before the proxy
-so the new container exists before the old Deployment is removed, and
-`deleteStandaloneCredentialProxy` skips objects the operator does not own.
+`spec.security.workloadIdentityFederation` is read fresh each reconcile, and it moves
+nothing: the broker is in the same pod either way. What changes is the credential source —
+the projected token volume and the `GOOGLE_APPLICATION_CREDENTIALS` pointing at it appear
+or disappear on the broker's pod template, and the Deployment rolls. A half-filled block is
+treated as absent, so an install that sets an audience without a service-account email gets
+the metadata-server path rather than a broker that cannot authenticate.
 
 ---
 
 ## Setting up the pool
 
+Federation is optional hardening, not a prerequisite: the broker reaches the metadata
+server through its ServiceAccount without it. Configure it when you want the broker's
+credential source to be a file in its own pod rather than an identity a second pod shares.
 Three commands, run once per install, before the chart values that turn federation on.
 Nothing in the Helm chart, the Terraform modules, or `k8s-operator/scripts/` runs them —
 see [Where the install surfaces stand](#where-the-install-surfaces-stand).
@@ -2272,7 +2311,10 @@ PROJECT_ID=<project>
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
 CLUSTER=<cluster>            # the cluster the agent runs in
 NAMESPACE=kubeagents-system
-AGENT=<platformagent name>   # the sandbox KSA is <name>-shell
+# The broker runs as spec.security.serviceAccountName, defaulting to the
+# PlatformAgent's own name -- not the sandbox KSA, which is <name>-shell and is
+# deliberately bound to nothing.
+BROKER_KSA=<platformagent name>
 GSA=kubeagents-platform-gsa@"$PROJECT_ID".iam.gserviceaccount.com
 
 # 1. A pool, and a provider trusting the cluster's OIDC issuer. --allowed-audiences
@@ -2296,17 +2338,13 @@ gcloud iam workload-identity-pools providers create-oidc "$CLUSTER" \
 #    token is system:serviceaccount:<namespace>:<ksa>.
 gcloud iam service-accounts add-iam-policy-binding "$GSA" \
   --project="$PROJECT_ID" --role=roles/iam.workloadIdentityUser \
-  --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/kubeagents/subject/system:serviceaccount:${NAMESPACE}:${AGENT}-shell"
+  --member="principal://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/kubeagents/subject/system:serviceaccount:${NAMESPACE}:${BROKER_KSA}"
 ```
 
 Then the chart values:
 
 ```yaml
 platformAgent:
-  harness:
-    experimental:
-      shellSandbox:
-        enabled: true
   security:
     workloadIdentityFederation:
       audience: //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/kubeagents/providers/<cluster>
@@ -2329,29 +2367,25 @@ cover.
 
 ---
 
-## The standalone fallback
+## What an install without federation still has open
 
-Without a complete `workloadIdentityFederation` block the proxy is not co-located: it runs
-in a Deployment of its own on `kubeagents-platform-agent`, and reads the metadata server.
-That is what an install gets before it configures federation, and the shell is in the
-sandbox either way. Three things this placement does not give you:
+The broker runs in a pod of its own whether or not `workloadIdentityFederation` is
+configured, and the shell is in the sandbox either way. What federation adds is a credential
+source that is a file in the broker's pod rather than the metadata server answering a
+ServiceAccount two pods share. Without it, two things stay open:
 
-**Every pod under that service account keeps a cloud identity.** The gateway pod and the
-proxy pod both run as `kubeagents-platform-agent`, which carries the
-`iam.gke.io/gcp-service-account` annotation, so anything with execution in either can mint
-the GSA's token from `169.254.169.254`. The property this document is about is not
-delivered — the separate pod buys reachability, not isolation.
+**The gateway pod keeps a cloud identity.** The gateway and the broker both run as
+`kubeagents-platform-agent`, which carries the `iam.gke.io/gcp-service-account` annotation,
+so anything with execution in the gateway can mint the GSA's token from
+`169.254.169.254`. The sandbox — the pod running code the model wrote — cannot, which is
+the property this document is about; what is left is trusted code holding more than it
+needs. Two ways to close it: configure federation, or give the broker a ServiceAccount of
+its own and take the annotation off the gateway's. Neither ships today.
 
-**The exec path authenticates no caller.** Envoy binds
-`CREDENTIAL_PROXY_LISTEN_ADDRESS=0.0.0.0` and nothing replaced loopback, so any pod that
-can route to the Service can run a credentialed command. See
-[Caller authentication](#caller-authentication).
-
-**`git` does not work, and neither does `kubectl -f FILE`.** The caller sends no `cwd`, the
-proxy falls back to an emptyDir workspace it alone can see, and the lease check refuses the
-command. This is the constraint co-location exists to remove, and while it holds the
-sandbox's `kubectl`, `gcloud`, `gh` and `git` are either unconfigured or unable to touch a
-working tree.
+**Nothing tells the gateway from the sandbox.** The broker authenticates its callers, but
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names both ServiceAccounts and no policy varies on which
+one presented the token. See [Caller authentication](#caller-authentication). Federation
+does not fix this one.
 
 ---
 
@@ -2419,11 +2453,12 @@ gVisor](#running-the-sandbox-under-gvisor) for what the setting is and is not.
 Agent Sandbox ships a default GKE policy blocking egress to RFC1918, cluster DNS and
 the metadata server. Not taking the CRD means not inheriting that default either, so
 the equivalent is ours to write: deny by default, with holes punched only for cluster
-DNS, 443 off-cluster, and the agent pod's SSH ingress on 2222. That is the
-`NetworkPolicy` in the table above, and it is the one piece of the reversal that is
-genuinely extra work rather than a rename. The proxy needs no hole of its own, because
-co-located it is reached over the pod's loopback; the 443 rule is what its own calls to
-STS, IAM and the Google APIs need, and the shell inherits it.
+DNS, 443 off-cluster, the agent pod's SSH ingress on 2222, and the broker's Service. That
+last hole is what the split adds: the shim reaches the broker over the cluster network
+rather than loopback, so the sandbox's egress policy has to name it. The broker's own pod
+needs 443 for its calls to STS, IAM and the Google APIs, and it gets that separately —
+which is the point, because the sandbox's 443 rule no longer has to be as wide as the
+broker's.
 
 Note that a GKE Standard cluster does **not enforce** NetworkPolicy unless network policy
 or Dataplane V2 is turned on (`addonsConfig.networkPolicyConfig.disabled: true` is the
@@ -2550,11 +2585,11 @@ anyway is in [The Session KV store](#the-session-kv-store).
 - **The version-control abstraction** — the design that follows this one, and the one that
   supersedes its weakest part; its document lands with it. Forge-neutral verbs move
   history as a bundle over HTTP, so the credential runtime no longer needs the caller's
-  `cwd` and stops having to share the sandbox's pod. Splitting it out closes what
-  co-location forces open here: the shared pod IP that makes the sandbox's egress as wide
-  as the proxy's, the pod-scoped `runtimeClassName` that would wrap the proxy in the
-  shell's gVisor sentry, and the mount namespace standing as the only boundary in front of
-  the proxy's kubeconfig and federated token.
+  `cwd`. That is what let the broker leave the sandbox's pod in this change: the shared pod
+  IP that made the sandbox's egress as wide as the broker's, the pod-scoped
+  `runtimeClassName` that would have wrapped the broker in the shell's gVisor sentry, and
+  the mount namespace standing as the only boundary in front of the broker's kubeconfig and
+  federated token are all gone with it.
 - [#962](https://github.com/gke-labs/kube-agents/pull/962) — broker-owned git trees,
   merged. The content-passing half of the same move, and the baseline the abstraction was
   measured against.

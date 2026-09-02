@@ -97,6 +97,11 @@ GH_MISSING_RC = 127
 #: tick's per-job lock open indefinitely.
 GH_TIMEOUT_S = 60
 
+#: The value `gh` reads as "this input file is stdin". The shim decides whether
+#: to forward fd 0 by matching the flag against `STDIN_FILE_FLAGS` and then
+#: checking its value is exactly this, so the two spellings have to agree.
+BODY_STDIN = "-"
+
 #: Page size for the pull-request list. `gh api --paginate` merges the pages
 #: into one JSON array (verified against gh 2.92 on the live install), so this
 #: bounds the number of round trips rather than the number of results — unlike
@@ -261,7 +266,7 @@ class ForgeProvider(Protocol):
 
     def list_comments(self, repo: str, pr: PullRequest) -> list[Comment]: ...
 
-    def post_comment(self, repo: str, pr: PullRequest, body_file: str) -> None: ...
+    def post_comment(self, repo: str, pr: PullRequest, body: str) -> None: ...
 
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
 
@@ -357,7 +362,7 @@ def _parse_repo(configured: str) -> str:
     return repo
 
 
-def run_gh(argv: Sequence[str]) -> subprocess.CompletedProcess:
+def run_gh(argv: Sequence[str], *, stdin: str | None = None) -> subprocess.CompletedProcess:
     """One `gh` invocation, never raising for a non-zero exit.
 
     Callers here always need the reason code more than the exception: a token
@@ -379,11 +384,17 @@ def run_gh(argv: Sequence[str]) -> subprocess.CompletedProcess:
     command that ran and exited non-zero; ssh failing to connect means it never
     ran, and a tick that reports GitHub silence because the transport was down
     is the one failure this whole path must not produce.
+
+    `stdin` carries a document to a command that names `-` as its input file.
+    It is the only way to hand `gh` a multi-thousand-character body from here:
+    a path would name a file in this pod, and `gh` runs in neither this pod nor
+    the one that holds the credential.
     """
     try:
         return sandbox_exec.run(
             ["gh", *argv],
             timeout=GH_TIMEOUT_S,
+            stdin=stdin,
         )
     except FileNotFoundError:
         return subprocess.CompletedProcess(
@@ -433,7 +444,8 @@ class GitHubProvider:
         self._viewer: Optional[str] = None
 
     # -- the seam ---------------------------------------------------------
-    def _call(self, argv: Sequence[str], *, expect_json: bool = True):
+    def _call(self, argv: Sequence[str], *, expect_json: bool = True,
+              stdin: str | None = None):
         """Every forge round trip goes through here. See the module docstring.
 
         Returns parsed JSON, or None for a call made only for its effect. A
@@ -441,7 +453,7 @@ class GitHubProvider:
         a `gh` failure that survived the preflight: the credential works
         somewhere, just not here.
         """
-        result = self._run(list(argv))
+        result = self._run(list(argv), stdin=stdin)
         if result.returncode != 0:
             raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
         if not expect_json:
@@ -649,17 +661,24 @@ class GitHubProvider:
                 line=row.get("line"),
             )
 
-    def post_comment(self, repo: str, pr: PullRequest, body_file: str) -> None:
-        """Post from a file, never from an argv string.
+    def post_comment(self, repo: str, pr: PullRequest, body: str) -> None:
+        """Post from stdin, never from an argv string and never from a path.
 
         The body carries a reviewer's own words back to them and can run to
         thousands of characters; `--body` would put all of that on a command
         line, through a proxy, with the quoting rules of two shells in between.
-        `--body-file` is also what `audit_report.py` and `resolver.py` use.
+
+        `--body-file -` rather than `--body-file /some/path` because there is no
+        path all three processes can see. This call is made in the agent pod,
+        ssh carries it to the sandbox, and the shim forwards it to the broker,
+        which is where `gh` actually runs; the filesystems are three different
+        ones. A byte stream crosses both hops, so the body travels on fd 0.
+        `audit_report.BODY_STDIN` is the same exit taken from the other side.
         """
         self._call(
-            ["pr", "comment", str(pr.number), "-R", repo, "--body-file", body_file],
+            ["pr", "comment", str(pr.number), "-R", repo, "--body-file", BODY_STDIN],
             expect_json=False,
+            stdin=body,
         )
 
     def acknowledge(self, repo: str, comment: Comment) -> bool:

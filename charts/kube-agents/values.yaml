@@ -73,7 +73,8 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, FLUENT_BIT_IMAGE) are
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
+  # FLUENT_BIT_IMAGE) are
   # rendered from global.imageRegistry and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
@@ -390,6 +391,18 @@ fluentBit:
     repository: docker.io/fluent/fluent-bit
     tag: "5.1.1"
 
+# The shell sandbox StatefulSet the operator renders beside every agent pod.
+# Same shape as fluentBit above and for the same reason: the chart never renders
+# the workload itself, it passes the reference to the operator as
+# AGENT_SANDBOX_IMAGE, but the pin has to live somewhere the mirror can be
+# pointed at. Unlike the credential broker — which the operator derives from the
+# agent image by swapping the trailing name — the sandbox is a separate
+# repository built from deploy/sandbox, so it has to be named.
+agentSandbox:
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
+    tag: "" # defaults to Chart.appVersion
+
 platformAgent:
   enabled: true
   name: platform-agent
@@ -421,12 +434,18 @@ platformAgent:
     # releases, and an install that sets one is expected to re-check it at every
     # upgrade. The CRD says the same in ExperimentalSpec.
     experimental:
-      # Moves the agent's shell into a pod of its own (#737 Part B), reached
-      # over SSH with the keypair in credentials.secretName. Off by default.
+      # The agent's shell runs in a pod of its own (#737 Part B), reached over
+      # SSH with the keypair in credentials.secretName.
       shellSandbox:
-        enabled: null # CRD default: false
-        # Overrides the sandbox image. Empty takes the operator's default,
-        # which comes from the same tag inventory as every other image.
+        # Not a toggle. The operator refuses `false` with
+        # Degraded/ShellSandboxCannotBeDisabled, and this chart fails at
+        # template time rather than installing something that will sit
+        # Degraded. Leave it null; set it true only to say so explicitly.
+        enabled: null # always on
+        # Overrides the sandbox image for this agent only. Empty takes the
+        # operator's AGENT_SANDBOX_IMAGE, which this chart sets from the
+        # agentSandbox block below — so a mirrored install needs the mirror
+        # pointed at that block, not at this key.
         image: ""
         # Runs the sandbox pod under a sandboxed container runtime — `gvisor`
         # on GKE. Empty leaves the node's default runtime, which is what every
@@ -444,12 +463,6 @@ platformAgent:
         # reports Degraded rather than leaving the pod Pending if the named
         # class does not exist.
         runtimeClassName: ""
-        # Makes the GitHub-writing skills hand the credential proxy file
-        # content and a commit message instead of a directory both containers
-        # mount, so the agent never holds a `.git` and cannot reach git's
-        # config-driven exec surface. The proxy keeps the checkout on its own
-        # state volume. Off by default; the directory path keeps working beside
-        # it, and a skill picks one per run by probing the proxy.
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent
@@ -575,17 +588,18 @@ platformAgent:
     # metadata server, which is what lets it run beside the shell sandbox.
     #
     # GKE resolves Workload Identity by POD IP, so every container in a pod
-    # shares one cloud identity: a proxy sitting next to the agent's shell under
-    # plain Workload Identity would let that shell mint the proxy's tokens
-    # straight from 169.254.169.254, with no policy layer in between. Federation
-    # replaces that with a projected token mounted into the proxy container
-    # alone. Mounts are per-container where pod identity is not.
+    # shares one cloud identity: the broker's pod and the gateway's pod both run
+    # as the annotated KSA, so anything with execution in the gateway can mint
+    # the GSA's token straight from 169.254.169.254, with no policy layer in
+    # between. Federation replaces that with a projected token mounted into the
+    # broker's pod alone, whose credential source is a file rather than the
+    # metadata server. The shell sandbox pod is already unbound and needs none
+    # of this.
     #
     # Set both fields or neither — the operator reads a half-filled block as
-    # absent, and the chart refuses it outright. Setting them without
-    # harness.experimental.shellSandbox.enabled leaves the proxy in its own
-    # Deployment on the metadata server, which is the default arrangement, so
-    # the chart refuses that combination too.
+    # absent, and the chart refuses it outright. Leaving them empty is
+    # supported: the broker then reads the metadata server as the ServiceAccount
+    # the gateway also runs as, which is the gap federation closes.
     #
     # NOTHING CREATES THE POOL. Neither this chart, the Terraform modules, nor
     # the provisioning scripts run the three gcloud commands; they are in

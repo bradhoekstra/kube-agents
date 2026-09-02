@@ -60,10 +60,11 @@ import logging
 import os
 import re
 import threading
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
+
+import workspace_paths
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -127,7 +128,6 @@ _ANY_HANDLE_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 # keeps it off the tail of a ref -- `origin/main` and `refs/heads/x` are not
 # paths and must survive, since they are most of what a git error is about.
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w/])/(?:[\w.@+-]+/)*[\w.@+-]+")
-_GIT_SHORTNAME_RE = re.compile(r"\Agit~[0-9]+\Z", re.IGNORECASE)
 
 
 class ContentWorkspaceError(Exception):
@@ -228,26 +228,11 @@ def _tree_bytes(path: Path) -> int:
 def _looks_like_dot_git(component: str) -> bool:
     """Every spelling git itself treats as `.git`, and a few it does not.
 
-    git refuses `.git` in a tree under several equivalences, because the
-    filesystems it runs on disagree about what a name is: NTFS strips trailing
-    dots and spaces and offers the 8.3 shortname `GIT~1`, HFS+ ignores a set of
-    zero-width codepoints inside a name. `is_ntfs_dotgit` and `is_hfs_dotgit` in
-    git's own source are the reference.
-
-    This is deliberately *stricter* than git. Refusing a manifest that happens
-    to be called `.git.` costs nothing — no such file exists in a GitOps
-    repository — while matching git's rule exactly would mean reimplementing two
-    of its parsers and betting they agree with the version in the image. That
-    bet is the one this project keeps losing.
+    `workspace_paths` owns the rule; this is the name the rest of this module
+    calls it by. See that module for why it is deliberately stricter than git's
+    own `is_ntfs_dotgit` / `is_hfs_dotgit`.
     """
-    stripped = "".join(
-        character
-        for character in component
-        # The HFS+ ignorable set git skips: zero-width and directionality marks.
-        if unicodedata.category(character) != "Cf"
-    )
-    stripped = stripped.rstrip(". ").casefold()
-    return stripped == ".git" or bool(_GIT_SHORTNAME_RE.match(stripped))
+    return workspace_paths._looks_like_dotgit(component)
 
 
 def repo_relative(path: str) -> PurePosixPath:
@@ -258,30 +243,19 @@ def repo_relative(path: str) -> PurePosixPath:
     is right, neither is allowed through. A checker that normalises is
     reimplementing another parser's edge cases and betting on the agreement,
     and that bet is the one defect class this codebase keeps producing.
+
+    The rule itself lives in `workspace_paths`, which the sandbox image also
+    carries, so the check the broker makes on a name and the check the reader
+    makes before that name becomes a write are the same code rather than two
+    implementations that could drift. Only the exception type is this module's:
+    `workspace_paths` answers with an HTTP status, and everything here is
+    written against `ContentWorkspaceError`.
     """
-    if not isinstance(path, str) or not path:
-        raise PathRefused("path must be a non-empty string")
-    if "\x00" in path:
-        raise PathRefused("path contains a NUL byte")
-    if "\\" in path:
-        # Windows separators are a component character on Linux and a separator
-        # to git's NTFS-aware checks. Two readings, so: neither.
-        raise PathRefused("path contains a backslash")
-    if path.startswith("/"):
-        raise PathRefused("path must be relative to the repository root")
-    components = path.split("/")
-    for component in components:
-        if component in ("", ".", ".."):
-            raise PathRefused(
-                f"path component {component!r} is not allowed; give a plain "
-                "relative path with no empty, '.' or '..' components"
-            )
-        if _looks_like_dot_git(component):
-            raise PathRefused(
-                "paths inside the git metadata directory are refused: the "
-                "repository's own configuration and hooks are not content"
-            )
-    return PurePosixPath(*components)
+    try:
+        validated = workspace_paths.validate_path(path)
+    except workspace_paths.WorkspaceError as exc:
+        raise PathRefused(str(exc)) from None
+    return PurePosixPath(*validated.split("/"))
 
 
 def _no_symlink_on_the_way(root: Path, relative: PurePosixPath) -> Path:

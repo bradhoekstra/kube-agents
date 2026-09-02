@@ -127,6 +127,12 @@ KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
 # Flags whose value may be `-`, meaning "read the document from stdin". This is
 # the whole list the shipped skills use: kubectl's `-f`/`--filename` and
 # `--patch-file`, and gh's `--body-file`.
+#
+# `gh`'s `-F` short form is deliberately absent, and every caller that used to
+# pass it now spells `--body-file` instead. It is not a synonym: `gh api -F
+# key=value` sets a typed field, so matching it here would forward fd 0 for an
+# API call that never asked for it. When a new call site needs a document from
+# stdin, widen it to the long flag rather than adding the short one.
 STDIN_FILE_FLAGS = frozenset({"-f", "--filename", "--patch-file", "--body-file"})
 
 

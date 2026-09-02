@@ -267,8 +267,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #   workspace_paths.py     the workspace protocol's path validator, imported by
 #                          inspect-repository to re-check every name at the point
 #                          it becomes a write. The broker's content_workspace
-#                          re-exports the same file, so the two ends cannot drift
-#                          into disagreeing about what is under `.git`
+#                          delegates to this same file, so the two ends cannot
+#                          drift into disagreeing about what is under `.git`
 #   gke_endpoint.py        the DNS-endpoint decision gke-networking sends the model
 #                          to read; stdlib only, and nothing in it is agent-pod-bound
 #   cluster_preflight.sh   the Cluster Agent's first command on every kanban task

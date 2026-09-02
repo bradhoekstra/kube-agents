@@ -244,6 +244,7 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
         local_env: dict[str, str] | None = None,
         cwd: str | None = None, timeout: float | None = None,
         check: bool = False, path: str | None = None,
+        stdin: str | None = None,
         principal: str = SANDBOX_PRINCIPAL) -> subprocess.CompletedProcess:
     """Run `argv` in the sandbox and return the finished process.
 
@@ -256,6 +257,14 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     rather than add one — see `_default_runner` in `gke_endpoint.py`, where a
     forwarded `KUBECONFIG` turns a `describe` into a guaranteed HTTP 400. It has
     no remote counterpart because the remote command inherits nothing from here.
+
+    `stdin` is how a document reaches the command without a file. A caller in
+    the agent pod that wants `gh` to publish a pull-request body cannot name a
+    path: `gh` runs two hops away, in the credential proxy's filesystem, and
+    the only thing all three processes share is the byte stream. So the body
+    travels as text on fd 0 and the argv says `--body-file -`. ssh forwards fd 0
+    to the remote command, and `-T` in `_CONNECT_OPTIONS` keeps it a plain pipe
+    rather than a pty that would rewrite the bytes in transit.
 
     Falls back to running locally when no sandbox is configured. Two different
     situations reach that branch and it is right for both. In the agent pod it
@@ -271,12 +280,13 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     if not sandbox_enabled(path):
         base = local_env if local_env is not None else {**os.environ, "HOME": "/tmp"}
         return subprocess.run(argv, capture_output=True, text=True, check=check,
-                              timeout=timeout, cwd=cwd, env={**base, **(remote_env or {})})
+                              timeout=timeout, cwd=cwd, input=stdin,
+                              env={**base, **(remote_env or {})})
 
     command = ssh_argv(argv, remote_env=remote_env, cwd=cwd, path=path,
                        principal=principal)
     completed = subprocess.run(command, capture_output=True, text=True,
-                               timeout=timeout, env=_client_env())
+                               timeout=timeout, input=stdin, env=_client_env())
     if completed.returncode == 255 and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
         raise SandboxUnavailable(
             f"could not reach the shell sandbox: {(completed.stderr or '').strip()}"

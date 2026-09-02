@@ -47,16 +47,20 @@ spec:
             # apply time on the missing Certificate CRD. See the chart README.
             - name: ENABLE_WEBHOOKS
               value: {{ .Values.operator.webhooks.enabled | quote }}
-            # The two images the operator resolves for pods the chart never
+            # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
-            # spec.deployment.image, and the logging sidecar it injects into
-            # every agent pod. Without these a mirrored install still reaches
-            # ghcr.io and Docker Hub at reconcile time, long after `helm
-            # install` reported success. CREDENTIAL_PROXY_IMAGE is absent by
-            # design — the operator derives that sidecar from the agent image
-            # by swapping the trailing name, so it follows the value below.
+            # spec.deployment.image, the shell sandbox StatefulSet it renders
+            # beside every agent pod, and the logging sidecar it injects into
+            # that pod. Without these a mirrored install still reaches ghcr.io
+            # and Docker Hub at reconcile time, long after `helm install`
+            # reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
+            # the operator derives the broker image from the agent image by
+            # swapping the trailing name, so it follows the value below. The
+            # sandbox does not: it is a separate repository, so it is named.
             - name: PLATFORM_AGENT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}"
+            - name: AGENT_SANDBOX_IMAGE
+              value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.agentSandbox.image.repository "registry" (include "kube-agents.imageRegistry" .)) }}:{{ .Values.agentSandbox.image.tag | default .Chart.AppVersion }}"
             - name: FLUENT_BIT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
             {{- /* The pull identity for those same pods. Redundant for the CR

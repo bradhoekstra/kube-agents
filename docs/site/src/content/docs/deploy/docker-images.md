@@ -236,24 +236,26 @@ do with `IMAGE_TAG`.
 
 ### What the prefix does not cover
 
-Two images are resolved by the operator at reconcile time rather than rendered by any install
+Three images are resolved by the operator at reconcile time rather than rendered by any install
 manifest, so they need the operator's own environment set — which the chart does automatically
 when a prefix is in effect:
 
 - `PLATFORM_AGENT_IMAGE` — the agent image for a `PlatformAgent` that omits
   `spec.deployment.image`.
+- `AGENT_SANDBOX_IMAGE` — the shell sandbox StatefulSet rendered beside every agent pod.
 - `FLUENT_BIT_IMAGE` — the logging sidecar injected into every agent pod.
 
-`CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives that sidecar from the agent image by
-swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror on
-its own. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
+`CREDENTIAL_PROXY_IMAGE` needs nothing: the operator derives the broker image from the agent image
+by swapping the trailing name (`platform-agent` to `credential-proxy`), which lands on the mirror
+on its own. The sandbox is a separate repository, so it gets no such derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset — one
 explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
 otherwise keeps each sidecar in step with its own agent's image.
 
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
 the above for that agent's containers — see the
-[PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/). The fluent-bit sidecar
-has no CR-level equivalent; `FLUENT_BIT_IMAGE` is its only override.
+[PlatformAgent CRD reference](/kube-agents/operator/platformagent-crd/). The sandbox has
+`spec.harness.experimental.shellSandbox.image`, which overrides `AGENT_SANDBOX_IMAGE` for that
+agent. The fluent-bit sidecar has no CR-level equivalent; `FLUENT_BIT_IMAGE` is its only override.
 
 ### Rebuilding rather than copying
 
