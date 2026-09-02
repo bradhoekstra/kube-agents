@@ -32,6 +32,51 @@ DEFAULTS="${SANDBOX_DEFAULTS:-/opt/defaults}"
 # deploy/shared/sandbox_mirror.py, which does know the list.
 SANDBOX_HOME_ROOTS="${SANDBOX_HOME_ROOTS:-. profiles/platform}"
 
+# Every name under $DATA is owned by uid 1000 and survives a pod recycle, so any
+# path below it that this script hands to root may be a symlink the model planted
+# on a previous boot. None of the three operations used below resolves anything
+# but the path text: `cat >` opens with O_CREAT|O_TRUNC and follows the link,
+# `install -d` creates the target's parent chain, and `chown` follows it and
+# hands the target to the model. Pointed at /etc/ld.so.preload that is a
+# root-owned file the model then owns and the next sshd re-exec loads from;
+# pointed at /opt it is the directory holding /opt/credential-proxy, which starts
+# every session's PATH, so uid 1000 could rename the shims aside and put its own
+# there. The chown walk below already refuses the *textual* climb out of the
+# volume; this is the same climb taken through a link.
+#
+# So nothing under $DATA is used until every component of the path has been
+# proven not to be a symlink. `rm` on a symlink removes the link rather than what
+# it points at, which makes this self-healing: the planted link goes and the real
+# directory or file is recreated in its place. There is no race to lose — sshd
+# has not started yet, so nothing the model wrote is running while this runs.
+unlink_if_symlink() {
+  if [ -L "$1" ]; then
+    log "removed a symlink at $1: no path under $DATA may be one"
+    rm -f "$1"
+  fi
+}
+
+# Each component of $1 below $DATA, outermost first. $DATA itself is the mount
+# point and cannot be a link, so it is the floor rather than a component.
+clear_symlinks_under_data() {
+  local target="$1" relative path component
+  if [ "$target" = "$DATA" ]; then
+    return 0
+  fi
+  relative="${target#"$DATA"/}"
+  if [ "$relative" = "$target" ]; then
+    log "refusing to touch $target: outside $DATA"
+    exit 1
+  fi
+  path="$DATA"
+  local IFS=/
+  for component in $relative; do
+    [ -n "$component" ] || continue
+    path="$path/$component"
+    unlink_if_symlink "$path"
+  done
+}
+
 # 1. The model's durable directory. A PVC mounts over the image's /opt/data and
 #    arrives owned by root, so the agent could not write to it. Not recursive:
 #    only the mount point needs fixing, and a recursive chown over a volume that
@@ -47,6 +92,7 @@ chown agent:agent "$DATA"
 # of that is one path naming two different directories. A missing file used to
 # be the signal that a path belonged to the other side; this marker is what
 # replaces it.
+clear_symlinks_under_data "$DATA/.sandbox"
 cat >"$DATA/.sandbox" <<'MARKER'
 This is the shell sandbox's /opt/data, on the sandbox's own volume.
 
@@ -84,6 +130,7 @@ if [ -d "$DEFAULTS" ]; then
     else
       home="$DATA/$root"
     fi
+    clear_symlinks_under_data "$home"
     install -d -o agent -g agent "$home"
     # -o/-g reach the last component only. `profiles/platform` therefore leaves
     # $DATA/profiles owned by root, and 0755 root:root is readable and traversable

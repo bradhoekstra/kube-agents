@@ -505,6 +505,38 @@ check "refuses the value" "contains a newline, quote or backslash" "$out"
 check_absent "and does not start sshd with it" "ready; starting" "$out"
 
 echo
+echo "== 9. a symlink the model plants under /opt/data must not survive a recycle =="
+# The volume outlives the pod and uid 1000 owns every name on it, so a link
+# written during one session is input to the *next* start — which runs as root
+# and, before this guard, followed it. Two live paths: the marker file, which
+# root writes with `cat >`, and the profile home root, which root chowns on its
+# way back up to $DATA. Both are planted here as the model and both are aimed
+# somewhere that would matter: /etc/ld.so.preload is loaded into every process
+# sshd forks, and /opt holds the credential-proxy shims that start each
+# session's PATH.
+planted=$("${SSH[@]}" 'rm -rf /opt/data/profiles && ln -s /opt /opt/data/profiles &&
+  rm -f /opt/data/.sandbox && ln -s /etc/ld.so.preload /opt/data/.sandbox &&
+  ls -ld /opt/data/profiles /opt/data/.sandbox' 2>&1)
+# Without this the whole section passes when the plant silently failed.
+check "the model can plant the links in the first place" "/opt/data/profiles -> /opt" "$planted"
+start_sandbox || exit 1
+check "the start says it removed them" "removed a symlink at /opt/data/profiles" \
+  "$(docker logs "$NAME" 2>&1)"
+check "/opt is still root's" "0" "$(docker exec "$NAME" stat -c '%u' /opt 2>&1)"
+check "the marker's target was never created" "absent" \
+  "$(docker exec "$NAME" sh -c '[ -e /etc/ld.so.preload ] && echo present || echo absent' 2>&1)"
+check "the marker is a real file again" "regular file" \
+  "$(docker exec "$NAME" stat -c '%F' /opt/data/.sandbox 2>&1)"
+check "and holds the marker text" "the shell sandbox's /opt/data" \
+  "$(docker exec "$NAME" cat /opt/data/.sandbox 2>&1)"
+check "the profile home is a real directory again" "directory" \
+  "$(docker exec "$NAME" stat -c '%F' /opt/data/profiles 2>&1)"
+check "owned by the agent" "1000" \
+  "$(docker exec "$NAME" stat -c '%u' /opt/data/profiles 2>&1)"
+check "with the image's trees back inside it" "scripts" \
+  "$("${SSH[@]}" 'ls /opt/data/profiles/platform' 2>&1)"
+
+echo
 docker image inspect "$IMAGE" --format '{{len .RootFS.Layers}} {{.Size}}' 2>/dev/null |
   awk '{printf "== %s layers, %.0f MB ==\n", $1, $2/1024/1024}'
 
