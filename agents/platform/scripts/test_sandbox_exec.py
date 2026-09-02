@@ -261,6 +261,29 @@ class RunTestCase(unittest.TestCase):
             sandbox_exec.run(["kubectl", "get", "pods"], path=local)
         self.assertEqual(runner.call_args[0][0], ["kubectl", "get", "pods"])
 
+    def test_a_command_with_no_document_does_not_inherit_the_callers_stdin(self):
+        """The caller's fd 0 is platform_mcp_server.py's JSON-RPC channel.
+
+        `input=None` leaves fd 0 alone rather than closing it, and ssh reads
+        ahead on fd 0, so a request the client pipelined behind the tool call
+        is consumed by the ssh the tool call started. The server never sees it
+        and the client waits for a reply that cannot come. Both branches have
+        to redirect: the local fallback runs in the same process.
+        """
+        for label, config in (("sandbox", self.config), ("local fallback", write_config(LOCAL_CONFIG))):
+            with self.subTest(label):
+                with patch("subprocess.run", return_value=self.completed()) as runner:
+                    sandbox_exec.run(["kubectl", "get", "pods"], path=config)
+                self.assertEqual(runner.call_args.kwargs.get("stdin"), subprocess.DEVNULL)
+                self.assertNotIn("input", runner.call_args.kwargs)
+
+    def test_a_document_still_reaches_the_command_on_a_pipe(self):
+        with patch("subprocess.run", return_value=self.completed()) as runner:
+            sandbox_exec.run(["gh", "pr", "create", "--body-file", "-"],
+                             path=self.config, stdin="a pull-request body")
+        self.assertEqual(runner.call_args.kwargs.get("input"), "a pull-request body")
+        self.assertNotIn("stdin", runner.call_args.kwargs)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

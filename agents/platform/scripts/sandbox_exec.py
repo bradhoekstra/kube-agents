@@ -354,16 +354,28 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
 
     Raises SandboxUnavailable when ssh itself could not connect.
     """
+    # `input=None` is not "no stdin". subprocess only redirects fd 0 when it is
+    # given something to redirect it to, so with no `stdin` the child inherits
+    # this process's — and in the agent pod that fd is platform_mcp_server.py's
+    # JSON-RPC channel to its client. ssh reads ahead on fd 0, so a request the
+    # client pipelined behind the tool call is swallowed by the ssh that call
+    # started: the server never sees it and the client waits for a reply to a
+    # message that no longer exists. A caller that passes a document still gets
+    # it on a pipe; everyone else gets /dev/null.
+    stdin_kwargs: dict[str, object] = (
+        {"input": stdin} if stdin is not None else {"stdin": subprocess.DEVNULL}
+    )
+
     if not sandbox_enabled(path):
         base = local_env if local_env is not None else {**os.environ, "HOME": "/tmp"}
         return subprocess.run(argv, capture_output=True, text=True, check=check,
-                              timeout=timeout, cwd=cwd, input=stdin,
-                              env={**base, **(remote_env or {})})
+                              timeout=timeout, cwd=cwd,
+                              env={**base, **(remote_env or {})}, **stdin_kwargs)
 
     command = ssh_argv(argv, remote_env=remote_env, cwd=cwd, path=path,
                        principal=principal)
     completed = subprocess.run(command, capture_output=True, text=True,
-                               timeout=timeout, input=stdin, env=_client_env())
+                               timeout=timeout, env=_client_env(), **stdin_kwargs)
     if completed.returncode == 255 and _SSH_LEVEL_ERRORS.search(completed.stderr or ""):
         raise SandboxUnavailable(
             f"could not reach the shell sandbox: {(completed.stderr or '').strip()}"
