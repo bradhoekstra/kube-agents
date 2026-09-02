@@ -149,7 +149,15 @@ const (
 )
 
 // metadataServerAddresses are every address a request for cloud credentials
-// can arrive at, and none of them may appear in a rendered egress rule.
+// can arrive at, and none of them may be permitted on a credential port by a
+// rendered egress rule.
+//
+// "On a credential port" and not "at all": the DNS rule in
+// buildAgentEgressNetworkPolicy names 169.254.169.254 on port 53, because that
+// is the resolver under Cloud DNS for GKE. Its comment argues why 53 reaches no
+// token, and permitsBeyondDNS in the tests is what holds the invariant at that
+// scope. The addresses below still may not appear anywhere else, and
+// egressRuleReachesMetadata refuses them in extraRules on every port.
 //
 //   - 169.254.169.254 is the documented GCE metadata address, and the one a
 //     Pod's own code connects to.

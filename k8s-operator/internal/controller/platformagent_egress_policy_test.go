@@ -139,11 +139,21 @@ func permitsBeyondDNS(policy *networkingv1.NetworkPolicy, address string) bool {
 
 // ruleIsDNSOnly reports whether every port the rule names is 53. A rule with no
 // ports permits all of them and is never DNS-only.
+//
+// An EndPort disqualifies the rule outright. A NetworkPolicyPort carrying one is
+// a range, and Port is only its lower bound: {Port: 53, EndPort: 988} permits
+// every port from 53 to 988 inclusive — the post-NAT token port among them —
+// while IntValue() still reads 53. Testing the lower bound alone would call that
+// rule DNS-only and drop it before permits ever saw it, which is precisely the
+// exemption this helper must not grant.
 func ruleIsDNSOnly(rule networkingv1.NetworkPolicyEgressRule) bool {
 	if len(rule.Ports) == 0 {
 		return false
 	}
 	for _, candidate := range rule.Ports {
+		if candidate.EndPort != nil {
+			return false
+		}
 		if candidate.Port == nil || candidate.Port.IntValue() != dnsPort {
 			return false
 		}
@@ -253,20 +263,44 @@ func TestTheDNSRuleReachesTheCloudDNSResolver(t *testing.T) {
 			"every destination in the allowlist becomes unreachable by name", metadataLinkLocalIP)
 	}
 
-	// And it is granted on 53 alone. Reading the rule out rather than trusting
-	// the two helpers to disagree correctly: a single rule that named both 53
-	// and 80 would satisfy permits and permitsBeyondDNS exactly as the pair of
-	// rules does, and would hand the agent the token-minting path.
-	for _, rule := range policy.Spec.Egress {
-		if ruleIsDNSOnly(rule) {
-			continue
-		}
-		for _, peer := range rule.To {
-			if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataResolverCIDR {
-				t.Errorf("%s is named by a rule that permits ports beyond 53 (%v); the resolver grant "+
-					"must not carry the credential API with it", metadataResolverCIDR, rule.Ports)
+	// That it is granted on 53 alone is TestTheRenderedPolicyDeniesEveryMetadataAddress's
+	// half, and it genuinely covers the case: a single rule naming both 53 and 80
+	// is not DNS-only, so permitsBeyondDNS keeps it and that test fails on it.
+	// Re-checking it here would only restate the same property more narrowly.
+}
+
+// TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree tests the helper rather than
+// the policy, because every metadata assertion in this file is only as strong as
+// this predicate: a rule it wrongly calls DNS-only is a rule permitsBeyondDNS
+// drops before permits can object to it. The exemption has to be impossible to
+// widen by accident, so the cases below are the ways a rule can name 53 and
+// still reach further.
+func TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree(t *testing.T) {
+	port := func(number int32) *intstr.IntOrString {
+		value := intstr.FromInt32(number)
+		return &value
+	}
+	endPort := func(number int32) *int32 { return &number }
+
+	for _, testCase := range []struct {
+		name  string
+		ports []networkingv1.NetworkPolicyPort
+		want  bool
+	}{
+		{"bare 53 is the exemption", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}}, true},
+		{"UDP and TCP 53 together are still DNS", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}, {Port: port(dnsPort)}}, true},
+		{"no ports permits everything", nil, false},
+		{"53 alongside the pre-NAT token port", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}, {Port: port(80)}}, false},
+		{"a range starting at 53 reaches the post-NAT token port", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort), EndPort: endPort(988)}}, false},
+		{"a named port cannot be read as 53", []networkingv1.NetworkPolicyPort{{Port: nil}}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := ruleIsDNSOnly(networkingv1.NetworkPolicyEgressRule{Ports: testCase.ports})
+			if got != testCase.want {
+				t.Errorf("ruleIsDNSOnly(%v) = %v, want %v; a wrong answer here silently exempts the "+
+					"rule from every metadata assertion in this file", testCase.ports, got, testCase.want)
 			}
-		}
+		})
 	}
 }
 

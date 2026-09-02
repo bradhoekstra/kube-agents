@@ -1531,6 +1531,39 @@ func TestBuildNetworkPolicy_CustomMetadataDaemonPort(t *testing.T) {
 	}
 }
 
+// TestBuildNetworkPolicy_ResolverIsNotDuplicatedByDNSClusterIPs covers the
+// operator who reads their Cloud DNS nodes' --cluster-dns and puts that value in
+// spec.networkPolicy.dnsClusterIPs. It is the same address the DNS rule already
+// grants unconditionally, and the two peers are built by separate
+// formatCIDRPeers calls, which dedupe only within themselves.
+func TestBuildNetworkPolicy_ResolverIsNotDuplicatedByDNSClusterIPs(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent",
+			Namespace: "test-ns",
+		},
+	}
+	profile := defaultTestNetpolProfile()
+	profile.DNSClusterIPs = []string{metadataLinkLocalIP}
+
+	netpol := buildNetworkPolicy(agent, nil, profile, false, "", false)
+
+	occurrences := 0
+	for i := range netpol.Spec.Egress {
+		if !ruleNamesPort(netpol.Spec.Egress[i], 53) {
+			continue
+		}
+		for _, peer := range netpol.Spec.Egress[i].To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == metadataLinkLocalIP+"/32" {
+				occurrences++
+			}
+		}
+	}
+	if occurrences != 1 {
+		t.Errorf("expected %s/32 exactly once among the port-53 peers, got %d", metadataLinkLocalIP, occurrences)
+	}
+}
+
 // egressPortsForCIDR returns the sorted, deduplicated ports every egress rule naming
 // cidr as an ipBlock peer opens towards it.
 func egressPortsForCIDR(netpol *networkingv1.NetworkPolicy, cidr string) []int32 {

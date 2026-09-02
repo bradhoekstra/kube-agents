@@ -4115,6 +4115,28 @@ func formatCIDRPeers(raw []string, enforceMinPrefix bool) []networkingv1.Network
 	return peers
 }
 
+// peersNotAlreadyPresent returns the candidates whose ipBlock CIDR no peer in
+// present already names. It exists because formatCIDRPeers dedupes only within
+// a single call, so two calls contributing to one rule's peer list can each
+// emit the same CIDR. Peers carrying no ipBlock are always kept: a selector
+// peer is not comparable to a CIDR and is never the duplicate being removed.
+func peersNotAlreadyPresent(present, candidates []networkingv1.NetworkPolicyPeer) []networkingv1.NetworkPolicyPeer {
+	seen := make(map[string]bool, len(present))
+	for _, peer := range present {
+		if peer.IPBlock != nil {
+			seen[peer.IPBlock.CIDR] = true
+		}
+	}
+	kept := make([]networkingv1.NetworkPolicyPeer, 0, len(candidates))
+	for _, candidate := range candidates {
+		if candidate.IPBlock != nil && seen[candidate.IPBlock.CIDR] {
+			continue
+		}
+		kept = append(kept, candidate)
+	}
+	return kept
+}
+
 // buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
 // Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
 //
@@ -4209,20 +4231,33 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// without this one the Pod has no name resolution — which is a total outage,
 	// because every destination in the rules below is reached by name.
 	//
-	// Discovery cannot substitute for it. resolveNetpolProfile reads the
-	// kube-system/kube-dns Service ClusterIP, and under Cloud DNS that Service
-	// still exists and still answers nothing, so discovery succeeds and is wrong.
-	// That is the failure this rule is unconditional to avoid: a peer that is
-	// inert on a kube-dns cluster, where nothing listens on 53 at this address,
-	// costs nothing, while getting the detection wrong costs the install.
+	// Unconditional rather than detected. Cloud DNS is detectable in principle —
+	// kubelet's --cluster-dns carries this address there, so the operator's own
+	// resolv.conf names it — but the discovery this policy already does is
+	// resolveNetpolProfile reading the kube-system/kube-dns Service ClusterIP,
+	// and under Cloud DNS that Service still exists and still answers nothing.
+	// That discovery succeeds and is wrong, which is the failure being avoided:
+	// a detector that guesses wrong costs the install its name resolution, while
+	// granting the peer always costs one port-53 rule on clusters not using it.
+	//
+	// On a kube-dns cluster the Pod's resolver is the kube-dns ClusterIP, so the
+	// peer carries no traffic — but it is not inert. On GCE this address answers
+	// DNS on 53 unless Workload Identity's gke-metadata-server or metadata
+	// concealment intercepts it, so on a cluster running neither, the rule does
+	// reach the node's GCE resolver. That is a resolver and not a credential
+	// path: the token API is HTTP on 80 pre-NAT and 988 post-NAT.
 	//
 	// Port 53 only. Rule 2 below grants the same address on TCP 80 for token
 	// fetches; these two are the whole of the metadata server's reach from this
 	// Pod, and they are separate rules so that neither widens the other.
 	//
-	// The IPv6 metadata address (fd20:ce::254) is deliberately absent: it is
-	// documented as a metadata endpoint, not as a resolver, and the static
-	// copies in charts/ and deploy/kustomize name only the IPv4 address here.
+	// Built separately from linkLocalPeers above rather than reusing that slice,
+	// and the difference is the point: this peer set is IPv4-only. fd20:ce::254
+	// is documented as a metadata endpoint rather than as a resolver, and no
+	// static copy in charts/ or deploy/kustomize names it in a DNS rule, so it
+	// stays out until a dual-stack Cloud DNS cluster is observed naming it in a
+	// Pod's resolv.conf. Reusing linkLocalPeers would pull it in silently the day
+	// that slice grows an IPv6 entry.
 	dnsPeers = append(dnsPeers, formatCIDRPeers([]string{metadataLinkLocalIP}, true)...)
 
 	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
@@ -4235,7 +4270,16 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	if len(dnsIPPeers) == 0 {
 		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
 	}
-	dnsPeers = append(dnsPeers, dnsIPPeers...)
+	// formatCIDRPeers dedupes within one call, not across the two above, and on a
+	// Cloud DNS cluster the two overlap: 169.254.169.254 is what kubelet's
+	// --cluster-dns carries there, so an operator setting
+	// spec.networkPolicy.dnsClusterIPs to the value their nodes actually use
+	// names the address this rule already grants. Without this filter that
+	// renders the same ipBlock twice — legal, and no wider, but a policy sold as
+	// auditable should not make a reader wonder which of the two is doing the
+	// work. buildAgentEgressNetworkPolicy drops the same input for its own
+	// reasons; both end up granting the resolver exactly once.
+	dnsPeers = append(dnsPeers, peersNotAlreadyPresent(dnsPeers, dnsIPPeers)...)
 
 	egressRules := []networkingv1.NetworkPolicyEgressRule{
 		// 1. Cluster DNS
