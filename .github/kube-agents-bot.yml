@@ -1,0 +1,4 @@
+# Live-test artifact for gke-labs/kube-agents-bot#feat/in-repo-config.
+# Safe to delete. Set to dry-run: the staging bot computes assignments and logs
+# what it would write, touching nothing.
+assignees: dry-run
