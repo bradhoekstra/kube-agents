@@ -1,4 +1,4 @@
 # Live-test artifact for gke-labs/kube-agents-bot#feat/in-repo-config.
-# Safe to delete. Set to on: the staging bot writes the assignee field, while
-# the deployment's own ASSIGNEE_MANAGEMENT stays off.
-assignees: on
+# Safe to delete. Deliberately outside the vocabulary: the bot must reject this
+# and fall back to the deployment's own setting, saying so in the log.
+assignees: enabled
