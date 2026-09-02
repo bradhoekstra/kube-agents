@@ -404,10 +404,11 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the two the chart does
-    # not render itself — the agent Deployment and the fluent-bit sidecar the
-    # operator resolves at reconcile time. See the chart README's
-    # "Installing from a mirrored registry".
+    # Reaches every image this release pulls, including the three the chart
+    # does not render itself — the agent Deployment, the shell sandbox
+    # StatefulSet, and the fluent-bit sidecar the operator resolves at
+    # reconcile time. See the chart README's "Installing from a mirrored
+    # registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
@@ -420,6 +421,18 @@ resource "helm_release" "kube_agents" {
       # Secret names only. The Secrets themselves are created out of band, so
       # no registry credential is ever written to Terraform state.
       imagePullSecrets = var.image_pull_secrets
+    }
+    # The sandbox is built from this repository at the same commit as the
+    # agent and the operator, so it takes image_tag with them. It needs its own
+    # entry because the operator does not derive it: unlike the credential
+    # broker, which comes from the agent image with the trailing name swapped,
+    # the sandbox is a separate repository the chart names in AGENT_SANDBOX_IMAGE.
+    # Leaving it out pins the sandbox to Chart.appVersion while everything
+    # around it moves, which fails the pull rather than running the wrong code.
+    agentSandbox = {
+      image = {
+        tag = var.image_tag
+      }
     }
     operator = {
       image = {

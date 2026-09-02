@@ -562,15 +562,24 @@ main() {
     kubectl apply --server-side --force-conflicts -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
   }
 
-  # The chart-only fast path: a mode that moves no GCP resource re-tags one
-  # image on the live release and leaves the rest of the values as they are.
-  # The regenerated tfvars carry the same new tag, so the next full
+  # The chart-only fast path: a mode that moves no GCP resource re-tags the
+  # images it owns on the live release and leaves the rest of the values as
+  # they are. The regenerated tfvars carry the same new tag, so the next full
   # `terraform apply` agrees with the release instead of reverting it.
+  #
+  # Takes every key it must move in one `helm upgrade`, not one call per key:
+  # two sequential upgrades leave the release briefly holding a new agent
+  # against an old sandbox, and the second one's --reuse-values would have to
+  # re-read what the first wrote.
   helm_retag() {
-    local set_key="$1"
+    local set_args=()
+    local set_key
+    for set_key in "$@"; do
+      set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
+    done
     helm upgrade kube-agents "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reuse-values \
-      --set "${set_key}=${PARAM_IMAGE_TAG}" --wait --timeout 10m
+      "${set_args[@]}" --wait --timeout 10m
   }
 
   # The release guard runs before the tfvars generation on purpose: a
@@ -598,7 +607,11 @@ main() {
 
     harness)
       print_step "4. Upgrading Platform Agent Deployment & Identity"
-      helm_retag "platformAgent.deployment.image.tag"
+      # The sandbox moves with the agent: both are built from this repository
+      # at the same commit, and the shell the agent reaches over ssh is the
+      # half that runs the new tools. Retagging the agent alone leaves the
+      # StatefulSet on the previous image.
+      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 

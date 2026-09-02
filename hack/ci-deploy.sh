@@ -244,11 +244,12 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
 STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
-# One submit, not three. The two agent images share the agent-base chain, so
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, sandbox, operator) ==="
+# One submit, not four. The two agent images share the agent-base chain, so
 # building them as consecutive steps on one worker lets the second reuse the
-# first's layers instead of rebuilding that chain on a cold daemon; the operator
-# build runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
+# first's layers instead of rebuilding that chain on a cold daemon; the sandbox
+# and operator builds run alongside them. See the header of cloudbuild-ci.yaml,
+# and #635.
 # Set REQUIRE_CACHE=true in the job environment to fail the build on a cache
 # miss instead of cold-building. Default false so a broken cache source cannot
 # block the PR that fixes it.
@@ -257,7 +258,7 @@ export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agent
 export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
 export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
 gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
+  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
   --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
 echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 
@@ -286,6 +287,8 @@ helm upgrade --install kube-agents ./charts/kube-agents \
   --set-string "operator.image.tag=${TAG}" \
   --set-string "platformAgent.deployment.image.repository=${AR_REPO}/platform-agent" \
   --set-string "platformAgent.deployment.image.tag=${TAG}" \
+  --set-string "agentSandbox.image.repository=${AR_REPO}/agent-sandbox" \
+  --set-string "agentSandbox.image.tag=${TAG}" \
   --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
   --set-string "platformAgent.harness.location=${REGION}" \
   --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \
@@ -316,6 +319,23 @@ if ! kubectl rollout status deployment/platform-agent-gateway -n "${NAMESPACE}" 
   kubectl describe deployment/platform-agent-gateway -n "${NAMESPACE}" || true
   kubectl get pods -n "${NAMESPACE}" || true
   kubectl logs -n "${NAMESPACE}" -l app=platform-agent-gateway --all-containers --tail=50 || true
+  exit 1
+fi
+
+# The shell sandbox is the other half of the agent: everything the model runs
+# executes there over ssh, so a gateway that is Ready against a StatefulSet
+# stuck on ImagePullBackOff is an install this job must fail rather than pass.
+# Gated separately for the same reason the Deployment is -- the operator
+# creates it from the CR, so `helm --wait` never saw it.
+for i in {1..60}; do
+  kubectl get statefulset platform-agent-shell -n "${NAMESPACE}" >/dev/null 2>&1 && break
+  sleep 5
+done
+if ! kubectl rollout status statefulset/platform-agent-shell -n "${NAMESPACE}" --timeout=600s; then
+  echo "ERROR: platform-agent-shell rollout failed"
+  kubectl describe statefulset/platform-agent-shell -n "${NAMESPACE}" || true
+  kubectl get pods -n "${NAMESPACE}" || true
+  kubectl logs -n "${NAMESPACE}" statefulset/platform-agent-shell --all-containers --tail=50 || true
   exit 1
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"

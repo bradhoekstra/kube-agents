@@ -24,7 +24,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/agent-sandbox",
       "tagPolicy": "release",
       "override": "AGENT_SANDBOX_IMAGE",
-      "pulledBy": "The Sandbox the agent's shell, file and code-execution tools run in, when execution isolation is enabled.",
+      "pulledBy": "The shell sandbox StatefulSet the operator renders beside every agent pod.",
       "description": "SSH-reachable shell sandbox: Python, an SSH server, and the credential-proxy CLI wrappers, with no credentials and no path back into the agent pod."
     },
     {
