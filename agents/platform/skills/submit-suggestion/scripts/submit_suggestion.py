@@ -122,7 +122,11 @@ def content_mode_available() -> bool:
 
 def handle_prepare_content(args) -> int:
     branch = check_branch(args.branch)
-    repo = gitops_workspace.resolve_repo()
+    # `--repo` first, as the directory path reads it. Ignoring it here silently
+    # opened the default repository under a flag that named another one, and a
+    # fleet whose cards target several GitOps repositories writes every
+    # suggestion to whichever one `resolve_repo` happens to answer with.
+    repo = args.repo or gitops_workspace.resolve_repo()
     # Same allowlist the directory path answers to. Content mode reaches the
     # broker instead of a clone, and skipping the check here would make the
     # managed-repos list depend on which transport the run happened to pick.

@@ -720,10 +720,13 @@ class TestContentMode(SubmitSuggestionTestCase):
             path.write_text(text, encoding="utf-8")
         return directory
 
-    def prepare_content(self, branch="platform-agent/fix-netpol"):
+    def prepare_content(self, branch="platform-agent/fix-netpol", repo=None):
+        argv = ["prepare", "--branch", branch]
+        if repo:
+            argv += ["--repo", repo]
         out = io.StringIO()
         with redirect_stdout(out):
-            submit_suggestion.dispatch(["prepare", "--branch", branch])
+            submit_suggestion.dispatch(argv)
         return json.loads(out.getvalue())
 
     def submit_content(self, prepared, source, title="t", body="b", deletes=()):
@@ -757,6 +760,18 @@ class TestContentMode(SubmitSuggestionTestCase):
         for value in payload.values():
             self.assertNotIn("/tmp", str(value))
             self.assertFalse(str(value).startswith("/"))
+
+    def test_prepare_opens_the_repository_the_flag_names(self):
+        """`--repo` decides the repository in both modes or in neither.
+
+        Content mode read the default instead, so a fleet whose cards target
+        more than one GitOps repository had every suggestion opened against
+        whichever one `resolve_repo` answered with -- under a flag naming
+        another.
+        """
+        self.patch_attr(gitops_workspace, "resolve_repo", lambda workspace=None: "acme/secondary-repo")
+        payload = self.prepare_content(repo="acme/fleet")
+        self.assertEqual("acme/fleet", payload["repo"])
 
     def test_prepare_then_submit_lands_the_branch_and_opens_the_pr(self):
         prepared = self.prepare_content()
