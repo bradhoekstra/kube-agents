@@ -1982,17 +1982,18 @@ ReadWriteOnce data PVC that only the gateway pod mounts.
 
 So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 
-| Role          | Starts                                               | Runs in                              |
-| ------------- | ---------------------------------------------------- | ------------------------------------ |
-| `credentials` | credential exec broker, Google Chat and Slack relays | the sandbox pod, beside the shell    |
-| `agent-api`   | API authenticator, k8s-event-watcher                 | the gateway pod, as `agent-api-auth` |
-| `full`        | all of them                                          | nothing, now — the default           |
+| Role        | Starts                                               | Runs in                              |
+| ----------- | ---------------------------------------------------- | ------------------------------------ |
+| `broker`    | credential exec broker, Google Chat and Slack relays | the `<agent>-credential-proxy` pod   |
+| `api-proxy` | API authenticator, k8s-event-watcher                 | the gateway pod, as `agent-api-auth` |
+| `combined`  | all of them                                          | nothing, now — the default           |
 
-`full` is the default, so an image paired with an operator that does not set the variable
-starts every service. The `agent-api` container loads no policy and builds no
+`combined` is the default, so an image paired with an operator that does not set the
+variable starts every service; `start-services.sh` refuses any other value rather than
+falling back to it. The `api-proxy` container loads no policy and builds no
 `CommandExecutor`: it compares one key and forwards, holding no credential path. It is
-called `agent-api-auth`, and `envoy-credential-proxy` names the `credentials` container —
-the one that does proxy credentials.
+called `agent-api-auth`, and `envoy-credential-proxy` names the `broker` container — the
+one that does proxy credentials.
 
 ### How the proxy gets a token
 

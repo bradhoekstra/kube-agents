@@ -82,13 +82,19 @@ The operator does not place managed credentials in the sandbox Pod's:
 
 - environment;
 - root filesystem;
-- persistent data volume;
-- mounted ServiceAccount token path; or
+- persistent data volume; or
 - Pod identity — its ServiceAccount is bound to no Google service account, so the
   metadata server has nothing to give it.
 
-The gateway's `platform-agent` container is the one place a projected token is mounted
-on purpose, and it is scoped to the broker's audience.
+Two containers mount a projected ServiceAccount token on purpose, and both projections
+carry the broker's audience rather than the Kubernetes API's: the gateway's
+`platform-agent` container and the sandbox's `shell` container. Each presents it to the
+broker to be let past the listener's authentication, which is what
+`CREDENTIAL_PROXY_TOKEN_FILE` names. The API server rejects a token minted for another
+audience, so neither is a Kubernetes credential and neither undoes the Pod's
+`automountServiceAccountToken: false`. The sandbox's is projected 0444 because uid 1000
+reads it; `buildShellSandboxCredentialProxyTokenVolume` says why that gives away nothing
+the container is not already holding.
 
 The shared agent volume used to be the live gap here: a `core.fsmonitor` entry the
 sandbox wrote under a workspace root ran in the credential holder on the next
@@ -841,9 +847,10 @@ CI and deployment tests should assert that:
 1. the sandbox has no `spec.deployment.env`, secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
-   be added without amending this list. The `platform-agent` container mounts
-   exactly one ServiceAccount token, the broker-audience projection, and still
-   none of the rest; the `<agent>-shell` Pod mounts none;
+   be added without amending this list. The `platform-agent` container and the
+   sandbox's `shell` container each mount exactly one ServiceAccount token, the
+   broker-audience projection, and still none of the rest; no container in
+   either Pod mounts a Kubernetes-API-audience token except `agent-api-auth`;
 2. only the credential runtime mounts proxy identity/state, and only the event
    watcher mounts its Kubernetes-API token projection;
 3. only the credential runtime receives Slack tokens and deployment env;
