@@ -1217,16 +1217,18 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Thirteen of the seventeen active cases are admitted: the ones
+# optional. Twelve of the twenty active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
-# infra classes the harness already excludes from the verdict. Four are
-# held out -- they still run and report on every pull request, and they
-# cannot red one on a GRADED failure. The scope of that promise is rungs
+# infra classes the harness already excludes from the verdict. The rest
+# cannot red one on a GRADED failure: five are held out below with named
+# exits, and the three obtainability activations (#1049) simply run
+# unadmitted while they earn a record. Held-out cases still run and
+# report on every pull request. The scope of that promise is rungs
 # 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
 # that is not a real run) stay blocking for every case by design,
 # admitted or not -- see grade_case, which evaluates them before it reads
 # admission. security-overgrant-remediation-proposal (#1066) is simply
-# new: it earns its record like any case, then enters. The other three
+# new: it earns its record like any case, then enters. The other four
 # each have a filed issue naming the exit condition:
 #
 #   capacity-pinned-pool-probe            -- #1010: worker completes its
@@ -1241,19 +1243,30 @@ print(m.group(1).strip('\'\"') if m else '')
 #   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
 #     on record; admitting it reds every pull request today. Enters when
 #     the lettered-options bar is settled and it has a clean record.
+#   compliance-rbac-overgrant             -- #1171: demoted 2026-09-02
+#     after rung-4 collapses on unrelated pull requests (#1153 was red on
+#     this case alone). The fleet-audit delegation chain is degraded:
+#     audits go partial on what the agent reports as "access
+#     limitations", skipping check 2.4 (the cluster-admin-binding check
+#     this case grades), and some runs publish no ledger at all -- so the
+#     collapse is the environment's, not the diff's. Enters when #1171's
+#     re-admission bar holds: delegation fixed and a clean 3-day graded
+#     record.
 #
 # If an admitted case reds a pull request its diff cannot explain on a
 # graded failure, demote it here and reference its issue. Demotion is a
 # one-line same-day edit to this list -- this file, not the Prow config,
 # is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
-# rung-1-3 red (mutation, erroring verifier, empty record) does not stop
-# when its case leaves this list, because those classes signal a broken
-# case or install, not flake, and the fix is on that side.
+# rung-1-3 red (mutation, erroring verifier, an empty record on a task
+# that provisions nothing -- a record whose deployer died before any
+# agent ran grades INFRA and reds nobody) does not stop when its case
+# leaves this list, because those classes signal a broken case or
+# install, not flake, and the fix is on that side.
 #
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
