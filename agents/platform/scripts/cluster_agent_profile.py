@@ -56,6 +56,13 @@ MAX_NAME_LEN = 63
 # Agent itself (`platform`). Reconciliation must never touch these.
 RESERVED_PROFILES = frozenset({"default", "platform"})
 
+# How the scaffold checks that gcloud's kubeconfig exists on the side that will
+# read it. An absolute path because a builtin `test` would be the sandbox
+# shell's, and a round number of seconds because one stat over a multiplexed
+# connection either answers immediately or the connection is gone.
+KUBECONFIG_PROBE = "/usr/bin/test"
+KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
+
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-PROFILE] {msg}", file=sys.stderr)
@@ -184,6 +191,30 @@ def _pin_otel_endpoint(home: Path, name: str) -> None:
         )
     except Exception as e:  # noqa: BLE001 - telemetry must not fail the scaffold
         log(f"{name}: pinning the OpenTelemetry endpoint failed ({e}); traces go to the image default")
+
+
+def _kubeconfig_landed(kubeconfig: Path) -> bool:
+    """Whether the kubeconfig exists and is non-empty, wherever kubectl runs.
+
+    Which filesystem that is depends on the install: with a sandbox it is the
+    sandbox's volume and this pod cannot stat it, without one it is this pod's
+    own. Asked the same way the credential was fetched, so the answer describes
+    the same side.
+    """
+    if not sandbox_exec.sandbox_enabled():
+        return kubeconfig.is_file() and kubeconfig.stat().st_size > 0
+    try:
+        probe = sandbox_exec.run(
+            [KUBECONFIG_PROBE, "-s", str(kubeconfig)],
+            check=False,
+            timeout=KUBECONFIG_PROBE_TIMEOUT_SECONDS,
+        )
+    except (sandbox_exec.SandboxUnavailable, OSError, subprocess.TimeoutExpired):
+        # The question could not be asked. Reported as an unwritten kubeconfig
+        # rather than as a scaffold that finished, because a sandbox that has
+        # gone away since the fetch is the case this check is for.
+        return False
+    return probe.returncode == 0
 
 
 def create_profile(project: str, cluster: str, location: str) -> str:
@@ -316,6 +347,21 @@ def create_profile(project: str, cluster: str, location: str) -> str:
         # against; keep it to one actionable line instead of a traceback in the
         # container log.
         raise SystemExit(f"ERROR: could not execute 'gcloud' to fetch credentials for '{cluster}': {e}")
+
+    # 3a. Check that the file exists on the side that will read it.
+    #
+    # gcloud exiting 0 is not the same statement. It writes the kubeconfig in
+    # the sandbox, and this pod cannot see that filesystem — so a step 2e that
+    # was skipped, a --wait that expired, or a gcloud that wrote somewhere else
+    # all leave a profile the scaffold calls finished and every later kubectl
+    # fails against, with an error naming the cluster rather than the scaffold
+    # that never gave it a credential.
+    if not _kubeconfig_landed(kubeconfig):
+        raise SystemExit(
+            f"ERROR: gcloud reported success for '{cluster}' but no kubeconfig is "
+            f"at {kubeconfig} where kubectl will look for it. The profile is "
+            "scaffolded; re-run this command once the shell sandbox is up."
+        )
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)

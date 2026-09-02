@@ -123,6 +123,7 @@ class CreateProfileTest(unittest.TestCase):
         self._patch(cap, "ensure_profile", self._fake_ensure_profile)
         # `gcloud container clusters get-credentials`.
         self.runs = []
+        self.writes_kubeconfig = True
         self._patch(subprocess, "run", self._fake_run)
         # Whether that command needs --dns-endpoint. Patched explicitly rather
         # than left to fall out of the fake above: gke_endpoint reads gcloud's
@@ -146,6 +147,16 @@ class CreateProfileTest(unittest.TestCase):
 
     def _fake_run(self, cmd, **kwargs):
         self.runs.append(cmd)
+        # Real gcloud writes the file its KUBECONFIG names, and the scaffold
+        # checks that it did before calling the profile finished. A fake that
+        # exits 0 without writing is a fake of the failure, not of the success.
+        if (
+            self.writes_kubeconfig
+            and cmd[:4] == ["gcloud", "container", "clusters", "get-credentials"]
+        ):
+            path = Path((kwargs.get("env") or {})["KUBECONFIG"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("apiVersion: v1\nkind: Config\n")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     def get_credentials_argv(self):
@@ -168,6 +179,45 @@ class CreateProfileTest(unittest.TestCase):
 
     def config(self):
         return yaml.safe_load((self.profile / "config.yaml").read_text()) or {}
+
+    def test_a_gcloud_that_wrote_nothing_is_not_a_scaffolded_profile(self):
+        """Exit 0 from gcloud is not the same statement as a credential.
+
+        The command runs in the sandbox and writes there, so this pod cannot
+        see the file either way. Reporting the profile as created leaves every
+        later kubectl failing with an error that names the cluster, and sends
+        whoever reads it to IAM instead of to the pod that never got a
+        kubeconfig.
+        """
+        self.writes_kubeconfig = False
+
+        with self.assertRaises(SystemExit) as caught:
+            self.create()
+
+        self.assertIn("kubeconfig", str(caught.exception))
+        # And the pin that follows it did not happen, so nothing points a
+        # worker at a file that is not there.
+        env_file = self.profile / ".env"
+        self.assertNotIn("KUBECONFIG", env_file.read_text() if env_file.exists() else "")
+
+    def test_the_kubeconfig_is_looked_for_where_kubectl_will_run(self):
+        """With a sandbox the file is on its volume, not on this one."""
+        missing = self.tmp / "nowhere" / "kubeconfig.yaml"
+        with mock.patch.object(cap.sandbox_exec, "sandbox_enabled", return_value=True):
+            probe = subprocess.CompletedProcess(["test"], 0, "", "")
+            with mock.patch.object(cap.sandbox_exec, "run", return_value=probe) as run:
+                self.assertTrue(cap._kubeconfig_landed(missing))
+            self.assertEqual(run.call_args[0][0][1:], ["-s", str(missing)])
+
+            probe = subprocess.CompletedProcess(["test"], 1, "", "")
+            with mock.patch.object(cap.sandbox_exec, "run", return_value=probe):
+                self.assertFalse(cap._kubeconfig_landed(missing))
+
+            # A sandbox that went away between the fetch and the check answers
+            # nothing, which is not the same as answering yes.
+            unavailable = cap.sandbox_exec.SandboxUnavailable("gone")
+            with mock.patch.object(cap.sandbox_exec, "run", side_effect=unavailable):
+                self.assertFalse(cap._kubeconfig_landed(missing))
 
     def test_fetches_credentials_over_the_ip_endpoint_by_default(self):
         self.create()
