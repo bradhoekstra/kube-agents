@@ -45,6 +45,12 @@ ID_TOKEN_URL = (
 )
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
 
+# How long an STS or IAM call may take. Both are Google endpoints reached over
+# the pod's own network, so a call that has not answered by now is a broken
+# route rather than a slow one -- and the caller is a proxy holding a request
+# open while it waits.
+TOKEN_REQUEST_TIMEOUT_SECONDS = 10
+
 
 def build_document(audience: str, service_account: str, token_file: str) -> dict:
     """Return the external_account document.
@@ -102,7 +108,9 @@ def write_document(path: str, document: dict) -> None:
 def _post(url: str, body: bytes, headers: dict) -> dict:
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        with urllib.request.urlopen(
+            request, timeout=TOKEN_REQUEST_TIMEOUT_SECONDS
+        ) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace").strip()

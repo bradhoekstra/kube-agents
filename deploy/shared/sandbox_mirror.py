@@ -263,6 +263,27 @@ DEFAULT_MAX_BYTES = 0  # 0 means unbounded; --max-bytes still overrides
 # worse than a skipped directory.
 FREE_SPACE_HEADROOM = 512 * 1024 * 1024  # leave this much on the sandbox volume
 
+# What the terminal block leaves unset. The port and the account are sshd's own
+# defaults in `deploy/sandbox/Dockerfile`; an operator that publishes neither is
+# describing that image.
+DEFAULT_SSH_PORT = 22
+DEFAULT_SSH_USER = "agent"
+
+# Long enough to open a connection to a pod that is up, short enough that a pod
+# that is not does not hold the agent's own start behind it. The retry loop
+# behind `--wait` is what covers a sandbox still being scheduled.
+CONNECT_TIMEOUT_SECONDS = 10
+
+# How long `--wait` waits by default: three minutes, which covers a sandbox
+# StatefulSet pulling its image on a cold node.
+DEFAULT_WAIT_SECONDS = 180
+
+# `df -Pk` prints Filesystem, 1024-blocks, Used, Available, Capacity, Mounted —
+# POSIX-mandated, one row per filesystem, which is why the caller takes the last
+# line and this column of it.
+DF_AVAILABLE_COLUMN = 3
+DF_BLOCK_BYTES = 1024
+
 
 def log(message: str) -> None:
     print(f"sandbox-mirror: {message}", flush=True)
@@ -300,7 +321,9 @@ def read_terminal_config(path: str) -> dict | None:
     return terminal
 
 
-def ssh_base_command(terminal: dict, connect_timeout: int = 10) -> list[str]:
+def ssh_base_command(
+    terminal: dict, connect_timeout: int = CONNECT_TIMEOUT_SECONDS
+) -> list[str]:
     """The ssh argv every call below shares.
 
     Connects as ``terminal.ssh_user`` — ``agent``, uid 1000 — and not as the
@@ -314,8 +337,8 @@ def ssh_base_command(terminal: dict, connect_timeout: int = 10) -> list[str]:
     """
     key = terminal.get("ssh_key") or ""
     host = terminal["ssh_host"]
-    user = terminal.get("ssh_user") or "agent"
-    port = str(terminal.get("ssh_port") or 22)
+    user = terminal.get("ssh_user") or DEFAULT_SSH_USER
+    port = str(terminal.get("ssh_port") or DEFAULT_SSH_PORT)
     argv = [
         "ssh",
         "-p",
@@ -565,7 +588,7 @@ def remote_free_bytes(ssh: list[str], remote_root: str) -> int | None:
     if result.returncode != 0:
         return None
     try:
-        return int(result.stdout.split()[3]) * 1024
+        return int(result.stdout.split()[DF_AVAILABLE_COLUMN]) * DF_BLOCK_BYTES
     except (IndexError, ValueError):
         return None
 
@@ -678,7 +701,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--wait",
         type=int,
-        default=180,
+        default=DEFAULT_WAIT_SECONDS,
         help="seconds to wait for the sandbox to answer before giving up",
     )
     parser.add_argument(

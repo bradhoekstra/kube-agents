@@ -73,6 +73,19 @@ TASK_DIR = re.compile(r"^t_[0-9a-f]+$")
 REMOTE_LS = "/bin/ls"
 REMOTE_RM = "/bin/rm"
 
+# How long each of those may take. Listing one directory is fast on any install
+# and slow only on one that is unreachable, which the connect timeout already
+# catches; removing is generous because one call unlinks every workspace the
+# sweep decided on, and a run that gave up half way would leave the board and
+# the disk disagreeing until the next one.
+LS_TIMEOUT_SECONDS = 60
+RM_TIMEOUT_SECONDS = 120
+
+# How much of a failed `rm`'s stderr reaches the warning. Enough for the first
+# few paths it could not unlink; the rest is the same message repeated once per
+# workspace, and the sweep's summary is read in a chat message.
+STDERR_EXCERPT_CHARS = 400
+
 
 class Sweep:
     """What one run found, and what went wrong doing it."""
@@ -147,7 +160,7 @@ def _sandbox_names(root: Path, sweep: Sweep) -> set[str] | None:
         result = sandbox_exec.run(
             [REMOTE_LS, "-1", "--", str(root)],
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
-            timeout=60,
+            timeout=LS_TIMEOUT_SECONDS,
         )
     except sandbox_exec.SandboxUnavailable as exc:
         sweep.warnings.append(f"could not reach the shell sandbox: {exc}")
@@ -170,7 +183,7 @@ def _remove_remote(root: Path, names: list[str], sweep: Sweep) -> None:
         result = sandbox_exec.run(
             [REMOTE_RM, "-rf", "--", *[str(root / name) for name in names]],
             principal=sandbox_exec.TERMINAL_PRINCIPAL,
-            timeout=120,
+            timeout=RM_TIMEOUT_SECONDS,
         )
     except sandbox_exec.SandboxUnavailable as exc:
         sweep.warnings.append(f"could not reach the shell sandbox: {exc}")
@@ -181,7 +194,7 @@ def _remove_remote(root: Path, names: list[str], sweep: Sweep) -> None:
     if result.returncode != 0:
         sweep.warnings.append(
             f"sandbox rm under {root} exited {result.returncode}: "
-            f"{(result.stderr or '').strip()[:400]}"
+            f"{(result.stderr or '').strip()[:STDERR_EXCERPT_CHARS]}"
         )
         return
     sweep.remote_removed.extend(names)
