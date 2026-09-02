@@ -8247,7 +8247,7 @@ class TestDispatchAndHandover(unittest.TestCase):
 
 
 class TestReadCommandsInDirectoryMode(HarnessTestCase):
-    """`fetch` and `list` are refused where the clone already answers them.
+    """`fetch`, `list` and `grep` are refused where the clone already answers them.
 
     Emulating them instead would teach an agent to call them in both modes and
     believe it had refreshed something; the clone's copy of the file can be
@@ -8263,6 +8263,12 @@ class TestReadCommandsInDirectoryMode(HarnessTestCase):
 
     def test_list_is_refused(self):
         self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 2)
+        self.assertIn("directory mode", self.err)
+
+    def test_grep_is_refused(self):
+        self.assertEqual(
+            self.run_main(["grep", "--audit", AUDIT, "--pattern", "seed"]), 2
+        )
         self.assertIn("directory mode", self.err)
 
 
@@ -8596,10 +8602,42 @@ class ContentModeTestCase(BaseTestCase):
         self.assertEqual(payload["repo"], "acme/fleet")
         self.assertEqual([e["path"] for e in payload["entries"]], ["README.md"])
 
+    def test_grep_searches_inside_the_repository_files(self):
+        """The command that keeps a content-mode audit off a fetch-everything path.
+
+        Discovering a remediation path means finding the file that declares an
+        object, and what identifies it is a line inside the file. Without this
+        the documented route is `list --prefix` and a `fetch` of every
+        candidate, which is a broker round-trip and a context window per file.
+        """
+        self.start()
+        self.assertEqual(
+            self.run_main(["grep", "--audit", AUDIT, "--pattern", "seed"]), 0
+        )
+        payload = json.loads(self.out.strip())
+        self.assertEqual(payload["repo"], "acme/fleet")
+        self.assertEqual(
+            [(m["path"], m["text"]) for m in payload["matches"]],
+            [("README.md", "seed")],
+        )
+        self.assertFalse(payload["truncated"])
+        # No content left the broker except the matching lines themselves: the
+        # audit did not have to fetch the file to find out that it matched.
+        self.assertNotIn("read", self.verbs)
+
+    def test_grep_that_matches_nothing_is_not_an_error(self):
+        self.start()
+        self.assertEqual(
+            self.run_main(["grep", "--audit", AUDIT, "--pattern", "no-such-string"]), 0
+        )
+        payload = json.loads(self.out.strip())
+        self.assertEqual(payload["matches"], [])
+        self.assertEqual(payload["total"], 0)
+
     def test_list_answers_with_names_only_and_never_a_dot_git(self):
-        # `git ls-files` rather than a walk, so the broker cannot leak its own
-        # `.git` — the one directory whose contents are the reason the agent
-        # does not have a clone.
+        # The walk filters anything named `.git` at every depth, so the broker
+        # cannot leak its own — the one directory whose contents are the reason
+        # the agent does not have a clone.
         self.start()
         self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 0)
         for entry in json.loads(self.out.strip())["entries"]:

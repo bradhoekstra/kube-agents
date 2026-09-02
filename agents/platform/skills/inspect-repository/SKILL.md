@@ -11,7 +11,7 @@ content back. What lands locally is source without a repository around it: files
 you can open, grep and reason about, and no `.git/config` for anything to
 execute out of.
 
-The script is `scripts/inspect_repository.py`. Every subcommand prints one JSON
+The script is `./skills/inspect-repository/scripts/inspect_repository.py`. Every subcommand prints one JSON
 object on stdout.
 
 ## When to Use
@@ -36,7 +36,7 @@ object on stdout.
 **Copy the tree** when the repository is small enough to read on disk:
 
 ```bash
-python3 scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --depth 1
+python3 ./skills/inspect-repository/scripts/inspect_repository.py clone --repo kubernetes-sigs/kustomize --depth 1
 ```
 
 Copies into `/opt/data/scratch/repos/<owner>__<name>` unless `--into` names
@@ -47,10 +47,10 @@ somewhere else, and prints `written`, `bytes`, `skipped`, `stopped` and
 most of them:
 
 ```bash
-H=$(python3 scripts/inspect_repository.py open --repo kubernetes-sigs/kustomize --depth 1 | jq -r .handle)
-python3 scripts/inspect_repository.py grep --handle "$H" --pattern 'func NewCmdBuild'
-python3 scripts/inspect_repository.py fetch --handle "$H" --into ./src kustomize/commands/build/build.go
-python3 scripts/inspect_repository.py close --handle "$H"
+H=$(python3 ./skills/inspect-repository/scripts/inspect_repository.py open --repo kubernetes-sigs/kustomize --depth 1 | jq -r .handle)
+python3 ./skills/inspect-repository/scripts/inspect_repository.py grep --handle "$H" --pattern 'func NewCmdBuild'
+python3 ./skills/inspect-repository/scripts/inspect_repository.py fetch --handle "$H" --into ./src kustomize/commands/build/build.go
+python3 ./skills/inspect-repository/scripts/inspect_repository.py close --handle "$H"
 ```
 
 The handle survives between turns; the shell does not. Keep it, and **close it
@@ -72,7 +72,7 @@ when you are done** — an open handle holds a clone on the broker's volume.
 - **Read `skipped`.** `tooLarge` means that file is never coming through this
   route; `requestBudget` means ask again for the rest; `symlink` means the file
   is there and the broker will not follow a link to it, so name the target
-  instead; `notAFile` means no such tracked file.
+  instead; `notAFile` means no such file in the checkout.
 - **Do not run `git` against what lands.** There is no repository there, on
   purpose.
 - **Say which repository and which ref** in anything you report, and treat a
@@ -84,7 +84,7 @@ when you are done** — an open handle holds a clone on the broker's volume.
 | ---------- | ---------------------------------------------------------------------- |
 | `clone`    | Copy a repository (or a `--prefix`) into a scratch directory and close |
 | `open`     | Open a broker-side workspace, print a handle                           |
-| `list`     | One page of tracked paths; page with `--after`                         |
+| `list`     | One page of the checkout's paths; page with `--after`                  |
 | `grep`     | Search tracked files; fixed-string unless `--regex`                    |
 | `fetch`    | Copy named paths into `--into`                                         |
 | `close`    | Drop the broker-side clone                                             |

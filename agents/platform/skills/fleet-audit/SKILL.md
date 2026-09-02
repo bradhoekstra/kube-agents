@@ -182,20 +182,23 @@ branch and writes nothing back into the workspace, so this does not apply.
 
 #### Reading the repository in content mode
 
-There is no clone to grep, so two commands stand in for one. `list` names the tracked files, and
-`fetch` copies the ones you name into the workspace:
+The clone is gone, so three commands stand in for it. `grep` searches inside the files, `list` names
+them, and `fetch` copies the ones you name into the workspace:
 
 ```bash
+./skills/fleet-audit/scripts/audit_report.py grep  --audit <audit-id> --pattern 'namespace: payments'
 ./skills/fleet-audit/scripts/audit_report.py list  --audit <audit-id> --prefix clusters/prod-us-east
 ./skills/fleet-audit/scripts/audit_report.py fetch --audit <audit-id> --path clusters/prod-us-east/payments-netpol.yaml
 ```
 
-`list` answers with paths and sizes, never content, and the broker caps how many entries it returns
-— **pass `--prefix`**, or a large repository comes back silently truncated. `fetch` writes each file
-into the workspace at its repo-relative path, which is exactly where a remediation editing that file
-has to end up; fetch it, edit it in place, and name the same path in the finding.
+`grep` runs broker-side and answers with matching lines; it is a fixed string unless `--regex`, and
+`--prefix` narrows it. Use it when what you know is what a file says. `list` answers with paths and
+sizes, never content — use it when what you know is where the file lives. The broker caps what each
+returns, so read `truncated` on both and **pass `--prefix`** on a large repository. `fetch` writes
+each file into the workspace at its repo-relative path, which is exactly where a remediation editing
+that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
-Both commands exit 2 in directory mode, where the clone already holds the file.
+All three exit 2 in directory mode, where the clone already holds the file.
 
 ### Step 3 — `finish`
 
@@ -424,8 +427,8 @@ field, and publishes nothing:
   one declares an object you observed on the target cluster** before writing beside it. A `grep` for
   a name is kind-blind and matches label lines and shared prefixes, so a hit is not a declaration
   until you have read it. In directory mode that search is a `grep` over the clone; in content mode
-  it is `list --prefix` to narrow to the directory and `fetch` to read the candidates, which does not
-  search inside files — so narrow by path and read, rather than expecting a content match.
+  it is the `grep` subcommand, which the broker runs over its own checkout, and `fetch` to read the
+  hits it named.
   **The parent directory must already exist in the repository**; if no sibling
   can be confirmed, or the hits straddle two directories you cannot tell apart, the finding is
   `kind: manual` with no path. The harness cannot check this for

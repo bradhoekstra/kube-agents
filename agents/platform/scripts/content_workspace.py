@@ -795,7 +795,7 @@ class ContentWorkspaceStore:
     # -- reads -----------------------------------------------------------
 
     def read(self, handle: str, path: str) -> bytes:
-        """The content of one tracked file. A read returns bytes, never a path."""
+        """The content of one file in the checkout. A read returns bytes, never a path."""
         with self._lock:
             workspace = self.get(handle)
             relative = repo_relative(path)
@@ -886,7 +886,7 @@ class ContentWorkspaceStore:
     def list(
         self, handle: str, prefix: str | None = None, after: str | None = None
     ) -> dict:
-        """Tracked paths and their sizes, a page at a time.
+        """The checkout's paths and their sizes, a page at a time.
 
         `prefix` names a directory, and it is matched component-wise. A plain
         string comparison would make `prefix="a"` return `ab/x` as well as

@@ -32,7 +32,8 @@ hands them to the broker, which owns the only checkout. Nothing here ever sees a
 `.git`, so nothing here can author the `.git/config` that every known
 code-execution route through the credential container needs — a filter driver,
 an alias, a hook path. `list` and `fetch` are the read half — the names of the
-tracked files, and the bytes of the ones a fix has to start from.
+files in the broker's checkout, and the bytes of the ones a fix has to start
+from.
 
 **Directory mode**, which is what ran before and still runs when the broker has
 not been armed: a leased clone on the shared volume, and `checkout`, `add`,
@@ -5589,20 +5590,20 @@ def handle_fetch(args: argparse.Namespace) -> None:
 
 
 def handle_list(args: argparse.Namespace) -> None:
-    """Name the repository's tracked files, content mode only.
+    """Name the files in the broker's checkout, content mode only.
 
     The other half of the read. `fetch` needs a path, and the rule that a
     remediation path is discovered rather than invented means the path has to
     come from the repository — which in directory mode the audit finds by
     grepping the clone. There is no clone here, so this is where the names come
-    from: `git ls-files` on the broker's tree, prefix-narrowed.
+    from: a walk of the broker's tree, prefix-narrowed, with anything named
+    `.git` filtered out at every depth so the one directory the agent must not
+    see cannot be listed however it is spelled.
 
-    It answers with names and sizes, not content. Narrowing to the directory a
-    sibling manifest would live in and then `fetch`ing the few candidates is
-    the content-mode spelling of that grep; it takes two commands instead of
-    one and does not search inside the files. The broker caps how many entries
-    it will return, so a bare listing of a large repository is a truncated one
-    — pass `--prefix`.
+    It answers with names and sizes, not content. Searching inside the files is
+    `grep`, below; this is for narrowing by path when the name is the thing you
+    know. The broker caps how many entries it will return, so a bare listing of
+    a large repository is a truncated one — pass `--prefix`.
     """
     audit_id = validate_audit_id(args.audit)
     repo = resolve_repo(audit_id=audit_id)
@@ -5629,6 +5630,59 @@ def handle_list(args: argparse.Namespace) -> None:
                 "entries": entries,
                 "total": entries.total,
                 "truncated": entries.truncated,
+            }
+        )
+    )
+
+
+def handle_grep(args: argparse.Namespace) -> None:
+    """Search inside the files of the broker's checkout, content mode only.
+
+    The directory-mode audit finds a remediation path by grepping the clone for
+    `namespace: <namespace>`. There is no clone in content mode, and narrowing
+    with `list --prefix` and reading the candidates only works when the path is
+    already most of the answer. This is the search itself: the broker runs it
+    over its own tree and sends back matching lines, so a path can still be
+    discovered from what a file says rather than from what it is called.
+
+    It answers with matches, not files. Confirming a hit is still a `fetch` and
+    a read — a match on `namespace: payments` is kind-blind and can be a label
+    line — so this narrows the candidate set rather than replacing the read.
+
+    Directory mode is refused for the same reason `fetch` and `list` are: the
+    clone is right there, and a command that quietly emulated it would teach an
+    audit to call it in both modes.
+    """
+    audit_id = validate_audit_id(args.audit)
+    repo = resolve_repo(audit_id=audit_id)
+    refresh_credentials(repo)
+    root = ensure_workspace(repo, audit_id)
+    if not content_mode():
+        raise ValidationError(
+            f"grep needs the content-passing broker; this run is in directory "
+            f"mode, where {root} is a clone you can grep directly"
+        )
+
+    import credential_proxy_client
+
+    with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
+        result = workspace.grep(
+            args.pattern,
+            prefix=args.prefix,
+            regex=args.regex,
+            ignore_case=args.ignore_case,
+        )
+    # `truncated` travels with the matches, for the reason it does in `list`: a
+    # search that stopped at the broker's ceiling reads as "these are all the
+    # hits", and "the repository does not declare that namespace" is the
+    # conclusion an audit draws from it.
+    print(
+        json.dumps(
+            {
+                "repo": repo,
+                "matches": result.get("matches", []),
+                "total": result.get("total", 0),
+                "truncated": result.get("truncated", False),
             }
         )
     )
@@ -6561,7 +6615,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_parser = subparsers.add_parser(
         "list",
-        help="Name the repository's tracked files, so a remediation path can be "
+        help="Name the files in the broker's checkout, so a remediation path can be "
         "discovered rather than invented (content mode only).",
     )
     list_parser.add_argument("--audit", required=True, help="Audit id.")
@@ -6571,6 +6625,30 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="REPO_PATH",
         help="Restrict the listing to this directory. The broker caps the "
         "number of entries it returns, so a large repository needs one.",
+    )
+
+    grep_parser = subparsers.add_parser(
+        "grep",
+        help="Search inside the files of the broker's checkout, so a remediation "
+        "path can be discovered from what a file says (content mode only).",
+    )
+    grep_parser.add_argument("--audit", required=True, help="Audit id.")
+    grep_parser.add_argument(
+        "--pattern",
+        required=True,
+        help="What to search for. A fixed string unless --regex.",
+    )
+    grep_parser.add_argument(
+        "--prefix",
+        default=None,
+        metavar="REPO_PATH",
+        help="Restrict the search to this directory.",
+    )
+    grep_parser.add_argument(
+        "--regex", action="store_true", help="Treat --pattern as a regular expression."
+    )
+    grep_parser.add_argument(
+        "--ignore-case", action="store_true", help="Match without regard to case."
     )
 
     remediate_parser = subparsers.add_parser(
@@ -6626,6 +6704,8 @@ def main(argv: list[str] | None = None) -> int:
             handle_fetch(args)
         elif args.subcommand == "list":
             handle_list(args)
+        elif args.subcommand == "grep":
+            handle_grep(args)
         elif args.subcommand == "remediate":
             handle_remediate(args)
         else:
