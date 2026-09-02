@@ -120,9 +120,9 @@ const (
 	// The agent pod's side of the same keypair. Two volumes rather than one for
 	// a reason spelled out at buildShellSandboxClientKeyInitContainer: the
 	// Secret cannot be handed to `ssh -i` directly.
-	shellSandboxClientKeySecretVolume = "sandbox-ssh-secret"
+	shellSandboxClientKeySecretVolume = "sandbox-ssh-secret" // #nosec G101 -- Volume name, not a credential
 	shellSandboxClientKeyVolume       = "sandbox-ssh"
-	shellSandboxClientKeySecretPath   = "/etc/sandbox-ssh-secret"
+	shellSandboxClientKeySecretPath   = "/etc/sandbox-ssh-secret" // #nosec G101 -- Mount path, not a credential
 	shellSandboxClientKeyPath         = "/etc/sandbox-ssh"
 	shellSandboxClientKeyFile         = "id_ed25519"
 
@@ -130,7 +130,7 @@ const (
 	// half is beside it as SANDBOX_SSH_PUBLIC_KEY, but the agent pod has no use
 	// for it — it is there so a re-running install surface can recover the pair
 	// from one place, and so the chart can render the sandbox's Secret from it.
-	shellSandboxPrivateKeySecretKey = "SANDBOX_SSH_PRIVATE_KEY"
+	shellSandboxPrivateKeySecretKey = "SANDBOX_SSH_PRIVATE_KEY" // #nosec G101 -- Secret key name, not a credential
 )
 
 // shellSandboxAuthorizedKeysSecretName is the Secret the sandbox mounts. It holds

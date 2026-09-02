@@ -60,14 +60,14 @@ const (
 	// are inside the proxy container's mount namespace and nowhere else — that
 	// containment is the control, so a mount added to the shell container at
 	// either path silently undoes this whole design.
-	credentialProxyWIFTokenVolume = "credential-proxy-wif-token"
-	credentialProxyWIFTokenPath   = "/var/run/secrets/kubeagents/wif"
+	credentialProxyWIFTokenVolume = "credential-proxy-wif-token" // #nosec G101 -- Volume name, not a credential
+	credentialProxyWIFTokenPath   = "/var/run/secrets/kubeagents/wif" // #nosec G101 -- Mount path, not a credential
 	credentialProxyWIFTokenFile   = credentialProxyWIFTokenPath + "/token"
 
 	// On credential-proxy-runtime, which is a memory-backed emptyDir: the file
 	// names the token path and the impersonation target and is regenerated at
 	// every container start, so nothing is gained by letting it reach a disk.
-	credentialProxyWIFCredentialFile = "/var/run/credential-proxy/wif-credentials.json"
+	credentialProxyWIFCredentialFile = "/var/run/credential-proxy/wif-credentials.json" // #nosec G101 -- File path, not a credential
 )
 
 // credentialProxyFederation returns the federation config when it is complete.

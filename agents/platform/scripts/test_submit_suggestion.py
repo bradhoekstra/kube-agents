@@ -668,10 +668,27 @@ class TestContentMode(SubmitSuggestionTestCase):
         # repo goes in at the runner, below the code under test.
         url = "https://github.com/acme/fleet.git"
 
+        # The identity the real executor injects for every `git` it runs, from
+        # the product's own defaults rather than a name invented here. Without
+        # it this runner inherits whatever ~/.gitconfig the machine happens to
+        # have, so `commit` passes on a developer's laptop and exits 128 on a CI
+        # runner that has no global identity — the test would be measuring the
+        # machine rather than the code.
+        identity = {
+            "GIT_AUTHOR_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+            "GIT_AUTHOR_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+            "GIT_COMMITTER_NAME": credential_proxy.DEFAULT_GIT_AUTHOR_NAME,
+            "GIT_COMMITTER_EMAIL": credential_proxy.DEFAULT_GIT_AUTHOR_EMAIL,
+        }
+
         def runner(argv, cwd):
             argv = [str(origin) if token == url else token for token in argv]
             completed = subprocess.run(
-                argv, cwd=str(cwd), capture_output=True, text=True
+                argv,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                env={**os.environ, **identity},
             )
             return GitResult(completed.returncode, completed.stdout, completed.stderr)
 
