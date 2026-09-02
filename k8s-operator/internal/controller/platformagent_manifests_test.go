@@ -1644,11 +1644,38 @@ func TestKustomizeCoreEgressDNSPeersMatchTheOperator(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "platform-agent", Namespace: "kubeagents-system"},
 	}
+	// Every port-53 rule, not egressCIDRsForPort, which returns at the first one
+	// it finds. The static side above iterates the whole file, and comparing one
+	// operator rule against all of the manifest's would report parity for a
+	// second operator rule nobody had mirrored — the exact drift this test is
+	// here to catch, and a split into two port-53 rules is a plausible edit given
+	// that separate rules are how this policy keeps grants from widening one
+	// another.
 	rendered := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
 	operator := map[string]bool{}
-	for _, cidr := range egressCIDRsForPort(rendered, dnsPort) {
-		if strings.HasSuffix(cidr, "/32") || strings.HasSuffix(cidr, "/128") {
-			operator[cidr] = true
+	for _, rule := range rendered.Spec.Egress {
+		// Written out rather than through ruleNamesPort, which counts a rule with
+		// no ports as naming every one of them. That is right for its callers and
+		// wrong here: such a rule's peers are not DNS peers, and folding them into
+		// this set would report drift against the static file for peers the static
+		// file's DNS rule was never supposed to carry.
+		namesDNS := false
+		for _, candidate := range rule.Ports {
+			if candidate.Port != nil && candidate.Port.IntValue() == dnsPort {
+				namesDNS = true
+				break
+			}
+		}
+		if !namesDNS {
+			continue
+		}
+		for _, peer := range rule.To {
+			if peer.IPBlock == nil {
+				continue
+			}
+			if strings.HasSuffix(peer.IPBlock.CIDR, "/32") || strings.HasSuffix(peer.IPBlock.CIDR, "/128") {
+				operator[peer.IPBlock.CIDR] = true
+			}
 		}
 	}
 

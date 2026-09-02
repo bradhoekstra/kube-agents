@@ -4251,7 +4251,10 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// fetches; these two are the whole of the metadata server's reach from this
 	// Pod, and they are separate rules so that neither widens the other.
 	//
-	// This evaluates to the same peer as linkLocalPeers above, and is written out
+	// Through metadataResolverCIDR, the name the sibling builder grants it under,
+	// so a grep for that constant finds both places the resolver is permitted.
+	//
+	// It evaluates to the same peer as linkLocalPeers above, and is written out
 	// again rather than reusing that slice so the two can diverge. The DNS grant
 	// is IPv4-only on purpose: fd20:ce::254 is documented as a metadata endpoint
 	// rather than as a resolver, and no static copy in charts/ or
@@ -4259,12 +4262,14 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// Cloud DNS cluster is observed naming it in a Pod's resolv.conf. Reusing
 	// linkLocalPeers would grant it here the day that slice grows an IPv6 entry,
 	// which is a decision about the token rules and not about this one.
-	dnsPeers = append(dnsPeers, formatCIDRPeers([]string{metadataLinkLocalIP}, true)...)
+	dnsPeers = append(dnsPeers, formatCIDRPeers([]string{metadataResolverCIDR}, true)...)
 
 	// Through formatCIDRPeers rather than a third spelling of /32-or-/128 in this
 	// file: it shares normalizeCIDRTarget with toEgressRules, and it sorts and
-	// dedupes. enforceMinPrefix is false because these are bare IPs resolved by the
-	// operator, which always widen to a single host. The default is the fallback for
+	// dedupes. enforceMinPrefix is false for dnsIPs because these are bare IPs
+	// resolved by the operator, which always widen to a single host; the resolver
+	// peer above passes true, as linkLocalPeers does, and a bare address clears
+	// the floor either way. The default is the fallback for
 	// nothing surviving, not for each entry that does not parse -- two bad entries
 	// used to emit the default twice.
 	dnsIPPeers := formatCIDRPeers(dnsIPs, false)

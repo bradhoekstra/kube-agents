@@ -126,10 +126,20 @@ func permits(policy *networkingv1.NetworkPolicy, address string) bool {
 // credential ports on purpose — a future rule permitting the metadata server on
 // some port nobody has thought of yet is caught by this and would not be caught
 // by a list of 80, 987, 988 and 8080.
+//
+// The exemption is granted to one address, not to the DNS rule. metadataLinkLocalIP
+// is the resolver under Cloud DNS for GKE and is deliberately on that rule;
+// metadataDaemonIP and the IPv6 endpoint answer the token API and no DNS at all,
+// so there is no reading of "DNS-only" that should let them onto it. Exempting
+// the rule itself would drop them from every assertion in this file the moment
+// someone added one to the peer list — port 53 included — and the package comment
+// on metadataServerAddresses promises the opposite.
 func permitsBeyondDNS(policy *networkingv1.NetworkPolicy, address string) bool {
+	exemptDNSRule := address == metadataLinkLocalIP
+
 	beyondDNS := &networkingv1.NetworkPolicy{Spec: networkingv1.NetworkPolicySpec{}}
 	for _, rule := range policy.Spec.Egress {
-		if ruleIsDNSOnly(rule) {
+		if exemptDNSRule && ruleIsDNSOnly(rule) {
 			continue
 		}
 		beyondDNS.Spec.Egress = append(beyondDNS.Spec.Egress, rule)
@@ -232,15 +242,20 @@ func labelSet(from map[string]string) labels.Set {
 // 169.254.169.254 on port 53 deliberately — that is the resolver under Cloud
 // DNS for GKE. The property being defended is that no rule permits a metadata
 // address on a port a token can be minted over, which is every port but that
-// one. TestTheDNSRuleReachesTheCloudDNSResolver holds the other side of it.
+// one, and for the other two addresses it is every port without exception.
+// TestTheDNSRuleReachesTheCloudDNSResolver holds the other side of it.
 func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
 	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
 
 	for _, address := range metadataServerAddresses {
 		if permitsBeyondDNS(policy, address) {
-			t.Errorf("the rendered egress policy permits the metadata server at %s on a port other "+
-				"than 53; anything that can make an HTTP request there can mint the Workload Identity "+
-				"token and bypass the credential broker entirely", address)
+			scope := "on any port"
+			if address == metadataLinkLocalIP {
+				scope = "on a port other than 53"
+			}
+			t.Errorf("the rendered egress policy permits the metadata server at %s %s; anything that "+
+				"can make an HTTP request there can mint the Workload Identity token and bypass the "+
+				"credential broker entirely", address, scope)
 		}
 	}
 }
