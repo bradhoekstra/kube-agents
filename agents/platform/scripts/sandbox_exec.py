@@ -123,6 +123,14 @@ _CONNECT_OPTIONS = (
 )
 
 
+class SandboxMisconfigured(RuntimeError):
+    """The managed config is present and unreadable, so where to run is unknown.
+
+    Raised rather than defaulted, because the default is the agent pod and
+    running there is the thing the sandbox exists to prevent.
+    """
+
+
 class SandboxUnavailable(RuntimeError):
     """ssh could not reach the sandbox, so the command never ran.
 
@@ -134,20 +142,34 @@ class SandboxUnavailable(RuntimeError):
 def _load_terminal_config(path: str | None = None) -> dict:
     """Read the `terminal:` block from the operator-managed Hermes config.
 
-    Returns `{}` when the file is missing or unreadable rather than raising:
-    the answer that matters to every caller is `sandbox_enabled()`, and a
-    missing managed config means no sandbox, not a broken agent.
+    A file that is not there is `{}` and no sandbox — that is the ordinary
+    answer inside the sandbox itself, where the managed config is an agent-pod
+    file that was never mounted, and it is what lets one call site serve both
+    sides of the boundary.
+
+    A file that *is* there and cannot be read is an error. Answering `{}` to
+    that reads as "no sandbox configured", and `run()` then executes the
+    command locally — model-authored code in the credentialed pod, which is
+    the arrangement this module exists to end. The failure is silent, and it
+    fires exactly when the operator-managed config is broken.
     """
     config_path = path or MANAGED_CONFIG_PATH
+    if not os.path.exists(config_path):
+        return {}
     try:
-        import yaml  # noqa: PLC0415 — optional at import time, see below
-
+        import yaml  # noqa: PLC0415 — see the ImportError branch below
+    except ImportError as exc:
+        # Only reachable with a managed config present, so this is the agent
+        # pod without PyYAML rather than the sandbox without a config.
+        raise SandboxMisconfigured(
+            f"{config_path} exists but PyYAML is not installed, so the terminal "
+            "backend cannot be read"
+        ) from exc
+    try:
         with open(config_path, encoding="utf-8") as handle:
             loaded = yaml.safe_load(handle) or {}
-    except (OSError, ImportError):
-        return {}
-    except Exception:  # pragma: no cover — a malformed managed config
-        return {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise SandboxMisconfigured(f"{config_path} could not be read: {exc}") from exc
     terminal = loaded.get("terminal")
     return terminal if isinstance(terminal, dict) else {}
 

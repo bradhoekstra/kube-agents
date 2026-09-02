@@ -53,6 +53,25 @@ class ConfigTestCase(unittest.TestCase):
     def test_missing_config_is_not_an_error(self):
         self.assertFalse(sandbox_exec.sandbox_enabled("/nonexistent/config.yaml"))
 
+    def test_a_config_that_is_there_and_unreadable_is_loud(self):
+        """The one place a default is worse than a crash.
+
+        "No sandbox" sends the command to `subprocess.run` in the agent pod,
+        which is where model-authored code must never run. A managed config
+        that exists and cannot be parsed says nothing about which side to use,
+        so it is not an answer to guess at.
+        """
+        broken = write_config("terminal:\n  backend: ssh\n   ssh_host: [\n")
+        with self.assertRaises(sandbox_exec.SandboxMisconfigured):
+            sandbox_exec.sandbox_enabled(broken)
+
+        unreadable = write_config(SANDBOX_CONFIG)
+        os.chmod(unreadable, 0o000)
+        self.addCleanup(os.chmod, unreadable, 0o600)
+        if os.geteuid() != 0:  # root reads it regardless
+            with self.assertRaises(sandbox_exec.SandboxMisconfigured):
+                sandbox_exec.sandbox_enabled(unreadable)
+
 
 class ArgvTestCase(unittest.TestCase):
     def setUp(self):
