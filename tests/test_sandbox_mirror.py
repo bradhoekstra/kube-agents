@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 _MODULE_PATH = (
     pathlib.Path(__file__).resolve().parents[1] / "deploy" / "shared" / "sandbox_mirror.py"
@@ -516,6 +517,70 @@ class DryRun(unittest.TestCase):
             self.assertIn("scratch", report["would_copy"])
             self.assertIn(".env", report["skipped"])
             self.assertIn("profiles/platform/workspace", report["would_copy"])
+
+
+class MigrationMarker(unittest.TestCase):
+    """When the run may declare itself finished.
+
+    The marker is what every later start reads to skip the copy, so writing it
+    while paths are still on the agent pod's volume is the one-way door: the
+    budget that was too tight for this start becomes permanent.
+    """
+
+    def drive(self, max_bytes):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        build_home(root)
+        config = root / "managed.yaml"
+        config.write_text("terminal:\n  backend: ssh\n  ssh_host: sandbox.invalid\n")
+
+        commands = []
+
+        def remote(ssh, command, check=True):
+            commands.append(command)
+            # The sandbox's own marker is present -- that is the check for
+            # --remote-root naming the right volume -- and the migration marker
+            # is not, which is what a first run looks like.
+            missing = command.startswith("test -f") and sm.MIGRATION_MARKER in command
+            return subprocess.CompletedProcess([], 1 if missing else 0, "", "")
+
+        patches = [
+            unittest.mock.patch.object(sm, "remote", remote),
+            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: True),
+            unittest.mock.patch.object(sm, "push_skeleton", lambda *a, **k: None),
+            unittest.mock.patch.object(sm, "remote_free_bytes", lambda *a, **k: None),
+            unittest.mock.patch.object(sm, "transfer", lambda *a, **k: None),
+            unittest.mock.patch.object(sm, "log", lambda message: None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+        code = sm.main(
+            ["--agent-home", str(root), "--config", str(config), "--max-bytes", str(max_bytes)]
+        )
+        written = [c for c in commands if sm.MIGRATION_MARKER in c and c.startswith("cat >")]
+        return code, written
+
+    def test_a_budget_that_left_paths_behind_writes_no_marker(self):
+        # One byte: everything is over budget, so nothing is copied. Marking
+        # that complete strands the model's work on the agent pod's volume
+        # forever, because no later start looks again.
+        code, written = self.drive(max_bytes=1)
+        self.assertEqual(0, code)
+        self.assertEqual([], written, "the migration is not finished; the marker says it is")
+
+    def test_a_run_that_copied_everything_writes_the_marker(self):
+        code, written = self.drive(max_bytes=0)
+        self.assertEqual(0, code)
+        self.assertEqual(1, len(written))
+        recorded = json.loads(written[0].split("\n", 1)[1].rsplit("\n", 2)[0])
+        # What landed, not what was considered: the summary is the only record
+        # of the run, and a dropped path listed as copied reads as data loss
+        # having been intentional.
+        self.assertIn("scratch", recorded["copied"])
+        self.assertNotIn(".env", recorded["copied"])
 
 
 if __name__ == "__main__":

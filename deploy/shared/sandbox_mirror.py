@@ -770,6 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         for rel, why in skipped
         if (agent_home / rel).is_dir() and any((agent_home / rel).iterdir())
     ]
+    copied: list[str] = []
+    deferred: list[str] = []
     if not include:
         log("nothing on the agent pod's home qualifies for migration")
     else:
@@ -779,6 +781,7 @@ def main(argv: list[str] | None = None) -> int:
             log(f"sandbox volume has {free // (1024 * 1024)} MiB free")
         budget = effective_budget(args.max_bytes, free)
         kept, dropped = apply_budget(sizes, budget)
+        deferred = [rel for rel, _ in dropped]
         for rel, size in dropped:
             log(
                 f"NOT migrating {rel} ({size // (1024 * 1024)} MiB): it does not fit "
@@ -790,16 +793,34 @@ def main(argv: list[str] | None = None) -> int:
             log(f"copying {len(kept)} path(s), {total // (1024 * 1024)} MiB, into the sandbox")
             transfer(ssh, agent_home, args.remote_root, kept)
             log("copy finished: " + ", ".join(kept))
+            copied = kept
         else:
             log("no path fits the budget; nothing copied")
 
     for rel, why in noisy_skips:
         log(f"left on the agent pod: {rel} ({why})")
 
+    if deferred:
+        # The marker means "the copy is done", and every later start reads it
+        # as permission to skip. Writing it while paths are still on the agent
+        # pod's volume makes a budget that was too tight for one start
+        # permanent: the sandbox volume grows, the next start would have had
+        # room, and nothing ever looks again. Left unwritten instead, so the
+        # retry happens on its own. Re-copying what already landed is safe --
+        # `transfer` passes `--skip-old-files` and never overwrites the
+        # sandbox's copy.
+        log(
+            f"NOT writing {migrated_path}: {len(deferred)} path(s) are still on the "
+            "agent pod's volume (" + ", ".join(sorted(deferred)) + "). The next "
+            "start will try again; raise --max-bytes or free space on the sandbox "
+            "volume to finish it sooner."
+        )
+        return 0
+
     summary = json.dumps(
         {
             "homes": homes,
-            "copied": sorted(include),
+            "copied": sorted(copied),
             "skipped": {rel: why for rel, why in skipped},
         },
         sort_keys=True,
