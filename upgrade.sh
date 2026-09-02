@@ -238,6 +238,13 @@ backfill_session_kv_keys() {
 # container copies into place once at startup, so a pod that started before the
 # backfill keeps the empty directory it was given until it restarts.
 SANDBOX_KEYS_PATCHED="false"
+
+# How long step 5 waits for the sandbox and the credential proxy. Longer than
+# the gateway's because the sandbox is a StatefulSet with a ReadWriteOnce
+# volume: the new pod cannot attach until the old one has detached, so its
+# rollout serialises where a Deployment's overlaps.
+SANDBOX_ROLLOUT_TIMEOUT="180s"
+
 backfill_sandbox_ssh_key() {
   local namespace="$1"
   local secret_name="platform-agent-secrets"
@@ -676,6 +683,20 @@ main() {
   fi
   if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
     kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=120s
+  fi
+  # A healthy gateway is not a working install. The agent runs no command in its
+  # own pod: every shell command goes over ssh to the sandbox StatefulSet, and
+  # every credentialed one through the proxy. Verifying only the gateway
+  # reported an upgrade that succeeded while the agent could not run kubectl.
+  #
+  # Guarded on the object existing, because the operator creates both and an
+  # operator-mode upgrade can reach here before its PlatformAgent has
+  # reconciled. A missing object is that, not a failed rollout.
+  if kubectl get statefulset platform-agent-shell -n "$target_namespace" >/dev/null 2>&1; then
+    kubectl rollout status statefulset/platform-agent-shell -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+  fi
+  if kubectl get deployment platform-agent-credential-proxy -n "$target_namespace" >/dev/null 2>&1; then
+    kubectl rollout status deployment/platform-agent-credential-proxy -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
   fi
   print_success "Upgraded deployments verified healthy."
 

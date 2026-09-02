@@ -444,7 +444,7 @@ platformAgent:
         enabled: null # always on
         # Overrides the sandbox image for this agent only. Empty takes the
         # operator's AGENT_SANDBOX_IMAGE, which this chart sets from the
-        # agentSandbox block below — so a mirrored install needs the mirror
+        # top-level agentSandbox block — so a mirrored install needs the mirror
         # pointed at that block, not at this key.
         image: ""
         # Runs the sandbox pod under a sandboxed container runtime — `gvisor`
