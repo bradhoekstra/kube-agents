@@ -1197,23 +1197,30 @@ GIT_LEASE_MARKER = ".lease"
 # A denylist rather than a read-only allowlist, deliberately. The set of verbs
 # that can mutate a tree is closed and well known; the set of read verbs is not,
 # and a new one silently failing closed would be a worse outcome than the race
-# this closes. `clone` is absent on purpose: it runs at the lease root, one
-# directory above the tree it is about to create, and it cannot damage a tree
-# that does not exist yet. `fetch` is absent for the same reason it is safe —
-# it writes remote-tracking refs and nothing in the working tree. `config`,
-# `remote` and every read verb are likewise untouched.
+# this closes. `config`, `remote` and every read verb are untouched.
 #
 # `pull`, `submodule` and `sparse-checkout` are here because each one is a
 # working-tree write wearing another word: `pull` is `fetch` plus the `merge`
 # or `rebase` two lines up, `submodule update` checks out whole directories,
 # and `sparse-checkout set` adds and removes files across the entire tree. All
 # three were reachable in a clone another agent was midway through.
+#
+# `clone` and `fetch` were left out at first, on the argument that neither
+# writes a working tree it does not own. `fetch` does something worse: it moves
+# `origin/*` in whatever clone it is run in, and every lease-holder in this
+# product compares against those refs to decide whether its work raced someone
+# else's. A foreign fetch makes that comparison agree while the answer is
+# wrong. `clone` writes into a destination it does not choose, which can be a
+# directory inside another agent's lease. Both are leased today by every caller
+# that issues them — `ensure_workspace` writes the marker before it clones, at
+# the lease root the clone runs in — so requiring the lease costs nothing and
+# closes the two remaining ways one agent reaches another's tree.
 GIT_MUTATING_SUBCOMMANDS = frozenset(
     {
         "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
-        "commit", "merge", "mv", "pull", "push", "rebase", "reset", "restore",
-        "revert", "rm", "sparse-checkout", "stash", "submodule", "switch",
-        "tag", "update-ref", "worktree",
+        "clone", "commit", "fetch", "merge", "mv", "pull", "push", "rebase",
+        "reset", "restore", "revert", "rm", "sparse-checkout", "stash",
+        "submodule", "switch", "tag", "update-ref", "worktree",
     }
 )
 

@@ -320,26 +320,36 @@ class GitLeaseGateTest(unittest.TestCase):
             ["git", "log", "-1"],
             ["git", "show", "HEAD"],
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            ["git", "fetch", "--prune", "origin"],
             ["git", "config", "user.name", "platform-agent"],
             ["git", "ls-files"],
         ):
             with self.subTest(argv=argv):
                 self.assertIsNone(executor.git_lease_violation(argv, unleased))
 
-    def test_clone_is_allowed_at_the_lease_root(self):
-        # `ensure_workspace` runs it one directory above a tree that does not
-        # exist yet, so there is nothing there to damage — and the `.lease` is
-        # written first, so the directory is leased even then.
+    def test_clone_and_fetch_need_the_lease_the_same_as_the_rest(self):
+        # Neither writes a tree it owns, which is why both were left out at
+        # first. `fetch` moves `origin/*` in whatever clone it runs in, and
+        # every lease-holder here compares against those refs to decide whether
+        # its work raced someone else's -- a foreign fetch makes that
+        # comparison agree while the answer is wrong. `clone` writes into a
+        # destination it does not choose, which can sit inside another lease.
         executor = self.executor()
+        unleased = str(executor.workspace_dir)
+        clone = ["git", "clone", "--quiet", "https://github.com/acme/fleet", "x"]
+        fetch = ["git", "fetch", "--prune", "origin"]
+        for argv in (clone, fetch):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(executor.git_lease_violation(argv, unleased))
+
+        # Paired ordinary use: `ensure_workspace` writes the marker before it
+        # clones, at the lease root the clone runs in, so the callers that
+        # legitimately issue these are unaffected.
         holder = executor.workspace_dir / "gitops" / "t_card"
         holder.mkdir(parents=True)
-        self.assertIsNone(
-            executor.git_lease_violation(
-                ["git", "clone", "--quiet", "https://github.com/acme/fleet", "x"],
-                str(holder),
-            )
-        )
+        (holder / ".lease").write_text("{}", encoding="utf-8")
+        for argv in (clone, fetch):
+            with self.subTest(argv=argv, leased=True):
+                self.assertIsNone(executor.git_lease_violation(argv, str(holder)))
 
     def test_a_dash_c_redirect_out_of_the_lease_is_refused(self):
         # git applies `-C` before running the subcommand, so a check that only
