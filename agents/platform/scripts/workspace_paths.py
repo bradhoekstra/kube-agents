@@ -22,12 +22,13 @@ for everything that already called it.
 
 from __future__ import annotations
 
+import unicodedata
 from pathlib import PurePosixPath
 from typing import Any
 
 # Codepoints HFS+ drops when it compares names, so `.gi<U+200C>t` opens `.git`
 # on a Mac. Git carries its own copy of this list in `is_hfs_dotgit`; this one
-# is deliberately not a port of it. See `_looks_like_dotgit`.
+# is deliberately not a port of it. See `looks_like_dotgit`.
 _HFS_IGNORABLE = {
     0x200C, 0x200D, 0x200E, 0x200F,
     0x202A, 0x202B, 0x202C, 0x202D, 0x202E,
@@ -35,8 +36,13 @@ _HFS_IGNORABLE = {
     0xFEFF,
 }
 
+# Unicode's class for a control character: C0, DEL, and C1. `str.isspace()`
+# covers only some of them, and the ones it misses -- ESC, and the C1 block --
+# are the ones that rewrite a terminal that prints the name back.
+_CONTROL_CATEGORY = "Cc"
 
-def _looks_like_dotgit(segment: str) -> bool:
+
+def looks_like_dotgit(segment: str) -> bool:
     """True for anything a filesystem might open as `.git`.
 
     This refuses more spellings than git itself accepts, on purpose. Git has two
@@ -76,30 +82,50 @@ class WorkspaceError(Exception):
 def validate_path(raw: Any) -> str:
     """A repository-relative name, or a refusal. One validator, both directions.
 
-    Refuses, in order: a non-string; an empty name; surrounding whitespace; a
-    NUL or newline; an absolute path; a Windows drive or backslash separator;
-    any `.` or `..` segment; and any segment that spells `.git`. Every rejection
-    is outright rather than normalising, because normalising means
-    reimplementing another library's edge cases and betting the two agree --
-    refusing the ambiguous form is the rule that does not depend on that bet.
-    Surrounding whitespace is in that list for the same reason it would have
-    been stripped: ` a.yaml` and `a.yaml` are two names, and deciding they are
-    one is a normalisation the enforcer downstream does not make.
+    Refuses, in order: a non-string; an empty name; any control character;
+    surrounding whitespace; a backslash separator; an absolute path; any `.` or
+    `..` segment; and any segment that spells `.git`. Every rejection is
+    outright rather than normalising, because normalising means reimplementing
+    another library's edge cases and betting the two agree -- refusing the
+    ambiguous form is the rule that does not depend on that bet. Surrounding
+    whitespace is in that list for the same reason it would have been stripped:
+    ` a.yaml` and `a.yaml` are two names, and deciding they are one is a
+    normalisation the enforcer downstream does not make.
+
+    Names travel both ways through this, which is what bounds the strictness.
+    `list` and `grep` answer with names read out of a repository nobody here
+    chose, and `read` then takes one of those names back -- so a spelling this
+    refuses is a file the protocol cannot see, not merely one the agent cannot
+    invent. `foo:bar` is such a name: git accepts it, `grep` already passes
+    `-z` so that a colon in a name cannot be misread, and a validator that
+    called it a drive letter would hide a file from the repository that holds
+    it.
     """
     if not isinstance(raw, str):
         raise WorkspaceError("path must be a string")
     text = raw
     if not text:
         raise WorkspaceError("path must not be empty")
+    # Ahead of the whitespace check, which `strip` would otherwise answer for
+    # a name ending in a newline -- "write it without the whitespace" reads as
+    # a formatting nit for a name carrying a control character. Every control
+    # character rather than NUL, CR and LF alone: ESC and the C1 block reach a
+    # log line and a terminal, and git quotes all of them in a name because
+    # none of them is one.
+    control = next(
+        (ch for ch in text if unicodedata.category(ch) == _CONTROL_CATEGORY), ""
+    )
+    if control:
+        raise WorkspaceError(
+            f"path must not contain control characters (found {control!r})"
+        )
     if text != text.strip():
         raise WorkspaceError(
             f"path {raw!r} has leading or trailing whitespace; write it without"
         )
-    if "\x00" in text or "\n" in text or "\r" in text:
-        raise WorkspaceError("path must not contain control characters")
     if "\\" in text:
         raise WorkspaceError(f"path {raw!r} must use / as its separator")
-    if text.startswith("/") or (len(text) > 1 and text[1] == ":"):
+    if text.startswith("/"):
         raise WorkspaceError(f"path {raw!r} must be repository-relative, not absolute")
     # Split by hand rather than through PurePosixPath. pathlib *normalises*:
     # it drops `.` segments and collapses `//`, so `./manifests/app.yaml` and
@@ -120,7 +146,7 @@ def validate_path(raw: Any) -> str:
         # outer repository but is a live config directory for anything that
         # later treats that subdirectory as a repository of its own, and the
         # cost of refusing it is zero.
-        if _looks_like_dotgit(part):
+        if looks_like_dotgit(part):
             raise WorkspaceError(
                 f"path {raw!r} names a git directory. Nothing the agent authors "
                 "belongs there: `.git/config` is where a filter driver, an alias "

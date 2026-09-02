@@ -232,7 +232,7 @@ def _looks_like_dot_git(component: str) -> bool:
     calls it by. See that module for why it is deliberately stricter than git's
     own `is_ntfs_dotgit` / `is_hfs_dotgit`.
     """
-    return workspace_paths._looks_like_dotgit(component)
+    return workspace_paths.looks_like_dotgit(component)
 
 
 def repo_relative(path: str) -> PurePosixPath:
