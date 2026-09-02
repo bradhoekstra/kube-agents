@@ -209,26 +209,22 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
     # one whose Secret-backed env this class is about.
     AGENT_DEPLOYMENT = "platformagent-gateway"
     AGENT_CONTAINER = "platform-agent"
-    # The same Deployment in this golden: the default layout keeps the proxy as
-    # a native sidecar beside the agent. It is named separately anyway because
-    # the other two layouts move it -- `spec.security.splitCredentialBrokerPod`
-    # gives it a Deployment of its own, and the shell sandbox moves the runtime
-    # into the sandbox Pod -- and because picking a Deployment by position is
-    # how this test would start asserting against whichever the operator
-    # happens to render first.
-    PROXY_DEPLOYMENT = "platformagent-gateway"
+    # A Deployment of its own, always. The pod is the smallest unit that has an
+    # IP and an IP is what GKE resolves Workload Identity by, so a proxy sharing
+    # the gateway Pod would share the agent's identity along with it.
+    PROXY_DEPLOYMENT = "platformagent-credential-proxy"
     PROXY_CONTAINER = "envoy-credential-proxy"
-    # A credential the proxy holds and the agent must never see. Named rather
-    # than counted: SESSION_KV_API_KEY is on both containers, so "the proxy has
-    # some Secret-backed env" is satisfied by a pod-scoped value and would stay
-    # true after the last real credential left.
-    PROXY_CREDENTIAL = "API_SERVER_EXTERNAL_KEY"
+    # What the proxy holds that the agent must never reach: the ServiceAccount
+    # token it authenticates to Google with, and the state dir it writes minted
+    # tokens and regenerated kubeconfigs into. Named rather than counted,
+    # because the proxy also mounts volumes the agent legitimately shares.
+    PROXY_ONLY_VOLUMES = {"credential-proxy-ksa-token", "credential-proxy-state"}
     GOLDEN = (
         Path(__file__).resolve().parents[3]
         / "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml"
     )
 
-    def _container(self, deployment, name):
+    def _containers(self, deployment):
         if not self.GOLDEN.exists():
             self.fail(
                 f"golden manifest not found at {self.GOLDEN}. This test reads the "
@@ -248,9 +244,12 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
             "If it was renamed, update the constant on this class — do not delete "
             "this test.")
         pod = deployments[0]["spec"]["template"]["spec"]
-        # Both lists: the credential proxy is a native sidecar, so it lives in
-        # initContainers with restartPolicy: Always rather than in containers.
-        containers = pod.get("containers", []) + pod.get("initContainers", [])
+        # Both lists, because a native sidecar lives in initContainers with
+        # restartPolicy: Always rather than in containers.
+        return pod.get("containers", []) + pod.get("initContainers", [])
+
+    def _container(self, deployment, name):
+        containers = self._containers(deployment)
         for container in containers:
             if container.get("name") == name:
                 return container
@@ -266,6 +265,10 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
             for env in container.get("env", [])
             if (env.get("valueFrom") or {}).get("secretKeyRef")
         }
+
+    @staticmethod
+    def _mounts(container):
+        return {mount["name"] for mount in container.get("volumeMounts", [])}
 
     def test_the_agent_holds_only_the_two_pod_scoped_secrets(self):
         self.assertEqual(
@@ -302,14 +305,28 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
         # moved credentials out of the proxy, the next question is whether they
         # landed on the agent, and the agent assertion alone reads the same
         # either way.
-        secret_backed = self._secret_backed(
-            self._container(self.PROXY_DEPLOYMENT, self.PROXY_CONTAINER))
-        self.assertIn(
-            self.PROXY_CREDENTIAL, secret_backed,
-            f"{self.PROXY_CREDENTIAL} is no longer Secret-backed on the "
-            f"{self.PROXY_CONTAINER} container (found {sorted(secret_backed)}). "
+        proxy = self._mounts(self._container(self.PROXY_DEPLOYMENT, self.PROXY_CONTAINER))
+        self.assertEqual(
+            self.PROXY_ONLY_VOLUMES, self.PROXY_ONLY_VOLUMES & proxy,
+            f"the {self.PROXY_CONTAINER} container no longer mounts "
+            f"{sorted(self.PROXY_ONLY_VOLUMES - proxy)} (it mounts {sorted(proxy)}). "
             "If credentials moved, they must not have moved onto the agent; "
-            "update PROXY_CREDENTIAL to whichever one now anchors this.")
+            "update PROXY_ONLY_VOLUMES to whichever volumes now carry them.")
+
+    def test_no_container_in_the_gateway_pod_mounts_what_the_proxy_holds(self):
+        # The proxy is in a Pod of its own, so the volumes it holds credentials
+        # on are unreachable from here — but "unreachable" is one `volumeMounts`
+        # entry away from being untrue, and a Secret projected into the gateway
+        # Pod is readable by `_run_env`'s children whatever the network policy
+        # says.
+        for container in self._containers(self.AGENT_DEPLOYMENT):
+            with self.subTest(container=container["name"]):
+                shared = self.PROXY_ONLY_VOLUMES & self._mounts(container)
+                self.assertEqual(
+                    set(), shared,
+                    f"{container['name']} in {self.AGENT_DEPLOYMENT} mounts "
+                    f"{sorted(shared)}, which is where the credential proxy keeps "
+                    "what the agent must never read.")
 
 
 if __name__ == "__main__":

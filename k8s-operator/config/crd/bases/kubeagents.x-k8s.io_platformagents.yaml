@@ -8749,23 +8749,27 @@ spec:
                           type: boolean
                         shellSandbox:
                           description: |-
-                            ShellSandbox moves the agent's shell off the gateway pod and into a
-                            separate container it reaches over SSH, so that a command the agent runs
-                            cannot read the agent's own filesystem, environment or credentials. See
+                            ShellSandbox tunes the agent's shell sandbox — the separate pod it reaches
+                            over SSH, where every command it runs executes. The sandbox itself is not
+                            optional; this block sets its image and its container runtime. See
                             docs/designs/agent-shell-sandboxing.md.
                           properties:
                             enabled:
-                              default: false
                               description: |-
-                                Enabled turns the sandbox on. Absent means off: an install that says
-                                nothing keeps the shell local, which is the behaviour every existing
-                                install has.
+                                Enabled is retained so that an install carrying `enabled: true` still
+                                applies, and so that `enabled: false` is refused rather than silently
+                                ignored. The sandbox is not optional: the agent image ships no kubectl,
+                                gcloud, gh or git, so an agent without a sandbox has no shell tools at
+                                all, and running them back in the gateway pod is the arrangement this
+                                design exists to end. Setting it false parks the agent Degraded with
+                                reason ShellSandboxCannotBeDisabled and changes nothing about the running
+                                workload.
 
-                                Turning it on needs a keypair in the agent's credential Secret
+                                The sandbox needs a keypair in the agent's credential Secret
                                 (SANDBOX_SSH_PRIVATE_KEY) and its public half in
                                 <agent>-shell-authorized-keys. Every install surface mints both; an
-                                install that predates them gets them from upgrade.sh. With the toggle on
-                                and no key, the sandbox runs and the agent cannot log into it.
+                                install that predates them gets them from upgrade.sh. With no key, the
+                                sandbox runs and the agent cannot log into it.
                               type: boolean
                             image:
                               description: |-
@@ -9687,10 +9691,10 @@ spec:
                         way: the gateway policy alone is enough to make the point above.
 
                         The overlap is deliberate rather than an oversight. Workload Identity
-                        needs the metadata path, and in the sidecar layout the credential broker
-                        shares the Pod, so <name>-gateway-netpol cannot stop permitting it
-                        without breaking every install. Narrowing it to the broker Pod once the
-                        broker has left is the work that turns this field into a control.
+                        needs the metadata path, and <name>-gateway-netpol still permits it to
+                        the agent Pod. Narrowing that allowance to the broker Pod, which is the
+                        only one that mints a cloud token, is the work that turns this field into
+                        a control.
 
                         So what is this for today? Two things, and they are worth having, but
                         neither is enforcement. It renders an auditable statement of the
@@ -9699,15 +9703,7 @@ spec:
                         rules and the reconcile behaviour, so that narrowing the gateway policy
                         later is a change to one policy rather than a new feature.
 
-                        REQUIRES splitCredentialBrokerPod: true. Containers in one Pod share a
-                        network namespace, and the credential broker reaches the metadata server
-                        on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
-                        cannot deny the metadata server to the agent container while allowing it
-                        to the broker container beside it. Asking for the combination is refused
-                        with Degraded/EgressPolicyRequiresSplitBroker rather than rendered — so
-                        the default install, which has the split off, has none of this.
-
-                        Three further conditions the operator cannot check for you.
+                        Three conditions the operator cannot check for you.
 
                           - The policy does nothing at all on a cluster whose CNI does not
                             enforce NetworkPolicy (GKE Standard without network policy enabled);
@@ -9763,24 +9759,11 @@ spec:
                         TURNING THIS OFF DOES NOT DELETE THE POLICY. An egress policy is a
                         guardrail, and the operator will not remove a guardrail it may not have
                         created, so setting this back to "None" leaves
-                        <name>-sandbox-metadata-deny in place. That is fail-closed and harmless
-                        on its own. Reverting both flags together leaves the returned broker
-                        inside the leftover policy's selection — which the gateway policy's
-                        union papers over today, by the same argument as above, but which
-                        becomes a broker cut off from the metadata server the moment the
-                        gateway policy is narrowed or absent (networkPolicy.enabled: false).
-                        Treat the order below as required rather than relying on the union to
-                        keep saving it.
-
-                        Revert in three steps, which never leaves a broker inside a policy that
-                        denies it:
-
-                          1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
-                          2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
-                             (safe now — with the field off the operator will not re-apply it,
-                             whereas deleting it while the field is still "Allowlist" only
-                             earns it back on the next reconcile);
-                          3. set splitCredentialBrokerPod: false.
+                        <name>-sandbox-metadata-deny in place, still denying what it denied. To
+                        undo it, set egressPolicy: None first and then
+                        `kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny`. Deleting
+                        it while the field still reads "Allowlist" only earns it back on the next
+                        reconcile.
                       enum:
                         - None
                         - Allowlist
@@ -9889,75 +9872,21 @@ spec:
                         ServiceAccountName is the Kubernetes Service Account
                         bound to the Deployment.
                       type: string
-                    splitCredentialBrokerPod:
-                      description: |-
-                        SplitCredentialBrokerPod moves the credential broker out of the agent Pod
-                        into a Deployment and Service of its own, so that a compromised agent no
-                        longer shares a network namespace with the process holding the cloud
-                        credentials.
-
-                        LEAVE THIS OFF for now. The broker runs proxied commands in a working
-                        directory the agent created on the shared data volume, so today both Pods
-                        have to mount that claim read-write at the same path and see the same
-                        files. The default GKE persistent disk is ReadWriteOnce and cannot do
-                        that across nodes: the broker Pod stays Pending with a Multi-Attach
-                        error, never becomes a Service endpoint, and every proxied command
-                        reports "credential proxy unavailable: [Errno 111] Connection refused" —
-                        the same symptom an unhealthy sidecar produces.
-
-                        That coupling is a property of the current directory-sharing design, not
-                        something the split needs, and it is being removed rather than worked
-                        around: the broker will own the workspace on an ordinary ReadWriteOnce
-                        volume of its own and take {path, content} pairs from the agent instead
-                        of a directory. That also closes the wider problem of the agent owning a
-                        tree the broker then runs git in. Until then the split is a mechanism
-                        with no adoptable storage story, which is why it defaults to false.
-
-                        A ReadWriteMany claim does satisfy today's design and is a choice
-                        available to you. It is not a requirement of this product and should not
-                        be treated as one — the managed options bill on provisioned capacity with
-                        a floor far above what an agent workspace needs. Co-scheduling both Pods
-                        on one node against a ReadWriteOnce claim is not a workaround: the next
-                        rolling update deadlocks on the volume, node affinity binds only at
-                        scheduling time, and the two Pods become a single failure domain.
-
-                        REQUIRES eventWatcher.enabled: false. The k8s-event-watcher is hosted
-                        inside the credential container and posts what it sees to the Session KV
-                        server the sandbox binds on the agent Pod's loopback, so the split takes
-                        the watcher away from the only address it can deliver to. Asking for both
-                        is refused rather than rendered: the agent goes Degraded with reason
-                        SplitBrokerStrandsEventWatcher and no workload is applied. The refusal
-                        sits after the ServiceAccount, RBAC, PVCs and ConfigMaps, so those are
-                        reconciled either way; and on an agent that is already running with the
-                        split, it leaves the running Pods alone rather than taking them down.
-                        eventWatcher
-                        defaults to enabled, so this fires on a stock spec, which is the intent —
-                        the split costs you fleet event delivery today and that should be a
-                        decision rather than a discovery. Giving the watcher a home that survives
-                        the split is separate work.
-
-                        Two further caveats. The agent Pod and the broker Pod share one
-                        ServiceAccount, because the Workload Identity IAM binding names it, so
-                        the identity the broker verifies is per-ServiceAccount rather than
-                        per-Pod. And the bearer token the agent presents crosses the cluster
-                        network in cleartext.
-                      type: boolean
                     workloadIdentityFederation:
                       description: |-
                         WorkloadIdentityFederation gives the credential proxy a GCP identity that
                         does not come from the metadata server.
 
-                        Set this when the proxy runs beside the shell sandbox. GKE resolves
-                        Workload Identity by pod IP, so every container in a pod shares one cloud
-                        identity — co-locating the proxy with the sandbox under plain Workload
-                        Identity would let the sandbox mint the proxy's tokens directly from
-                        169.254.169.254, with no policy layer in the way. Federation replaces that
-                        with a projected service-account token mounted into the proxy container
-                        alone, exchanged for a GCP access token over STS. Mounts are per-container
-                        where pod identity is not, which is the whole reason this field exists.
+                        Optional hardening rather than a requirement. GKE resolves Workload
+                        Identity by pod IP, so the broker's pod holds one cloud identity for
+                        whatever runs in it, and what it can mint is whatever that identity may
+                        mint. Federation replaces the metadata server with a projected
+                        service-account token exchanged for a GCP access token over STS, which
+                        narrows the pod to what the provider's attribute conditions allow.
 
-                        Absent means the proxy keeps using the metadata server, which is correct
-                        for the standalone-Deployment arrangement where it has a pod to itself.
+                        Absent means the broker keeps using the metadata server. That is a
+                        supported arrangement: the broker has a pod of its own, so the identity is
+                        already out of reach of the shell that runs model-authored code.
                       properties:
                         audience:
                           description:

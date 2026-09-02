@@ -43,7 +43,7 @@ func shellSandboxTestAgent() *agentv1alpha1.PlatformAgent {
 }
 
 func TestShellSandboxStatefulSetHasNoKubernetesCredential(t *testing.T) {
-	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	pod := sts.Spec.Template.Spec
 
 	if pod.AutomountServiceAccountToken == nil || *pod.AutomountServiceAccountToken {
@@ -140,7 +140,7 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 	// identity that minted it. They live in three files, so assert them together.
 	agent := shellSandboxAgent(true)
 	url := "http://test-agent-credential-proxy:8765"
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", url, "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", url, "settings-hash")
 
 	shell := sts.Spec.Template.Spec.Containers[0]
 	var tokenFile string
@@ -195,21 +195,12 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 	}
 }
 
-func TestBrokerServesOnlyTheAgentWithoutTheSandbox(t *testing.T) {
-	// The sandbox's identity is added by the sandbox being on, and by nothing
-	// else. An install without it must render the value it rendered before.
-	agent := shellSandboxAgent(false)
-	want := "system:serviceaccount:" + agent.Namespace + ":" + agentServiceAccountName(agent)
-	if got := allowedBrokerCallers(agent); got != want {
-		t.Errorf("expected %q, got %q", want, got)
-	}
-}
 
 func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 	// Hermes connects with StrictHostKeyChecking=accept-new and the host keys
 	// live on this volume, so a reclaimed claim is not a lost cache — it is every
 	// subsequent command failing until known_hosts is edited by hand.
-	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	policy := sts.Spec.PersistentVolumeClaimRetentionPolicy
 	if policy == nil {
 		t.Fatal("expected an explicit PersistentVolumeClaimRetentionPolicy; the default is Retain today and is not guaranteed to stay so")
@@ -235,7 +226,7 @@ func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 func TestShellSandboxMountsMatchTheImage(t *testing.T) {
 	// deploy/sandbox/entrypoint.sh reads both paths and exits if either is wrong.
 	// The failure is loud, but it is loud in a pod's logs rather than in CI.
-	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	containers := sts.Spec.Template.Spec.Containers
 	if len(containers) != 1 {
 		t.Fatalf("expected a single container, got %d", len(containers))
@@ -275,7 +266,7 @@ func TestShellSandboxGetsTheSameSettingsFileAsTheAgent(t *testing.T) {
 	// — so it is the one part of the delivery set that arrives as a mount. Everything
 	// else is baked at /opt/defaults and synced by deploy/sandbox/entrypoint.sh.
 	agent := shellSandboxTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 
 	var mount *corev1.VolumeMount
 	for i, m := range sts.Spec.Template.Spec.Containers[0].VolumeMounts {
@@ -333,11 +324,11 @@ func TestShellSandboxRollsWhenSettingsChange(t *testing.T) {
 	agent := shellSandboxTestAgent()
 	const key = "kubeagents.x-k8s.io/settings-config-hash"
 
-	first := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "hash-one", "policy-hash")
+	first := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "hash-one")
 	if got := first.Spec.Template.Annotations[key]; got != "hash-one" {
 		t.Fatalf("expected %s=hash-one on the pod template, got %q", key, got)
 	}
-	second := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "hash-two", "policy-hash")
+	second := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "hash-two")
 	if first.Spec.Template.Annotations[key] == second.Spec.Template.Annotations[key] {
 		t.Error("a different settings hash must change the pod template, or nothing restarts")
 	}
@@ -347,14 +338,14 @@ func TestShellSandboxCredentialProxyURLIsOptional(t *testing.T) {
 	// Empty is the state until #737 Part C, and it has to be a working state: the
 	// entrypoint warns and starts, so file and code-execution tools function while
 	// the credentialed wrappers report that they are unconfigured.
-	withoutURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash", "policy-hash")
+	withoutURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "", "settings-hash")
 	for _, env := range withoutURL.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "CREDENTIAL_PROXY_URL" {
 			t.Errorf("expected no CREDENTIAL_PROXY_URL when none was resolved, got %q", env.Value)
 		}
 	}
 
-	withURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://test-agent-credential-proxy:8765", "settings-hash", "policy-hash")
+	withURL := buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://test-agent-credential-proxy:8765", "settings-hash")
 	var found string
 	for _, env := range withURL.Spec.Template.Spec.Containers[0].Env {
 		if env.Name == "CREDENTIAL_PROXY_URL" {
@@ -376,9 +367,9 @@ func TestShellSandboxServiceIsHeadlessAndPublishesTheStableName(t *testing.T) {
 	if !svc.Spec.PublishNotReadyAddresses {
 		t.Error("expected PublishNotReadyAddresses: the pod is addressable while sshd generates host keys on a first start")
 	}
-	if svc.Name != buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash").Spec.ServiceName {
+	if svc.Name != buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash").Spec.ServiceName {
 		t.Errorf("the StatefulSet's serviceName must be this Service, got %q vs %q",
-			buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash").Spec.ServiceName, svc.Name)
+			buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash").Spec.ServiceName, svc.Name)
 	}
 	// The host Hermes dials has to be resolvable by this Service, which means
 	// <pod>.<service>.<namespace>.svc and nothing else.
@@ -439,7 +430,7 @@ func TestShellSandboxObjectsShareOneSelector(t *testing.T) {
 	// Three objects, one label set. A Service that selects nothing and a
 	// NetworkPolicy that constrains nothing both look healthy in `kubectl get`.
 	agent := shellSandboxTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 	svc := buildShellSandboxService(agent)
 	np := buildShellSandboxNetworkPolicy(agent)
 
@@ -466,7 +457,7 @@ func TestSandboxDataClaimIsNoSmallerThanTheAgentsOwn(t *testing.T) {
 	// construction, and it is the reason the mirror carries no byte cap of its
 	// own — size these apart again and the migration starts truncating silently.
 	agent := shellSandboxTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 
 	var claim *corev1.PersistentVolumeClaim
 	for i := range sts.Spec.VolumeClaimTemplates {
@@ -492,7 +483,7 @@ func TestSandboxDataClaimNameMatchesWhatTheStatefulSetCreates(t *testing.T) {
 	// as "first install, nothing to do" — so a wrong name fails as a silent
 	// no-op rather than an error.
 	agent := shellSandboxTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 
 	want := shellSandboxDataVolume + "-" + sts.Name + "-0"
 	if got := shellSandboxDataClaimName(agent); got != want {
@@ -640,7 +631,7 @@ func TestShellSandboxAuthorizedKeysSecretIsNotTheCredentialSecret(t *testing.T) 
 		t.Errorf("expected the Secret to be named after the sandbox, got %q", name)
 	}
 
-	sts := buildShellSandboxStatefulSet(agent, name, "", "settings-hash", "policy-hash")
+	sts := buildShellSandboxStatefulSet(agent, name, "", "settings-hash")
 	for _, v := range sts.Spec.Template.Spec.Volumes {
 		if v.Secret != nil && v.Secret.SecretName == defaultPlatformAgentSecrets {
 			t.Errorf("the sandbox pod must not reference %q, found volume %q", defaultPlatformAgentSecrets, v.Name)
@@ -659,25 +650,33 @@ func shellSandboxAgent(enabled bool) *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
-// Absent means off. Every install that exists today says nothing about the
-// sandbox, and each of these shapes is one of them — a nil check missed anywhere
-// in the four-level path is a panic in the reconcile loop, not a default.
-func TestShellSandboxIsOffUnlessAskedFor(t *testing.T) {
-	off := map[string]*agentv1alpha1.PlatformAgent{
+// Saying nothing means the sandbox, and each of these shapes is an install that
+// says nothing — a nil check missed anywhere in the four-level path is a panic in
+// the reconcile loop, not a default. `enabled: true` is the same answer reached
+// the long way; only an explicit false is refused.
+func TestOnlyAnExplicitFalseIsRefused(t *testing.T) {
+	accepted := map[string]*agentv1alpha1.PlatformAgent{
 		"nil agent":           nil,
 		"no harness":          shellSandboxTestAgent(),
 		"no experimental":     {Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{}}},
 		"no sandbox block":    {Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Experimental: &agentv1alpha1.ExperimentalSpec{}}}},
 		"sandbox without set": {Spec: agentv1alpha1.PlatformAgentSpec{Harness: &agentv1alpha1.HarnessSpec{Experimental: &agentv1alpha1.ExperimentalSpec{ShellSandbox: &agentv1alpha1.ShellSandboxSpec{}}}}},
-		"explicitly false":    shellSandboxAgent(false),
+		"explicitly true":     shellSandboxAgent(true),
 	}
-	for name, agent := range off {
-		if shellSandboxEnabled(agent) {
-			t.Errorf("%s must leave the shell local", name)
+	for name, agent := range accepted {
+		if reason, _ := validateShellSandbox(agent); reason != "" {
+			t.Errorf("%s was refused with reason %q", name, reason)
 		}
 	}
-	if !shellSandboxEnabled(shellSandboxAgent(true)) {
-		t.Error("an explicit true must turn the sandbox on")
+
+	reason, msg := validateShellSandbox(shellSandboxAgent(false))
+	if reason != reasonShellSandboxCannotBeDisabled {
+		t.Errorf("reason = %q, want %q", reason, reasonShellSandboxCannotBeDisabled)
+	}
+	// The operator surfaces this on the CR's status, where it is the only
+	// explanation the person who set the field will see.
+	if msg == "" {
+		t.Error("the refusal carries no message")
 	}
 }
 
@@ -686,11 +685,7 @@ func TestShellSandboxIsOffUnlessAskedFor(t *testing.T) {
 // changed a preference, it has left the sandbox — so these keys have to be in the
 // rendering that Hermes treats as immutable, and absent from it entirely when the
 // feature is off so that no existing install sees a new key.
-func TestManagedConfigCarriesTheTerminalBackendOnlyWhenSandboxed(t *testing.T) {
-	if got := renderConfigYAML(shellSandboxAgent(false), nil); strings.Contains(got, "terminal:") {
-		t.Errorf("the managed scope must say nothing about the terminal when the sandbox is off:\n%s", got)
-	}
-
+func TestManagedConfigCarriesTheTerminalBackend(t *testing.T) {
 	agent := shellSandboxAgent(true)
 	got := renderConfigYAML(agent, nil)
 	for _, want := range []string{
@@ -712,11 +707,10 @@ func TestManagedConfigCarriesTheTerminalBackendOnlyWhenSandboxed(t *testing.T) {
 }
 
 // The builders were tested in isolation long before anything called them. This is
-// the join: with the toggle on, the agent pod has to carry the init container, both
-// volumes and the read-only mount, and with it off it must carry none of them —
-// an install that has never heard of the sandbox should not grow a reference to a
-// Secret key it does not have.
-func TestAgentPodStagesTheClientKeyOnlyWhenSandboxed(t *testing.T) {
+// the join: the agent pod has to carry the init container, both volumes and the
+// read-only mount, because without the key it cannot log into the sandbox and the
+// sandbox is where every command it runs executes.
+func TestAgentPodStagesTheClientKey(t *testing.T) {
 	has := func(pod corev1.PodSpec) (init, volume, staged, mount bool) {
 		for _, c := range pod.InitContainers {
 			if c.Name == "sandbox-ssh-key" {
@@ -744,11 +738,6 @@ func TestAgentPodStagesTheClientKeyOnlyWhenSandboxed(t *testing.T) {
 			}
 		}
 		return
-	}
-
-	off := buildPodTemplateSpec(shellSandboxAgent(false), "", "", "", "", nil, renderOptions{})
-	if init, volume, staged, mount := has(off.Spec); init || volume || staged || mount {
-		t.Errorf("an agent with the sandbox off must carry no key staging (init=%v secret=%v staged=%v mount=%v)", init, volume, staged, mount)
 	}
 
 	on := buildPodTemplateSpec(shellSandboxAgent(true), "", "", "", "", nil, renderOptions{})
@@ -781,12 +770,6 @@ func TestSandboxRepointsTheWriteSafeRoot(t *testing.T) {
 			}
 		}
 		return "", false
-	}
-
-	// Off, the operator says nothing and the image's own default stands.
-	off := buildPodTemplateSpec(shellSandboxAgent(false), "", "", "", "", nil, renderOptions{})
-	if got, found := safeRoot(off.Spec); found {
-		t.Errorf("an agent with the sandbox off must not override the write safe root, got %q", got)
 	}
 
 	on := buildPodTemplateSpec(shellSandboxAgent(true), "", "", "", "", nil, renderOptions{})
@@ -832,13 +815,6 @@ func TestSandboxPointsTheTerminalAtTheDataVolume(t *testing.T) {
 		return "", false
 	}
 
-	// Off, the shell is local and `~` is the agent's own durable home. Setting a
-	// cwd there would change behaviour for installs that are not sandboxed at all.
-	off := buildPodTemplateSpec(shellSandboxAgent(false), "", "", "", "", nil, renderOptions{})
-	if got, found := cwd(off.Spec); found {
-		t.Errorf("an agent with the sandbox off must not set TERMINAL_CWD, got %q", got)
-	}
-
 	on := buildPodTemplateSpec(shellSandboxAgent(true), "", "", "", "", nil, renderOptions{})
 	got, found := cwd(on.Spec)
 	if !found {
@@ -854,11 +830,15 @@ func TestSandboxPointsTheTerminalAtTheDataVolume(t *testing.T) {
 	}
 }
 
-// The co-located placement: the credential proxy as a second container of this
-// pod. These are the properties that make that safe rather than a regression,
-// and each one is a single field away from being silently untrue.
+// The credential proxy is never a container of this pod. These are the
+// properties that keep it out, and each one is a single field away from being
+// silently untrue.
 
-func colocatedTestAgent() *agentv1alpha1.PlatformAgent {
+// federatedTestAgent is the sandbox with workload identity federation configured
+// on the broker. Federation is optional hardening rather than a placement
+// switch — see credentialProxyFederation — so this agent differs from
+// shellSandboxTestAgent in what the broker's pod mints with, and in nothing else.
+func federatedTestAgent() *agentv1alpha1.PlatformAgent {
 	agent := shellSandboxTestAgent()
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
 		Experimental: &agentv1alpha1.ExperimentalSpec{
@@ -875,109 +855,57 @@ func colocatedTestAgent() *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
-func TestCredentialProxyColocatesOnlyWithFederation(t *testing.T) {
-	// Fail-safe in both directions. Co-locating without federation puts a
-	// metadata-server identity in the shell's network namespace, which is
-	// strictly worse than the separate pod it would replace; federation without
-	// the sandbox has no pod to move into.
-	sandboxOnly := shellSandboxTestAgent()
-	sandboxOnly.Spec.Harness = &agentv1alpha1.HarnessSpec{
-		Experimental: &agentv1alpha1.ExperimentalSpec{
-			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(true)},
-		},
-	}
-	if credentialProxyColocated(sandboxOnly) {
-		t.Error("the sandbox alone must not co-locate the proxy: it would have a metadata-server identity")
-	}
+func TestSandboxPodHoldsNothingOfTheBrokers(t *testing.T) {
+	// The property the separate pod exists for. A broker container here would
+	// share the shell's network namespace, so the model would reach it on
+	// loopback and reach everything it can reach; a broker volume here would put
+	// its kubeconfig, gcloud configuration or federated token a mount away.
+	// Nothing in the reconcile fails if one creeps back — the pod just quietly
+	// becomes the layout this design replaced.
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"federation off": shellSandboxTestAgent(),
+		"federation on":  federatedTestAgent(),
+	} {
+		sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", credentialProxySandboxURL(agent), "settings-hash")
+		pod := sts.Spec.Template.Spec
 
-	federationOnly := colocatedTestAgent()
-	federationOnly.Spec.Harness = nil
-	if credentialProxyColocated(federationOnly) {
-		t.Error("federation alone must not co-locate the proxy: there is no sandbox pod to move into")
-	}
-
-	// A half-filled block is absent, not a partial opt-in.
-	half := colocatedTestAgent()
-	half.Spec.Security.WorkloadIdentityFederation.ServiceAccountEmail = ""
-	if credentialProxyColocated(half) {
-		t.Error("a federation block with no impersonation target cannot produce a token and must not co-locate")
-	}
-
-	if !credentialProxyColocated(colocatedTestAgent()) {
-		t.Error("expected co-location when the sandbox is on and federation is complete")
-	}
-}
-
-func TestSandboxSharesOnlyTheDataVolumeWithTheProxy(t *testing.T) {
-	// The two containers deliberately run as the same uid, so the mount
-	// namespace is the entire boundary between the shell and the proxy's
-	// kubeconfig, gcloud configuration and federated token. Every volume the
-	// shell mounts is therefore a decision, and this is where it gets made.
-	agent := colocatedTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", credentialProxySandboxURL(agent), "settings-hash", "policy-hash")
-	pod := sts.Spec.Template.Spec
-
-	if len(pod.Containers) != 2 {
-		t.Fatalf("expected the shell and the credential proxy, got %d containers", len(pod.Containers))
-	}
-	shell, proxy := pod.Containers[0], pod.Containers[1]
-	if shell.Name != "shell" || proxy.Name != "envoy-credential-proxy" {
-		t.Fatalf("unexpected containers %q and %q", shell.Name, proxy.Name)
-	}
-
-	shellMounts := map[string]bool{}
-	for _, m := range shell.VolumeMounts {
-		shellMounts[m.Name] = true
-	}
-	for _, m := range proxy.VolumeMounts {
-		if m.Name == shellSandboxDataVolume {
-			continue
+		if len(pod.Containers) != 1 || pod.Containers[0].Name != "shell" {
+			t.Fatalf("%s: expected the shell alone, got %#v", name, pod.Containers)
 		}
-		if shellMounts[m.Name] {
-			t.Errorf("the shell mounts %q, which is the credential proxy's: the mount namespace is the only boundary these two containers have", m.Name)
+		brokerVolumes := map[string]bool{credentialProxyWIFTokenVolume: true}
+		for vol := range credentialProxyRuntimeVolumeNames {
+			brokerVolumes[vol] = true
 		}
-	}
-	if !shellMounts[shellSandboxDataVolume] {
-		t.Error("the shell must mount the data volume; it is the shared working tree that makes git work")
-	}
-
-	// The federated token by name, because it is the one file in the pod worth
-	// stealing and an accidental mount of it is invisible at runtime.
-	for _, m := range shell.VolumeMounts {
-		if m.Name == credentialProxyWIFTokenVolume || m.MountPath == credentialProxyWIFTokenPath {
-			t.Fatalf("the shell mounts the federated token at %q — the pod's whole cloud identity", m.MountPath)
+		for _, vol := range pod.Volumes {
+			if brokerVolumes[vol.Name] {
+				t.Errorf("%s: the sandbox pod declares the broker's volume %q", name, vol.Name)
+			}
+		}
+		for _, m := range pod.Containers[0].VolumeMounts {
+			if m.MountPath == credentialProxyWIFTokenPath {
+				t.Errorf("%s: the shell mounts the federated token at %q", name, m.MountPath)
+			}
 		}
 	}
 }
 
-func TestColocatedProxyRunsAsTheSandboxLogin(t *testing.T) {
-	// The entrypoint chowns the data volume to uid 1000, so a proxy running as
-	// anything else cannot write the tree the agent works in, and files it does
-	// create are unwritable from the shell.
-	agent := colocatedTestAgent()
-	proxy := buildCredentialProxyContainer(agent, true)
-	sc := proxy.SecurityContext
-	if sc == nil || sc.RunAsUser == nil || *sc.RunAsUser != int64(shellSandboxUID) {
-		t.Fatalf("expected the proxy to run as uid %d, got %#v", shellSandboxUID, sc)
-	}
-	if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
-		t.Error("expected runAsNonRoot on the co-located proxy")
-	}
+func TestBrokerTakesTheFederatedIdentityWhenConfigured(t *testing.T) {
+	// Federation narrows what the broker's pod can mint. It is not what moves the
+	// broker — that is unconditional — so the env, the projection and the mount
+	// all key on the field alone, and all three have to agree: a mount naming a
+	// volume the pod does not declare is a pod that never starts.
+	proxy := buildCredentialProxyContainer(federatedTestAgent())
 
-	var root string
 	federation := map[string]string{}
 	for _, e := range proxy.Env {
 		switch e.Name {
-		case "CREDENTIAL_PROXY_WORKSPACE_ROOT":
-			root = e.Value
 		case "CREDENTIAL_PROXY_WIF_AUDIENCE", "CREDENTIAL_PROXY_WIF_SERVICE_ACCOUNT",
 			"CREDENTIAL_PROXY_WIF_TOKEN_FILE", "GOOGLE_APPLICATION_CREDENTIALS",
 			"CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE":
 			federation[e.Name] = e.Value
+		case "CREDENTIAL_PROXY_WORKSPACE_ROOT":
+			t.Errorf("the broker must not be pointed at a shared tree: %q is in another pod", e.Value)
 		}
-	}
-	if root != shellSandboxDataPath {
-		t.Errorf("the proxy's workspace root must be the shared tree %q, got %q", shellSandboxDataPath, root)
 	}
 	if len(federation) != 5 {
 		t.Errorf("expected the full federation environment, got %#v", federation)
@@ -989,10 +917,34 @@ func TestColocatedProxyRunsAsTheSandboxLogin(t *testing.T) {
 		t.Errorf("gcloud must be pinned to the federated credential file, got %q",
 			federation["CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"])
 	}
+
+	var mounted bool
+	for _, m := range proxy.VolumeMounts {
+		if m.Name == credentialProxyWIFTokenVolume {
+			mounted = true
+		}
+	}
+	if !mounted {
+		t.Error("the broker declares the federation environment but mounts no token to satisfy it")
+	}
+
+	// Without the field, none of the three appears — the broker falls back to the
+	// metadata server, which is already out of the shell's reach.
+	plain := buildCredentialProxyContainer(shellSandboxTestAgent())
+	for _, m := range plain.VolumeMounts {
+		if m.Name == credentialProxyWIFTokenVolume {
+			t.Error("no federation configured, but the broker mounts a token volume nothing projects")
+		}
+	}
+	for _, e := range plain.Env {
+		if e.Name == "GOOGLE_APPLICATION_CREDENTIALS" {
+			t.Error("no federation configured, but ADC is pointed at a file that is not written")
+		}
+	}
 }
 
-func TestColocatedTokenProjectionIsAudienceScoped(t *testing.T) {
-	agent := colocatedTestAgent()
+func TestFederatedTokenProjectionIsAudienceScoped(t *testing.T) {
+	agent := federatedTestAgent()
 	volumes := buildCredentialProxyRuntimeVolumes(agent)
 
 	var projected *corev1.Volume
@@ -1015,31 +967,35 @@ func TestColocatedTokenProjectionIsAudienceScoped(t *testing.T) {
 		t.Errorf("token audience = %q, want the federation provider", got)
 	}
 
-	// Standalone, the same call must not add a volume nothing mounts.
-	standalone := colocatedTestAgent()
-	standalone.Spec.Harness = nil
-	for _, v := range buildCredentialProxyRuntimeVolumes(standalone) {
+	// A half-filled block is absent, not a partial opt-in: a pool with nothing to
+	// impersonate cannot produce a token, and projecting one would leave the
+	// broker configured for an exchange that fails on every credentialed command.
+	half := federatedTestAgent()
+	half.Spec.Security.WorkloadIdentityFederation.ServiceAccountEmail = ""
+	for _, v := range buildCredentialProxyRuntimeVolumes(half) {
 		if v.Name == credentialProxyWIFTokenVolume {
-			t.Error("the federated token must not be projected into the standalone proxy pod: nothing mounts it")
+			t.Error("a federation block with no impersonation target must read as absent")
 		}
 	}
 }
 
-func TestSandboxWrappersPostToLoopbackWhenColocated(t *testing.T) {
-	// credential_proxy_client.shares_filesystem_with_proxy keys on the endpoint
-	// being loopback, and only then forwards the caller's cwd. That forwarding is
-	// the whole of git support — routing two containers of one pod through the
-	// Service would leave them as strangers.
-	if got := credentialProxySandboxURL(colocatedTestAgent()); got != "http://127.0.0.1:8765" {
-		t.Errorf("co-located sandbox URL = %q, want loopback", got)
+func TestSandboxWrappersPostToTheBrokerService(t *testing.T) {
+	// Never loopback. A loopback endpoint is a broker in the shell's own pod, and
+	// it is also what credential_proxy_client used to read as "we share a
+	// filesystem" — so the address is both the placement and the contract that
+	// paths do not cross it.
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"federation off": shellSandboxTestAgent(),
+		"federation on":  federatedTestAgent(),
+	} {
+		if got := credentialProxySandboxURL(agent); got != credentialProxyURL(agent) {
+			t.Errorf("%s: sandbox URL = %q, want the broker Service", name, got)
+		}
 	}
-	if got := credentialProxySandboxURL(shellSandboxTestAgent()); got != credentialProxyURL(shellSandboxTestAgent()) {
-		t.Errorf("standalone sandbox URL = %q, want the proxy Service", got)
-	}
-	// The gateway's relay clients keep the Service in both placements; only its
-	// selector moves.
-	if got := buildCredentialProxyService(colocatedTestAgent()).Spec.Selector["app"]; got != "test-agent-shell" {
-		t.Errorf("co-located, the proxy Service must select the sandbox pod, got %q", got)
+	// The Service selects the broker's own pod, which is what the gateway's relay
+	// clients and the sandbox's wrapped CLIs both dial.
+	if got := buildCredentialProxyService(federatedTestAgent()).Spec.Selector["app"]; got != "test-agent-credential-proxy" {
+		t.Errorf("the proxy Service must select the broker pod, got %q", got)
 	}
 }
 
@@ -1049,9 +1005,6 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxAndTheGateway(t *testin
 	// it. Untested, a refactor can widen it back to the namespace and nothing
 	// fails.
 	agent := shellSandboxTestAgent()
-	if credentialProxyColocated(agent) {
-		t.Fatal("this agent is meant to exercise the standalone proxy placement")
-	}
 	np := buildCredentialProxyNetworkPolicy(agent)
 
 	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
@@ -1113,39 +1066,44 @@ func TestCredentialProxyNetworkPolicySelectsItsOwnPod(t *testing.T) {
 	}
 }
 
-func TestColocatedSandboxAdmitsTheGatewayOnTheProxyPort(t *testing.T) {
-	// The relay clients are the one caller that is genuinely remote: the shell
-	// reaches the proxy on loopback, which no NetworkPolicy sees.
-	np := buildShellSandboxNetworkPolicy(colocatedTestAgent())
-	var proxyPort bool
-	for _, rule := range np.Spec.Ingress {
+func TestSandboxEgressReachesNothingButDNSAndTheBroker(t *testing.T) {
+	// The narrow egress is what the broker's separate pod buys, and it is the
+	// half of the policy that is easy to widen by accident: a rule added for one
+	// skill's API is a rule the model's own code can use.
+	np := buildShellSandboxNetworkPolicy(federatedTestAgent())
+	for _, rule := range np.Spec.Egress {
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil {
+				t.Errorf("the sandbox may reach %s directly; every remote address belongs to the broker", peer.IPBlock.CIDR)
+			}
+		}
 		for _, p := range rule.Ports {
-			if p.Port != nil && p.Port.IntVal == credentialProxyPort {
-				proxyPort = true
+			switch p.Port.IntValue() {
+			case 53, credentialProxyPort:
+			default:
+				t.Errorf("unexpected egress port %v — the sandbox needs cluster DNS and the broker, nothing else", p.Port)
 			}
 		}
 	}
-	if !proxyPort {
-		t.Error("co-located, the sandbox must admit the gateway on the credential proxy port or the chat relays are unreachable")
+	// Ingress is sshd from the gateway and nothing else. The broker port is not
+	// admitted here: no process in this pod listens on it.
+	for _, rule := range np.Spec.Ingress {
+		for _, p := range rule.Ports {
+			if p.Port.IntValue() != shellSandboxPort {
+				t.Errorf("the sandbox admits traffic on %v; only sshd listens in this pod", p.Port)
+			}
+		}
 	}
+}
 
-	// And the pod has to carry the label github-token-minter's own policy admits,
-	// or `gh` and `git` lose their installation token.
-	agent := colocatedTestAgent()
-	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", credentialProxySandboxURL(agent), "settings-hash", "policy-hash")
-	if sts.Spec.Template.Labels["kubeagents.x-k8s.io/has-credential-proxy"] != "true" {
-		t.Errorf("expected the has-credential-proxy pod label, got %#v", sts.Spec.Template.Labels)
-	}
-	// The selector is immutable, so the extra label must be on the template only.
-	if _, present := sts.Spec.Selector.MatchLabels["kubeagents.x-k8s.io/has-credential-proxy"]; present {
-		t.Error("the label must not reach spec.selector: a StatefulSet's selector is immutable and turning federation on would need the object deleted")
-	}
-
+func TestSandboxPodTemplateCarriesTheSelectorLabels(t *testing.T) {
 	// ObjectMeta.Labels and Selector.MatchLabels are one map, and withCommonLabels
 	// merges into it in place — so the selector the API server stores carries the
 	// recommended labels whether or not the template does. A template narrower
 	// than that selector is rejected outright: `selector` does not match template
 	// `labels`, on every reconcile, with the StatefulSet left as it was.
+	agent := federatedTestAgent()
+	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", credentialProxySandboxURL(agent), "settings-hash")
 	withCommonLabels(sts, agent)
 	for k, v := range sts.Spec.Selector.MatchLabels {
 		if sts.Spec.Template.Labels[k] != v {
@@ -1161,7 +1119,7 @@ func TestColocatedSandboxAdmitsTheGatewayOnTheProxyPort(t *testing.T) {
 // the model's code on the host kernel while the CR says otherwise.
 func TestShellSandboxRuntimeClassIsOptOnly(t *testing.T) {
 	runtimeOf := func(agent *agentv1alpha1.PlatformAgent) *string {
-		return buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash", "policy-hash").
+		return buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash").
 			Spec.Template.Spec.RuntimeClassName
 	}
 
@@ -1184,15 +1142,6 @@ func TestShellSandboxRuntimeClassIsOptOnly(t *testing.T) {
 	if got := runtimeOf(named); got == nil || *got != "gvisor" {
 		t.Errorf("expected the sandbox pod to run under gvisor, got %v", got)
 	}
-
-	// Off means off, including for this. A CR that names a runtime under a
-	// disabled sandbox builds no sandbox pod at all, so the only way the name
-	// could escape is through the agent pod, which has its own field.
-	offButNamed := shellSandboxAgent(false)
-	offButNamed.Spec.Harness.Experimental.ShellSandbox.RuntimeClassName = ptr.To("gvisor")
-	if got := requestedRuntimeClasses(offButNamed); len(got) != 0 {
-		t.Errorf("a disabled sandbox must request no RuntimeClass, got %v", got)
-	}
 }
 
 // The pre-flight check is what turns a missing RuntimeClass into a Degraded CR
@@ -1200,12 +1149,12 @@ func TestShellSandboxRuntimeClassIsOptOnly(t *testing.T) {
 // pods' fields, and it has to name each class once: the message it feeds joins
 // the list, and `gvisor, gvisor` reads like two different problems.
 func TestRequestedRuntimeClassesCoversBothPodsAndDeduplicates(t *testing.T) {
-	agentPodOnly := shellSandboxAgent(false)
+	agentPodOnly := shellSandboxAgent(true)
 	agentPodOnly.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
 	}
 	if got := requestedRuntimeClasses(agentPodOnly); len(got) != 1 || got[0] != "gvisor" {
-		t.Errorf("the agent pod's runtime must still be checked with the sandbox off, got %v", got)
+		t.Errorf("the agent pod's runtime must be checked on its own, got %v", got)
 	}
 
 	sandboxOnly := shellSandboxAgent(true)
@@ -1238,11 +1187,11 @@ func TestRequestedRuntimeClassesCoversBothPodsAndDeduplicates(t *testing.T) {
 }
 
 func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
-	// The sidecar analogue of TestSandboxSharesOnlyTheDataVolumeWithTheProxy
-	// above. That one asserts the split pod carries none of the broker's
-	// volumes in the shell container; nothing asserted the same for a CR that
-	// asks for one by name, and spec.deployment.extraVolumeMounts is appended
-	// to the agent container with no validation at all.
+	// The CR-driven analogue of TestSandboxPodHoldsNothingOfTheBrokers above.
+	// That one asserts the sandbox pod carries none of the broker's volumes;
+	// nothing asserted the same for a CR that asks for one by name, and
+	// spec.deployment.extraVolumeMounts is appended to the agent container with
+	// no validation at all.
 	for _, name := range []string{
 		"credential-proxy-state",
 		"credential-proxy-policy",
@@ -1250,7 +1199,7 @@ func TestExtraVolumeMountsCannotNameTheBrokersVolumes(t *testing.T) {
 		"credential-proxy-ksa-token",
 	} {
 		t.Run(name, func(t *testing.T) {
-			agent := colocatedTestAgent()
+			agent := federatedTestAgent()
 			agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 				ExtraVolumeMounts: []corev1.VolumeMount{
 					{Name: name, MountPath: "/opt/data/state"},
@@ -1271,7 +1220,7 @@ func TestExtraVolumeMountsAllowsAnOrdinaryVolume(t *testing.T) {
 	// The field is a documented extension point and stays one. A guard that
 	// refuses more than the broker's own volumes is a regression dressed as a
 	// control.
-	agent := colocatedTestAgent()
+	agent := federatedTestAgent()
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		ExtraVolumeMounts: []corev1.VolumeMount{
 			{Name: "customer-ca-bundle", MountPath: "/etc/ssl/extra"},
@@ -1284,58 +1233,10 @@ func TestExtraVolumeMountsAllowsAnOrdinaryVolume(t *testing.T) {
 }
 
 func TestExtraVolumeMountsGuardToleratesAnEmptyDeployment(t *testing.T) {
-	agent := colocatedTestAgent()
+	agent := federatedTestAgent()
 	agent.Spec.Deployment = nil
 	if msg := validateExtraVolumeMounts(agent); msg != "" {
 		t.Fatalf("a CR with no deployment block was refused: %s", msg)
-	}
-}
-
-// The gateway Pod's own containers under the sandbox layout. Both of these
-// properties are asserted for the sidecar layout in platformagent_manifests_test.go
-// — against buildCredentialProxySidecar, which is not what renders here. The
-// switch in buildPodTemplateSpec means a regression in one branch leaves the
-// other's test green, so each branch needs its own.
-
-// TestShellSandboxAgentAPIAuthIsANativeSidecar is the sandbox half of
-// TestCredentialProxyBindsBeforeTheSandboxExists. The credential runtime leaves
-// this Pod, but the agent-API front door does not, and it inherits the port the
-// Service targets along with the race for it.
-func TestShellSandboxAgentAPIAuthIsANativeSidecar(t *testing.T) {
-	dep := buildDeployment(shellSandboxAgent(true), "h1", "h2", "h3", "h4", nil, renderOptions{imageVolumeSupported: true})
-	spec := dep.Spec.Template.Spec
-
-	if _, found := findContainer(spec, "envoy-credential-proxy"); found {
-		t.Error("the credential runtime is still in the gateway Pod; the sandbox layout moves it to the sandbox's")
-	}
-
-	auth, found := findContainer(spec, "agent-api-auth")
-	if !found {
-		t.Fatal("agent-api-auth is missing entirely; nothing is holding 8643 in this Pod")
-	}
-
-	inInit := false
-	for _, c := range spec.InitContainers {
-		if c.Name == "agent-api-auth" {
-			inInit = true
-		}
-	}
-	if !inInit {
-		t.Error("agent-api-auth is an ordinary container; it races the agent for port 8643")
-	}
-	if auth.RestartPolicy == nil || *auth.RestartPolicy != corev1.ContainerRestartPolicyAlways {
-		t.Error("agent-api-auth lacks restartPolicy: Always, so it is not a native sidecar " +
-			"-- either it races the agent, or the kubelet waits forever for it to exit")
-	}
-
-	holds8643 := false
-	for _, p := range auth.Ports {
-		if p.ContainerPort == 8643 {
-			holds8643 = true
-		}
-	}
-	if !holds8643 {
-		t.Error("agent-api-auth no longer declares 8643; re-check what the Service targets")
 	}
 }
 

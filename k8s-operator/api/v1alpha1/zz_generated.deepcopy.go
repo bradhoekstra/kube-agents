@@ -932,11 +932,6 @@ func (in *SecuritySpec) DeepCopyInto(out *SecuritySpec) {
 		*out = make([]ScopedServiceAccount, len(*in))
 		copy(*out, *in)
 	}
-	if in.SplitCredentialBrokerPod != nil {
-		in, out := &in.SplitCredentialBrokerPod, &out.SplitCredentialBrokerPod
-		*out = new(bool)
-		**out = **in
-	}
 	if in.WorkloadIdentityFederation != nil {
 		in, out := &in.WorkloadIdentityFederation, &out.WorkloadIdentityFederation
 		*out = new(WorkloadIdentityFederationSpec)

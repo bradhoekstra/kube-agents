@@ -15,45 +15,45 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// The credential proxy, in one of two placements.
+// The credential proxy: the pod that holds every credential the agent is not
+// allowed to see.
 //
-// **Beside the shell sandbox**, when the sandbox is on and
-// spec.security.workloadIdentityFederation names a pool. The proxy is a second
-// container in the sandbox's StatefulSet, sharing that pod's loopback and its
-// data volume with the shell. This is the placement the design targets and the
-// only one in which `git` works, because git's state is the working tree and the
-// tree has to be visible from both sides of the exec relay.
+// It is a Deployment of its own, always. No setting places it in the agent's
+// gateway Pod or in the shell sandbox's StatefulSet, because the pod is the
+// smallest unit that has an IP and an IP is what GKE resolves Workload Identity
+// by. A credential runtime sharing a pod with model-authored code lets that code
+// curl 169.254.169.254 and mint the runtime's own GSA token — every credential
+// the proxy holds, with the policy layer bypassed entirely. Neither gVisor nor
+// NetworkPolicy nor automountServiceAccountToken:false closes that: gVisor's
+// boundary is the host kernel rather than the network, runtimeClassName and
+// NetworkPolicy are both pod-scoped, and Workload Identity does not read the
+// projected token file.
 //
-// **In a Deployment of its own** otherwise. A separate pod cannot mount the
-// sandbox's ReadWriteOnce claim, so the proxy falls back to a workspace in its
-// own emptyDir: kubectl reads work, `git` and every `-f FILE` write path do not.
-// It is also unauthenticated on a ClusterIP, which hands the exec endpoint to
-// every pod in the cluster — a NetworkPolicy narrows that where the CNI enforces
-// one, and on the reference install (GKE Standard, no Dataplane V2) it does not.
+// Callers reach it over a ClusterIP on credentialProxyPort and are authenticated
+// by TokenReview against CREDENTIAL_PROXY_ALLOWED_CALLERS, which names the
+// ServiceAccounts it will serve. buildCredentialProxyNetworkPolicy narrows who
+// can open the connection at all, wherever the CNI enforces one.
 //
-// Co-location used to be unavailable for a reason worth restating, because it is
-// what spec.security.workloadIdentityFederation exists to remove. GKE resolves
-// Workload Identity by *pod IP*, so a sidecar of the sandbox would let the shell
-// container curl 169.254.169.254 and mint the proxy's own GSA token — every
-// credential the proxy holds, with the policy layer bypassed entirely. Neither
-// gVisor nor NetworkPolicy nor automountServiceAccountToken:false closes that:
-// gVisor's boundary is the host kernel rather than the network, runtimeClassName
-// is pod-scoped, NetworkPolicy is pod-scoped, and Workload Identity does not read
-// the projected token file. The pod is the smallest unit that has an IP.
+// The boundary costs the proxy a shared working tree. A separate pod cannot
+// mount the sandbox's ReadWriteOnce claim, so `git` here operates on the proxy's
+// own state volume rather than on the shell's checkout, and a wrapped command
+// that names a host path has to pass the content rather than the filename. The
+// version-control abstraction is what settles this rather than working around
+// it: local git stays in the sandbox against a remoteless checkout, and only the
+// remote operations cross to this pod.
 //
-// What is *not* pod-scoped is a volumeMount. Federation moves the proxy's cloud
-// identity off the metadata server and onto a projected token file mounted into
-// this container alone: the pod's ServiceAccount carries no
-// iam.gke.io/gcp-service-account annotation, so the metadata server answers both
-// containers with an unbound <project>.svc.id.goog principal that IAM grants
-// nothing, and the only identity in the pod lives behind a mount namespace the
-// shell is not in. shareProcessNamespace stays false so /proc/<pid>/root cannot
-// route around that; shell_sandbox_manifests.go pins it and a test asserts it.
+// spec.security.workloadIdentityFederation is optional hardening on top. It
+// moves this pod's cloud identity off the metadata server and onto a projected
+// token file: the pod's ServiceAccount carries no iam.gke.io/gcp-service-account
+// annotation, so the metadata server answers with an unbound
+// <project>.svc.id.goog principal that IAM grants nothing, and the provider's
+// attribute conditions bound what the exchange can mint. It narrows what this
+// pod may mint; it does not decide where the pod runs.
 //
-// The split is by role rather than by copy: the same image runs in both places
-// with CREDENTIAL_PROXY_ROLE selecting which of its three services start. See
-// deploy/shared/start-services.sh, and the design in
-// docs/designs/agent-shell-sandboxing.md.
+// The split is by role rather than by copy: the same image runs here and in the
+// gateway Pod's agent-api-auth container, with CREDENTIAL_PROXY_ROLE selecting
+// which of its three services start. See deploy/shared/start-services.sh, and
+// the design in docs/designs/agent-shell-sandboxing.md.
 
 const (
 	// Where the federated token and the ADC config derived from it live. Both
@@ -74,10 +74,13 @@ const (
 //
 // Both fields or neither: a pool with no service account to impersonate, or an
 // impersonation target with no pool to reach it through, cannot produce a token.
-// Treating a half-filled block as absent means the proxy falls back to its own
-// pod and the metadata server, which works — rather than co-locating with the
-// sandbox and then failing every credentialed command, which is the same
-// misconfiguration with the security property removed.
+// Treating a half-filled block as absent means the broker falls back to the
+// metadata server, which works from a pod the model cannot enter — rather than
+// half-configuring an exchange and failing every credentialed command.
+//
+// Optional, not a precondition. The broker always has a pod to itself, so the
+// metadata identity it holds is already out of the shell's network namespace;
+// federation narrows what that pod can mint, it does not decide where it runs.
 func credentialProxyFederation(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.WorkloadIdentityFederationSpec {
 	if agent == nil || agent.Spec.Security == nil {
 		return nil
@@ -89,31 +92,9 @@ func credentialProxyFederation(agent *agentv1alpha1.PlatformAgent) *agentv1alpha
 	return wif
 }
 
-// credentialProxyColocated reports whether the proxy runs as a container of the
-// sandbox's StatefulSet rather than in a Deployment of its own.
-//
-// Federation is a precondition, not a preference. Co-locating without it puts a
-// metadata-server-backed cloud identity in the same network namespace as the
-// shell, which is strictly worse than the separate pod it replaces.
-func credentialProxyColocated(agent *agentv1alpha1.PlatformAgent) bool {
-	return shellSandboxEnabled(agent) && credentialProxyFederation(agent) != nil
-}
-
 // credentialProxyName is the Deployment, Service and pod-selector name.
 func credentialProxyName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-credential-proxy"
-}
-
-// credentialProxyServiceSelector is what the Service sends traffic to. Co-located,
-// that is the sandbox pod; otherwise the proxy's own Deployment. Keeping one
-// Service name across both placements is what lets credentialProxyURL stay
-// constant for the gateway, whose relay clients should not have to know where the
-// relays are running.
-func credentialProxyServiceSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
-	if credentialProxyColocated(agent) {
-		return shellSandboxSelector(agent)
-	}
-	return credentialProxySelector(agent)
 }
 
 // credentialProxySelector reproduces the labels the pre-#368 standalone proxy
@@ -137,20 +118,18 @@ func credentialProxyURL(agent *agentv1alpha1.PlatformAgent) string {
 		credentialProxyName(agent), agent.Namespace, credentialProxyPort)
 }
 
-// credentialProxySandboxURL is what the sandbox's wrapped CLIs post to, which is
-// loopback whenever the proxy is in the same pod.
+// credentialProxySandboxURL is what the sandbox's wrapped CLIs post to.
 //
-// Not a micro-optimisation. credential_proxy_client.shares_filesystem_with_proxy
-// keys on the endpoint being a loopback host, and only when it is true does the
-// shim forward the caller's `cwd` and `kubeconfig`. That forwarding is the whole
-// of git support: without it every `git` call runs in the proxy's own default
-// workspace instead of the tree the agent is working in, which is why the
-// standalone placement cannot clone-edit-commit at all. Naming the Service here
-// would leave the two containers in one pod and still route them as strangers.
+// The same Service address the gateway uses, because the broker is never in the
+// sandbox's pod: a broker sharing the shell's network namespace is reachable by
+// the model on loopback, and so is anything that namespace can reach, which is
+// the property the separate pod exists to deny.
+//
+// One consequence to keep in view. The two pods share no filesystem, so a path
+// is not a value that can cross this boundary — a `cwd`, a `kubeconfig` or a
+// `--body-file` argument names something the broker cannot open. Content moves
+// as content, over the workspace API, or it does not move.
 func credentialProxySandboxURL(agent *agentv1alpha1.PlatformAgent) string {
-	if credentialProxyColocated(agent) {
-		return fmt.Sprintf("http://127.0.0.1:%d", credentialProxyPort)
-	}
 	return credentialProxyURL(agent)
 }
 
@@ -159,7 +138,7 @@ func buildCredentialProxyService(agent *agentv1alpha1.PlatformAgent) *corev1.Ser
 		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
 		ObjectMeta: metav1.ObjectMeta{Name: credentialProxyName(agent), Namespace: agent.Namespace},
 		Spec: corev1.ServiceSpec{
-			Selector: credentialProxyServiceSelector(agent),
+			Selector: credentialProxySelector(agent),
 			Ports: []corev1.ServicePort{{
 				Name:       "cred-proxy",
 				Port:       credentialProxyPort,
@@ -185,8 +164,6 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 	if agent.Spec.Security != nil && agent.Spec.Security.ServiceAccountName != "" {
 		saName = agent.Spec.Security.ServiceAccountName
 	}
-	fsGroup := int64(10000)
-
 	podLabels := commonLabels(agent)
 	for k, v := range credentialProxySelector(agent) {
 		podLabels[k] = v
@@ -220,16 +197,20 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           saName,
 					AutomountServiceAccountToken: ptr.To(false),
+					// The same UID and group the agent image ships, because the
+					// credential runtime and the agent are built from it. What
+					// used to separate this process from the sandbox's was a
+					// second UID inside one Pod; the Pod boundary does it now.
 					SecurityContext: &corev1.PodSecurityContext{
-						FSGroup:        &fsGroup,
-						RunAsUser:      ptr.To(int64(10000)),
+						FSGroup:        ptr.To(agentFSGroup),
+						RunAsUser:      ptr.To(sandboxUID),
 						RunAsNonRoot:   ptr.To(true),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Affinity:     affinity,
 					NodeSelector: nodeSelector,
 					Tolerations:  tolerations,
-					Containers:   []corev1.Container{buildCredentialProxyContainer(agent, false)},
+					Containers:   []corev1.Container{buildCredentialProxyContainer(agent)},
 					Volumes:      buildCredentialProxyRuntimeVolumes(agent),
 				},
 			},
@@ -244,54 +225,40 @@ func buildCredentialProxyDeployment(agent *agentv1alpha1.PlatformAgent, policyHa
 // and the credential runtime, with the chat relays the runtime hosts. The event
 // watcher and the agent API authenticator stay in the gateway pod, because both
 // talk to processes on that pod's loopback — see buildAgentAPIAuthSidecar.
-// colocated selects the sandbox-sidecar variant: the shell's data volume as the
-// workspace root, a federated identity in place of the metadata server, and a uid
-// matching the sandbox login so the two can write each other's files.
-func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent, colocated bool) corev1.Container {
+//
+// One variant, because the broker has one placement: a Deployment of its own.
+// It shares no pod with the agent, which holds the credentials it mints from,
+// and no pod with the sandbox, which runs model-authored code.
+func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	pullPolicy := corev1.PullAlways
 	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
 		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
 	}
 	// The role, the listen address and the caller authentication come from
-	// buildCredentialProxyEnv, which sets them for either way of moving the
-	// broker off the agent's Pod. Still 0.0.0.0 when co-located: the sandbox
-	// reaches the proxy on loopback, but the gateway reaches the chat relays
-	// hosted in the same process over the Service, and one listener serves both.
+	// buildCredentialProxyEnv. 0.0.0.0 because both callers arrive over the
+	// Service — the sandbox's wrapped CLIs and the gateway's chat relays, which
+	// are hosted in this same process, and one listener serves both.
 	envVars := buildCredentialProxyEnv(agent)
-	volumeMounts := buildCredentialProxyVolumeMounts()
+	volumeMounts := buildCredentialProxyVolumeMounts(agent)
 	securityContext := &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false), ReadOnlyRootFilesystem: ptr.To(true), Capabilities: &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 	}
-	if colocated {
+	// Federation is optional hardening on this pod rather than a precondition
+	// for it. Set, the broker's Google clients read a projected token instead of
+	// 169.254.169.254; unset, they use the metadata server, which is already out
+	// of the shell's reach because the shell is in another pod. The mount is
+	// gated on the same nil check as the volume in
+	// buildCredentialProxyFederationVolume: a mount naming a volume that is not
+	// there does not start.
+	if credentialProxyFederation(agent) != nil {
 		envVars = append(envVars, buildCredentialProxyFederationEnv(agent)...)
-		// The shell's own data volume, at the path the shell sees it. One
-		// filesystem, two mounts, nothing copied — which is what makes
-		// `git clone` land where the agent can then edit it, and what makes
-		// `kubectl apply -f manifest.yaml` find the file the agent just wrote.
 		volumeMounts = append(volumeMounts,
-			corev1.VolumeMount{Name: shellSandboxDataVolume, MountPath: shellSandboxDataPath},
 			corev1.VolumeMount{Name: credentialProxyWIFTokenVolume, MountPath: credentialProxyWIFTokenPath, ReadOnly: true},
 		)
-		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: shellSandboxDataPath})
-		// The sandbox login's uid, from deploy/sandbox/Dockerfile, because the
-		// entrypoint chowns the data volume to it and a shared tree neither side
-		// can fully write is not shared.
-		//
-		// Sharing a uid with the shell is safe here and was not safe in the
-		// gateway pod, and the difference is one field: that pod set
-		// shareProcessNamespace, so /proc/<pid>/environ crossed the boundary
-		// (#720). The sandbox pod pins it false. With no shared PID namespace and
-		// no shared volume but this one, a common uid grants the shell nothing —
-		// every credential the proxy holds is in its environment, on an emptyDir
-		// it alone mounts, or behind credentialProxyWIFTokenPath.
-		securityContext.RunAsUser = ptr.To(int64(shellSandboxUID))
-		securityContext.RunAsGroup = ptr.To(int64(shellSandboxUID))
-		securityContext.RunAsNonRoot = ptr.To(true)
-		securityContext.SeccompProfile = &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault}
 	}
-	// Standalone, CREDENTIAL_PROXY_WORKSPACE_ROOT is deliberately not set. It
-	// would name the sandbox's data volume, which a separate pod cannot mount —
-	// that claim is ReadWriteOnce. Unset, credential_proxy.py falls back to
+	// CREDENTIAL_PROXY_WORKSPACE_ROOT is deliberately not set. It would name the
+	// sandbox's data volume, which a separate pod cannot mount — that claim is
+	// ReadWriteOnce. Unset, credential_proxy.py falls back to
 	// <state-dir>/workspace inside this pod's own emptyDir, which is where a
 	// `git clone` through the proxy lands and where nothing else can read it.
 	return corev1.Container{
@@ -324,15 +291,21 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent, colocated
 	}
 }
 
-// buildCredentialProxyVolumeMounts is the set both placements share.
+// buildCredentialProxyVolumeMounts is what the broker container mounts.
 //
-// Every entry is a volume the shell container must never mount. That is not a
-// style rule: co-located, the mount namespace is the only thing separating the
-// shell from the proxy's kubeconfig, its gcloud config directory and its
-// federated token, because the two containers deliberately run as the same uid.
-// TestSandboxSharesOnlyTheDataVolumeWithTheProxy holds the line.
-func buildCredentialProxyVolumeMounts() []corev1.VolumeMount {
-	return []corev1.VolumeMount{
+// Every entry holds something the shell must never read — the proxy's
+// kubeconfig, its gcloud config directory, its projected tokens. None of them
+// is mounted anywhere but this pod, and the sandbox is a different pod, so a
+// mount here is not reachable from the shell at all.
+//
+// Two of them exist only because buildCredentialProxyEnv names the paths.
+// GITOPS_STATE_PATH points into gitopsStateDir and
+// CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE into scopedSAPoolMountPath; without the
+// mounts the broker reads a variable naming a file that is not there, which is
+// a runtime failure in the GitOps and scoped-identity paths rather than a
+// startup one. Keep the two lists in step.
+func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []corev1.VolumeMount {
+	mounts := []corev1.VolumeMount{
 		{Name: "credential-proxy-policy", MountPath: "/etc/credential-proxy/policy.json", SubPath: "policy.json", ReadOnly: true},
 		{Name: "credential-proxy-tmp", MountPath: "/tmp"},
 		{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
@@ -352,7 +325,20 @@ func buildCredentialProxyVolumeMounts() []corev1.VolumeMount {
 		// AutomountServiceAccountToken is false on both Pods, so nothing
 		// projects this bundle unless it is asked for.
 		{Name: "event-watcher-ksa-token", MountPath: kubeAPIAccessMountPath, ReadOnly: true},
+		{Name: gitopsStateVolumeName, MountPath: gitopsStateDir, ReadOnly: true},
 	}
+	// Conditional because it is a SubPath mount: naming a key the ConfigMap does
+	// not carry leaves the container unable to start, so the mount and the key
+	// have to appear and disappear together.
+	if scopedSAPoolEnabled(agent) {
+		mounts = append(mounts, corev1.VolumeMount{
+			Name:      "credential-proxy-policy",
+			MountPath: scopedSAPoolMountPath,
+			SubPath:   scopedSAPoolKey,
+			ReadOnly:  true,
+		})
+	}
+	return mounts
 }
 
 // buildCredentialProxyFederationEnv points the proxy's Google clients at a token
@@ -389,13 +375,15 @@ func buildCredentialProxyFederationEnv(agent *agentv1alpha1.PlatformAgent) []cor
 // STS checks for the provider's. One token cannot satisfy both, and widening
 // either audience to cover the other would let a token minted for one verifier be
 // replayed at the other.
-// Gated on the placement rather than on the field being set: standalone, the
-// proxy has a pod to itself and the metadata server is the simpler correct
-// answer, so a federation block left in the CR while the sandbox is off should
-// produce no unmounted volume and no behaviour change.
+//
+// Gated on the field alone, and matched by the mount in
+// buildCredentialProxyContainer. Federation is hardening the operator applies
+// wherever it is configured: it narrows what this pod can mint to what the
+// provider's attribute conditions allow, which is worth having whether or not
+// the metadata identity would also have worked.
 func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	wif := credentialProxyFederation(agent)
-	if wif == nil || !credentialProxyColocated(agent) {
+	if wif == nil {
 		return nil
 	}
 	return []corev1.Volume{{
@@ -415,18 +403,19 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 	}}
 }
 
-// buildCredentialProxyNetworkPolicy narrows who may reach the unauthenticated
-// endpoint back down to the two callers that have a reason to: the sandbox,
-// whose wrapped CLIs are the proxy's purpose, and the gateway, which pulls chat
-// events from the relay hosted here.
+// buildCredentialProxyNetworkPolicy narrows who may reach the endpoint down to
+// the two callers that have a reason to: the sandbox, whose wrapped CLIs are the
+// proxy's purpose, and the gateway, which pulls chat events from the relay
+// hosted here. TokenReview already rejects a caller this pod does not serve;
+// this is the layer that keeps such a caller from opening the connection.
 //
 // Ingress only. Egress is left open because this pod is the one that talks to
 // the world — GKE control planes, the Google Chat and Slack APIs, the token
-// broker — and enumerating that is #720's problem, not a temporary bridge's.
+// broker. buildAgentEgressNetworkPolicy enumerates the agent Pod's egress and
+// deliberately leaves this one alone.
 //
-// Inert without a NetworkPolicy implementation, which the reference install
-// (GKE Standard, no Dataplane V2) does not have. It is a control where it is
-// enforced and a statement of intent where it is not.
+// Inert on a cluster whose CNI does not implement NetworkPolicy. It is a control
+// where it is enforced and a statement of intent where it is not.
 func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	np := &networkingv1.NetworkPolicy{
@@ -493,40 +482,14 @@ var (
 	}
 )
 
-// buildCredentialProxyRuntimeVolumes is the credential runtime's own set, in
-// either placement. Co-located it is added to the sandbox pod's volume list
-// alongside the federated token; the shell container mounts none of it.
+// buildCredentialProxyRuntimeVolumes is the credential runtime's own set: the
+// broker Deployment's volume list. The 0400 mode the projections carry is
+// readable because that pod sets an fsGroup, which is what makes kubelet apply
+// group ownership to a projected file.
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
-	volumes = append(volumes, buildCredentialProxyFederationVolume(agent)...)
-	if credentialProxyColocated(agent) {
-		volumes = relaxProjectedTokenMode(volumes)
-	}
-	return volumes
-}
-
-// relaxProjectedTokenMode widens the projected tokens from 0400 to 0444 in the
-// sandbox pod.
-//
-// Kubelet writes a projected file as root:root and applies fsGroup only where a
-// pod sets one. The gateway and standalone proxy pods do, so 0400 there arrives
-// group-readable; the sandbox pod deliberately does not, because fsGroup is
-// pod-wide and would take the data volume the shell owns with it. 0400 in that
-// pod is therefore readable by nobody: the container runs as 1000, and gcloud's
-// first read of the federated token fails with EACCES, which surfaces as the
-// proxy crash-looping with no other symptom.
-//
-// Not a downgrade. What keeps these tokens away from the shell is that the shell
-// container does not mount the volumes at all — a volumeMount is per-container
-// where a pod's identity is not. Inside the proxy container there is no second
-// uid for the extra read bits to reach.
-func relaxProjectedTokenMode(volumes []corev1.Volume) []corev1.Volume {
-	for i := range volumes {
-		if volumes[i].Projected != nil {
-			volumes[i].Projected.DefaultMode = ptr.To(int32(0444))
-		}
-	}
-	return volumes
+	volumes = append(volumes, buildGitopsStateVolume(agent))
+	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }
 
 // buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume

@@ -73,10 +73,8 @@ const (
 	shellSandboxUser = "agent"
 
 	// shellSandboxUser's uid, from the same useradd. Named here because the
-	// credential proxy runs under it when it shares this pod — the entrypoint
-	// chowns the data volume to this uid, and a workspace only one of the two
-	// can write is not a shared workspace. See buildCredentialProxyContainer for
-	// why a common uid is safe in this pod and was not in the gateway's.
+	// entrypoint chowns the data volume to it and the StatefulSet's
+	// securityContext has to agree with the image.
 	shellSandboxUID = 1000
 
 	shellSandboxDataVolume     = "data"
@@ -235,12 +233,29 @@ func shellSandboxSpec(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ShellSa
 	return agent.Spec.Harness.Experimental.ShellSandbox
 }
 
-// shellSandboxEnabled reports whether this agent's shell runs in the sandbox.
-// Absent means off: an install that says nothing keeps the local shell every
-// existing install has.
-func shellSandboxEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+// reasonShellSandboxCannotBeDisabled refuses spec.harness.experimental.shellSandbox.enabled: false.
+const reasonShellSandboxCannotBeDisabled = "ShellSandboxCannotBeDisabled"
+
+// validateShellSandbox refuses a CR that asks for the sandbox to be off,
+// returning a Degraded reason and message, or "" when the CR is acceptable.
+//
+// There is nothing to render for that request. The agent image carries no
+// kubectl, gcloud, gh or git — #737 removed them — so an agent with a local
+// shell has no shell tools, and the only way to give it any is to put
+// model-authored code back in the pod holding the credentials. Answering the
+// field by ignoring it would leave an operator reading `enabled: false` off a
+// running CR that does the opposite.
+func validateShellSandbox(agent *agentv1alpha1.PlatformAgent) (string, string) {
 	spec := shellSandboxSpec(agent)
-	return spec != nil && spec.Enabled != nil && *spec.Enabled
+	if spec == nil || spec.Enabled == nil || *spec.Enabled {
+		return "", ""
+	}
+	return reasonShellSandboxCannotBeDisabled, "spec.harness.experimental.shellSandbox.enabled: false " +
+		"is not a supported configuration. Every command the agent runs executes in the sandbox pod, and " +
+		"the agent image ships no kubectl, gcloud, gh or git of its own — so with the sandbox off the agent " +
+		"has no shell tools at all, and restoring them would mean running model-authored code in the pod " +
+		"that holds the credentials. Remove the field or set it to true. To stop the agent instead, scale " +
+		"its Deployment to zero or delete the PlatformAgent."
 }
 
 // shellSandboxRuntimeClassName is the sandbox pod's runtime, or nil for the
@@ -328,15 +343,10 @@ func buildShellSandboxService(agent *agentv1alpha1.PlatformAgent) *corev1.Servic
 //
 // authorizedKeysSecret holds the public half of the keypair the agent pod connects
 // with, under the key "authorized_keys". credentialProxyURL is what the sandbox's
-// kubectl/gcloud/gh/git wrappers post to — loopback when the proxy is a container
-// of this same pod, the proxy's Service otherwise. Empty is a supported state: the
-// entrypoint logs that the wrappers are unconfigured and starts anyway, so file and
-// code-execution tools work while the credentialed ones report a clear error
-// instead of a stack trace.
-//
-// policyHash reaches the pod template only when the proxy is here. It is the same
-// annotation the standalone Deployment carries, and it exists so that editing the
-// exec policy restarts whatever pod is enforcing it.
+// kubectl/gcloud/gh/git wrappers post to — always the broker's Service, which is
+// always another pod. Empty is a supported state: the entrypoint logs that the
+// wrappers are unconfigured and starts anyway, so file and code-execution tools
+// work while the credentialed ones report a clear error instead of a stack trace.
 //
 // settingsConfigHash goes on the pod template for the same reason the agent's
 // Deployment carries it: SETTINGS.md is mounted with a subPath, and a subPath mount
@@ -344,7 +354,7 @@ func buildShellSandboxService(agent *agentv1alpha1.PlatformAgent) *corev1.Servic
 // the CR's scope rolls the agent pod onto the new file and leaves the sandbox holding
 // the old one — and the sandbox is where the shell reads it, so the skills that read
 // SETTINGS.md by path would be the ones getting the stale answer.
-func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorizedKeysSecret, credentialProxyURL, settingsConfigHash, policyHash string) *appsv1.StatefulSet {
+func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorizedKeysSecret, credentialProxyURL, settingsConfigHash string) *appsv1.StatefulSet {
 	name := shellSandboxName(agent)
 	labels := shellSandboxSelector(agent)
 
@@ -373,10 +383,6 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	annotations := map[string]string{
 		"kubeagents.x-k8s.io/settings-config-hash": settingsConfigHash,
 	}
-	// A superset of the selector, never a replacement for it: a StatefulSet's
-	// spec.selector is immutable, so the extra label has to live on the template
-	// alone or turning federation on would need the object deleted first.
-	//
 	// commonLabels is in here explicitly, and that is not belt-and-braces.
 	// `labels` is one map shared by ObjectMeta.Labels and Selector.MatchLabels
 	// below, and withCommonLabels merges into the object's map in place on the
@@ -388,14 +394,6 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	for k, v := range labels {
 		podLabels[k] = v
 	}
-	if credentialProxyColocated(agent) {
-		annotations["kubeagents.x-k8s.io/proxy-policy-hash"] = policyHash
-		// github-token-minter's NetworkPolicy admits callers by this label. It
-		// follows the credential runtime between placements, which is the whole
-		// reason it is a label rather than a pod name.
-		podLabels["kubeagents.x-k8s.io/has-credential-proxy"] = "true"
-	}
-
 	return &appsv1.StatefulSet{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -518,30 +516,21 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 	}
 }
 
-// buildShellSandboxContainers is the shell, plus the credential proxy when this
-// pod is where the proxy lives.
+// buildShellSandboxContainers is the shell, and only the shell.
 //
-// Order matters only for readability — kubelet starts both concurrently and
-// neither waits on the other. The proxy tolerates a data volume the shell's
-// entrypoint has not chowned yet because its workspace root is the mount point
-// itself, which already exists; it creates nothing there until the first command
-// arrives, by which time the shell has been up long enough to accept an ssh
-// session.
+// One container, because the credential runtime is never here. A broker in this
+// pod is a broker on the model's loopback, and everything that pod can reach is
+// reachable from the shell along with it — see credentialProxySandboxURL.
 func buildShellSandboxContainers(agent *agentv1alpha1.PlatformAgent, env []corev1.EnvVar) []corev1.Container {
-	containers := []corev1.Container{buildShellSandboxContainer(agent, env)}
-	if credentialProxyColocated(agent) {
-		containers = append(containers, buildCredentialProxyContainer(agent, true))
-	}
-	return containers
+	return []corev1.Container{buildShellSandboxContainer(agent, env)}
 }
 
-// buildShellSandboxVolumes is the shell's own set, plus the credential runtime's
-// when co-located.
+// buildShellSandboxVolumes is the shell's own set.
 //
-// The two sets are disjoint apart from the data volume, and only the data volume
-// is mounted by both containers. That is the isolation: the proxy's kubeconfig,
-// gcloud configuration and federated token are separated from the shell by a
-// mount namespace, which is the only per-container boundary a pod has.
+// Nothing credential-bearing is in it but the audience-bound token the shell
+// presents to the broker, which buys the caller nothing except the right to ask.
+// The broker's kubeconfig, gcloud configuration and federated token are in
+// another pod.
 func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeysSecret string) []corev1.Volume {
 	volumes := []corev1.Volume{{
 		Name: shellSandboxKeysVolume,
@@ -572,9 +561,6 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 			},
 		},
 	}, buildShellSandboxCredentialProxyTokenVolume()}
-	if credentialProxyColocated(agent) {
-		volumes = append(volumes, buildCredentialProxyRuntimeVolumes(agent)...)
-	}
 	return volumes
 }
 
@@ -669,29 +655,24 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 	}
 }
 
-// buildShellSandboxNetworkPolicy is deny-by-default in both directions, with three
-// holes.
+// buildShellSandboxNetworkPolicy is deny-by-default in both directions, with
+// three holes: ssh in from the gateway, DNS out, and the broker's Service out.
 //
 // Agent Sandbox ships an equivalent as its GKE default; not taking the CRD means
 // writing it, and this is the one part of that reversal that is real work rather
-// than a rename. Note that it is inert on any cluster without a NetworkPolicy
-// implementation — the reference install has none — so it is a control on clusters
-// that enforce it and documentation everywhere else.
+// than a rename. It is inert on any cluster without a NetworkPolicy
+// implementation, so it is a control where one is enforced and documentation
+// everywhere else.
 //
-// Co-location changes both directions, and the egress change is the cost of the
-// design rather than a detail. A NetworkPolicy selects pods, so every rule the
-// credential proxy needs to reach a GKE control plane, the Google Chat and Slack
-// APIs, GitHub and the token broker is a rule the *shell* container gets too:
-// putting the two in one pod hands the sandbox the proxy's outbound reach. What
-// the design buys is not a smaller network — it is that nothing reachable over
-// that network will answer the shell, because the shell holds no credential. The
-// metadata server is the one exception worth naming, and it answers the whole pod
-// with an unbound principal (see shellSandboxServiceAccountName).
+// The narrow egress is what the broker's separate pod buys. A NetworkPolicy
+// selects pods, so a broker sharing this pod would make every address it needs —
+// a GKE control plane per registered cluster, googleapis.com, chat.googleapis.com,
+// slack.com, github.com, the token minter — an address the *shell* may reach.
+// Off-pod, the shell's whole outbound world is DNS and one ClusterIP.
 func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
 	gateway := map[string]string{"app": agent.Name + "-gateway"}
-	colocated := credentialProxyColocated(agent)
 
 	ingress := []networkingv1.NetworkPolicyIngressRule{{
 		// Only the agent pod may open a shell, and only on sshd's port.
@@ -722,83 +703,17 @@ func buildShellSandboxNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *network
 		},
 	}}
 
-	if colocated {
-		// The gateway's chat relay clients, which now dial a process in this
-		// pod. Loopback needs no rule — the shell reaches the proxy at
-		// 127.0.0.1 and a NetworkPolicy never sees that packet — so this hole
-		// exists for the one caller that is genuinely remote.
-		ingress = append(ingress, networkingv1.NetworkPolicyIngressRule{
-			From: []networkingv1.NetworkPolicyPeer{{
-				PodSelector: &metav1.LabelSelector{MatchLabels: gateway},
-			}},
-			Ports: []networkingv1.NetworkPolicyPort{{
-				Protocol: &tcp,
-				Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
-			}},
-		})
-		// Everything the proxy talks to. Left as a single 443 rule rather than
-		// an address list because the set is open-ended — a GKE control plane
-		// per registered cluster, googleapis.com, chat.googleapis.com,
-		// slack.com, github.com, and whatever a skill reaches next — and an
-		// enumeration that goes stale fails closed in a way that looks like the
-		// agent being broken. 10.0.0.0/8 and friends are excluded so this does
-		// not become a lateral-movement rule for the rest of the cluster; the
-		// private ranges the proxy does need are the two below it.
-		egress = append(egress,
-			networkingv1.NetworkPolicyEgressRule{
-				To: []networkingv1.NetworkPolicyPeer{{
-					IPBlock: &networkingv1.IPBlock{
-						CIDR: "0.0.0.0/0",
-						Except: []string{
-							"10.0.0.0/8",
-							"172.16.0.0/12",
-							"192.168.0.0/16",
-							// The metadata server. The pod's identity is
-							// unbound so it answers nothing useful, but the
-							// proxy has no reason to ask and the shell must
-							// not learn to.
-							"169.254.169.254/32",
-						},
-					},
-				}},
-				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(443))}},
-			},
-			networkingv1.NetworkPolicyEgressRule{
-				// github-token-minter, in this namespace, on 8080. It is what
-				// mints the installation token every `gh` and `git` call uses,
-				// and it admits this pod by the
-				// kubeagents.x-k8s.io/has-credential-proxy label the template
-				// carries when co-located.
-				To: []networkingv1.NetworkPolicyPeer{{
-					PodSelector: &metav1.LabelSelector{
-						MatchLabels: map[string]string{"app": "github-token-minter"},
-					},
-				}},
-				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(8080))}},
-			},
-			networkingv1.NetworkPolicyEgressRule{
-				// The Kubernetes API. `kubectl` against the local cluster goes
-				// to a ClusterIP in the default namespace, which the 0.0.0.0/0
-				// rule above deliberately excludes.
-				To: []networkingv1.NetworkPolicyPeer{{
-					IPBlock: &networkingv1.IPBlock{CIDR: "0.0.0.0/0"},
-				}},
-				Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(6443))}},
-			},
-		)
-	} else {
-		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
-			// The credential proxy in a pod of its own. This is the connection
-			// every wrapped CLI in the sandbox makes.
-			To: []networkingv1.NetworkPolicyPeer{{
-				PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
-			}},
-			Ports: []networkingv1.NetworkPolicyPort{{
-				Protocol: &tcp,
-				Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
-			}},
-		})
-	}
+	egress = append(egress, networkingv1.NetworkPolicyEgressRule{
+		// The credential proxy in a pod of its own. This is the connection
+		// every wrapped CLI in the sandbox makes.
+		To: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{MatchLabels: credentialProxySelector(agent)},
+		}},
+		Ports: []networkingv1.NetworkPolicyPort{{
+			Protocol: &tcp,
+			Port:     ptr.To(intstr.FromInt32(credentialProxyPort)),
+		}},
+	})
 
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -850,10 +765,12 @@ func buildShellSandboxClientKeyVolumes() []corev1.Volume {
 					}},
 					DefaultMode: ptr.To(int32(0444)),
 					// Optional so that an install predating the keypair keeps
-					// starting: it gets an empty directory, the init container
-					// says so, and the agent runs with local tools as before.
-					// A required mount would hold the whole pod in
-					// CreateContainerConfigError over a dormant feature.
+					// starting: it gets an empty directory and the init container
+					// says so, which leaves an agent that cannot reach its shell
+					// but can be read and fixed. A required mount would hold the
+					// whole pod in CreateContainerConfigError instead, where the
+					// missing Secret key is not in any log the operator reads.
+					// upgrade.sh mints the pair on an install that lacks it.
 					Optional: ptr.To(true),
 				},
 			},

@@ -198,11 +198,19 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	proxyC, found := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	authC, found := findContainer(dep.Spec.Template.Spec, "agent-api-auth")
 	if !found {
-		t.Errorf("expected Deployment to contain Envoy credential sidecar")
-	} else if proxyC.RestartPolicy == nil || *proxyC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
-		t.Errorf("credential proxy must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+		t.Errorf("expected Deployment to contain the agent-API front door")
+	} else if authC.RestartPolicy == nil || *authC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("the front door must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+	}
+
+	// The credential runtime is a Deployment of its own, reconciled alongside.
+	brokerDep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-credential-proxy", Namespace: "test-ns"}, brokerDep); err != nil {
+		t.Errorf("failed to get the credential broker Deployment: %v", err)
+	} else if _, found := findContainer(brokerDep.Spec.Template.Spec, "envoy-credential-proxy"); !found {
+		t.Errorf("the broker Deployment does not run the credential runtime")
 	}
 
 	// Service

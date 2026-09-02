@@ -76,11 +76,6 @@ const (
 	// the upstream NousResearch/hermes-agent Dockerfile (line 92). Everything the
 	// agent image ships is owned by it, so the sandbox cannot run as anything else.
 	sandboxUID = int64(10000)
-	// credentialProxyUID keeps the credential sidecar off the sandbox's user. The
-	// sidecar holds every credential in the Pod; a distinct UID means a sandbox
-	// process cannot reach the sidecar's process state or its files by identity
-	// alone, only through the proxy's own policy-checked API.
-	credentialProxyUID = int64(10001)
 	// agentFSGroup is the group both containers share. They mount one PVC and each
 	// writes files the other has to change — the sandbox creates a leased GitOps
 	// directory that the sidecar clones into, and the sidecar writes kubeconfig
@@ -1284,8 +1279,8 @@ func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.Confi
 // `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for
 // ssh_host and needs one more fact about the far side — the directory a proxied
-// command must run in, which is credentialProxyWorkspaceRoot on the co-located
-// proxy. It is published rather than hardcoded in the script because it describes
+// command must run in, which is shellSandboxDataPath, the sandbox's data volume.
+// It is published rather than hardcoded in the script because it describes
 // the sandbox, and the script runs in the agent pod: the two filesystems agree
 // only because deploy/sandbox/Dockerfile creates /opt/data to match, and a script
 // that reads its own HERMES_HOME to name a path in another container is relying on
@@ -1384,20 +1379,18 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// approval on a scaffolded cluster profile.
 	cfg.Approvals.CronMode = "approve"
 
-	// Terminal. Absent unless the sandbox is on, and absent is what every install
-	// that has never turned it on renders — so the key never appears in the managed
-	// scope, Hermes' own default (`local`) applies, and nothing about the existing
-	// fleet changes.
-	if shellSandboxEnabled(agent) {
-		cfg.Terminal = &managedTerminalConfig{
-			Backend:         "ssh",
-			SSHHost:         shellSandboxHost(agent),
-			SSHUser:         shellSandboxUser,
-			SSHPort:         shellSandboxPort,
-			SSHKey:          shellSandboxClientKeyFilePath(),
-			LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
-			WorkspaceRoot:   shellSandboxDataPath,
-		}
+	// Terminal. The ssh backend, always: the agent container has no shell tools
+	// of its own, so a `local` terminal here would run the model's commands in
+	// the pod holding the credentials — which is the arrangement this design
+	// exists to end.
+	cfg.Terminal = &managedTerminalConfig{
+		Backend:         "ssh",
+		SSHHost:         shellSandboxHost(agent),
+		SSHUser:         shellSandboxUser,
+		SSHPort:         shellSandboxPort,
+		SSHKey:          shellSandboxClientKeyFilePath(),
+		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
+		WorkspaceRoot:   shellSandboxDataPath,
 	}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
@@ -1799,14 +1792,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	// The shell sandbox's half of the SSH keypair, staged into an emptyDir the
 	// agent container can read — see buildShellSandboxClientKeyVolumes for why the
-	// Secret cannot be handed to `ssh -i` directly. Added only when the sandbox is
-	// on, so an install with the toggle off carries no extra init container and no
-	// reference to a key it does not use.
-	var shellSandboxVolumes []corev1.Volume
-	if shellSandboxEnabled(agent) {
-		initContainers = append(initContainers, buildShellSandboxClientKeyInitContainer(image))
-		shellSandboxVolumes = buildShellSandboxClientKeyVolumes()
-	}
+	// Secret cannot be handed to `ssh -i` directly.
+	initContainers = append(initContainers, buildShellSandboxClientKeyInitContainer(image))
+	shellSandboxVolumes := buildShellSandboxClientKeyVolumes()
 
 	pluginsDebugVal := "0"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PluginsDebug != nil {
@@ -2081,46 +2069,41 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// override of the environment (hermes_cli/config.py), so this is a pod-wide
 	// default a profile can still narrow to its own directory, which is what #11 is
 	// for. A managed-scope value could not be narrowed by anything.
-	if shellSandboxEnabled(agent) {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "HERMES_WRITE_SAFE_ROOT",
-			Value: strings.Join([]string{shellSandboxDataPath, shellSandboxHomePath}, ":"),
-		})
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "TERMINAL_CWD",
-			Value: shellSandboxDataPath,
-		})
-	}
-	// With the sandbox on: no CREDENTIAL_PROXY_URL, and no /opt/credential-proxy/bin
-	// on PATH. Both existed to serve the credential-proxy shims, and #737 took the
-	// last of them out of the agent image: this container has no kubectl, gcloud, gh
-	// or git in any form, and the code that used to invoke one goes through
-	// sandbox_exec.py to the shell sandbox instead. Neither variable has a reader
-	// here any more.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "HERMES_WRITE_SAFE_ROOT",
+		Value: strings.Join([]string{shellSandboxDataPath, shellSandboxHomePath}, ":"),
+	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "TERMINAL_CWD",
+		Value: shellSandboxDataPath,
+	})
+	// CREDENTIAL_PROXY_URL is emitted EMPTY here, and /opt/credential-proxy/bin is
+	// off PATH. Both existed to serve the credential-proxy shims, and #737 took
+	// the last of them out of the agent image: this container has no kubectl,
+	// gcloud, gh or git in any form, and the code that used to invoke one goes
+	// through sandbox_exec.py to the shell sandbox instead. Neither has a reader
+	// here any more, and buildShellSandboxStatefulSet sets the URL on the sandbox.
+	//
+	// Empty rather than absent, and unconditionally, for the reason
+	// HERMES_GATEWAY_PROFILE is: last-wins only settles a duplicate, so a name the
+	// operator never emits leaves an AgentPlugin's spec.env as the only writer —
+	// and extractAgentPluginEnvVars copies that verbatim, with no allowlist. A
+	// shim reinstated in this container is meant to need deliberate wiring; a
+	// plugin able to supply the URL is that wiring, arriving from a field further
+	// down the same CR.
 	//
 	// This is tidiness, not containment. GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL
-	// above still name the proxy, and the proxy authenticates no caller in this
-	// placement, so anything in this container that can form an HTTP request can
-	// still reach it — that is what #737 Part C is for. What removing the variable
-	// does buy is that a shim reinstated here would have to be wired up
-	// deliberately rather than working the moment it appeared.
-	//
-	// buildShellSandboxStatefulSet sets the variable on the sandbox instead.
-	if !shellSandboxEnabled(agent) {
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "CREDENTIAL_PROXY_URL",
-			Value: credentialProxyBaseURL(agent),
-		})
-	}
-	if credentialBrokerOffPod(agent) {
-		// Only meaningful once the broker is off the Pod's loopback. In the
-		// sidecar layout the client sends no credential at all, because the
-		// socket it reaches is the credential.
-		envVars = append(envVars, corev1.EnvVar{
-			Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
-			Value: credentialProxyTokenMountPath + "/token",
-		})
-	}
+	// above still name the broker, so anything in this container that can form an
+	// HTTP request can still reach it — what stops that being free is the token
+	// below, which the broker now checks on every call.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "CREDENTIAL_PROXY_URL",
+		Value: "",
+	})
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
+		Value: credentialProxyTokenMountPath + "/token",
+	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -2210,33 +2193,15 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// and so no bind to race for, and what stays behind is the front door for the
 	// agent's own API, which cannot follow the runtime across the Pod boundary.
 	//
-	// The two switches differ in what they leave behind. The shell sandbox puts
-	// the runtime in the sandbox's Pod and keeps buildAgentAPIAuthSidecar here,
-	// which hosts the k8s-event-watcher as well as the front door — the watcher
-	// posts to the Session KV server on this Pod's loopback and has nowhere else
-	// to deliver. spec.security.splitCredentialBrokerPod puts the runtime in a
-	// Deployment of its own and keeps buildAgentAPIProxyContainer, which is the
-	// front door alone; validateCredentialBrokerSplit refuses that combination
-	// together with the watcher for exactly the reason above. Both paths project
-	// the token the agent presents to the runtime over the network.
-	switch {
-	case shellSandboxEnabled(agent):
-		initContainers = append(initContainers, asNativeSidecar(buildAgentAPIAuthSidecar(agent, homeDir)))
-	case credentialBrokerIsSplit(agent):
-		containers = append(containers, buildAgentAPIProxyContainer(agent))
-	default:
-		initContainers = append(initContainers, asNativeSidecar(buildCredentialProxySidecar(agent, homeDir)))
-	}
-	if credentialBrokerOffPod(agent) {
-		// Outside the switch because it is the one thing both non-default
-		// branches need and neither owns: whichever Pod the runtime went to, the
-		// agent now reaches it over the network and has to present a token to be
-		// served. Inside the switch it would be two identical lines, and the
-		// sandbox branch is the one that was missing it.
-		mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
-			Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
-		})
-	}
+	// buildAgentAPIAuthSidecar stays because it hosts the k8s-event-watcher as
+	// well as the front door, and the watcher posts to the Session KV server on
+	// this Pod's loopback with nowhere else to deliver.
+	initContainers = append(initContainers, asNativeSidecar(buildAgentAPIAuthSidecar(agent, homeDir)))
+	// The agent reaches the runtime over the network now, so it has to present a
+	// token to be served.
+	mountIntoContainer(containers, "platform-agent", corev1.VolumeMount{
+		Name: agentCredentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true,
+	})
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -2273,23 +2238,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		}
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
-	switch {
-	case shellSandboxEnabled(agent):
-		// The credential runtime's volumes go with it into the sandbox Pod. The
-		// event-watcher pair stays, because buildAgentAPIAuthSidecar still hosts
-		// the watcher here.
-		volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
-		volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
-	case credentialBrokerIsSplit(agent):
-		// The broker's volumes all go with the broker, including the
-		// event-watcher pair: the watcher is hosted inside the credential
-		// container, so it leaves the agent Pod too and nothing here mounts
-		// either volume. What stays is the token the agent presents to the
-		// broker across the network.
-		volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
-	default:
-		volumes = append(volumes, buildCredentialProxyVolumes(agent)...)
-	}
+	// The credential runtime's volumes go with it into its own Pod. The
+	// event-watcher pair stays, because buildAgentAPIAuthSidecar still hosts the
+	// watcher here, and so does the token the agent presents across the network.
+	volumes = append(volumes, buildAgentAPIAuthVolumes(agent)...)
+	volumes = append(volumes, buildAgentCredentialProxyTokenVolume())
 	if len(sidecarVolumes) > 0 {
 		volumes = append(volumes, sidecarVolumes...)
 	}
@@ -2314,15 +2267,10 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// immutable once created.
 	podLabels := commonLabels(agent)
 	podLabels["app"] = agent.Name + "-gateway"
-	if !shellSandboxEnabled(agent) {
-		// What github-token-minter's NetworkPolicy admits on 8080. The sandbox
-		// layout is the one placement where this Pod has no caller for the minter:
-		// the credential runtime is in the sandbox's Pod and carries the label
-		// there, and nothing left here can form the call. Under
-		// splitCredentialBrokerPod the label stays, because that is what main does
-		// and the split is not this change's to narrow.
-		podLabels["kubeagents.x-k8s.io/has-credential-proxy"] = "true"
-	}
+	// No kubeagents.x-k8s.io/has-credential-proxy label. That is what
+	// github-token-minter's NetworkPolicy admits on 8080, and this Pod has no
+	// caller for the minter: the credential runtime is in a Pod of its own and
+	// carries the label there, and nothing left here can form the call.
 
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2330,10 +2278,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			// No ShareProcessNamespace. The sandbox and the credential sidecar are
-			// in one Pod, so a shared process namespace would put the sidecar's
-			// /proc/<pid>/environ — where its credentials live — inside a directory
-			// the sandbox can read. See docs/security-requirements.md.
+			// No ShareProcessNamespace. Nothing in this Pod holds a credential
+			// any more, so the field is not load-bearing here — it stays unset
+			// because a Pod that shares its process namespace hands every
+			// container's /proc/<pid>/environ to every other one, and the next
+			// container added here should not inherit that by default.
+			// See docs/security-requirements.md.
 			RuntimeClassName: runtimeClassName,
 			InitContainers:   initContainers,
 			// Pod-scoped, so it covers the agent, both operator-injected sidecars,
@@ -2345,8 +2295,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			AutomountServiceAccountToken: ptr.To(false),
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup: ptr.To(agentFSGroup),
-				// The Pod default is the sandbox's user; the credential sidecar
-				// overrides it with credentialProxyUID at container level.
+				// Every container in this Pod runs as the agent image's user;
+				// none of them holds a credential.
 				RunAsUser:      ptr.To(sandboxUID),
 				RunAsGroup:     ptr.To(agentFSGroup),
 				RunAsNonRoot:   ptr.To(true),
@@ -2381,11 +2331,8 @@ func buildDeployment(agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHa
 	podTemplate := buildPodTemplateSpec(agent, configHash, fluentBitHash, settingsConfigHash, policyHash, agentPlugins, opts)
 	progressDeadline := gatewayProgressDeadlineSeconds
 
-	// Mirrors the pod template's label, and drops out on the same condition.
+	// Mirrors the pod template's labels.
 	workloadLabels := map[string]string{"app": agent.Name + "-gateway"}
-	if !shellSandboxEnabled(agent) {
-		workloadLabels["kubeagents.x-k8s.io/has-credential-proxy"] = "true"
-	}
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{
@@ -2732,103 +2679,6 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 	return c
 }
 
-// buildCredentialProxySidecar returns the Envoy-fronted credential runtime.
-// Its environment and volume mounts are intentionally disjoint from the agent
-// container even though both containers share a Pod network namespace.
-func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
-	image := resolveCredentialProxyImage(agent.Spec.Deployment)
-	pullPolicy := corev1.PullAlways
-	if agent.Spec.Deployment != nil && agent.Spec.Deployment.ImagePullPolicy != nil {
-		pullPolicy = *agent.Spec.Deployment.ImagePullPolicy
-	}
-	envVars := buildCredentialProxyEnv(agent)
-	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_WORKSPACE_ROOT", Value: homeDir})
-	// The one piece of the event watcher's configuration that varies per
-	// install. Set unconditionally and from the same resolver the rest of the
-	// operator uses, rather than letting the entrypoint fall back to
-	// GKE_CLUSTER_NAME: that variable is only set when projectID, location and
-	// clusterName are all present, so a CR naming its cluster but omitting the
-	// project would silently label every payload and metric with the default
-	// name instead of the one the user chose. The watcher's remaining flags
-	// describe loopback plumbing inside this container and live in the
-	// entrypoint.
-	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
-	// The emergency stop from spec.harness.eventWatcher.enabled. Written on every
-	// reconcile rather than only when off, so the Deployment answers "is the
-	// watcher meant to be running?" without reading the CR — the pod stays Ready
-	// either way, so there is otherwise nothing to tell a deliberately silent
-	// install from a broken one. Appended after mergeCredentialProxyEnv like the
-	// cluster name above, so the name is reserved in that function's explicit
-	// list instead: an unreserved name appended here would not shadow a
-	// same-named entry in spec.deployment.env, it would sit beside it, and
-	// server-side apply refuses a duplicate key in `env`.
-	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
-	// A user of its own, not the sandbox's. The shared PVC still works across the
-	// two because both containers keep agentFSGroup (see the constant) and write
-	// group-readable/writable files. Layered onto hardenedSecurityContext rather
-	// than written out, because a different user is exactly what that helper says
-	// belongs on the container instead of in the floor.
-	securityContext := hardenedSecurityContext()
-	securityContext.RunAsUser = ptr.To(credentialProxyUID)
-	securityContext.RunAsGroup = ptr.To(agentFSGroup)
-
-	// Conditional because it is a SubPath mount: naming a key the ConfigMap
-	// does not carry leaves the container unable to start, so the mount and the
-	// key have to appear and disappear together.
-	scopedPoolMounts := []corev1.VolumeMount{}
-	if scopedSAPoolEnabled(agent) {
-		scopedPoolMounts = append(scopedPoolMounts, corev1.VolumeMount{
-			Name:      "credential-proxy-policy",
-			MountPath: scopedSAPoolMountPath,
-			SubPath:   scopedSAPoolKey,
-			ReadOnly:  true,
-		})
-	}
-	return corev1.Container{
-		Name:            "envoy-credential-proxy",
-		Image:           image,
-		ImagePullPolicy: pullPolicy,
-		// Starts three peer services: the credential runtime, Envoy, and the
-		// k8s-event-watcher. See deploy/shared/start-services.sh.
-		Command: []string{"/usr/local/bin/start-services"},
-		Env:     envVars,
-		Ports: []corev1.ContainerPort{
-			{Name: "cred-proxy", ContainerPort: credentialProxyPort},
-			{Name: "proxy-api", ContainerPort: 8643},
-		},
-		ReadinessProbe: &corev1.Probe{
-			ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: []string{
-				"curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8765/healthz",
-			}}},
-			InitialDelaySeconds: 5,
-			PeriodSeconds:       15,
-		},
-		Resources: corev1.ResourceRequirements{
-			// Memory request covers the watcher's informer and dedup caches, which
-			// scale with the number of watched clusters.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("150m"), corev1.ResourceMemory: resource.MustParse("384Mi")},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
-			},
-		},
-		VolumeMounts: append([]corev1.VolumeMount{
-			{Name: "credential-proxy-policy", MountPath: "/etc/credential-proxy/policy.json", SubPath: "policy.json", ReadOnly: true},
-			{Name: "credential-proxy-tmp", MountPath: "/tmp"},
-			{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
-			{Name: "credential-proxy-runtime", MountPath: "/var/run/credential-proxy"},
-			{Name: "event-watcher-kubeconfig", MountPath: "/var/run/event-watcher"},
-			{Name: "credential-proxy-ksa-token", MountPath: "/var/run/secrets/kubeagents/serviceaccount", ReadOnly: true},
-			// Default audience, unlike credential-proxy-ksa-token above. This is the
-			// token rest.InClusterConfig reads, so it is what lets the watcher cover
-			// the management cluster, which never gets a Cluster Agent profile.
-			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
-			{Name: "platform-agent-data-vol", MountPath: homeDir},
-			{Name: gitopsStateVolumeName, MountPath: gitopsStateDir, ReadOnly: true},
-		}, scopedPoolMounts...),
-		SecurityContext: securityContext,
-	}
-}
-
 // buildAgentAPIAuthSidecar returns what is left in the gateway pod after the
 // credential runtime moved out: the authenticated front door for the Hermes API,
 // and the k8s-event-watcher.
@@ -2848,11 +2698,9 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 // reach a credentialed endpoint on this pod's loopback because there is no
 // longer one to reach — which is the property the sandbox split is for.
 //
-// Selected only when the shell sandbox is on. Without it the credential
-// runtime is placed by spec.security.splitCredentialBrokerPod instead — see
-// platformagent_broker_split.go — and the two paths collapse into one when
-// the version-control abstraction makes the split unconditional. See
-// credential_proxy_manifests.go.
+// The only shape there is. The credential runtime always runs in its own pod —
+// see credential_proxy_manifests.go — so this is what the gateway Pod carries
+// on every install.
 func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
 	image := resolveCredentialProxyImage(agent.Spec.Deployment)
 	pullPolicy := corev1.PullAlways
@@ -2882,12 +2730,12 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// server-side apply refuses a duplicate key in `env`.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_ENABLED", Value: strconv.FormatBool(eventWatcherEnabled(agent))})
 	envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "api-proxy"})
-	// The plain hardened context, not the credentialProxyUID one that
-	// buildCredentialProxySidecar and buildAgentAPIProxyContainer carry. That uid
-	// exists to keep the shell from reading the credential runtime's memory and
-	// files, and the shell is not in this Pod — it is in the sandbox, and so is
-	// the runtime. What is left here holds no cloud credential, and it writes the
-	// watcher's dedup snapshots to the shared PVC as the agent's own user.
+	// The plain hardened context, with no UID of its own. The credential runtime
+	// used to sit in this Pod under a second uid, so that the shell could not
+	// read its memory or its files; neither is here any more — the shell is in
+	// the sandbox and the runtime is in the broker's own pod. What is left holds
+	// no cloud credential, and it writes the watcher's dedup snapshots to the
+	// shared PVC as the agent's own user.
 	securityContext := hardenedSecurityContext()
 	return corev1.Container{
 		Name:            "agent-api-auth",
@@ -3023,61 +2871,32 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 	} else {
 		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"})
 	}
-	if credentialBrokerOffPod(agent) {
-		// Everything moving the broker off the agent's Pod changes about its own
-		// configuration, and it is the same list for both switches. The
-		// agent-API front door is gone (it stayed in the agent Pod, so none of
-		// its three variables are set here), Envoy listens on the Pod IP rather
-		// than loopback, and the loopback that used to be the access control is
-		// replaced by a verified caller.
-		//
-		// The authentication is not optional in either placement:
-		// credential_proxy.py refuses to serve a listener reachable from outside
-		// its Pod with CREDENTIAL_PROXY_AUTH_MODE unset, so a broker rendered
-		// without these would crash-loop at boot rather than serve credentials
-		// to whoever reached the port.
-		envVars = append(envVars,
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUTH_MODE", Value: "serviceaccount"},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
-			corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
-		)
-	}
-	if shellSandboxEnabled(agent) {
-		// Content-passing, armed unconditionally with the sandbox and with no
-		// field to turn it off. The two Pods share no volume, so a working-tree
-		// clone in a directory the agent named is not something the broker can
-		// do here at all — the fallback the flag guards elsewhere does not
-		// exist in this layout, and an install that could switch it off would
-		// only be choosing to have the GitHub-writing skills fail.
-		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"})
-	}
-	if !credentialBrokerOffPod(agent) {
-		apiServerSecretRef := defaultSecretRef(nil, defaultPlatformAgentSecrets, "API_SERVER_KEY")
-		if harness := agent.Spec.Harness; harness != nil && harness.Hermes != nil && harness.Hermes.ApiServerSecretRef != nil {
-			apiServerSecretRef = harness.Hermes.ApiServerSecretRef
-		}
-		envVars = append(envVars,
-			corev1.EnvVar{Name: "AGENT_API_PROXY_PORT", Value: "8643"},
-			corev1.EnvVar{Name: "AGENT_API_UPSTREAM_KEY", Value: loopbackAgentAPIKey},
-			corev1.EnvVar{
-				Name:      "API_SERVER_EXTERNAL_KEY",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: apiServerSecretRef},
-			},
-			// The k8s-event-watcher hosted here posts events to the Session KV
-			// server in the sandbox container over the shared pod loopback, and
-			// that server now authenticates. start-services.sh passes this name
-			// to --token-env. Sidecar mode only: in the split there is no shared
-			// loopback for it to cross.
-			corev1.EnvVar{
-				Name:      "SESSION_KV_API_KEY",
-				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVApiKeySecretRef(agent)},
-			},
-		)
-	}
+	// What the broker's own Pod changes about its configuration. The agent-API
+	// front door is gone — it stayed in the agent Pod, so none of its three
+	// variables are set here — Envoy listens on the Pod IP rather than loopback,
+	// and the loopback that used to be the access control is replaced by a
+	// verified caller.
+	//
+	// The authentication is not optional: credential_proxy.py refuses to serve a
+	// listener reachable from outside its Pod with CREDENTIAL_PROXY_AUTH_MODE
+	// unset, so a broker rendered without these would crash-loop at boot rather
+	// than serve credentials to whoever reached the port.
+	//
+	// CREDENTIAL_PROXY_CONTENT_WORKSPACE has no field to turn it off. The Pods
+	// share no volume, so a working-tree clone in a directory the agent named is
+	// not something the broker can do at all — the fallback the flag guards
+	// elsewhere does not exist here, and an install that could switch it off
+	// would only be choosing to have the GitHub-writing skills fail.
+	envVars = append(envVars,
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ROLE", Value: "broker"},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ENVOY_ADDRESS", Value: "0.0.0.0"},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUTH_MODE", Value: "serviceaccount"},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedBrokerCallers(agent)},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
+		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
+	)
 	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
@@ -3464,9 +3283,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 	// The staged SSH key, read-only. Only the emptyDir the init container wrote —
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
-	if shellSandboxEnabled(agent) {
-		volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
-	}
+	volumeMounts = append(volumeMounts, buildShellSandboxClientKeyMount())
 
 	// Args, never Command. Command replaces the image ENTRYPOINT
 	// (/usr/local/bin/agent-entrypoint), and that script is what makes $HERMES_HOME
