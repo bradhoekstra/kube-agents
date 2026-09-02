@@ -161,6 +161,25 @@ class RunTestCase(unittest.TestCase):
             with self.assertRaises(sandbox_exec.SandboxUnavailable):
                 sandbox_exec.run(["kubectl", "get", "pods"], path=self.config)
 
+    def test_a_connection_that_dies_mid_command_is_a_transport_failure_too(self):
+        """Not every ssh failure happens before the command starts.
+
+        An evicted sandbox pod, and a rolling StatefulSet update replacing
+        sshd, both kill an open session -- and neither prints "connect to
+        host". Read as a remote exit 255, they surface to the caller as the
+        cluster refusing the command rather than as something to retry.
+        """
+        for stderr in (
+            "Timeout, server not responding.",
+            "ssh_exchange_identification: read: Connection reset by peer",
+            "client_loop: send disconnect: Broken pipe",
+            "Connection to platform-agent-shell closed by remote host.",
+        ):
+            with self.subTest(stderr=stderr):
+                with patch("subprocess.run", return_value=self.completed(255, stderr=stderr)):
+                    with self.assertRaises(sandbox_exec.SandboxUnavailable):
+                        sandbox_exec.run(["kubectl", "get", "pods"], path=self.config)
+
     def test_a_remote_command_exiting_255_is_not_mistaken_for_a_transport_failure(self):
         remote = self.completed(255, stderr="error: the server could not find the requested resource")
         with patch("subprocess.run", return_value=remote):

@@ -87,10 +87,19 @@ DEFAULT_SANDBOX_CWD = "/opt/data"
 # own exit-code sentinel to stdout would corrupt the output of every command
 # that returns anything but text.
 _SSH_LEVEL_ERRORS = re.compile(
-    r"(ssh: connect to host|Connection (refused|closed|timed out)|"
+    r"(ssh: connect to host|Connection (refused|closed|timed out|reset)|"
     r"Could not resolve hostname|Permission denied \(publickey|"
     r"Host key verification failed|kex_exchange_identification|"
-    r"Operation timed out|No route to host)",
+    r"Operation timed out|No route to host|Network is unreachable|"
+    # A connection that died mid-command rather than failing to open. The
+    # first is what ServerAliveCountMax prints when the sandbox pod is
+    # evicted under an open session; the second is sshd going away during the
+    # banner exchange, which a rolling StatefulSet update produces routinely;
+    # the third is the client noticing the socket is gone. Missing them made
+    # an unreachable sandbox report as the command exiting 255, which callers
+    # render as a cluster fault rather than a retryable one.
+    r"Timeout, server not responding|ssh_exchange_identification|"
+    r"client_loop: send disconnect|closed by remote host)",
     re.IGNORECASE,
 )
 
