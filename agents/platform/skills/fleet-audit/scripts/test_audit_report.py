@@ -8595,6 +8595,47 @@ class ContentModeTestCase(BaseTestCase):
             (self.workspace / "README.md").read_text(encoding="utf-8"), "seed\n"
         )
 
+    def test_a_read_can_be_pointed_at_the_remediation_branch(self):
+        """Without --branch every read answers from the base.
+
+        That is the wrong file on a second round. The remediation branch
+        already carries a commit — an earlier run's, or a reviewer's — and an
+        edit that starts from the base and is committed onto the branch reverts
+        it, fast-forward, with nothing anywhere objecting. The manifest below
+        exists only on the branch, so the base read cannot see it and the
+        branch read must.
+        """
+        self.start()
+        path = "clusters/prod-us-east/payments-netpol.yaml"
+        self.write_manifest(path, "kind: NetworkPolicy\n")
+        self.harness.replies = {
+            "issue list": "[]",
+            "issue create": "https://github.com/acme/fleet/issues/7\n",
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.assertEqual(self.run_finish(make_doc()), 0)
+        branch = self.branch_for(make_doc())
+
+        # Overwritten locally first, so what comes back is demonstrably the
+        # broker's answer rather than the file the run left in the workspace.
+        self.write_manifest(path, "clobbered\n")
+        self.assertEqual(
+            self.run_main(["fetch", "--audit", AUDIT, "--path", path, "--branch", branch]), 0
+        )
+        self.assertEqual(
+            (self.workspace / path).read_text(encoding="utf-8"), "kind: NetworkPolicy\n"
+        )
+
+        listed = self.run_main(["list", "--audit", AUDIT, "--branch", branch])
+        self.assertEqual(listed, 0)
+        self.assertIn(path, [e["path"] for e in json.loads(self.out.strip())["entries"]])
+
+        # And the base still does not have it, which is what made the read wrong.
+        self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 0)
+        self.assertNotIn(
+            path, [e["path"] for e in json.loads(self.out.strip())["entries"]]
+        )
+
     def test_list_names_the_repository_files(self):
         self.start()
         self.assertEqual(self.run_main(["list", "--audit", AUDIT]), 0)

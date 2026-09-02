@@ -5580,7 +5580,9 @@ def handle_fetch(args: argparse.Namespace) -> None:
     targets = {path: resolve_inside_repo(root, path, "fetch") for path in args.path}
 
     written: list[str] = []
-    with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=args.branch
+    ) as workspace:
         for path, target in targets.items():
             content = workspace.read(path)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -5617,7 +5619,9 @@ def handle_list(args: argparse.Namespace) -> None:
 
     import credential_proxy_client
 
-    with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=args.branch
+    ) as workspace:
         entries = workspace.list(args.prefix)
     # `truncated` travels with the entries. A listing that stopped at the
     # broker's ceiling looks complete otherwise, and the audit's next move is to
@@ -5665,7 +5669,9 @@ def handle_grep(args: argparse.Namespace) -> None:
 
     import credential_proxy_client
 
-    with credential_proxy_client.Workspace.open(proxy_endpoint(), repo) as workspace:
+    with credential_proxy_client.Workspace.open(
+        proxy_endpoint(), repo, branch=args.branch
+    ) as workspace:
         result = workspace.grep(
             args.pattern,
             prefix=args.prefix,
@@ -6563,6 +6569,30 @@ def handle_finish(args: argparse.Namespace) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _add_read_branch_argument(parser: argparse.ArgumentParser) -> None:
+    """`--branch` for the three content-mode reads.
+
+    Without it every read answers from the base branch, and on a second round
+    that is the wrong file: the remediation branch already carries a commit,
+    possibly a reviewer's, and an edit that starts from the base and is
+    committed onto the branch reverts it. The revert fast-forwards, so nothing
+    anywhere objects. Naming the branch is what makes `read`, `list` and `grep`
+    answer with the file as the pull request has it — see Workspace.open in
+    credential_proxy_client.py, which was built for exactly this.
+
+    A branch the remote does not have yet is not an error: the broker falls
+    back to the base, which is what a first round wants anyway.
+    """
+    parser.add_argument(
+        "--branch",
+        default=None,
+        metavar="BRANCH",
+        help="Read from this remediation branch rather than the base. Pass it "
+        "when the fix already has a branch on the remote, or the edit starts "
+        "from the base and the commit reverts what is on the branch.",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Deterministic audit-reporting harness for the fleet-audit skill."
@@ -6612,6 +6642,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="REPO_PATH",
         help="Repository-relative path to copy in; repeat for more than one.",
     )
+    _add_read_branch_argument(fetch_parser)
 
     list_parser = subparsers.add_parser(
         "list",
@@ -6626,6 +6657,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Restrict the listing to this directory. The broker caps the "
         "number of entries it returns, so a large repository needs one.",
     )
+    _add_read_branch_argument(list_parser)
 
     grep_parser = subparsers.add_parser(
         "grep",
@@ -6650,6 +6682,7 @@ def build_parser() -> argparse.ArgumentParser:
     grep_parser.add_argument(
         "--ignore-case", action="store_true", help="Match without regard to case."
     )
+    _add_read_branch_argument(grep_parser)
 
     remediate_parser = subparsers.add_parser(
         "remediate",

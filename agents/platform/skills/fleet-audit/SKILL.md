@@ -198,6 +198,12 @@ returns, so read `truncated` on both and **pass `--prefix`** on a large reposito
 each file into the workspace at its repo-relative path, which is exactly where a remediation editing
 that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
+All three take `--branch`, and a second round needs it. Without it they answer from the base, so a
+file the remediation branch has already changed — by an earlier run or by a reviewer — comes back as
+the base has it, and committing the edit onto that branch reverts the change. The revert
+fast-forwards, so nothing objects. Pass the remediation branch whenever the remote already has one;
+a branch it does not have falls back to the base, which is what a first round wants anyway.
+
 All three exit 2 in directory mode, where the clone already holds the file.
 
 ### Step 3 — `finish`
