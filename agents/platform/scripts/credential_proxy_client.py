@@ -8,23 +8,31 @@ import base64
 import http.client
 import json
 import os
+import re
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 
 SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
 
-# Hostnames that mean "the proxy is in this pod", and therefore that a local
-# path means the same thing on both sides of the call.
-LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]", ""})
-
 # How long to wait to reach the broker. Bounds the connect only — see
 # BrokerConnection.
 BROKER_CONNECT_TIMEOUT_SECONDS = 10.0
+
+# `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
+# `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
+# scope key in a log line and a filename in the broker's state dir. `fullmatch`
+# at the call site says the same thing twice on purpose: whichever a later
+# reader changes, the other still holds.
+_GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+
+# Enough for any real kubeconfig; the point is that the file is read into
+# memory before anything is known about it.
+MAX_KUBECONFIG_BYTES = 1 << 20
 
 
 class BrokerConnection(http.client.HTTPConnection):
@@ -88,12 +96,11 @@ class TokenUnavailable(Exception):
 def authorization_headers() -> dict[str, str]:
     """Return the credential that identifies this caller to the broker.
 
-    Empty when CREDENTIAL_PROXY_TOKEN_FILE is unset, which is the sidecar
-    deployment: there the broker is reachable only on the Pod's own loopback,
-    behind a socket only its own container can open, and it asks for no
-    credential. When the broker runs in its own Pod the operator projects a
-    ServiceAccount token with the broker's audience into this container and
-    points this variable at it.
+    The operator projects a ServiceAccount token with the broker's audience into
+    every container that may call, and points CREDENTIAL_PROXY_TOKEN_FILE at it.
+    Empty when that variable is unset, which is a misconfiguration rather than a
+    layout: the broker is on a ClusterIP and authenticates every caller by
+    TokenReview, so a request with no header earns a 401 that says so.
 
     Read on every invocation, never cached: the kubelet rewrites a projected
     token in place as it approaches expiry, and this process is short-lived
@@ -112,9 +119,9 @@ def authorization_headers() -> dict[str, str]:
 
 # Only these read KUBECONFIG: kubectl to pick a context, gcloud to write one in
 # `container clusters get-credentials`. `git` and `gh` ignore the variable, so
-# forwarding it to them buys nothing and costs plenty — the server rejects an
-# out-of-workspace path rather than ignoring it, which would turn a stray
-# KUBECONFIG into a 400 on a command that has nothing to do with Kubernetes.
+# resolving it for them buys nothing and costs plenty — an unreadable kubeconfig
+# is a hard failure, which would turn a stray KUBECONFIG into a refused `gh pr
+# create`.
 KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
 
 # Flags whose value may be `-`, meaning "read the document from stdin". This is
@@ -149,23 +156,190 @@ def reads_stdin(argv: list[str]) -> bool:
     return False
 
 
-def shares_filesystem_with_proxy(endpoint: str) -> bool:
-    """Whether a path sent to `endpoint` names the same file the caller means.
+@dataclass(frozen=True)
+class ClusterTarget:
+    """A GKE cluster identified well enough to re-fetch credentials for it."""
 
-    Both path-valued fields in the request — `cwd` and `kubeconfig` — are
-    resolved by the server against its own filesystem. That was always safe
-    while the proxy was a sidecar. It is wrong the moment the caller is in
-    another pod: the sandbox's `/opt/data` is its own volume, and the server
-    would either reject the path for being outside its workspace or, worse,
-    open a same-named file of its own. So a cross-pod caller sends neither, and
-    the server falls back to its own workspace.
+    project: str
+    location: str
+    cluster: str
 
-    The cost is that `git` cannot be driven from another pod — the lease check
-    it runs is a statement about a directory the proxy can see, and there is no
-    such directory. See docs/designs/agent-shell-sandboxing.md, "The workspace
-    check".
+    @property
+    def context_name(self) -> str:
+        return f"gke_{self.project}_{self.location}_{self.cluster}"
+
+
+def parse_gke_context(context: str) -> ClusterTarget | None:
+    """Recover the cluster triple from a `gke_<project>_<location>_<cluster>` name.
+
+    This is the same convention the operator builds in `buildCredentialProxyEnv`
+    and the Cluster Agent preflight compares against, and it is what makes the
+    broker's regeneration possible: the context name alone says which cluster to
+    ask Google for. Underscores are the separator and none of the three
+    components may contain one, so a 4-way split is unambiguous.
+
+    Each component is held to the GKE naming rules, which is also what keeps the
+    value safe to use in a filename — no separators, no dots, no traversal, and
+    no newline, which `$` would have let through and `context_name` would then
+    have carried into a path and a log record.
     """
-    return (urllib.parse.urlsplit(endpoint).hostname or "") in LOOPBACK_HOSTS
+    parts = context.split("_", 3)
+    if len(parts) != 4 or parts[0] != "gke":
+        return None
+    project, location, cluster = parts[1], parts[2], parts[3]
+    if not all(
+        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (project, location, cluster)
+    ):
+        return None
+    return ClusterTarget(project=project, location=location, cluster=cluster)
+
+
+def read_current_context(text: str) -> str | None:
+    """Read `current-context` out of a kubeconfig the way kubectl would.
+
+    `yaml.safe_load`, deliberately, and never `yaml.CSafeLoader`. The C loader
+    recurses in C, so a deeply nested document exits on SIGSEGV where the
+    pure-Python loader raises a catchable `RecursionError`. `safe_load` picks
+    the Python loader on its own; the point of saying so is that switching it
+    would be a denial of service rather than an optimisation.
+
+    Alias expansion is not a concern here. PyYAML resolves every reference to an
+    anchor to the same node and caches the object built from it, so a
+    billion-laughs document costs memory proportional to its own size rather
+    than to its nominal expansion.
+
+    Anything else — a syntax error, several documents, a top level that is not a
+    mapping, a non-string `current-context` — reads as absent, and the caller
+    turns that into a rejection.
+    """
+    import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
+
+    try:
+        document = yaml.safe_load(text)
+    except (yaml.YAMLError, RecursionError):
+        return None
+    if not isinstance(document, dict):
+        return None
+    context = document.get("current-context")
+    if not isinstance(context, str):
+        return None
+    return context.strip() or None
+
+
+class KubeconfigUnreadable(RuntimeError):
+    """A kubeconfig was named, and no cluster name could be taken from it."""
+
+
+def kubeconfig_context(kubeconfig: str) -> str:
+    """The GKE context a local kubeconfig pins, to send in the file's place.
+
+    The broker is in another pod and cannot open this file. It also should not:
+    a kubeconfig is not passive data — `users[].user.exec.command` names a
+    program to run, `clusters[].cluster.server` and `proxy-url` choose where the
+    access token is sent, and `users[].user.tokenFile` reads a file of the
+    author's choosing and sends it as the bearer token. The agent writes this
+    file, so parsing it beside the credentials was the thing worth avoiding, and
+    the pod boundary now makes it impossible rather than merely discouraged.
+
+    What crosses instead is the one string the broker ever took from it. The
+    broker holds that string to `parse_gke_context` and regenerates every other
+    field with `gcloud container clusters get-credentials`, so naming a cluster
+    is all the authority this hands the caller — and `get-credentials` is bound
+    by the same IAM the broker already runs under.
+
+    Raises rather than returning None. A kubeconfig that cannot be read is a
+    request whose target cluster is unknown, and running it anyway means running
+    it against the broker's own default cluster: the wrong cluster, silently.
+    """
+    entries = [entry.strip() for entry in kubeconfig.split(os.pathsep) if entry.strip()]
+    if not entries:
+        raise KubeconfigUnreadable("KUBECONFIG is set but empty")
+    if len(entries) > 1:
+        raise KubeconfigUnreadable(
+            "KUBECONFIG must name a single file; merged lists are not supported"
+        )
+    candidate = Path(entries[0])
+    try:
+        if candidate.stat().st_size > MAX_KUBECONFIG_BYTES:
+            raise KubeconfigUnreadable(f"kubeconfig is implausibly large: {candidate}")
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise KubeconfigUnreadable(f"kubeconfig is unreadable: {candidate}: {exc}") from exc
+    context = read_current_context(text)
+    if not context:
+        raise KubeconfigUnreadable(f"kubeconfig names no current-context: {candidate}")
+    if parse_gke_context(context) is None:
+        raise KubeconfigUnreadable(
+            f"current-context {context!r} is not a GKE context name"
+            " (expected gke_<project>_<location>_<cluster>)"
+        )
+    return context
+
+
+def resolve_kubeconfig_flags(argv: list[str]) -> list[str]:
+    """Rewrite any `--kubeconfig <path>` in argv to the context that path pins.
+
+    The flag is the second door into cluster selection and beats the environment
+    in kubectl's own precedence, so it has to be translated here for the same
+    reason the environment is: the path names a file only this pod has. The
+    broker resolves whichever it receives through the same regeneration.
+    """
+    rewritten = list(argv)
+    for index, argument in enumerate(rewritten):
+        if argument == "--kubeconfig" and index + 1 < len(rewritten):
+            rewritten[index + 1] = kubeconfig_context(rewritten[index + 1])
+        elif argument.startswith("--kubeconfig="):
+            _, _, value = argument.partition("=")
+            rewritten[index] = f"--kubeconfig={kubeconfig_context(value)}"
+    return rewritten
+
+
+def is_get_credentials(argv: list[str]) -> bool:
+    """Is this the one command that legitimately authors a kubeconfig?
+
+    Matched on the subcommand sequence rather than on position, so global flags
+    may appear anywhere ahead of it.
+    """
+    if not argv or argv[0] != "gcloud":
+        return False
+    try:
+        index = argv.index("container")
+    except ValueError:
+        return False
+    return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
+
+
+def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None]:
+    """Take the `--kubeconfig` off a get-credentials argv, keeping where it pointed.
+
+    This one command writes a kubeconfig rather than reading one, so the flag
+    cannot be resolved to a context name — the file does not exist yet, and the
+    cluster it will name is in the rest of the argv. The path also cannot be
+    forwarded: it is a path in this pod, and gcloud runs in the broker's. So the
+    flag comes off, the broker returns the file it generated, and `execute`
+    writes it here.
+
+    Falls back to `$KUBECONFIG`, which is where a Cluster Agent profile's pin
+    lives when the caller did not name one.
+    """
+    stripped: list[str] = []
+    destination: str | None = None
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--kubeconfig" and index + 1 < len(argv):
+            destination = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith("--kubeconfig="):
+            destination = argument.split("=", 1)[1]
+            index += 1
+            continue
+        stripped.append(argument)
+        index += 1
+    if destination is None:
+        destination = os.environ.get("KUBECONFIG", "").strip() or None
+    return stripped, Path(destination) if destination else None
 
 
 def execute(
@@ -173,24 +347,39 @@ def execute(
     argv: list[str],
     stdin: str | None = None,
 ) -> int:
+    # No `cwd`. The broker resolves a path against its own filesystem, and it
+    # has no view of this one — so a directory sent from here would name either
+    # nothing or, worse, a same-named directory of the broker's. Every command
+    # runs at the broker's own workspace root instead.
+    #
+    # KUBECONFIG is the one thing an agent legitimately steers with a path:
+    # Cluster Agent profiles pin themselves to a target cluster through it (see
+    # agents/cluster/config.yaml). It survives the pod boundary by being
+    # resolved to a context name here rather than forwarded as a path.
+    # Whitespace is stripped because profile .env files routinely carry a
+    # trailing newline.
+    destination: Path | None = None
+    try:
+        context = ""
+        if is_get_credentials(argv):
+            argv, destination = get_credentials_destination(argv)
+        elif argv and argv[0] in KUBECONFIG_AWARE:
+            argv = resolve_kubeconfig_flags(argv)
+            kubeconfig = os.environ.get("KUBECONFIG", "").strip()
+            if kubeconfig:
+                context = kubeconfig_context(kubeconfig)
+    except KubeconfigUnreadable as exc:
+        print(f"credential proxy: {exc}", file=sys.stderr)
+        return 1
+
     request_payload = {
         "requestId": str(uuid.uuid4()),
         "argv": argv,
     }
-    local = shares_filesystem_with_proxy(endpoint)
-    if local:
-        request_payload["cwd"] = os.getcwd()
-    # The command runs in the proxy, so the caller's environment is not
-    # inherited. KUBECONFIG is the one variable an agent legitimately needs to
-    # steer: Cluster Agent profiles pin themselves to a target cluster with it
-    # (see agents/cluster/config.yaml). Forward the path and let the server
-    # decide whether it is acceptable — it only honours paths inside the shared
-    # workspace. Whitespace is stripped because profile .env files routinely
-    # carry a trailing newline.
-    if local and argv and argv[0] in KUBECONFIG_AWARE:
-        kubeconfig = os.environ.get("KUBECONFIG", "").strip()
-        if kubeconfig:
-            request_payload["kubeconfig"] = kubeconfig
+    if context:
+        request_payload["kubeconfigContext"] = context
+    if destination is not None:
+        request_payload["wantsKubeconfig"] = True
     if stdin is not None:
         request_payload["stdin"] = stdin
     body = json.dumps(
@@ -244,6 +433,19 @@ def execute(
     sys.stderr.write(payload.get("stderr", ""))
     if payload.get("truncated"):
         print("credential proxy output truncated", file=sys.stderr)
+    generated = payload.get("kubeconfig")
+    if destination is not None and generated:
+        # gcloud's own output, written where gcloud would have written it had it
+        # run here. The agent never runs a command against this file — a later
+        # kubectl names the cluster and the broker regenerates from that name —
+        # so this is the visible pin `cluster_agent_profile.py` records and the
+        # Cluster Agent preflight stats, and nothing more.
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(generated, encoding="utf-8")
+        except OSError as exc:
+            print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
+            return 1
     return int(payload.get("exitCode", 1))
 
 

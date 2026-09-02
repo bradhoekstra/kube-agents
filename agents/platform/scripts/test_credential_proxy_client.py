@@ -34,12 +34,24 @@ class RecordingResponse(io.BytesIO):
         return False
 
 
-class SubmittedPayloadTestCase(unittest.TestCase):
-    # A sidecar proxy. Whether the endpoint is loopback decides whether the
-    # client sends paths at all, so it is part of every case below.
-    LOCAL_ENDPOINT = "http://127.0.0.1:8765"
+# A well-formed GKE context name, which is the only thing the broker accepts.
+GKE_CONTEXT = "gke_acme-prod_us-central1_ka-cluster-a"
 
-    def send(self, argv, environ, endpoint=LOCAL_ENDPOINT):
+
+def write_kubeconfig(directory: Path, context: str = GKE_CONTEXT) -> Path:
+    path = directory / "kubeconfig.yaml"
+    path.write_text(
+        f"apiVersion: v1\nkind: Config\ncurrent-context: {context}\n", encoding="utf-8"
+    )
+    return path
+
+
+class SubmittedPayloadTestCase(unittest.TestCase):
+    # The broker's Service. There is no other endpoint: it is always a Pod of
+    # its own, so nothing the shim sends may name a path.
+    LOCAL_ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+
+    def send(self, argv, environ, endpoint=LOCAL_ENDPOINT, response=None):
         """Run the client against a stubbed proxy, returning the whole request.
 
         The stub replaces `open_broker_request` rather than `urlopen`: the
@@ -47,11 +59,12 @@ class SubmittedPayloadTestCase(unittest.TestCase):
         while the response is not.
         """
         captured = {}
+        body = {"exitCode": 0} if response is None else response
 
         def fake_open(request, *args, **kwargs):
             captured["request"] = request
             captured["payload"] = json.loads(request.data.decode("utf-8"))
-            return RecordingResponse(json.dumps({"exitCode": 0}).encode("utf-8"))
+            return RecordingResponse(json.dumps(body).encode("utf-8"))
 
         with patch.dict("os.environ", environ, clear=False):
             with patch.object(credential_proxy_client, "open_broker_request", fake_open):
@@ -64,81 +77,166 @@ class SubmittedPayloadTestCase(unittest.TestCase):
         return self.send(argv, environ, endpoint)["payload"]
 
 
-class TestKubeconfigForwarding(SubmittedPayloadTestCase):
-    PINNED = "/opt/data/profiles/cluster-a/kubeconfig.yaml"
+class TestKubeconfigResolution(SubmittedPayloadTestCase):
+    """The pin crosses as a cluster name, because the file itself cannot.
 
-    def test_kubectl_carries_the_pin(self):
-        # The whole point of the forward: a Cluster Agent's pinned kubeconfig
-        # has to reach the sidecar, which does not inherit the caller's env.
-        payload = self.submit(["kubectl", "get", "pods"], {"KUBECONFIG": self.PINNED})
-        self.assertEqual(payload["kubeconfig"], self.PINNED)
+    The broker is in another pod: a path sent from here names nothing there, or
+    something else. So the shim reads `current-context` out of the file it can
+    see and sends that, and the broker regenerates the kubeconfig from the name.
+    """
 
-    def test_gcloud_carries_the_pin(self):
-        # gcloud writes it: `container clusters get-credentials` renders the
-        # kubeconfig at $KUBECONFIG, which is how switch_kube_context works.
-        payload = self.submit(["gcloud", "container", "clusters", "get-credentials", "c"],
-                              {"KUBECONFIG": self.PINNED})
-        self.assertEqual(payload["kubeconfig"], self.PINNED)
+    def setUp(self):
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, ignore_errors=True)
+        self.pinned = write_kubeconfig(directory)
+
+    def test_kubectl_carries_the_context_and_never_the_path(self):
+        payload = self.submit(["kubectl", "get", "pods"], {"KUBECONFIG": str(self.pinned)})
+        self.assertEqual(payload["kubeconfigContext"], GKE_CONTEXT)
+        self.assertNotIn("kubeconfig", payload)
+
+    def test_the_flag_is_translated_too(self):
+        # kubectl prefers --kubeconfig over the environment, so a flag left as a
+        # path would be the door the environment no longer is.
+        payload = self.submit(
+            ["kubectl", "--kubeconfig", str(self.pinned), "get", "pods"], {}
+        )
+        self.assertEqual(payload["argv"][2], GKE_CONTEXT)
+        payload = self.submit([f"kubectl", f"--kubeconfig={self.pinned}", "get", "pods"], {})
+        self.assertEqual(payload["argv"][1], f"--kubeconfig={GKE_CONTEXT}")
+
+    def test_no_cwd_is_ever_sent(self):
+        # The other path-valued field, and gone for the same reason.
+        payload = self.submit(["kubectl", "get", "pods"], {})
+        self.assertNotIn("cwd", payload)
 
     def test_git_and_gh_do_not(self):
-        # Neither reads KUBECONFIG, and the server rejects an out-of-workspace
-        # path rather than ignoring it - so forwarding it here would 400 a
-        # command that has nothing to do with Kubernetes.
+        # Neither reads KUBECONFIG, and an unreadable one is now a hard failure
+        # - so resolving it here would refuse a command with nothing to do with
+        # Kubernetes.
         for argv in (["git", "status"], ["gh", "pr", "list"]):
             with self.subTest(argv=argv):
-                payload = self.submit(argv, {"KUBECONFIG": "/tmp/somewhere.yaml"})
-                self.assertNotIn("kubeconfig", payload)
+                payload = self.submit(argv, {"KUBECONFIG": "/nowhere/at/all.yaml"})
+                self.assertNotIn("kubeconfigContext", payload)
 
     def test_absent_when_unset(self):
         payload = self.submit(["kubectl", "get", "pods"], {"KUBECONFIG": ""})
-        self.assertNotIn("kubeconfig", payload)
+        self.assertNotIn("kubeconfigContext", payload)
 
     def test_trailing_newline_is_stripped(self):
-        # Profile .env files routinely carry one, and an unstripped value fails
-        # the server's containment check on a path that is actually fine.
-        payload = self.submit(["kubectl", "get", "pods"], {"KUBECONFIG": self.PINNED + "\n"})
-        self.assertEqual(payload["kubeconfig"], self.PINNED)
+        # Profile .env files routinely carry one, and an unstripped value is a
+        # path that does not exist.
+        payload = self.submit(
+            ["kubectl", "get", "pods"], {"KUBECONFIG": str(self.pinned) + "\n"}
+        )
+        self.assertEqual(payload["kubeconfigContext"], GKE_CONTEXT)
 
 
-class TestCrossPodCallerSendsNoPaths(SubmittedPayloadTestCase):
-    """A path only means something when both ends share a filesystem.
+class TestAnUnusablePinFailsLoudly(SubmittedPayloadTestCase):
+    """The alternative is a command that quietly runs against another cluster.
 
-    The sandbox calls the proxy over a Service, and its `/opt/data` is its own
-    volume. Sending either path field would have the server resolve it against
-    a filesystem where it names nothing, or something else.
+    Dropping an unreadable KUBECONFIG leaves the broker falling back to its own
+    default cluster, which is the failure nobody notices until it has written
+    something. Each of these exits 1 without sending a request at all.
     """
 
-    REMOTE_ENDPOINT = "http://agent-credential-proxy.kubeagents-system.svc.cluster.local:8765"
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
 
-    def test_no_cwd(self):
-        payload = self.submit(["kubectl", "get", "pods"], {}, endpoint=self.REMOTE_ENDPOINT)
-        self.assertNotIn("cwd", payload)
+    def assertRefused(self, kubeconfig):
+        captured = self.send(["kubectl", "get", "pods"], {"KUBECONFIG": kubeconfig})
+        self.assertEqual(captured["exit_code"], 1)
+        self.assertNotIn("payload", captured, "no request should have been sent")
 
-    def test_no_kubeconfig(self):
-        payload = self.submit(
-            ["kubectl", "get", "pods"],
-            {"KUBECONFIG": "/opt/data/profiles/cluster-a/kubeconfig.yaml"},
-            endpoint=self.REMOTE_ENDPOINT,
+    def test_a_missing_file(self):
+        self.assertRefused(str(self.directory / "absent.yaml"))
+
+    def test_a_kubeconfig_naming_no_context(self):
+        empty = self.directory / "empty.yaml"
+        empty.write_text("apiVersion: v1\nkind: Config\n", encoding="utf-8")
+        self.assertRefused(str(empty))
+
+    def test_a_context_that_is_not_a_gke_name(self):
+        # The broker can only regenerate a kubeconfig it can name a cluster
+        # from, so anything else is refused here rather than 400ed there.
+        self.assertRefused(str(write_kubeconfig(self.directory, "minikube")))
+
+    def test_a_merged_list(self):
+        # kubectl would flatten two files into one view and there is no sound
+        # way to regenerate a merge.
+        first = write_kubeconfig(self.directory)
+        self.assertRefused(f"{first}:{first}")
+
+
+class TestGetCredentialsWritesTheFileOnThisSide(SubmittedPayloadTestCase):
+    """The one command that authors a kubeconfig, across a pod boundary.
+
+    gcloud runs in the broker's pod and the destination is a path in this one,
+    so the flag comes off the argv, the broker returns what gcloud wrote, and
+    the shim puts it where the caller asked.
+    """
+
+    ARGV = ["gcloud", "container", "clusters", "get-credentials", "ka-cluster-a"]
+    GENERATED = f"apiVersion: v1\nkind: Config\ncurrent-context: {GKE_CONTEXT}\n"
+
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory, ignore_errors=True)
+        self.destination = self.directory / "profiles" / "cluster-a" / "kubeconfig.yaml"
+
+    def run_it(self, argv, environ):
+        return self.send(
+            argv,
+            environ,
+            response={"exitCode": 0, "kubeconfig": self.GENERATED},
         )
-        self.assertNotIn("kubeconfig", payload)
 
-    def test_a_sidecar_still_sends_its_cwd(self):
-        # The loopback case has to keep working: the workspace containment
-        # check and the git lease check are both driven by this field.
-        payload = self.submit(["kubectl", "get", "pods"], {})
-        self.assertIn("cwd", payload)
+    def test_the_flag_comes_off_and_the_file_lands_here(self):
+        captured = self.run_it([*self.ARGV, "--kubeconfig", str(self.destination)], {})
+        self.assertNotIn("--kubeconfig", captured["payload"]["argv"])
+        self.assertTrue(captured["payload"]["wantsKubeconfig"])
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), self.GENERATED)
+
+    def test_the_joined_spelling_too(self):
+        captured = self.run_it([*self.ARGV, f"--kubeconfig={self.destination}"], {})
+        self.assertEqual(
+            [token for token in captured["payload"]["argv"] if token.startswith("--kubeconfig")],
+            [],
+        )
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), self.GENERATED)
+
+    def test_the_environment_is_the_fallback_destination(self):
+        # How a Cluster Agent scaffold pins itself: no flag, just $KUBECONFIG.
+        self.run_it(self.ARGV, {"KUBECONFIG": str(self.destination)})
+        self.assertEqual(self.destination.read_text(encoding="utf-8"), self.GENERATED)
+
+    def test_no_destination_asks_for_nothing_back(self):
+        captured = self.send(self.ARGV, {"KUBECONFIG": ""})
+        self.assertNotIn("wantsKubeconfig", captured["payload"])
 
 
-class TestSharesFilesystemWithProxy(unittest.TestCase):
-    def test_loopback_hosts(self):
-        for endpoint in ("http://127.0.0.1:8765", "http://localhost:8765", "http://[::1]:8765"):
-            with self.subTest(endpoint=endpoint):
-                self.assertTrue(credential_proxy_client.shares_filesystem_with_proxy(endpoint))
+class TestContextGrammar(unittest.TestCase):
+    """The grammar both sides hold the name to, tested where it now lives."""
 
-    def test_a_service_name_is_not_loopback(self):
-        for endpoint in ("http://agent-credential-proxy:8765", "http://10.4.0.7:8765"):
-            with self.subTest(endpoint=endpoint):
-                self.assertFalse(credential_proxy_client.shares_filesystem_with_proxy(endpoint))
+    def test_a_gke_context_round_trips(self):
+        target = credential_proxy_client.parse_gke_context(GKE_CONTEXT)
+        self.assertEqual(target.project, "acme-prod")
+        self.assertEqual(target.location, "us-central1")
+        self.assertEqual(target.cluster, "ka-cluster-a")
+        self.assertEqual(target.context_name, GKE_CONTEXT)
+
+    def test_anything_else_is_refused(self):
+        for context in (
+            "minikube",
+            "gke_only_three",
+            "gke_proj_us-central1_cluster\nevil",
+            "gke_Proj_us-central1_cluster",
+            "gke__us-central1_cluster",
+            "gke_../etc_us-central1_cluster",
+        ):
+            with self.subTest(context=context):
+                self.assertIsNone(credential_proxy_client.parse_gke_context(context))
 
 
 class StdinGateTest(unittest.TestCase):

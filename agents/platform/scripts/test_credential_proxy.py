@@ -1394,7 +1394,11 @@ class CommandExecutorTest(unittest.TestCase):
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
-        """A kubeconfig where the agent can reach it — i.e. one to distrust."""
+        """A kubeconfig where the agent can reach it — i.e. one to distrust.
+
+        Nothing in the proxy opens this file; it exists so a test can plant one
+        and then show that naming it gets the request refused.
+        """
         path = executor.workspace_dir / name
         path.parent.mkdir(parents=True, exist_ok=True)
         if body is None:
@@ -1498,20 +1502,22 @@ class CommandExecutorTest(unittest.TestCase):
     def test_command_runs_against_the_proxy_copy_not_the_callers(self):
         executor = self.executor()
         managed = self.seed_managed(executor)
-        pinned = self.caller_kubeconfig(executor, name="profiles/cluster-a/kubeconfig.yaml")
 
-        resolved = executor._resolve_kubeconfig(str(pinned))
+        resolved = executor._resolve_kubeconfig(self.CONTEXT)
 
         self.assertEqual(managed, resolved)
         # The whole point: what kubectl opens is somewhere the agent cannot write.
         self.assertFalse(executor._within_workspace(resolved))
 
-    def test_hostile_kubeconfig_content_never_reaches_the_command(self):
-        # The escape this mechanism exists to close. Every field here is one the
-        # sidecar would otherwise act on: `exec.command` runs next to the
-        # credentials, `server` picks where the minted token is sent, and
-        # `insecure-skip-tls-verify` removes the obstacle to sending it there.
-        # None of it can be seen by the policy engine, whose rules match argv.
+    def test_a_path_is_not_a_context_name(self):
+        # The escape this mechanism exists to close. Every field in the planted
+        # document is one the proxy would otherwise act on: `exec.command` runs
+        # next to the credentials, `server` picks where the minted token is sent,
+        # and `insecure-skip-tls-verify` removes the obstacle to sending it
+        # there. None of it can be seen by the policy engine, whose rules match
+        # argv. The proxy never opens the file, so a request that names a path
+        # instead of a context is refused by the grammar before anything reads
+        # it — the caller's shim is what turns a file into a name.
         executor = self.executor()
         self.seed_managed(executor)
         hostile = self.caller_kubeconfig(
@@ -1534,26 +1540,22 @@ class CommandExecutorTest(unittest.TestCase):
             ),
         )
 
-        resolved = executor._resolve_kubeconfig(str(hostile))
-        contents = resolved.read_text(encoding="utf-8")
-
-        for trace in ("attacker.example.invalid", "/bin/sh", "insecure-skip-tls-verify"):
-            self.assertNotIn(trace, contents)
+        with self.assertRaisesRegex(ValueError, "not a GKE context name"):
+            executor._resolve_kubeconfig(str(hostile))
 
     def test_kubeconfig_flag_is_rerouted_as_well_as_the_environment(self):
         # `--kubeconfig` takes precedence over KUBECONFIG in kubectl and reaches
-        # the sidecar untouched — no policy rule mentions it. Rewriting only the
-        # environment would leave the flag as a way straight back to the
-        # caller's own file.
+        # the proxy untouched — no policy rule mentions it. Rewriting only the
+        # environment would leave the flag as a way straight back to a file the
+        # agent controls.
         executor = self.executor()
         managed = self.seed_managed(executor)
-        pinned = self.caller_kubeconfig(executor)
 
         joined, joined_path = executor._reroute_kubeconfig_flags(
-            ["kubectl", f"--kubeconfig={pinned}", "get", "pods"]
+            ["kubectl", f"--kubeconfig={self.CONTEXT}", "get", "pods"]
         )
         separate, separate_path = executor._reroute_kubeconfig_flags(
-            ["kubectl", "--kubeconfig", str(pinned), "get", "pods"]
+            ["kubectl", "--kubeconfig", self.CONTEXT, "get", "pods"]
         )
 
         self.assertEqual(["kubectl", f"--kubeconfig={managed}", "get", "pods"], joined)
@@ -1565,97 +1567,94 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(["kubectl", "get", "pods"], untouched)
         self.assertIsNone(no_path, "a request with no flag must not report one")
 
-    def test_kubeconfig_flag_outside_the_workspace_is_still_refused(self):
+    def test_a_flag_carrying_a_path_is_refused(self):
         executor = self.executor()
-        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
-            executor._reroute_kubeconfig_flags(["kubectl", "--kubeconfig=/etc/kubeconfig.yaml", "get", "pods"])
+        with self.assertRaisesRegex(ValueError, "not a GKE context name"):
+            executor._reroute_kubeconfig_flags(
+                ["kubectl", "--kubeconfig=/etc/kubeconfig.yaml", "get", "pods"]
+            )
 
     def test_kubeconfig_surrounding_whitespace_is_ignored(self):
-        # Profile .env files routinely carry a trailing newline; a path that
-        # only differs by whitespace must still resolve, not silently fail.
+        # Profile .env files routinely carry a trailing newline, and the shim
+        # forwards what it read; a name that only differs by whitespace must
+        # still resolve, not silently fail.
         executor = self.executor()
         managed = self.seed_managed(executor)
-        pinned = self.caller_kubeconfig(executor)
-        self.assertEqual(managed, executor._resolve_kubeconfig(f"  {pinned}\n"))
+        self.assertEqual(managed, executor._resolve_kubeconfig(f"  {self.CONTEXT}\n"))
 
     # ---- Failing closed ------------------------------------------------------
 
-    def test_rejects_kubeconfig_naming_no_current_context(self):
-        executor = self.executor()
-        pinned = self.caller_kubeconfig(executor, body="apiVersion: v1\nkind: Config\n")
-        with self.assertRaisesRegex(ValueError, "names no current-context"):
-            executor._resolve_kubeconfig(str(pinned))
-
-    def test_rejects_kubeconfig_whose_context_is_not_a_gke_name(self):
+    def test_rejects_a_context_that_is_not_a_gke_name(self):
         # Without a parseable triple there is no cluster to re-fetch, so there is
-        # no way to serve the request without trusting the caller's document.
+        # no way to serve the request at all: the name is the only thing the
+        # proxy has to go on.
         executor = self.executor()
-        pinned = self.caller_kubeconfig(executor, body="current-context: minikube\n")
         with self.assertRaisesRegex(ValueError, "not a GKE context name"):
-            executor._resolve_kubeconfig(str(pinned))
+            executor._resolve_kubeconfig("minikube")
 
-    def test_rejects_kubeconfig_outside_shared_workspace(self):
-        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
-            self.executor()._resolve_kubeconfig("/etc/kubeconfig.yaml")
-
-    def test_rejects_kubeconfig_escaping_the_workspace_by_traversal(self):
+    def test_rejects_a_context_name_that_could_traverse(self):
+        # The name becomes a filename under kubeconfig_dir, so a separator or a
+        # `..` component in it would be a write outside that directory.
         executor = self.executor()
-        escape = str(executor.workspace_dir / ".." / "home" / ".kube" / "config")
-        with self.assertRaisesRegex(ValueError, "outside the shared workspace"):
-            executor._resolve_kubeconfig(escape)
+        for hostile in (
+            "gke_..___..___etc",
+            "gke_demo-project_us-central1_../../etc/passwd",
+            f"{self.CONTEXT}/../../etc/passwd",
+            f"{self.CONTEXT}:/etc/kubeconfig.yaml",
+        ):
+            with self.subTest(context=hostile):
+                with self.assertRaisesRegex(ValueError, "not a GKE context name"):
+                    executor._resolve_kubeconfig(hostile)
 
-    def test_rejects_merged_kubeconfig_lists(self):
-        # kubectl would flatten these into one view; there is no meaningful way
-        # to regenerate a merge of documents that are never trusted.
-        executor = self.executor()
-        allowed = self.caller_kubeconfig(executor)
-        with self.assertRaisesRegex(ValueError, "single file"):
-            executor._resolve_kubeconfig(f"{allowed}:/etc/kubeconfig.yaml")
-
-    def test_rejects_an_implausibly_large_kubeconfig(self):
-        executor = self.executor()
-        pinned = self.caller_kubeconfig(executor, body="#" * (1 << 20) + "\n")
-        with self.assertRaisesRegex(ValueError, "implausibly large"):
-            executor._resolve_kubeconfig(str(pinned))
-
-    # ---- Fetching, and the visible pin --------------------------------------
+    # ---- Fetching, and the returned pin --------------------------------------
 
     def test_cache_miss_refetches_credentials_from_gcloud(self):
         executor = self.fake_gcloud(self.executor())
-        pinned = self.caller_kubeconfig(executor)
 
-        resolved = executor._resolve_kubeconfig(str(pinned))
+        resolved = executor._resolve_kubeconfig(self.CONTEXT)
 
         self.assertEqual(executor.kubeconfig_dir / f"{self.CONTEXT}.yaml", resolved)
         self.assertIn(self.CONTEXT, resolved.read_text(encoding="utf-8"))
         # Nothing is left behind from the fetch.
         self.assertEqual([resolved.name], sorted(p.name for p in executor.kubeconfig_dir.iterdir()))
 
-    def test_get_credentials_writes_both_the_managed_copy_and_the_visible_pin(self):
+    def test_get_credentials_returns_the_document_and_caches_it(self):
         # cluster_agent_profile.py and switch_kube_context both reach a cluster
-        # by running this first, so it is what warms the cache. The workspace
-        # copy has to appear too: the profile records that path and the Cluster
-        # Agent preflight stats it.
+        # by running this first, so it is what warms the cache. The caller also
+        # needs the file itself — the profile records a path and the Cluster
+        # Agent preflight stats it — and it comes back in the response, because
+        # the proxy cannot write into a volume it does not mount.
         executor = self.fake_gcloud(self.executor())
-        destination = executor.workspace_dir / "profiles" / "cluster-a" / "kubeconfig.yaml"
 
         result = executor.execute(
             ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
              "--location=us-central1", "--project=demo-project"],
-            kubeconfig=str(destination),
+            wants_kubeconfig=True,
         )
 
         self.assertEqual(0, result.exit_code)
-        self.assertIn(self.CONTEXT, destination.read_text(encoding="utf-8"))
+        self.assertIn(self.CONTEXT, result.kubeconfig)
         managed = executor.kubeconfig_dir / f"{self.CONTEXT}.yaml"
         self.assertIn(self.CONTEXT, managed.read_text(encoding="utf-8"))
 
-    def test_get_credentials_never_writes_through_the_callers_path(self):
-        # gcloud must not be handed the agent-writable path directly; if it were,
-        # the agent could swap the file between the write and the read that files
-        # it in the cache.
+    def test_get_credentials_returns_nothing_when_the_caller_did_not_ask(self):
+        # Only the shim knows whether a file is wanted, and a request that did
+        # not ask for one must not carry the document back across the boundary.
         executor = self.fake_gcloud(self.executor())
-        destination = executor.workspace_dir / "kubeconfig.yaml"
+
+        result = executor.execute(
+            ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+             "--location=us-central1", "--project=demo-project"],
+        )
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("", result.kubeconfig)
+
+    def test_get_credentials_never_writes_into_the_shared_workspace(self):
+        # gcloud must not be handed a path the agent can reach; if it were, the
+        # agent could swap the file between the write and the read that files it
+        # in the cache.
+        executor = self.fake_gcloud(self.executor())
         seen = []
         original = executor._execute
 
@@ -1667,7 +1666,7 @@ class CommandExecutorTest(unittest.TestCase):
             executor.execute(
                 ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
                  "--location=us-central1", "--project=demo-project"],
-                kubeconfig=str(destination),
+                wants_kubeconfig=True,
             )
 
         self.assertEqual(1, len(seen))
@@ -1680,7 +1679,6 @@ class CommandExecutorTest(unittest.TestCase):
         # on its own rather than reusing what the agent's get-credentials filed.
         # A DNS-only cluster has to survive that refetch.
         executor = self.fake_gcloud(self.executor())
-        pinned = self.caller_kubeconfig(executor)
         seen = []
         original = executor._execute
 
@@ -1692,7 +1690,7 @@ class CommandExecutorTest(unittest.TestCase):
             mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--dns-endpoint"]),
             mock.patch.object(executor, "_execute", record),
         ):
-            executor._resolve_kubeconfig(str(pinned))
+            executor._resolve_kubeconfig(self.CONTEXT)
 
         fetches = [argv for argv in seen if "get-credentials" in argv]
         self.assertEqual(1, len(fetches))
@@ -2866,7 +2864,9 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
             def git_lease_violation(self, argv, cwd):
                 return None
 
-            def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+            def execute(
+                self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            ):
                 owner.executed.append(argv)
                 return credential_proxy.ExecutionResult(
                     exit_code=0, stdout="", stderr="",
@@ -3436,7 +3436,9 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
             # one that logs the caller's cwd -- is actually reached.
             return "no lease" if argv and argv[0] == "git" else None
 
-        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+        def execute(
+            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+        ):
             return credential_proxy.ExecutionResult(
                 exit_code=0, stdout="", stderr="",
                 duration_ms=0, truncated=False, timed_out=False,
@@ -3553,7 +3555,9 @@ class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
         def git_lease_violation(self, argv, cwd):
             return None
 
-        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+        def execute(
+            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+        ):
             self.executed.append(argv)
             return credential_proxy.ExecutionResult(
                 exit_code=0, stdout="", stderr="",
@@ -4067,7 +4071,9 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
         def git_lease_violation(self, argv, cwd):
             return None
 
-        def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
+        def execute(
+            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+        ):
             self.executed.append(argv)
             return credential_proxy.ExecutionResult(
                 exit_code=0, stdout="", stderr="",
@@ -4335,16 +4341,13 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         executor.executables["kubectl"] = str(stub)
         return executor
 
-    def agent_kubeconfig(self, executor, cluster):
-        """The pin a Cluster Agent profile forwards: a name, not a credential."""
-        path = executor.workspace_dir / f"{cluster}-kubeconfig.yaml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            f"apiVersion: v1\nkind: Config\n"
-            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
-            encoding="utf-8",
-        )
-        return str(path)
+    def agent_context(self, cluster):
+        """The pin a Cluster Agent profile forwards: a name, not a credential.
+
+        The profile's kubeconfig stays in the agent's own pod; the shim reads
+        `current-context` out of it there and sends this string.
+        """
+        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
 
     def test_a_read_against_a_mapped_cluster_runs_on_that_cluster_s_account(self):
         """The ordinary read, and the assertion that it changed identity.
@@ -4356,7 +4359,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         executor = self.executor(self.pool())
         result = executor.execute(
             ["kubectl", "get", "pods"],
-            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+            kubeconfig_context=self.agent_context(self.MAPPED),
         )
         self.assertEqual(0, result.exit_code, result.stderr)
         self.assertIn("token: TOKEN-1", result.stdout)
@@ -4367,7 +4370,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         executor = self.executor(self.pool())
         result = executor.execute(
             ["kubectl", "get", "pods"],
-            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+            kubeconfig_context=self.agent_context(self.MAPPED),
         )
         self.assertNotIn("gke-gcloud-auth-plugin", result.stdout)
         self.assertNotIn("exec:", result.stdout)
@@ -4379,7 +4382,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         with self.assertRaises(scoped_sa_pool.PoolRefusal):
             executor.execute(
                 ["kubectl", "get", "pods"],
-                kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+                kubeconfig_context=self.agent_context(self.UNMAPPED),
             )
         self.assertEqual([], self.minted)
 
@@ -4401,7 +4404,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         with self.assertRaises(scoped_sa_pool.PoolRefusal):
             executor.execute(
                 ["kubectl", "get", "pods"],
-                kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+                kubeconfig_context=self.agent_context(self.UNMAPPED),
             )
         self.assertEqual(
             [],
@@ -4412,7 +4415,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
 
         executor.execute(
             ["kubectl", "get", "pods"],
-            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+            kubeconfig_context=self.agent_context(self.MAPPED),
         )
         self.assertEqual(
             [f"gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}"],
@@ -4469,7 +4472,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
             executor.execute(
                 [
                     "kubectl",
-                    f"--kubeconfig={self.agent_kubeconfig(executor, self.UNMAPPED)}",
+                    f"--kubeconfig={self.agent_context(self.UNMAPPED)}",
                     "get",
                     "pods",
                 ]
@@ -4492,7 +4495,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         result = executor.execute(
             [
                 "kubectl",
-                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                f"--kubeconfig={self.agent_context(self.MAPPED)}",
                 "get",
                 "pods",
             ]
@@ -4513,7 +4516,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         executor.execute(
             [
                 "kubectl",
-                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                f"--kubeconfig={self.agent_context(self.MAPPED)}",
                 "get",
                 "pods",
             ]
@@ -4538,11 +4541,11 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         result = executor.execute(
             [
                 "kubectl",
-                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                f"--kubeconfig={self.agent_context(self.MAPPED)}",
                 "get",
                 "pods",
             ],
-            kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+            kubeconfig_context=self.agent_context(self.UNMAPPED),
         )
         self.assertEqual(0, result.exit_code, result.stderr)
         self.assertEqual(
@@ -4564,7 +4567,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         executor = self.executor(self.pool())
         executor.execute(
             ["kubectl", "get", "pods"],
-            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+            kubeconfig_context=self.agent_context(self.MAPPED),
         )
         scoped = list(executor.kubeconfig_dir.glob("*.scoped.yaml"))
         self.assertEqual(1, len(scoped), f"expected one scoped kubeconfig, got {scoped}")
@@ -4579,7 +4582,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         executor = self.executor(None)
         result = executor.execute(
             ["kubectl", "get", "pods"],
-            kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+            kubeconfig_context=self.agent_context(self.UNMAPPED),
         )
         self.assertEqual(0, result.exit_code, result.stderr)
         self.assertIn("gke-gcloud-auth-plugin", result.stdout)
@@ -4597,7 +4600,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
         for cluster in (self.UNMAPPED, self.MAPPED):
             result = executor.execute(
                 ["gcloud", "logging", "read", "severity>=ERROR"],
-                kubeconfig=self.agent_kubeconfig(executor, cluster),
+                kubeconfig_context=self.agent_context(cluster),
             )
             self.assertEqual(0, result.exit_code, result.stderr)
         self.assertEqual([], self.minted)
@@ -4619,7 +4622,7 @@ class ScopedServiceAccountPathTest(unittest.TestCase):
             [
                 "git",
                 "status",
-                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                f"--kubeconfig={self.agent_context(self.MAPPED)}",
             ]
         )
         self.assertEqual([], self.minted)
@@ -4769,15 +4772,8 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
             else:
                 setattr(CredentialProxyHandler, name, value)
 
-    def kubeconfig_naming(self, cluster):
-        path = CredentialProxyHandler.executor.workspace_dir / f"{cluster}.yaml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            f"apiVersion: v1\nkind: Config\n"
-            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
-            encoding="utf-8",
-        )
-        return str(path)
+    def context_naming(self, cluster):
+        return f"gke_{self.PROJECT}_{self.LOCATION}_{cluster}"
 
     def post(self, body):
         request = urllib.request.Request(
@@ -4797,7 +4793,7 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
             {
                 "requestId": "r1",
                 "argv": ["kubectl", "get", "pods"],
-                "kubeconfig": self.kubeconfig_naming("nowhere-cluster"),
+                "kubeconfigContext": self.context_naming("nowhere-cluster"),
             }
         )
         self.assertEqual(403, status, body)
@@ -4807,12 +4803,25 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
             body.get("message", ""),
         )
 
-    # The vocabulary the /v1/exec handler reads out of the request body. Five
-    # keys, none of which names an identity. Pinned here because the test below
-    # used to be a denylist of seven field names I guessed an attacker might
-    # try, and a denylist that misses the actual key is worse than none: a hole
-    # reading `payload.get("context")` would have passed all 169 tests.
-    EXEC_BODY_KEYS = {"argv", "cwd", "kubeconfig", "requestId", "stdin"}
+    # The vocabulary the /v1/exec handler reads out of the request body. Six
+    # keys. Pinned here because the test below used to be a denylist of seven
+    # field names I guessed an attacker might try, and a denylist that misses
+    # the actual key is worse than none: a hole reading `payload.get("context")`
+    # would have passed all 169 tests.
+    #
+    # `kubeconfigContext` does name a cluster, and it is the one field that has
+    # to: the proxy holds no other way to know which of a fleet a request is
+    # for. It is safe because naming a cluster is not choosing an account —
+    # `scoped_sa_pool` maps the name to an account, and a name with no entry is
+    # the refusal below rather than a fallback to the wide one.
+    EXEC_BODY_KEYS = {
+        "argv",
+        "cwd",
+        "kubeconfigContext",
+        "requestId",
+        "stdin",
+        "wantsKubeconfig",
+    }
 
     def test_the_exec_handler_reads_no_field_this_test_has_not_seen(self):
         """The allowlist behind the denylist below, read off the handler itself.
@@ -4845,29 +4854,27 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
     def test_a_refusal_cannot_forge_a_log_record(self):
         """The refusal message carries a scope the agent wrote.
 
-        The scope key is built from `current-context` in a kubeconfig on the
-        shared volume, and it lands in a WARNING. Logged raw, a newline in that
-        value splits one record into two and the second one says whatever the
-        agent wanted it to say. The ValueError handler beside this one already
-        sanitises for exactly this reason.
+        The scope key is built from the context name in the request body, and it
+        lands in a WARNING. Logged raw, a newline in that value splits one
+        record into two and the second one says whatever the agent wanted it to
+        say. The ValueError handler beside this one already sanitises for
+        exactly this reason.
 
         The component regex now refuses a newline outright, so this is the
         second of the two locks: it stays true if someone loosens the pattern.
         """
-        # A YAML double-quoted scalar, so the \n is a real newline in the value
-        # the parser hands back rather than two characters in the file.
-        path = CredentialProxyHandler.executor.workspace_dir / "forged.yaml"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "apiVersion: v1\nkind: Config\n"
-            'current-context: "gke_kagents-dev_us-east4_nowhere\\n'
-            '2026-01-01 00:00:00 INFO credential-proxy all clear"\n',
-            encoding="utf-8",
+        forged = (
+            "gke_kagents-dev_us-east4_nowhere\n"
+            "2026-01-01 00:00:00 INFO credential-proxy all clear"
         )
 
         with self.assertLogs("credential-proxy", level="WARNING") as logs:
             status, body = self.post(
-                {"requestId": "r4", "argv": ["kubectl", "get", "pods"], "kubeconfig": str(path)}
+                {
+                    "requestId": "r4",
+                    "argv": ["kubectl", "get", "pods"],
+                    "kubeconfigContext": forged,
+                }
             )
         self.assertIn(status, (400, 403), body)
         for record in logs.output:
@@ -4938,7 +4945,7 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
                     {
                         "requestId": "r2",
                         "argv": ["kubectl", "get", "pods"],
-                        "kubeconfig": self.kubeconfig_naming("nowhere-cluster"),
+                        "kubeconfigContext": self.context_naming("nowhere-cluster"),
                         field: value,
                     }
                 )
@@ -4971,7 +4978,7 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
             {
                 "requestId": "r3",
                 "argv": ["kubectl", "get", "pods"],
-                "kubeconfig": self.kubeconfig_naming(self.MAPPED),
+                "kubeconfigContext": self.context_naming(self.MAPPED),
                 "serviceAccount": self.WIDE,
             }
         )
