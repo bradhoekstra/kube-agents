@@ -133,7 +133,6 @@ func buildAgentCredentialProxyTokenVolume() corev1.Volume {
 	}
 }
 
-
 // buildCredentialBrokerTokenReviewRole lets the broker verify the tokens its
 // callers present.
 //

@@ -196,7 +196,6 @@ func TestShellSandboxPresentsATokenTheBrokerWillAccept(t *testing.T) {
 	}
 }
 
-
 func TestShellSandboxRetainsItsVolumesOnDeleteAndScale(t *testing.T) {
 	// Hermes connects with StrictHostKeyChecking=accept-new and the host keys
 	// live on this volume, so a reclaimed claim is not a lost cache — it is every
