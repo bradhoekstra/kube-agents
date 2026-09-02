@@ -78,6 +78,15 @@ const (
 	// - https://github.com/cilium/cilium/issues/12277 (CIDR rules don't match node IPs without --policy-cidr-match-mode=nodes)
 	metadataDaemonIP = "169.254.169.252"
 
+	// How long applyShellSandboxStatefulSet waits for an orphan-propagation
+	// delete to finish before giving the reconcile back. Orphan collection is
+	// a finalizer removal on one object, so it lands in milliseconds; the
+	// budget is for an overloaded garbage collector, not for the normal case,
+	// and expiry requeues rather than fails the recreation.
+	shellSandboxDeleteTimeout = 5 * time.Second
+	// The gap between reads while that wait runs.
+	shellSandboxDeletePollInterval = 100 * time.Millisecond
+
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
@@ -1119,7 +1128,9 @@ func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context,
 // that already has a sandbox — and take the rest of the agent's reconcile with
 // it. Deleting with Orphan propagation leaves the pod and its claims running and
 // the replacement adopts the pod by selector, so the shell stays up across the
-// swap and the sandbox's disk is never at risk.
+// swap and the sandbox's disk is never at risk. awaitStatefulSetGone is what
+// makes the re-apply a creation rather than another update of the object that
+// is on its way out.
 func (r *PlatformAgentReconciler) applyShellSandboxStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
 	err := r.applyManaged(ctx, agent, obj)
 	if !errors.IsInvalid(err) {
@@ -1137,7 +1148,48 @@ func (r *PlatformAgentReconciler) applyShellSandboxStatefulSet(ctx context.Conte
 	if delErr := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &orphan}); client.IgnoreNotFound(delErr) != nil {
 		return fmt.Errorf("failed to delete the sandbox StatefulSet for recreation: %w", delErr)
 	}
+	if err := r.awaitStatefulSetGone(ctx, client.ObjectKeyFromObject(obj)); err != nil {
+		return err
+	}
 	return r.applyManaged(ctx, agent, obj)
+}
+
+// awaitStatefulSetGone blocks until a deleted StatefulSet has left the API
+// server, or the budget above runs out.
+//
+// Delete returns once the object is marked, not once it is gone: orphan
+// propagation puts the `orphan` finalizer on it and the garbage collector
+// clears the ownerReferences off the pod and the claims before removing that
+// finalizer. Applying the replacement inside that window addresses the object
+// that is still terminating, so it is validated against the immutable fields
+// the recreation exists to change and comes back Invalid a second time — and on
+// the runs where it does not, the collector deletes what the apply just wrote
+// and the agent has no sandbox until some later reconcile happens to find the
+// name free.
+//
+// Running out of budget is not a failure of the recreation, only of doing it in
+// this pass: the error requeues, the delete has already been accepted, and the
+// next reconcile finds the name free and applies. Say that in the message, so
+// the log line does not read as an agent stuck without a shell.
+func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key client.ObjectKey) error {
+	deadline := time.Now().Add(shellSandboxDeleteTimeout)
+	for {
+		err := r.Get(ctx, key, &appsv1.StatefulSet{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read the sandbox StatefulSet %s/%s while waiting for its deletion: %w", key.Namespace, key.Name, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the sandbox StatefulSet %s/%s is still terminating %s after it was deleted for recreation; retrying on the next reconcile", key.Namespace, key.Name, shellSandboxDeleteTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(shellSandboxDeletePollInterval):
+		}
+	}
 }
 
 // reconcileCredentialProxy creates the broker's own pod: the Deployment that runs
