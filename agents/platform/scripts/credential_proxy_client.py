@@ -570,7 +570,9 @@ class Workspace:
         Returns what came back and what did not, the second as the broker's own
         `{path, reason}` records. A caller that ignores the second half will
         materialise a partial tree and not know it -- `requestBudget` means ask
-        again for the rest, and `tooLarge` means that file is never coming.
+        again for the rest, `tooLarge` means that file is never coming, and
+        `symlink` means the file is there but the broker will not follow a link
+        to it, so ask for the target's own name.
         """
         result = _workspace_call(
             self.endpoint, "read", {"handle": self.handle, "paths": list(paths)}

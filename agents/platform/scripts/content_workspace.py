@@ -56,6 +56,7 @@ read-then-act on a tree another verb may delete or reset underneath it.
 from __future__ import annotations
 
 import base64
+import bisect
 import logging
 import os
 import re
@@ -849,7 +850,12 @@ class ContentWorkspaceStore:
                 try:
                     target = _no_symlink_on_the_way(workspace.tree, relative)
                 except PathRefused:
-                    skipped.append({"path": name, "reason": "notAFile"})
+                    # Its own reason, because it is its own situation. The file
+                    # is there and the broker will not follow the link to it, so
+                    # a caller told `notAFile` looks for a name it already has
+                    # right -- and `list` handed it that name. `symlink` is the
+                    # one skip a caller can act on by naming the link's target.
+                    skipped.append({"path": name, "reason": "symlink"})
                     continue
                 if not target.is_file():
                     skipped.append({"path": name, "reason": "notAFile"})
@@ -899,9 +905,7 @@ class ContentWorkspaceStore:
             workspace = self.get(handle)
             under = repo_relative(prefix).parts if prefix else ()
             cursor = str(repo_relative(after)) if after else ""
-            entries: list[dict] = []
-            total = 0
-            names: list[tuple[str, int]] = []
+            names: list[str] = []
             for path in workspace.tree.rglob("*"):
                 if not path.is_file() or path.is_symlink():
                     continue
@@ -911,16 +915,24 @@ class ContentWorkspaceStore:
                     continue
                 if under and parts[: len(under)] != under:
                     continue
-                names.append((str(PurePosixPath(*parts)), path.stat().st_size))
+                names.append(str(PurePosixPath(*parts)))
             # Sorted on the name this answers with rather than on the `Path`,
             # because the cursor is compared against that name and an order the
             # caller cannot reproduce is a cursor that skips or repeats a page.
-            for name, size in sorted(names):
-                if cursor and name <= cursor:
-                    continue
-                total += 1
-                if len(entries) < max_entries():
-                    entries.append({"path": name, "size": size})
+            names.sort()
+            # The cursor is located rather than scanned past, and only the
+            # page's own files are stat'd. Walking the tree again is what a
+            # page costs -- the repository can have changed between calls, so
+            # there is nothing here to cache -- but sizing every file in it and
+            # discarding all but a page's worth is a cost paid once per page,
+            # and a caller paging a large repository pays it on every one.
+            start = bisect.bisect_right(names, cursor) if cursor else 0
+            page = names[start : start + max_entries()]
+            entries = [
+                {"path": name, "size": (workspace.tree / name).stat().st_size}
+                for name in page
+            ]
+            total = len(names) - start
             return {
                 "entries": entries,
                 "total": total,

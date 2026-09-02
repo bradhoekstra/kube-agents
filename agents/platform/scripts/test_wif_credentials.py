@@ -181,6 +181,58 @@ class IdentityTokenTest(unittest.TestCase):
         key_file.write_text(json.dumps({"type": "service_account"}), encoding="utf-8")
         self.assertIsNone(self.fetch([], GOOGLE_APPLICATION_CREDENTIALS=str(key_file)))
 
+    def test_an_external_account_these_legs_cannot_drive_is_declined(self):
+        """Not every external_account is the one this module writes.
+
+        The test above establishes that a hand-placed credential is honoured, so
+        the shapes that arrive that way have to be answered. Direct-access
+        federation carries no impersonation URL, and credential_source may name
+        a `url` or an `executable` rather than a `file`. Both are valid
+        credentials and neither can drive the two legs here, so the answer is
+        the same None an unfederated identity gets -- the caller then falls
+        through to gcloud. Raising KeyError instead would take down a GitHub
+        token refresh that had a working route to the metadata server.
+        """
+        shapes = {
+            "direct access, no impersonation": {
+                "type": "external_account",
+                "audience": AUDIENCE,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": wif_credentials.STS_TOKEN_URL,
+                "credential_source": {"file": str(self.token)},
+            },
+            "a url credential_source": {
+                "type": "external_account",
+                "audience": AUDIENCE,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": wif_credentials.STS_TOKEN_URL,
+                "service_account_impersonation_url": wif_credentials.IMPERSONATION_URL.format(
+                    email=SERVICE_ACCOUNT
+                ),
+                "credential_source": {"url": "http://169.254.169.254/token"},
+            },
+            "no credential_source at all": {
+                "type": "external_account",
+                "audience": AUDIENCE,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+                "token_url": wif_credentials.STS_TOKEN_URL,
+                "service_account_impersonation_url": wif_credentials.IMPERSONATION_URL.format(
+                    email=SERVICE_ACCOUNT
+                ),
+            },
+        }
+        for label, document in shapes.items():
+            with self.subTest(shape=label):
+                self.posted = []
+                path = self.root / "hand-placed.json"
+                path.write_text(json.dumps(document), encoding="utf-8")
+                self.assertIsNone(
+                    self.fetch([], GOOGLE_APPLICATION_CREDENTIALS=str(path))
+                )
+                # Declined before the network, so nothing was exchanged on the
+                # way to finding out.
+                self.assertEqual([], self.posted)
+
     def test_it_reads_the_credential_the_rest_of_the_container_uses(self):
         # gcloud's override and google-auth's variable, not just the one this
         # module writes -- a caller under a hand-placed credential should see the

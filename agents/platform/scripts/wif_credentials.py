@@ -44,6 +44,9 @@ ID_TOKEN_URL = (
     "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/{email}:generateIdToken"
 )
 CLOUD_PLATFORM_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+# The segment of an impersonation URL that the service account's email follows.
+# fetch_identity_token splits on it to recover that email.
+IMPERSONATION_PATH = "/serviceAccounts/"
 
 # How long an STS or IAM call may take. Both are Google endpoints reached over
 # the pod's own network, so a call that has not answered by now is a broken
@@ -169,15 +172,34 @@ def fetch_identity_token(audience: str, path: str = "") -> str | None:
     one the metadata server presented. No broker-side configuration changes when
     an install moves the proxy into the sandbox pod.
 
-    Returns None when the credential is not an external_account document, which
-    leaves the caller on its existing path.
+    Returns None when the credential is not an external_account document, or is
+    one of the external_account shapes these two legs cannot drive, which leaves
+    the caller on its existing path.
     """
     document = load_document(path)
     if document is None:
         return None
 
-    email = document["service_account_impersonation_url"].split("/serviceAccounts/", 1)[1].split(":", 1)[0]
-    with open(document["credential_source"]["file"], encoding="utf-8") as handle:
+    # Not every external_account carries these. Direct-access federation omits
+    # the impersonation URL, and credential_source may name a `url` or an
+    # `executable` instead of a `file`. Both are valid credentials, and
+    # load_document reads GOOGLE_APPLICATION_CREDENTIALS precisely so a
+    # hand-placed one is honoured -- so reaching either is a configuration this
+    # path cannot drive, not a bug. Decline the way an unfederated identity is
+    # declined and let the caller fall through to gcloud, rather than raising
+    # KeyError out of a function whose contract is to return None. `audience`,
+    # `token_url` and `subject_token_type` below are indexed directly because
+    # the schema requires them of every external_account.
+    impersonation = document.get("service_account_impersonation_url")
+    source = document.get("credential_source")
+    source_file = source.get("file") if isinstance(source, dict) else None
+    if not isinstance(impersonation, str) or IMPERSONATION_PATH not in impersonation:
+        return None
+    if not isinstance(source_file, str) or not source_file:
+        return None
+
+    email = impersonation.split(IMPERSONATION_PATH, 1)[1].split(":", 1)[0]
+    with open(source_file, encoding="utf-8") as handle:
         subject_token = handle.read().strip()
 
     federated = _post(

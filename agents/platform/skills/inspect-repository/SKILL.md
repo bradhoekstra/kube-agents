@@ -70,7 +70,9 @@ when you are done** — an open handle holds a clone on the broker's volume.
   means you are looking at part of a repository. "The repository does not
   contain X" is not a claim a truncated result supports.
 - **Read `skipped`.** `tooLarge` means that file is never coming through this
-  route; `requestBudget` means ask again for the rest.
+  route; `requestBudget` means ask again for the rest; `symlink` means the file
+  is there and the broker will not follow a link to it, so name the target
+  instead; `notAFile` means no such tracked file.
 - **Do not run `git` against what lands.** There is no repository there, on
   purpose.
 - **Say which repository and which ref** in anything you report, and treat a

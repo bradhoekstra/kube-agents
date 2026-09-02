@@ -1364,6 +1364,47 @@ class ReadVerbCeilingTest(unittest.TestCase):
             base64.b64decode(answer["files"][0]["contentBase64"]),
         )
 
+    def test_a_link_the_broker_will_not_follow_says_so(self):
+        """A symlink is not a missing file, and the skip has to say which.
+
+        The caller only ever names what `list` and `grep` returned, so both of
+        these are names the repository itself supplied. Told `notAFile` about
+        one of them, a reader concludes the name is wrong and goes looking for
+        the right one -- there isn't one. `symlink` is the only skip reason it
+        can act on: ask for the target under its own name.
+        """
+        link = self.workspace.tree / "manifests" / "vendored.yaml"
+        link.symlink_to(self.workspace.tree / "manifests" / "0.yaml")
+
+        answer = self.store.read_many(
+            self.handle(), ["manifests/vendored.yaml", "manifests/absent.yaml"]
+        )
+        self.assertEqual([], answer["files"])
+        self.assertEqual(
+            [("manifests/vendored.yaml", "symlink"), ("manifests/absent.yaml", "notAFile")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # A directory on the way is the same refusal, and reports the same way:
+        # nothing here is a claim about the leaf alone.
+        (self.workspace.tree / "vendor").mkdir()
+        (self.workspace.tree / "vendor" / "app.yaml").write_text("kind: Pod\n")
+        (self.workspace.tree / "manifests" / "vendor").symlink_to(
+            self.workspace.tree / "vendor"
+        )
+        answer = self.store.read_many(self.handle(), ["manifests/vendor/app.yaml"])
+        self.assertEqual(
+            [("manifests/vendor/app.yaml", "symlink")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # Paired ordinary use: the target under its own name is served, which is
+        # what the reason is telling the caller to do.
+        self.assertEqual(
+            ["vendor/app.yaml"],
+            [f["path"] for f in self.store.read_many(self.handle(), ["vendor/app.yaml"])["files"]],
+        )
+
     def test_a_batch_read_refuses_the_whole_request_for_one_bad_path(self):
         """`.git/config` in the last entry does not get the others answered.
 
@@ -1423,6 +1464,18 @@ class ReadVerbCeilingTest(unittest.TestCase):
             )
             self.assertEqual(["manifests/4.yaml"], [e["path"] for e in last["entries"]])
             self.assertFalse(last["truncated"])
+
+            # A cursor need not name a file that is still there. The page
+            # before named it and the tree can have moved on, so `after` is a
+            # position in the order rather than a lookup: a name that has gone
+            # resumes where it would have been instead of restarting the
+            # listing or returning nothing.
+            resumed = self.store.list(self.handle(), after="manifests/2a.yaml")
+            self.assertEqual(
+                ["manifests/3.yaml", "manifests/4.yaml"],
+                [e["path"] for e in resumed["entries"]],
+            )
+            self.assertEqual(2, resumed["total"])
 
         # Paired ordinary use: under the ceiling one page is the whole answer
         # and it does not claim to be truncated.
