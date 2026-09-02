@@ -755,10 +755,14 @@ each of them.
 **The shell no longer inherits the broker's egress.** A NetworkPolicy applies to a pod, so
 while the two shared one, the rules that let the broker reach STS, IAM, the Kubernetes API
 and `github-token-minter` let the model's shell reach them too, and there was no way to
-narrow that inside a shared network namespace. Separate pods get separate policies. The
-sandbox's is the narrow one; `buildShellSandboxNetworkPolicy` still excludes RFC1918 space
-and `169.254.169.254/32` from its `0.0.0.0/0:443` rule, so a widened egress rule cannot
-become in-cluster reach.
+narrow that inside a shared network namespace. Separate pods get separate policies, and
+the sandbox's is the narrow one: `buildShellSandboxNetworkPolicy` opens three holes and no
+others — sshd ingress from the gateway, DNS egress, and the broker Service on
+`credentialProxyPort`. There is no `0.0.0.0/0:443` rule, because the shell has nothing to
+say to the internet directly. The wrappers reach the broker, and the broker is what talks
+to STS, IAM and GitHub. Anything that later needs outbound 443 in this pod is a new hole
+and should be argued for as one, with the RFC1918 and `169.254.169.254/32` exclusions the
+gateway's rule carries.
 
 **The two workloads no longer have to agree on a uid.** Sharing a working tree meant
 sharing a user, which is why `shareProcessNamespace: false` had to be pinned rather than
@@ -844,12 +848,12 @@ Four objects per agent, all owned by the `PlatformAgent` CR so they are garbage
 collected with it, built in
 [`shell_sandbox_manifests.go`](../../k8s-operator/internal/controller/shell_sandbox_manifests.go).
 
-| Object                       | Named           | What it is for                                                               |
-| ---------------------------- | --------------- | ---------------------------------------------------------------------------- |
-| `StatefulSet`, `replicas: 1` | `<agent>-shell` | the pod, and the `data` and `sshd` volumeClaimTemplates behind it            |
-| `Service`, `clusterIP: None` | `<agent>-shell` | the StatefulSet's governing service, and the name Hermes dials               |
-| `ServiceAccount`             | `<agent>-shell` | no annotations at all — the unbound identity the whole pod runs as           |
-| `NetworkPolicy`              | `<agent>-shell` | ingress on 2222 from the gateway only; egress to DNS, and to 443 off-cluster |
+| Object                       | Named           | What it is for                                                              |
+| ---------------------------- | --------------- | --------------------------------------------------------------------------- |
+| `StatefulSet`, `replicas: 1` | `<agent>-shell` | the pod, and the `data` and `sshd` volumeClaimTemplates behind it           |
+| `Service`, `clusterIP: None` | `<agent>-shell` | the StatefulSet's governing service, and the name Hermes dials              |
+| `ServiceAccount`             | `<agent>-shell` | no annotations at all — the unbound identity the whole pod runs as          |
+| `NetworkPolicy`              | `<agent>-shell` | ingress on 2222 from the gateway only; egress to DNS and to the broker only |
 
 Five fields carry an argument rather than a default:
 
@@ -878,10 +882,35 @@ Five fields carry an argument rather than a default:
 The ServiceAccount is the pod's identity and not a credential: it carries no annotation,
 so the metadata server answers every container in the pod with a principal IAM grants
 nothing, and `automountServiceAccountToken` is false on both the ServiceAccount and the
-pod. Notably absent from this pod is any Role, any projected token, and any Secret other
-than the public half of the agent's SSH key — the broker's credentials are in the broker's
-own pod, which this one reaches only over HTTP. If a future change needs one of those in
-the sandbox, that is the boundary moving, and it should be argued for here first.
+pod. Absent from this pod is any Role, any Secret other than the public half of the
+agent's SSH key, and any credential that spends anything — the broker's credentials are in
+the broker's own pod, which this one reaches over HTTP.
+
+**One projected token is mounted here, and it is the exception this paragraph asked to be
+argued for.** Moving the broker out of the pod took loopback away as the thing that
+decided who may spend the agent's credentials, and something had to replace it: the broker
+now authenticates its callers, so a caller needs something to present. That is an
+audience-bound projected ServiceAccount token at `credentialProxyTokenMountPath`, minted
+for `credentialProxyAudience` and mounted into the shell container mode 0444 because uid
+1000 reads it.
+
+What makes it admissible is the audience. The API server rejects a token minted for one
+audience when it is presented to another, so this token is not a Kubernetes credential:
+it cannot list pods, read Secrets, or do anything at all except say "I am the sandbox" to
+the broker. It does not undo `automountServiceAccountToken: false`, which is about the
+Kubernetes API, and it authorises nothing on its own — what the sandbox may ask the broker
+to do is still the broker's policy. The same projection is mounted into the gateway's
+`platform-agent` container for the same reason.
+
+The honest cost is that a token file now exists in the pod running model-authored code,
+so a prompt injection can read it and make broker calls as the sandbox. That is the
+capability the sandbox already has by construction — it is the pod whose whole job is
+running commands through the broker — so the token grants the model nothing it could not
+already reach through the shim. It does not put a raw cloud or GitHub credential in reach,
+which is the property this design exists to hold.
+
+Anything beyond this one token — a Role, a Secret, a second audience — is the boundary
+moving again, and should be argued for here the way this one is.
 
 ### Running the sandbox under gVisor
 
@@ -2454,12 +2483,12 @@ gVisor](#running-the-sandbox-under-gvisor) for what the setting is and is not.
 Agent Sandbox ships a default GKE policy blocking egress to RFC1918, cluster DNS and
 the metadata server. Not taking the CRD means not inheriting that default either, so
 the equivalent is ours to write: deny by default, with holes punched only for cluster
-DNS, 443 off-cluster, the agent pod's SSH ingress on 2222, and the broker's Service. That
-last hole is what the split adds: the shim reaches the broker over the cluster network
-rather than loopback, so the sandbox's egress policy has to name it. The broker's own pod
-needs 443 for its calls to STS, IAM and the Google APIs, and it gets that separately —
-which is the point, because the sandbox's 443 rule no longer has to be as wide as the
-broker's.
+DNS, the agent pod's SSH ingress on 2222, and the broker's Service. That last hole is
+what the split adds: the shim reaches the broker over the cluster network rather than
+loopback, so the sandbox's egress policy has to name it. The split is also what lets the
+list stop there. The broker's own pod needs 443 for its calls to STS, IAM and the Google
+APIs and gets that under its own policy; while the two shared a pod, the shell was inside
+whatever the broker needed. Off-cluster 443 is not on the sandbox's list at all.
 
 Note that a GKE Standard cluster does **not enforce** NetworkPolicy unless network policy
 or Dataplane V2 is turned on (`addonsConfig.networkPolicyConfig.disabled: true` is the
