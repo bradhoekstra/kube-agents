@@ -1244,21 +1244,29 @@ directories. Nothing about it is ordered against the sandbox starting: the Deplo
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
-**Two of its failures hold the agent pod down and the rest do not**, which is a distinction
-the exit codes carry rather than a judgement the entrypoint makes. A `--remote-root` that is
-not the sandbox's volume and a copy that ran and failed both leave the model's files
-stranded on the agent pod where its shell cannot see them, and coming up healthy in that
-state is the outcome the mirror exists to prevent — so those exit `EXIT_FATAL` and the
-container refuses to start, which `getDeploymentStatusDetails` surfaces as a Degraded CR
-naming this container. Everything else exits `EXIT_RETRY`: the entrypoint warns and the
-agent starts. That split is load-bearing rather than tidy. Everything under the sandbox's
-`/opt/data` is owned by uid 1000, so the model decides what the layout push finds there,
-and while any non-zero exit was fatal a single `touch /opt/data/scratch` from a sandbox
-shell was a permanent `CrashLoopBackOff` — nothing on either side cleared it, and the agent
-could not repair what had to be running to be asked. The push now moves a non-directory
-aside to `<name>.displaced-<stamp>` and carries on; the sandbox's own entrypoint does the
-same for a home root, where `install -d` had the identical problem and no pod left to exec
-into.
+**One of its failures holds the agent pod down and the rest do not**, which is a distinction
+the exit codes carry rather than a judgement the entrypoint makes. A copy that ran and
+failed can have moved the model's files off the agent pod's volume without landing them on
+the sandbox's, and coming up healthy in that state is the outcome the mirror exists to
+prevent — so it exits `EXIT_FATAL`, the container refuses to start, and
+`getDeploymentStatusDetails` surfaces a Degraded CR naming this container. Everything else
+exits `EXIT_RETRY`: the entrypoint warns and the agent starts.
+
+The dividing line is who can provoke the failure, not how bad it looks. Everything under
+the sandbox's `/opt/data` is owned by uid 1000 and the volume outlives the pod, so the model
+decides what the next root-run start finds there — and while any non-zero exit was fatal, a
+single `touch /opt/data/scratch` or `rm -f /opt/data/.sandbox` from a sandbox shell was a
+permanent `CrashLoopBackOff` on the gateway. Nothing on either side cleared it, and the
+agent could not repair what had to be running to be asked. Nothing has been copied at either
+of those points, so nothing is lost by coming up without them and retrying next start.
+
+Both sides also stop being wedged by the state itself rather than only by the exit code. A
+non-directory on a skeleton path is moved to `<name>.displaced-<stamp>` and the directory
+recreated; the sandbox's own entrypoint does the same for a home root, where `install -d`
+exits 71 with no pod left to exec into, and the narrower inverse for `/opt/data/.sandbox`,
+which has to be a regular file and where a planted directory would fail the marker write
+with `EISDIR`. Renamed rather than deleted in every case: it is broken state either way, but
+it is the model's own byte.
 
 **The migration is the same mechanism run once.** An install that upgrades into the
 sandbox has files on the agent pod's PVC that the model will look for and not find —
@@ -2151,10 +2159,18 @@ expires. mTLS is the fix and is not deployed.
 ### The relay path
 
 `GOOGLE_CHAT_RELAY_URL` and `SLACK_RELAY_URL` both point at the proxy Service rather than
-`127.0.0.1` — the relay listener moved with the broker, so both follow it — and the gateway
-needs no new ingress rule for either. Both Google Chat directions are gateway-initiated
-pulls against `/v1/chat/events` on the relay, so moving the relay out of the gateway pod
-does not reverse the direction of any connection.
+`127.0.0.1` — the relay listener moved with the broker, so both follow it. Both Google Chat
+directions are gateway-initiated pulls against `/v1/chat/events` on the relay, so moving the
+relay out of the gateway pod does not reverse the direction of any connection and the
+gateway needs no new ingress rule for either.
+
+It needs an egress one, which is a different sentence and was the easier half to miss. A
+loopback call crosses no NetworkPolicy; this one does, so rule 12 of `buildNetworkPolicy`
+reaches the broker's pod selector on `credentialProxyPort` and
+`buildCredentialProxyNetworkPolicy` admits the gateway there. Written one-sided, both
+policies still read as though they permitted the call and an enforcing dataplane drops
+every chat pull while the pods stay Running and the CR reads Ready — which is rule 11's
+lesson about the sandbox's sshd, arriving a second time by the same route.
 
 ### The workspace check, and why the `cwd` stopped being sent
 
