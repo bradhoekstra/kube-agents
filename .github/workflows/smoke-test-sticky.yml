@@ -54,7 +54,7 @@ jobs:
     # is the reference, this expression is what keeps the other statuses off a
     # runner.
     if: >-
-      github.repository == 'gke-labs/kube-agents' &&
+      github.repository == 'bradhoekstra/kube-agents' &&
       (github.event_name == 'push' ||
         (github.event.context == 'pull-kube-agents-smoke-test' &&
           github.event.state == 'success' &&
