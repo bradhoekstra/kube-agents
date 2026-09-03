@@ -203,8 +203,11 @@ path.
 The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS`
 (`command_policy.py:277-363`) admits `container clusters list` and `projects list` but no `asset`
 command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
-refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2,
-with the resolver that needs it.
+refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2, with the resolver that needs it,
+and so is adding `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
+flag it does not know the arity of before it matches the command path, so a verb whose flags are
+not listed is admitted and unreachable at once, which the set's own comment records as having
+happened to `logging read`.
 
 **Every project gets an outcome, and no outcome is silent.** For an explicit project the outcome
 comes from its `clusters list`. For a project reached through a container, Asset Inventory has
@@ -404,7 +407,7 @@ works. Each is listed with whether it blocks the first phase or follows it.
 | Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                                                                                                                                                                          | 2     |
 | `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                                                                                                                       | "sweeps the project"                                                                                                                                                                                                                                            | docs  |
 | `docs/site/src/content/docs/reference/security-and-iam.md:84`                                                                                                                                                                                                                    | "an IAM role grants privileges across all clusters in the project" becomes "in the scope"                                                                                                                                                                       | docs  |
-| `docs/site/src/content/docs/reference/credential-isolation.md:218`                                                                                                                                                                                                               | Describes the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; phase 1 because the override retires with `RECONCILE_EXCLUDE`                                                                                 | 1     |
+| `docs/site/src/content/docs/reference/credential-isolation.md:218`, `k8s-operator/api/v1alpha1/common_types.go:708` (rendered into both CRD YAMLs)                                                                                                                               | Describe the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; phase 1 because the override retires with `RECONCILE_EXCLUDE`                                                                                  | 1     |
 | `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80`, `agents/platform/governance/inventory.md:70`, `agents/chat/scripts/bootstrap_scan_gate.py:331` | Name `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; becomes `spec.scope.exclude.clusters`. Phase 1 rather than docs because the variable is deprecated in that release and these pages must point at the triple before it goes | 1     |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
@@ -459,7 +462,7 @@ into a second project the tester controls.
    project from the event or the profile identity rather than one environment value; the
    `RECONCILE_EXCLUDE` mentions §8 lists point at the new field. This is the smallest change that
    manages two projects from one install.
-2. **Folders and organisations.** Asset Inventory resolution and its allowlist entry;
+2. **Folders and organisations.** Asset Inventory resolution, its allowlist entry, and its two value flags;
    `cloudasset.googleapis.com` in the composition's API list; container outcomes and the freeze
    rule; folder- and organisation-level bindings of `scope_roles` plus `roles/cloudasset.viewer`;
    the installer preflight for container IAM permissions; `via` and `containers` in the snapshot.
