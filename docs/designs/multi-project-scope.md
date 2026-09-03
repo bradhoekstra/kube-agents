@@ -61,7 +61,7 @@ bash provisioning scripts. The provisioning scripts were replaced by Terraform i
 branch was open; a force-push then dropped the IAM code without porting it, and the branch was
 closed on 2026-08-28 with a comment that `main` handles multi-project IAM and reconciliation
 natively through Terraform and Helm. It does not: the IAM module above takes one project, and no
-reconciler reads more than one. Epic #618 still lists multi-project onboarding as its open phase 3.
+reconciler reads more than one. Epic #618 filed multi-project onboarding as its phase 3 and pointed it at #588.
 #953 (the agent cannot route a request that does not name a cluster) and #1126 (the broker's read
 allowlist withholds discovery reads a leaf read needs) are the same problem seen from the agent's
 side: the fleet it can enumerate is narrower than the fleet it is asked about.
@@ -78,13 +78,13 @@ Cluster Agent is named, stored, or driven:
 - PRUNE works per stamped identity, not per resolved project: `_cluster_exists`
   (`cluster_agent_reconcile.py:135-163`) runs `describe --project=<identity.project>`, so a profile
   for a cluster in another project is verified against the right project today.
-- `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:235-241`).
+- `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:235-243`).
 - The credential broker passes `--project` through as a value-taking flag
   (`agents/platform/scripts/command_policy.py:378`), takes the project from the kubeconfig context
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project
   (`:2496`). It does not pin a project. Only IAM stops a cross-project call.
-- The scoped service account pool is already keyed on a per-row project. `scoped_clusters` in
-  `terraform/modules/kube-agents-iam/variables.tf:71-101` is a list of
+- The scoped service account pool is already keyed on a per-row project. `scoped_clusters`
+  (`terraform/modules/kube-agents-iam/variables.tf:71` onward) is a list of
   `{project_id, location, cluster_name}` objects, with the comment that "a cluster in another
   project is a row in this list rather than a second module"; the CRD mirror is
   `spec.security.scopedServiceAccounts[]` (`k8s-operator/api/v1alpha1/common_types.go:498-540`),
@@ -121,25 +121,29 @@ spec:
 
 Rules:
 
-- **Empty scope means today's behaviour.** A scope is set when at least one of `projects`,
+- **Empty scope means today's behaviour.** Selectors are set when at least one of `projects`,
   `folders`, or `organizations` is non-empty. No `spec.scope`, `spec.scope: {}`, and a scope with
-  only `exclude` populated are all unset, and resolve to the management project alone, found the
-  way `_project()` finds it now.
+  only `exclude` populated all resolve to the management project alone, found the way `_project()`
+  finds it now. Rendering is a separate question from resolution: the operator renders the scope
+  file whenever any list in `spec.scope` is non-empty, `exclude` included, so an install that
+  migrates only its exclusions still gets them applied.
 - **The management project is always in scope.** It cannot be excluded, because the management
   cluster's own alerts need a profile to be delegated to (the reasoning in
   `cluster_agent_reconcile.py:17-27` still holds).
 - **Selectors union; exclusions subtract afterwards.** A project reached through a folder and named
   explicitly appears once. An excluded project is dropped whether it was reached through a list or a
   container.
-- **`exclude.clusters` names one cluster, not one name.** Entries are the `{projectId, location,
-clusterName}` triple `scopedServiceAccounts` already uses, because cluster names are unique only
-  within a project and location; `prod` and `cluster-1` recur across a folder, and an exclusion
-  prunes, so a bare name would delete a namesake's profile in another project. `RECONCILE_EXCLUDE`
-  keeps its bare-name, management-project-only meaning for one release, and nothing an operator
-  relies on today is dropped by adding a scope: the script applies the union of the file's
-  `exclude.clusters` and the variable's names (each name qualified to the management project) for
-  that release, logs every exclusion that came from the variable so the operator can move it, and
-  the variable is then removed. This matters because the security page tells an operator on a
+- **`exclude.clusters` names one cluster, not one name.** Entries are the triple of `projectId`,
+  `location`, and `clusterName` that `scopedServiceAccounts` already uses, because cluster names
+  are unique only within a project and location; `prod` and `cluster-1` recur across a folder, and
+  an exclusion prunes. `RECONCILE_EXCLUDE` is project-blind today: `cluster_agent_reconcile.py`
+  compares the bare name against every stamped profile on the PVC (`:266`, `:296`), so a
+  hand-onboarded cross-project namesake is already pruned by it. That is today's behaviour, not a
+  hypothetical, and it is what the triple replaces. The variable keeps that project-blind meaning
+  for one release, and nothing an operator relies on today is dropped by adding a scope: the script
+  applies the union of the file's `exclude.clusters` and the variable's bare names for that
+  release, logs every exclusion that came from the variable so the operator can move it to the
+  triple, and the variable is then removed. This matters because the security page tells an operator on a
   `custom` role set to exclude the management cluster by that variable; a scope that silently
   ended the exclusion would recreate the one profile they were told to prevent. The places that
   name the variable as the opt-out (§8) change with it.
@@ -372,17 +376,17 @@ and unclassified errors leave profiles untouched.
 Discovery and IAM are the mechanism; these are the places that will read wrong once the mechanism
 works. Each is listed with whether it blocks the first phase or follows it.
 
-| Where                                                                                                                                                                                                                                                                            | What it assumes                                                                                                     | Phase |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----- |
-| `agents/platform/scripts/session_kv_server.py:1155`                                                                                                                                                                                                                              | `GCP_PROJECT_ID` is the project for every event's console links                                                     | 1     |
-| `agents/platform/scripts/platform_mcp_server.py:275-300`                                                                                                                                                                                                                         | `get_project_id()` reads one `project:` line from `USER.md`                                                         | 1     |
-| `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                                                                                                                        | Delegation needs `--project` from the requester; #953 already asks for enumeration first                            | 1     |
-| `terraform/modules/drift-pubsub`                                                                                                                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs need a sink each into the host topic                   | 2     |
-| Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                              | 2     |
-| `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                                                                                                                       | "sweeps the project"                                                                                                | docs  |
-| `docs/site/src/content/docs/reference/security-and-iam.md:84`                                                                                                                                                                                                                    | "an IAM role grants privileges across all clusters in the project" becomes "in the scope"                           | docs  |
-| `docs/site/src/content/docs/reference/credential-isolation.md:218`                                                                                                                                                                                                               | Describes the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project    | docs  |
-| `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80`, `agents/platform/governance/inventory.md:70`, `agents/chat/scripts/bootstrap_scan_gate.py:331` | Name `RECONCILE_EXCLUDE`, a bare cluster name in one project, as the opt-out; becomes `spec.scope.exclude.clusters` | 1     |
+| Where                                                                                                                                                                                                                                                                            | What it assumes                                                                                                                                                                                     | Phase |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `agents/platform/scripts/session_kv_server.py:1155`                                                                                                                                                                                                                              | `GCP_PROJECT_ID` is the project for every event's console links                                                                                                                                     | 1     |
+| `agents/platform/scripts/platform_mcp_server.py:275-300`                                                                                                                                                                                                                         | `get_project_id()` reads one `project:` line from `USER.md`                                                                                                                                         | 1     |
+| `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                                                                                                                        | Delegation needs `--project` from the requester; #953 already asks for enumeration first                                                                                                            | 1     |
+| `terraform/modules/drift-pubsub`                                                                                                                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs need a sink each into the host topic                                                                                                   | 2     |
+| Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                                                                                                              | 2     |
+| `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                                                                                                                       | "sweeps the project"                                                                                                                                                                                | docs  |
+| `docs/site/src/content/docs/reference/security-and-iam.md:84`                                                                                                                                                                                                                    | "an IAM role grants privileges across all clusters in the project" becomes "in the scope"                                                                                                           | docs  |
+| `docs/site/src/content/docs/reference/credential-isolation.md:218`                                                                                                                                                                                                               | Describes the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project                                                                                    | docs  |
+| `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80`, `agents/platform/governance/inventory.md:70`, `agents/chat/scripts/bootstrap_scan_gate.py:331` | Name `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; becomes `spec.scope.exclude.clusters`. Phase 1 rather than docs because the variable's meaning changes with it | 1     |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
 profile's kubeconfig and already labels every metric with `project` and `location`, so Kubernetes
@@ -425,7 +429,7 @@ Each step is shippable alone and live-testable on a shared install by granting i
 into a second project the tester controls.
 
 1. **Explicit projects.** `spec.scope.projects` and `spec.scope.exclude` on the CRD; the operator
-   renders the scope file when `spec.scope` is set; `cluster_agent_reconcile.py` iterates the list,
+   renders the scope file whenever any `spec.scope` list is non-empty; `cluster_agent_reconcile.py` iterates the list,
    applies the three-condition prune, and writes `fleet_scope.json` with per-project outcomes and
    `unmanaged` and `retiring` entries; `kube-agents-iam` binds `scope_roles` per explicit project;
    the bootstrap
