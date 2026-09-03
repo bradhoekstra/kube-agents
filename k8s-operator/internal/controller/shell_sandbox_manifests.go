@@ -18,12 +18,13 @@ limitations under the License.
 // run in once Hermes' `ssh` terminal backend is turned on. Design and rationale
 // live in docs/designs/agent-shell-sandboxing.md; the image is deploy/sandbox/.
 //
-// Reconciled only when spec.harness.experimental.shellSandbox.enabled is true, which
-// no install sets by default. It stays experimental until #737 Part C gives the
-// credential proxy an address of its own (see the credentialProxyURL parameter
-// below): without it the sandbox has no credential path at all, so kubectl, gcloud,
-// gh and git report that they are unconfigured. That is a usable state for testing
-// the file and code-execution tools and not one to ship an agent in.
+// Reconciled on every install. spec.harness.experimental.shellSandbox is a block of
+// overrides now, not a switch: `enabled: false` is refused with
+// Degraded/ShellSandboxCannotBeDisabled (validateShellSandbox below), because the
+// agent image ships no kubectl, gcloud, gh or git and this pod is the only place a
+// command can run. The credential proxy it reaches for those credentials has an
+// address of its own — see the credentialProxyURL parameter below and
+// credential_proxy_manifests.go.
 //
 // On the name: "sandbox" already means something else here. The agent's own
 // container is the credential-isolation sandbox — see buildSandboxCredentialCleanup
@@ -235,6 +236,27 @@ func shellSandboxSpec(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ShellSa
 
 // reasonShellSandboxCannotBeDisabled refuses spec.harness.experimental.shellSandbox.enabled: false.
 const reasonShellSandboxCannotBeDisabled = "ShellSandboxCannotBeDisabled"
+
+// reasonShellSandboxKeysMissing names an install whose authorized-keys Secret was
+// never created.
+const reasonShellSandboxKeysMissing = "ShellSandboxKeysMissing"
+
+// shellSandboxKeysMissingMessage explains an absent authorized-keys Secret and
+// names the fix for each install surface.
+//
+// Worth a condition of its own because the symptom is unreadable: the volume is
+// not optional, so kubelet leaves the pod in ContainerCreating indefinitely and
+// says why only in a FailedMount event on the pod — not on the StatefulSet, and
+// not anywhere in the PlatformAgent an operator is looking at. Every install
+// surface generates the pair (see docs/designs/agent-shell-sandboxing.md#key-management),
+// so reaching this means a bare `helm install` that supplied none.
+func shellSandboxKeysMissingMessage(secretName string) string {
+	return fmt.Sprintf("Secret '%s' does not exist, so the shell sandbox pod cannot start and no command "+
+		"the agent runs will execute. The chart renders it from the SANDBOX_SSH_PUBLIC_KEY entry in "+
+		"platform-agent-secrets; a bare `helm install` that supplies no keypair renders nothing. Run "+
+		"`upgrade.sh`, which generates the pair into that Secret, or pass both halves as "+
+		"platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY and .SANDBOX_SSH_PUBLIC_KEY.", secretName)
+}
 
 // validateShellSandbox refuses a CR that asks for the sandbox to be off,
 // returning a Degraded reason and message, or "" when the CR is acceptable.

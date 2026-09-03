@@ -398,10 +398,24 @@ func TestAPluginCannotDisableCallerAuthentication(t *testing.T) {
 	}
 }
 
+// shellSandboxKeysSecret is the authorized-keys Secret every install surface
+// generates, as a fixture. A reconcile that cannot find it reports
+// Degraded/ShellSandboxKeysMissing, so a test about anything else has to seed it
+// or it is testing a broken install.
+func shellSandboxKeysSecret(agent *agentv1alpha1.PlatformAgent) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      shellSandboxAuthorizedKeysSecretName(agent),
+			Namespace: agent.Namespace,
+		},
+		StringData: map[string]string{"authorized_keys": "ssh-ed25519 AAAAC3Nz test@fixture"},
+	}
+}
+
 func newSplitReconciler(t *testing.T, agent *agentv1alpha1.PlatformAgent, objects ...client.Object) (*PlatformAgentReconciler, client.Client) {
 	t.Helper()
 	scheme := setupScheme()
-	all := append([]client.Object{agent}, objects...)
+	all := append([]client.Object{agent, shellSandboxKeysSecret(agent)}, objects...)
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(all...).
@@ -568,6 +582,68 @@ func TestReconcileRefusesADisabledSandboxBeforeRenderingAnything(t *testing.T) {
 	} {
 		if err := cl.Get(ctx, client.ObjectKeyFromObject(object), object); !errors.IsNotFound(err) {
 			t.Errorf("a refused spec must render no %T %s, got %v", object, object.GetName(), err)
+		}
+	}
+}
+
+// TestAMissingSandboxKeypairIsReportedRatherThanRendered covers the install that
+// supplied no keypair. The pod then sits in ContainerCreating on a mount error
+// kubelet reports only as an event on the pod, so the CR is where an operator
+// has to be able to read it.
+//
+// Everything is still rendered, unlike the refusals above: the StatefulSet is
+// wanted in place so the pod starts by itself once the Secret appears, and the
+// gateway is wanted so the operator can be told what is wrong over chat.
+func TestAMissingSandboxKeypairIsReportedRatherThanRendered(t *testing.T) {
+	agent := brokerPodAgent()
+	scheme := setupScheme()
+	// Not newSplitReconciler, which seeds the Secret this test is about.
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(ssaApplyInterceptor()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("a missing Secret is a Degraded status, not a reconcile error: %v", err)
+	}
+	// Secrets are not watched, so nothing wakes this reconcile when one is
+	// created. Without the requeue the agent stays Degraded after the fix.
+	if result.RequeueAfter == 0 {
+		t.Error("expected a requeue: creating the Secret is not an event this controller sees")
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("re-reading the agent failed: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
+	}
+	ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if ready == nil || ready.Reason != reasonShellSandboxKeysMissing {
+		t.Fatalf("expected Ready=False/%s, got %+v", reasonShellSandboxKeysMissing, ready)
+	}
+	// The message is the whole value of the condition, so it has to name the
+	// object that is missing and a way to create it.
+	for _, want := range []string{"test-agent-shell-authorized-keys", "SANDBOX_SSH_PUBLIC_KEY", "upgrade.sh"} {
+		if !strings.Contains(ready.Message, want) {
+			t.Errorf("the message must mention %q; got %q", want, ready.Message)
+		}
+	}
+
+	for _, object := range []client.Object{
+		&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-shell", Namespace: "test-ns"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-gateway", Namespace: "test-ns"}},
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns"}},
+	} {
+		if err := cl.Get(ctx, client.ObjectKeyFromObject(object), object); err != nil {
+			t.Errorf("a missing keypair must withhold nothing; %T %s: %v", object, object.GetName(), err)
 		}
 	}
 }

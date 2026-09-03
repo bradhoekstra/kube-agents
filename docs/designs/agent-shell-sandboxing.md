@@ -1002,7 +1002,11 @@ use:
 So the path that installs production — the Terraform composition the installer
 drives — gets a keypair with nothing typed. Helm's `credentials.create` accepts a supplied
 pair and renders the sandbox's Secret from it, but generates nothing; absent a key it
-renders no Secret and the sandbox stays unusable. Adding a post-install hook `Job` to
+renders no Secret and the sandbox stays unusable. The operator reports that state as
+`Degraded`/`ShellSandboxKeysMissing` rather than leaving it to be inferred: the volume
+is not optional, so kubelet parks the pod in `ContainerCreating` and names the missing
+Secret only in an event on the pod — nowhere an operator reading the `PlatformAgent`
+will find it. Adding a post-install hook `Job` to
 close that gap would mean a ServiceAccount with write access to the credential
 Secret, which is a worse trade than the gap. It is also consistent with what
 [`values.yaml`](../../charts/kube-agents/values.yaml) already says about the flag:

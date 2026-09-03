@@ -627,7 +627,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, rc).
+		WithObjects(agent, shellSandboxKeysSecret(agent), rc).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -732,7 +732,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, rc, pod).
+		WithObjects(agent, shellSandboxKeysSecret(agent), rc, pod).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -808,7 +808,7 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -883,7 +883,7 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -1613,7 +1613,7 @@ func TestPlatformAgentReconciler_Reconcile_EventWatcherDisabledCondition(t *test
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -1756,7 +1756,7 @@ func TestPlatformAgentReconciler_Reconcile_EventWatcherMessageIsRefreshed(t *tes
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -4529,7 +4529,7 @@ func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()

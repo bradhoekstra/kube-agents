@@ -433,6 +433,25 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	// 13. Report an install whose sandbox keypair was never generated.
+	//
+	// Last, below every reconcile step, because unlike the refusals above it this
+	// one withholds nothing: everything is already applied, and the StatefulSet is
+	// wanted in place so the pod starts on its own the moment the Secret appears.
+	// What is withheld is the Ready status, which would otherwise be the only
+	// thing an operator sees while no command the agent runs can execute.
+	//
+	// Requeued rather than watched. Secrets are not in this controller's watch
+	// set, and adding them for one check would wake every reconcile on every
+	// Secret write in the namespace.
+	if reason, msg := r.checkShellSandboxKeys(ctx, instance); reason != "" {
+		log.Info(msg)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -2114,6 +2133,21 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	}
 
 	return phase, reason, message
+}
+
+// checkShellSandboxKeys returns a Degraded reason and message when the Secret the
+// sandbox mounts its authorized_keys from does not exist, or "" when it does.
+//
+// A read error other than NotFound returns "" as well. This runs after every object
+// is applied and its only job is to phrase a status; an API blip must not turn a
+// healthy agent Degraded on a claim this function could not check.
+func (r *PlatformAgentReconciler) checkShellSandboxKeys(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
+	name := shellSandboxAuthorizedKeysSecretName(agent)
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, &corev1.Secret{})
+	if err == nil || !errors.IsNotFound(err) {
+		return "", ""
+	}
+	return reasonShellSandboxKeysMissing, shellSandboxKeysMissingMessage(name)
 }
 
 // validateRuntimeClass returns the name it could not resolve alongside the
