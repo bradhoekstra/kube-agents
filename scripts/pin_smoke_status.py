@@ -22,9 +22,9 @@ It is best-effort against Tide's own clock. Tide syncs about once a minute,
 and a sync that sees the stale statuses before the sweep has re-pinned them
 starts the retest -- as a batch, when two or more pull requests qualify --
 and crier's `pending` is then the newer word, which this leaves alone. So the
-sweep is kept short (no dependencies, one read per open pull request), takes
-the pull requests Tide is actually waiting on first, and is still a race that
-is sometimes lost. Two merges seconds apart start two sweeps with no ordering
+sweep is kept short (no dependencies, one read per open pull request plus the
+head of `main` before each write), takes the pull requests Tide is actually
+waiting on first, and is still a race that is sometimes lost. Two merges seconds apart start two sweeps with no ordering
 between them, so a pin is always made to the head of `main` as read just
 before the write, never to the head the run started with.
 

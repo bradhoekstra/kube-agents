@@ -292,8 +292,9 @@ waiting on it.
 `/hold` parks an otherwise-mergeable pull request without withdrawing anything else, and
 `/hold cancel` releases it — #1045 held that way for a smoke test. `/override <context>`, which only
 a repository admin can use, forces a required check that cannot pass on its own — and expires: the
-forced status embeds the base SHA at override time, so the next merge to `main` invalidates it and
-Tide re-runs the job, so an override has to be repeated if `main` moves before Tide merges (#1202).
+forced status embeds the base SHA at override time, so the next merge to `main` invalidates it,
+Tide re-runs the job, and the override has to be repeated if `main` moves before Tide merges
+(#1202).
 Prow's `/override-sticky` would write the `[prow:skip-retest]` sentinel instead, which Tide accepts
 regardless of base — but it is not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
@@ -326,7 +327,7 @@ gh api repos/gke-labs/kube-agents/branches/main/protection \
 against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status
 — so on its own every merge to `main` would invalidate every other pull request's green
 `pull-kube-agents-smoke-test` and re-run the whole job for a pull request whose head has not
-changed. [`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix
+changed (#1179, #1202). [`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix
 to the new head of `main` — for every open pull request against `main` on each push to `main`, and
 for one commit when its green arrives after `main` has already moved — with a note in the
 description saying so, and Tide reads the result as current. It is a race against Tide's roughly
@@ -339,8 +340,8 @@ reports (`/retest` does not, because it reruns only failed contexts); a red is n
 neither is an admin `/override`. What this trades away is testing the combination with the `main`
 it lands on before the merge; until a scheduled eval run on `main` exists, a bad combination is
 found by the next pull request's run. Prow's own form of this — a `[prow:skip-retest]` sentinel
-written by `/override-sticky` — is upstream since mid-2026 and not in the Prow build this
-repository merges through; `scripts/pin_smoke_status.py` says when to switch.
+written by `/override-sticky` — is upstream but not in the Prow build this repository merges
+through; `scripts/pin_smoke_status.py` says when to switch.
 
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
