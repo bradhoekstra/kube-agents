@@ -1,0 +1,92 @@
+name: Smoke Test Sticky Status
+
+# Keep a green `pull-kube-agents-smoke-test` result valid when `main` moves.
+#
+# Tide credits a presubmit only against the base SHA it ran on, which crier
+# records as a `BaseSHA:<sha>` suffix on the commit status. Every merge to
+# `main` therefore turns every other pull request's green smoke run stale, and
+# the 1.5-3.5h job runs again for a pull request whose head has not changed
+# (#1179, #1202). `scripts/pin_smoke_status.py` re-pins that suffix to the new
+# head of `main` -- for every open pull request on each push to `main`, and for
+# one commit when its green arrives after `main` has already moved -- so a pull
+# request green at its own head merges without a fresh-base retest. What that
+# gives up is testing the combination with the `main` it lands on before the
+# merge; until a scheduled eval run on `main` exists, a bad combination is
+# found by the next pull request's run. docs/pull-request-workflow.md "How a
+# change merges" owns that statement; the script's docstring says why this is
+# a BaseSHA pin and not Prow's `[prow:skip-retest]` sentinel, and when to swap.
+#
+# What it does NOT change: a push creates a new head with no status, so the
+# job runs as before; `/test pull-kube-agents-smoke-test` on the same head
+# posts `pending`, which is newer and wins (`/retest` does not -- it reruns
+# only failed contexts); a red is never touched, and neither is an admin
+# `/override`.
+#
+# A status created with GITHUB_TOKEN does not fire `status` again, so the
+# re-post cannot loop; a push to `main` is only ever Tide's merge.
+
+on:
+  status:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+# One run at a time: a sweep after a merge and a pin from a status event may
+# reach the same commit, and the second must read what the first wrote.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  pin:
+    name: Pin green smoke-test statuses to the head of main
+    # The repository guard is required of any credentialed workflow that starts
+    # on its own (AGENTS.md, Pull Request Hygiene). A push to main always
+    # sweeps; a status event qualifies only when it is the smoke test, green,
+    # and not an admin override -- the script checks the same things again and
+    # is the reference, this expression is what keeps the other statuses off a
+    # runner.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      (github.event_name == 'push' ||
+        (github.event.context == 'pull-kube-agents-smoke-test' &&
+          github.event.state == 'success' &&
+          !startsWith(github.event.description, 'Overridden by')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the default branch: the script
+      statuses: write # re-post the smoke-test status on pull request heads
+    steps:
+      # The default branch, never a pull request head: this job holds a
+      # writable token and must not run code from a fork.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      # On a push GITHUB_SHA is the new head of main. Nothing else from the
+      # event is needed.
+      - name: Re-pin every open pull request after the merge
+        if: github.event_name == 'push'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/pin_smoke_status.py sweep --main-sha "$GITHUB_SHA"
+
+      # Event fields go in through the environment, never into the script
+      # text: the description is free text written by another app. The script
+      # resolves the head of main itself and re-posts only if this status is
+      # still the latest on its context.
+      - name: Re-pin this commit's green if main has already moved
+        if: github.event_name == 'status'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATUS_ID: ${{ github.event.id }}
+          SHA: ${{ github.event.sha }}
+        run: python3 scripts/pin_smoke_status.py status --sha "$SHA" --status-id "$STATUS_ID"

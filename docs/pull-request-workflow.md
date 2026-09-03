@@ -315,6 +315,25 @@ gh api repos/gke-labs/kube-agents/branches/main/protection \
   --jq '.required_status_checks.contexts'
 ```
 
+**A green smoke run stays valid when `main` moves.** Tide credits a Prow presubmit only against
+the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status — so on
+its own every merge to `main` would invalidate every other pull request's green
+`pull-kube-agents-smoke-test` and re-run the 1.5–3.5 h job for a pull request whose head has not
+changed. [`smoke-test-sticky.yml`](../.github/workflows/smoke-test-sticky.yml) re-pins that suffix
+to the new head of `main` — for every open pull request on each push to `main`, and for one commit
+when its green arrives after `main` has already moved — with a note in the description saying so,
+and Tide reads the result as current. A pull request green at its own head therefore merges
+without a fresh-base retest: one pull request per Tide sync, about a minute apart, once no batch
+is in flight (Tide lets a running batch finish before it merges anything else). A push still
+starts a fresh run; `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which is
+newer and wins until that run reports (`/retest` does not, because it reruns only failed
+contexts); a red is never touched, and neither is an admin `/override`. What this trades away is
+testing the combination with the `main` it lands on before the merge; until a scheduled eval run
+on `main` exists, a bad combination is found by the next pull request's run. Prow's own form of
+this — a `[prow:skip-retest]` sentinel written by `/override-sticky` — is upstream since July 2026
+and not in the Prow build this repository merges through; `scripts/pin_smoke_status.py` says when
+to switch.
+
 **`mergeStateStatus` cannot answer "is this ready to merge" here, and it is the natural thing to
 reach for.** Every open pull request reads `BLOCKED` or `DIRTY` and none ever reads `CLEAN`, because
 `main` restricts pushes to the `google-oss-prow` app and GitHub scores that restriction as a block
