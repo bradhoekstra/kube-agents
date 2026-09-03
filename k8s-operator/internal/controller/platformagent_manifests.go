@@ -4660,6 +4660,28 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 		},
 	})
 
+	// 12. The credential broker. The gateway holds no credential and calls nothing
+	//     on the broker's credential surface, but the chat relay moved into that
+	//     pod with it, so GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL both address
+	//     this Service now — see credentialProxyBaseURL. Without the rule the
+	//     gateway's pull against /v1/chat/events is dropped and the agent stops
+	//     receiving chat, while every pod stays Running and the CR reads Ready.
+	//     buildCredentialProxyNetworkPolicy already admits the gateway on this
+	//     port; this is the other half, and rule 11's comment is there because
+	//     the same pair was written one-sided once already.
+	egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{
+			{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(credentialProxyPort))},
+		},
+		To: []networkingv1.NetworkPolicyPeer{
+			{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: credentialProxySelector(agent),
+				},
+			},
+		},
+	})
+
 	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
 	// addition to the operator's own set rather than being interleaved with it.
 	if len(profile.AdditionalEgress) > 0 {

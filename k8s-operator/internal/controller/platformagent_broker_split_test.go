@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -305,6 +307,60 @@ func TestTheBrokerServiceAddressesTheBrokerPod(t *testing.T) {
 	}
 	if len(service.Spec.Ports) != 1 || service.Spec.Ports[0].Port != credentialProxyPort {
 		t.Errorf("unexpected ports %v", service.Spec.Ports)
+	}
+}
+
+// TestTheGatewayMayReachTheRelayItIsPointedAt asserts the halves of the pair
+// against each other rather than each against a constant. The relay moved into
+// the broker's pod, so the two RELAY_URL variables became a cross-pod call and
+// the default gateway policy needed an egress rule it did not have. Both
+// policies read as though they permitted the call — the broker's ingress named
+// the gateway — and the pods stayed Running with the CR Ready while every chat
+// pull was dropped on an enforcing dataplane. That is rule 11's failure a second
+// time, which is why this checks the URL the agent is actually given rather
+// than a port somebody remembered to write down.
+func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
+	agent := brokerPodAgent()
+	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
+	agentContainer := brokerContainerNamed(pod.Spec.Containers, "platform-agent")
+
+	relay, found := brokerEnvValue(agentContainer.Env, "SLACK_RELAY_URL")
+	if !found || relay == "" {
+		t.Fatal("SLACK_RELAY_URL is unset, so this test asserts nothing")
+	}
+	target, err := url.Parse(relay)
+	if err != nil {
+		t.Fatalf("SLACK_RELAY_URL is not a URL: %v", err)
+	}
+	if target.Hostname() == "127.0.0.1" || target.Hostname() == "localhost" {
+		t.Fatalf("the relay is back on loopback (%q); this test and the rule it "+
+			"guards both assume it is a cross-pod call", relay)
+	}
+	port, err := strconv.ParseInt(target.Port(), 10, 32)
+	if err != nil {
+		t.Fatalf("SLACK_RELAY_URL names no port: %v", err)
+	}
+
+	gateway := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+	if !allowsPeerOnPort(gateway, agent.Namespace, credentialProxySelector(agent), int32(port)) {
+		t.Errorf("the gateway policy has no egress rule reaching %s on %d — the chat "+
+			"clients poll the relay there and an enforcing dataplane drops every "+
+			"request while the agent reads Ready", relay, port)
+	}
+
+	// The other half, so a fix that deleted the ingress rule instead would not
+	// pass by making both sides equally wrong.
+	broker := buildCredentialProxyNetworkPolicy(agent)
+	var admitted bool
+	for _, rule := range broker.Spec.Ingress {
+		for _, peer := range rule.From {
+			if peer.PodSelector != nil && peer.PodSelector.MatchLabels["app"] == agent.Name+"-gateway" {
+				admitted = true
+			}
+		}
+	}
+	if !admitted {
+		t.Error("the broker policy no longer admits the gateway; the pair is one-sided again")
 	}
 }
 

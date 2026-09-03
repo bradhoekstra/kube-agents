@@ -1779,6 +1779,14 @@ spec:
         - podSelector:
             matchLabels:
               app: platformagent-shell
+    - ports:
+        - port: 8765
+          protocol: TCP
+      to:
+        - podSelector:
+            matchLabels:
+              app: platformagent-credential-proxy
+              kubeagents.x-k8s.io/component: credential-proxy
   ingress:
     - from:
         - podSelector: {}
