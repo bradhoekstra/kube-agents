@@ -201,7 +201,10 @@ def sweep(api, main_sha, dry_run=False):
     Returns (outcomes, failures). One pull request's failure does not end the
     sweep -- every pull request after it would otherwise wait for the next
     merge, and a lost pin costs a 1.5-3.5h retest -- but it is counted, so the
-    run can exit non-zero and be seen.
+    run can exit non-zero and be seen. Each outcome is logged as it happens,
+    not after the loop: the log is the only record of the writes this makes,
+    and a runner killed mid-sweep must not take the record of the ones already
+    made with it.
     """
     expected = _resolve(main_sha)  # once, for the comparisons; each write re-reads it
     outcomes, failures = [], 0
@@ -209,10 +212,12 @@ def sweep(api, main_sha, dry_run=False):
     for pull_request in pulls:
         sha = pull_request["head"]["sha"]
         try:
-            outcomes.append(pin_head(api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected))
+            outcome = pin_head(api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected)
         except Exception as error:  # noqa: BLE001 -- one pull request must not end the sweep
             failures += 1
-            outcomes.append(f"{sha[:SHORT_SHA]}: failed, moving on: {error}")
+            outcome = f"{sha[:SHORT_SHA]}: failed, moving on: {error}"
+        log(outcome)
+        outcomes.append(outcome)
     return outcomes, failures
 
 
@@ -245,11 +250,9 @@ def main(argv=None):
     api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
     main_sha = args.main_sha or (lambda: main_head(api))
     if args.mode == "status":
-        outcomes, failures = [pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run)], 0
-    else:
-        outcomes, failures = sweep(api, main_sha, dry_run=args.dry_run)
-    for outcome in outcomes:
-        log(outcome)
+        log(pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run))
+        return 0
+    _, failures = sweep(api, main_sha, dry_run=args.dry_run)
     return 1 if failures else 0
 
 

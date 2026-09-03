@@ -252,6 +252,16 @@ class SweepTest(unittest.TestCase):
         self.assertIn("failed, moving on", outcomes[0])
         self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [fine])
 
+    def test_each_outcome_is_logged_before_the_next_pull_request_is_touched(self):
+        """A runner killed mid-sweep must not take the record of the writes already made with it."""
+        first, second = "1" * 40, "2" * 40
+        api = FakeAPI(statuses={sha: [status()] for sha in (first, second)}, pulls=[pull(first), pull(second)])
+        logged = []
+        with unittest.mock.patch.object(pin, "log", lambda message: logged.append((message, len(api.posts)))):
+            pin.sweep(api, MAIN)
+        self.assertEqual([posts_so_far for _, posts_so_far in logged], [1, 2])
+        self.assertTrue(logged[0][0].startswith(first[:8]))
+
     def test_the_sweep_asks_github_for_pull_requests_against_main_only(self):
         api = FakeAPI()
         pin.sweep(api, MAIN)
