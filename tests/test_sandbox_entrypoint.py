@@ -181,6 +181,26 @@ class SandboxEntrypointHomeRootsTest(unittest.TestCase):
         self.assertTrue(marker.is_file(), "the marker should be a plain file")
         self.assertEqual([], self._displaced(marker))
 
+    def test_a_directory_where_the_marker_belongs_is_moved_aside(self) -> None:
+        """`mkdir /opt/data/.sandbox` is the same wedge by the opposite input.
+
+        `cat >` fails with EISDIR against a directory, and `set -euo pipefail`
+        ends the run before sshd starts. The symlink pass does not reach it and
+        the home-root displacement deliberately does not either, so this path
+        needs the narrower check of its own.
+        """
+        planted = self.data / ".sandbox"
+        planted.mkdir()
+        (planted / "kept").write_text("the model put this here")
+
+        self._run(". profiles/platform")
+
+        self.assertTrue(planted.is_file(), "the marker was not rewritten as a file")
+        self.assertIn("shell sandbox's /opt/data", planted.read_text())
+        moved = self._displaced(planted)
+        self.assertEqual(1, len(moved), f"expected the directory to be moved aside, found {moved}")
+        self.assertEqual("the model put this here", (moved[0] / "kept").read_text())
+
 
 if __name__ == "__main__":
     unittest.main()

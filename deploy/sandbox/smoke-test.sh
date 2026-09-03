@@ -561,6 +561,27 @@ check "and the displaced copy is still readable" "the model put a file here" \
   "$("${SSH[@]}" 'cat /opt/data/profiles/platform.displaced-*' 2>&1)"
 
 echo
+echo "== 11. a directory where the marker belongs must not wedge the start either =="
+# The same wedge by the opposite input, and the reason section 10's displacement
+# is deliberately not applied here: $DATA/.sandbox has to end up a regular file,
+# so "displace anything that is not a directory" would move the marker aside on
+# every start. `cat >` fails with EISDIR against a directory, before sshd starts.
+planted=$("${SSH[@]}" 'rm -f /opt/data/.sandbox &&
+  mkdir -p /opt/data/.sandbox &&
+  echo "the model put this here" > /opt/data/.sandbox/kept &&
+  stat -c %F /opt/data/.sandbox' 2>&1)
+check "the model can plant the directory in the first place" "directory" "$planted"
+start_sandbox || exit 1
+check "the start says it moved it aside" "was not a regular file" \
+  "$(docker logs "$NAME" 2>&1)"
+check "the marker is a regular file again" "regular file" \
+  "$(docker exec "$NAME" stat -c '%F' /opt/data/.sandbox 2>&1)"
+check "and holds the marker text" "shell sandbox's /opt/data" \
+  "$("${SSH[@]}" 'cat /opt/data/.sandbox' 2>&1)"
+check "the displaced directory kept its contents" "the model put this here" \
+  "$("${SSH[@]}" 'cat /opt/data/.sandbox.displaced-*/kept' 2>&1)"
+
+echo
 docker image inspect "$IMAGE" --format '{{len .RootFS.Layers}} {{.Size}}' 2>/dev/null |
   awk '{printf "== %s layers, %.0f MB ==\n", $1, $2/1024/1024}'
 

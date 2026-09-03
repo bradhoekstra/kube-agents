@@ -719,13 +719,24 @@ class MirrorExitCodes(unittest.TestCase):
 
         self.assertEqual(sm.EXIT_RETRY, self.drive(remote))
 
-    def test_a_remote_root_that_is_not_the_sandbox_volume_is_still_fatal(self):
+    def test_a_missing_sandbox_marker_refuses_to_write_without_holding_the_pod_down(self):
+        # The marker sits under the same uid-1000 /opt/data as everything else,
+        # so `rm -f /opt/data/.sandbox` from a sandbox shell produces exactly
+        # this, and the sandbox does not rewrite it until its own container
+        # restarts. Fatal here meant the model could crash-loop the gateway with
+        # one command and then nothing was left to repair it with.
         def remote(ssh, command, check=True):
             if command.startswith("test -f") and sm.SANDBOX_MARKER in command:
                 return subprocess.CompletedProcess([], 1, "", "")
             return self.ok(command, check)
 
-        self.assertEqual(sm.EXIT_FATAL, self.drive(remote))
+        copied = []
+        self.assertEqual(
+            sm.EXIT_RETRY, self.drive(remote, lambda *a, **k: copied.append(a))
+        )
+        # Refusing is still the point: coming up is not the same as writing to a
+        # root that may not be the sandbox's volume.
+        self.assertEqual([], copied)
 
     def test_a_copy_that_ran_and_failed_is_still_fatal(self):
         # Nothing catches this one, so it leaves main() as a traceback and the

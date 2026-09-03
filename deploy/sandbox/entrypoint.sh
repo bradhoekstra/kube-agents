@@ -76,14 +76,32 @@ displace_if_not_a_directory() {
   fi
 }
 
+# The mirror image of the above, for the one path that has to be a regular file.
+# `cat >` fails with EISDIR against a directory, so `mkdir /opt/data/.sandbox`
+# from a shell is the same permanent wedge by the opposite input: the marker
+# write below is what would fail, before `exec "$@"` ever starts sshd.
+#
+# "not a regular file" rather than "is a directory" on purpose. A fifo is the
+# sharper one — `cat >` on it blocks forever with no reader, which hangs the
+# start rather than failing it, and a hung entrypoint has no exit code for
+# anything to act on. Symlinks are already gone by the time this runs.
+displace_if_not_a_regular_file() {
+  local path="$1"
+  if [ -e "$path" ] && [ ! -f "$path" ]; then
+    mv -f "$path" "$path.displaced-$(date -u +%Y%m%dT%H%M%S)"
+    log "$path was not a regular file; moved it aside so the marker can be written"
+  fi
+}
+
 # Each component of $1 below $DATA, outermost first. $DATA itself is the mount
 # point and cannot be a link, so it is the floor rather than a component.
 #
 # $2 is whether a component that survives the symlink pass but is not a
 # directory should be displaced. Only the home roots want that, because only
 # they are about to be `install -d`ed. The other caller's target is $DATA/.sandbox,
-# which is a regular file on purpose: displacing it would move the marker aside
-# on every single start.
+# which is a regular file on purpose: displacing every non-directory there would
+# move the marker aside on every single start. That path gets the narrower
+# displace_if_not_a_regular_file at its call site instead.
 clear_symlinks_under_data() {
   local target="$1" displace="${2:-0}" relative path component
   if [ "$target" = "$DATA" ]; then
@@ -122,6 +140,7 @@ chown agent:agent "$DATA"
 # be the signal that a path belonged to the other side; this marker is what
 # replaces it.
 clear_symlinks_under_data "$DATA/.sandbox"
+displace_if_not_a_regular_file "$DATA/.sandbox"
 cat >"$DATA/.sandbox" <<'MARKER'
 This is the shell sandbox's /opt/data, on the sandbox's own volume.
 

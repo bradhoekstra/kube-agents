@@ -25,11 +25,10 @@ them over once.
 
 Neither step is fatal on its own. The sandbox is a separate pod with no ordering
 against this one, so "not up yet" is an ordinary outcome; both steps are
-idempotent and the next container start retries. Two things are fatal, and the
-exit codes below say which: a --remote-root that is not the sandbox's volume,
-and a copy that ran and failed. Those hold the agent pod down, because coming up
-healthy with the model's files stranded is the failure this script exists to
-prevent.
+idempotent and the next container start retries. One thing is fatal, and the
+exit codes below say why it is the only one: a copy that ran and failed. That
+holds the agent pod down, because coming up healthy with the model's files
+stranded is the failure this script exists to prevent.
 
 What does *not* come across, and why the list below is a denylist:
 
@@ -91,16 +90,20 @@ SKELETON_DIRS = ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
 
 # What this script returns, and what the agent pod's entrypoint does with it.
 #
-# EXIT_FATAL holds the gateway container down, because the message the
-# entrypoint prints with it -- the model's files are still on this pod's volume
-# -- is true of exactly two failures: a --remote-root that is not the sandbox's
-# volume, and a copy that ran and failed. EXIT_RETRY is for the failures the
-# next container start fixes on its own, and it exists because they used to be
-# fatal too. Everything below /opt/data on the sandbox is owned by uid 1000, so
-# the model can leave the layout in a state the push cannot handle, and a fatal
-# push means the model can stop its own agent from starting. An unhandled
-# exception still exits 1 and so still counts as fatal, which is the
-# conservative way round: an unknown failure may have lost data.
+# EXIT_FATAL holds the gateway container down, and one failure earns it: a copy
+# that ran and failed, which is the only one that can have moved the model's
+# files off this pod's volume without landing them on the sandbox's. Everything
+# else is EXIT_RETRY, because the next container start fixes it on its own.
+#
+# The dividing line is not "how bad does this look" but "who can make it
+# happen". Everything below /opt/data on the sandbox is owned by uid 1000, so a
+# failure the model can provoke -- a layout the push cannot handle, a marker it
+# deleted -- must not be fatal, or a prompt injection stops the agent for good
+# and the repair needs the agent that is no longer running. Nothing has been
+# copied at any of those points, so nothing is lost by coming up without them.
+#
+# An unhandled exception still exits 1 and so still counts as fatal, which is
+# the conservative way round: an unknown failure may have lost data.
 EXIT_OK = 0
 EXIT_FATAL = 1
 EXIT_RETRY = 2
@@ -836,15 +839,25 @@ def main(argv: list[str] | None = None) -> int:
     # The sandbox writes this at the root of its own volume on every start. Its
     # absence means --remote-root does not name that volume, and every write
     # below would land somewhere nobody reads.
+    #
+    # Refusing is the point; holding the gateway down while refusing is not. The
+    # marker lives under the same uid-1000 $DATA as everything else, so `rm -f
+    # /opt/data/.sandbox` from a sandbox shell makes it missing, and the sandbox
+    # does not rewrite it until its own container restarts -- which a
+    # crash-looping gateway is in no position to arrange. Nothing has been copied
+    # at this point, so this is the same trade as the layout push below: warn
+    # loudly, come up, try again next start. An operator who really did point
+    # --remote-root somewhere wrong reads the same line on every restart.
     marker = remote(
         ssh, f"test -f {shlex.quote(args.remote_root + '/' + SANDBOX_MARKER)}", check=False
     )
     if marker.returncode != 0:
         log(
             f"{args.remote_root}/{SANDBOX_MARKER} is missing on the far side: "
-            f"{args.remote_root} is not the sandbox's data volume. Refusing to write."
+            f"{args.remote_root} is not the sandbox's data volume, or the marker was "
+            "removed from it. Refusing to write, and leaving it for the next start."
         )
-        return EXIT_FATAL
+        return EXIT_RETRY
 
     # Not fatal, and this is the one call where that distinction earns its keep.
     # The sandbox has no start ordering against this pod, so it can be
