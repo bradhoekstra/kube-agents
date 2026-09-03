@@ -209,9 +209,12 @@ with the resolver that needs it.
 **Every project gets an outcome, and no outcome is silent.** For an explicit project the outcome
 comes from its `clusters list`. For a project reached through a container, Asset Inventory has
 listed its clusters without any per-project call, so the outcome starts as `ok` and is revised by
-CREATE: a 403 from `get-credentials` for any of its clusters sets the project to `denied` (an IAM
-deny policy on a member project blocks the inherited grant without hiding the cluster from the
-asset index), and the `create_failed` bucket the script already keeps names the cluster. The
+the two per-cluster calls the run already makes: a 403 from CREATE's `get-credentials` or from
+PRUNE's `describe` for any cluster in the project sets the project to `denied` (an IAM deny policy
+on a member project blocks the inherited grant without hiding the cluster from the asset index).
+PRUNE is the one that matters in the steady state, because CREATE runs only for clusters without a
+profile, and a binding revoked after every profile exists would otherwise never be observed. The
+`create_failed` and `skipped_error` buckets the script already keeps name the clusters. The
 outcome is one of:
 
 | Outcome        | Meaning                                                     | Effect on profiles                          |
@@ -280,7 +283,7 @@ complete.
 The operator renders `spec.scope` to the pod the way it renders other agent configuration, as a
 mounted file rather than an environment variable: the lists are unbounded and the CRD already
 carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic passthrough. The
-rendered file's hash joins the ConfigMap hash that rolls the Deployment, so editing the scope
+rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
@@ -309,9 +312,9 @@ in `terraform/examples/full-install/main.tf`, which the module default
 (`terraform/modules/kube-agents-iam/variables.tf:59-68`) mirrors. The intersection matters on the
 `custom` permission set, where the operator names `project_roles` outright: a list that carries
 `roles/container.admin` for the host project must not carry it to another project, where
-`container.clusters.impersonate` would apply to every cluster, and the
-a quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` (proposed for the
-default list in #945) must not consume quota in projects the agent only reads. Widening `project_roles` widens the host project alone; widening
+`container.clusters.impersonate` would apply to every cluster, and a
+quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
+projects the agent only reads. Widening `project_roles` widens the host project alone; widening
 what the scope carries is an edit to the allowlist, in one file, on purpose.
 
 The default roles outside the allowlist are outside it by design, and so is any role a later
@@ -350,8 +353,10 @@ owns them, which is the property #588 lost when its revocation lived in a bash f
 ## 7. The onboarding lifecycle
 
 **Adding a project.** Under a declared folder or organisation: nothing to do; it is discovered at
-the next tick. As an explicit project: add it to `spec.scope.projects` and to the tfvars, run
-`upgrade.sh` so the IAM binding exists before the reconcile tries the list, and the project's
+the next tick. As an explicit project: add it to `scope.projects` in the tfvars and run
+`upgrade.sh`, which binds the IAM and renders the CR from the same value (a hand-applied CR is
+edited separately, and §11 says why that split is the weak point). The binding then exists before
+the reconcile tries the list, and the project's
 outcome goes from `denied` to `ok` at the following tick. The order matters and the snapshot shows
 it: a project added to the CR before Terraform has run reads `denied`, which is correct and visible,
 not an error to suppress.
@@ -399,7 +404,7 @@ works. Each is listed with whether it blocks the first phase or follows it.
 | Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                                                                                                                                                                          | 2     |
 | `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                                                                                                                       | "sweeps the project"                                                                                                                                                                                                                                            | docs  |
 | `docs/site/src/content/docs/reference/security-and-iam.md:84`                                                                                                                                                                                                                    | "an IAM role grants privileges across all clusters in the project" becomes "in the scope"                                                                                                                                                                       | docs  |
-| `docs/site/src/content/docs/reference/credential-isolation.md:218`                                                                                                                                                                                                               | Describes the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project                                                                                                                                                | docs  |
+| `docs/site/src/content/docs/reference/credential-isolation.md:218`                                                                                                                                                                                                               | Describes the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project; phase 1 because the override retires with `RECONCILE_EXCLUDE`                                                                                 | 1     |
 | `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80`, `agents/platform/governance/inventory.md:70`, `agents/chat/scripts/bootstrap_scan_gate.py:331` | Name `RECONCILE_EXCLUDE`, a bare cluster name matched project-blind, as the opt-out; becomes `spec.scope.exclude.clusters`. Phase 1 rather than docs because the variable is deprecated in that release and these pages must point at the triple before it goes | 1     |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
