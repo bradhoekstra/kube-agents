@@ -23,9 +23,13 @@ move those files are still there and the model can no longer see them, which
 from a user's point of view is an upgrade that deleted their work. This copies
 them over once.
 
-Neither step is fatal. The sandbox is a separate pod with no ordering against
-this one, so "not up yet" is an ordinary outcome; both steps are idempotent and
-the next container start retries.
+Neither step is fatal on its own. The sandbox is a separate pod with no ordering
+against this one, so "not up yet" is an ordinary outcome; both steps are
+idempotent and the next container start retries. Two things are fatal, and the
+exit codes below say which: a --remote-root that is not the sandbox's volume,
+and a copy that ran and failed. Those hold the agent pod down, because coming up
+healthy with the model's files stranded is the failure this script exists to
+prevent.
 
 What does *not* come across, and why the list below is a denylist:
 
@@ -84,6 +88,55 @@ MIGRATION_MARKER = ".sandbox-migrated"
 # them yet. Cheap, and it means a skill can write to $HERMES_HOME/artifacts
 # without a mkdir -p first, which is how it behaved before the shell moved.
 SKELETON_DIRS = ("artifacts", "gitops", "plans", "scratch", "tmp", "workspace")
+
+# What this script returns, and what the agent pod's entrypoint does with it.
+#
+# EXIT_FATAL holds the gateway container down, because the message the
+# entrypoint prints with it -- the model's files are still on this pod's volume
+# -- is true of exactly two failures: a --remote-root that is not the sandbox's
+# volume, and a copy that ran and failed. EXIT_RETRY is for the failures the
+# next container start fixes on its own, and it exists because they used to be
+# fatal too. Everything below /opt/data on the sandbox is owned by uid 1000, so
+# the model can leave the layout in a state the push cannot handle, and a fatal
+# push means the model can stop its own agent from starting. An unhandled
+# exception still exits 1 and so still counts as fatal, which is the
+# conservative way round: an unknown failure may have lost data.
+EXIT_OK = 0
+EXIT_FATAL = 1
+EXIT_RETRY = 2
+
+# Where a non-directory sitting on a skeleton path is moved to. Renamed rather
+# than deleted: `scratch` as a regular file is broken state whichever way it got
+# there, but it is the model's own byte and this is not the code that should
+# decide it is worthless. The stamp keeps two runs from colliding and leaves a
+# reader something to sort by.
+DISPLACED_SUFFIX = ".displaced"
+DISPLACED_STAMP_FORMAT = "%Y%m%dT%H%M%S"
+
+# One `sh` loop rather than one `mkdir -p` over every target, because a plain
+# mkdir -p is the whole vulnerability: it returns 1 when any target exists as
+# something other than a directory, the failure is permanent, and it used to
+# take the gateway with it. Permanent because nothing on the sandbox side
+# reaches a skeleton path -- that entrypoint displaces a non-directory at a
+# *home root*, where its own `install -d` would trip on one, and rewrites only
+# the trees it ships in /opt/defaults. A plain file at `scratch` survives every
+# recycle. Symlinks are displaced here too, including one pointing at a
+# directory, which `[ -d ]` alone would accept.
+SKELETON_SHELL = """
+for target in {targets}; do
+  displace=0
+  if [ -L "$target" ]; then
+    displace=1
+  elif [ -e "$target" ] && [ ! -d "$target" ]; then
+    displace=1
+  fi
+  if [ "$displace" = 1 ]; then
+    mv -f "$target" "$target"{suffix} || exit 1
+    echo "displaced $target"
+  fi
+  mkdir -p "$target" || exit 1
+done
+"""
 
 # Hermes runtime state. Reachable in-process from the agent pod and from
 # nowhere else; a copy in the sandbox is dead weight that reads as live.
@@ -421,19 +474,36 @@ def home_relative_paths(agent_home: Path) -> list[str]:
 
 
 def push_skeleton(ssh: list[str], remote_root: str, homes: list[str]) -> None:
-    """One mkdir -p for every home's working directories.
+    """Make every home's working directories exist, whatever is there now.
 
     A single remote shell invocation rather than one per directory: nine homes
     times seven directories is sixty-three SSH round trips otherwise, on a path
     that runs on every container start.
+
+    Targets are pushed parent-first, so a home root that has to be displaced is
+    a directory again before its own skeleton is created inside it.
     """
     targets = []
     for home in homes:
         base = f"{remote_root}/{home}" if home else remote_root
         targets.append(base)
         targets.extend(f"{base}/{d}" for d in SKELETON_DIRS)
-    command = "mkdir -p " + " ".join(shlex.quote(t) for t in targets)
-    remote(ssh, command)
+    suffix = f"{DISPLACED_SUFFIX}-{time.strftime(DISPLACED_STAMP_FORMAT)}"
+    result = remote(
+        ssh,
+        SKELETON_SHELL.format(
+            targets=" ".join(shlex.quote(t) for t in targets),
+            suffix=shlex.quote(suffix),
+        ),
+    )
+    for line in result.stdout.splitlines():
+        if line.startswith("displaced "):
+            path = line[len("displaced ") :]
+            log(
+                f"{path} was not a directory; moved it to {path}{suffix} and created "
+                "the directory. Nothing reads the moved copy -- delete it once you "
+                "know what put it there."
+            )
     log(f"skeleton in place for {len(homes)} home(s): {', '.join(h or '<machine>' for h in homes)}")
 
 
@@ -731,15 +801,15 @@ def main(argv: list[str] | None = None) -> int:
     agent_home = Path(args.agent_home)
     if not agent_home.is_dir():
         log(f"{agent_home} is not a directory; nothing to mirror")
-        return 0
+        return EXIT_OK
 
     terminal = read_terminal_config(args.config)
     if terminal is None:
         log("no ssh terminal backend in the managed config; no sandbox to mirror")
-        return 0
+        return EXIT_OK
     if not terminal.get("ssh_host"):
         log("the managed terminal block names no ssh_host; refusing to guess")
-        return 0
+        return EXIT_OK
 
     ssh = ssh_base_command(terminal)
     homes = home_relative_paths(agent_home)
@@ -758,10 +828,10 @@ def main(argv: list[str] | None = None) -> int:
             "skipped": dict(skipped),
         }
         print(json.dumps(report, indent=2, sort_keys=True))
-        return 0
+        return EXIT_OK
 
     if not wait_for_sandbox(ssh, time.monotonic() + args.wait):
-        return 0
+        return EXIT_OK
 
     # The sandbox writes this at the root of its own volume on every start. Its
     # absence means --remote-root does not name that volume, and every write
@@ -774,18 +844,35 @@ def main(argv: list[str] | None = None) -> int:
             f"{args.remote_root}/{SANDBOX_MARKER} is missing on the far side: "
             f"{args.remote_root} is not the sandbox's data volume. Refusing to write."
         )
-        return 1
+        return EXIT_FATAL
 
-    push_skeleton(ssh, args.remote_root, homes)
+    # Not fatal, and this is the one call where that distinction earns its keep.
+    # The sandbox has no start ordering against this pod, so it can be
+    # rescheduled between wait_for_sandbox answering and this line running --
+    # and everything under its /opt/data is owned by uid 1000, so the model can
+    # also leave the layout in a state the push refuses. Either way nothing has
+    # been copied yet, so nothing is lost by coming up without the layout and
+    # pushing it on the next start. Holding the gateway down instead handed a
+    # prompt injection a way to stop the agent for good.
+    try:
+        push_skeleton(ssh, args.remote_root, homes)
+    except RuntimeError as exc:
+        log(
+            f"could not push the directory layout into the sandbox: {exc}. "
+            "Starting anyway and leaving it for the next start; nothing has been "
+            "copied, so nothing is lost. Skills that write to a home's working "
+            "directories will fail until it succeeds."
+        )
+        return EXIT_RETRY
 
     if args.skeleton_only:
-        return 0
+        return EXIT_OK
 
     migrated_path = f"{args.remote_root}/{MIGRATION_MARKER}"
     already = remote(ssh, f"test -f {shlex.quote(migrated_path)}", check=False)
     if already.returncode == 0 and not args.force_migrate:
         log("the sandbox already carries the migration marker; nothing to copy")
-        return 0
+        return EXIT_OK
 
     include, skipped = migration_candidates(agent_home, homes)
     noisy_skips = [
@@ -838,7 +925,7 @@ def main(argv: list[str] | None = None) -> int:
             "start will try again; raise --max-bytes or free space on the sandbox "
             "volume to finish it sooner."
         )
-        return 0
+        return EXIT_OK
 
     summary = json.dumps(
         {
@@ -848,16 +935,28 @@ def main(argv: list[str] | None = None) -> int:
         },
         sort_keys=True,
     )
-    remote(
-        ssh,
-        f"cat > {shlex.quote(migrated_path)} <<'SANDBOX_MIRROR_EOF'\n{summary}\nSANDBOX_MIRROR_EOF",
-    )
+    # Also not fatal. The copy is already done at this point, and the marker
+    # only says "do not do it again": without it the next start re-copies,
+    # which transfer makes harmless -- --skip-old-files never overwrites what
+    # the sandbox already has.
+    try:
+        remote(
+            ssh,
+            f"cat > {shlex.quote(migrated_path)} <<'SANDBOX_MIRROR_EOF'\n{summary}\nSANDBOX_MIRROR_EOF",
+        )
+    except RuntimeError as exc:
+        log(
+            f"the copy finished but {migrated_path} could not be written: {exc}. "
+            "The next start will run the copy again, which changes nothing the "
+            "sandbox already has."
+        )
+        return EXIT_RETRY
     log(f"wrote {migrated_path}; later starts will skip the copy")
-    return 0
+    return EXIT_OK
 
 
 if __name__ == "__main__":
     if shutil.which("tar") is None:
         log("no tar on PATH; cannot move files to the sandbox")
-        sys.exit(1)
+        sys.exit(EXIT_FATAL)
     sys.exit(main())

@@ -133,6 +133,54 @@ class SandboxEntrypointHomeRootsTest(unittest.TestCase):
         for component in ("profiles", "profiles/a", "profiles/a/b"):
             self.assertIn(str(self.data / component), chowned, component)
 
+    def _displaced(self, path: pathlib.Path) -> list[pathlib.Path]:
+        return sorted(p for p in path.parent.iterdir() if p.name.startswith(f"{path.name}.displaced"))
+
+    def test_a_file_where_a_home_root_belongs_is_moved_aside(self) -> None:
+        """Everything under $DATA is uid 1000's, including the home roots.
+
+        `install -d` exits 71 on a path that exists and is not a directory, and
+        `set -e` takes the container with it, so `rm -rf profiles/platform &&
+        touch profiles/platform` from a sandbox shell used to stop this pod
+        starting for good -- with no way back, because the pod you would exec
+        into to repair it is the one that is down. The symlink pass does not
+        reach this: it removes links and leaves plain files alone.
+        """
+        (self.data / "profiles").mkdir()
+        planted = self.data / "profiles" / "platform"
+        planted.write_text("not a directory")
+
+        self._run(". profiles/platform")
+
+        self.assertTrue(planted.is_dir(), "the home root was not recreated")
+        moved = self._displaced(planted)
+        self.assertEqual(1, len(moved), f"expected the file to be moved aside, found {moved}")
+        # Renamed, not deleted: it is broken state either way, but it is the
+        # model's own byte and the entrypoint is not what decides it is worthless.
+        self.assertEqual("not a directory", moved[0].read_text())
+
+    def test_a_file_at_an_intermediate_component_is_moved_aside_too(self) -> None:
+        """`install -d` creates the parents, so a file at one fails the same way."""
+        planted = self.data / "profiles"
+        planted.write_text("not a directory either")
+
+        self._run(". profiles/platform")
+
+        self.assertTrue((self.data / "profiles" / "platform").is_dir())
+        self.assertEqual(1, len(self._displaced(planted)))
+
+    def test_the_sandbox_marker_is_not_displaced_on_every_start(self) -> None:
+        """$DATA/.sandbox is a regular file on purpose.
+
+        It shares the symlink walk with the home roots, so displacing every
+        non-directory the walk sees would move the marker aside once per start
+        and leave a new copy behind each time.
+        """
+        self._run(". profiles/platform")
+        marker = self.data / ".sandbox"
+        self.assertTrue(marker.is_file(), "the marker should be a plain file")
+        self.assertEqual([], self._displaced(marker))
+
 
 if __name__ == "__main__":
     unittest.main()

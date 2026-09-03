@@ -56,10 +56,36 @@ unlink_if_symlink() {
   fi
 }
 
+# A plain file where a home root belongs is the same shape of permanent failure
+# as a planted link, and the symlink pass above does not reach it. `install -d`
+# below exits 71 on one — "exists but is not a directory" — and `set -e` takes
+# the container with it. Everything under $DATA is uid 1000's, so
+# `rm -rf /opt/data/profiles/platform && touch /opt/data/profiles/platform` from
+# a shell would stop this pod starting for good, and unlike the agent pod there
+# would then be nothing left to exec into and repair it with.
+#
+# Moved aside rather than deleted, matching push_skeleton in
+# deploy/shared/sandbox_mirror.py: broken state either way, but it is the model's
+# own byte and this is not the code that decides it is worthless. Nothing reads
+# the moved copy.
+displace_if_not_a_directory() {
+  local path="$1"
+  if [ -e "$path" ] && [ ! -d "$path" ]; then
+    mv -f "$path" "$path.displaced-$(date -u +%Y%m%dT%H%M%S)"
+    log "$path was not a directory; moved it aside so the home root can be created"
+  fi
+}
+
 # Each component of $1 below $DATA, outermost first. $DATA itself is the mount
 # point and cannot be a link, so it is the floor rather than a component.
+#
+# $2 is whether a component that survives the symlink pass but is not a
+# directory should be displaced. Only the home roots want that, because only
+# they are about to be `install -d`ed. The other caller's target is $DATA/.sandbox,
+# which is a regular file on purpose: displacing it would move the marker aside
+# on every single start.
 clear_symlinks_under_data() {
-  local target="$1" relative path component
+  local target="$1" displace="${2:-0}" relative path component
   if [ "$target" = "$DATA" ]; then
     return 0
   fi
@@ -74,6 +100,9 @@ clear_symlinks_under_data() {
     [ -n "$component" ] || continue
     path="$path/$component"
     unlink_if_symlink "$path"
+    if [ "$displace" = 1 ]; then
+      displace_if_not_a_directory "$path"
+    fi
   done
 }
 
@@ -130,7 +159,7 @@ if [ -d "$DEFAULTS" ]; then
     else
       home="$DATA/$root"
     fi
-    clear_symlinks_under_data "$home"
+    clear_symlinks_under_data "$home" 1
     install -d -o agent -g agent "$home"
     # -o/-g reach the last component only. `profiles/platform` therefore leaves
     # $DATA/profiles owned by root, and 0755 root:root is readable and traversable

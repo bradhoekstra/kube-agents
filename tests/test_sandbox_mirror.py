@@ -583,5 +583,161 @@ class MigrationMarker(unittest.TestCase):
         self.assertNotIn(".env", recorded["copied"])
 
 
+class Skeleton(unittest.TestCase):
+    """The layout push, against a real filesystem with `sh -c` as the SSH hop.
+
+    Everything below the sandbox's /opt/data is owned by uid 1000, so the model
+    decides what is sitting on a skeleton path when this runs. A plain
+    `mkdir -p` returned 1 for any of it, the entrypoint turned that into
+    `exit 1` for the whole gateway container, and nothing on either side ever
+    cleared it -- the sandbox entrypoint only unlinks symlinks and only rewrites
+    the trees it ships in /opt/defaults. `touch /opt/data/scratch` from a sandbox
+    shell was a permanent CrashLoopBackOff the agent could not repair.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+        self.logged = []
+        patcher = unittest.mock.patch.object(sm, "log", self.logged.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def push(self, homes=("",)):
+        # `sh -c CMD` has the same argv shape ssh does; see Transfer above.
+        sm.push_skeleton(["sh", "-c"], str(self.root), list(homes))
+
+    def displaced(self, name):
+        found = [p for p in self.root.iterdir() if p.name.startswith(f"{name}{sm.DISPLACED_SUFFIX}")]
+        self.assertEqual(1, len(found), f"expected one displaced {name}, got {found}")
+        return found[0]
+
+    def test_every_skeleton_directory_is_created_for_every_home(self):
+        self.push(homes=["", "profiles/platform"])
+        for home in ("", "profiles/platform"):
+            base = self.root / home if home else self.root
+            for name in sm.SKELETON_DIRS:
+                self.assertTrue((base / name).is_dir(), f"{home}/{name} missing")
+
+    def test_a_file_where_a_directory_belongs_is_displaced_not_fatal(self):
+        (self.root / "scratch").write_text("the model put a file here")
+        self.push()
+        self.assertTrue((self.root / "scratch").is_dir())
+        # Renamed, not deleted. It is broken state either way, but it is the
+        # model's own byte and this is not the code that decides it is worthless.
+        self.assertEqual("the model put a file here", self.displaced("scratch").read_text())
+
+    def test_a_symlink_where_a_directory_belongs_is_displaced_too(self):
+        # `[ -d ]` accepts a symlink that points at a directory, so testing for
+        # a directory alone would leave this one in place -- and the migration
+        # would then extract the model's files through it.
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (self.root / "workspace").symlink_to(elsewhere)
+        self.push()
+        target = self.root / "workspace"
+        self.assertTrue(target.is_dir())
+        self.assertFalse(target.is_symlink())
+        self.assertTrue(self.displaced("workspace").is_symlink())
+
+    def test_a_home_root_that_is_a_file_is_displaced_before_its_own_skeleton(self):
+        # Targets go parent-first for this: displacing profiles/platform after
+        # trying to mkdir profiles/platform/scratch inside it is too late.
+        (self.root / "profiles").mkdir()
+        (self.root / "profiles" / "platform").write_text("not a directory")
+        self.push(homes=["", "profiles/platform"])
+        self.assertTrue((self.root / "profiles" / "platform" / "scratch").is_dir())
+
+    def test_a_displacement_is_reported_so_somebody_can_look_at_it(self):
+        (self.root / "tmp").write_text("x")
+        self.push()
+        self.assertTrue(
+            any("was not a directory" in line and "/tmp" in line for line in self.logged),
+            f"the displacement was silent: {self.logged}",
+        )
+
+    def test_a_push_that_cannot_be_repaired_still_raises(self):
+        # Displacing is not the same as swallowing. A remote that fails for a
+        # reason this cannot fix -- a read-only volume, a dead connection --
+        # still has to reach main(), which decides whether it is fatal.
+        with self.assertRaises(RuntimeError):
+            sm.push_skeleton(["sh", "-c"], "/proc/nonexistent-and-unwritable", [""])
+
+
+class MirrorExitCodes(unittest.TestCase):
+    """Which failures hold the gateway container down, and which do not.
+
+    The agent pod's entrypoint exits 1 on any code other than EXIT_RETRY, so
+    this is the boundary between "the model's files are stranded, refuse to
+    start" and "the next start fixes it". Getting it wrong in the permissive
+    direction hides data loss; getting it wrong in the strict direction lets a
+    prompt injection stop the agent for good.
+    """
+
+    def drive(self, remote, transfer=lambda *a, **k: None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        build_home(root)
+        config = root / "managed.yaml"
+        config.write_text("terminal:\n  backend: ssh\n  ssh_host: sandbox.invalid\n")
+
+        patches = [
+            unittest.mock.patch.object(sm, "remote", remote),
+            unittest.mock.patch.object(sm, "wait_for_sandbox", lambda *a, **k: True),
+            unittest.mock.patch.object(sm, "remote_free_bytes", lambda *a, **k: None),
+            unittest.mock.patch.object(sm, "transfer", transfer),
+            unittest.mock.patch.object(sm, "log", lambda message: None),
+        ]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return sm.main(["--agent-home", str(root), "--config", str(config)])
+
+    @staticmethod
+    def ok(command, check=True):
+        missing = command.startswith("test -f") and sm.MIGRATION_MARKER in command
+        return subprocess.CompletedProcess([], 1 if missing else 0, "", "")
+
+    def test_a_failed_layout_push_asks_for_a_retry_rather_than_a_crash_loop(self):
+        def remote(ssh, command, check=True):
+            if "mkdir -p" in command:
+                raise RuntimeError("mkdir -p: File exists")
+            return self.ok(command, check)
+
+        self.assertEqual(sm.EXIT_RETRY, self.drive(remote))
+
+    def test_a_failed_marker_write_asks_for_a_retry(self):
+        # The copy already landed. Re-running it costs a tar the sandbox
+        # discards -- transfer passes --skip-old-files -- and that is cheaper
+        # than an agent that will not start.
+        def remote(ssh, command, check=True):
+            if command.startswith("cat >"):
+                raise RuntimeError("no space left on device")
+            return self.ok(command, check)
+
+        self.assertEqual(sm.EXIT_RETRY, self.drive(remote))
+
+    def test_a_remote_root_that_is_not_the_sandbox_volume_is_still_fatal(self):
+        def remote(ssh, command, check=True):
+            if command.startswith("test -f") and sm.SANDBOX_MARKER in command:
+                return subprocess.CompletedProcess([], 1, "", "")
+            return self.ok(command, check)
+
+        self.assertEqual(sm.EXIT_FATAL, self.drive(remote))
+
+    def test_a_copy_that_ran_and_failed_is_still_fatal(self):
+        # Nothing catches this one, so it leaves main() as a traceback and the
+        # interpreter exits 1 -- which is EXIT_FATAL, and is the conservative
+        # way round for a failure nobody has classified.
+        def failing_transfer(*args, **kwargs):
+            raise RuntimeError("tar: exit 2")
+
+        with self.assertRaises(RuntimeError):
+            self.drive(lambda ssh, command, check=True: self.ok(command, check), failing_transfer)
+        self.assertEqual(1, sm.EXIT_FATAL)
+
+
 if __name__ == "__main__":
     unittest.main()

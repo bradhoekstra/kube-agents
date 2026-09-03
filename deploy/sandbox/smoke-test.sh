@@ -537,6 +537,30 @@ check "with the image's trees back inside it" "scripts" \
   "$("${SSH[@]}" 'ls /opt/data/profiles/platform' 2>&1)"
 
 echo
+echo "== 10. a plain file where a home root belongs must not wedge the start =="
+# Same volume, same uid 1000, one step sideways from section 9: a regular file
+# rather than a link. The symlink pass does not reach it -- `rm` on a symlink is
+# not `rm` on a file, deliberately -- and `install -d` exits 71 on a path that
+# exists and is not a directory, which `set -e` turns into a start that never
+# finishes. Nothing on the volume would have cleared it, so this was a permanent
+# CrashLoopBackOff a session could arrange with one `touch`, and the pod you
+# would exec into to undo it is the pod that is down.
+planted=$("${SSH[@]}" 'rm -rf /opt/data/profiles/platform &&
+  echo "the model put a file here" > /opt/data/profiles/platform &&
+  stat -c %F /opt/data/profiles/platform' 2>&1)
+check "the model can plant the file in the first place" "regular file" "$planted"
+start_sandbox || exit 1
+check "the start says it moved it aside" "was not a directory" \
+  "$(docker logs "$NAME" 2>&1)"
+check "the home root is a directory again" "directory" \
+  "$(docker exec "$NAME" stat -c '%F' /opt/data/profiles/platform 2>&1)"
+check "with the image's trees back inside it" "scripts" \
+  "$("${SSH[@]}" 'ls /opt/data/profiles/platform' 2>&1)"
+# Moved, not deleted. Broken state either way, but it is the model's own byte.
+check "and the displaced copy is still readable" "the model put a file here" \
+  "$("${SSH[@]}" 'cat /opt/data/profiles/platform.displaced-*' 2>&1)"
+
+echo
 docker image inspect "$IMAGE" --format '{{len .RootFS.Layers}} {{.Size}}' 2>/dev/null |
   awk '{printf "== %s layers, %.0f MB ==\n", $1, $2/1024/1024}'
 

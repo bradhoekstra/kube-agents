@@ -11,6 +11,16 @@ set -e
 # files that already exist at mount time; this fixes up the ones created after.
 umask 0002
 
+# Below the umask and not above it, where the rest of this file's constants would
+# go: tests/test_startup_umask.py asserts that the umask is the first line here
+# that can create a file, and it reads the file rather than running it, so an
+# assignment above the umask reads to it as that line.
+#
+# EXIT_RETRY in deploy/shared/sandbox_mirror.py: the mirror failed in a way the
+# next container start fixes on its own. Step 5.7 warns on it and lets the agent
+# come up; every other non-zero exit there is still fatal. Change both together.
+readonly SANDBOX_MIRROR_RETRY_RC=2
+
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
@@ -1547,19 +1557,26 @@ fi
 # same script with --skeleton-only when it scaffolds one, so a profile created
 # between restarts does not wait for the next one.
 #
-# Foreground, and fatal. It was neither, and the reason it was both is sound as
-# far as it goes: the sandbox is a separate StatefulSet with no start ordering
-# against this Deployment, so "not up yet" is an ordinary outcome rather than an
-# error. What that misses is that the script already draws the distinction. A
-# sandbox that never answers inside --wait returns 0 and leaves the marker
-# unwritten, so the next start retries; the only non-zero exits are a
-# --remote-root that is not the sandbox's volume, and a transfer that ran and
-# failed. Neither is survivable and neither is transient, so backgrounding them
-# bought nothing but silence: the agent came up healthy, the model's files were
-# still on this volume where its shell can no longer see them, and the sole
+# Foreground, and fatal on EXIT_FATAL only. It was neither, and the reason it
+# was both is sound as far as it goes: the sandbox is a separate StatefulSet
+# with no start ordering against this Deployment, so "not up yet" is an ordinary
+# outcome rather than an error. What that misses is that the script already
+# draws the distinction. A sandbox that never answers inside --wait returns 0
+# and leaves the marker unwritten, so the next start retries; the fatal exits
+# are a --remote-root that is not the sandbox's volume, and a transfer that ran
+# and failed. Neither is survivable and neither is transient, so backgrounding
+# them bought nothing but silence: the agent came up healthy, the model's files
+# were still on this volume where its shell can no longer see them, and the sole
 # trace was a WARN line in a log file nobody reads. That happened on a live
 # upgrade — ten cluster profile homes, every one Permission denied — and it was
 # found by hand, days later.
+#
+# Fatal on *those* and not on everything non-zero, which is the correction. The
+# layout push and the marker write both reach a filesystem uid 1000 owns, so the
+# model can make either fail — and while any non-zero exit landed here, that was
+# a way for a prompt injection to CrashLoopBackOff this container permanently,
+# with no path back because the thing that would repair it is the thing that is
+# down. Those two now return EXIT_RETRY and warn instead.
 #
 # Exiting non-zero here is what makes it visible, and it needs no privilege the
 # agent does not have. The kubelet restarts the container, CrashLoopBackOff
@@ -1583,9 +1600,14 @@ SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"
 [ -f "$SANDBOX_MIRROR_SCRIPT" ] || SANDBOX_MIRROR_SCRIPT="$TARGET_DIR/scripts/sandbox_mirror.py"
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SANDBOX_MIRROR_SCRIPT" ]; then
     echo "Mirroring the profile layout into the shell sandbox..."
-    if ! HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+    SANDBOX_MIRROR_RC=0
+    HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
         "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
-        >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1; then
+        >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1 || SANDBOX_MIRROR_RC=$?
+    if [ "$SANDBOX_MIRROR_RC" = "$SANDBOX_MIRROR_RETRY_RC" ]; then
+        echo "WARN: the shell sandbox mirror did not finish, in a way the next start retries. Nothing has been lost -- the copy either has not run or has already landed. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+    elif [ "$SANDBOX_MIRROR_RC" != "0" ]; then
         echo "FATAL: the shell sandbox migration failed. The model's files are still on this pod's volume, where its shell cannot reach them, so this container is refusing to start rather than come up looking healthy with the agent's work missing. Last lines of logs/sandbox_mirror.log:" >&2
         tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
         exit 1
