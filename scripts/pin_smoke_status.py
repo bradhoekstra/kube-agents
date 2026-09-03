@@ -22,18 +22,23 @@ It is best-effort against Tide's own clock. Tide syncs about once a minute,
 and a sync that sees the stale statuses before the sweep has re-pinned them
 starts the retest -- as a batch, when two or more pull requests qualify --
 and crier's `pending` is then the newer word, which this leaves alone. So the
-sweep is kept short (no dependencies, one read per open pull request plus the
-head of `main` before each write), takes the pull requests Tide is actually
-waiting on first, and is still a race that is sometimes lost. Two merges seconds apart start two sweeps with no ordering
+sweep is kept short (no dependencies, one read per open pull request, and two
+more -- `main` again, the status again -- only for the ones it writes), takes
+the pull requests Tide is actually waiting on first, and is still a race that
+is sometimes lost. Two merges seconds apart start two sweeps with no ordering
 between them, so a pin is always made to the head of `main` as read just
 before the write, never to the head the run started with.
 
 What it will not do: touch a status that is not `success`, touch an admin
 `/override`, pin a pull request that does not target `main` (Tide keys the
 base SHA on the pull request's own base branch), or overwrite a newer status
-on the same context. The read and the write are two calls, so a `pending`
-that lands between them is buried; that window is a few hundred milliseconds
-and its cost is the trade-off above, taken a little early.
+on the same context. Deciding and writing are separate calls, and a throttled
+call retries with a delay of seconds to a minute, so the status is read a
+second time immediately before the write and the write is dropped if a newer
+one has landed. What stays open is the POST itself. One pull request failing
+-- a head force-pushed away mid-sweep, a call out of retries -- is logged and
+the sweep goes on, because every pull request after it would otherwise wait
+for the next merge; the failure still sets the exit status.
 """
 
 import argparse
@@ -82,12 +87,18 @@ def split_description(description):
 
 
 def pinned_description(description, main_sha):
-    """The same status, its base pinned to `main_sha`, within GitHub's limit."""
+    """The same status, its base pinned to `main_sha`, within GitHub's limit.
+
+    The note is dropped whole when it does not fit: a sliced one would not be
+    recognised by the next pin and would stack.
+    """
     human, _ = split_description(description)
-    human = f"{human} {PIN_NOTE}".strip()
     suffix = f"{BASE_SHA_DELIMITER}{main_sha}"
     room = MAX_DESCRIPTION - len(suffix)
-    return human[:room].rstrip() + suffix
+    noted = f"{human} {PIN_NOTE}".strip()
+    if len(noted) > room:
+        noted = human[:room].rstrip()
+    return noted + suffix
 
 
 def skip_reason(status, main_sha):
@@ -128,22 +139,45 @@ def targets_main(api, sha):
     return any(p["head"]["sha"] == sha for p in open_pulls_against_main(api))
 
 
-def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True):
+#: Compares equal to no SHA, so `skip_reason` can be asked the questions that need no `main`.
+_NO_MAIN = object()
+
+
+def _resolve(main_sha):
+    return main_sha() if callable(main_sha) else main_sha
+
+
+def pin_head(api, sha, main_sha, status_id=None, dry_run=False, check_base=True, expected_main=None):
     """Re-pin one commit's smoke status. Returns what happened, for the log.
 
-    `main_sha` is a SHA or a callable returning one; the callable is read just
-    before the write, so a sweep that overlaps a newer one cannot pin backwards.
+    `main_sha` is a SHA or a callable returning one. `expected_main` is the head
+    of `main` a stale base is compared against -- a sweep reads it once for all
+    its pull requests -- and defaults to `main_sha` itself. Two reads sit
+    between deciding and writing: `main` again, so a sweep overlapping a newer
+    one cannot pin backwards, and the status again, so a `pending` that landed
+    meanwhile -- a push, `/test`, or Tide's own retest -- is not buried under a
+    stale success. Neither read is made for a status that is left alone.
     """
     if check_base and not targets_main(api, sha):
         return f"{sha[:SHORT_SHA]}: not the head of an open pull request against {MAIN_BRANCH}"
     status = latest_status(api, sha)
     if status_id is not None and status is not None and str(status.get("id")) != str(status_id):
         return f"{sha[:SHORT_SHA]}: status {status_id} is no longer the latest (now {status.get('id')}); leaving it"
-    if status is not None and status.get("state") == SUCCESS:
-        main_sha = main_sha() if callable(main_sha) else main_sha
-    reason = skip_reason(status, main_sha)
+    reason = skip_reason(status, _NO_MAIN)
     if reason:
         return f"{sha[:SHORT_SHA]}: {reason}"
+    main_now = expected_main if expected_main is not None else _resolve(main_sha)
+    reason = skip_reason(status, main_now)
+    if reason is None and expected_main is not None and callable(main_sha):
+        main_now = main_sha()  # just before the write, not as of the start of the sweep
+        reason = skip_reason(status, main_now)
+    if reason:
+        return f"{sha[:SHORT_SHA]}: {reason}"
+    latest = latest_status(api, sha)
+    if latest is None or str(latest.get("id")) != str(status.get("id")):
+        newer = latest.get("id") if latest else "none"
+        return f"{sha[:SHORT_SHA]}: status {status.get('id')} was superseded while deciding (now {newer}); leaving it"
+    main_sha = main_now
     payload = {
         "state": SUCCESS,
         "context": CONTEXT,
@@ -162,12 +196,24 @@ def in_tide_pool(pull_request):
 
 
 def sweep(api, main_sha, dry_run=False):
-    """Every open pull request's head, after a push to main; the pool first."""
-    outcomes = []
+    """Every open pull request's head, after a push to main; the pool first.
+
+    Returns (outcomes, failures). One pull request's failure does not end the
+    sweep -- every pull request after it would otherwise wait for the next
+    merge, and a lost pin costs a 1.5-3.5h retest -- but it is counted, so the
+    run can exit non-zero and be seen.
+    """
+    expected = _resolve(main_sha)  # once, for the comparisons; each write re-reads it
+    outcomes, failures = [], 0
     pulls = sorted(open_pulls_against_main(api), key=lambda p: not in_tide_pool(p))
     for pull_request in pulls:
-        outcomes.append(pin_head(api, pull_request["head"]["sha"], main_sha, dry_run=dry_run, check_base=False))
-    return outcomes
+        sha = pull_request["head"]["sha"]
+        try:
+            outcomes.append(pin_head(api, sha, main_sha, dry_run=dry_run, check_base=False, expected_main=expected))
+        except Exception as error:  # noqa: BLE001 -- one pull request must not end the sweep
+            failures += 1
+            outcomes.append(f"{sha[:SHORT_SHA]}: failed, moving on: {error}")
+    return outcomes, failures
 
 
 def main_head(api):
@@ -199,12 +245,12 @@ def main(argv=None):
     api = GitHubAPI(args.repo, token, user_agent=USER_AGENT)
     main_sha = args.main_sha or (lambda: main_head(api))
     if args.mode == "status":
-        outcomes = [pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run)]
+        outcomes, failures = [pin_head(api, args.sha, main_sha, status_id=args.status_id, dry_run=args.dry_run)], 0
     else:
-        outcomes = sweep(api, main_sha, dry_run=args.dry_run)
+        outcomes, failures = sweep(api, main_sha, dry_run=args.dry_run)
     for outcome in outcomes:
         log(outcome)
-    return 0
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":

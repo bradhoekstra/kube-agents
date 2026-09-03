@@ -339,7 +339,8 @@ newer status, and the sweep leaves it alone. A push still starts a fresh run;
 reports (`/retest` does not, because it reruns only failed contexts); a red is never touched, and
 neither is an admin `/override`. What this trades away is testing the combination with the `main`
 it lands on before the merge; until a scheduled eval run on `main` exists, a bad combination is
-found by the next pull request's run. Prow's own form of this — a `[prow:skip-retest]` sentinel
+found by the next smoke run that actually starts after it — a push or `/test` on whichever pull
+request that is, whose author then sees a red that is not theirs. Prow's own form of this — a `[prow:skip-retest]` sentinel
 written by `/override-sticky` — is upstream but not in the Prow build this repository merges
 through; `scripts/pin_smoke_status.py` says when to switch.
 

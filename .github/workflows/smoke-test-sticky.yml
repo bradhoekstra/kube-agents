@@ -12,7 +12,8 @@ name: Smoke Test Sticky Status
 # request green at its own head merges without a fresh-base retest. What that
 # gives up is testing the combination with the `main` it lands on before the
 # merge; until a scheduled eval run on `main` exists, a bad combination is
-# found by the next pull request's run. docs/pull-request-workflow.md "How a
+# found by the next smoke run that actually starts after it, on whichever pull
+# request that is. docs/pull-request-workflow.md "How a
 # change merges" owns that statement; the script's docstring says why this is
 # a BaseSHA pin and not Prow's `[prow:skip-retest]` sentinel, and when to swap.
 #
@@ -27,7 +28,10 @@ name: Smoke Test Sticky Status
 # So the job carries nothing it does not need -- the runner's own python3 runs
 # a stdlib-only script -- and has no concurrency group: GitHub keeps one
 # pending run per group and cancels the older one, which would drop a pin,
-# while two runs pinning the same commit to the same head are harmless.
+# while two runs pinning the same commit to the same head are harmless. The
+# price is the Actions tab: every status event on the repository -- Tide's own
+# `tide` context on each sync, every CI context on every push -- starts a run
+# here that the `if:` skips, hundreds a day, free in minutes.
 #
 # A status created with GITHUB_TOKEN does not fire `status` again, so the
 # re-post cannot loop; a push to `main` is only ever Tide's merge.

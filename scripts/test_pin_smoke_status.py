@@ -48,11 +48,16 @@ class FakeAPI:
         self.main = main
         self.posts = []
         self.list_calls = []
+        self.ref_reads = 0
+        self.broken = set()  # heads whose status read fails, as a force-pushed-away head does
 
     def get(self, path):
         if path.endswith(f"/git/ref/{pin.MAIN_REF}"):
+            self.ref_reads += 1
             return {"object": {"sha": self.main}}
         sha = path.rsplit("/commits/", 1)[1].split("/")[0]
+        if sha in self.broken:
+            raise RuntimeError(f"HTTP 422 No commit found for SHA: {sha}")
         return {"statuses": self.statuses.get(sha, [])}
 
     def get_all(self, path):
@@ -85,6 +90,13 @@ class DescriptionTest(unittest.TestCase):
         got = pin.pinned_description("x" * 200, MAIN)
         self.assertEqual(len(got), pin.MAX_DESCRIPTION)
         self.assertTrue(got.endswith(f"BaseSHA:{MAIN}"))
+
+    def test_a_note_that_does_not_fit_is_dropped_whole_not_sliced(self):
+        """A fragment like "(base" would not be recognised by the next pin and would stack."""
+        got = pin.pinned_description("x" * 85, MAIN)
+        self.assertLessEqual(len(got), pin.MAX_DESCRIPTION)
+        self.assertNotIn("(base", got)
+        self.assertEqual(pin.split_description(got), ("x" * 85, MAIN))
 
     def test_a_description_without_a_base_gets_one(self):
         self.assertEqual(pin.split_description("Job succeeded.")[1], None)
@@ -157,6 +169,39 @@ class PinHeadTest(unittest.TestCase):
         self.assertIn("already pinned", pin.pin_head(api, HEAD, lambda: pin.main_head(api)))
         self.assertEqual(api.posts, [])
 
+    def test_a_status_that_arrives_while_deciding_wins(self):
+        """A `pending` posted between the first read and the write must not be buried."""
+
+        class RacedAPI(FakeAPI):
+            def get(self, path):
+                result = super().get(path)
+                if "/commits/" in path:  # the next read sees a fresh run's pending
+                    self.statuses[HEAD] = [status(id=2, state="pending", description="Job triggered.")]
+                return result
+
+        api = RacedAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)])
+        outcome = pin.pin_head(api, HEAD, MAIN, status_id=1)
+        self.assertIn("superseded while deciding", outcome)
+        self.assertEqual(api.posts, [])
+
+    def test_a_sweep_compares_against_its_one_read_but_writes_the_fresh_head(self):
+        """expected_main is the sweep's single read; the write re-reads main so it never pins backwards."""
+        api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)], main="9" * 40)
+        outcome = pin.pin_head(api, HEAD, lambda: pin.main_head(api), expected_main=MAIN)
+        self.assertIn("pinned to 99999999", outcome)
+        self.assertEqual(api.ref_reads, 1)
+
+    def test_a_fresh_read_that_finds_the_status_current_posts_nothing(self):
+        api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)], main=OLD)
+        outcome = pin.pin_head(api, HEAD, lambda: pin.main_head(api), expected_main=MAIN)
+        self.assertIn("already pinned", outcome)
+        self.assertEqual(api.posts, [])
+
+    def test_no_read_of_main_is_spent_on_a_status_left_alone(self):
+        api = FakeAPI(statuses={HEAD: [status(state="failure")]}, pulls=[pull(HEAD)])
+        pin.pin_head(api, HEAD, lambda: pin.main_head(api))
+        self.assertEqual(api.ref_reads, 0)
+
     def test_dry_run_posts_nothing(self):
         api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)])
         self.assertIn("pinned", pin.pin_head(api, HEAD, MAIN, dry_run=True))
@@ -174,9 +219,10 @@ class SweepTest(unittest.TestCase):
             },
             pulls=[pull(sha) for sha in (stale, current, red, none)] + [pull("5" * 40, base="release-1")],
         )
-        outcomes = pin.sweep(api, MAIN)
-        self.assertEqual(len(outcomes), 4)
+        outcomes, failures = pin.sweep(api, MAIN)
+        self.assertEqual((len(outcomes), failures), (4, 0))
         self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [stale])
+        self.assertEqual(len(api.list_calls), 1)
 
     def test_the_pool_is_swept_first(self):
         first, second, held = "6" * 40, "7" * 40, "8" * 40
@@ -186,6 +232,25 @@ class SweepTest(unittest.TestCase):
         )
         pin.sweep(api, MAIN)
         self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [first, second, held])
+
+    def test_main_is_read_once_for_the_sweep_and_once_more_per_write(self):
+        stale, current = "1" * 40, "2" * 40
+        api = FakeAPI(
+            statuses={stale: [status()], current: [status(description=f"Job succeeded. BaseSHA:{MAIN}")]},
+            pulls=[pull(stale), pull(current)],
+        )
+        pin.sweep(api, lambda: pin.main_head(api))
+        self.assertEqual(api.ref_reads, 2)
+        self.assertEqual(len(api.posts), 1)
+
+    def test_one_pull_request_failing_does_not_end_the_sweep(self):
+        broken, fine = "1" * 40, "2" * 40
+        api = FakeAPI(statuses={fine: [status()]}, pulls=[pull(broken), pull(fine)])
+        api.broken.add(broken)
+        outcomes, failures = pin.sweep(api, MAIN)
+        self.assertEqual(failures, 1)
+        self.assertIn("failed, moving on", outcomes[0])
+        self.assertEqual([path.rsplit("/", 1)[1] for path, _ in api.posts], [fine])
 
     def test_the_sweep_asks_github_for_pull_requests_against_main_only(self):
         api = FakeAPI()
@@ -206,6 +271,26 @@ class ArgumentsTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def _run(self, api, argv):
+        with unittest.mock.patch.dict("os.environ", {"GITHUB_TOKEN": "t"}), unittest.mock.patch.object(
+            pin, "GitHubAPI", lambda *args, **kwargs: api
+        ):
+            return pin.main(["--repo", "gke-labs/kube-agents", *argv])
+
+    def test_status_mode_forwards_the_status_id_and_reads_main_itself(self):
+        api = FakeAPI(statuses={HEAD: [status(id=2, state="pending")]}, pulls=[pull(HEAD)])
+        self.assertEqual(self._run(api, ["status", "--sha", HEAD, "--status-id", "1"]), 0)
+        self.assertEqual(api.posts, [])  # the id check saw the newer pending
+        api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD)], main="9" * 40)
+        self.assertEqual(self._run(api, ["status", "--sha", HEAD, "--status-id", "1"]), 0)
+        self.assertTrue(api.posts[0][1]["description"].endswith("9" * 40))  # no --main-sha: read from GitHub
+
+    def test_a_sweep_with_a_failure_exits_non_zero(self):
+        api = FakeAPI(statuses={HEAD: [status()]}, pulls=[pull(HEAD), pull("1" * 40)])
+        api.broken.add("1" * 40)
+        self.assertEqual(self._run(api, ["sweep"]), 1)
+        self.assertEqual(len(api.posts), 1)
+
     def test_refuses_to_run_without_a_token(self):
         env = {k: v for k, v in __import__("os").environ.items() if k not in ("GITHUB_TOKEN",)}
         with unittest.mock.patch.dict("os.environ", env, clear=True):
