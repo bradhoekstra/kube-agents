@@ -32,8 +32,9 @@ exactly once:
 - `_all_clusters(project)` (`:99-132`) runs one `gcloud container clusters list --project <P>` and
   tags every row with that project.
 - `reconcile()` (`:261-262`) calls it once. When the project cannot be resolved, or that one list
-  call fails, the CREATE direction is skipped for the run and the job exits 0 in prune-only mode.
-  #566 is that path: the broker refuses the list call, and nothing reports it.
+  call fails, the CREATE direction is skipped for the run. The hourly job then exits 0 in prune-only
+  mode; only the bootstrap gate, which passes `--require-create-pass`, sees a non-zero exit. #566 is
+  that path, with the broker refusing the list call.
 - The header (`:7-10`) states the policy: "every cluster in the project gets a Cluster Agent
   profile". The only opt-out is `RECONCILE_EXCLUDE`, a list of cluster names (`:63`).
 
@@ -87,7 +88,7 @@ Cluster Agent is named, stored, or driven:
   `{project_id, location, cluster_name}` objects, with the comment that "a cluster in another
   project is a row in this list rather than a second module"; the CRD mirror is
   `spec.security.scopedServiceAccounts[]` (`k8s-operator/api/v1alpha1/common_types.go:498-540`),
-  whose `projectId` "need not be the project the agent runs in".
+  whose `projectId` "need not be the project the agent runs in" (`:808-809`).
 
 What changes is therefore confined to four places: how the set of projects is declared, how it is
 resolved to clusters, how the service account is granted into it, and which documents describe the
@@ -112,8 +113,10 @@ spec:
     exclude:
       projects: # never resolved, even if a folder above contains them
         - payments-sandbox
-      clusters: # by name, in any project; replaces RECONCILE_EXCLUDE
-        - scratch-cluster
+      clusters: # one cluster, fully qualified; replaces RECONCILE_EXCLUDE
+        - projectId: payments-staging
+          location: us-central1
+          clusterName: scratch-cluster
 ```
 
 Rules:
@@ -126,9 +129,14 @@ Rules:
 - **Selectors union; exclusions subtract afterwards.** A project reached through a folder and named
   explicitly appears once. An excluded project is dropped whether it was reached through a list or a
   container.
-- **`exclude.clusters` subsumes `RECONCILE_EXCLUDE`.** Exclusions travel in the scope file (§5)
-  with the rest of the declaration. The environment variable keeps working for one release as a
-  fallback the script honours only when no scope file is present, and is then removed.
+- **`exclude.clusters` names one cluster, not one name.** Entries are the `{projectId, location,
+clusterName}` triple `scopedServiceAccounts` already uses, because cluster names are unique only
+  within a project and location; `prod` and `cluster-1` recur across a folder, and an exclusion
+  prunes, so a bare name would delete a namesake's profile in another project. `RECONCILE_EXCLUDE`
+  keeps its bare-name, management-project-only meaning for one release: the operator renders the
+  scope file only when `spec.scope` is set, the script honours the environment variable only when
+  no scope file is present, and the variable is then removed. The five places that name it as the
+  opt-out (§8) change with it.
 - **Resolution is deterministic.** The resolved project set is sorted before it is listed or written
   anywhere, so two runs against an unchanged fleet produce byte-identical snapshots (§5) and an
   unchanged roster.
@@ -166,20 +174,21 @@ host project only. The project ID is parsed from the asset `name`
 explicit project ID produces, and would never match an `exclude.projects` entry. Everything
 downstream keys on the ID.
 
-The fallback when the Asset API is not enabled is a Resource Manager walk: list the folders under
-the container with `gcloud resource-manager folders list --folder=<F>` recursively, then
-`gcloud projects list --filter='parent.type=folder AND parent.id=<F>'` for each folder found, then
-`clusters list` per project. That is one call per folder plus one per project, needs
-`resourcemanager.folders.list` and `resourcemanager.projects.list` at the container, and has to
-recurse: `parent.id` matches the immediate parent only, so a walk that stops at the declared folder
-misses every project in a sub-folder, silently. The snapshot records which path ran.
+There is no second resolver. The composition already owns host-project API enablement
+(`google_project_service.required` in `terraform/examples/full-install/main.tf`), and
+`cloudasset.googleapis.com` joins that list, so "Asset API not enabled" is not a state an install
+can be in. A Resource Manager walk (`projects list` per folder, recursing) was considered and
+dropped: it is one call per folder plus one per project, needs `resourcemanager.folders.list` and
+`resourcemanager.projects.list` at the container on top of the viewer roles, and `parent.id`
+matches the immediate parent only, so a walk that stops early misses every project in a sub-folder
+silently. An organisation policy that forbids the Asset API is an open question (§11), not a code
+path.
 
-The discovery verbs are absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS`
+The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS`
 (`command_policy.py:277-363`) admits `container clusters list` and `projects list` but no `asset`
-or `resource-manager` command, and `projects list` today serves no scope wider than one. This is
-the class of gap #1126 describes: a discovery read the leaf reads depend on, refused fail-closed
-with no signal. Adding `("asset", "search-all-resources")` and
-`("resource-manager", "folders", "list")` is part of phase 1.
+command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
+refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2,
+with the resolver that needs it.
 
 **Every project gets an outcome, and no outcome is silent.** For each resolved project the run
 records one of:
@@ -201,10 +210,14 @@ scope" and §7's prune would delete every profile under the folder in a single t
 one thing `cluster_agent_reconcile.py:11-15` exists to never do.
 
 `denied` and `unreachable`, for projects and containers alike, are counted in the report the job
-already prints (`report` at `cluster_agent_reconcile.py:228-236`) and make the bootstrap gate's
-roster read as partial rather than complete. This is the lesson of #566: a project the agent was
-told to manage and cannot list is a finding, and folding it into an empty list turns a permission
-gap into a clean fleet.
+already prints (`report` at `cluster_agent_reconcile.py:228-236`). The report already carries one
+bit of this kind, `create_pass_ran`, and the bootstrap gate already acts on it: it runs the script
+with `--require-create-pass`, treats a non-zero exit as "roster not reconciled", and retries up to
+a ceiling. Per-project outcomes extend that from one bit for the whole run to one per project, so
+the gate can hand the sweep a roster that is partial in a named way rather than a roster it can
+only call reconciled or not. This is the lesson of #566: a project the agent was told to manage and
+cannot list is a finding, and folding it into an empty list turns a permission gap into a clean
+fleet.
 
 ## 5. Where the resolved membership lives
 
@@ -255,16 +268,23 @@ follow the selector type:
   `roles/cloudasset.viewer`, on the folder.
 - **Organisation.** `google_organization_iam_member`, same roles, on the organisation.
 
-`container_roles` is `project_roles` minus the two entries that are not viewer roles.
-`roles/iam.serviceAccountUser` is `iam.serviceAccounts.actAs`, held so the agent can run jobs as
-service accounts in its own project; inherited across a folder it would let the one agent identity
-act as every service account in every project beneath, including ones created tomorrow.
-`roles/mcp.toolUser` lets the agent call the GKE MCP server; whether that check runs in the host
-project or in the project a call targets is not measured here, so it stays host-only until it is
-(§11). Both stay bound in the host project only. The remaining six
-(`container.clusterViewer`, `container.viewer`, `compute.viewer`, `monitoring.viewer`,
-`logging.viewer`, `iam.securityReviewer`) are read roles, and they are what a container binding
-carries.
+`container_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
+`project_roles` itself. The allowlist is `container.clusterViewer`, `container.viewer`,
+`compute.viewer`, `monitoring.viewer`, `logging.viewer`, and `iam.securityReviewer`, the read roles
+in the default `project_roles` (`terraform/modules/kube-agents-iam/variables.tf:59-68`). The
+intersection matters on the `custom` permission set, where the operator names `project_roles`
+outright: a list that carries `roles/container.admin` for the host project must not carry it to a
+folder, where `container.clusters.impersonate` would apply to every cluster in every project
+beneath, and #945's `roles/serviceusage.serviceUsageConsumer` must not consume quota fleet-wide by
+inheritance. Widening `project_roles` widens the host project and explicit projects; widening a
+container binding is an edit to the allowlist, in one file, on purpose.
+
+Two default roles are outside the allowlist by design. `roles/iam.serviceAccountUser` is
+`iam.serviceAccounts.actAs`, held so the agent can run jobs as service accounts in its own project;
+inherited across a folder it would let the one agent identity act as every service account in every
+project beneath, including ones created tomorrow. `roles/mcp.toolUser` lets the agent call the GKE
+MCP server; whether that check runs in the host project or in the project a call targets is not
+measured here, so it stays host-only until it is (§11).
 
 Inheritance is the point of offering containers at all. A folder-level binding reaches every
 project beneath it, including one created tomorrow, so onboarding a new project under a declared
@@ -285,9 +305,9 @@ Prerequisites the design has to state and the installer has to preflight:
   `api-disabled`); Terraform must not enable the API in other people's projects.
 - `project_roles` stays the list bound in the host project and in explicit projects, and the
   mirror between it and `read_only_roles` that `tests/test_scoped_sa_pool_iam.py` checks is
-  unchanged. `container_roles` is derived from it by subtraction in one place, with a test that the
-  two excluded roles are the only difference, so a role added to `project_roles` later reaches
-  containers unless someone decides otherwise in that file.
+  unchanged. The `container_roles` allowlist lives beside it with a test that every entry is also
+  in the default `project_roles`, so the allowlist cannot name a role the agent does not otherwise
+  hold.
 
 Uninstall revokes what install granted: `terraform destroy` removes the bindings because Terraform
 owns them, which is the property #588 lost when its revocation lived in a bash function.
@@ -303,11 +323,18 @@ not an error to suppress.
 
 **Removing a project from scope.** Its clusters' profiles are pruned the way `RECONCILE_EXCLUDE`
 prunes a cluster today, on the strength of the declaration rather than of a cloud error. The rule
-has two conditions, both required: the project is absent from the resolved set, _and_ every
+has three conditions, all required: the project is absent from this run's resolved set; every
 declared container resolved `ok` this run, so that the absence is the declaration speaking and not
-a failed lookup (§4). A project that became `denied` because a binding was revoked without editing
-the scope is not pruned; the profiles stay, the outcome is reported, and an operator resolves it
-one way or the other.
+a failed lookup (§4); and the project was present in the previous snapshot's resolved set, so that
+removal is a transition the scope made and not a state it merely finds. The third condition is what
+protects profiles the scope never produced. The `manage-cluster` skill onboards a cluster with an
+explicit `--project` today, and those profiles exist on installs that will upgrade into phase 1
+with an empty scope; without it, the first tick would delete every one of them, which is the
+deletion `cluster_agent_reconcile.py:11-15` exists to never do. A profile whose project is outside
+the scope and was never in it is kept, verified by PRUNE against its own project as today, and
+listed in the snapshot as `unmanaged` so the operator can declare it or delete it. A project that
+became `denied` because a binding was revoked without editing the scope is not pruned; the
+profiles stay, the outcome is reported, and an operator resolves it one way or the other.
 
 **A project that disappears.** Deleted, or moved out from under a declared folder: its clusters
 stop appearing in the resolved set, and PRUNE's per-profile `describe --project=<P>` now returns a
@@ -325,16 +352,17 @@ and unclassified errors leave profiles untouched.
 Discovery and IAM are the mechanism; these are the places that will read wrong once the mechanism
 works. Each is listed with whether it blocks the first phase or follows it.
 
-| Where                                                              | What it assumes                                                                                   | Phase |
-| ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------- | ----- |
-| `agents/platform/scripts/session_kv_server.py:1155`                | `GCP_PROJECT_ID` is the project for every event's console links                                   | 1     |
-| `agents/platform/scripts/platform_mcp_server.py:275-300`           | `get_project_id()` reads one `project:` line from `USER.md`                                       | 1     |
-| `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`          | Delegation needs `--project` from the requester; #953 already asks for enumeration first          | 1     |
-| `terraform/modules/drift-pubsub`                                   | One log sink in `var.project_id`; other projects' audit logs need a sink each into the host topic | 2     |
-| Fleet-audit SOPs and the cost, recommender, and compliance skills  | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot            | 2     |
-| `docs/site/src/content/docs/concepts/cluster-agents.md:24`         | "sweeps the project"                                                                              | docs  |
-| `docs/site/src/content/docs/reference/security-and-iam.md:84`      | "an IAM role grants privileges across all clusters in the project" becomes "in the scope"         | docs  |
-| `docs/site/src/content/docs/reference/credential-isolation.md:218` | Describes `RECONCILE_PROJECT` as the way the script finds its project                             | docs  |
+| Where                                                                                                                                                                                                                                                                            | What it assumes                                                                                                     | Phase |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------- | ----- |
+| `agents/platform/scripts/session_kv_server.py:1155`                                                                                                                                                                                                                              | `GCP_PROJECT_ID` is the project for every event's console links                                                     | 1     |
+| `agents/platform/scripts/platform_mcp_server.py:275-300`                                                                                                                                                                                                                         | `get_project_id()` reads one `project:` line from `USER.md`                                                         | 1     |
+| `agents/platform/skills/cluster-agent-lifecycle/SKILL.md`                                                                                                                                                                                                                        | Delegation needs `--project` from the requester; #953 already asks for enumeration first                            | 1     |
+| `terraform/modules/drift-pubsub`                                                                                                                                                                                                                                                 | One log sink in `var.project_id`; other projects' audit logs need a sink each into the host topic                   | 2     |
+| Fleet-audit SOPs and the cost, recommender, and compliance skills                                                                                                                                                                                                                | Query "the project" for quotas, recommendations, and IAM; need to iterate the snapshot                              | 2     |
+| `docs/site/src/content/docs/concepts/cluster-agents.md:24`                                                                                                                                                                                                                       | "sweeps the project"                                                                                                | docs  |
+| `docs/site/src/content/docs/reference/security-and-iam.md:84`                                                                                                                                                                                                                    | "an IAM role grants privileges across all clusters in the project" becomes "in the scope"                           | docs  |
+| `docs/site/src/content/docs/reference/credential-isolation.md:218`                                                                                                                                                                                                               | Describes the metadata lookup, with `RECONCILE_PROJECT` as its override, as how the script finds its one project    | docs  |
+| `docs/site/src/content/docs/reference/security-and-iam.md:28`, `agents/platform/skills/manage-cluster/SKILL.md:41`, `agents/platform/skills/cluster-agent-lifecycle/SKILL.md:80`, `agents/platform/governance/inventory.md:70`, `agents/chat/scripts/bootstrap_scan_gate.py:331` | Name `RECONCILE_EXCLUDE`, a bare cluster name in one project, as the opt-out; becomes `spec.scope.exclude.clusters` | 1     |
 
 Event delivery from other projects is the largest of these. The event watcher watches through each
 profile's kubeconfig and already labels every metric with `project` and `location`, so Kubernetes
@@ -376,15 +404,17 @@ Each step is shippable alone and live-testable on a shared install by granting i
 into a second project the tester controls.
 
 1. **Explicit projects.** `spec.scope.projects` and `spec.scope.exclude` on the CRD; the operator
-   renders the scope file; `cluster_agent_reconcile.py` iterates the list and writes
-   `fleet_scope.json` with per-project outcomes; `kube-agents-iam` binds `project_roles` per
-   explicit project; the bootstrap gate names non-`ok` projects; `session_kv_server.py` and
-   `platform_mcp_server.py` read the project from the event or the profile identity rather than one
-   environment value. This is the smallest change that manages two projects from one install.
-2. **Folders and organisations.** Asset Inventory resolution, the Resource Manager fallback, and
-   their allowlist entries; container outcomes and the freeze rule; folder- and organisation-level
-   bindings of `container_roles` plus `roles/cloudasset.viewer`; the installer preflight for
-   container IAM permissions; `via` and `containers` in the snapshot.
+   renders the scope file when `spec.scope` is set; `cluster_agent_reconcile.py` iterates the list,
+   applies the three-condition prune, and writes `fleet_scope.json` with per-project outcomes and
+   `unmanaged` profiles; `kube-agents-iam` binds `project_roles` per explicit project; the bootstrap
+   gate names non-`ok` projects; `session_kv_server.py` and `platform_mcp_server.py` read the
+   project from the event or the profile identity rather than one environment value; the five
+   `RECONCILE_EXCLUDE` mentions in §8 point at the new field. This is the smallest change that
+   manages two projects from one install.
+2. **Folders and organisations.** Asset Inventory resolution and its allowlist entry;
+   `cloudasset.googleapis.com` in the composition's API list; container outcomes and the freeze
+   rule; folder- and organisation-level bindings of `container_roles` plus `roles/cloudasset.viewer`;
+   the installer preflight for container IAM permissions; `via` and `containers` in the snapshot.
 3. **Downstream consumers.** The phase-2 rows of §8: audit-log sinks per project or an aggregated
    sink, and the fleet-audit SOPs and cost skills iterating the snapshot.
 4. **Documents.** The architecture edits in §9 and the three site pages in §8, in one PR once
@@ -411,6 +441,11 @@ into a second project the tester controls.
   project a call targets rather than in the caller's project, MCP-backed reads of a scoped project
   fail while `gcloud` reads succeed, and the role has to join `container_roles`. One call against a
   second project settles it.
+- **An organisation policy against the Asset API.** §4 has one resolver and assumes the host
+  project can enable `cloudasset.googleapis.com`. An organisation that forbids it would need the
+  Resource Manager walk §4 rejected, or would be told folders and organisations are unavailable to
+  it. Which of those is right depends on whether such a policy exists among the installs that want
+  this.
 - **Who may widen the scope.** Editing `spec.scope` is a Kubernetes RBAC question on the
   management cluster; granting into a folder is a GCP IAM question. They are enforced by different
   systems and can disagree. The design assumes the tfvars is the source of both and the CR is
