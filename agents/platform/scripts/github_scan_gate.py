@@ -84,6 +84,8 @@ SWEEPS_ENV = "GITHUB_WATCHER_SWEEPS"
 ASSIGNEE = "platform"
 
 RESOLVER_REL = "skills/github-issue-resolver/scripts/resolver.py"
+PLATFORM_PROFILE_DIR = "profiles/platform"
+PLATFORM_TEMPLATE_DIR = "/opt/platform-template"
 
 # `resolver.py poll` sweeps stale issues before it queries, so it is not a
 # read-only call and its runtime is not bounded by a single request.
@@ -190,7 +192,17 @@ def selected_sweeps() -> tuple[tuple[str, ...], list[str]]:
 
 
 def _resolver_path() -> Path:
-    return hermes_home() / RESOLVER_REL
+    home = hermes_home()
+    candidates = (
+        home / PLATFORM_PROFILE_DIR / RESOLVER_REL,
+        home / RESOLVER_REL,
+        Path(PLATFORM_TEMPLATE_DIR) / RESOLVER_REL,
+        Path(__file__).resolve().parent.parent / RESOLVER_REL,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return home / RESOLVER_REL
 
 
 def run_resolver_poll() -> dict:
