@@ -1237,12 +1237,28 @@ home and one per profile — gets the same skeleton of working directories in th
 **[`sandbox_mirror.py`](../../deploy/shared/sandbox_mirror.py) does the mirroring, and it
 runs on the agent pod.** That side has the three things the job needs and the sandbox has
 none of them: the profile list, the SSH key, and the files themselves. It runs from the
-agent entrypoint (step 5.7, backgrounded and non-fatal, gated on the bootstrap primary so
+agent entrypoint (step 5.7, in the foreground, gated on the bootstrap primary so
 two replicas do not both push) and again from `cluster_agent_profile.py` when a profile is
 scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart to get its
 directories. Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
+
+**Two of its failures hold the agent pod down and the rest do not**, which is a distinction
+the exit codes carry rather than a judgement the entrypoint makes. A `--remote-root` that is
+not the sandbox's volume and a copy that ran and failed both leave the model's files
+stranded on the agent pod where its shell cannot see them, and coming up healthy in that
+state is the outcome the mirror exists to prevent — so those exit `EXIT_FATAL` and the
+container refuses to start, which `getDeploymentStatusDetails` surfaces as a Degraded CR
+naming this container. Everything else exits `EXIT_RETRY`: the entrypoint warns and the
+agent starts. That split is load-bearing rather than tidy. Everything under the sandbox's
+`/opt/data` is owned by uid 1000, so the model decides what the layout push finds there,
+and while any non-zero exit was fatal a single `touch /opt/data/scratch` from a sandbox
+shell was a permanent `CrashLoopBackOff` — nothing on either side cleared it, and the agent
+could not repair what had to be running to be asked. The push now moves a non-directory
+aside to `<name>.displaced-<stamp>` and carries on; the sandbox's own entrypoint does the
+same for a home root, where `install -d` had the identical problem and no pod left to exec
+into.
 
 **The migration is the same mechanism run once.** An install that upgrades into the
 sandbox has files on the agent pod's PVC that the model will look for and not find —
@@ -2134,11 +2150,11 @@ expires. mTLS is the fix and is not deployed.
 
 ### The relay path
 
-`GOOGLE_CHAT_RELAY_URL` points at the proxy Service rather than `127.0.0.1`;
-`SLACK_RELAY_URL` stays on loopback, and the gateway needs no new ingress rule for either.
-Both Google Chat directions are gateway-initiated pulls against `/v1/chat/events` on the
-relay, so moving the relay out of the gateway pod does not reverse the direction of any
-connection.
+`GOOGLE_CHAT_RELAY_URL` and `SLACK_RELAY_URL` both point at the proxy Service rather than
+`127.0.0.1` — the relay listener moved with the broker, so both follow it — and the gateway
+needs no new ingress rule for either. Both Google Chat directions are gateway-initiated
+pulls against `/v1/chat/events` on the relay, so moving the relay out of the gateway pod
+does not reverse the direction of any connection.
 
 ### The workspace check, and why the `cwd` stopped being sent
 
