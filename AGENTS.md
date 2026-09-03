@@ -350,7 +350,10 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
 three repetitions each — and has been merge-blocking since 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
 against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
-batch changes rather than stacking pushes.
+batch changes rather than stacking pushes. A merge elsewhere need not restart it: a green status
+is re-pinned to the new head of `main`, when that lands before Tide's next sync, so Tide keeps
+crediting it
+([`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges)).
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
