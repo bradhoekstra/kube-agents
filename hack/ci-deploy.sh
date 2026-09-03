@@ -35,9 +35,25 @@ readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
 # so a Helm formatting change cannot silently blind the guard.
 readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 
+# The keypair the agent uses to reach its shell sandbox over SSH. Generated per
+# run and thrown away with the lease: nothing outside this cluster ever sees it,
+# and the next run's install gets a pair of its own.
+readonly SANDBOX_SSH_KEY_TYPE="ed25519"
+readonly SANDBOX_SSH_KEY_COMMENT="kube-agents-ci-eval"
+
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "ERROR: GEMINI_API_KEY environment variable is required"
+  exit 1
+fi
+
+# Checked here rather than where the key is generated, because the failure it
+# prevents is invisible for fifteen minutes: with no public half in
+# platform-agent-secrets the chart renders no <name>-shell-authorized-keys, and
+# the sandbox pod then sits in ContainerCreating on a `secret not found` mount
+# error until step 6's rollout gate times out. Fail at second zero instead.
+if ! command -v ssh-keygen >/dev/null 2>&1; then
+  echo "ERROR: ssh-keygen is required to generate the shell sandbox keypair"
   exit 1
 fi
 
@@ -348,6 +364,23 @@ if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}"
 fi
 
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
+
+# ─── 5b. The shell sandbox keypair ────────────────────────────────────────────
+# The chart cannot generate this one — sprig emits PEM and has no encoder for
+# authorized_keys form — so every install surface supplies it: `install.sh`
+# through the Terraform composition's tls_private_key, `upgrade.sh` through
+# backfill_sandbox_ssh_key, and this job here. Without it the chart renders no
+# authorized-keys Secret and the sandbox never starts.
+#
+# --set-file rather than --set-string: the private half is a PEM, and Helm's
+# --set parser reads its newlines and commas as syntax. Both halves go into
+# credentials.data, which is where the chart's authorized-keys template reads
+# the public one from and where the gateway's init container finds the private
+# one.
+SANDBOX_KEY_DIR="$(umask 077 && mktemp -d)"
+ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}" \
+  -f "${SANDBOX_KEY_DIR}/id_sandbox"
+
 helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --namespace "${NAMESPACE}" --create-namespace \
   --set-string "operator.image.repository=${AR_REPO}/kube-agents-operator" \
@@ -365,12 +398,18 @@ helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --set "platformAgent.credentials.create=true" \
   --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
   --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \
+  --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${SANDBOX_KEY_DIR}/id_sandbox" \
+  --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
   --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
   --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
   --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
   --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
   --wait --timeout 15m
+# Deleted here rather than from the EXIT trap, which two later steps replace.
+# A failed install leaves the directory behind in a pod prow destroys with the
+# lease, and nothing uploads it — /logs/artifacts is the only path off this box.
+rm -rf "${SANDBOX_KEY_DIR}"
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────
