@@ -293,8 +293,12 @@ waiting on it.
 `/hold cancel` releases it — #1045 held that way for a smoke test. `/override <context>`, which only
 a repository admin can use, forces a required check that cannot pass on its own — and expires: the
 forced status embeds the base SHA at override time, so the next merge to `main` invalidates it and
-Tide re-runs the job. `/override-sticky` writes the `[prow:skip-retest]` sentinel instead, which
-Tide accepts regardless of base, so it survives `main` moving (#1202).
+Tide re-runs the job, so an override has to be repeated if `main` moves before Tide merges (#1202).
+Prow's `/override-sticky` would write the `[prow:skip-retest]` sentinel instead, which Tide accepts
+regardless of base — but it is not in the Prow build this repository merges through: the
+[plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
+`/override`, and the command is silently ignored. A green run of the job is a different matter,
+below.
 
 **Branch protection is not the gate and reads as though there is none.** `main` requires ten
 contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
