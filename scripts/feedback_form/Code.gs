@@ -21,6 +21,7 @@ const FORM_ID_PROPERTY = 'FORM_ID';
 // seen within this window is not filed again.
 const FILED_CACHE_PREFIX = 'filed:';
 const FILED_CACHE_SECONDS = 6 * 60 * 60;
+const LOCK_WAIT_MS = 30 * 1000;
 const SUBMIT_HANDLER = 'onFormSubmit';
 const FORM_TITLE = 'kube-agents feedback';
 const FORM_DESCRIPTION =
@@ -199,13 +200,10 @@ function addQuestion(form, q) {
  * fires this trigger twice for one submission.
  */
 function onFormSubmit(e) {
-  const cache = CacheService.getScriptCache();
-  const seenKey = FILED_CACHE_PREFIX + e.response.getId();
-  if (cache.get(seenKey)) {
+  if (!claimResponse(e.response.getId())) {
     Logger.log('Response %s already handled; skipping duplicate trigger.', e.response.getId());
     return;
   }
-  cache.put(seenKey, '1', FILED_CACHE_SECONDS);
 
   const answers = answersByKey(e.response);
   const issue = buildIssue(answers, e.source.getPublishedUrl());
@@ -219,6 +217,27 @@ function onFormSubmit(e) {
       Logger.log('Could not email the owner about the failure below: %s', mailErr);
     }
     throw err;
+  }
+}
+
+/**
+ * Marks a response id as handled and says whether this execution was the
+ * one to do it. The check and the mark happen under the script lock, so two
+ * executions that start together for the same response cannot both win.
+ */
+function claimResponse(responseId) {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_WAIT_MS);
+  try {
+    const cache = CacheService.getScriptCache();
+    const seenKey = FILED_CACHE_PREFIX + responseId;
+    if (cache.get(seenKey)) {
+      return false;
+    }
+    cache.put(seenKey, '1', FILED_CACHE_SECONDS);
+    return true;
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -247,9 +266,11 @@ function buildIssue(answers, formUrl) {
     labels.push(KIND_LABELS[answers.kind]);
   }
 
+  // Plain text, not italics: a reporter name containing `_` would otherwise
+  // end the emphasis early.
   const lines = [
-    '_Filed from the [feedback form](' + formUrl + ') on behalf of an outside reporter. ' +
-      'Reporter: ' + reporter + '. Contact details, if given, are in the form responses, not here._',
+    'Filed from the [feedback form](' + formUrl + ') on behalf of an outside reporter. ' +
+      'Reporter: ' + reporter + '. Contact details, if given, are in the form responses, not here.',
     '',
     '**Kind:** ' + (answers.kind || NOT_GIVEN),
   ];

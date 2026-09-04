@@ -40,8 +40,9 @@ One person owns the form and the script; today that is the maintainer who create
 
 1. Open <https://script.google.com>, create a new project, replace the default file with
    `Code.gs`, and save.
-2. Run `setup` once from the editor and grant the permissions it asks for: Forms,
-   Drive (to create the form), external requests (GitHub), and Mail (failure alerts).
+2. Run `setup` once from the editor and grant the permissions it asks for. They cover Forms,
+   Drive (to create the form), external requests (GitHub), Mail (failure alerts), and
+   managing the project's triggers.
    It logs the share link and the edit link. It records the form id in the `FORM_ID` script
    property as soon as the form exists, and every later step is safe to repeat, so if a run
    throws partway, run it again and it finishes the form rather than creating another.
@@ -49,8 +50,12 @@ One person owns the form and the script; today that is the maintainer who create
    error message says so.
 3. Create a GitHub token for the script. A fine-grained personal access token, resource
    owner `gke-labs`, repository access limited to `kube-agents`, permission Issues:
-   Read and write, nothing else. Fine-grained tokens expire; set a calendar reminder for the
-   expiry, because the first sign of an expired token is the failure email below.
+   Read and write, nothing else. The account behind it needs write access to the
+   repository as well: GitHub sets labels on a new issue only for a caller with push
+   access and silently drops them otherwise, so a lesser account gets issues filed
+   without `external-feedback` and no error. Fine-grained tokens expire; set a calendar
+   reminder for the expiry, because the first sign of an expired token is the failure email
+   below.
 4. In the Apps Script project, Project Settings, Script Properties, add `GITHUB_TOKEN` with
    that value. The token lives only there.
 5. Submit the form once yourself and check the issue arrives with the right labels. Close
@@ -89,4 +94,4 @@ this repository (403), and a GitHub outage.
 - **Retiring it.** Close the form to responses, delete the trigger, revoke the token, remove
   the redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
   guide and the root `README.md`. If this directory goes too, drop its row from
-  `docs/README.md`.
+  `docs/README.md` and its mention in the tree at the top of that file.
