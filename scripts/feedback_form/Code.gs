@@ -26,6 +26,18 @@ const TOKEN_PROPERTY = 'GITHUB_TOKEN';
 const APP_JWT_LIFETIME_SECONDS = 9 * 60; // GitHub's ceiling is ten minutes
 const APP_JWT_BACKDATE_SECONDS = 60; // tolerates clock skew against GitHub
 const PEM_HEADER = '-----BEGIN';
+// GitHub downloads App keys as PKCS#1 ("BEGIN RSA PRIVATE KEY"). Apps Script's
+// signer wants PKCS#8 ("BEGIN PRIVATE KEY"), which is the same key inside a
+// DER wrapper naming the rsaEncryption algorithm. The script does the wrapping.
+const PKCS1_LABEL = 'RSA PRIVATE KEY';
+const PKCS8_LABEL = 'PRIVATE KEY';
+const PEM_LINE_LENGTH = 64;
+const DER_SEQUENCE = 0x30;
+const DER_OCTET_STRING = 0x04;
+// version INTEGER 0, then AlgorithmIdentifier { OID 1.2.840.113549.1.1.1, NULL }
+const PKCS8_RSA_PREAMBLE = [
+  0x02, 0x01, 0x00, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+];
 const FORM_ID_PROPERTY = 'FORM_ID';
 // Apps Script can fire a submit trigger twice for one response. A response id
 // seen within this window is not filed again.
@@ -276,8 +288,11 @@ function answersByKey(response) {
 
 function buildIssue(answers, formUrl) {
   // Truncate on code points, not UTF-16 units, so a 120-unit cut cannot
-  // split an emoji into a lone surrogate.
-  const title = Array.from(answers.title || DEFAULT_TITLE).slice(0, TITLE_MAX_CHARS).join('');
+  // split an emoji into a lone surrogate. A summary longer than the title
+  // allows is kept whole in the body, so nothing the reporter wrote is lost.
+  const summary = Array.from(answers.title || DEFAULT_TITLE);
+  const title = summary.slice(0, TITLE_MAX_CHARS).join('');
+  const overflow = summary.length > TITLE_MAX_CHARS;
   const reporter = answers.name || NOT_GIVEN;
   const labels = [LABEL];
   if (Object.prototype.hasOwnProperty.call(KIND_LABELS, answers.kind)) {
@@ -292,6 +307,9 @@ function buildIssue(answers, formUrl) {
     '',
     '**Kind:** ' + (answers.kind || NOT_GIVEN),
   ];
+  if (overflow) {
+    lines.push('', '## Summary', '', summary.join(''));
+  }
   BODY_SECTIONS.forEach(function (s) {
     const text = answers[s.key];
     if (text) {
@@ -329,14 +347,55 @@ function authToken() {
 
 /**
  * Accepts the key as pasted into the properties UI (real newlines), as it
- * often arrives through a shell (literal backslash-n), or as one base64 line.
+ * often arrives through a shell (literal backslash-n), or as one base64 line,
+ * in either PKCS#1 or PKCS#8, and returns a PKCS#8 PEM the signer accepts.
  */
 function normalisePem(value) {
   let pem = value.replace(/\\n/g, '\n').trim();
   if (pem.indexOf(PEM_HEADER) !== 0) {
     pem = Utilities.newBlob(Utilities.base64Decode(pem)).getDataAsString().trim();
   }
-  return pem;
+  const parsed = parsePem(pem);
+  if (parsed.label === PKCS8_LABEL) {
+    return pem;
+  }
+  if (parsed.label === PKCS1_LABEL) {
+    return toPem(PKCS8_LABEL, wrapPkcs1AsPkcs8(parsed.der));
+  }
+  throw new Error('Unsupported key type "' + parsed.label + '"; expected an RSA private key.');
+}
+
+function parsePem(pem) {
+  const m = pem.match(/-----BEGIN ([^-]+)-----([\s\S]*?)-----END \1-----/);
+  if (!m) {
+    throw new Error('Script property ' + APP_PRIVATE_KEY_PROPERTY + ' is not a PEM block.');
+  }
+  return { label: m[1], der: Utilities.base64Decode(m[2].replace(/\s+/g, '')) };
+}
+
+function toPem(label, der) {
+  const b64 = Utilities.base64Encode(der);
+  const lines = [];
+  for (let i = 0; i < b64.length; i += PEM_LINE_LENGTH) {
+    lines.push(b64.slice(i, i + PEM_LINE_LENGTH));
+  }
+  return '-----BEGIN ' + label + '-----\n' + lines.join('\n') + '\n-----END ' + label + '-----';
+}
+
+function wrapPkcs1AsPkcs8(pkcs1) {
+  const inner = PKCS8_RSA_PREAMBLE.concat([DER_OCTET_STRING], derLength(pkcs1.length), pkcs1);
+  return [DER_SEQUENCE].concat(derLength(inner.length), inner);
+}
+
+function derLength(n) {
+  if (n < 0x80) {
+    return [n];
+  }
+  const bytes = [];
+  for (let v = n; v > 0; v = Math.floor(v / 0x100)) {
+    bytes.unshift(v % 0x100);
+  }
+  return [0x80 | bytes.length].concat(bytes);
 }
 
 /**

@@ -55,9 +55,20 @@ One person owns the form and the script; today that is the maintainer who create
    credential to revoke without touching the bot.
 4. In the Apps Script project, Project Settings, Script Properties, add `GITHUB_APP_ID`
    with the App's id (`4437198`, the value the bot service runs with) and
-   `GITHUB_APP_PRIVATE_KEY` with the downloaded PEM pasted whole. The key lives only there.
-   For each submission the script signs a JWT with it and exchanges that for a token good
-   for this repository and Issues: write, nothing else.
+   `GITHUB_APP_PRIVATE_KEY` with the downloaded PEM pasted whole. GitHub issues the key in
+   PKCS#1 form (`BEGIN RSA PRIVATE KEY`) and Apps Script's signer takes PKCS#8; the script
+   converts, so no `openssl` step is needed. For each submission it signs a JWT with the key
+   and exchanges that for a token it asks to be limited to this repository and Issues:
+   write.
+
+   Be clear about what that key is. The limit above is something the script requests per
+   token; the key itself is the App's full identity and can mint a token with every
+   permission the App holds on every repository it is installed on, including pull request
+   reviews and check runs. Anyone who can read the script's properties, which is every editor
+   of the Apps Script project, holds that. Keep the project to its owner. A fine-grained
+   personal token is the narrower credential if that trade is preferred; see the fallback
+   below.
+
 5. Submit the form once yourself and check the issue arrives with the right labels, authored
    by `kube-agents-bot`. Close that issue.
 
