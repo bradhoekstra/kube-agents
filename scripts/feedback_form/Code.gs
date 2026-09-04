@@ -31,6 +31,7 @@ const GITHUB_API_VERSION = '2022-11-28';
 const HTTP_CREATED = 201;
 const TITLE_MAX_CHARS = 120;
 const NOT_GIVEN = 'not given';
+const DEFAULT_TITLE = 'Feedback from the form';
 
 // Form questions in display order. `key` is how onFormSubmit reads an answer,
 // `title` is what the responder sees and is also the match key, so a title
@@ -109,18 +110,30 @@ const BODY_SECTIONS = [
 
 /**
  * One-time setup: creates the form, adds the questions, and installs the
- * submit trigger. Safe to re-run; it refuses if a form already exists.
+ * submit trigger. Re-running it reports the existing form. The form id is
+ * recorded the moment the form exists, so a later step throwing (the
+ * external-sharing call below is the likely one) leaves a form this
+ * function can find and finish rather than an orphan in Drive.
  */
 function setup() {
   const props = PropertiesService.getScriptProperties();
   const existing = props.getProperty(FORM_ID_PROPERTY);
   if (existing) {
-    const form = FormApp.openById(existing);
+    let form;
+    try {
+      form = FormApp.openById(existing);
+    } catch (err) {
+      throw new Error(
+        'Script property ' + FORM_ID_PROPERTY + ' names form ' + existing + ', which cannot be opened (' +
+          err + '). If that form was deleted, remove the property and run setup again.'
+      );
+    }
     Logger.log('Form already exists. Share: %s  Edit: %s', form.getPublishedUrl(), form.getEditUrl());
     return;
   }
 
   const form = FormApp.create(FORM_TITLE);
+  props.setProperty(FORM_ID_PROPERTY, form.getId());
   form.setDescription(FORM_DESCRIPTION);
   form.setConfirmationMessage(CONFIRMATION_MESSAGE);
   // Anyone with the link, no sign-in. This is the whole point: the people this
@@ -136,7 +149,6 @@ function setup() {
   });
 
   ScriptApp.newTrigger(SUBMIT_HANDLER).forForm(form).onFormSubmit().create();
-  props.setProperty(FORM_ID_PROPERTY, form.getId());
 
   Logger.log('Share this link: %s', form.getPublishedUrl());
   Logger.log('Edit the form here: %s', form.getEditUrl());
@@ -165,7 +177,8 @@ function addQuestion(form, q) {
  * Installed trigger: files the submission as a GitHub issue. On failure it
  * emails the form owner the full issue so nothing is lost, then rethrows so
  * the failure also shows in the Apps Script executions log. The submission
- * itself stays in the form's responses either way.
+ * itself stays in the form's responses either way. A failure to send the
+ * email is logged and does not replace the GitHub error being rethrown.
  */
 function onFormSubmit(e) {
   const answers = answersByKey(e.response);
@@ -174,7 +187,11 @@ function onFormSubmit(e) {
     const url = createIssue(issue);
     Logger.log('Filed %s', url);
   } catch (err) {
-    notifyOwner(issue, err);
+    try {
+      notifyOwner(issue, err);
+    } catch (mailErr) {
+      Logger.log('Could not email the owner about the failure below: %s', mailErr);
+    }
     throw err;
   }
 }
@@ -195,12 +212,13 @@ function answersByKey(response) {
 }
 
 function buildIssue(answers, formUrl) {
-  const title = (answers.title || 'Feedback from the form').slice(0, TITLE_MAX_CHARS);
+  // Truncate on code points, not UTF-16 units, so a 120-unit cut cannot
+  // split an emoji into a lone surrogate.
+  const title = Array.from(answers.title || DEFAULT_TITLE).slice(0, TITLE_MAX_CHARS).join('');
   const reporter = answers.name || NOT_GIVEN;
   const labels = [LABEL];
-  const kindLabel = KIND_LABELS[answers.kind];
-  if (kindLabel) {
-    labels.push(kindLabel);
+  if (Object.prototype.hasOwnProperty.call(KIND_LABELS, answers.kind)) {
+    labels.push(KIND_LABELS[answers.kind]);
   }
 
   const lines = [

@@ -66,8 +66,8 @@ kube-agents/
 ├── examples/                                      gitops-repo template + inference/
 │                                                  integration READMEs
 ├── k8s-operator/                                  operator, event watcher, Minty READMEs
-├── scripts/                                       installer/, dev/, release/ and
-│                                                  testdata/ READMEs
+├── scripts/                                       installer/, dev/, release/,
+│                                                  feedback_form/ and testdata/ READMEs
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
 └── tests/e2e/                                     Google Chat E2E suite README
