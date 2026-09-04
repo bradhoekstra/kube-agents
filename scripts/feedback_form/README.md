@@ -4,11 +4,10 @@ A public Google Form that files each submission as an issue on `gke-labs/kube-ag
 labelled `external-feedback`. `Code.gs` is the Google Apps Script behind it; it runs in
 Apps Script, not in this repository, and this file is the record of how it is set up.
 
-The live form is
-<https://docs.google.com/forms/d/e/1FAIpQLSfw5eGttWOrii7bvSUmALmRbqpxDRWKmdHoImEZZNe6hOtVtQ/viewform>.
-The docs site serves <https://gke-labs.github.io/kube-agents/feedback> as a redirect to it,
-configured in `docs/site/astro.config.mjs`; that short link is the one to publish, and the
-line above is where to check the long one against if the form is ever recreated.
+The link to publish is <https://gke-labs.github.io/kube-agents/feedback>. It is a redirect
+the docs site serves to the form's own URL, and `FEEDBACK_FORM_URL` in
+`docs/site/astro.config.mjs` is the one place that URL is recorded. If the form is ever
+recreated, change it there.
 
 ## Why it exists
 
@@ -43,10 +42,11 @@ One person owns the form and the script; today that is the maintainer who create
    `Code.gs`, and save.
 2. Run `setup` once from the editor and grant the permissions it asks for: Forms,
    Drive (to create the form), external requests (GitHub), and Mail (failure alerts).
-   It logs the share link and the edit link. Re-running it reports the existing form rather
-   than creating another. It records the form id in the `FORM_ID` script property as soon
-   as the form exists; if the form is ever deleted, remove that property before running
-   `setup` again, and it tells you so.
+   It logs the share link and the edit link. It records the form id in the `FORM_ID` script
+   property as soon as the form exists, and every later step is safe to repeat, so if a run
+   throws partway, run it again and it finishes the form rather than creating another.
+   If the form is ever deleted, remove that property before running `setup` again; the
+   error message says so.
 3. Create a GitHub token for the script. A fine-grained personal access token, resource
    owner `gke-labs`, repository access limited to `kube-agents`, permission Issues:
    Read and write, nothing else. Fine-grained tokens expire; set a calendar reminder for the
@@ -86,5 +86,7 @@ this repository (403), and a GitHub outage.
   that account's record with GitHub as well as on the repository. If volume grows, move the
   token to a machine account with write access to the repository and nothing else.
 - **Rotating the token.** Replace the `GITHUB_TOKEN` script property. Nothing else changes.
-- **Retiring it.** Close the form to responses, delete the trigger, revoke the token, and
-  remove the link from the contributing guide.
+- **Retiring it.** Close the form to responses, delete the trigger, revoke the token, remove
+  the redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
+  guide and the root `README.md`. If this directory goes too, drop its row from
+  `docs/README.md`.

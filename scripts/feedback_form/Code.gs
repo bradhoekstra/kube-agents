@@ -17,6 +17,10 @@ const REPO = 'gke-labs/kube-agents';
 const LABEL = 'external-feedback';
 const TOKEN_PROPERTY = 'GITHUB_TOKEN';
 const FORM_ID_PROPERTY = 'FORM_ID';
+// Apps Script can fire a submit trigger twice for one response. A response id
+// seen within this window is not filed again.
+const FILED_CACHE_PREFIX = 'filed:';
+const FILED_CACHE_SECONDS = 6 * 60 * 60;
 const SUBMIT_HANDLER = 'onFormSubmit';
 const FORM_TITLE = 'kube-agents feedback';
 const FORM_DESCRIPTION =
@@ -109,17 +113,18 @@ const BODY_SECTIONS = [
 ];
 
 /**
- * One-time setup: creates the form, adds the questions, and installs the
- * submit trigger. Re-running it reports the existing form. The form id is
- * recorded the moment the form exists, so a later step throwing (the
- * external-sharing call below is the likely one) leaves a form this
- * function can find and finish rather than an orphan in Drive.
+ * Setup: creates the form if none is recorded, then brings it to the
+ * configured state. Every step is safe to repeat, so a run that threw
+ * partway (the external-sharing call is the likely one) is finished by
+ * running it again: the form id is recorded the moment the form exists,
+ * settings are re-applied, questions are added only to an empty form, and
+ * the submit trigger is created only if this form has none.
  */
 function setup() {
   const props = PropertiesService.getScriptProperties();
+  let form;
   const existing = props.getProperty(FORM_ID_PROPERTY);
   if (existing) {
-    let form;
     try {
       form = FormApp.openById(existing);
     } catch (err) {
@@ -128,12 +133,11 @@ function setup() {
           err + '). If that form was deleted, remove the property and run setup again.'
       );
     }
-    Logger.log('Form already exists. Share: %s  Edit: %s', form.getPublishedUrl(), form.getEditUrl());
-    return;
+  } else {
+    form = FormApp.create(FORM_TITLE);
+    props.setProperty(FORM_ID_PROPERTY, form.getId());
   }
 
-  const form = FormApp.create(FORM_TITLE);
-  props.setProperty(FORM_ID_PROPERTY, form.getId());
   form.setDescription(FORM_DESCRIPTION);
   form.setConfirmationMessage(CONFIRMATION_MESSAGE);
   // Anyone with the link, no sign-in. This is the whole point: the people this
@@ -144,17 +148,29 @@ function setup() {
   form.setLimitOneResponsePerUser(false);
   form.setAllowResponseEdits(false);
 
-  QUESTIONS.forEach(function (q) {
-    addQuestion(form, q);
-  });
+  if (form.getItems().length === 0) {
+    QUESTIONS.forEach(function (q) {
+      addQuestion(form, q);
+    });
+  } else {
+    Logger.log('Form already has questions; leaving them as they are.');
+  }
 
-  ScriptApp.newTrigger(SUBMIT_HANDLER).forForm(form).onFormSubmit().create();
+  if (!hasSubmitTrigger(form)) {
+    ScriptApp.newTrigger(SUBMIT_HANDLER).forForm(form).onFormSubmit().create();
+  }
 
   Logger.log('Share this link: %s', form.getPublishedUrl());
   Logger.log('Edit the form here: %s', form.getEditUrl());
   if (!props.getProperty(TOKEN_PROPERTY)) {
     Logger.log('Now set the %s script property (Project Settings > Script Properties).', TOKEN_PROPERTY);
   }
+}
+
+function hasSubmitTrigger(form) {
+  return ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getTriggerSourceId() === form.getId() && t.getHandlerFunction() === SUBMIT_HANDLER;
+  });
 }
 
 function addQuestion(form, q) {
@@ -179,8 +195,18 @@ function addQuestion(form, q) {
  * the failure also shows in the Apps Script executions log. The submission
  * itself stays in the form's responses either way. A failure to send the
  * email is logged and does not replace the GitHub error being rethrown.
+ * A response id seen recently is skipped, because the platform sometimes
+ * fires this trigger twice for one submission.
  */
 function onFormSubmit(e) {
+  const cache = CacheService.getScriptCache();
+  const seenKey = FILED_CACHE_PREFIX + e.response.getId();
+  if (cache.get(seenKey)) {
+    Logger.log('Response %s already handled; skipping duplicate trigger.', e.response.getId());
+    return;
+  }
+  cache.put(seenKey, '1', FILED_CACHE_SECONDS);
+
   const answers = answersByKey(e.response);
   const issue = buildIssue(answers, e.source.getPublishedUrl());
   try {
