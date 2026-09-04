@@ -9,13 +9,23 @@
  * file has the setup steps and the operating notes.
  *
  * Runs in Google Apps Script, not in this repository. Paste it into a new
- * project at script.google.com, run `setup` once, then set the GitHub token as
- * a script property.
+ * project at script.google.com, run `setup` once, then give it the
+ * kube-agents-bot App's id and a private key as script properties.
  */
 
 const REPO = 'gke-labs/kube-agents';
 const LABEL = 'external-feedback';
+// Credentials. Issues are filed as the kube-agents-bot GitHub App: the script
+// signs a short-lived JWT with the App's private key, exchanges it for an
+// installation token limited to this repository and Issues: write, and uses
+// that token once. A personal token in TOKEN_PROPERTY is the fallback when
+// no App key is set.
+const APP_ID_PROPERTY = 'GITHUB_APP_ID';
+const APP_PRIVATE_KEY_PROPERTY = 'GITHUB_APP_PRIVATE_KEY';
 const TOKEN_PROPERTY = 'GITHUB_TOKEN';
+const APP_JWT_LIFETIME_SECONDS = 9 * 60; // GitHub's ceiling is ten minutes
+const APP_JWT_BACKDATE_SECONDS = 60; // tolerates clock skew against GitHub
+const PEM_HEADER = '-----BEGIN';
 const FORM_ID_PROPERTY = 'FORM_ID';
 // Apps Script can fire a submit trigger twice for one response. A response id
 // seen within this window is not filed again.
@@ -31,8 +41,12 @@ const FORM_DESCRIPTION =
 const CONFIRMATION_MESSAGE =
   'Thanks. Your report is being filed as a public issue on ' +
   'github.com/gke-labs/kube-agents/issues and should appear there within a minute.';
-const ISSUES_API_URL = 'https://api.github.com/repos/' + REPO + '/issues';
+const API_BASE_URL = 'https://api.github.com';
+const ISSUES_API_URL = API_BASE_URL + '/repos/' + REPO + '/issues';
+const REPO_INSTALLATION_URL = API_BASE_URL + '/repos/' + REPO + '/installation';
+const INSTALLATIONS_URL = API_BASE_URL + '/app/installations/';
 const GITHUB_API_VERSION = '2022-11-28';
+const HTTP_OK = 200;
 const HTTP_CREATED = 201;
 const TITLE_MAX_CHARS = 120;
 const NOT_GIVEN = 'not given';
@@ -163,8 +177,12 @@ function setup() {
 
   Logger.log('Share this link: %s', form.getPublishedUrl());
   Logger.log('Edit the form here: %s', form.getEditUrl());
-  if (!props.getProperty(TOKEN_PROPERTY)) {
-    Logger.log('Now set the %s script property (Project Settings > Script Properties).', TOKEN_PROPERTY);
+  if (!props.getProperty(APP_PRIVATE_KEY_PROPERTY) && !props.getProperty(TOKEN_PROPERTY)) {
+    Logger.log(
+      'Now set the %s and %s script properties (Project Settings > Script Properties).',
+      APP_ID_PROPERTY,
+      APP_PRIVATE_KEY_PROPERTY
+    );
   }
 }
 
@@ -285,25 +303,96 @@ function buildIssue(answers, formUrl) {
 }
 
 function createIssue(issue) {
-  const token = PropertiesService.getScriptProperties().getProperty(TOKEN_PROPERTY);
-  if (!token) {
-    throw new Error('Script property ' + TOKEN_PROPERTY + ' is not set. See README.md.');
+  return githubJson('post', ISSUES_API_URL, authToken(), issue, HTTP_CREATED).html_url;
+}
+
+/**
+ * The bearer token to file with: a fresh installation token for the App when
+ * its id and key are configured, otherwise the personal token.
+ */
+function authToken() {
+  const props = PropertiesService.getScriptProperties();
+  const appId = props.getProperty(APP_ID_PROPERTY);
+  const pem = props.getProperty(APP_PRIVATE_KEY_PROPERTY);
+  if (appId && pem) {
+    return installationToken(appId, normalisePem(pem));
   }
-  const res = UrlFetchApp.fetch(ISSUES_API_URL, {
-    method: 'post',
-    contentType: 'application/json',
+  const token = props.getProperty(TOKEN_PROPERTY);
+  if (token) {
+    return token;
+  }
+  throw new Error(
+    'No credentials: set script properties ' + APP_ID_PROPERTY + ' and ' + APP_PRIVATE_KEY_PROPERTY +
+      ' (or ' + TOKEN_PROPERTY + '). See README.md.'
+  );
+}
+
+/**
+ * Accepts the key as pasted into the properties UI (real newlines), as it
+ * often arrives through a shell (literal backslash-n), or as one base64 line.
+ */
+function normalisePem(value) {
+  let pem = value.replace(/\\n/g, '\n').trim();
+  if (pem.indexOf(PEM_HEADER) !== 0) {
+    pem = Utilities.newBlob(Utilities.base64Decode(pem)).getDataAsString().trim();
+  }
+  return pem;
+}
+
+/**
+ * Exchanges an App JWT for an installation token that can write issues on
+ * this repository and nothing else. Minted per submission; volume is low and
+ * a token is good for an hour, so there is nothing worth caching.
+ */
+function installationToken(appId, pem) {
+  const jwt = appJwt(appId, pem);
+  const installation = githubJson('get', REPO_INSTALLATION_URL, jwt, null, HTTP_OK);
+  const repoName = REPO.split('/')[1];
+  const grant = githubJson(
+    'post',
+    INSTALLATIONS_URL + installation.id + '/access_tokens',
+    jwt,
+    { repositories: [repoName], permissions: { issues: 'write' } },
+    HTTP_CREATED
+  );
+  return grant.token;
+}
+
+function appJwt(appId, pem) {
+  const now = Math.floor(Date.now() / 1000);
+  const header = base64Url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const payload = base64Url(
+    JSON.stringify({ iss: appId, iat: now - APP_JWT_BACKDATE_SECONDS, exp: now + APP_JWT_LIFETIME_SECONDS })
+  );
+  const signature = Utilities.computeRsaSha256Signature(header + '.' + payload, pem);
+  return header + '.' + payload + '.' + base64Url(signature);
+}
+
+function base64Url(value) {
+  return Utilities.base64EncodeWebSafe(value).replace(/=+$/, '');
+}
+
+function githubJson(method, url, bearer, payload, expectedCode) {
+  const options = {
+    method: method,
     headers: {
-      Authorization: 'Bearer ' + token,
+      Authorization: 'Bearer ' + bearer,
       Accept: 'application/vnd.github+json',
       'X-GitHub-Api-Version': GITHUB_API_VERSION,
     },
-    payload: JSON.stringify(issue),
     muteHttpExceptions: true,
-  });
-  if (res.getResponseCode() !== HTTP_CREATED) {
-    throw new Error('GitHub returned ' + res.getResponseCode() + ': ' + res.getContentText());
+  };
+  if (payload) {
+    options.contentType = 'application/json';
+    options.payload = JSON.stringify(payload);
   }
-  return JSON.parse(res.getContentText()).html_url;
+  const res = UrlFetchApp.fetch(url, options);
+  if (res.getResponseCode() !== expectedCode) {
+    throw new Error(
+      'GitHub returned ' + res.getResponseCode() + ' for ' + method.toUpperCase() + ' ' + url + ': ' + res.getContentText()
+    );
+  }
+  return JSON.parse(res.getContentText());
 }
 
 function notifyOwner(issue, err) {

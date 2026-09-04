@@ -21,8 +21,7 @@ is where readers are pointed at it.
 
 ## What a submission becomes
 
-An issue on `gke-labs/kube-agents`, opened by the account whose token the script holds,
-with:
+An issue on `gke-labs/kube-agents`, opened by `kube-agents-bot`, with:
 
 - the one-line summary as the title, truncated at 120 characters;
 - labels `external-feedback` plus `bug`, `enhancement`, or `question` when the reporter
@@ -48,18 +47,24 @@ One person owns the form and the script; today that is the maintainer who create
    throws partway, run it again and it finishes the form rather than creating another.
    If the form is ever deleted, remove that property before running `setup` again; the
    error message says so.
-3. Create a GitHub token for the script. A fine-grained personal access token, resource
-   owner `gke-labs`, repository access limited to `kube-agents`, permission Issues:
-   Read and write, nothing else. The account behind it needs write access to the
-   repository as well: GitHub sets labels on a new issue only for a caller with push
-   access and silently drops them otherwise, so a lesser account gets issues filed
-   without `external-feedback` and no error. Fine-grained tokens expire; set a calendar
-   reminder for the expiry, because the first sign of an expired token is the failure email
-   below.
-4. In the Apps Script project, Project Settings, Script Properties, add `GITHUB_TOKEN` with
-   that value. The token lives only there.
-5. Submit the form once yourself and check the issue arrives with the right labels. Close
-   that issue.
+3. Give the script the bot's identity. The `kube-agents-bot` GitHub App already holds
+   Issues: Read and write on this repository, which also lets it set labels. On the App's
+   settings page (the `gke-labs` organization, Developer settings, GitHub Apps,
+   kube-agents-bot, Private keys) generate a new private key for this script. Do not reuse
+   the key the bot service holds in Secret Manager: a second key gives the form its own
+   credential to revoke without touching the bot.
+4. In the Apps Script project, Project Settings, Script Properties, add `GITHUB_APP_ID`
+   with the App's id (`4437198`, the value the bot service runs with) and
+   `GITHUB_APP_PRIVATE_KEY` with the downloaded PEM pasted whole. The key lives only there.
+   For each submission the script signs a JWT with it and exchanges that for a token good
+   for this repository and Issues: write, nothing else.
+5. Submit the form once yourself and check the issue arrives with the right labels, authored
+   by `kube-agents-bot`. Close that issue.
+
+A fine-grained personal access token in a `GITHUB_TOKEN` property is the fallback the script
+uses only when no App key is set. Issues then carry that person's name, GitHub only sets the
+labels if their account has write access to the repository, and the token expires. Prefer the
+App.
 
 The `external-feedback` label exists on the repository. If a label named in the script did
 not, GitHub would create it on the first issue, default grey and with no description, rather
@@ -74,9 +79,10 @@ from an account whose domain allows it.
 
 The trigger emails the form owner the complete issue text and the GitHub error, then
 records the failure in the project's Executions view. The submission is also kept in the
-form's responses, so nothing is lost; file it by hand from the email and fix the cause.
-The usual causes are an expired or revoked token (401), a token without Issues write on
-this repository (403), and a GitHub outage.
+form's responses, so nothing is lost; file it by hand from the email and fix the cause. The
+error names which call failed. The usual causes are a revoked App key (401 on the
+installation lookup), the App no longer installed on the repository (404 there), an App
+that lost Issues: write (422 minting the token), and a GitHub outage.
 
 ## Operating it
 
@@ -87,11 +93,12 @@ this repository (403), and a GitHub outage.
   any `@mentions` it contains. If that is abused, set the form to require sign-in from its
   settings, or close it to responses; both take effect immediately and neither needs a code
   change. Issues already filed are ordinary issues and can be closed or deleted like any
-  other. Every issue is authored by the account that owns the token, so a flood lands on
-  that account's record with GitHub as well as on the repository. If volume grows, move the
-  token to a machine account with write access to the repository and nothing else.
-- **Rotating the token.** Replace the `GITHUB_TOKEN` script property. Nothing else changes.
-- **Retiring it.** Close the form to responses, delete the trigger, revoke the token, remove
+  other. Issues are authored by the bot, so a flood lands on the bot's record with GitHub,
+  not on a person's. Revoking the form's private key on the App's Private keys page cuts the
+  form off at once without affecting the bot service, which signs with a different key.
+- **Rotating the key.** Generate a new private key on the App, replace the
+  `GITHUB_APP_PRIVATE_KEY` script property, then revoke the old key. Nothing else changes.
+- **Retiring it.** Close the form to responses, delete the trigger, revoke the key, remove
   the redirect from `docs/site/astro.config.mjs`, and remove the links from the contributing
   guide and the root `README.md`. If this directory goes too, drop its row from
   `docs/README.md` and its mention in the tree at the top of that file.
