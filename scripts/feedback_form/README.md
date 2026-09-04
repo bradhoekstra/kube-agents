@@ -64,10 +64,16 @@ One person owns the form and the script; today that is the maintainer who create
    Be clear about what that key is. The limit above is something the script requests per
    token; the key itself is the App's full identity and can mint a token with every
    permission the App holds on every repository it is installed on, including pull request
-   reviews and check runs. Anyone who can read the script's properties, which is every editor
-   of the Apps Script project, holds that. Keep the project to its owner. A fine-grained
-   personal token is the narrower credential if that trade is preferred; see the fallback
-   below.
+   reviews and the `AI Review` check run that `.github/workflows/auto_request_review.yml`
+   trusts by this App's id. Anyone who can read the script's properties, which is every
+   editor of the Apps Script project, holds that, and the project's access control is the
+   owner's Google account rather than the Secret Manager IAM and audit trail the bot
+   service's own key sits behind. Revoking the key stops new tokens; a token already minted
+   stays valid for the rest of its hour. This trade was made knowingly, for issues that
+   carry the bot's name rather than a person's. Keep the project to its owner and add no
+   editors. The ways back, if the trade stops being worth it: a separate GitHub App holding
+   Issues: write only, which the script supports by changing `GITHUB_APP_ID` and the key,
+   or the fine-grained personal token below, which is narrower still.
 
 5. Submit the form once yourself and check the issue arrives with the right labels, authored
    by `kube-agents-bot`. Close that issue.
