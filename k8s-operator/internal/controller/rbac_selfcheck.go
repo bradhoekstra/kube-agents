@@ -125,11 +125,19 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
-	{Group: "", Resources: []string{"namespaces", "nodes", "events", "persistentvolumes", "resourcequotas", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
-	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get"}},
+	{Group: "", Resources: []string{"namespaces", "nodes", "events", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
+	// resourcequotas: the mode-next session-pod bound is rendered and removed
+	// by the operator, so this one is write rather than read.
+	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},
+	// secrets: `get` for checkShellSandboxKeys; the rest for the mode-next A2A
+	// credential and config Secrets the operator generates. No list/watch --
+	// see tests/test_operator_secrets_grant.py.
+	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get", "create", "update", "patch", "delete"}},
 	{Group: "metrics.k8s.io", Resources: []string{"nodes", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "autoscaling", Resources: []string{"horizontalpodautoscalers"}, Verbs: rbacReadVerbs},
-	{Group: "batch", Resources: []string{"cronjobs", "jobs"}, Verbs: rbacReadVerbs},
+	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},
+	// jobs: the mode-next provisioning run is created and swept by the operator.
+	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
 	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
 	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacWriteVerbs},

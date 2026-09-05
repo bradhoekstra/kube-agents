@@ -25,6 +25,7 @@ rules:
       - configmaps
       - persistentvolumeclaims
       - pods
+      - resourcequotas
       - serviceaccounts
       - services
     verbs:
@@ -45,7 +46,6 @@ rules:
       - nodes
       - persistentvolumes
       - pods/log
-      - resourcequotas
     verbs:
       - get
       - list
@@ -55,7 +55,11 @@ rules:
     resources:
       - secrets
     verbs:
+      - create
+      - delete
       - get
+      - patch
+      - update
   - apiGroups:
       - apiextensions.k8s.io
     resources:
@@ -104,10 +108,21 @@ rules:
       - batch
     resources:
       - cronjobs
-      - jobs
     verbs:
       - get
       - list
+      - watch
+  - apiGroups:
+      - batch
+    resources:
+      - jobs
+    verbs:
+      - create
+      - delete
+      - get
+      - list
+      - patch
+      - update
       - watch
   - apiGroups:
       - coordination.k8s.io

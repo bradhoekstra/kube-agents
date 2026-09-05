@@ -1,11 +1,28 @@
 """The operator's `secrets` grant, and the ceiling on it.
 
-`manager-role` holds `get` on `secrets` and nothing else. One caller needs it:
-`checkShellSandboxKeys` asks whether the sandbox's authorized-keys Secret exists
-so the CR can say so, because that Secret is the one mount on this branch a pod
-cannot start without, and a missing one is otherwise fifteen minutes of
-`ContainerCreating` with the cause on an object nobody is looking at. It reads
-no value out of the Secret and the operator creates that Secret nowhere.
+Two callers need a Secret verb on `manager-role`:
+
+- `checkShellSandboxKeys` needs `get`. It asks whether the sandbox's
+  authorized-keys Secret exists so the CR can say so, because that Secret is the
+  one mount a pod cannot start without, and a missing one is otherwise fifteen
+  minutes of `ContainerCreating` with the cause on an object nobody is looking
+  at. It reads no value out of the Secret and creates that Secret nowhere.
+- The `mode: next` A2A render needs `create`/`update`/`patch`/`delete`. The
+  operator generates the NATS credential Secret once and repairs a missing key,
+  renders the config Secret, and deletes the config Secret on the way back to
+  `today`; all of them are owner-referenced to the `PlatformAgent`.
+
+The verb set was `{get}` until the A2A render landed. It widened once,
+deliberately, and this file is what keeps it from widening again by accident:
+the set is pinned exactly, so an addition fails here rather than passing
+silently under the trivy ignore.
+
+`list` and `watch` are the ones that stay refused, and they are asserted
+separately below rather than left implicit in the exact-set check. They are the
+verbs that turn a by-name grant into cluster-wide enumeration of every Secret in
+every namespace, which is a different power from the five above; `a2aReader()`
+exists precisely so every A2A Secret read is by name and uncached, and without
+the enumeration verbs a cached read cannot be reintroduced by accident.
 
 Trivy's KSV-0041 flags any Secret verb on a ClusterRole as CRITICAL, and its
 ignore file has no way to scope an exemption to one rule -- `paths` globs are
@@ -33,7 +50,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ROLE_PATH = REPO_ROOT / "k8s-operator" / "config" / "rbac" / "role.yaml"
 CORE_API_GROUP = ""
 SECRETS_RESOURCE = "secrets"
-PERMITTED_SECRET_VERBS = {"get"}
+PERMITTED_SECRET_VERBS = {"get", "create", "update", "patch", "delete"}
+REFUSED_SECRET_VERBS = {"list", "watch"}
 IGNORE_PATH = REPO_ROOT / ".trivyignore.yaml"
 SECRETS_MISCONFIG_ID = "KSV-0041"
 
@@ -56,10 +74,23 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             f"expected one rule naming {SECRETS_RESOURCE}, found {len(rules)}: {rules}",
         )
 
-    def test_the_only_secret_verb_is_get(self):
+    def test_the_secret_verbs_are_exactly_the_set_two_callers_need(self):
         rule = _secret_rules()[0]
         self.assertEqual(set(rule.get("verbs") or []), PERMITTED_SECRET_VERBS)
         self.assertEqual(rule.get("apiGroups"), [CORE_API_GROUP])
+
+    def test_the_operator_can_never_enumerate_secrets(self):
+        # Named separately from the exact-set check above because this is the
+        # property, not a consequence of today's list: `list`/`watch` on a
+        # cluster-scoped role means every Secret in every namespace, which is a
+        # different power from get/create/update/patch/delete by name.
+        verbs = set(_secret_rules()[0].get("verbs") or [])
+        self.assertEqual(
+            set(),
+            verbs & REFUSED_SECRET_VERBS,
+            "the operator reads Secrets by name through a2aReader(); granting "
+            "list or watch would let a cached, cluster-wide read be added",
+        )
 
     def test_the_secrets_rule_names_no_other_resource(self):
         # A verb set is only a ceiling for the resources it is attached to.
