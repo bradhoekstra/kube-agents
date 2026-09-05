@@ -306,7 +306,7 @@ func TestReconcileReportsAnOutOfDateClusterRoleAndKeepsGoing(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -395,7 +395,7 @@ func TestAStandingRBACDenialDoesNotWriteStatusEveryPass(t *testing.T) {
 	}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(funcs).
 		Build()

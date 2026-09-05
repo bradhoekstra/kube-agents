@@ -126,6 +126,7 @@ var requiredPermissions = []requiredPermission{
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
 	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
 	{Group: "", Resources: []string{"namespaces", "nodes", "events", "persistentvolumes", "resourcequotas", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
+	{Group: "", Resources: []string{"secrets"}, Verbs: []string{"get"}},
 	{Group: "metrics.k8s.io", Resources: []string{"nodes", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "autoscaling", Resources: []string{"horizontalpodautoscalers"}, Verbs: rbacReadVerbs},
 	{Group: "batch", Resources: []string{"cronjobs", "jobs"}, Verbs: rbacReadVerbs},
