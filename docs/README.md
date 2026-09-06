@@ -179,6 +179,7 @@ identifier appears, add its source here.
 | Admission webhook server port (`--webhook-port` default) | `DefaultPort` in `k8s-operator/internal/webhook/platformagent_webhook.go` |
 | Live-test lease: ConfigMap name, TTL, install-configuration keys read, which commands count as mutations | `scripts/live_test_lease.py` |
 | PR evidence screenshots: publish branch, file-name provenance, caption format | `scripts/pr_evidence_screenshot.sh` |
+| Unresolved-thread hold: the label, the pool condition, the sweep interval, the ownership rule | `scripts/hold_unresolved_threads.py` and `.github/workflows/hold-unresolved-threads.yml` |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 | Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, and `OWNERS_ALIASES` |
 | Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
