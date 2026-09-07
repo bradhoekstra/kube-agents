@@ -25,6 +25,7 @@ name: Hold Unresolved Threads
 on:
   schedule:
     - cron: "*/5 * * * *" # SWEEP_MINUTES in the script quotes this to the author
+  #checkov:skip=CKV_GHA_7:One boolean, dry-run, which decides whether the sweep writes; nothing is built and no input reaches a shell
   workflow_dispatch:
     inputs:
       dry_run:
