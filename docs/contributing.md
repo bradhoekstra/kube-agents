@@ -24,3 +24,6 @@ lives in the documentation site:
 **<https://gke-labs.github.io/kube-agents/contributing/>**
 
 Repository conventions for AI coding agents are in [`AGENTS.md`](../AGENTS.md).
+
+The pull request template in [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md)
+lists what a description is expected to answer before review.
