@@ -1,0 +1,7 @@
+# What this repository asks of the review bot (docs/design.md §13 in
+# gke-labs/kube-agents-bot). Read from the default branch only.
+
+# Documents a change is judged against. A finding against one quotes the
+# passage, names the path and names the mechanism in the change that crosses it.
+principles:
+  - docs/architecture/README.md
