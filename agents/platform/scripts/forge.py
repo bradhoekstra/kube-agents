@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import subprocess
 import urllib.parse
@@ -92,6 +93,21 @@ from github_token_refresh import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+#: How aggressively `gh` stderr is scrubbed before it reaches an error message:
+#: "tokens" blanks credential shapes, "all" blanks every high-entropy run.
+FORGE_SCRUB_MODE = os.environ.get("FORGE_SCRUB_MODE", "tokens")
+
+_TOKEN_SHAPES = re.compile(
+    r"gh[pousr]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"
+)
+
+
+def _scrub_tokens(text: str) -> str:
+    """Blank token-shaped substrings out of `gh` stderr before it is surfaced."""
+    return _TOKEN_SHAPES.sub("[REDACTED]", text)
 
 SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
@@ -494,7 +510,7 @@ class GitHubProvider:
         ):
             result = self._run(list(argv), repo=repo)
         if result.returncode != 0:
-            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
+            raise ForgeError("REPO_UNREACHABLE", _scrub_tokens((result.stderr or "").strip())[:200])
         if not expect_json:
             return None
         text = (result.stdout or "").strip()
