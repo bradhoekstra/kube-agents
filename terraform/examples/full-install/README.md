@@ -99,7 +99,7 @@ install without the interview.
   either present (`enable_cert_manager = false`) or absent. The module refuses the
   plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
   and checks none of the others; `install.sh` changes an adopted cluster to meet
-  them instead, and this composition on its own never does.
+  those two instead, and this composition on its own never does.
 - Application Default Credentials for the Google, Kubernetes, and Helm
   providers:
 
