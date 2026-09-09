@@ -140,6 +140,10 @@ Before beginning installation, ensure your environment meets the following requi
 | **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by the kustomize deployment targets (Method 2) for template substitution.                              |
 | **`jq`**                        | `1.6+`                                          | `jq --version`             | Reads `images.json`; the kustomize deploy targets resolve image references from it.                         |
 
+A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
+NetworkPolicy enforcement, and the rest of the site's
+[cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
+
 ---
 
 ## Method 1: The Install Engine — Terraform + Helm
