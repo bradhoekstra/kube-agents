@@ -150,8 +150,10 @@ REASON_MAX_CHARS = 200
 HOURS_PER_DAY = 24
 AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
-UNBLOCK_COMMAND = 'HERMES_HOME={home} hermes kanban unblock --reason "<why>" {task_id}'
-ARCHIVE_COMMAND = "HERMES_HOME={home} hermes kanban archive {task_id}"
+# Pinned to the board file this run read, the way `diagnostics_lines` pins the
+# engine: `kanban_db_path()` would otherwise honour `kanban/current` first.
+UNBLOCK_COMMAND = 'HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban unblock --reason "<why>" {task_id}'
+ARCHIVE_COMMAND = "HERMES_HOME={home} HERMES_KANBAN_DB={home}/kanban.db hermes kanban archive {task_id}"
 
 # The CLI opens the board through Hermes' own connection and may run an
 # idempotent migration; 60s is generous for a board of this size and still well

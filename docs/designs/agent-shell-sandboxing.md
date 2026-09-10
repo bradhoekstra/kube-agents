@@ -1961,9 +1961,9 @@ it read-only (`mode=ro`) for its invariant and blocked-card queries and shells o
 `hermes kanban diagnostics --json` for the rule engine; its docstring records that a
 read-write open of `/opt/data/kanban.db` from an agent shell is what the persona forbids.
 [`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
-does open it, `sqlite3.connect` at line 63 — and `SOUL.md:61` tells the agent to run it
-from the shell. That is coherent today, where `SOUL.md:66`'s ban on touching the board
-is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not survive
+does open it, `sqlite3.connect` at line 63 — and the Platform Agent's `SOUL.md` (§0, the
+fan-out bullet) tells the agent to run it from the shell. That is coherent today, where
+the same section's ban on touching the board is a ban on ad-hoc edits and the script is a sanctioned writer, but it does not survive
 the move.
 
 Mounting `kanban.db` into the sandbox is ruled out. It would hand the shell exactly the
