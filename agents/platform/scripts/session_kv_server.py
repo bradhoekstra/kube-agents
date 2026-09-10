@@ -1105,11 +1105,13 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     The **Done when** line is the card's acceptance criterion, stated apart from
     the template on purpose. `_build_agent_query` rule 4 keeps triage cards out
     of goal mode; this line is the fallback if one is graded anyway. Hermes's
-    `judge_goal` reads title + body, and a body that says what done means can
-    be satisfied where a body that only says what the report looks like cannot
-    (#656). It is deliberately not a ``##`` heading, for the three-section rule
-    above, and it sits outside the ``## What to do`` → 🔗 span that the bench
-    delivery contract slices.
+    `judge_goal` grades the worker's `summary` (falling back to `result`)
+    against title + body, so the line asks for the three facts in `summary`
+    too: a body that says what done means, answered by a summary that states
+    it, can be satisfied where a body that only says what the report looks like
+    cannot (#656). It is deliberately not a ``##`` heading, for the
+    three-section rule above, and it sits outside the ``## What to do`` → 🔗
+    span that the bench delivery contract slices.
 
     The report ends by inviting the reader to reply ``apply``, and something
     honours it. The agent that acts on such a reply reads the report back from
@@ -1183,7 +1185,8 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
         f"**Done when:** the root cause is named with the evidence that proves it; at least one GitOps remediation option is proposed, "
         f"or the report says explicitly that no manifest change is warranted and why; and the whole report is recorded with `kanban_complete`. "
         f"Nothing else is a condition of finishing. The shape below is how to present that work, not a fourth requirement: "
-        f"once you have those three things, complete the card — never `kanban_block` over formatting.\n\n"
+        f"once you have those three things, complete the card — never `kanban_block` over formatting. "
+        f"State those three things in `summary`'s one line as well: a judge that grades this card reads `summary` before `result`.\n\n"
         f"**Do this yourself. Do not delegate the diagnosis to another agent, and do not open child cards for it** — "
         f"you are the agent scoped to the cluster that is failing, and the report has to be this card's own result to be delivered.\n\n"
         f"Propose as many GitOps remediation options as the root cause genuinely warrants — one is fine if there is only one sound fix; do not invent filler alternatives to pad the list.\n\n"

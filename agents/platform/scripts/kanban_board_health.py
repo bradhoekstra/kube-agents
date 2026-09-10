@@ -125,9 +125,10 @@ from pathlib import Path
 # never `HERMES_HOME`, which under the platform roster names the profile home.
 import gitops_workspace
 
-# Severity floor handed to `hermes kanban diagnostics`. "error" on purpose: the
-# engine's warning-tier rules are useful to pull on demand but too chatty to
-# push every 15 minutes on first rollout. Override with KANBAN_HEALTH_SEVERITY.
+# Severity floor applied to what `hermes kanban diagnostics` returns. "error" on
+# purpose: the engine's warning-tier rules are useful to pull on demand but too
+# chatty to push into chat daily, with the one exception named below. Override
+# with KANBAN_HEALTH_SEVERITY.
 DEFAULT_SEVERITY = "error"
 SEVERITY_ENV = "KANBAN_HEALTH_SEVERITY"
 SEVERITIES = ("warning", "error", "critical")
@@ -142,13 +143,15 @@ STUCK_IN_BLOCKED = "stuck_in_blocked"
 ENGINE_SEVERITY = SEVERITIES[0]
 # Where the board lives, for tests and hand runs; otherwise the agent home.
 HOME_ENV = "KANBAN_HEALTH_HOME"
-# Rendering of a stuck card.
+# Rendering. The engine's `detail` runs to several paragraphs; chat gets its
+# first line, clipped, and the rest stays behind `hermes kanban diagnostics`.
+DETAIL_MAX_CHARS = 200
 REASON_MAX_CHARS = 200
 HOURS_PER_DAY = 24
 AGE_IN_HOURS_BELOW_H = 48
 NO_KIND = "no kind"
-UNBLOCK_COMMAND = 'HERMES_HOME=/opt/data hermes kanban unblock --reason "<why>" {task_id}'
-ARCHIVE_COMMAND = "HERMES_HOME=/opt/data hermes kanban archive {task_id}"
+UNBLOCK_COMMAND = 'HERMES_HOME={home} hermes kanban unblock --reason "<why>" {task_id}'
+ARCHIVE_COMMAND = "HERMES_HOME={home} hermes kanban archive {task_id}"
 
 # The CLI opens the board through Hermes' own connection and may run an
 # idempotent migration; 60s is generous for a board of this size and still well
@@ -264,11 +267,20 @@ def blocked_context(conn: sqlite3.Connection) -> dict:
             except ValueError:
                 payload = {}
             if isinstance(payload, dict):
+                # Events arrive oldest first, so the last one wins for both fields.
                 tasks[row["task_id"]]["reason"] = str(payload.get("reason") or tasks[row["task_id"]]["reason"])
-                tasks[row["task_id"]]["kind"] = tasks[row["task_id"]]["kind"] or payload.get("kind")
+                if payload.get("kind"):
+                    tasks[row["task_id"]]["kind"] = payload["kind"]
     except sqlite3.OperationalError:
         return {}
     return tasks
+
+
+def first_line(text: str, limit: int) -> str:
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:limit]
+    return ""
 
 
 def render_age(age_hours) -> str:
@@ -281,20 +293,23 @@ def render_age(age_hours) -> str:
     return f"{int(hours // HOURS_PER_DAY)}d"
 
 
-def stuck_card_lines(task_id: str, diag: dict, context: dict) -> list:
+def stuck_card_lines(task_id: str, diag: dict, context: dict, entry: dict, home: Path) -> list:
+    """One stuck card: the board's kind and reason, the CLI's title and assignee as fallback."""
     info = context.get(task_id) or {}
     kind = info.get("kind") or NO_KIND
+    assignee = info.get("assignee") or entry.get("assignee") or "?"
+    title = info.get("title") or entry.get("title") or ""
     reason = " ".join((info.get("reason") or "").split())[:REASON_MAX_CHARS]
     age = render_age((diag.get("data") or {}).get("age_hours"))
-    head = f"  - {task_id} ({info.get('assignee') or '?'}, {kind}, blocked {age})"
-    if info.get("title"):
-        head += f": {info['title']}"
+    head = f"  - {task_id} ({assignee}, {kind}, blocked {age})"
+    if title:
+        head += f": {title}"
     if reason:
         head += f' — "{reason}"'
     return [
         head,
-        f"    re-run it:  {UNBLOCK_COMMAND.format(task_id=task_id)}",
-        f"    drop it:    {ARCHIVE_COMMAND.format(task_id=task_id)}",
+        f"    re-run it:  {UNBLOCK_COMMAND.format(home=home, task_id=task_id)}",
+        f"    drop it:    {ARCHIVE_COMMAND.format(home=home, task_id=task_id)}",
     ]
 
 
@@ -412,13 +427,13 @@ def diagnostics_lines(home: Path, severity: str, runner=_default_runner,
                 continue
             kind = diag.get("kind")
             if kind == STUCK_IN_BLOCKED and kind in always:
-                stuck.extend(stuck_card_lines(task_id, diag, context or {}))
+                stuck.extend(stuck_card_lines(task_id, diag, context or {}, entry, home))
                 continue
             if not clears_floor(str(diag.get("severity", "")), severity) and kind not in always:
                 continue
             parts = [f"  [{diag.get('severity', '?')}] {task_id} ({status}): "
                      f"{diag.get('title', diag.get('kind', 'diagnostic'))}"]
-            detail = (diag.get("detail") or "").strip()
+            detail = first_line((diag.get("detail") or ""), DETAIL_MAX_CHARS)
             if detail:
                 parts.append(f" - {detail}")
             lines.append("".join(parts))
