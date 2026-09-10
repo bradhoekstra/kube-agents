@@ -59,7 +59,6 @@ import hashlib
 import json
 import os
 import re
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,13 +67,6 @@ from pathlib import Path
 import forge
 import gitops_workspace
 from cluster_agent_profile import RESERVED_PROFILES
-
-try:
-    from sandbox_exec import SandboxUnavailable
-except ImportError:  # an image from before the shell moved to its own pod runs gh in-process
-
-    class SandboxUnavailable(RuntimeError):
-        """Placeholder so the except clause below stays valid where there is no sandbox."""
 
 # --- channels -----------------------------------------------------------------
 # Stable prefix for a log filter. Cloud Logging:
@@ -103,9 +95,9 @@ STATE_SCHEMA_VERSION = 1
 THRESHOLD_ENV = "CHAT_DELIVERY_ALERT_THRESHOLD"
 THRESHOLD_DEFAULT = 2
 MAX_ERROR_CHARS = 500
-# An output file written this much before `last_run_at` is still the latest
-# run's: the scheduler stamps the run start and writes the file at the end, and
-# the two clocks are the same one, so this only absorbs rounding.
+# The scheduler saves the run's output first and stamps `last_run_at` last, after
+# delivery; a silent run skips delivery, so the two are seconds apart. An output
+# file older than the run by more than this belongs to an earlier run.
 SILENT_OUTPUT_SLACK_S = 300
 
 # --- grades, from the strings deploy/docker/plugins/chat/adapter.py produces ---
@@ -131,6 +123,10 @@ SILENT_STATUS_MARKER = "**Status:** silent"
 # A job the scheduler will not run again has no next run to recover with, so it
 # holds no streak: `enabled: false` (a retirement tombstone) or a paused state.
 PAUSED_STATE = "paused"
+# A run the scheduler recorded as anything but ok never reached delivery, or
+# reached it only with a failure summary; either way it says nothing about the
+# leg, so it neither advances nor resets the streak.
+STATUS_OK = "ok"
 
 # --- the ledger issue ---------------------------------------------------------
 # Where the issue lives: this variable when set, otherwise the install's managed
@@ -344,10 +340,16 @@ def advance(entry: dict, job: dict, *, silent: bool) -> dict:
         updated["last_failure_at"] = run_at
         updated["last_error"] = error[:MAX_ERROR_CHARS]
         return updated
-    if silent:
-        # Delivered nothing, so says nothing about the leg.
+    if silent or job.get("last_status") != STATUS_OK:
+        # Delivered nothing (a silent answer, an interrupted or failed run), so
+        # says nothing about the leg.
         return updated
     updated["streak"] = 0
+    updated["grade"] = None
+    updated["platforms"] = []
+    updated["first_failure_at"] = None
+    updated["last_failure_at"] = None
+    updated["last_error"] = None
     return updated
 
 
@@ -453,10 +455,19 @@ def fingerprint(title: str, body: str) -> str:
 def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, now: str, threshold_value: int) -> str:
     """Bring the ledger issue in line with `degraded`; returns the `ledger=` value for the ALERT lines."""
     ledger = state["ledger"]
+    if ledger.get("issue_number") is not None and ledger.get("repo") and ledger.get("repo") != repo:
+        # The ledger repository changed under an open issue: close it there so
+        # it is not left open forever, and start afresh in the new one.
+        gh(
+            ["issue", "close", str(ledger["issue_number"]), "-R", ledger["repo"], "--reason", CLOSE_REASON, "--comment",
+             f"The delivery ledger moved to {repo} as of {now}; closing this copy."],
+            ledger["repo"],
+        )
+        state["ledger"] = ledger = {"repo": None, "issue_number": None, "fingerprint": None}
     if degraded:
-        number = ledger.get("issue_number") if ledger.get("repo") == repo else None
-        if number is None:
-            number = find_ledger_issue(repo)
+        # Listed every time rather than trusting the cached number: an issue a
+        # person closed by hand must not keep being edited while closed.
+        number = find_ledger_issue(repo)
         title, body = render_issue(degraded, now, threshold_value)
         digest = fingerprint(title, body)
         if number is None:
@@ -468,7 +479,7 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
             )
             match = ISSUE_URL_RE.search(result.stdout or "")
             number = int(match.group(1)) if match else None
-        elif digest != ledger.get("fingerprint"):
+        elif digest != ledger.get("fingerprint") or number != ledger.get("issue_number"):
             gh(["issue", "edit", str(number), "-R", repo, "--title", title, "--body-file", forge.BODY_STDIN], repo, stdin=body)
         state["ledger"] = {"repo": repo, "issue_number": number, "fingerprint": digest}
         return f"{repo}#{number}" if number else repo
@@ -620,8 +631,11 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
     state["last_tick_at"] = now
     state["last_tick_ok"] = True
     state["last_tick_error"] = None
-    if not dry_run:
-        save_state(state_path, state)
+    if dry_run:
+        for line in lines:
+            print(line)
+        return lines
+    save_state(state_path, state)
     emit(lines, agent_home, now)
     return lines
 

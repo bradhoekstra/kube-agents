@@ -598,8 +598,10 @@ an unreachable relay, no key), `partial` when it landed somewhere but not on the
 platforms the `undelivered` field names, `degraded` when it posted but the Chat
 Agent's turn failed. The scheduler's own two failures, a platform named in
 `deliver` that is not enabled and a `deliver` that resolved to no target, also
-grade `hard`: nothing was delivered either way. A job that is disabled or paused
-holds no streak, since it has no next run to recover with.
+grade `hard`: nothing was delivered either way. A run the scheduler recorded as
+anything but `ok` (interrupted by a gateway shutdown, or failed before delivery)
+is no evidence either, like a silent one. A job that is disabled or paused holds
+no streak, since it has no next run to recover with.
 `CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many consecutive failing runs
 make a job degraded.
 
@@ -615,8 +617,10 @@ privilege the pod does not already hold.
   managed GitHub repository; several managed repositories and no override is
   refused rather than guessed, as `resolve_repo` refuses it. It is opened when
   any job crosses the threshold, edited when the set of degraded jobs or their
-  errors change (a fingerprint in the ledger keeps an unchanged tick from making
-  any call), and closed with a comment once every leg has recovered. The call is
+  errors change (a fingerprint in the ledger keeps an unchanged tick down to one
+  read, which is how an issue a person closed by hand is noticed and replaced
+  rather than edited while closed), and closed with a comment once every leg
+  has recovered. The call is
   `forge.run_gh` through the sandbox and the credential proxy, the same route
   `github-repo-watcher` takes; the minted token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its

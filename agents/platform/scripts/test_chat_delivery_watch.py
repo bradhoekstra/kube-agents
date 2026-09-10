@@ -196,11 +196,23 @@ class AdvanceTest(unittest.TestCase):
         again = cdw.advance(entry, job("a", RUN_1, HARD_ERROR), silent=False)
         self.assertIs(again, entry)
 
-    def test_a_clean_run_resets(self) -> None:
+    def test_a_clean_run_resets_and_forgets_the_episode(self) -> None:
         entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
         entry = cdw.advance(entry, job("a", RUN_2), silent=False)
         self.assertEqual(entry["streak"], 0)
         self.assertEqual(entry["last_seen_run_at"], RUN_2)
+        self.assertIsNone(entry["first_failure_at"])
+        # A later episode starts its own clock rather than inheriting RUN_1.
+        entry = cdw.advance(entry, job("a", RUN_3, HARD_ERROR), silent=False)
+        self.assertEqual(entry["first_failure_at"], RUN_3)
+
+    def test_an_interrupted_or_failed_run_is_no_evidence(self) -> None:
+        # Seen in Hermes: a gateway shutdown or an exception before delivery records
+        # last_status "error" with last_delivery_error None and writes no output.
+        entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
+        interrupted = dict(job("a", RUN_2), last_status="error", last_error="Interrupted by gateway shutdown")
+        entry = cdw.advance(entry, interrupted, silent=False)
+        self.assertEqual((entry["streak"], entry["last_seen_run_at"]), (1, RUN_2))
 
     def test_a_silent_run_neither_advances_nor_resets(self) -> None:
         entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
@@ -302,7 +314,8 @@ class TickTest(WatchCase):
         before = self.state.read_bytes()
         calls = len(self.gh.calls)
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[calls:], [])
+        # One read, to notice an issue a person closed by hand; no write.
+        self.assertEqual(self.gh.verbs()[calls:], ["issue list"])
         after = self.state_data()
         self.assertEqual(after["jobs"], json.loads(before)["jobs"])
         self.assertEqual(after["jobs"]["platform/a"]["streak"], 2)
@@ -345,6 +358,34 @@ class TickTest(WatchCase):
         self.run_tick()
         self.assertNotIn("issue create", self.gh.verbs())
         self.assertEqual(self.gh.calls[-1][:3], ["issue", "edit", "8"])
+
+    def test_an_issue_closed_by_hand_is_replaced_not_edited(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR))
+        self.run_tick()
+        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        # The fake lists no open issue now: someone closed #42 by hand. A changed
+        # picture must open a new one rather than edit the closed one.
+        self.write_store(job("a", RUN_3, HARD_ERROR))
+        self.run_tick()
+        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        self.assertNotIn("issue edit", self.gh.verbs())
+        self.assertEqual(self.state_data()["ledger"]["issue_number"], 43)
+
+    def test_a_ledger_repository_change_closes_the_old_issue(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR))
+        self.run_tick()
+        os.environ[cdw.LEDGER_REPO_ENV] = "other/ledger"
+        self.write_store(job("a", RUN_3, HARD_ERROR))
+        rc, out = self.run_tick()
+        closes = [c for c in self.gh.calls if c[:2] == ["issue", "close"]]
+        self.assertEqual(len(closes), 1)
+        self.assertIn(LEDGER_REPO, closes[0])
+        self.assertEqual(self.state_data()["ledger"]["repo"], "other/ledger")
+        self.assertIn("ledger=other/ledger#", out)
 
     def test_a_failed_lookup_never_creates_a_duplicate(self) -> None:
         self.gh.fail = {"issue list"}
@@ -440,6 +481,8 @@ class TickTest(WatchCase):
         self.assertIn(f"ledger={cdw.LEDGER_DRY_RUN}", out)
         self.assertEqual(self.state.read_bytes(), before)
         self.assertEqual(self.gh.calls, [])
+        # A hand check must not fire the log-based alert channel.
+        self.assertEqual(self.log_lines(), [])
 
     def test_every_store_on_the_volume_is_read_including_cluster_profiles(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
