@@ -362,7 +362,8 @@ the channel.
 
 The cap truncates rather than rejects. It answered HTTP 413 until #1094, and the
 finding then existed only in the job's saved output with a line in
-`last_delivery_error` that nothing read; #1094 records three runs lost that way
+`last_delivery_error` that nothing read until `chat-delivery-watch` (see
+[Detecting a broken leg](#detecting-a-broken-leg)); #1094 records three runs lost that way
 over 30 and 31 August 2026, across `stockout-prevention` and `compliance-audit`,
 whose fleet-wide output runs to several times this cap. The head survives, and
 the message opens with a `[truncated]` line naming `cron/output/<job_id>/`,
@@ -568,11 +569,74 @@ configured/enabled" against a delivery that in fact succeeded.
 `report_to_chat` stays, scoped to what the mode cannot do: reporting mid-run, or
 sending something other than the final response.
 
+## Detecting a broken leg
+
+Everything above records a failed delivery faithfully and reports it to nobody.
+`last_delivery_error` is written on every failed run, and #1102 is the account of
+what that was worth: seven days of six audits composed, dropped, and recorded as
+dropped, with the only signal being that the reports had stopped arriving. The
+watcher on the other end of the field is `chat-delivery-watch`
+(`agents/platform/scripts/chat_delivery_watch.py`), a `no_agent` job on the
+Platform Agent's roster that runs every half hour.
+
+**What it counts.** The field holds only the latest run. The next run that
+delivered cleanly sets it back to `None`, and so does a run that delivered
+nothing: a `[SILENT]` answer skips delivery and clears the field with it, so on
+a quiet fleet the evidence of a dead leg is erased every morning. The watcher
+therefore keeps its own ledger, `profiles/platform/cron/chat_delivery_watch.json`,
+keyed by `<profile>/<job id>` across every store on the volume (the chat
+profile's, the Platform Agent's, every Cluster Agent's). A job's streak advances
+only when `last_run_at` has changed since the last tick, so a half-hourly tick
+over a daily job counts runs; a failing run adds one, a clean run resets to zero,
+and a silent run, recognised from the job's newest file under `cron/output/`,
+moves the high-water mark and changes nothing else. Failures are graded from the
+strings this design produces: `hard` when the report reached no platform (a 502,
+an unreachable relay, no key), `partial` when it landed somewhere but not on the
+platforms the `undelivered` field names, `degraded` when it posted but the Chat
+Agent's turn failed. `CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many
+consecutive failing runs make a job degraded.
+
+**Where it reports.** Not chat: a chat message saying that chat is down is the
+one message guaranteed not to arrive. The job's `deliver` is `"local"`, the only
+platform-roster entry allowed that value (the README's rule and its test carry
+the exemption by name), and it reports through two channels that need no
+privilege the pod does not already hold.
+
+- A **GitHub ledger issue**, one per install, in the repository the install
+  manages, labelled `agent:delivery-watch` and carrying a hidden
+  `<!-- chat-delivery-watch -->` marker. It is opened when any job crosses the
+  threshold, edited when the set of degraded jobs or their errors change (a
+  fingerprint in the ledger keeps an unchanged tick from writing at all), and
+  closed with a comment once every leg has recovered. The call is
+  `forge.run_gh` through the sandbox and the credential proxy, the same route
+  `github-repo-watcher` takes; the minted token already holds `issues: write`.
+  With no managed GitHub repository the job falls back to the log line alone.
+- An **`ALERT chat_delivery_watch` line** appended to
+  `<agent home>/logs/chat_delivery_watch.log`. The gateway pod's fluent-bit
+  sidecar tails `logs/*.log` and copies it to the container's stdout, which GKE
+  ships to Cloud Logging, so a log-based alert reaches it with
+  `resource.type="k8s_container" resource.labels.container_name="fluent-bit"
+jsonPayload.log:"ALERT chat_delivery_watch"`. This is the file rather than
+  the job's own stdout on purpose: the scheduler captures a `no_agent` job's
+  stdout into `cron/output/` and, with `deliver: "local"`, sends it nowhere.
+  The watcher's own failures land on the same line as `self=error`, and the
+  ledger's `last_tick_at` answers whether it has run at all.
+
+**Why not a `PlatformAgent` condition, a Kubernetes Event or a metric yet.** Each
+would be a better fit for an alerting system, and none has a carrier today. The
+agent container mounts no service-account token, the Role the operator grants is
+read-only apart from leader-election Leases, the credential proxy refuses every
+write verb before RBAC is consulted, and the operator reads nothing the pod
+writes, so a condition or an Event needs a new pod-to-operator path and a new
+grant first. Prometheus metrics are disabled in every shipped deploy and no
+container in the pod exposes an endpoint. Those are the next step, with this
+section as the record of why the first step took the channels it did.
+
 ## Related
 
 - [`agents/platform/cron/README.md`](../../agents/platform/cron/README.md) — the
-  roster's own rules, including why no job sets `deliver: "local"` and why an id
-  must not appear on two rosters.
+  roster's own rules, including why exactly one job sets `deliver: "local"` and
+  why an id must not appear on two rosters.
 - [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md)
   — the Session KV server, its callers and its auth.
 - [`concepts/autonomous-watchdogs`](../site/src/content/docs/concepts/autonomous-watchdogs.md)
