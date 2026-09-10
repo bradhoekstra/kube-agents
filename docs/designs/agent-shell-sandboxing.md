@@ -1956,7 +1956,7 @@ None of them blocks the work above. All three are recorded here so the dead ends
 are not re-walked.
 
 **Reaching `kanban.db`.** Two scripts touch the board.
-[`kanban_board_health.py`](../../agents/chat/scripts/kanban_board_health.py) never
+[`kanban_board_health.py`](../../agents/platform/scripts/kanban_board_health.py) never
 opens the file — it shells out to `hermes kanban diagnostics --json`, and says at line
 29 that opening `/opt/data/kanban.db` from an agent shell is what the persona forbids.
 [`kanban_notify_propagate.py`](../../agents/platform/scripts/kanban_notify_propagate.py)
