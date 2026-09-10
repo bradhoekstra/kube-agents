@@ -593,8 +593,12 @@ moves the high-water mark and changes nothing else. Failures are graded from the
 strings this design produces: `hard` when the report reached no platform (a 502,
 an unreachable relay, no key), `partial` when it landed somewhere but not on the
 platforms the `undelivered` field names, `degraded` when it posted but the Chat
-Agent's turn failed. `CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many
-consecutive failing runs make a job degraded.
+Agent's turn failed. The scheduler's own two failures, a platform named in
+`deliver` that is not enabled and a `deliver` that resolved to no target, also
+grade `hard`; on 2026-09-10 the gkedemos install carried the first on all nine
+audits and the second on both `chat` script jobs, every report lost and nothing
+saying so. `CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many consecutive
+failing runs make a job degraded.
 
 **Where it reports.** Not chat: a chat message saying that chat is down is the
 one message guaranteed not to arrive. The job's `deliver` is `"local"`, the only

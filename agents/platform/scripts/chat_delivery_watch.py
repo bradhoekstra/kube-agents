@@ -67,8 +67,14 @@ from pathlib import Path
 # `sys.path[0]` when the scheduler runs it.
 import forge
 import gitops_workspace
-import sandbox_exec
 from cluster_agent_profile import RESERVED_PROFILES
+
+try:
+    from sandbox_exec import SandboxUnavailable
+except ImportError:  # an image from before the shell moved to its own pod runs gh in-process
+
+    class SandboxUnavailable(RuntimeError):
+        """Placeholder so the except clause below stays valid where there is no sandbox."""
 
 # --- channels -----------------------------------------------------------------
 # Stable prefix for a log filter. Cloud Logging:
@@ -103,16 +109,24 @@ MAX_ERROR_CHARS = 500
 SILENT_OUTPUT_SLACK_S = 300
 
 # --- grades, from the strings deploy/docker/plugins/chat/adapter.py produces ---
+# The scheduler itself writes two more before any adapter is reached: a
+# platform named in `deliver` that is not enabled, and a `deliver` that resolved
+# to no target at all. Both mean nothing was delivered, so both grade hard.
 GRADE_HARD = "hard"
 GRADE_PARTIAL = "partial"
 GRADE_DEGRADED = "degraded"
 PARTIAL_RE = re.compile(r"chat relay partial: the report did not reach ([^.]+)\.")
 HARD_UNDELIVERED_RE = re.compile(r"composed but not delivered to ([^\n]+?)(?: \(target [^)]*\))?$")
+NOT_CONFIGURED_RE = re.compile(r"platform '([^']+)' not configured/enabled")
 DEGRADED_MARKER = "chat relay degraded:"
 SILENT_MARKER = "[SILENT]"
 SILENT_STATUS_MARKER = "**Status:** silent"
 
 # --- the ledger issue ---------------------------------------------------------
+# Where the issue lives: this variable when set, otherwise the install's managed
+# GitHub repository. The override is for an install whose ledger should sit
+# somewhere other than its GitOps repository, and for a hand run.
+LEDGER_REPO_ENV = "CHAT_DELIVERY_LEDGER_REPO"
 LABEL = "agent:delivery-watch"
 LABEL_COLOR = "D73A4A"
 LABEL_DESCRIPTION = "Scheduled-report delivery to chat is failing; maintained by chat_delivery_watch.py"
@@ -217,9 +231,9 @@ def grade_error(error: str) -> str:
 
 def platforms_from(error: str) -> list[str]:
     match = PARTIAL_RE.search(error) or HARD_UNDELIVERED_RE.search(error)
-    if not match:
-        return []
-    return [p.strip() for p in match.group(1).split(",") if p.strip()]
+    if match:
+        return [p.strip() for p in match.group(1).split(",") if p.strip()]
+    return sorted(set(NOT_CONFIGURED_RE.findall(error)))
 
 
 # --- the streak ledger --------------------------------------------------------
@@ -439,6 +453,9 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
 
 
 def ledger_repo() -> str | None:
+    configured = os.environ.get(LEDGER_REPO_ENV, "").strip()
+    if configured:
+        return configured
     repos = gitops_workspace.get_managed_github_repos()
     return sorted(repos)[0] if repos else None
 
@@ -459,7 +476,7 @@ def format_alert(key: str, entry: dict, threshold_value: int, ledger: str) -> st
             f"platforms={','.join(entry.get('platforms') or []) or '-'}",
             f"since={entry.get('first_failure_at')}",
             f"ledger={ledger}",
-            f"error={json.dumps(entry.get('last_error') or '')}",
+            f"error={json.dumps(entry.get('last_error') or '', ensure_ascii=False)}",
         ]
     )
 
@@ -526,12 +543,22 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
 
     ledger_ref = LEDGER_DRY_RUN if dry_run else LEDGER_NONE
     lines: list[str] = []
-    if not dry_run:
-        repo = ledger_repo()
+    # GitHub is consulted only when there is something to say or something to
+    # close: a quiet tick makes no call at all, and a tick on an install with no
+    # forge configured does not log a discovery failure every half hour.
+    if not dry_run and (degraded or state["ledger"].get("issue_number") is not None):
+        # Finding the repository and talking to GitHub are both allowed to fail;
+        # the log line below is the channel that must not depend on either.
+        try:
+            repo = ledger_repo()
+        except Exception as exc:  # noqa: BLE001 - discovery shells out; any failure means log-only
+            repo = None
+            ledger_ref = f"error:{type(exc).__name__}"
+            lines.append(format_self_error(exc))
         if repo:
             try:
                 ledger_ref = reconcile_issue(repo, degraded, state, now, limit)
-            except (LedgerError, sandbox_exec.SandboxUnavailable) as exc:
+            except Exception as exc:  # noqa: BLE001 - whatever GitHub does, the ALERT lines below still go out
                 ledger_ref = f"error:{type(exc).__name__}"
                 lines.append(format_self_error(exc))
     for key, entry in sorted(degraded):

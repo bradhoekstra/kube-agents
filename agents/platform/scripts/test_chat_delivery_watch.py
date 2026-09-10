@@ -61,6 +61,9 @@ HARD_ERROR = (
     "delivered to slack, google_chat (target chat:cron-reports)"
 )
 UNREACHABLE_ERROR = "delivery error: chat relay unreachable: URLError: [Errno 111] Connection refused"
+# Written by the scheduler before any adapter runs; both seen live on gkedemos on 2026-09-10.
+NOT_CONFIGURED_ERROR = "platform 'google_chat' not configured/enabled"
+NO_TARGET_ERROR = "no delivery target resolved for deliver=chat"
 
 RUN_1 = "2026-09-08T06:20:11+00:00"
 RUN_2 = "2026-09-09T06:20:09+00:00"
@@ -134,6 +137,7 @@ class WatchCase(unittest.TestCase):
         self.addCleanup(self.env.stop)
         os.environ.pop(cdw.THRESHOLD_ENV, None)
         os.environ.pop(cdw.STATE_PATH_ENV, None)
+        os.environ.pop(cdw.LEDGER_REPO_ENV, None)
 
     def write_store(self, *jobs: dict, profile: str = "platform") -> Path:
         path = self.home / "profiles" / profile / "cron" / "jobs.json"
@@ -168,6 +172,12 @@ class GradingTest(unittest.TestCase):
 
     def test_degraded_is_its_own_grade(self) -> None:
         self.assertEqual(cdw.grade_error(DEGRADED_ERROR), cdw.GRADE_DEGRADED)
+
+    def test_the_scheduler_s_own_failures_grade_hard_and_name_the_platform(self) -> None:
+        self.assertEqual(cdw.grade_error(NOT_CONFIGURED_ERROR), cdw.GRADE_HARD)
+        self.assertEqual(cdw.platforms_from(NOT_CONFIGURED_ERROR), ["google_chat"])
+        self.assertEqual(cdw.grade_error(NO_TARGET_ERROR), cdw.GRADE_HARD)
+        self.assertEqual(cdw.platforms_from(NO_TARGET_ERROR), [])
 
     def test_label_description_fits_github_s_limit(self) -> None:
         # A 108-character description broke `gh label create` for months on the audit ledger.
@@ -361,6 +371,30 @@ class TickTest(WatchCase):
         self.assertIn(f"ledger={cdw.LEDGER_NONE}", out)
         self.assertEqual(len(self.log_lines()), 1)
 
+    def test_a_failing_repo_discovery_still_writes_the_log_line(self) -> None:
+        def broken() -> list[str]:
+            raise AttributeError("module has no attribute get_managed_github_repos")
+
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", broken):
+            self.write_store(job("a", RUN_1, HARD_ERROR))
+            self.run_tick()
+            self.write_store(job("a", RUN_2, HARD_ERROR))
+            rc, out = self.run_tick()
+        self.assertEqual(rc, 0)
+        self.assertIn("self=error kind=AttributeError", out)
+        self.assertIn("job=a profile=platform grade=hard streak=2", out)
+        self.assertIn("ledger=error:AttributeError", out)
+        self.assertEqual(len(self.log_lines()), 2)
+
+    def test_the_ledger_repo_env_wins_over_discovery(self) -> None:
+        os.environ[cdw.LEDGER_REPO_ENV] = "other/ledger"
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR))
+        rc, out = self.run_tick()
+        self.assertIn("ledger=other/ledger#42", out)
+        self.assertIn("other/ledger", self.gh.calls[-1])
+
     def test_dry_run_writes_nothing(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
         self.run_tick()
@@ -403,6 +437,22 @@ class TickTest(WatchCase):
         self.assertEqual(rc, 0)
         self.assertIn("self=error kind=SandboxUnavailable", out)
         self.assertIn("ledger=error:SandboxUnavailable", out)
+        self.assertTrue(self.state_data()["last_tick_ok"])
+
+    def test_an_unexpected_github_failure_still_emits_the_alert_lines(self) -> None:
+        # Seen live: an older image's forge.run_gh has no `stdin` argument and raises TypeError.
+        def old_run_gh(argv, repo=None):
+            raise TypeError("run_gh() got an unexpected keyword argument 'stdin'")
+
+        with mock.patch.object(cdw.forge, "run_gh", old_run_gh):
+            self.write_store(job("a", RUN_1, HARD_ERROR))
+            self.run_tick()
+            self.write_store(job("a", RUN_2, HARD_ERROR))
+            rc, out = self.run_tick()
+        self.assertEqual(rc, 0)
+        self.assertIn("self=error kind=TypeError", out)
+        self.assertIn("job=a profile=platform grade=hard streak=2 threshold=2", out)
+        self.assertIn("ledger=error:TypeError", out)
         self.assertTrue(self.state_data()["last_tick_ok"])
 
     def test_an_unexpected_exception_is_reported_and_exits_zero(self) -> None:
