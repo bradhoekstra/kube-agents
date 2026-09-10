@@ -3,7 +3,7 @@
 The classification itself is `scripts/classify_risk.py`, tested beside it.
 What this file pins is the one line of YAML that no other test reaches and
 that GitHub's scheduler, not the script, acts on: the concurrency group. The
-other pull-request workflows here that set one group by pull request number
+other pull-request workflows here that set one key it by pull request number
 alone, so a cleanup that normalises this one to match is the likeliest way
 the #1364 hang comes back -- an `edited` run carrying the previous head cancelling the
 `synchronize` run for the current one, leaving the current head with a

@@ -3,7 +3,8 @@ name: Risk Classification
 # Classifies every pull request's risk tier (low / medium / high) from its
 # diff, against the rules in .github/risk-rules.yml -- a non-blocking signal
 # for reviewers (#818). The verdict lands as a `Risk Classification` check run
-# that always concludes `success`, and a `risk:*` label.
+# that always concludes `success`, and a `risk:*` label. The job's own
+# `classify` check run is the one Tide can trip over; see `concurrency` below.
 #
 # The trigger cannot be `pull_request`: every pull request here comes from a
 # fork, and on a fork `pull_request` hands the workflow a read-only
@@ -39,7 +40,7 @@ permissions: {}
 # the edit's run put its `classify` check run on the old head, which left the
 # cancelled one as the only `classify` on the new head, and Tide counts a
 # cancelled check run as failing whether or not the context is required, so
-# the pull request sat unmerged with lgtm and approve. Keyed by head, a run
+# the pull request sat unmerged with lgtm and approved. Keyed by head, a run
 # can only supersede runs for its own head.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
