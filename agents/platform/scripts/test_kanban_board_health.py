@@ -234,7 +234,7 @@ class DiagnosticsTests(unittest.TestCase):
         text = "\n".join(lines)
         self.assertIn("t_stuck (platform, no kind, blocked 19d): From the CLI", text)
         # The operator commands name the home this run actually read.
-        self.assertIn("HERMES_HOME=/data/moved hermes kanban archive t_stuck", text)
+        self.assertIn("HERMES_HOME=/data/moved HERMES_KANBAN_DB=/data/moved/kanban.db hermes kanban archive t_stuck", text)
 
     def test_always_report_can_be_narrowed_by_env(self):
         lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
