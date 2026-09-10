@@ -35,8 +35,8 @@ delivery, so routing it through a card loses the run. A poller is the inverse: i
 has nothing to deliver on almost every tick, its product goes to GitHub, and it
 owes a model turn only when real work exists — which is why `github-repo-watcher`
 is a `no_agent` script that costs nothing when idle and files a card when it
-finds something. It still names an audible `deliver` for itself — `"chat"`, like
-every other report-producing entry here — so a sweep that cannot run still says so. Being
+finds something. It still names an audible `deliver` for itself — `"chat"` — like
+every other report-producing entry here, so a sweep that cannot run still says so. Being
 `no_agent` changes what it delivers, not whether it does: a clean tick prints
 nothing and relays nothing, and only a sweep that failed produces text.
 

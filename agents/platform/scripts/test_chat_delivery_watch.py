@@ -106,9 +106,13 @@ class FakeGh:
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(self.open_issues), stderr="")
         if verb == "issue create":
             self.next_number += 1
+            # A created issue is open until closed, as the real one would be.
+            self.open_issues.append({"number": self.next_number, "body": stdin or ""})
             return subprocess.CompletedProcess(
                 argv, 0, stdout=f"https://github.com/{repo}/issues/{self.next_number}\n", stderr=""
             )
+        if verb == "issue close":
+            self.open_issues = [i for i in self.open_issues if str(i["number"]) != argv[2]]
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     def verbs(self) -> list[str]:
@@ -365,8 +369,9 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_2, HARD_ERROR))
         self.run_tick()
         self.assertEqual(self.gh.verbs()[-1], "issue create")
-        # The fake lists no open issue now: someone closed #42 by hand. A changed
-        # picture must open a new one rather than edit the closed one.
+        # Someone closes #42 by hand. A changed picture must open a new issue
+        # rather than edit the closed one.
+        self.gh.open_issues = []
         self.write_store(job("a", RUN_3, HARD_ERROR))
         self.run_tick()
         self.assertEqual(self.gh.verbs()[-1], "issue create")

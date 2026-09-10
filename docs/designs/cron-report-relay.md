@@ -616,11 +616,12 @@ privilege the pod does not already hold.
   repository `CHAT_DELIVERY_LEDGER_REPO` names, or else in the install's one
   managed GitHub repository; several managed repositories and no override is
   refused rather than guessed, as `resolve_repo` refuses it. It is opened when
-  any job crosses the threshold, edited when the set of degraded jobs or their
-  errors change (a fingerprint in the ledger keeps an unchanged tick down to one
-  read, which is how an issue a person closed by hand is noticed and replaced
-  rather than edited while closed), and closed with a comment once every leg
-  has recovered. The call is
+  any job crosses the threshold, edited when the picture changes (a job joins or
+  leaves the degraded set, a further failing run is counted, an error string
+  changes; a fingerprint in the ledger keeps a tick that saw no new run down to
+  one read, which is how an issue a person closed by hand is noticed and
+  replaced rather than edited while closed), and closed with a comment once
+  every leg has recovered. The call is
   `forge.run_gh` through the sandbox and the credential proxy, the same route
   `github-repo-watcher` takes; the minted token already holds `issues: write`.
   The issue resolver's search excludes the label, so the agent never triages its
@@ -630,8 +631,10 @@ privilege the pod does not already hold.
   repository is the answer for both.
 - An **`ALERT chat_delivery_watch` line** appended to
   `<agent home>/logs/chat_delivery_watch.log`. The gateway pod's fluent-bit
-  sidecar tails `logs/*.log` and copies it to the container's stdout, which GKE
-  ships to Cloud Logging, so a log-based alert reaches it with
+  sidecar ships that directory's log files to Cloud Logging (the pipeline is
+  described on the site's
+  [observability page](../site/src/content/docs/concepts/observability.md)), so
+  a log-based alert reaches it with
   `resource.type="k8s_container" resource.labels.container_name="fluent-bit"
 jsonPayload.log:"ALERT chat_delivery_watch"`. This is the file rather than
   the job's own stdout on purpose: the scheduler captures a `no_agent` job's
@@ -641,11 +644,13 @@ jsonPayload.log:"ALERT chat_delivery_watch"`. This is the file rather than
 
 **Why not a `PlatformAgent` condition, a Kubernetes Event or a metric yet.** Each
 would be a better fit for an alerting system, and none has a carrier today. The
-agent container mounts no service-account token, the Role the operator grants is
-read-only apart from leader-election Leases, the credential proxy refuses every
-write verb before RBAC is consulted, and the operator reads nothing the pod
-writes, so a condition or an Event needs a new pod-to-operator path and a new
-grant first. Prometheus metrics are disabled in every shipped deploy and no
+agent container mounts no service-account token, the operator grants the agent
+identity no write on anything a watcher could use (the site's
+[security reference](../site/src/content/docs/reference/security-and-iam.md) is
+the canonical account of what it does grant), the credential proxy refuses
+every write verb before RBAC is consulted, and the operator reads nothing the
+pod writes, so a condition or an Event needs a new pod-to-operator path and a
+new grant first. Prometheus metrics are disabled in every shipped deploy and no
 container in the pod exposes an endpoint. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
