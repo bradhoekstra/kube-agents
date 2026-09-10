@@ -220,12 +220,21 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("hermes kanban unblock --reason", text)
         self.assertIn("hermes kanban archive t_stuck", text)
 
-    def test_a_stuck_card_without_context_still_reports(self):
-        # An unmigrated board (no block_kind, no task_events) yields no context.
-        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
-                                      runner=self.runner_for(0, STUCK_PAYLOAD)[0],
+    def test_a_stuck_card_without_context_falls_back_to_the_cli_s_fields(self):
+        # An unmigrated board (no block_kind, no task_events) yields no context;
+        # the CLI's own JSON still carries the title and assignee.
+        payload = json.dumps([{
+            "task_id": "t_stuck", "status": "blocked", "title": "From the CLI", "assignee": "platform",
+            "diagnostics": [{"kind": "stuck_in_blocked", "severity": "warning", "title": "x",
+                             "detail": "y", "data": {"age_hours": 456.2}}],
+        }])
+        lines = kbh.diagnostics_lines(Path("/data/moved"), "error",
+                                      runner=self.runner_for(0, payload)[0],
                                       binary="/x/hermes", env={}, context={})
-        self.assertIn("t_stuck (?, no kind, blocked 19d)", "\n".join(lines))
+        text = "\n".join(lines)
+        self.assertIn("t_stuck (platform, no kind, blocked 19d): From the CLI", text)
+        # The operator commands name the home this run actually read.
+        self.assertIn("HERMES_HOME=/data/moved hermes kanban archive t_stuck", text)
 
     def test_always_report_can_be_narrowed_by_env(self):
         lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
@@ -253,6 +262,17 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("[error] t_1 (blocked)", lines[0])
         self.assertIn("Repeated failures", lines[0])
+
+    def test_a_multi_paragraph_detail_is_cut_to_its_first_line(self):
+        payload = json.dumps([{
+            "task_id": "t_1", "status": "blocked",
+            "diagnostics": [{"kind": "repeated_failures", "severity": "error",
+                             "title": "Agent crash x3", "detail": "first line\n\nsecond paragraph\nthird"}],
+        }])
+        lines = kbh.diagnostics_lines(Path("/opt/data"), "error",
+                                      runner=self.runner_for(0, payload)[0],
+                                      binary="/x/hermes", env={})
+        self.assertEqual(lines, ["  [error] t_1 (blocked): Agent crash x3 - first line"])
 
     def test_log_prefix_before_json_is_tolerated(self):
         runner, _ = self.runner_for(0, "WARNING: something\n[]\n")
@@ -395,6 +415,21 @@ class BlockedContextTests(unittest.TestCase):
         self.assertEqual(context["t_b"]["kind"], "needs_input")
         self.assertEqual(context["t_b"]["reason"], "judge rejected")
         self.assertEqual(context["t_b"]["assignee"], "cluster-a")
+
+    def test_kind_and_reason_both_follow_the_latest_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = make_board(
+                Path(tmp),
+                tasks=[{"id": "t_b", "status": "blocked", "block_kind": None}],
+                events=[{"task_id": "t_b", "kind": "blocked", "payload": {"reason": "old", "kind": "needs_input"}, "created_at": 1},
+                        {"task_id": "t_b", "kind": "blocked", "payload": {"reason": "new", "kind": "dependency"}, "created_at": 2}],
+            )
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        self.assertEqual((context["t_b"]["kind"], context["t_b"]["reason"]), ("dependency", "new"))
 
     def test_an_unmigrated_board_yields_no_context_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as tmp:
