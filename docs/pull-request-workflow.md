@@ -333,8 +333,13 @@ Those ten are not the whole required set either. Tide also requires every Prow p
 `optional`, and those are configured in `oss-test-infra` rather than in branch protection —
 `pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
-date. The command below therefore answers half the question, and a red check in neither list blocks
-no merge:
+date. The command below therefore answers half the question. It does not answer a third one either:
+the two lists say which contexts must be _present_ and green, but Tide also refuses any context that
+is present and not green, required or not, because this repository sets no Tide context policy and
+the default treats a cancelled or failed check run as a failing context. A `classify` run cancelled
+by a superseding event held #1364 unmerged with `lgtm` and `approved` on it, though `classify` is in
+neither list. `tide`'s own status names the offending context; a `gh run rerun --job` of the
+cancelled job clears it.
 
 ```bash
 gh api repos/gke-labs/kube-agents/branches/main/protection \
@@ -407,8 +412,8 @@ test is a different system and is not watched; the `presubmit-gate` label is tha
 Every open pull request has exactly one party whose move it is, and the commonest way one sits for
 a fortnight is that both sides believe it is the other's. The rule:
 
-**The author owns it while it is blocked on them** — a draft, failing _required_ checks, merge
-conflicts, unresolved review threads, changes requested, or no human reviewer requested yet.
+**The author owns it while it is blocked on them** — a draft, a failing or cancelled check that
+`tide` names, merge conflicts, unresolved review threads, changes requested, or no human reviewer requested yet.
 **Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
 is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
 
@@ -426,9 +431,10 @@ Four states that look like somebody else's problem and are not:
   Clearing the findings and commenting `/review` for a clean pass is what summons one;
   `/request-review` is the override. Answering every bot thread does not summon one by itself, so
   an author who has done everything asked of them can still be sitting with nobody assigned.
-- **A red check that is not required.** It blocks no merge and is not the author's problem — but
-  "required" means both lists above, not branch protection's ten alone, and `tide` is what actually
-  knows. Ask it before treating a failing job as work owed, and before concluding one is not.
+- **A red check that is not required.** It still blocks the merge if it is red on the head: Tide
+  refuses any posted context that is not green, not only the ones on the two lists above, so a
+  cancelled run of a non-required job is the author's problem too. `tide` is what actually knows —
+  ask it before treating a failing job as work owed, and before concluding one is not.
 - **`mergeable: UNKNOWN`.** GitHub computes mergeability lazily and the first query only triggers
   the job, so a conflict reads as conflict-free until you ask twice.
 
