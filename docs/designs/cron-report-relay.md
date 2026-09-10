@@ -1,8 +1,10 @@
 # Scheduled-report relay: the specialist reasons, the Chat Agent speaks
 
-**Status:** implemented and validated end to end on a live GKE cluster; every job
-on [the Platform Agent's roster](../../agents/platform/cron/README.md) delivers
-this way.
+**Status:** implemented and validated end to end on a live GKE cluster; every
+report-producing job on
+[the Platform Agent's roster](../../agents/platform/cron/README.md) delivers this
+way. The one exception, `chat-delivery-watch`, is the job that notices when this
+path is broken; see [Detecting a broken leg](#detecting-a-broken-leg).
 
 ## The problem
 
@@ -572,10 +574,11 @@ sending something other than the final response.
 ## Detecting a broken leg
 
 Everything above records a failed delivery faithfully and reports it to nobody.
-`last_delivery_error` is written on every failed run, and #1102 is the account of
-what that was worth: seven days of six audits composed, dropped, and recorded as
-dropped, with the only signal being that the reports had stopped arriving. The
-watcher on the other end of the field is `chat-delivery-watch`
+`last_delivery_error` is written on every failed run; #1094 is the account of
+what that was worth (seven days of six audits composed, dropped, and recorded as
+dropped, with the only signal being that the reports had stopped arriving) and
+#1102 is the gap it left open. The watcher on the other end of the field is
+`chat-delivery-watch`
 (`agents/platform/scripts/chat_delivery_watch.py`), a `no_agent` job on the
 Platform Agent's roster that runs every half hour.
 
@@ -595,10 +598,10 @@ an unreachable relay, no key), `partial` when it landed somewhere but not on the
 platforms the `undelivered` field names, `degraded` when it posted but the Chat
 Agent's turn failed. The scheduler's own two failures, a platform named in
 `deliver` that is not enabled and a `deliver` that resolved to no target, also
-grade `hard`; on 2026-09-10 the gkedemos install carried the first on all nine
-audits and the second on both `chat` script jobs, every report lost and nothing
-saying so. `CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many consecutive
-failing runs make a job degraded.
+grade `hard`: nothing was delivered either way. A job that is disabled or paused
+holds no streak, since it has no next run to recover with.
+`CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many consecutive failing runs
+make a job degraded.
 
 **Where it reports.** Not chat: a chat message saying that chat is down is the
 one message guaranteed not to arrive. The job's `deliver` is `"local"`, the only
@@ -606,15 +609,21 @@ platform-roster entry allowed that value (the README's rule and its test carry
 the exemption by name), and it reports through two channels that need no
 privilege the pod does not already hold.
 
-- A **GitHub ledger issue**, one per install, in the repository the install
-  manages, labelled `agent:delivery-watch` and carrying a hidden
-  `<!-- chat-delivery-watch -->` marker. It is opened when any job crosses the
-  threshold, edited when the set of degraded jobs or their errors change (a
-  fingerprint in the ledger keeps an unchanged tick from writing at all), and
-  closed with a comment once every leg has recovered. The call is
+- A **GitHub ledger issue**, one per install, labelled `agent:delivery-watch`
+  and carrying a hidden `<!-- chat-delivery-watch -->` marker. It lives in the
+  repository `CHAT_DELIVERY_LEDGER_REPO` names, or else in the install's one
+  managed GitHub repository; several managed repositories and no override is
+  refused rather than guessed, as `resolve_repo` refuses it. It is opened when
+  any job crosses the threshold, edited when the set of degraded jobs or their
+  errors change (a fingerprint in the ledger keeps an unchanged tick from making
+  any call), and closed with a comment once every leg has recovered. The call is
   `forge.run_gh` through the sandbox and the credential proxy, the same route
   `github-repo-watcher` takes; the minted token already holds `issues: write`.
-  With no managed GitHub repository the job falls back to the log line alone.
+  The issue resolver's search excludes the label, so the agent never triages its
+  own ledger. With no repository to use, the job falls back to the log line
+  alone. Two installs that manage one repository would share one issue; the
+  fleet-audit ledgers have the same property, and an install-specific ledger
+  repository is the answer for both.
 - An **`ALERT chat_delivery_watch` line** appended to
   `<agent home>/logs/chat_delivery_watch.log`. The gateway pod's fluent-bit
   sidecar tails `logs/*.log` and copies it to the container's stdout, which GKE

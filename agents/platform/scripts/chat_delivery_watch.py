@@ -119,8 +119,18 @@ PARTIAL_RE = re.compile(r"chat relay partial: the report did not reach ([^.]+)\.
 HARD_UNDELIVERED_RE = re.compile(r"composed but not delivered to ([^\n]+?)(?: \(target [^)]*\))?$")
 NOT_CONFIGURED_RE = re.compile(r"platform '([^']+)' not configured/enabled")
 DEGRADED_MARKER = "chat relay degraded:"
-SILENT_MARKER = "[SILENT]"
+# Silence, as the scheduler recognises it (`cron/scheduler.py::_is_cron_silence_response`):
+# one of these tokens as the whole first or last line of the response, compared
+# case-insensitively, or a response that starts with `[SILENT]`. The saved
+# document puts the response under its last `## Response` heading; a no_agent
+# job's document says `**Status:** silent` instead.
+SILENT_TOKENS = frozenset({"[silent]", "silent", "no_reply", "no reply"})
+SILENT_PREFIX = "[silent]"
+RESPONSE_HEADING = "## Response"
 SILENT_STATUS_MARKER = "**Status:** silent"
+# A job the scheduler will not run again has no next run to recover with, so it
+# holds no streak: `enabled: false` (a retirement tombstone) or a paused state.
+PAUSED_STATE = "paused"
 
 # --- the ledger issue ---------------------------------------------------------
 # Where the issue lives: this variable when set, otherwise the install's managed
@@ -138,6 +148,7 @@ CLOSE_REASON = "completed"
 ISSUE_URL_RE = re.compile(r"/issues/(\d+)\s*$")
 
 LEDGER_NONE = "none"
+FOOTER_PREFIX = "_Maintained by"
 LEDGER_CLOSED = "closed"
 LEDGER_DRY_RUN = "dry-run"
 
@@ -187,10 +198,21 @@ def roster_paths(agent_home: Path) -> list[tuple[str, Path]]:
 
 
 def load_jobs(path: Path) -> list[dict]:
-    """The job dicts in a store; `{"jobs": [...]}` or a bare list, as Hermes accepts."""
+    """The live job dicts in a store; `{"jobs": [...]}` or a bare list, as Hermes accepts.
+
+    A disabled or paused entry is left out: it will not run again, so a streak
+    it carries could never recover, and a retirement tombstone (the README's
+    two-release sequence leaves one) would otherwise hold the issue open.
+    """
     data = json.loads(path.read_text(encoding="utf-8"))
     jobs = data.get("jobs", []) if isinstance(data, dict) else data
-    return [j for j in jobs if isinstance(j, dict) and j.get("id")]
+    if not isinstance(jobs, list):
+        raise ValueError(f"{path}: `jobs` is {type(jobs).__name__}, not a list")
+    return [
+        j
+        for j in jobs
+        if isinstance(j, dict) and j.get("id") and j.get("enabled", True) is not False and j.get("state") != PAUSED_STATE
+    ]
 
 
 def newest_output_is_silent(store_path: Path, job_id: str, last_run_at: str | None) -> bool:
@@ -214,8 +236,19 @@ def newest_output_is_silent(store_path: Path, job_id: str, last_run_at: str | No
         text = newest.read_text(encoding="utf-8")
     except OSError:
         return False
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    return (bool(lines) and lines[-1] == SILENT_MARKER) or SILENT_STATUS_MARKER in text
+    return is_silent_document(text)
+
+
+def is_silent_document(text: str) -> bool:
+    """Whether a saved run document records a response the scheduler treated as silence."""
+    if SILENT_STATUS_MARKER in text:
+        return True
+    response = text.rsplit(RESPONSE_HEADING, 1)[-1] if RESPONSE_HEADING in text else text
+    lines = [line.strip() for line in response.splitlines() if line.strip()]
+    if not lines:
+        return False
+    first, last = lines[0].lower(), lines[-1].lower()
+    return first in SILENT_TOKENS or last in SILENT_TOKENS or first.startswith(SILENT_PREFIX)
 
 
 # --- grading ------------------------------------------------------------------
@@ -402,7 +435,7 @@ def render_issue(degraded: list[tuple[str, dict]], now: str, threshold_value: in
             "- For a `partial`: whether the platform named has a home channel configured and a working connection.",
             "- For a `hard`: whether every enabled chat platform is really configured on this install.",
             "",
-            f"_Maintained by `chat_delivery_watch.py`; updated {now}. It closes this issue itself once every leg has recovered._",
+            f"{FOOTER_PREFIX} `chat_delivery_watch.py`; updated {now}. It closes this issue itself once every leg has recovered._",
         ]
     )
     return title, body
@@ -413,7 +446,7 @@ def fingerprint(title: str, body: str) -> str:
     digest.update(title.encode("utf-8"))
     digest.update(b"\0")
     # The timestamp line changes every tick; everything above it is the state.
-    digest.update(body.rsplit("\n_Maintained by", 1)[0].encode("utf-8"))
+    digest.update(body.rsplit("\n" + FOOTER_PREFIX, 1)[0].encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -421,13 +454,13 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
     """Bring the ledger issue in line with `degraded`; returns the `ledger=` value for the ALERT lines."""
     ledger = state["ledger"]
     if degraded:
-        ensure_label(repo)
         number = ledger.get("issue_number") if ledger.get("repo") == repo else None
         if number is None:
             number = find_ledger_issue(repo)
         title, body = render_issue(degraded, now, threshold_value)
         digest = fingerprint(title, body)
         if number is None:
+            ensure_label(repo)
             result = gh(
                 ["issue", "create", "-R", repo, "--title", title, "--body-file", forge.BODY_STDIN, "--label", LABEL],
                 repo,
@@ -441,23 +474,36 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
         return f"{repo}#{number}" if number else repo
     number = ledger.get("issue_number")
     if number is not None and ledger.get("repo") == repo:
+        # One call, so a close that fails cannot leave a comment behind to be
+        # repeated on every later tick.
         gh(
-            ["issue", "comment", str(number), "-R", repo, "--body-file", forge.BODY_STDIN],
+            ["issue", "close", str(number), "-R", repo, "--reason", CLOSE_REASON, "--comment",
+             f"Every scheduled report reached chat again as of {now}; closing."],
             repo,
-            stdin=f"Every scheduled report reached chat again as of {now}; closing.",
         )
-        gh(["issue", "close", str(number), "-R", repo, "--reason", CLOSE_REASON], repo)
         state["ledger"] = {"repo": None, "issue_number": None, "fingerprint": None}
         return LEDGER_CLOSED
     return LEDGER_NONE
 
 
+class LedgerRepoAmbiguous(RuntimeError):
+    """More than one managed repository and no `CHAT_DELIVERY_LEDGER_REPO` to choose."""
+
+
 def ledger_repo() -> str | None:
+    """The ledger repository, or None for log-only mode.
+
+    The override wins; otherwise the one managed GitHub repository. Several
+    managed repositories and no override is refused rather than guessed, the
+    way `gitops_workspace.resolve_repo` and the audit ledger refuse it.
+    """
     configured = os.environ.get(LEDGER_REPO_ENV, "").strip()
     if configured:
         return configured
-    repos = gitops_workspace.get_managed_github_repos()
-    return sorted(repos)[0] if repos else None
+    repos = sorted(gitops_workspace.get_managed_github_repos())
+    if len(repos) > 1:
+        raise LedgerRepoAmbiguous(f"{len(repos)} managed repositories ({', '.join(repos)}); set {LEDGER_REPO_ENV}")
+    return repos[0] if repos else None
 
 
 # --- the ALERT lines ----------------------------------------------------------
@@ -529,7 +575,7 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
             jobs = load_jobs(store)
         except FileNotFoundError:
             continue
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
             unreadable.append(f"{profile}: {exc}")
             continue
         for job in jobs:

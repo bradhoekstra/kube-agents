@@ -222,12 +222,23 @@ class SilentOutputTest(WatchCase):
         out.mkdir(parents=True, exist_ok=True)
         (out / "2026-09-09_06-20-09.md").write_text(text, encoding="utf-8")
 
-    def test_silent_marker_and_status_line_both_count(self) -> None:
+    def test_every_silence_form_the_scheduler_accepts_counts(self) -> None:
         self.write_store(job("a", RUN_2))
-        for text in ("Nothing to report.\n\n[SILENT]\n", "# run\n\n**Status:** silent\n\nno findings\n"):
-            with self.subTest(text=text[:12]):
+        for text in (
+            "Nothing to report.\n\n[SILENT]\n",
+            "# run\n\n**Status:** silent\n\nno findings\n",
+            "# Cron run\n\n## Prompt\n\naudit\n\n## Response\n\n[SILENT] No changes detected\n",
+            "# Cron run\n\n## Response\n\nsilent\n",
+            "# Cron run\n\n## Response\n\nNO_REPLY\n",
+            "# Cron run\n\n## Response\n\nno reply\n\nfooter line\n",
+        ):
+            with self.subTest(text=text[-30:]):
                 self.write_output("a", text)
                 self.assertTrue(cdw.newest_output_is_silent(self.store, "a", utc_now_iso()))
+
+    def test_a_response_that_merely_mentions_silence_is_not_silent(self) -> None:
+        self.assertFalse(cdw.is_silent_document("# Cron run\n\n## Response\n\nTwo findings; the [SILENT] rule did not apply.\n"))
+        self.assertFalse(cdw.is_silent_document("## Prompt\n\n[SILENT]\n\n## Response\n\nA finding.\n"))
 
     def test_a_real_report_is_not_silent(self) -> None:
         self.write_store(job("a", RUN_2))
@@ -269,7 +280,7 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_2, HARD_ERROR), job("b", RUN_2, PARTIAL_ERROR))
         rc, out = self.run_tick()
         self.assertEqual(rc, 0)
-        self.assertEqual(self.gh.verbs(), ["label create", "issue list", "issue create"])
+        self.assertEqual(self.gh.verbs(), ["issue list", "label create", "issue create"])
         created = self.gh.stdins[-1]
         self.assertIn(cdw.BODY_MARKER, created)
         self.assertIn("`a`", created)
@@ -291,7 +302,7 @@ class TickTest(WatchCase):
         before = self.state.read_bytes()
         calls = len(self.gh.calls)
         self.run_tick()
-        self.assertEqual(self.gh.verbs()[calls:], ["label create"])
+        self.assertEqual(self.gh.verbs()[calls:], [])
         after = self.state_data()
         self.assertEqual(after["jobs"], json.loads(before)["jobs"])
         self.assertEqual(after["jobs"]["platform/a"]["streak"], 2)
@@ -313,7 +324,8 @@ class TickTest(WatchCase):
         self.run_tick()
         self.write_store(job("a", RUN_3))
         rc, out = self.run_tick()
-        self.assertEqual(self.gh.verbs()[-2:], ["issue comment", "issue close"])
+        self.assertEqual(self.gh.verbs()[-1], "issue close")
+        self.assertIn("--comment", self.gh.calls[-1])
         self.assertIn("recovered=true", out)
         self.assertIn(f"ledger={cdw.LEDGER_CLOSED}", out)
         self.assertEqual(self.state_data()["ledger"]["issue_number"], None)
@@ -386,6 +398,30 @@ class TickTest(WatchCase):
         self.assertIn("ledger=error:AttributeError", out)
         self.assertEqual(len(self.log_lines()), 2)
 
+    def test_a_disabled_or_paused_job_holds_no_streak(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR), job("b", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR), job("b", RUN_2, HARD_ERROR))
+        self.run_tick()
+        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        disabled = dict(job("a", RUN_2, HARD_ERROR), enabled=False)
+        paused = dict(job("b", RUN_2, HARD_ERROR), state="paused")
+        self.write_store(disabled, paused)
+        rc, out = self.run_tick()
+        self.assertEqual(self.gh.verbs()[-1], "issue close")
+        self.assertNotIn("platform/a", self.state_data()["jobs"])
+
+    def test_several_managed_repositories_without_an_override_is_log_only(self) -> None:
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", lambda: ["z/two", "a/one"]):
+            self.write_store(job("a", RUN_1, HARD_ERROR))
+            self.run_tick()
+            self.write_store(job("a", RUN_2, HARD_ERROR))
+            rc, out = self.run_tick()
+        self.assertEqual(self.gh.calls, [])
+        self.assertIn("self=error kind=LedgerRepoAmbiguous", out)
+        self.assertIn("ledger=error:LedgerRepoAmbiguous", out)
+        self.assertIn(cdw.LEDGER_REPO_ENV, out)
+
     def test_the_ledger_repo_env_wins_over_discovery(self) -> None:
         os.environ[cdw.LEDGER_REPO_ENV] = "other/ledger"
         self.write_store(job("a", RUN_1, HARD_ERROR))
@@ -420,9 +456,12 @@ class TickTest(WatchCase):
         self.write_store(job("a", RUN_1, HARD_ERROR))
         bad = self.write_store(job("b", RUN_1), profile="broken")
         bad.write_text("[", encoding="utf-8")
+        odd = self.write_store(job("c", RUN_1), profile="odd")
+        odd.write_text('{"jobs": 5}', encoding="utf-8")
         rc, out = self.run_tick()
         self.assertEqual(rc, 0)
         self.assertIn("unreadable cron store broken", out)
+        self.assertIn("unreadable cron store odd", out)
         self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 1)
 
     def test_a_sandbox_outage_degrades_to_the_log_line(self) -> None:
