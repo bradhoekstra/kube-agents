@@ -108,7 +108,9 @@ CI enforcement: `make docs-check` runs the same checks as
   generated region or file no longer matches its source. This is what catches a
   document deleted from inside a collapsed family row's glob (see section 5).
 - `docs-check-links` — `scripts/check_docs_links.py`; relative links must
-  resolve to **git-tracked** targets.
+  resolve to **git-tracked** targets, and a `docs/designs/…` or
+  `docs/architecture/…` path cited from a `.py`, `.go` or `.sh` file must be
+  one too.
 - `docs-check-terminology` — `hack/check-docs-terminology.sh`; identifiers in
   prose must match their source (service-account names, versions, the
   fleet-audit finding-id pattern and rendering caps, …), and a quoted cron
