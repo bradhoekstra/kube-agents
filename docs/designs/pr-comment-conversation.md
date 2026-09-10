@@ -661,7 +661,7 @@ The mechanism is already shipped, which is the point:
 
 - The age is free. `Comment.created_at` is in the payload the sweep already fetches, and
   `pr_triggers.handled_node_ids` already computes whether a trigger is unanswered.
-- The channel is free. `github-repo-watcher` is `deliver: "all"` so that a sweep which cannot run is
+- The channel is free. `github-repo-watcher` is `deliver: "chat"` so that a sweep which cannot run is
   audible (§2); an escalation is the same class of message and rides the same stdout.
 - There is no new state, no table, no route, and nothing for `submit_suggestion.py` to register.
 

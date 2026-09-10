@@ -599,9 +599,13 @@ platforms the `undelivered` field names, `degraded` when it posted but the Chat
 Agent's turn failed. The scheduler's own two failures, a platform named in
 `deliver` that is not enabled and a `deliver` that resolved to no target, also
 grade `hard`: nothing was delivered either way. A run the scheduler recorded as
-anything but `ok` (interrupted by a gateway shutdown, or failed before delivery)
-is no evidence either, like a silent one. A job that is disabled or paused holds
-no streak, since it has no next run to recover with.
+anything but `ok` and that saved no document (interrupted by a gateway shutdown,
+or failed before delivery) is no evidence either, like a silent one; a failed
+run that did save its document had its failure summary delivered, which is a
+working leg. A note the scheduler files under the same field for a report that
+arrived (a thread it fell back from, an attachment it could not confirm) is not
+a failure. A job that is disabled or paused holds no streak, since it has no
+next run to recover with.
 `CHAT_DELIVERY_ALERT_THRESHOLD` (default 2) is how many consecutive failing runs
 make a job degraded.
 
@@ -650,8 +654,9 @@ identity no write on anything a watcher could use (the site's
 the canonical account of what it does grant), the credential proxy refuses
 every write verb before RBAC is consulted, and the operator reads nothing the
 pod writes, so a condition or an Event needs a new pod-to-operator path and a
-new grant first. Prometheus metrics are disabled in every shipped deploy and no
-container in the pod exposes an endpoint. Those are the next step, with this
+new grant first. Prometheus metrics are disabled by default in every shipped
+deploy and no container in the pod exposes an endpoint unless one is switched
+on. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

@@ -73,6 +73,9 @@ from cluster_agent_profile import RESERVED_PROFILES
 #   resource.type="k8s_container" resource.labels.container_name="fluent-bit"
 #   jsonPayload.log:"ALERT chat_delivery_watch"
 LOG_PREFIX = "ALERT chat_delivery_watch"
+# Housekeeping the file also carries, under a prefix the alert filter does not
+# match: an unreadable store or a log-append failure is not a dead leg.
+WARN_PREFIX = "WARN chat_delivery_watch"
 LOGS_DIR = "logs"
 ALERT_FILE_NAME = "chat_delivery_watch.log"
 
@@ -90,6 +93,7 @@ OUTPUT_SUFFIX = ".md"
 STATE_FILE_NAME = "chat_delivery_watch.json"
 STATE_PATH_ENV = "CHAT_DELIVERY_WATCH_STATE"
 STATE_SCHEMA_VERSION = 1
+STATE_TMP_SUFFIX = ".tmp"
 # A second consecutive miss on a daily job is two days of silence; a single miss
 # is what a relay restart during the run looks like, and is not worth an issue.
 THRESHOLD_ENV = "CHAT_DELIVERY_ALERT_THRESHOLD"
@@ -108,8 +112,25 @@ GRADE_HARD = "hard"
 GRADE_PARTIAL = "partial"
 GRADE_DEGRADED = "degraded"
 PARTIAL_RE = re.compile(r"chat relay partial: the report did not reach ([^.]+)\.")
-HARD_UNDELIVERED_RE = re.compile(r"composed but not delivered to ([^\n]+?)(?: \(target [^)]*\))?$")
+# Several targets' errors arrive joined with "; ", and the relay may append a
+# "(target …)" note, so the platform list ends at either.
+HARD_UNDELIVERED_RE = re.compile(r"composed but not delivered to ([^;(\n]+)")
 NOT_CONFIGURED_RE = re.compile(r"platform '([^']+)' not configured/enabled")
+# Notes the scheduler files under the same field for a report that did arrive:
+# a thread it fell back from, an attachment it could not confirm. An error that
+# carries one of these and none of the failure shapes is a delivered report.
+DELIVERED_NOTE_MARKERS = ("delivered without thread_id", "attachment(s) not delivered")
+FAILURE_MARKERS = (
+    "composed but not delivered",
+    "chat relay answered HTTP",
+    "chat relay unreachable",
+    "chat relay partial",
+    "chat relay degraded",
+    "not configured/enabled",
+    "no delivery target resolved",
+    "SESSION_KV_API_KEY",
+    "failed:",
+)
 DEGRADED_MARKER = "chat relay degraded:"
 # Silence, as the scheduler recognises it (`cron/scheduler.py::_is_cron_silence_response`):
 # one of these tokens as the whole first or last line of the response, compared
@@ -123,9 +144,10 @@ SILENT_STATUS_MARKER = "**Status:** silent"
 # A job the scheduler will not run again has no next run to recover with, so it
 # holds no streak: `enabled: false` (a retirement tombstone) or a paused state.
 PAUSED_STATE = "paused"
-# A run the scheduler recorded as anything but ok never reached delivery, or
-# reached it only with a failure summary; either way it says nothing about the
-# leg, so it neither advances nor resets the streak.
+# A run the scheduler recorded as anything but ok either failed before delivery
+# (a gateway shutdown, an exception) and wrote no output, which says nothing
+# about the leg, or failed and had its failure summary delivered, which proves
+# the leg works. The presence of an output file for the run tells them apart.
 STATUS_OK = "ok"
 
 # --- the ledger issue ---------------------------------------------------------
@@ -142,6 +164,8 @@ GH_LIST_LIMIT = "20"
 CLOSE_REASON = "completed"
 # `gh issue create` prints the new issue's URL; the number is its last segment.
 ISSUE_URL_RE = re.compile(r"/issues/(\d+)\s*$")
+EMPTY_CELL = "—"
+EMPTY_FIELD = "-"
 
 LEDGER_NONE = "none"
 FOOTER_PREFIX = "_Maintained by"
@@ -211,28 +235,37 @@ def load_jobs(path: Path) -> list[dict]:
     ]
 
 
-def newest_output_is_silent(store_path: Path, job_id: str, last_run_at: str | None) -> bool:
-    """Whether the job's latest run delivered nothing on purpose.
+def newest_output(store_path: Path, job_id: str, last_run_at: str | None) -> str | None:
+    """The document the job's latest run saved, or None when there is none for that run.
 
-    Best effort, and deliberately biased: when the output directory is missing
-    or the newest file predates the run, the run is treated as a real delivery,
-    so an unreadable history closes an alert rather than holding one open.
+    Best effort: a missing directory, an unreadable file, or a newest file that
+    predates the run all read as "no document".
     """
     output_dir = store_path.parent / OUTPUT_DIR / job_id
     if not output_dir.is_dir():
-        return False
+        return None
     candidates = [p for p in output_dir.iterdir() if p.is_file() and p.suffix == OUTPUT_SUFFIX]
     if not candidates:
-        return False
+        return None
     newest = max(candidates, key=lambda p: p.stat().st_mtime)
     run_at = parse_iso(last_run_at)
     if run_at is not None and newest.stat().st_mtime < run_at.timestamp() - SILENT_OUTPUT_SLACK_S:
-        return False
+        return None
     try:
-        text = newest.read_text(encoding="utf-8")
+        return newest.read_text(encoding="utf-8")
     except OSError:
-        return False
-    return is_silent_document(text)
+        return None
+
+
+def newest_output_is_silent(store_path: Path, job_id: str, last_run_at: str | None) -> bool:
+    """Whether the job's latest run delivered nothing on purpose.
+
+    Deliberately biased: with no document for the run, the run is treated as a
+    real delivery, so an unreadable history closes an alert rather than holding
+    one open.
+    """
+    text = newest_output(store_path, job_id, last_run_at)
+    return bool(text) and is_silent_document(text)
 
 
 def is_silent_document(text: str) -> bool:
@@ -248,6 +281,11 @@ def is_silent_document(text: str) -> bool:
 
 
 # --- grading ------------------------------------------------------------------
+
+
+def is_delivered_note(error: str) -> bool:
+    """Whether the error only annotates a report that arrived anyway."""
+    return any(m in error for m in DELIVERED_NOTE_MARKERS) and not any(m in error for m in FAILURE_MARKERS)
 
 
 def grade_error(error: str) -> str:
@@ -300,7 +338,7 @@ def load_state(path: Path) -> dict:
 
 def save_state(path: Path, state: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    tmp = path.with_name(path.name + STATE_TMP_SUFFIX)
     tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
@@ -318,19 +356,27 @@ def new_entry() -> dict:
     }
 
 
-def advance(entry: dict, job: dict, *, silent: bool) -> dict:
+def run_changed(entry: dict, job: dict) -> bool:
+    run_at = job.get("last_run_at")
+    return bool(run_at) and run_at != entry.get("last_seen_run_at")
+
+
+def advance(entry: dict, job: dict, *, silent: bool, has_output: bool = True) -> dict:
     """One job's ledger entry after seeing its current store record.
 
-    Pure: the caller decides `silent` (see `newest_output_is_silent`). The
-    streak moves only when `last_run_at` differs from the last run this ledger
-    saw, so a half-hourly tick over a daily job counts runs, not ticks.
+    Pure: the caller decides `silent` and `has_output` from the run's saved
+    document (see `newest_output`). The streak moves only when `last_run_at`
+    differs from the last run this ledger saw, so a half-hourly tick over a
+    daily job counts runs, not ticks.
     """
-    run_at = job.get("last_run_at")
-    if not run_at or run_at == entry.get("last_seen_run_at"):
+    if not run_changed(entry, job):
         return entry
+    run_at = job["last_run_at"]
     updated = dict(entry)
     updated["last_seen_run_at"] = run_at
     error = job.get("last_delivery_error")
+    if error and is_delivered_note(str(error)):
+        error = None
     if error:
         error = str(error)
         updated["streak"] = int(entry.get("streak") or 0) + 1
@@ -340,9 +386,11 @@ def advance(entry: dict, job: dict, *, silent: bool) -> dict:
         updated["last_failure_at"] = run_at
         updated["last_error"] = error[:MAX_ERROR_CHARS]
         return updated
-    if silent or job.get("last_status") != STATUS_OK:
-        # Delivered nothing (a silent answer, an interrupted or failed run), so
-        # says nothing about the leg.
+    if silent or (job.get("last_status") != STATUS_OK and not has_output):
+        # Delivered nothing: a silent answer, or a run that failed before it
+        # saved anything. Says nothing about the leg. A failed run that did
+        # save its document had its failure summary delivered, and that is a
+        # working leg, so it falls through to the reset.
         return updated
     updated["streak"] = 0
     updated["grade"] = None
@@ -409,7 +457,7 @@ def render_issue(degraded: list[tuple[str, dict]], now: str, threshold_value: in
                     f"`{_cell(job_id)}`",
                     _cell(entry.get("grade") or ""),
                     str(entry.get("streak") or 0),
-                    _cell(", ".join(entry.get("platforms") or []) or "—"),
+                    _cell(", ".join(entry.get("platforms") or []) or EMPTY_CELL),
                     _cell(entry.get("first_failure_at") or ""),
                     _cell(entry.get("last_failure_at") or ""),
                     f"`{_cell(entry.get('last_error') or '')}`",
@@ -530,7 +578,7 @@ def format_alert(key: str, entry: dict, threshold_value: int, ledger: str) -> st
             f"grade={entry.get('grade')}",
             f"streak={entry.get('streak')}",
             f"threshold={threshold_value}",
-            f"platforms={','.join(entry.get('platforms') or []) or '-'}",
+            f"platforms={','.join(entry.get('platforms') or []) or EMPTY_FIELD}",
             f"since={entry.get('first_failure_at')}",
             f"ledger={ledger}",
             f"error={json.dumps(entry.get('last_error') or '', ensure_ascii=False)}",
@@ -559,7 +607,7 @@ def emit(lines: list[str], agent_home: Path, now: str) -> None:
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write("".join(f"{now} {line}\n" for line in lines))
     except OSError as exc:
-        print(f"{LOG_PREFIX} self=warning detail={json.dumps(f'could not append to {log_path}: {exc}')}")
+        print(f"{WARN_PREFIX} detail={json.dumps(f'could not append to {log_path}: {exc}')}")
 
 
 # --- the tick -----------------------------------------------------------------
@@ -592,8 +640,12 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
         for job in jobs:
             key = f"{profile}/{job['id']}"
             entry = previous.get(key) or new_entry()
-            silent = not job.get("last_delivery_error") and newest_output_is_silent(store, job["id"], job.get("last_run_at"))
-            current[key] = advance(entry, job, silent=silent)
+            silent = has_output = False
+            if run_changed(entry, job) and not job.get("last_delivery_error"):
+                document = newest_output(store, job["id"], job.get("last_run_at"))
+                has_output = document is not None
+                silent = bool(document) and is_silent_document(document)
+            current[key] = advance(entry, job, silent=silent, has_output=has_output)
 
     degraded = [(k, e) for k, e in current.items() if int(e.get("streak") or 0) >= limit]
     recovered = [k for k, e in current.items() if e.get("alerted") and int(e.get("streak") or 0) == 0]
@@ -612,6 +664,10 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
             repo = None
             ledger_ref = f"error:{type(exc).__name__}"
             lines.append(format_self_error(exc))
+            if not degraded and state["ledger"].get("repo"):
+                # Nothing to report and an issue we opened is still out there:
+                # the repository we recorded is enough to close it.
+                repo = state["ledger"]["repo"]
         if repo:
             try:
                 ledger_ref = reconcile_issue(repo, degraded, state, now, limit)
@@ -625,7 +681,7 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
         lines.append(format_recovery(key, ledger_ref if ledger_ref == LEDGER_CLOSED else LEDGER_NONE))
         current[key]["alerted"] = False
     for note in unreadable:
-        lines.append(f"{LOG_PREFIX} self=warning detail={json.dumps(f'unreadable cron store {note}')}")
+        lines.append(f"{WARN_PREFIX} detail={json.dumps(f'unreadable cron store {note}')}")
 
     state["jobs"] = current
     state["last_tick_at"] = now

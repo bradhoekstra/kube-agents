@@ -177,6 +177,19 @@ class GradingTest(unittest.TestCase):
     def test_degraded_is_its_own_grade(self) -> None:
         self.assertEqual(cdw.grade_error(DEGRADED_ERROR), cdw.GRADE_DEGRADED)
 
+    def test_joined_errors_from_several_targets_keep_the_platform_list_clean(self) -> None:
+        joined = HARD_ERROR + "; delivery to slack:C123 failed: channel_not_found"
+        self.assertEqual(cdw.platforms_from(joined), ["slack", "google_chat"])
+
+    def test_the_adapter_still_produces_the_phrases_the_grader_matches(self) -> None:
+        # The guard behind the constants above: the phrases are literals here, so
+        # this reads the adapter's source and fails if either sentence is reworded.
+        adapter = (REPO_ROOT / "deploy" / "docker" / "plugins" / "chat" / "adapter.py").read_text(encoding="utf-8")
+        self.assertIn("chat relay partial: the report did not reach {undelivered}.", adapter)
+        self.assertIn("chat relay degraded: ", adapter)
+        relay = (REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py").read_text(encoding="utf-8")
+        self.assertIn("composed but not delivered to ", relay)
+
     def test_the_scheduler_s_own_failures_grade_hard_and_name_the_platform(self) -> None:
         self.assertEqual(cdw.grade_error(NOT_CONFIGURED_ERROR), cdw.GRADE_HARD)
         self.assertEqual(cdw.platforms_from(NOT_CONFIGURED_ERROR), ["google_chat"])
@@ -210,13 +223,31 @@ class AdvanceTest(unittest.TestCase):
         entry = cdw.advance(entry, job("a", RUN_3, HARD_ERROR), silent=False)
         self.assertEqual(entry["first_failure_at"], RUN_3)
 
-    def test_an_interrupted_or_failed_run_is_no_evidence(self) -> None:
-        # Seen in Hermes: a gateway shutdown or an exception before delivery records
-        # last_status "error" with last_delivery_error None and writes no output.
+    def test_an_interrupted_run_is_no_evidence_but_a_delivered_failure_summary_is(self) -> None:
+        # A gateway shutdown or an exception before delivery records last_status
+        # "error" with last_delivery_error None and saves no document...
         entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
         interrupted = dict(job("a", RUN_2), last_status="error", last_error="Interrupted by gateway shutdown")
-        entry = cdw.advance(entry, interrupted, silent=False)
+        entry = cdw.advance(entry, interrupted, silent=False, has_output=False)
         self.assertEqual((entry["streak"], entry["last_seen_run_at"]), (1, RUN_2))
+        # ...whereas a run that failed and had its failure summary delivered did
+        # save one, and that delivery proves the leg works.
+        failed = dict(job("a", RUN_3), last_status="error", last_error="model quota exhausted")
+        entry = cdw.advance(entry, failed, silent=False, has_output=True)
+        self.assertEqual(entry["streak"], 0)
+
+    def test_a_note_about_a_report_that_arrived_is_not_a_failure(self) -> None:
+        for note in (
+            "configured thread_id 12345 was not found; delivered without thread_id",
+            "2 media attachment(s) not delivered to slack (live adapter confirmation timed out)",
+        ):
+            with self.subTest(note=note[:30]):
+                self.assertTrue(cdw.is_delivered_note(note))
+                entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
+                entry = cdw.advance(entry, job("a", RUN_2, note), silent=False)
+                self.assertEqual(entry["streak"], 0)
+        self.assertFalse(cdw.is_delivered_note(HARD_ERROR))
+        self.assertFalse(cdw.is_delivered_note(HARD_ERROR + "; delivered without thread_id"))
 
     def test_a_silent_run_neither_advances_nor_resets(self) -> None:
         entry = cdw.advance(cdw.new_entry(), job("a", RUN_1, HARD_ERROR), silent=False)
@@ -499,6 +530,27 @@ class TickTest(WatchCase):
         self.run_tick()
         self.assertEqual(set(self.state_data()["jobs"]), {"platform/a", "cluster-p-c-l/a", "default/tick"})
 
+    def test_an_interrupted_run_seen_by_the_tick_holds_the_streak(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        interrupted = dict(job("a", RUN_2), last_status="error", last_error="Interrupted by gateway shutdown")
+        self.write_store(interrupted)
+        self.run_tick()
+        self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 1)
+
+    def test_an_ambiguous_repository_still_closes_the_issue_it_opened(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR))
+        self.run_tick()
+        self.assertEqual(self.gh.verbs()[-1], "issue create")
+        with mock.patch.object(cdw.gitops_workspace, "get_managed_github_repos", lambda: ["a/one", "z/two"]):
+            self.write_store(job("a", RUN_3))
+            rc, out = self.run_tick()
+        self.assertEqual(self.gh.verbs()[-1], "issue close")
+        self.assertIn(LEDGER_REPO, self.gh.calls[-1])
+        self.assertIsNone(self.state_data()["ledger"]["issue_number"])
+
     def test_the_tick_survives_a_corrupt_state_file_and_an_unreadable_store(self) -> None:
         self.state.write_text("{not json", encoding="utf-8")
         self.write_store(job("a", RUN_1, HARD_ERROR))
@@ -510,6 +562,8 @@ class TickTest(WatchCase):
         self.assertEqual(rc, 0)
         self.assertIn("unreadable cron store broken", out)
         self.assertIn("unreadable cron store odd", out)
+        # Housekeeping, not an alert: it must not match the alert filter.
+        self.assertFalse([l for l in out.splitlines() if l.startswith(cdw.LOG_PREFIX)], out)
         self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 1)
 
     def test_a_sandbox_outage_degrades_to_the_log_line(self) -> None:
