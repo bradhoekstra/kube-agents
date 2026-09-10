@@ -7,10 +7,12 @@ The synthetic ones build a miniature git repository in a temporary directory
 and point the checker at it. They prove each rule *fires*: a lint nobody has
 watched fail is a lint nobody knows is wired up.
 
-The rest run against the real repository. They pin the two things that would
-silently turn the code-citation scan into a no-op -- a glob that stops matching
-the files it exists for, and the tree growing a dangling citation -- because a
-lint that stops reporting anything looks exactly like a clean repository.
+The rest run against the real repository. They do not re-run the lint over the
+tree -- `make docs-check-links` already does that in CI, and a second copy of
+its verdict would only make one dangling citation red two jobs. They pin what
+would silently turn the scan into a no-op: a glob that stops matching the
+files it exists for, and this module growing a literal it would then report.
+A lint that stops reporting anything looks exactly like a clean repository.
 
 Every design-document path a fixture cites is assembled from DESIGNS and
 ARCHITECTURE at runtime. This file is itself a tracked ``.py``, so a literal
@@ -43,10 +45,15 @@ MISSING = DESIGNS + "missing.md"
 ON_DISK_ONLY = DESIGNS + "on_disk_only.md"
 MISSING_PLAIN = "docs/missing.md"  # outside the scanned directories: a Markdown-link fixture only
 
-# The two files #992 was filed against; the scan has to keep reaching them.
-ISSUE_992_FILES = (
+# Files the scan has to keep reaching: the two #992 was filed against, and one
+# of each other kind CODE_GLOBS names, each of which cites a design document.
+MUST_REACH = (
     "agents/platform/scripts/cluster_agent_reconcile.py",
     "agents/platform/scripts/cluster_agent_profile.py",
+    "deploy/sandbox/Dockerfile",
+    "a2a/cmd/gateway/main.go",
+    "charts/kube-agents/values.yaml",
+    "hack/ci-eval-pr.sh",
 )
 
 TOOL_LINES = (
@@ -157,14 +164,9 @@ class CitationPatternTest(unittest.TestCase):
 
 
 class RealRepoTest(unittest.TestCase):
-    def test_no_code_file_cites_a_missing_design_document(self) -> None:
-        tracked = cdl.tracked_paths()
-        problems = [p for f in cdl.tracked_code() for p in cdl.check_code_file(f, tracked)]
-        self.assertEqual(problems, [])
-
-    def test_the_scan_reaches_the_files_from_issue_992(self) -> None:
+    def test_the_scan_reaches_the_files_it_exists_for(self) -> None:
         code = {p.relative_to(REPO).as_posix() for p in cdl.tracked_code()}
-        for rel in ISSUE_992_FILES:
+        for rel in MUST_REACH:
             with self.subTest(file=rel):
                 self.assertIn(rel, code)
 

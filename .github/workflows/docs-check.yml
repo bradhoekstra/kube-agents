@@ -36,7 +36,7 @@ jobs:
 
       # Relative links, and design-doc paths cited from code, must resolve.
       # Catches paths broken by moved files and citations of unmerged docs.
-      - name: Relative links resolve
+      - name: Links and cited design docs resolve
         run: make docs-check-links
 
       # Identifiers must match the source of truth (service accounts,

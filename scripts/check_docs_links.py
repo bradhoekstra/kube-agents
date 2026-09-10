@@ -17,14 +17,16 @@ Scope is deliberately narrow and offline:
   build in ``docs-build.yml``;
 * anchors are stripped before resolution, and a bare ``#anchor`` is skipped;
 * a ``docs/designs/...`` or ``docs/architecture/...`` path written inside a
-  ``.py``, ``.go`` or ``.sh`` file is resolved from the repository root and
-  must be git-tracked too. Header comments cite design documents as the
-  reasoning behind the code, and a citation of a document that was never
-  merged reads the same as a real one (#992). Nothing else in code is
-  inspected. A test fixture that needs a fake document path cites something
-  like ``docs/x.md``, outside the two directories, as the existing ones do,
-  or assembles the path from parts at runtime the way this script's own
-  tests do; a literal in a tracked ``.py`` is a citation like any other.
+  code or configuration file (the ``CODE_GLOBS`` below: Python, Go, shell,
+  Dockerfiles, YAML, Terraform, TypeScript) is resolved from the repository
+  root and must be git-tracked too. Comments cite design documents as the
+  reasoning behind what they sit above, and a citation of a document that
+  was never merged reads the same as a real one (#992). No other path in
+  those files is inspected. A test fixture that needs a fake document path
+  cites something like ``docs/x.md``, outside the two directories, as the
+  existing ones do, or assembles the path from parts at runtime the way
+  this script's own tests do; a literal in a tracked file is a citation
+  like any other.
 
 Standard library only, so it runs in CI and in a bare clone.
 
@@ -44,7 +46,13 @@ from urllib.parse import unquote
 REPO = Path(__file__).resolve().parent.parent
 
 MARKDOWN_GLOBS = ("*.md", "*.mdx")
-CODE_GLOBS = ("*.py", "*.go", "*.sh")
+# Where a design document gets cited as the reasoning behind something: code,
+# shell, container builds, Helm and cron configuration, Terraform, the A2A web
+# client. Selected by name pattern because `git ls-files` takes one; the
+# citation pattern below is conservative enough that any text file could be
+# scanned, so widen this rather than exempt when a new kind of file starts
+# citing designs.
+CODE_GLOBS = ("*.py", "*.go", "*.sh", "*Dockerfile*", "*.yaml", "*.yml", "*.tf", "*.ts")
 # The docs site's dependency tree carries its own Markdown and scripts.
 VENDORED_DIR = "node_modules"
 
