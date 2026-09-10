@@ -203,6 +203,9 @@ Rules:
   from several branches every week, and a re-aligned table rewrites rows your PR did not author.
   `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
   family needs no map edit at all.
+- **Nothing under `.claude/` is committed, example files included.** Hook wiring an agent
+  should copy into place is documented on the contributing page and nowhere else; a pull
+  request that adds a file under `.claude/` is not ready for review.
 - **Write it straight.** Lead with the fact — no preamble, no restating the question, no "it's
   worth noting". Cut hype and self-assessment (`comprehensive`, `robust`, `seamless`, `simply`,
   `powerful`). Skip the "not X, but Y" antithesis and rule-of-three padding: one precise example
