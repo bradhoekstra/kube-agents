@@ -46,8 +46,10 @@ one means it was posted but the Chat Agent's turn failed. All three count
 toward the streak; the grade and the platforms are carried into the issue so
 a partial outage of one platform reads differently from a dead relay.
 
-Run by the platform roster every half hour. Cadence bounds how late a failure
-is noticed, not how it is counted. Exit code is 0 on every path a cron tick
+Run by the platform roster every half hour. A tick sees each job's latest run
+only, so a job that runs more often than that is under-counted (never
+over-counted), and cadence bounds how late a failure is noticed. Exit code is
+0 on every path a cron tick
 can reach: a non-zero exit would only make the scheduler build a failure
 summary that ``local`` then drops.
 """
@@ -475,9 +477,9 @@ def render_issue(degraded: list[tuple[str, dict]], now: str, threshold_value: in
             "",
             *rows,
             "",
-            "**Grades.** `hard`: the report reached no platform (the relay answered 502, was unreachable, "
-            "or had no key). `partial`: it landed on some platforms and not the ones listed. `degraded`: "
-            "it was posted but the Chat Agent's turn failed.",
+            "**Grades.** `hard`: the leg recorded no delivery at all (the relay answered 502, was unreachable, "
+            "or had no key; for a job on `deliver: \"all\"`, one of its legs failed outright). `partial`: the relay "
+            "landed on some platforms and not the ones listed. `degraded`: it was posted but the Chat Agent's turn failed.",
             "",
             "**What to check.**",
             "- The relay route: `logs/session_kv_server.log` in the agent home, around each last-failure time.",
@@ -500,8 +502,12 @@ def fingerprint(title: str, body: str) -> str:
     return digest.hexdigest()
 
 
-def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, now: str, threshold_value: int) -> str:
-    """Bring the ledger issue in line with `degraded`; returns the `ledger=` value for the ALERT lines."""
+def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, now: str, threshold_value: int, *, recovering: bool = False) -> str:
+    """Bring the ledger issue in line with `degraded`; returns the `ledger=` value for the ALERT lines.
+
+    `recovering` says this tick saw a job come back after alerting, which is
+    when an issue whose number the ledger no longer holds is worth one lookup.
+    """
     ledger = state["ledger"]
     if ledger.get("issue_number") is not None and ledger.get("repo") and ledger.get("repo") != repo:
         # The ledger repository changed under an open issue: close it there so
@@ -531,8 +537,12 @@ def reconcile_issue(repo: str, degraded: list[tuple[str, dict]], state: dict, no
             gh(["issue", "edit", str(number), "-R", repo, "--title", title, "--body-file", forge.BODY_STDIN], repo, stdin=body)
         state["ledger"] = {"repo": repo, "issue_number": number, "fingerprint": digest}
         return f"{repo}#{number}" if number else repo
-    number = ledger.get("issue_number")
-    if number is not None and ledger.get("repo") == repo:
+    number = ledger.get("issue_number") if ledger.get("repo") == repo else None
+    if number is None and recovering:
+        # The number can be lost (a create whose URL did not parse, a replaced
+        # state file); a tick that just saw a recovery looks the issue up once.
+        number = find_ledger_issue(repo)
+    if number is not None:
         # One call, so a close that fails cannot leave a comment behind to be
         # repeated on every later tick.
         gh(
@@ -641,7 +651,8 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
             key = f"{profile}/{job['id']}"
             entry = previous.get(key) or new_entry()
             silent = has_output = False
-            if run_changed(entry, job) and not job.get("last_delivery_error"):
+            error = job.get("last_delivery_error")
+            if run_changed(entry, job) and (not error or is_delivered_note(str(error))):
                 document = newest_output(store, job["id"], job.get("last_run_at"))
                 has_output = document is not None
                 silent = bool(document) and is_silent_document(document)
@@ -655,7 +666,7 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
     # GitHub is consulted only when there is something to say or something to
     # close: a quiet tick makes no call at all, and a tick on an install with no
     # forge configured does not log a discovery failure every half hour.
-    if not dry_run and (degraded or state["ledger"].get("issue_number") is not None):
+    if not dry_run and (degraded or recovered or state["ledger"].get("issue_number") is not None):
         # Finding the repository and talking to GitHub are both allowed to fail;
         # the log line below is the channel that must not depend on either.
         try:
@@ -670,7 +681,7 @@ def tick(agent_home: Path, state_path: Path, rosters: list[tuple[str, Path]], *,
                 repo = state["ledger"]["repo"]
         if repo:
             try:
-                ledger_ref = reconcile_issue(repo, degraded, state, now, limit)
+                ledger_ref = reconcile_issue(repo, degraded, state, now, limit, recovering=bool(recovered))
             except Exception as exc:  # noqa: BLE001 - whatever GitHub does, the ALERT lines below still go out
                 ledger_ref = f"error:{type(exc).__name__}"
                 lines.append(format_self_error(exc))
@@ -710,6 +721,9 @@ def main(argv: list[str] | None = None) -> int:
         tick(agent_home, state_path, rosters, dry_run=args.dry_run)
     except Exception as exc:  # noqa: BLE001 - the cron path must exit 0 and say why on the log channel
         now = now_iso()
+        if args.dry_run:
+            print(format_self_error(exc))
+            return 0
         emit([format_self_error(exc)], agent_home, now)
         try:
             state = load_state(state_path)

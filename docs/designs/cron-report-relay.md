@@ -590,7 +590,8 @@ therefore keeps its own ledger, `profiles/platform/cron/chat_delivery_watch.json
 keyed by `<profile>/<job id>` across every store on the volume (the chat
 profile's, the Platform Agent's, every Cluster Agent's). A job's streak advances
 only when `last_run_at` has changed since the last tick, so a half-hourly tick
-over a daily job counts runs; a failing run adds one, a clean run resets to zero,
+over a daily job counts runs (a job that runs more often than the watcher is
+under-counted, never over-counted); a failing run adds one, a clean run resets to zero,
 and a silent run, recognised from the job's newest file under `cron/output/`,
 moves the high-water mark and changes nothing else. Failures are graded from the
 strings this design produces: `hard` when the report reached no platform (a 502,
@@ -654,9 +655,9 @@ identity no write on anything a watcher could use (the site's
 the canonical account of what it does grant), the credential proxy refuses
 every write verb before RBAC is consulted, and the operator reads nothing the
 pod writes, so a condition or an Event needs a new pod-to-operator path and a
-new grant first. Prometheus metrics are disabled by default in every shipped
-deploy and no container in the pod exposes an endpoint unless one is switched
-on. Those are the next step, with this
+new grant first. The operator binds no metrics endpoint in the shipped deploy
+and no container in the agent pod exposes one unless it is switched on; the
+`PodMonitoring` objects the chart renders are LiteLLM's and Hindsight's. Those are the next step, with this
 section as the record of why the first step took the channels it did.
 
 ## Related

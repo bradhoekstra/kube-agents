@@ -538,6 +538,38 @@ class TickTest(WatchCase):
         self.run_tick()
         self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 1)
 
+    def test_a_delivered_failure_summary_resets_through_the_tick(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        failed = dict(job("a", RUN_2), last_status="error", last_error="model quota exhausted")
+        self.write_store(failed)
+        out = self.store.parent / "output" / "a"
+        out.mkdir(parents=True)
+        (out / "2026-09-09_06-20-09.md").write_text("# Cron run\n\n## Response\n\nThe run failed: model quota exhausted.\n", encoding="utf-8")
+        self.run_tick()
+        self.assertEqual(self.state_data()["jobs"]["platform/a"]["streak"], 0)
+
+    def test_a_lost_issue_number_is_looked_up_once_on_recovery(self) -> None:
+        self.write_store(job("a", RUN_1, HARD_ERROR))
+        self.run_tick()
+        self.write_store(job("a", RUN_2, HARD_ERROR))
+        self.run_tick()
+        state = self.state_data()
+        state["ledger"]["issue_number"] = None
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+        self.write_store(job("a", RUN_3))
+        rc, out = self.run_tick()
+        self.assertEqual(self.gh.verbs()[-2:], ["issue list", "issue close"])
+        self.assertIn("42", self.gh.calls[-1])
+
+    def test_dry_run_writes_nothing_even_when_the_tick_raises(self) -> None:
+        self.write_store(job("a", RUN_1))
+        with mock.patch.object(cdw, "tick", side_effect=RuntimeError("kaboom")):
+            rc, out = self.run_tick("--dry-run")
+        self.assertEqual(rc, 0)
+        self.assertIn("self=error", out)
+        self.assertEqual(self.log_lines(), [])
+
     def test_an_ambiguous_repository_still_closes_the_issue_it_opened(self) -> None:
         self.write_store(job("a", RUN_1, HARD_ERROR))
         self.run_tick()
