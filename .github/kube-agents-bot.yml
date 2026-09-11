@@ -1,0 +1,2 @@
+# Staging proving ground for gke-labs/kube-agents-bot#78: nominate the review playbook.
+playbook: .agents/skills/review-adversarial/SKILL.md
