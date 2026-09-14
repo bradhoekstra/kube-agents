@@ -612,10 +612,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         "jwt": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW0iLCJhdWQiOlsiazhzIl19.c2lnbmF0dXJlXw",
         "gcp api key": "AIza" + "a" * 35,
         # The body is elided, as `test_audit_report.py`'s copy is. The redactor
-        # keys on the armour lines and reads nothing between them, while a
-        # base64 run after this header is what GitHub's secret scanner keys
-        # on: the earlier fixture carried twenty characters of DER framing,
-        # no modulus, and was reported as a leaked RSA key regardless.
+        # keys on the armour lines and reads nothing between them. GitHub
+        # secret-scanning alert 4 reported the earlier form of this literal --
+        # header, twenty characters of DER framing with no modulus behind
+        # them, footer, in one string -- as a leaked RSA key; the same body
+        # split across three literals in the plugin's `test_redactor.py` has
+        # never been reported.
         "pem block": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----",
     }
     # A Secret's payload is credential material whatever its keys are called,
