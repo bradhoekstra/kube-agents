@@ -402,11 +402,11 @@ Three things to do with it:
   as though the reason were not there wastes both of you.
 
 **When it runs.** On `opened`, `reopened`, and draft-marked-ready. **Pushing more commits does not
-start another review** — an active branch would otherwise pay for a re-read on every push. To get a
-fresh review of the current commit, comment `/review` on a line of its own (repository owners,
-members, and collaborators only) — that pass is the strict one, only what the bot is certain of,
-while `/review all` re-reads at the width of the automatic first review and includes findings it
-believes are real without being sure. The `agent:ignore` label opts a pull request out entirely and
+start another review** — an active branch would otherwise pay for a re-read on every push. For a
+fresh review of the current commit, comment `/review` on a line of its own (owners, members, and
+collaborators only): the strict pass, what the bot is certain of plus a high-severity finding just
+under that bar, marked as such. `/review all` re-reads at the first review's width and adds findings
+it believes are real without being sure. The `agent:ignore` label opts a pull request out and
 outranks both.
 
 **A human reviewer is requested only once its check passes.** The bot posts an `AI Review` check
