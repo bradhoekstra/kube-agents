@@ -39,7 +39,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `findings-morning-nudge` | Platform Agent | `0 12 * * *` | Daily 12:00 | yes | `findings_nudge.py` |
 | `github-repo-watcher` | Platform Agent | `*/10 * * * *` | Every 10 minutes | yes | `github_scan_gate.py` |
 | `kanban-workspace-gc` | Platform Agent | `40 5 * * *` | Daily 05:40 | yes | `kanban_workspace_gc.py` |
-| `kanban-board-health` | Platform Agent | `35 7 * * *` | Daily 07:35 | yes | `kanban_board_health.py` |
+| `kanban-board-health` | Platform Agent | `35 12 * * *` | Daily 12:35 | yes | `kanban_board_health.py` |
 | `eod-event-watcher-daily-report` | Platform Agent | `0 21 * * 1-5` | Weekdays 21:00 | yes | `eod_report_generator.py` |
 | `chat-delivery-watch` | Platform Agent | `*/30 * * * *` | Every 30 minutes | yes | `chat_delivery_watch.py` |
 

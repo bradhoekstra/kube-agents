@@ -179,8 +179,8 @@
       "name": "Kanban Board Health",
       "schedule": {
         "kind": "cron",
-        "expr": "35 7 * * *",
-        "display": "35 7 * * *"
+        "expr": "35 12 * * *",
+        "display": "35 12 * * *"
       },
       "prompt": "",
       "skills": [],
