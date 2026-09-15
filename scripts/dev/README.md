@@ -74,3 +74,4 @@ When the script finishes, it will print three variables (`GCP_PROJECT_ID`, `GCP_
 <!-- kube-agents-bot#99 fixture: fifth commit -->
 <!-- kube-agents-bot#99 fixture: sixth commit -->
 <!-- kube-agents-bot#99 fixture: seventh commit -->
+<!-- kube-agents-bot#99 fixture: eighth commit -->
