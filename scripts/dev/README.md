@@ -68,3 +68,4 @@ chmod +x setup-gcp-github-wif.sh
 When the script finishes, it will print three variables (`GCP_PROJECT_ID`, `GCP_SERVICE_ACCOUNT`, and `GCP_WORKLOAD_IDENTITY_PROVIDER`). To complete the setup, copy those three values and add them to your GitHub Repository > Settings > Environments as Environment Variables.
 
 <!-- kube-agents-bot#99 fixture: first commit -->
+<!-- kube-agents-bot#99 fixture: second commit -->
