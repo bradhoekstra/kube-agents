@@ -116,6 +116,15 @@ CI on files you did not touch. Prefer the installed binary over `npx prettier`, 
 package against the npm registry on every run and fails outright behind an authenticated mirror —
 that failure is why this step has previously been skipped rather than run.
 
+**Shell scripts.** If you change a `.sh` file, run `make shellcheck`. The `validate` job runs the
+same target on every pull request, and it is a required check, so a warning-severity finding in
+any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
+shellcheck step in `.github/workflows/validate.yml`) from
+<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: apt on
+Ubuntu 24.04 ships 0.9.0, and a release two behind reports a different set of findings than CI.
+Fix a finding or suppress it on its line with `# shellcheck disable=SCnnnn # reason`; the
+Makefile's exclude list is not the place, and the comment above the target says why.
+
 **Docker build.** Validate the agent runner Dockerfile by building it locally:
 
 ```bash
