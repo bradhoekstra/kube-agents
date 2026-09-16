@@ -800,7 +800,7 @@ register_host_label() {
   return 0
 }
 
-confirm_action() {
+confirm_destruction() {
   local warning_msg=$1
   shift
 
@@ -813,7 +813,7 @@ confirm_action() {
   # consults CI, and that is right: a value prompt asks "can anyone answer",
   # and taking the default there is what an unattended run wants. This prompt
   # asks "did someone authorise this", which an inherited variable cannot say.
-  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ]; then
+  if [ "${NO_CONFIRM:-0}" -eq 1 ] && [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
   
