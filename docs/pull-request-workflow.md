@@ -120,8 +120,9 @@ that failure is why this step has previously been skipped rather than run.
 same target on every pull request, and it is a required check, so a warning-severity finding in
 any tracked script fails the merge. Install the shellcheck release that job pins (see the Install
 shellcheck step in `.github/workflows/validate.yml`) from
-<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: apt on
-Ubuntu 24.04 ships 0.9.0, and a release two behind reports a different set of findings than CI.
+<https://github.com/koalaman/shellcheck/releases> rather than the distribution package: the apt
+package on the `ubuntu-latest` runner image is 0.9.0 (Ubuntu 24.04), two releases behind, and a
+release two behind reports a different set of findings than CI.
 Fix a finding or suppress it on its line with `# shellcheck disable=SCnnnn # reason`; the
 Makefile's exclude list is not the place, and the comment above the target says why.
 
@@ -179,8 +180,10 @@ version before opening the pull request.
 and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
 loop while you work:
 
-- `make validate` — the `Validate Repo Structure` job; fails if skills live under
-  `agents/*/defaults/skills/` instead of `agents/*/skills/`.
+- `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
+  check; see **Shell scripts** above for the release to install.
+- `make validate` — the structure check in the `Validate Repo Structure` job; fails if skills
+  live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
 - `make -C k8s-operator test` — manifests, generate, fmt, vet, the envtest download, the
   operator's Python tests, then `go test`; what the `Operator Tests` job runs.
 - `make test-integration` — the seam tier only, for a component another one talks to across a
