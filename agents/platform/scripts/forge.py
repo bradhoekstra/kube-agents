@@ -97,7 +97,6 @@ def _last_lines(text: str, count: int) -> str:
     lines = text.splitlines()
     # A negative slice bound is the whole list when `count` exceeds it.
     return "\n".join(lines[-count:]) if count else ""
-
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
 GH_TIMEOUT_S = 60
