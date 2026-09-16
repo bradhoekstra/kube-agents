@@ -124,7 +124,7 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # deploy/shared/docker-entrypoint.sh (`#!/bin/sh`) is checked as POSIX sh.
 # SC1090 joins SC1091 in the exclude list because scripts/installer/common.sh
 # sources a runtime path that `-x` cannot follow; every other finding is fixed
-# or carries an inline `# shellcheck disable=SCnnnn # reason`, so widening this
+# or carries a `# shellcheck disable=SCnnnn # reason` on the line above, so widening this
 # list is how a real finding gets silenced.
 #
 # The scripts under agents/platform/skills/gke-*/ are left out. Those trees are

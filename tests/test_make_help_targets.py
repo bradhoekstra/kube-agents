@@ -7,7 +7,8 @@ is renamed or deleted, therefore vanishes from the only place a contributor
 would look, and no other check notices. `lint-python` is the developer entry
 point for a gate the unit suite runs (`tests/test_lint_python.py`) and
 `shellcheck` for the one the `validate` job in `.github/workflows/validate.yml`
-runs; nothing else names either target, so this pins them to the help output.
+runs (tests/test_shellcheck_gate_wiring.py pins that step); `make help` is
+where a contributor discovers both, so this pins them to the help output.
 """
 
 import pathlib
