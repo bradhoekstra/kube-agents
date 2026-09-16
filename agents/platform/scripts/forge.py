@@ -95,7 +95,7 @@ LOGGER = logging.getLogger(__name__)
 def _last_lines(text: str, count: int) -> str:
     """The final `count` lines of `text`, for an error message that quotes stderr."""
     lines = text.splitlines()
-    return "\n".join(lines[len(lines) - count + 1 :]) if count else ""
+    return "\n".join(lines[-count:]) if count else ""
 
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
