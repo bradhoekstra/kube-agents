@@ -91,12 +91,6 @@ from github_token_refresh import (
 
 LOGGER = logging.getLogger(__name__)
 
-
-def _last_lines(text: str, count: int) -> str:
-    """The final `count` lines of `text`, for an error message that quotes stderr."""
-    lines = text.splitlines()
-    # A negative slice bound is the whole list when `count` exceeds it.
-    return "\n".join(lines[-count:]) if count else ""
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
 GH_TIMEOUT_S = 60
@@ -508,7 +502,7 @@ class GitHubProvider:
         ):
             result = self._run(list(argv), repo=repo, stdin=stdin)
         if result.returncode != 0:
-            raise ForgeError("REPO_UNREACHABLE", _last_lines((result.stderr or "").strip(), 3))
+            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
         if not expect_json:
             return None
         text = (result.stdout or "").strip()
