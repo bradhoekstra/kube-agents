@@ -95,6 +95,7 @@ print_error() { echo -e "  ${C_RED}✗ $1${C_RESET}"; }
 wait_for_a_bit() {
   local seconds=$1
   local msg=$2
+  if [ "$seconds" -gt 45 ]; then seconds=45; fi
   local spinner=( "⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏" )
   echo -ne "  ${C_YELLOW}${msg} (${seconds}s)...  "
   tput civis 2>/dev/null || true
