@@ -43,12 +43,24 @@ main that is green.
 Two bounds keep the reconciliation from undoing a person or a newer run. A
 green closes only issues whose episode is no newer than the green run itself,
 because an issue for a red that finished after this green describes a main this
-green has not seen. And a closed issue that carries the current episode's marker
-and already lists the newest red run is a breakage someone has dealt with -- by
-hand, or by a merge whose description named the issue; the workflow's header
-admits it can file on an innocent commit -- so it is not filed again for a run
-it already knew about. A red run it never listed is new evidence and files as
-usual, and so does the next episode.
+green has not seen. And a closed issue that carries the current episode's marker,
+already lists the newest red run, and was not closed by this workflow's own
+token is a breakage someone has dealt with -- by hand, or by a merge whose
+description named the issue; the workflow's header admits it can file on an
+innocent commit -- so it is not filed again for a run it already knew about. A
+red run it never listed is new evidence and files as usual, and so does the next
+episode; a close the workflow itself made, the green that ended a streak, does
+not silence the same run going red again on a re-run.
+
+A third bound is about the read rather than the state. The run-history endpoint
+has answered with a page missing recent runs, and once with a page weeks old:
+on 2026-09-17 a read that lacked runs 5928 and 6008 made run 6009 look like a
+fresh breakage, and the notifier opened a second issue and closed the right one
+as superseded. So before it opens, supersedes, rewrites or closes anything, it
+checks that every run the issues in play name is in the list it read -- or is
+older than a full page, which is the one honest reason for a run to be absent.
+A read that fails that test writes nothing; the next read is at most fifteen
+minutes away.
 
 That is also what makes a dropped notify run survivable. GitHub keeps one run
 pending per concurrency group and cancels the rest of a burst, and the earlier
@@ -146,14 +158,23 @@ WATCHED_WORKFLOWS = (
     "Validate Repo Structure",
 )
 
-# Page size for the repository's workflow list, which `--sweep` reads to turn
-# the names above into ids. The endpoint wraps its page in an object with a
-# `total_count`, so the shared client's `get_all` cannot page it.
-WORKFLOWS_PER_PAGE = 100
-
 LABEL = "ci:main-broken"
 LABEL_COLOR = "d73a4a"
 LABEL_DESCRIPTION = "A required check is failing on main"
+
+# The two issue states the reconciliation reads.
+ISSUE_OPEN = "open"
+ISSUE_CLOSED = "closed"
+
+# Who closes an issue when this script does, running on the workflow's own
+# `GITHUB_TOKEN`. A close by anyone else is a decision about the breakage; one
+# by this login is the script's own bookkeeping and silences nothing.
+OWN_CLOSER_LOGIN = "github-actions[bot]"
+
+# The episode marker, read back off an issue body to learn which run opened it,
+# and a table row, read back to learn which runs the issue already lists.
+_EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
+_ROW_RUN = re.compile(r"^\| \[(\d+)\]\(", re.MULTILINE)
 
 
 # --------------------------------------------------------------------------- #
@@ -291,9 +312,6 @@ def _author(run):
 # request, pointing whoever broke main at the issue about it.
 _PR_SUFFIX = re.compile(r"\(#(\d+)\)\s*$")
 
-# The episode marker, read back off an issue body to learn which run opened it.
-_EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
-
 
 def _pull_request(run):
     match = _PR_SUFFIX.search(_commit_subject(run))
@@ -352,6 +370,39 @@ def episode_of(issue):
     """
     match = _EPISODE.search(issue.get("body") or "")
     return int(match.group(1)) if match else 0
+
+
+def runs_named(issue):
+    """Every run number an issue's marker and table name."""
+    body = issue.get("body") or ""
+    named = {int(number) for number in _ROW_RUN.findall(body)}
+    episode = episode_of(issue)
+    return named | ({episode} if episode else set())
+
+
+def history_window(runs):
+    """What one read of the history covered, for judging whether it is whole.
+
+    A full page may honestly omit runs older than its oldest entry; a page
+    shorter than `HISTORY_DEPTH` claims to be the workflow's entire history
+    and may omit nothing at all.
+    """
+    numbers = {run["run_number"] for run in runs}
+    return {"numbers": numbers, "oldest": min(numbers, default=0), "full": len(runs) >= HISTORY_DEPTH}
+
+
+def unlisted_runs(issue, window):
+    """Runs an issue names that a whole read would list and this one did not.
+
+    Non-empty means the read is missing runs known to exist, and any decision
+    built on it -- a fresh episode, a shorter streak, a recovery -- is built
+    on a hole. The reconciliation then writes nothing.
+    """
+    return sorted(
+        number
+        for number in runs_named(issue)
+        if number not in window["numbers"] and (not window["full"] or number >= window["oldest"])
+    )
 
 
 def render_title(notification):
@@ -474,7 +525,7 @@ class GitHubAPI(BaseGitHubAPI):
         found = []
         page = 1
         while True:
-            query = urllib.parse.urlencode({"per_page": WORKFLOWS_PER_PAGE, "page": page})
+            query = urllib.parse.urlencode({"per_page": PER_PAGE, "page": page})
             batch = self.get(f"/repos/{self.repo}/actions/workflows?{query}")
             found.extend(batch["workflows"])
             if not batch["workflows"] or len(found) >= batch["total_count"]:
@@ -551,8 +602,20 @@ def reconcile(api, notification, repo, workflow_id):
 
     Returns a human-readable account of what it did, for the log.
     """
-    open_issues = api.issues_for_workflow(workflow_id, "open")
+    open_issues = api.issues_for_workflow(workflow_id, ISSUE_OPEN)
     comment = render_comment(notification, repo)
+    window = notification.get("window")
+
+    def incomplete_for(issues):
+        """The issues among `issues` that name runs this read did not list."""
+        if window is None:
+            return {}
+        gaps = {issue["number"]: unlisted_runs(issue, window) for issue in issues}
+        return {number: missing for number, missing in gaps.items() if missing}
+
+    def leave(gaps):
+        described = "; ".join(f"#{number} names run(s) {', '.join(map(str, missing))}" for number, missing in gaps.items())
+        return f"the history read is missing runs that exist ({described}); writing nothing until a fuller read"
 
     if notification["kind"] == "green":
         if not open_issues:
@@ -570,6 +633,9 @@ def reconcile(api, notification, repo, workflow_id):
         green_number = notification["run"]["run_number"]
         closable = [issue for issue in open_issues if episode_of(issue) <= green_number]
         newer = [issue for issue in open_issues if issue not in closable]
+        gaps = incomplete_for(closable)
+        if gaps:
+            return leave(gaps)
         for issue in closable:
             api.comment(issue["number"], comment)
             api.close_issue(issue["number"])
@@ -584,27 +650,40 @@ def reconcile(api, notification, repo, workflow_id):
     current = next((issue for issue in open_issues if marker in (issue.get("body") or "")), None)
     stale = [issue for issue in open_issues if issue is not current]
 
+    # A read that lacks a run these issues name is not a read to act on: a
+    # fresh episode it suggests may be a hole in the list, and a shorter streak
+    # a missing row. Checked before anything is written, for the issue this run
+    # would update and for every issue it would supersede.
+    gaps = incomplete_for([current] if current is not None else stale)
+    if gaps:
+        return leave(gaps)
+
     if current is None:
         # No open issue for this episode. Before opening one, look for a closed
-        # one that already lists the newest red run: someone closed it knowing
-        # what it knows -- by hand, or through a merge whose description named
-        # it -- and the sweep would otherwise reverse that within fifteen
-        # minutes, and again after every close. A closed issue that never saw
-        # this run does not count, whoever closed it: a red that landed after a
-        # "fixes" merge, or after the bot itself closed the issue as superseded,
-        # is new evidence and files. Nothing here can tell a person's close
-        # from a robot's, and it does not have to.
+        # one that already lists the newest red run and that this workflow did
+        # not close itself: someone closed it knowing what it knows -- by hand,
+        # or through a merge whose description named it -- and the sweep would
+        # otherwise reverse that within fifteen minutes, and again after every
+        # close. A closed issue that never saw this run does not count, whoever
+        # closed it: a red that landed after a "fixes" merge is new evidence
+        # and files. Nor does a close made on the workflow's own token -- the
+        # green that ended the streak, or a supersede -- since the same run
+        # re-run back to red after that is a breakage nobody has looked at.
         newest_red = notification["run"]["html_url"]
         dismissed = [
             issue
-            for issue in api.issues_for_workflow(workflow_id, "closed")
-            if marker in (issue.get("body") or "") and newest_red in (issue.get("body") or "")
+            for issue in api.issues_for_workflow(workflow_id, ISSUE_CLOSED)
+            if marker in (issue.get("body") or "")
+            and newest_red in (issue.get("body") or "")
+            and (issue.get("closed_by") or {}).get("login") != OWN_CLOSER_LOGIN
         ]
         if dismissed:
-            return (
-                f"#{dismissed[0]['number']} already lists run {notification['run']['run_number']} "
-                f"and was closed; leaving it"
-            )
+            done = f"#{dismissed[0]['number']} already lists run {notification['run']['run_number']} and was closed; leaving it"
+            for issue in stale:
+                api.comment(issue["number"], f"Superseded by #{dismissed[0]['number']}, which was closed.")
+                api.close_issue(issue["number"])
+                done += f", superseded #{issue['number']}"
+            return done
         api.ensure_label()
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
@@ -673,6 +752,7 @@ def report(api, workflow_id, runs, repo, dry_run):
         return
 
     notification = decide(current, reporting_history(runs, current))
+    notification["window"] = history_window(runs)
 
     if dry_run:
         log(f"--dry-run: {current['name']} run {current['run_number']} is {notification['kind']}")

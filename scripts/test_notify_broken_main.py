@@ -476,7 +476,7 @@ class QueryTest(unittest.TestCase):
             return _response(json.dumps(pages[len(calls) - 1]).encode())
 
         api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
-        with mock.patch.object(notifier, "WORKFLOWS_PER_PAGE", 2):
+        with mock.patch.object(notifier, "PER_PAGE", 2):
             workflows = api.workflows()
         self.assertEqual([w["id"] for w in workflows], [1, 2, 3])
         self.assertEqual(len(calls), 2)
@@ -751,10 +751,16 @@ class HandCloseAndOrderingTest(unittest.TestCase):
     def _reconcile(self, api, decision, workflow_id=77):
         return notifier.reconcile(api, decision, self.REPO, workflow_id)
 
-    def _closed_listing(self, decision):
+    def _closed_listing(self, decision, closed_by="a-person"):
         """An issue the notifier itself wrote for `decision`, then closed."""
         body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        return {"number": 901, "state": "closed", "title": notifier.render_title(decision), "body": body}
+        return {
+            "number": 901,
+            "state": "closed",
+            "title": notifier.render_title(decision),
+            "body": body,
+            "closed_by": {"login": closed_by},
+        }
 
     def test_an_issue_closed_knowing_the_newest_red_is_not_refiled(self):
         """Without this the sweep reopens a dismissed issue within fifteen
@@ -790,6 +796,26 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self._reconcile(api, after_rerun)
         self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
         self.assertEqual(api.actions[3][1], 902)
+
+    def test_the_workflows_own_green_close_does_not_dismiss_the_same_run_going_red_again(self):
+        """Run 10 red opened #901; a re-run of 10 went green and the bot closed
+        #901, which lists run 10; a further re-run of 10 goes red. The closed
+        issue matches the marker and lists the newest red, but the close was
+        the bot's own bookkeeping, not anyone's decision, so it files."""
+        decision = notifier.decide(run(10, "failure"), [run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(decision, closed_by=notifier.OWN_CLOSER_LOGIN)])
+        self._reconcile(api, decision)
+        self.assertEqual(api.kinds(), ["label", "create"])
+
+    def test_a_dismissal_still_supersedes_an_older_issue_left_open(self):
+        """A stale older-episode issue whose close once failed must not sit
+        open behind a dismissed newer episode until the next green."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI([issue(880, 77, 3)], closed_issues=[self._closed_listing(decision)])
+        result = self._reconcile(api, decision)
+        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertEqual(api.actions[1][1], 880)
+        self.assertIn("superseded #880", result)
 
     def test_the_next_breakage_after_a_dismissal_is_filed(self):
         """A dismissal is about one episode. A green in between makes the next
@@ -843,6 +869,87 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         api = FakeAPI([damaged])
         self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "success")]))
         self.assertEqual(api.kinds(), ["comment", "close"])
+
+
+class IncompleteReadTest(unittest.TestCase):
+    """The run-history endpoint has answered with pages missing recent runs. A
+    reconciliation that can see its read is missing a run the issues name
+    writes nothing, whichever way the hole would have pushed it."""
+
+    REPO = "gke-labs/kube-agents"
+
+    def _decision(self, current, runs):
+        decision = notifier.decide(current, notifier.reporting_history(runs, current))
+        decision["window"] = notifier.history_window(runs)
+        return decision
+
+    def _listing(self, number, decision):
+        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
+        return {"number": number, "state": "open", "title": notifier.render_title(decision), "body": body}
+
+    def _reconcile(self, api, decision):
+        return notifier.reconcile(api, decision, self.REPO, 77)
+
+    def test_runs_named_reads_the_marker_and_every_row(self):
+        decision = self._decision(run(12, "failure"), [run(12, "failure"), run(11, "failure"), run(10, "failure")])
+        self.assertEqual(notifier.runs_named(self._listing(1, decision)), {10, 11, 12})
+
+    def test_a_read_missing_the_episode_does_not_open_a_second_issue(self):
+        """2026-09-17 on main: #1677 (episode 5928, rows 5928 and 6008) was
+        open; the notify for 6009 read a history without either and opened
+        #1679 as a fresh episode, closing #1677 as superseded."""
+        full = [run(6009, "failure"), run(6008, "failure"), run(5928, "failure"), run(5927, "success")]
+        open_issue = self._listing(1677, self._decision(run(6008, "failure"), full[1:]))
+        api = FakeAPI([open_issue])
+        result = self._reconcile(api, self._decision(run(6009, "failure"), [run(6009, "failure")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("missing runs", result)
+        self.assertIn("5928", result)
+
+    def test_the_same_read_done_whole_updates_the_right_issue(self):
+        full = [run(6009, "failure"), run(6008, "failure"), run(5928, "failure"), run(5927, "success")]
+        open_issue = self._listing(1677, self._decision(run(6008, "failure"), full[1:]))
+        api = FakeAPI([open_issue])
+        self._reconcile(api, self._decision(run(6009, "failure"), full))
+        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertEqual(api.actions[0][1], 1677)
+
+    def test_a_read_missing_a_middle_row_does_not_shorten_the_streak(self):
+        full = [run(12, "failure"), run(11, "failure"), run(10, "failure"), run(9, "success")]
+        open_issue = self._listing(901, self._decision(run(12, "failure"), full))
+        api = FakeAPI([open_issue])
+        holed = [run(12, "failure"), run(10, "failure"), run(9, "success")]
+        result = self._reconcile(api, self._decision(run(12, "failure"), holed))
+        self.assertEqual(api.actions, [])
+        self.assertIn("11", result)
+
+    def test_a_green_read_that_lacks_the_reds_does_not_close(self):
+        """Closing would be the right end state, but the comment would name
+        the wrong fix and the wrong count; a whole read is minutes away."""
+        open_issue = self._listing(901, self._decision(run(11, "failure"), [run(11, "failure"), run(10, "failure")]))
+        api = FakeAPI([open_issue])
+        self._reconcile(api, self._decision(run(12, "success"), [run(12, "success")]))
+        self.assertEqual(api.actions, [])
+        self._reconcile(api, self._decision(run(12, "success"), [run(12, "success"), run(11, "failure"), run(10, "failure")]))
+        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertIn("Fixed by", api.actions[0][2])
+
+    def test_a_full_page_may_omit_runs_older_than_itself(self):
+        """An issue from before the window is the accepted long-streak case,
+        not a hole in the read: it is superseded as before."""
+        page = [run(n, "failure") if n == 69 else run(n, "success") for n in range(69, 69 - notifier.HISTORY_DEPTH, -1)]
+        self.assertEqual(len(page), notifier.HISTORY_DEPTH)
+        api = FakeAPI([issue(880, 77, 5)])
+        self._reconcile(api, self._decision(run(69, "failure"), page))
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+
+    def test_a_short_page_may_omit_nothing(self):
+        """Fewer runs than the depth means the workflow's whole history came
+        back, so a run the issue names that is absent from it is missing."""
+        api = FakeAPI([issue(880, 77, 5)])
+        result = self._reconcile(api, self._decision(run(12, "failure"), [run(12, "failure"), run(11, "success")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("5", result)
 
 
 class MainTest(unittest.TestCase):
