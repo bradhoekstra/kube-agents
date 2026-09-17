@@ -1473,7 +1473,8 @@ class SweepTest(unittest.TestCase):
 
     def test_a_history_read_that_raises_does_not_stop_the_rest_of_the_sweep(self):
         """The 5xx that outlasts the retries arrives from the history read, so
-        that is the call that must be inside the guard."""
+        that is the call that must be inside the guard. Not a red: an API
+        incident would otherwise red the schedule every fifteen minutes."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
 
@@ -1489,12 +1490,12 @@ class SweepTest(unittest.TestCase):
             "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
         ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
             status = notifier.main(["--sweep"])
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
 
     def test_one_workflows_failure_does_not_stop_the_rest_of_the_sweep(self):
         """A write that fails on one workflow must not leave the others unread
-        until the next sweep; the sweep still goes red."""
+        until the next sweep; the failure is logged and annotated, not a red."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
         api = mock.Mock()
@@ -1512,7 +1513,7 @@ class SweepTest(unittest.TestCase):
             "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
         ), mock.patch.object(notifier, "reconcile", side_effect=reconcile):
             status = notifier.main(["--sweep"])
-        self.assertEqual(status, 1)
+        self.assertEqual(status, 0)
         self.assertEqual(len(calls), len(notifier.WATCHED_WORKFLOWS))
 
     def test_a_dry_run_sweep_writes_nothing(self):

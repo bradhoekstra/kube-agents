@@ -69,8 +69,7 @@ honest reasons for a run to be absent; and an empty page for a workflow the
 endpoint itself counts runs for is refused before any of that -- only the
 empty one, since the count has been seen to change between two calls and a
 short page is the ordinary state of a newly watched workflow. Issues name only
-red
-runs, so a green close also stamps the issue with the run that fixed it: a
+red runs, so a green close also stamps the issue with the run that fixed it: a
 later page that has the reds around that green but not the green itself is
 then a hole too, not a relapse. A read that fails writes nothing; the next read
 is at most fifteen minutes away, or as long as a re-run of a listed run takes,
@@ -973,8 +972,13 @@ def sweep(api, repo, branch, dry_run):
     if missing:
         log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing reports on it")
     if failed:
-        log(f"Reconciling {', '.join(failed)} failed; the rest were reconciled, and the next sweep retries")
-    return 1 if missing or failed else 0
+        # Logged and annotated, not a red: an API incident that outlasts the
+        # client's retries would otherwise red the schedule every fifteen
+        # minutes and mail the cron line's last editor each time, for a fault
+        # nobody here can fix. The next sweep retries. A missing name is a red
+        # because it is ours to fix.
+        warn(f"Reconciling {', '.join(failed)} failed; the rest were reconciled, and the next sweep retries")
+    return 1 if missing else 0
 
 
 def main(argv=None):
