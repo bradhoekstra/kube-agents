@@ -76,7 +76,13 @@ on:
   # reconciliation that finds the issues already right writes nothing.
   schedule:
     - cron: "*/15 * * * *"
+  #checkov:skip=CKV_GHA_7:One boolean, dry_run, which decides whether the sweep writes; nothing is built and no input reaches a shell
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Print what the sweep would file and file nothing
+        type: boolean
+        default: false
 
 # Push-to-main event runs are serialised per watched workflow. Two merges
 # landing together would otherwise both read the same history, reach the same
@@ -146,7 +152,8 @@ jobs:
       issues: write # open, update and close the tracking issue, and its label
     steps:
       # The default branch on every trigger but a dispatch, which checks out the
-      # ref it was dispatched from -- the way to try a branch's script for real.
+      # ref it was dispatched from -- the way to try a branch's script, with
+      # `dry_run` set until it has earned the right to write.
       - name: Checkout the script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -171,8 +178,16 @@ jobs:
       # No run to start from: the schedule and a manual dispatch reconcile
       # every watched workflow against its newest completed push run that said
       # anything.
+      # `DRY_RUN` is the dispatch's one input, a boolean that GitHub renders
+      # as the string "true"; the schedule has no inputs and always writes.
       - name: Sweep every watched workflow
         if: github.event_name != 'workflow_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: python3 scripts/notify_broken_main.py --sweep
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then
+            python3 scripts/notify_broken_main.py --sweep --dry-run
+          else
+            python3 scripts/notify_broken_main.py --sweep
+          fi

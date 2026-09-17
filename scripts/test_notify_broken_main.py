@@ -14,6 +14,7 @@ which does the same thing more slowly; and writing to an issue that already says
 so, which the scheduled sweep would turn into a comment every fifteen minutes.
 """
 
+import io
 import json
 import re
 import sys
@@ -1010,6 +1011,16 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.actions, [])
         self.assertIn("reopened by hand", result)
 
+    def test_an_issue_a_person_reopened_is_not_superseded_by_the_next_breakage(self):
+        """The same bound on the red path: a reopened older issue is theirs
+        to close, so a new episode opens beside it rather than over it."""
+        reopened = issue(880, 77, 3)
+        reopened["state_reason"] = notifier.REOPENED
+        api = FakeAPI([reopened])
+        self._reconcile(api, decided(run(100, "failure"), full_page(99)))
+        self.assertEqual(api.kinds(), ["label", "create"])
+        self.assertEqual([i["number"] for i in api.open_issues], [880, 901])
+
     def test_a_green_still_closes_every_older_episode(self):
         """Episode 5 is older than the full page can show, which is the one
         honest reason for a named run to be absent; episode 101 is newer than
@@ -1453,9 +1464,30 @@ class SweepTest(unittest.TestCase):
         self.assertNotIn(999, reconciled)
         self.assertNotIn(100, reconciled)
 
+    def test_a_history_read_that_raises_does_not_stop_the_rest_of_the_sweep(self):
+        """The 5xx that outlasts the retries arrives from the history read, so
+        that is the call that must be inside the guard."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
+
+        def history(workflow_id, branch):
+            if workflow_id == 100:
+                raise urllib.error.HTTPError("u", 502, "bad gateway", {}, None)
+            return histories[workflow_id]
+
+        api = mock.Mock()
+        api.workflows.return_value = self._workflows(names_to_ids)
+        api.history.side_effect = history
+        with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
+            "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
+        ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
+            status = notifier.main(["--sweep"])
+        self.assertEqual(status, 1)
+        self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
+
     def test_one_workflows_failure_does_not_stop_the_rest_of_the_sweep(self):
-        """A 5xx that outlasts the retries on one workflow must not leave the
-        others unread until the next sweep; the sweep still goes red."""
+        """A write that fails on one workflow must not leave the others unread
+        until the next sweep; the sweep still goes red."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
         api = mock.Mock()
@@ -1484,6 +1516,20 @@ class SweepTest(unittest.TestCase):
         reconcile.assert_not_called()
 
 
+class WarnTest(unittest.TestCase):
+    def test_the_annotation_is_emitted_only_on_a_runner(self):
+        """The unit tests exercise every refusal and their output is echoed
+        into a CI step, which would otherwise annotate every pull request."""
+        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            notifier.warn("quiet")
+        self.assertEqual(out.getvalue(), "")
+        with mock.patch.dict("os.environ", {notifier.ACTIONS_ENV: "true"}, clear=True), mock.patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as out:
+            notifier.warn("loud")
+        self.assertEqual(out.getvalue(), f"{notifier.WARNING_PREFIX}loud\n")
+
+
 class WorkflowShapeTest(unittest.TestCase):
     """The burst fix rests on the concurrency key and the job guard, which no
     linter checks for meaning. Pinned here so a simplification that lets a
@@ -1505,9 +1551,11 @@ class WorkflowShapeTest(unittest.TestCase):
             self.assertIn(needed, group)
         self.assertIs(self.document["concurrency"]["cancel-in-progress"], False)
 
-    def test_the_sweep_has_a_schedule_and_a_dispatch(self):
+    def test_the_sweep_has_a_schedule_and_a_dispatch_with_a_dry_run(self):
         self.assertIn("schedule", self.triggers)
-        self.assertIn("workflow_dispatch", self.triggers)
+        self.assertIn("dry_run", self.triggers["workflow_dispatch"]["inputs"])
+        sweep_step = next(step for step in self.document["jobs"]["notify"]["steps"] if step["name"] == "Sweep every watched workflow")
+        self.assertIn("--sweep --dry-run", sweep_step["run"])
 
     def test_the_job_is_guarded_and_filters_nothing_by_conclusion(self):
         job = self.document["jobs"]["notify"]

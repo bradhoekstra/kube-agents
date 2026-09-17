@@ -213,7 +213,10 @@ _FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+)(?: run=(\d+))? -->")
 # A refusal to write is a log line and exit 0, since a stale page is ordinary
 # and a red job for one would be noise; this prefix makes the line a warning
 # annotation on the job, so a refusal that persists shows up in the summary.
+# Emitted only where a runner reads it: the unit tests exercise every refusal,
+# and their output is echoed into a step that would annotate the pull request.
 WARNING_PREFIX = "::warning::"
+ACTIONS_ENV = "GITHUB_ACTIONS"
 
 
 # --------------------------------------------------------------------------- #
@@ -222,9 +225,10 @@ WARNING_PREFIX = "::warning::"
 
 
 def warn(message):
-    """A log line that also annotates the job. Stdout, where the runner reads
-    workflow commands."""
-    print(f"{WARNING_PREFIX}{message}", flush=True)
+    """A log line that, on a runner, also annotates the job. Stdout, where the
+    runner reads workflow commands."""
+    if os.environ.get(ACTIONS_ENV):
+        print(f"{WARNING_PREFIX}{message}", flush=True)
     log(message)
 
 
@@ -761,7 +765,11 @@ def reconcile(api, notification, repo, workflow_id):
     # the older is the one people were notified of; it stays.
     matching = [issue for issue in open_issues if marker in (issue.get("body") or "")]
     current = min(matching, key=lambda issue: issue["number"], default=None)
-    stale = [issue for issue in open_issues if issue is not current]
+    # An issue a person reopened is theirs to close, on this path as on the
+    # green one; it is neither superseded nor counted as a duplicate.
+    stale = [
+        issue for issue in open_issues if issue is not current and issue.get("state_reason") != REOPENED
+    ]
 
     def supersede(issue, by_number):
         api.comment(issue["number"], f"Superseded by #{by_number}.")
@@ -935,23 +943,23 @@ def sweep(api, repo, branch, dry_run):
         if not carriers.get(name):
             missing.append(name)
             continue
-        candidates = [(workflow, api.history(workflow["id"], branch)) for workflow in carriers[name]]
-        if any(runs is None for _, runs in candidates):
-            # With a carrier unread, "which ran most recently" cannot be
-            # answered, and a ghost must not win by default.
-            warn(f"{name}: a history read came back short; leaving it to the next sweep")
-            continue
-        if len(candidates) > 1:
-            candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
-            others = ", ".join(f"{w['id']} ({w['path']})" for w, _ in candidates[1:])
-            log(
-                f"{name} is carried by {len(candidates)} workflows; reconciling {candidates[0][0]['id']}, "
-                f"which ran most recently, and not {others}"
-            )
-        workflow, runs = candidates[0]
         try:
+            candidates = [(workflow, api.history(workflow["id"], branch)) for workflow in carriers[name]]
+            if any(runs is None for _, runs in candidates):
+                # With a carrier unread, "which ran most recently" cannot be
+                # answered, and a ghost must not win by default.
+                warn(f"{name}: a history read came back short; leaving it to the next sweep")
+                continue
+            if len(candidates) > 1:
+                candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
+                others = ", ".join(f"{w['id']} ({w['path']})" for w, _ in candidates[1:])
+                log(
+                    f"{name} is carried by {len(candidates)} workflows; reconciling {candidates[0][0]['id']}, "
+                    f"which ran most recently, and not {others}"
+                )
+            workflow, runs = candidates[0]
             report(api, workflow["id"], runs, repo, dry_run)
-        except Exception as error:  # noqa: BLE001 - one workflow's failure must not stop the rest
+        except Exception as error:  # noqa: BLE001 - one workflow's failure, read or write, must not stop the rest
             log(f"{name}: {type(error).__name__}: {error}")
             failed.append(name)
 
