@@ -194,19 +194,31 @@ OWN_CLOSER_LOGIN = "github-actions[bot]"
 # episode, so a later history read that lacks that run reads as a hole.
 SUPERSEDED_STAMP = "<!-- main-broken superseded-by={number} -->"
 SUPERSEDED_PREFIX = "<!-- main-broken superseded-by="
-FIXED_BY_STAMP = "<!-- main-broken fixed-by={number} -->"
+FIXED_BY_STAMP = "<!-- main-broken fixed-by={number} run={run_id} -->"
 
 # The episode marker, read back off an issue body to learn which run opened it;
 # a table row, read back to learn which runs the issue already lists; and the
 # fixed-by stamp, read back to learn which green run closed it.
 _EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
 _ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)\)", re.MULTILINE)
-_FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+) -->")
+_FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+)(?: run=(\d+))? -->")
+
+# A refusal to write is a log line and exit 0, since a stale page is ordinary
+# and a red job for one would be noise; this prefix makes the line a warning
+# annotation on the job, so a refusal that persists shows up in the summary.
+WARNING_PREFIX = "::warning::"
 
 
 # --------------------------------------------------------------------------- #
 # Deciding whether there is anything to say
 # --------------------------------------------------------------------------- #
+
+
+def warn(message):
+    """A log line that also annotates the job. Stdout, where the runner reads
+    workflow commands."""
+    print(f"{WARNING_PREFIX}{message}", flush=True)
+    log(message)
 
 
 def is_failing(run):
@@ -399,9 +411,11 @@ def runs_named(issue):
     """
     body = issue.get("body") or ""
     named = {int(number): int(run_id) for number, run_id in _ROW_RUN.findall(body)}
-    for number in [episode_of(issue)] + [int(n) for n in _FIXED_BY.findall(body)]:
-        if number:
-            named.setdefault(number, None)
+    for number, run_id in _FIXED_BY.findall(body):
+        named.setdefault(int(number), int(run_id) if run_id else None)
+    episode = episode_of(issue)
+    if episode:
+        named.setdefault(episode, None)
     return named
 
 
@@ -590,7 +604,7 @@ class GitHubAPI(BaseGitHubAPI):
         runs = page["workflow_runs"]
         expected = min(page.get("total_count", len(runs)), depth)
         if len(runs) < expected:
-            log(f"history of workflow {workflow_id} came back with {len(runs)} of {expected} runs; not trusting it")
+            warn(f"history of workflow {workflow_id} came back with {len(runs)} of {expected} runs; not trusting it")
             return None
         return runs
 
@@ -651,9 +665,12 @@ class GitHubAPI(BaseGitHubAPI):
         """Close an issue and stamp its body with why, in one write.
 
         One PATCH rather than two, so a failure between them cannot leave an
-        open issue already carrying a stamp.
+        open issue already carrying a stamp. The body is re-read first: the
+        list this issue came from may be minutes old by now, and a note
+        someone wrote in the meantime must not be overwritten.
         """
-        body = (issue.get("body") or "").rstrip() + "\n" + stamp
+        fresh = self.get(f"/repos/{self.repo}/issues/{issue['number']}") or issue
+        body = (fresh.get("body") or "").rstrip() + "\n" + stamp
         return self.update_issue(issue["number"], body=body, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
 
 
@@ -692,7 +709,9 @@ def reconcile(api, notification, repo, workflow_id):
 
     def leave(gaps):
         described = "; ".join(f"#{number} names run(s) {', '.join(map(str, missing))}" for number, missing in gaps.items())
-        return f"the history read is missing runs that exist ({described}); writing nothing until a fuller read"
+        message = f"the history read is missing runs that exist ({described}); writing nothing until a fuller read"
+        warn(message)
+        return message
 
     if notification["kind"] == "green":
         if not open_issues:
@@ -716,7 +735,7 @@ def reconcile(api, notification, repo, workflow_id):
             return leave(gaps)
         for issue in closable:
             api.comment(issue["number"], comment)
-            api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number))
+            api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number, run_id=notification["run"]["id"]))
         done = "closed " + ", ".join(f"#{issue['number']}" for issue in closable) if closable else "closed nothing"
         if newer:
             done += "; left open " + ", ".join(f"#{issue['number']}" for issue in newer) + " (a newer breakage)"
@@ -784,17 +803,20 @@ def reconcile(api, notification, repo, workflow_id):
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
     else:
-        # Rewrite the body only when the set of rows changes. A body that
-        # already lists this run was written by the notify run that saw it
-        # first, and that run commented then; the scheduled sweep and a
-        # redelivered event both land here, and either commenting again would
-        # add a "Still failing" every fifteen minutes for as long as main stays
-        # red. Comparing rows rather than text also leaves a note someone wrote
-        # into the body alone until there is news to rewrite it with. A
-        # hand-edited title is restored on its own, body untouched and without
-        # a comment: nothing is news.
-        rows_changed = listed_rows(current) != {run["run_number"] for run in notification["streak"]}
-        if rows_changed:
+        # Rewrite the body only when the set of rows changes, and comment only
+        # when a row is added. A body that already lists this run was written
+        # by the notify run that saw it first, and that run commented then; the
+        # scheduled sweep and a redelivered event both land here, and either
+        # commenting again would add a "Still failing" every fifteen minutes
+        # for as long as main stays red. A row that disappears -- a run deleted
+        # from GitHub -- rewrites the table but is not a commit landing, so it
+        # draws no comment. Comparing rows rather than text also leaves a note
+        # someone wrote into the body alone until there is news to rewrite it
+        # with. A hand-edited title is restored on its own, body untouched and
+        # without a comment: nothing is news.
+        listed = listed_rows(current)
+        streak_rows = {run["run_number"] for run in notification["streak"]}
+        if listed != streak_rows:
             api.update_issue(current["number"], title=title, body=body)
             done = f"updated #{current['number']}"
         elif current.get("title") != title:
@@ -802,7 +824,7 @@ def reconcile(api, notification, repo, workflow_id):
             done = f"retitled #{current['number']}"
         else:
             done = f"#{current['number']} already says so"
-        if comment and rows_changed:
+        if comment and streak_rows - listed:
             api.comment(current["number"], comment)
 
     # An issue for an older breakage of this workflow is still open, which means
@@ -902,7 +924,7 @@ def sweep(api, repo, branch, dry_run):
         if any(runs is None for _, runs in candidates):
             # With a carrier unread, "which ran most recently" cannot be
             # answered, and a ghost must not win by default.
-            log(f"{name}: a history read came back short; leaving it to the next sweep")
+            warn(f"{name}: a history read came back short; leaving it to the next sweep")
             continue
         if len(candidates) > 1:
             candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
@@ -945,7 +967,7 @@ def main(argv=None):
     workflow_id = current["workflow_id"]
     runs = api.history(workflow_id, args.branch)
     if runs is None:
-        log("The history read came back short; leaving this to the next run or the sweep")
+        warn("The history read came back short; leaving this to the next run or the sweep")
         return 0
     # The list is read moments after the run completed and lists can lag the
     # run they are about; the run that woke this is known to have completed, so

@@ -558,22 +558,28 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(calls[0].get_header("Authorization"), "Bearer t")
         self.assertEqual(calls[0].get_header("X-github-api-version"), "2022-11-28")
 
-    def test_closing_an_issue_is_one_patch_with_the_stamp_and_a_state_reason(self):
+    def test_closing_an_issue_rereads_the_body_then_patches_once_with_the_stamp(self):
         """`state_reason` is what makes the issue read as completed rather than
         as abandoned in the issue list; the stamp rides in the same write so a
-        failure between them cannot leave an open issue already stamped."""
-        api, calls = self._api({})
-        api.close_issue({"number": 901, "body": "text\n\n<!-- marker -->\n"}, "<!-- main-broken fixed-by=12 -->")
-        self.assertEqual(calls[0].method, "PATCH")
-        self.assertTrue(calls[0].full_url.endswith("/repos/gke-labs/kube-agents/issues/901"))
+        failure between them cannot leave an open issue already stamped; and
+        the body is the one GitHub has now, not the one a minutes-old list
+        carried, so a note written in between survives."""
+        api, calls = self._api({"number": 901, "body": "text, with a fresh note\n\n<!-- marker -->\n"})
+        api.close_issue({"number": 901, "body": "text\n\n<!-- marker -->\n"}, "<!-- main-broken fixed-by=12 run=1012 -->")
+        self.assertEqual([call.method for call in calls], ["GET", "PATCH"])
+        self.assertTrue(calls[1].full_url.endswith("/repos/gke-labs/kube-agents/issues/901"))
         self.assertEqual(
-            json.loads(calls[0].data),
+            json.loads(calls[1].data),
             {
-                "body": "text\n\n<!-- marker -->\n<!-- main-broken fixed-by=12 -->",
+                "body": "text, with a fresh note\n\n<!-- marker -->\n<!-- main-broken fixed-by=12 run=1012 -->",
                 "state": "closed",
                 "state_reason": notifier.CLOSE_COMPLETED,
             },
         )
+
+    def test_an_older_fixed_by_stamp_without_a_run_id_still_names_the_run(self):
+        stamped = {"number": 1, "body": notifier.workflow_marker(77) + "episode=10 -->\n<!-- main-broken fixed-by=11 -->"}
+        self.assertEqual(notifier.runs_named(stamped), {10: None, 11: None})
 
     def test_creating_an_issue_carries_the_label(self):
         """Without it `issues_for_workflow` never finds the issue again."""
@@ -687,7 +693,7 @@ class ReconcileTest(unittest.TestCase):
         self._reconcile(api, decided(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
         self.assertEqual(api.kinds(), ["comment", "close"])
         self.assertIn("Fixed by", api.actions[0][2])
-        self.assertIn(notifier.FIXED_BY_STAMP.format(number=12), api.closed_issues[0]["body"])
+        self.assertIn(notifier.FIXED_BY_STAMP.format(number=12, run_id=1012), api.closed_issues[0]["body"])
 
     def test_a_recovery_with_nothing_open_is_quiet(self):
         """Main was already red when this workflow was added, or someone closed
@@ -1044,7 +1050,20 @@ class IncompleteReadTest(unittest.TestCase):
         api = FakeAPI([open_issue], deleted_runs={1011})
         holed = [run(12, "failure"), run(10, "failure"), run(9, "success")]
         self._reconcile(api, self._decision(run(12, "failure"), holed))
-        self.assertEqual(api.kinds(), ["update", "comment"], "the table lost the deleted run's row, which is a change")
+        self.assertEqual(api.kinds(), ["update"], "the table lost a row, which rewrites it; nothing landed, so no comment")
+
+    def test_a_deleted_fixing_green_is_not_a_permanent_hole(self):
+        """The fixed-by stamp carries the green run's id, so a green an
+        administrator deleted is excused like a deleted row rather than
+        blocking every new episode until it ages past a full page."""
+        api = FakeAPI([self._listing(901, self._decision(run(10, "failure"), [run(10, "failure"), run(9, "success")]))])
+        self._reconcile(api, self._decision(run(11, "success"), [run(11, "success"), run(10, "failure"), run(9, "success")]))
+        api.deleted_runs.add(1011)
+        later_red = run(12, "failure")
+        later_red["updated_at"] = "2026-09-05T00:00:00Z"  # after the close, as a real relapse is
+        relapse = self._decision(later_red, [later_red, run(10, "failure"), run(9, "success")])
+        self._reconcile(api, relapse)
+        self.assertEqual(api.kinds()[-2:], ["label", "create"])
 
     def test_a_read_missing_the_episode_does_not_open_a_second_issue(self):
         """2026-09-17 on main: #1677 (episode 5928, rows 5928 and 6008) was
@@ -1115,7 +1134,7 @@ class IncompleteReadTest(unittest.TestCase):
         api = FakeAPI([self._listing(901, self._decision(run(10, "failure"), [run(10, "failure"), run(9, "success")]))])
         self._reconcile(api, self._decision(run(11, "success"), [run(11, "success"), run(10, "failure"), run(9, "success")]))
         self.assertEqual(api.kinds(), ["comment", "close"])
-        self.assertEqual(notifier.runs_named(api.closed_issues[0]), {10: 1010, 11: None})
+        self.assertEqual(notifier.runs_named(api.closed_issues[0]), {10: 1010, 11: 1011})
         relapse = self._decision(run(12, "failure"), [run(12, "failure"), run(10, "failure"), run(9, "success")])
         result = self._reconcile(api, relapse)
         self.assertEqual(api.kinds(), ["comment", "close"])
