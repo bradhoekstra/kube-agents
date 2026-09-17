@@ -49,7 +49,10 @@ that has been dealt with, whoever closed it -- a person, a merge whose
 description named the issue, or this workflow itself on a green that a stale
 read no longer shows -- so it is not filed again for evidence that predates the
 close. A run re-run after the close, or a new red, moves the streak past it and
-files as usual, and so does the next episode.
+files as usual, and so does the next episode. The one close that never counts
+is this workflow's own "superseded": it says another issue covers the
+breakage, not that anyone dealt with it, and it is marked `not_planned` so it
+can be told apart.
 
 A third bound is about the read rather than the state. The run-history endpoint
 has answered with a page missing recent runs, and once with a page weeks old:
@@ -57,11 +60,13 @@ on 2026-09-17 a read that lacked runs 5928 and 6008 made run 6009 look like a
 fresh breakage, and the notifier opened a second issue and closed the right one
 as superseded. So before it opens, supersedes, rewrites or closes anything, it
 checks that every run the issues in play name -- open, and closed when it is
-about to open one -- is in the list it read, or is older than a full page,
-which is the one honest reason for a run to be absent. A read that fails that
-test writes nothing; the next read is at most fifteen minutes away, or as long
-as a re-run of a listed run takes, since a run being re-run is not completed and
-is absent from every page until it is.
+about to open one -- is in the list it read, or is older than a full page, or
+has been deleted from GitHub, which are the honest reasons for a run to be
+absent; and a page shorter than the count the endpoint itself reports is
+refused before any of that. A read that fails writes nothing; the next read is
+at most fifteen minutes away, or as long as a re-run of a listed run takes,
+since a run being re-run is not completed and is absent from every page until
+it is.
 
 That is also what makes a dropped notify run survivable. GitHub keeps one run
 pending per concurrency group and cancels the rest of a burst, and the earlier
@@ -167,10 +172,16 @@ LABEL_DESCRIPTION = "A required check is failing on main"
 ISSUE_OPEN = "open"
 ISSUE_CLOSED = "closed"
 
+# Why an issue was closed. A recovery or a hand close reads as completed; an
+# issue closed because another issue covers the same breakage is marked
+# distinctly, so that close is never mistaken for someone dealing with it.
+CLOSE_COMPLETED = "completed"
+CLOSE_SUPERSEDED = "not_planned"
+
 # The episode marker, read back off an issue body to learn which run opened it,
 # and a table row, read back to learn which runs the issue already lists.
 _EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
-_ROW_RUN = re.compile(r"^\| \[(\d+)\]\(", re.MULTILINE)
+_ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)\)", re.MULTILINE)
 
 
 # --------------------------------------------------------------------------- #
@@ -200,15 +211,18 @@ def reporting_history(runs, current):
 
     `current` is the newest reporting run, but the list may hold newer runs
     that said nothing, so it is filtered by id and run number rather than
-    sliced from the front.
+    sliced from the front -- and sorted, because the streak is read off the
+    order and the list's order is only as good as the API's, plus whatever
+    `main` had to put back in.
     """
-    return [
+    history = [
         run
         for run in runs
         if run["id"] != current["id"]
         and run["run_number"] < current["run_number"]
         and run["conclusion"] in REPORTING_CONCLUSIONS
     ]
+    return sorted(history, key=lambda run: run["run_number"], reverse=True)
 
 
 def failure_streak(current, history):
@@ -369,11 +383,17 @@ def episode_of(issue):
 
 
 def runs_named(issue):
-    """Every run number an issue's marker and table name."""
+    """Every run an issue's marker and table name: run number to run id.
+
+    The id comes from the row's link; the marker carries only the number, so
+    an episode with no row of its own maps to None.
+    """
     body = issue.get("body") or ""
-    named = {int(number) for number in _ROW_RUN.findall(body)}
+    named = {int(number): int(run_id) for number, run_id in _ROW_RUN.findall(body)}
     episode = episode_of(issue)
-    return named | ({episode} if episode else set())
+    if episode:
+        named.setdefault(episode, None)
+    return named
 
 
 def history_window(runs):
@@ -392,13 +412,14 @@ def unlisted_runs(issue, window):
 
     Non-empty means the read is missing runs known to exist, and any decision
     built on it -- a fresh episode, a shorter streak, a recovery -- is built
-    on a hole. The reconciliation then writes nothing.
+    on a hole. The reconciliation then writes nothing. Run number to run id,
+    so the caller can ask GitHub whether the run still exists at all.
     """
-    return sorted(
-        number
-        for number in runs_named(issue)
+    return {
+        number: run_id
+        for number, run_id in runs_named(issue).items()
         if number not in window["numbers"] and (not window["full"] or number >= window["oldest"])
-    )
+    }
 
 
 def render_title(notification):
@@ -528,8 +549,14 @@ class GitHubAPI(BaseGitHubAPI):
                 return found
             page += 1
 
+    def run_exists(self, run_id):
+        """Whether a run is still there. An administrator can delete one."""
+        return self.get(f"/repos/{self.repo}/actions/runs/{run_id}", tolerate=(404,)) is not None
+
     def history(self, workflow_id, branch="main", depth=HISTORY_DEPTH):
-        """Completed push runs of one workflow on `branch`, newest first.
+        """Completed push runs of one workflow on `branch`, newest first, or
+        None when the page is shorter than the endpoint's own count says it
+        should be -- a read not to build anything on.
 
         `event=push` keeps pull-request runs of the same workflow out: they
         vastly outnumber the push runs and say nothing about main.
@@ -543,7 +570,13 @@ class GitHubAPI(BaseGitHubAPI):
             }
         )
         path = f"/repos/{self.repo}/actions/workflows/{workflow_id}/runs?{query}"
-        return self.get(path)["workflow_runs"]
+        page = self.get(path)
+        runs = page["workflow_runs"]
+        expected = min(page.get("total_count", len(runs)), depth)
+        if len(runs) < expected:
+            log(f"history of workflow {workflow_id} came back with {len(runs)} of {expected} runs; not trusting it")
+            return None
+        return runs
 
     def issues_for_workflow(self, workflow_id, state):
         """`ci:main-broken` issues in `state` belonging to one workflow, newest first.
@@ -584,8 +617,8 @@ class GitHubAPI(BaseGitHubAPI):
     def comment(self, number, body):
         return self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", {"body": body})
 
-    def close_issue(self, number):
-        return self.update_issue(number, state="closed", state_reason="completed")
+    def close_issue(self, number, reason=CLOSE_COMPLETED):
+        return self.update_issue(number, state=ISSUE_CLOSED, state_reason=reason)
 
 
 # --------------------------------------------------------------------------- #
@@ -602,12 +635,26 @@ def reconcile(api, notification, repo, workflow_id):
     comment = render_comment(notification, repo)
     window = notification.get("window")
 
+    deleted = {}
+
+    def still_exists(run_id):
+        """A run the read lacks may have been deleted, which is no hole."""
+        if run_id is None:
+            return True
+        if run_id not in deleted:
+            deleted[run_id] = not api.run_exists(run_id)
+        return not deleted[run_id]
+
     def incomplete_for(issues):
         """The issues among `issues` that name runs this read did not list."""
         if window is None:
             return {}
-        gaps = {issue["number"]: unlisted_runs(issue, window) for issue in issues}
-        return {number: missing for number, missing in gaps.items() if missing}
+        gaps = {}
+        for issue in issues:
+            missing = sorted(n for n, run_id in unlisted_runs(issue, window).items() if still_exists(run_id))
+            if missing:
+                gaps[issue["number"]] = missing
+        return gaps
 
     def leave(gaps):
         described = "; ".join(f"#{number} names run(s) {', '.join(map(str, missing))}" for number, missing in gaps.items())
@@ -674,13 +721,15 @@ def reconcile(api, notification, repo, workflow_id):
         dismissed = [
             issue
             for issue in closed
-            if marker in (issue.get("body") or "") and (issue.get("closed_at") or "") > latest_change
+            if marker in (issue.get("body") or "")
+            and issue.get("state_reason") != CLOSE_SUPERSEDED
+            and (issue.get("closed_at") or "") > latest_change
         ]
         if dismissed:
             done = f"#{dismissed[0]['number']} was closed after the last of these runs changed; leaving it"
             for issue in stale:
                 api.comment(issue["number"], f"Superseded by #{dismissed[0]['number']}, which was closed.")
-                api.close_issue(issue["number"])
+                api.close_issue(issue["number"], CLOSE_SUPERSEDED)
                 done += f", superseded #{issue['number']}"
             return done
         api.ensure_label()
@@ -708,7 +757,7 @@ def reconcile(api, notification, repo, workflow_id):
     # rather than leaving two issues claiming main is broken.
     for issue in stale:
         api.comment(issue["number"], f"Superseded by #{current['number']}.")
-        api.close_issue(issue["number"])
+        api.close_issue(issue["number"], CLOSE_SUPERSEDED)
         done += f", superseded #{issue['number']}"
     return done
 
@@ -794,9 +843,13 @@ def sweep(api, repo, branch, dry_run):
 
     missing = []
     for name in WATCHED_WORKFLOWS:
-        candidates = [(workflow, api.history(workflow["id"], branch)) for workflow in carriers.get(name, [])]
-        if not candidates:
+        if not carriers.get(name):
             missing.append(name)
+            continue
+        candidates = [(workflow, api.history(workflow["id"], branch)) for workflow in carriers[name]]
+        candidates = [(workflow, runs) for workflow, runs in candidates if runs is not None]
+        if not candidates:
+            log(f"{name}: every history read came back short; leaving it to the next sweep")
             continue
         if len(candidates) > 1:
             candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
@@ -838,11 +891,15 @@ def main(argv=None):
 
     workflow_id = current["workflow_id"]
     runs = api.history(workflow_id, args.branch)
+    if runs is None:
+        log("The history read came back short; leaving this to the next run or the sweep")
+        return 0
     # The list is read moments after the run completed and lists can lag the
     # run they are about; the run that woke this is known to have completed, so
-    # it is put in if the list has not caught up rather than left to the sweep.
+    # it is put in if the list has not caught up rather than left to the sweep
+    # -- and the list re-sorted, since a run newer than it may already be there.
     if all(run["id"] != current["id"] for run in runs):
-        runs = [current] + runs
+        runs = sorted([current] + runs, key=lambda run: run["run_number"], reverse=True)
 
     # Notify runs are queued in the order the runs they watch *finish*, which is
     # not the order those runs started, and a burst of merges drops some of them
