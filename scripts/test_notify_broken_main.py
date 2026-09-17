@@ -998,6 +998,16 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.actions, [])
         self.assertIn("left open #901", result)
 
+    def test_an_issue_a_person_reopened_is_left_alone_by_a_green(self):
+        """Reopening is a decision. Without this the sweep closes it again
+        every fifteen minutes, with a fresh "passes again" comment each time."""
+        reopened = issue(901, 77, 10)
+        reopened["state_reason"] = notifier.REOPENED
+        api = FakeAPI([reopened])
+        result = self._reconcile(api, decided(run(12, "success"), [run(11, "success"), run(10, "failure")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("reopened by hand", result)
+
     def test_a_green_still_closes_every_older_episode(self):
         """Episode 5 is older than the full page can show, which is the one
         honest reason for a named run to be absent; episode 101 is newer than
@@ -1288,6 +1298,15 @@ class MainTest(unittest.TestCase):
         self.assertEqual(status, 0)
         reconcile.assert_not_called()
 
+    def test_a_run_of_an_unwatched_workflow_is_refused(self):
+        """The trigger list keeps this from happening in the workflow; a
+        hand-run on a `Prettier Check` run would file for a workflow the sweep
+        never reconciles or closes."""
+        unwatched = run(10, "failure", name="Prettier Check")
+        status, reconcile = self._main(unwatched, [unwatched], ["--run-id", "1010"], {"GITHUB_TOKEN": "t"})
+        self.assertEqual(status, 0)
+        reconcile.assert_not_called()
+
     def test_a_run_on_another_branch_is_refused(self):
         other = run(10, "failure")
         other["head_branch"] = "release-1.2"
@@ -1431,6 +1450,29 @@ class SweepTest(unittest.TestCase):
         reconciled = [call.args[3] for call in reconcile.call_args_list]
         self.assertNotIn(999, reconciled)
         self.assertNotIn(100, reconciled)
+
+    def test_one_workflows_failure_does_not_stop_the_rest_of_the_sweep(self):
+        """A 5xx that outlasts the retries on one workflow must not leave the
+        other five unread until the next sweep; the sweep still goes red."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
+        api = mock.Mock()
+        api.workflows.return_value = self._workflows(names_to_ids)
+        api.history.side_effect = lambda workflow_id, branch: histories[workflow_id]
+        calls = []
+
+        def reconcile(api_, notification, repo, workflow_id):
+            calls.append(workflow_id)
+            if workflow_id == 100:
+                raise RuntimeError("boom")
+            return "done"
+
+        with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
+            "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
+        ), mock.patch.object(notifier, "reconcile", side_effect=reconcile):
+            status = notifier.main(["--sweep"])
+        self.assertEqual(status, 1)
+        self.assertEqual(len(calls), len(notifier.WATCHED_WORKFLOWS))
 
     def test_a_dry_run_sweep_writes_nothing(self):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}

@@ -43,7 +43,8 @@ main that is green.
 Two bounds keep the reconciliation from undoing a person or a newer run. A
 green closes only issues whose episode is no newer than the green run itself,
 because an issue for a red that finished after this green describes a main this
-green has not seen. And a closed issue that carries the current episode's marker
+green has not seen -- and never one a person reopened, which GitHub marks as
+such. And a closed issue that carries the current episode's marker
 and was closed after the last change to any run in the streak is a breakage
 that has been dealt with, whoever closed it -- a person, or a merge whose
 description named the issue -- so it is not filed again for evidence that
@@ -176,6 +177,11 @@ LABEL_DESCRIPTION = "A required check is failing on main"
 # The two issue states the reconciliation reads.
 ISSUE_OPEN = "open"
 ISSUE_CLOSED = "closed"
+
+# What GitHub records on an issue a person reopened. A green leaves such an
+# issue alone: reopening is a decision, and the sweep would otherwise close it
+# again every fifteen minutes with a fresh "passes again" comment each time.
+REOPENED = "reopened"
 
 # The state reason every close carries. Not used to mean anything: "not
 # planned" is what a person picks for a false alarm, so a close's meaning is
@@ -728,8 +734,11 @@ def reconcile(api, notification, repo, workflow_id):
         # finished, or read a list that lagged it, would otherwise close a
         # correct issue with a "passes again" naming a run that is not the fix.
         green_number = notification["run"]["run_number"]
-        closable = [issue for issue in open_issues if episode_of(issue) <= green_number]
-        newer = [issue for issue in open_issues if issue not in closable]
+        reopened = [issue for issue in open_issues if issue.get("state_reason") == REOPENED]
+        closable = [
+            issue for issue in open_issues if issue not in reopened and episode_of(issue) <= green_number
+        ]
+        newer = [issue for issue in open_issues if issue not in closable and issue not in reopened]
         gaps = incomplete_for(closable)
         if gaps:
             return leave(gaps)
@@ -739,6 +748,8 @@ def reconcile(api, notification, repo, workflow_id):
         done = "closed " + ", ".join(f"#{issue['number']}" for issue in closable) if closable else "closed nothing"
         if newer:
             done += "; left open " + ", ".join(f"#{issue['number']}" for issue in newer) + " (a newer breakage)"
+        if reopened:
+            done += "; left open " + ", ".join(f"#{issue['number']}" for issue in reopened) + " (reopened by hand)"
         return done
 
     marker = episode_marker(notification, workflow_id)
@@ -916,6 +927,7 @@ def sweep(api, repo, branch, dry_run):
             carriers.setdefault(workflow["name"], []).append(workflow)
 
     missing = []
+    failed = []
     for name in WATCHED_WORKFLOWS:
         if not carriers.get(name):
             missing.append(name)
@@ -934,12 +946,17 @@ def sweep(api, repo, branch, dry_run):
                 f"which ran most recently, and not {others}"
             )
         workflow, runs = candidates[0]
-        report(api, workflow["id"], runs, repo, dry_run)
+        try:
+            report(api, workflow["id"], runs, repo, dry_run)
+        except Exception as error:  # noqa: BLE001 - one workflow's failure must not stop the rest
+            log(f"{name}: {type(error).__name__}: {error}")
+            failed.append(name)
 
     if missing:
         log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing reports on it")
-        return 1
-    return 0
+    if failed:
+        log(f"Reconciling {', '.join(failed)} failed; the rest were reconciled, and the next sweep retries")
+    return 1 if missing or failed else 0
 
 
 def main(argv=None):
@@ -962,6 +979,12 @@ def main(argv=None):
     # the wrong run id harmless rather than an issue about a pull request.
     if current["head_branch"] != args.branch or current["event"] != "push":
         log(f"Run {args.run_id} is {current['event']} on {current['head_branch']}, not push on {args.branch}")
+        return 0
+    if current["name"] not in WATCHED_WORKFLOWS:
+        # The trigger list keeps this from happening in the workflow; a hand-run
+        # on, say, a `Prettier Check` run would file for a workflow the sweep
+        # never reconciles, and the header says why it is not watched.
+        log(f"Run {args.run_id} belongs to {current['name']}, which is not watched; nothing to do")
         return 0
 
     workflow_id = current["workflow_id"]
