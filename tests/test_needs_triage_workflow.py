@@ -59,7 +59,7 @@ _PAGE_SIZE_RE = re.compile(r"^\s*PAGE_SIZE=(\d+)", re.MULTILINE)
 # gh's: FAKE_GH_FAIL_WRITES fails every write with a 500; FAKE_GH_DELETE_404
 # (comma-separated issue numbers) answers a DELETE on those issues the way
 # GitHub answers a label that is no longer there; FAKE_GH_MISSING (likewise)
-# answers a single-issue GET the way GitHub answers a deleted issue.
+# answers a single-issue GET, or a POST, the way GitHub answers a deleted issue.
 _FAKE_GH = textwrap.dedent(
     """\
     #!/usr/bin/env python3
@@ -95,6 +95,8 @@ _FAKE_GH = textwrap.dedent(
             fail("Internal Server Error", 500)
         if method == "DELETE" and issue_in_path in listed("FAKE_GH_DELETE_404"):
             fail("Label does not exist", 404)
+        if method == "POST" and issue_in_path in listed("FAKE_GH_MISSING"):
+            fail("Not Found", 404)
         sys.exit(0)
     issues = json.load(open(os.environ["FAKE_GH_ISSUES"]))
     single = re.fullmatch(r"repos/[^/]+/[^/]+/issues/(\\d+)", path)
@@ -285,7 +287,7 @@ class ScriptTest(unittest.TestCase):
                 result = self._run(event)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(self._adds_and_removes(), (_EXPECTED_ADDS, _EXPECTED_REMOVES))
-                self.assertIn(f"{len(_EXPECTED_ADDS) + len(_EXPECTED_REMOVES)} change(s), 0 already done", result.stdout)
+                self.assertIn(f"{len(_EXPECTED_ADDS) + len(_EXPECTED_REMOVES)} change(s), 0 skipped", result.stdout)
 
     def test_sweep_without_paginate_would_miss_the_second_page(self):
         """Proves the test above depends on `--paginate`: the first page alone needs nothing."""
@@ -302,7 +304,15 @@ class ScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self._writes(), [("POST", 1), ("DELETE", 3), ("POST", 7), ("DELETE", 8)])
         self.assertIn(f"remove: {_LABEL} on #3 -- already gone", result.stdout)
-        self.assertIn("3 change(s), 1 already done by another run", result.stdout)
+        self.assertIn("3 change(s), 1 skipped: already gone", result.stdout)
+
+    def test_sweep_continues_past_an_issue_deleted_since_the_read(self):
+        """The add side of the same window: the issue itself is gone, so there is nothing to label and the rest of the sweep still runs."""
+        result = self._run("workflow_dispatch", missing="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._writes(), [("POST", 1), ("DELETE", 3), ("POST", 7), ("DELETE", 8)])
+        self.assertIn(f"add: {_LABEL} on #1 -- issue gone", result.stdout)
+        self.assertIn("3 change(s), 1 skipped: already gone", result.stdout)
 
     def test_dispatch_dry_run_writes_nothing(self):
         result = self._run("workflow_dispatch", dry_run="true")

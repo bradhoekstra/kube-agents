@@ -154,21 +154,27 @@ jobs:
               echo "would ${verb} ${LABEL} on #${number}"
               continue
             fi
+            # Either write can find its target gone since the read: the label
+            # removed by another run or a person (DELETE answers 404), or the
+            # issue itself deleted (POST answers 404, 410 if it was transferred
+            # or locked away). Both mean the rule already holds there.
+            status=0
             case "${verb}" in
               add)
-                gh api --silent -X POST "repos/${REPO}/issues/${number}/labels" -f "labels[]=${LABEL}" ;;
+                tolerate "404|410" gh api --silent -X POST "repos/${REPO}/issues/${number}/labels" -f "labels[]=${LABEL}" || status=$?
+                reason="issue gone; nothing to label" ;;
               remove)
-                status=0
                 tolerate "404" gh api --silent -X DELETE "repos/${REPO}/issues/${number}/labels/${LABEL}" || status=$?
-                if [ "${status}" -eq 2 ]; then
-                  gone=$((gone + 1))
-                  echo "remove: ${LABEL} on #${number} -- already gone; another run got there first"
-                  continue
-                elif [ "${status}" -ne 0 ]; then
-                  exit "${status}"
-                fi ;;
+                reason="already gone; another run got there first" ;;
             esac
+            if [ "${status}" -eq 2 ]; then
+              gone=$((gone + 1))
+              echo "${verb}: ${LABEL} on #${number} -- ${reason}"
+              continue
+            elif [ "${status}" -ne 0 ]; then
+              exit "${status}"
+            fi
             changes=$((changes + 1))
             echo "${verb}: ${LABEL} on #${number}"
           done <<< "${ROWS}"
-          echo "${changes} change(s), ${gone} already done by another run"
+          echo "${changes} change(s), ${gone} skipped: already gone"
