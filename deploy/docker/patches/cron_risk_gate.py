@@ -39,10 +39,13 @@ APPROVALS_KEY = "approvals"
 #: ``LOG_HOST_MAX_LEN`` bounds it.
 LOG_DIGEST_LEN = 12
 #: Longest host a lookalike refusal log line reproduces whole. ``_HOST_TOKEN``'s
-#: capture group admits only ``[a-z0-9.-]``, so a captured host carries no
-#: scheme, userinfo, port, path or query from the command; what it can still
-#: be is arbitrarily long, and 253 is the longest presentation-form DNS name
-#: (RFC 1035), so the cap cuts nothing that could resolve.
+#: capture group admits letters of either case, digits, dots and hyphens and
+#: nothing else, so the ``:``, ``@``, ``/`` and ``?`` that delimit a scheme,
+#: userinfo, port, path or query never cross into a captured host. The token
+#: is still whatever host-shaped text the command holds -- a userinfo that is
+#: itself shaped like a host is captured as one -- and it can be arbitrarily
+#: long; 253 is the longest presentation-form DNS name (RFC 1035), so the cap
+#: cuts nothing that could resolve.
 LOG_HOST_MAX_LEN = 253
 #: Appended to a host the log line cut at ``LOG_HOST_MAX_LEN``, naming how much
 #: is missing. The apex can sit anywhere in the host, so a cut can hide the
