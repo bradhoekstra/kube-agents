@@ -19,7 +19,7 @@ newest completed run that said anything says:
 
     failing, previous run green     -> open an issue: "main is broken"
     failing, previous run failing   -> add the commit to that issue, and comment
-    green                           -> close whatever issue is open, if any
+    green                           -> close any older issue still open
 
 One issue per breakage, not per failing run. A breakage that spans several merges
 is one event, and keying the issue on the run that started the streak collapses
@@ -654,7 +654,7 @@ def reconcile(api, notification, repo, workflow_id):
     # fresh episode it suggests may be a hole in the list, and a shorter streak
     # a missing row. Checked before anything is written, for the issue this run
     # would update and for every issue it would supersede.
-    gaps = incomplete_for([current] if current is not None else stale)
+    gaps = incomplete_for(([current] if current is not None else []) + stale)
     if gaps:
         return leave(gaps)
 

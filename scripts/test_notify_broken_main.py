@@ -536,7 +536,7 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(json.loads(calls[0].data), {"state": "closed", "state_reason": "completed"})
 
     def test_creating_an_issue_carries_the_label(self):
-        """Without it `open_issues_for_workflow` never finds the issue again."""
+        """Without it `issues_for_workflow` never finds the issue again."""
         api, calls = self._api({"number": 901})
         api.create_issue("t", "b")
         self.assertEqual(json.loads(calls[0].data)["labels"], [notifier.LABEL])

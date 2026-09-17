@@ -72,7 +72,7 @@ on:
   # `workflow_run`, a runner outage -- and for anything the group below drops:
   # every watched workflow is reconciled against its newest completed push run
   # that said anything.
-  # Cheap enough to run often: one history read per watched workflow, and a
+  # Cheap enough to run often: a few reads per watched workflow, and a
   # reconciliation that finds the issues already right writes nothing.
   schedule:
     - cron: "*/15 * * * *"
