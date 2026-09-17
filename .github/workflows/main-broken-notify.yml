@@ -10,7 +10,9 @@ name: Notify on Broken Main
 # further workflows, so this cannot start a loop.
 #
 # `workflows:` matches on the workflow's `name:`, not its filename, and a rename
-# there silently stops this from firing. The scheduled sweep is what notices: it
+# there silently stops this from firing. The scheduled sweep is what notices an
+# edit in place (a file moved and renamed together leaves a listed ghost carrying
+# the old name, which it cannot tell from a quiet workflow): it
 # carries the same list as `WATCHED_WORKFLOWS` in the script -- a workflow
 # cannot read its own triggers, so the list exists three times: here, there
 # (`scripts/test_notify_broken_main.py` fails when the two disagree), and as
@@ -68,7 +70,8 @@ on:
     types: [completed]
   # The backstop for an event that is never delivered -- a dropped
   # `workflow_run`, a runner outage -- and for anything the group below drops:
-  # every watched workflow is reconciled against its newest completed push run.
+  # every watched workflow is reconciled against its newest completed push run
+  # that said anything.
   # Cheap enough to run often: one history read per watched workflow, and a
   # reconciliation that finds the issues already right writes nothing.
   schedule:
@@ -83,8 +86,9 @@ on:
 # `cancel-in-progress: false` does not mean nothing is dropped: GitHub holds at
 # most one run pending per group, and a third arrival cancels the one waiting.
 # So a burst of merges loses notify runs, and on 2026-09-16 it lost the only one
-# whose triggering run was red (#1681): the other five deferred to it and main
-# went unreported for fourteen hours. That is survivable now because every
+# whose triggering run was red, on the timing (#1681): the survivors deferred
+# to it and main went unreported for nearly fifteen hours. That is survivable
+# now because every
 # notify run reconciles against the newest completed run of its workflow rather
 # than the one that woke it: the last arrival in a group is never cancelled, it
 # runs after every push run of the burst has finished, and it files whatever the
@@ -92,7 +96,7 @@ on:
 #
 # That holds only if nothing else enters the group. `workflow_run` fires for
 # every completion of a watched workflow, pull-request runs included -- about
-# ten of those per push run -- and the group is evaluated before the job's `if:`
+# five of those per push run -- and the group is evaluated before the job's `if:`
 # skips them. Keyed on the workflow alone, a pull-request run's notify arriving
 # mid-burst would cancel the pending push run's notify and then skip itself,
 # leaving the red to the sweep. So the key repeats the `if:`'s push-to-main
@@ -163,7 +167,8 @@ jobs:
         run: python3 scripts/notify_broken_main.py --run-id "$RUN_ID"
 
       # No run to start from: the schedule and a manual dispatch reconcile
-      # every watched workflow against its newest completed push run.
+      # every watched workflow against its newest completed push run that said
+      # anything.
       - name: Sweep every watched workflow
         if: github.event_name != 'workflow_run'
         env:

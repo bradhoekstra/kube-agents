@@ -14,8 +14,8 @@ fix at 2700. It was three hours and forty-five minutes before anyone noticed.
 
 So this writes it down. `.github/workflows/main-broken-notify.yml` hands it the
 run id of a completed push run on `main` for one of the watched workflows -- or,
-on a schedule, nothing -- and it decides what that workflow's newest completed
-run says:
+on a schedule or a dispatch, nothing -- and it decides what that workflow's
+newest completed run that said anything says:
 
     failing, previous run green     -> open an issue: "main is broken"
     failing, previous run failing   -> add the commit to that issue, and comment
@@ -54,12 +54,12 @@ That is also what makes a dropped notify run survivable. GitHub keeps one run
 pending per concurrency group and cancels the rest of a burst, and the earlier
 design let each run speak only for itself, deferring to any later run: on
 2026-09-16 six merges landed within a minute, the only red run of the burst
-(#1651, `b458323d`) finished before two of the greens, its notify run was the one
-the group cancelled, and every surviving run deferred to it. Nothing was filed
-for fourteen hours, until the next merge produced a fresh run; #1681 is the
-write-up. Now any
-run of the burst reconciles against that red, and the last arrival in a group is
-never cancelled -- so a burst costs nothing as long as one event is delivered.
+(#1651, `b458323d`) finished before two of the greens, the group cancelled two
+notify runs in the seconds after it -- on the timing, its own among them -- and
+every surviving run deferred to it. Nothing was filed for nearly fifteen hours,
+until the next merge produced a fresh run; #1681 is the write-up. Now any run of
+the burst reconciles against that red, and the last arrival in a group is never
+cancelled -- so a burst costs nothing as long as one event is delivered.
 
 Delivery can still fail entirely: a `workflow_run` event that is never sent, a
 runner outage. `--sweep` does the same reconciliation for every workflow in
@@ -647,7 +647,7 @@ def parse_args(argv):
     what.add_argument(
         "--sweep",
         action="store_true",
-        help="reconcile every watched workflow against its newest completed push run",
+        help="reconcile every watched workflow against its newest completed push run that said anything",
     )
     parser.add_argument(
         "--repo",

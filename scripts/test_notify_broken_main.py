@@ -906,10 +906,11 @@ class MainTest(unittest.TestCase):
         """#1681, with the run numbers from 2026-09-16. Six merges landed in a
         minute; the red run, 5928, failed fast and finished before the
         greens 5926 and 5927 that carry older commits. The concurrency group
-        cancelled 5928's own notify run. The notify runs for 5926 and 5927
-        survived, and under the old rule each deferred to 5928 and exited --
-        so nothing was filed for fourteen hours. Handling 5926 must file
-        against 5928."""
+        cancelled two notify runs in the seconds after 5928 finished -- its own
+        among them, on the timing -- and a surviving notify run for a green
+        such as 5926 deferred to 5928 and exited under the old rule, so nothing
+        was filed for nearly fifteen hours. Handling 5926 must file against
+        5928."""
         burst = [
             run(5923, "success"),
             run(5924, "success"),
@@ -1092,7 +1093,7 @@ class WatchListTest(unittest.TestCase):
         """The `workflow_run` trigger and `WATCHED_WORKFLOWS` are the same list,
         because a workflow cannot read its own triggers; the third copy, the
         required-check roster in `test_integration_contracts.py`, is a subset
-        the trigger must contain and that test enforces it. A name on one of
+        the trigger must contain, enforced there. A name on one of
         these two and not the other is a workflow the event path watches and
         the sweep does not, or the reverse."""
         document = yaml.safe_load(WORKFLOW_FILE.read_text())
