@@ -49,8 +49,8 @@ and was closed after the last change to any run in the streak is a breakage
 that has been dealt with, whoever closed it -- a person, or a merge whose
 description named the issue -- so it is not filed again for evidence that
 predates the close. A run re-run after the close, or a new red, moves the streak past it and
-files as usual, and so does the next episode. The one close that never counts
-is this workflow's own "superseded": it says another issue covers the
+files as usual, and so does the next episode. Two closes never count. One is
+this workflow's own "superseded": it says another issue covers the
 breakage, not that anyone dealt with it, and the issue is stamped with a hidden
 `superseded-by` line when it is closed so it can be told apart -- a state
 reason cannot do that, since "not planned" is also what a person picks for a
@@ -65,11 +65,12 @@ as superseded. So before it opens, supersedes, rewrites or closes anything, it
 checks that every run the issues in play name -- open, and closed when it is
 about to open one -- is in the list it read, or is older than a full page, or,
 for a run the issue links to, has been deleted from GitHub, which are the
-honest reasons for a run to be absent; and a page shorter than the count the endpoint itself reports is
-refused before any of that. Issues name only red runs, so a green close also
-stamps the issue with the run that fixed it: a later page that has the reds
-around that green but not the green itself is then a hole too, not a relapse. A read that fails writes nothing; the next read is
-at most fifteen minutes away, or as long as a re-run of a listed run takes,
+honest reasons for a run to be absent; and a page shorter than the count the
+endpoint itself reports is refused before any of that. Issues name only red
+runs, so a green close also stamps the issue with the run that fixed it: a
+later page that has the reds around that green but not the green itself is
+then a hole too, not a relapse. A read that fails writes nothing; the next read
+is at most fifteen minutes away, or as long as a re-run of a listed run takes,
 since a run being re-run is not completed and is absent from every page until
 it is.
 
@@ -410,10 +411,11 @@ def episode_of(issue):
 
 
 def runs_named(issue):
-    """Every run an issue's marker and table name: run number to run id.
+    """Every run an issue names -- marker, table rows, fixed-by stamp -- as run
+    number to run id.
 
-    The id comes from the row's link; the marker carries only the number, so
-    an episode with no row of its own maps to None.
+    The id comes from a row's link or a stamp's `run=`; the marker and an old
+    stamp carry only the number, so those map to None.
     """
     body = issue.get("body") or ""
     named = {int(number): int(run_id) for number, run_id in _ROW_RUN.findall(body)}
@@ -466,8 +468,8 @@ def render_body(notification, repo, marker):
     A table of the commits that have landed since main went red, oldest first.
     It is derived entirely from the run history, so it is idempotent: handling
     the same run twice produces the same body. It is written only when the set
-    of rows changes, so a note someone adds to the body stays until the next
-    commit lands on the broken main.
+    of rows changes -- a commit landing on the broken main, or a listed run
+    deleted from GitHub -- so a note someone adds to the body stays until then.
     """
     run = notification["run"]
     workflow = run["name"]
@@ -838,8 +840,9 @@ def reconcile(api, notification, repo, workflow_id):
         if comment and streak_rows - listed:
             api.comment(current["number"], comment)
 
-    # An issue for an older breakage of this workflow is still open, which means
-    # its recovery never got recorded. Point it at the current one and close it
+    # Another issue for this workflow is still open: an older breakage whose
+    # recovery never got recorded, or a newer duplicate of this episode from a
+    # sweep and an event run racing. Point it at the current one and close it
     # rather than leaving two issues claiming main is broken.
     for issue in stale:
         supersede(issue, current["number"])

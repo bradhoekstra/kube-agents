@@ -801,8 +801,9 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["label", "create"])
 
     def test_a_stale_issue_from_an_earlier_breakage_is_closed(self):
-        """Only reachable if a close failed, but two open issues both claiming
-        main is broken is worse than the missed close that caused it."""
+        """Reachable when a close failed, or when a sweep and an event run
+        raced; two open issues both claiming main is broken is worse than
+        either cause."""
         api = FakeAPI([issue(901, 77, 5)])
         self._reconcile(api, decided(run(100, "failure"), full_page(99)))
         self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
@@ -878,13 +879,14 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["label", "create"])
 
     def test_a_stale_read_after_an_unstamped_close_does_not_refile(self):
-        """Main recovered at 12 and #901 was closed without a fixed-by stamp:
-        by a person, or by this script before it stamped. A later read returns
-        a page from before the recovery: 11 red, 10 red, 9 green. The
-        completeness check passes -- the page lacks only the green, which the
-        unstamped issue does not name -- so the close postdating every run in
-        the streak is what keeps a "main is broken" issue from opening against
-        a green main. A stamped close is caught earlier, as a hole."""
+        """Main recovered at 12 and a person closed #901, which carries no
+        fixed-by stamp. A later read returns a page from before the recovery:
+        11 red, 10 red, 9 green. The completeness check passes -- the page
+        lacks only the green, which the unstamped issue does not name -- so
+        the close postdating every run in the streak is what keeps a "main is
+        broken" issue from opening against a green main. A stamped close is
+        caught earlier, as a hole; an unstamped close by the workflow's own
+        token files, as the next test says."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
         self._reconcile(api, decision)
@@ -1453,7 +1455,7 @@ class SweepTest(unittest.TestCase):
 
     def test_one_workflows_failure_does_not_stop_the_rest_of_the_sweep(self):
         """A 5xx that outlasts the retries on one workflow must not leave the
-        other five unread until the next sweep; the sweep still goes red."""
+        others unread until the next sweep; the sweep still goes red."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
         api = mock.Mock()

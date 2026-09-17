@@ -89,7 +89,7 @@ on:
 # whose triggering run was red, on the timing (#1681): the survivors deferred
 # to it and main went unreported for nearly fifteen hours. That is survivable
 # now because every
-# notify run reconciles against the newest completed run of its workflow rather
+# notify run reconciles against the newest run of its workflow that said anything rather
 # than the one that woke it: the last arrival in a group is never cancelled, it
 # runs after every push run of the burst has finished, and it files whatever the
 # newest of them says.
@@ -130,7 +130,7 @@ jobs:
     # `conclusion` is deliberately not filtered at all. A success can be the
     # recovery that closes a breakage, a cancelled run's notify can be the one
     # arrival of a burst the concurrency group keeps, and the script reads the
-    # workflow's newest completed run rather than this one in any case.
+    # workflow's newest run that said anything rather than this one in any case.
     if: >-
       github.repository == 'gke-labs/kube-agents' &&
       (github.event_name != 'workflow_run' ||
@@ -140,7 +140,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the script
-      actions: read # read the triggering run, the workflow list, each workflow's run history, and a run an issue links to
+      # The triggering run, the workflow list, each workflow's run history,
+      # and any run an issue links to.
+      actions: read
       issues: write # open, update and close the tracking issue, and its label
     steps:
       # The default branch on every trigger but a dispatch, which checks out the
