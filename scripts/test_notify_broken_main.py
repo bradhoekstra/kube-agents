@@ -778,9 +778,10 @@ class ReconcileTest(unittest.TestCase):
 
 
 class HandCloseAndOrderingTest(unittest.TestCase):
-    """Two bounds on what a reconciliation may undo: a person's close, and an
-    issue about a red newer than the green being handled. Both matter more now
-    that a sweep reconciles every fifteen minutes."""
+    """Two bounds on what a reconciliation may undo: a close made after the
+    streak's last change, whoever made it, and an issue about a red newer than
+    the green being handled. Both matter more now that a sweep reconciles
+    every fifteen minutes."""
 
     REPO = "gke-labs/kube-agents"
 
@@ -837,10 +838,10 @@ class HandCloseAndOrderingTest(unittest.TestCase):
 
     def test_a_stale_read_after_the_workflows_own_close_does_not_refile(self):
         """Main recovered at 12 and the bot closed #901. A later read returns a
-        page from before the recovery: 11 red, 10 red, 9 green. Nothing is
-        open, so the completeness check has nothing to compare; the close
-        postdating every run in the streak is what keeps a "main is broken"
-        issue from opening against a green main."""
+        page from before the recovery: 11 red, 10 red, 9 green. The
+        completeness check passes -- the run the page lacks is the green, which
+        no issue names -- so the close postdating every run in the streak is
+        what keeps a "main is broken" issue from opening against a green main."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
         self._reconcile(api, decision)
@@ -1308,6 +1309,21 @@ class SweepTest(unittest.TestCase):
         status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
         self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
+
+    def test_a_name_with_one_carrier_unread_is_skipped_rather_than_left_to_the_other(self):
+        """If the live carrier's read is refused and the ghost's is not, the
+        ghost must not be reconciled by default against its frozen history."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        workflows = self._workflows(names_to_ids)
+        workflows.append({"id": 999, "name": notifier.WATCHED_WORKFLOWS[0], "path": ".github/workflows/old.yml"})
+        histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
+        histories[100] = None
+        histories[999] = [run(40, "failure")]
+        status, _, reconcile = self._sweep(workflows, histories)
+        self.assertEqual(status, 0)
+        reconciled = [call.args[3] for call in reconcile.call_args_list]
+        self.assertNotIn(999, reconciled)
+        self.assertNotIn(100, reconciled)
 
     def test_a_dry_run_sweep_writes_nothing(self):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}

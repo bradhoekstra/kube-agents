@@ -585,8 +585,9 @@ class GitHubAPI(BaseGitHubAPI):
         this API is concerned -- so anything carrying a `pull_request` key is
         dropped. Deliberately one page: more than a hundred open issues on this
         label is not a state worth writing code for, and the closed list is
-        read only to find an episode still in progress, which is among the
-        newest.
+        read for the newest closed issues only -- a dismissal of an episode
+        still in progress, and runs a short page failed to list -- so an older
+        closed issue past the page goes unchecked, which errs toward writing.
         """
         query = urllib.parse.urlencode({"labels": LABEL, "state": state, "per_page": PER_PAGE})
         issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
@@ -664,7 +665,8 @@ def reconcile(api, notification, repo, workflow_id):
         if not open_issues:
             # The overwhelmingly common case: main is green and nothing claims
             # otherwise. One list request per green run buys the guarantee that
-            # an issue is never left open on a green main.
+            # an issue about an older red is never left open on a green main a
+            # whole read has seen.
             return "green, and no issue is open for this workflow"
         # Every open issue for this workflow whose breakage this green run comes
         # after, not just the episode this run's streak points at: whatever the
@@ -847,9 +849,10 @@ def sweep(api, repo, branch, dry_run):
             missing.append(name)
             continue
         candidates = [(workflow, api.history(workflow["id"], branch)) for workflow in carriers[name]]
-        candidates = [(workflow, runs) for workflow, runs in candidates if runs is not None]
-        if not candidates:
-            log(f"{name}: every history read came back short; leaving it to the next sweep")
+        if any(runs is None for _, runs in candidates):
+            # With a carrier unread, "which ran most recently" cannot be
+            # answered, and a ghost must not win by default.
+            log(f"{name}: a history read came back short; leaving it to the next sweep")
             continue
         if len(candidates) > 1:
             candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
