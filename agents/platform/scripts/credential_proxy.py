@@ -1688,15 +1688,19 @@ GIT_REMOTE_HEAD_FILE = "HEAD"
 # `<repository>` slot of `git push` takes a name, a URL, or a filesystem path,
 # and only a name has a tracking HEAD under `refs/remotes/` to read; a path,
 # joined onto that directory verbatim, walked out of it (`../../../../etc`)
-# and read whichever file the agent's argv pointed at (CodeQL alert #38). The
-# test is "one path component", nothing more: no separator, not empty, and
-# not the two names that mean a directory. It is deliberately not git's own remote-name
-# grammar, which admits `gh+fork` and `my@fork` and refuses `.lock`; narrowing
-# to an allowlist would silently drop the lookup for a remote git accepts, and
-# the containment check at the sink does not need the help. A value that is
-# not a name is not looked up, and the push is judged against `origin`, which
-# is what a URL push already got.
-_GIT_REMOTE_NAME_SEPARATORS = frozenset({"/", "\\", "\0"})
+# and read whichever file the agent's argv pointed at (CodeQL alert #38). This
+# pre-check is deliberately thin: not empty, not the two names that mean a
+# directory, and no character that cannot be in a ref. `/` stays allowed
+# because git accepts slash-named remotes (`git remote add team/upstream …`
+# keeps `refs/remotes/team/upstream/HEAD`), and refusing it here would drop
+# the lookup, and the protection, for a remote git honours -- the same
+# narrowing an ASCII allowlist would do to `gh+fork` or `my@fork`. Containment
+# is not this check's job: `_remote_head_path` normalises the joined path at
+# the sink and refuses anything that leaves `refs/remotes/`, whatever mix of
+# `..` and `/` it was built from. A value this drops, or the sink refuses, is
+# not looked up, and the push is judged against `origin`, which is what a URL
+# push already got.
+_GIT_REMOTE_NAME_SEPARATORS = frozenset({"\\", "\0"})
 _GIT_REMOTE_NOT_A_NAME = frozenset({"", ".", ".."})
 
 # Directory `core.hooksPath` is pinned to. It lives under the state dir, which
@@ -2129,17 +2133,18 @@ def _git_refused_name(argument: str) -> str:
 
 
 def _is_git_remote_name(value: str) -> bool:
-    """Is `value` one path component, the shape a remote name has?"""
+    """Could `value` be a remote name at all? Containment is `_remote_head_path`'s."""
     return value not in _GIT_REMOTE_NOT_A_NAME and _GIT_REMOTE_NAME_SEPARATORS.isdisjoint(value)
 
 
 def _remote_head_path(remotes_dir: Path, remote: str) -> Path | None:
     """`<remotes_dir>/<remote>/HEAD`, or None when that path leaves `remotes_dir`.
 
-    `remote` is the agent's `git push <repository>` argument. The caller has
-    already refused anything `_is_git_remote_name` does not accept, so this is
-    the check behind that check, placed at the sink: normalise the joined path
-    and require the refs directory to be a proper prefix of it. Spelled with
+    `remote` is the agent's `git push <repository>` argument, and this is the
+    check that confines it, placed at the sink: normalise the joined path and
+    require the refs directory to be a proper prefix of it, so `../x`, an
+    absolute path, and `team/../../x` are all refused while `team/upstream`
+    resolves to its own tracking HEAD. Spelled with
     `os.path.normpath` and `str.startswith` rather than `Path.resolve` and
     `_within` because that pair is what CodeQL's `py/path-injection` query
     recognises as a sanitiser; the workspace containment the rest of this
@@ -2163,10 +2168,11 @@ def _detect_repo_default_branch(
     deliberate workspace ref manipulation requires setting CREDENTIAL_PROXY_BASE_BRANCH
     or GITOPS_BASE_BRANCH.
 
-    `remote` comes from the agent's argv. Only a remote *name* is looked up.
-    A URL in that slot never reached here (the caller keeps `origin` for
-    anything with a `:`); a filesystem path used to be joined and read, and is
-    now skipped, so both are judged against `origin`.
+    `remote` comes from the agent's argv. Only a value that stays under
+    `refs/remotes/` once joined is looked up. A URL in that slot never reached
+    here (the caller keeps `origin` for anything with a `:`); a filesystem
+    path used to be joined and read, and is now refused at the sink, so both
+    are judged against `origin`.
     """
     if not repo_dir:
         return None
