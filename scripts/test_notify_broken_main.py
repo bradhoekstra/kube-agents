@@ -520,8 +520,8 @@ class QueryTest(unittest.TestCase):
         self.assertTrue(calls[0].full_url.endswith("/actions/runs/1010"))
 
     def test_the_labelled_issue_list_is_read_once_per_state(self):
-        """A sweep reconciles six workflows; the list they filter is the same
-        list, so it is fetched once."""
+        """A sweep reconciles every watched workflow; the list they filter is
+        the same list, so it is fetched once."""
         api, calls = self._api([])
         api.issues_for_workflow(77, "open")
         api.issues_for_workflow(88, "open")

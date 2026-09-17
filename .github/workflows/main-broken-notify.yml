@@ -140,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the script
-      actions: read # read the triggering run, the workflow list, and each workflow's run history
+      actions: read # read the triggering run, the workflow list, each workflow's run history, and a run an issue links to
       issues: write # open, update and close the tracking issue, and its label
     steps:
       # The default branch on every trigger but a dispatch, which checks out the
