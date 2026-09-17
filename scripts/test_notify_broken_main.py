@@ -5,11 +5,12 @@ Run: cd scripts && python3 -m unittest test_notify_broken_main
 
 The notifier cannot be exercised end to end before it is on main -- a
 `workflow_run` workflow only runs from the default branch's copy of itself -- so
-everything that can be decided without a runner is decided here. Three failure
+everything that can be decided without a runner is decided here. Four failure
 modes are worth more than the rest: staying quiet when main is broken, which
 reproduces the gap this exists to close; opening an issue on a green run, which
-trains everyone to ignore the label; and leaving an issue open after main
-recovers, which does the same thing more slowly.
+trains everyone to ignore the label; leaving an issue open after main recovers,
+which does the same thing more slowly; and writing to an issue that already says
+so, which the scheduled sweep would turn into a comment every fifteen minutes.
 """
 
 import json
@@ -21,11 +22,15 @@ import urllib.parse
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 import notify_broken_main as notifier
+
+WORKFLOW_FILE = _HERE.parent / ".github" / "workflows" / "main-broken-notify.yml"
 
 
 def run(number, conclusion, *, sha=None, subject="a commit", run_id=None, name="Operator Tests"):
@@ -172,6 +177,25 @@ class HistoryFilterTest(unittest.TestCase):
             "if this stops reading as a green the guard has moved into the script, and "
             "the paths: filter in k8s-operator-test.yml can be reconsidered",
         )
+
+
+class NewestReportingRunTest(unittest.TestCase):
+    """Which run is the current state of main. Every reconciliation starts here,
+    whichever run woke it."""
+
+    def test_the_highest_run_number_wins_whatever_the_list_order(self):
+        """The API lists by creation and a burst finishes out of order, so the
+        first element is regularly not the newest."""
+        runs = [run(11, "success"), run(13, "failure"), run(12, "success")]
+        self.assertEqual(notifier.newest_reporting_run(runs)["run_number"], 13)
+
+    def test_a_newer_run_that_said_nothing_is_passed_over(self):
+        runs = [run(13, "cancelled"), run(12, "failure"), run(11, "success")]
+        self.assertEqual(notifier.newest_reporting_run(runs)["run_number"], 12)
+
+    def test_no_reporting_run_is_none(self):
+        self.assertIsNone(notifier.newest_reporting_run([run(13, "cancelled"), run(12, "skipped")]))
+        self.assertIsNone(notifier.newest_reporting_run([]))
 
 
 class EpisodeMarkerTest(unittest.TestCase):
@@ -434,6 +458,42 @@ class QueryTest(unittest.TestCase):
         for expected in ("branch=main", "event=push", "status=completed", f"per_page={notifier.HISTORY_DEPTH}"):
             self.assertIn(expected, url)
 
+    def test_the_workflow_list_is_paged_to_its_own_total(self):
+        """The endpoint wraps its page in an object, so the shared client's
+        `get_all` cannot page it. The repository has more workflows than one
+        default page holds, and a watched workflow on the second page would
+        otherwise read as renamed on every sweep."""
+        pages = [
+            {"total_count": 3, "workflows": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]},
+            {"total_count": 3, "workflows": [{"id": 3, "name": "c"}]},
+        ]
+        calls = []
+
+        def opener(request):
+            calls.append(request)
+            return _response(json.dumps(pages[len(calls) - 1]).encode())
+
+        api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
+        with mock.patch.object(notifier, "WORKFLOWS_PER_PAGE", 2):
+            workflows = api.workflows()
+        self.assertEqual([w["id"] for w in workflows], [1, 2, 3])
+        self.assertEqual(len(calls), 2)
+        self.assertIn("per_page=2&page=1", calls[0].full_url)
+        self.assertIn("page=2", calls[1].full_url)
+
+    def test_an_empty_page_ends_the_workflow_list_even_under_its_total(self):
+        """A `total_count` the pages never add up to must not spin forever."""
+        calls = []
+
+        def opener(request):
+            calls.append(request)
+            payload = {"total_count": 5, "workflows": [{"id": 1, "name": "a"}] if len(calls) == 1 else []}
+            return _response(json.dumps(payload).encode())
+
+        api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
+        self.assertEqual(len(api.workflows()), 1)
+        self.assertEqual(len(calls), 2)
+
     def test_the_issue_query_is_scoped_to_the_open_labelled_issues(self):
         api, calls = self._api([])
         api.open_issues_for_workflow(77)
@@ -480,7 +540,9 @@ class QueryTest(unittest.TestCase):
 
 class FakeAPI:
     """Records what `reconcile` asks of the API and answers from a list of open
-    issues, which is the whole of the state it reads."""
+    issues, which is the whole of the state it reads. The writes land on that
+    list, so a second reconciliation sees what the first one left -- which is
+    how the sweep's idempotency is observed."""
 
     def __init__(self, open_issues=()):
         self.open_issues = list(open_issues)
@@ -497,16 +559,22 @@ class FakeAPI:
     def create_issue(self, title, body):
         self.next_number += 1
         self.actions.append(("create", self.next_number, title, body))
-        return {"number": self.next_number}
+        created = {"number": self.next_number, "title": title, "body": body, "state": "open"}
+        self.open_issues.append(created)
+        return created
 
     def update_issue(self, number, **fields):
         self.actions.append(("update", number, fields))
+        for issue in self.open_issues:
+            if issue["number"] == number:
+                issue.update(fields)
 
     def comment(self, number, body):
         self.actions.append(("comment", number, body))
 
     def close_issue(self, number):
         self.actions.append(("close", number))
+        self.open_issues = [issue for issue in self.open_issues if issue["number"] != number]
 
     def kinds(self):
         return [action[0] for action in self.actions]
@@ -587,17 +655,67 @@ class ReconcileTest(unittest.TestCase):
         self._reconcile(api, notifier.decide(run(10, "failure"), [run(9, "success")]))
         self.assertEqual(api.kinds(), ["update"], "a new break on an existing issue should not comment")
 
-    def test_redelivering_a_follow_up_repeats_its_comment(self):
-        """Known and accepted, recorded so it is a decision rather than a
-        surprise. The body is rebuilt so no row doubles; the "Still failing"
-        comment does. Deduplicating it means listing every comment on the issue
-        on every failure, which costs more than the duplicate does -- and a
-        redelivered `workflow_run` is rare, where a broken main is not."""
+    def test_redelivering_a_follow_up_writes_nothing_the_second_time(self):
+        """The scheduled sweep lands here every fifteen minutes for as long as
+        main stays red, and a redelivered `workflow_run` lands here too. The
+        first pass rewrote the body and commented; a second pass that finds
+        the body already saying so must do neither, or a broken main becomes a
+        "Still failing" comment on every tick."""
         api = FakeAPI([issue(901, 77, 10)])
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         self._reconcile(api, decision)
+        result = self._reconcile(api, decision)
+        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertIn("already says so", result)
+
+    def test_a_body_github_hands_back_with_crlf_still_reads_as_current(self):
+        """GitHub may return `\r\n` for the `\n` it was sent. Compared raw,
+        every sweep would see a change, rewrite the body, and comment."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
+        stored = issue(901, 77, 10)
+        stored["title"] = notifier.render_title(decision)
+        stored["body"] = body.replace("\n", "\r\n") + "\r\n"
+        api = FakeAPI([stored])
         self._reconcile(api, decision)
-        self.assertEqual(api.kinds(), ["update", "comment", "update", "comment"])
+        self.assertEqual(api.actions, [])
+
+    def test_a_hand_renamed_issue_is_restored_without_a_comment(self):
+        """The title is rewritten so the label stays legible, but the commits
+        the body lists are not news and nobody needs a "Still failing" for a
+        rename."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
+        stored = issue(901, 77, 10)
+        stored["title"] = "someone renamed this"
+        stored["body"] = body
+        api = FakeAPI([stored])
+        self._reconcile(api, decision)
+        self.assertEqual(api.kinds(), ["update"])
+        self.assertEqual(api.actions[0][2]["title"], notifier.render_title(decision))
+
+    def test_a_new_commit_on_a_broken_main_still_updates_and_comments(self):
+        """The idempotency check must not swallow real news: a body that lists
+        one commit fewer than the history is a change, and the comment is how
+        a subscriber hears about it."""
+        earlier = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        stored = issue(901, 77, 10)
+        stored["title"] = notifier.render_title(earlier)
+        stored["body"] = notifier.render_body(earlier, self.REPO, notifier.episode_marker(earlier, 77))
+        api = FakeAPI([stored])
+        later = notifier.decide(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
+        self._reconcile(api, later)
+        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertIn("3 consecutive failures", api.actions[1][2])
+
+    def test_the_first_failure_reconciled_twice_opens_one_issue(self):
+        """A sweep and an event run can both handle a fresh red. The second
+        finds the first's issue current and leaves it alone."""
+        api = FakeAPI()
+        decision = notifier.decide(run(10, "failure"), [run(9, "success")])
+        self._reconcile(api, decision)
+        self._reconcile(api, decision)
+        self.assertEqual(api.kinds(), ["label", "create"])
 
     def test_a_stale_issue_from_an_earlier_breakage_is_closed(self):
         """Only reachable if a close failed, but two open issues both claiming
@@ -645,16 +763,22 @@ class MainTest(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_args[0][1]["kind"], "green")
 
-    def test_a_conclusion_that_says_nothing_reaches_nothing(self):
+    def test_a_conclusion_that_says_nothing_still_reconciles_what_the_history_says(self):
+        """A `neutral` run is as good a reason to look as any. Main is broken at
+        run 9 whatever run 10 concluded, and a notify run that went quiet here
+        could be the only one of a burst that survived."""
         status, reconcile = self._main(
-            run(10, "neutral"), [run(9, "failure")], ["--run-id", "1010"], {"GITHUB_TOKEN": "t"}
+            run(10, "neutral"), [run(10, "neutral"), run(9, "failure")], ["--run-id", "1010"], {"GITHUB_TOKEN": "t"}
         )
         self.assertEqual(status, 0)
-        reconcile.assert_not_called()
+        self.assertEqual(reconcile.call_args[0][1]["kind"], "broken")
+        self.assertEqual(reconcile.call_args[0][1]["run"]["run_number"], 9)
 
-    def test_a_run_a_later_one_has_overtaken_is_left_to_that_one(self):
+    def test_a_run_a_later_one_has_overtaken_reconciles_against_the_later_one(self):
         """Out of order, a red run handled after the green that fixed it would
-        open a "main is broken" issue against a green main."""
+        open a "main is broken" issue against a green main. Rather than going
+        quiet -- which lost the whole notification in #1681 -- it acts on what
+        the later run says."""
         status, reconcile = self._main(
             run(11, "failure"),
             [run(12, "success"), run(11, "failure"), run(10, "failure")],
@@ -662,7 +786,44 @@ class MainTest(unittest.TestCase):
             {"GITHUB_TOKEN": "t"},
         )
         self.assertEqual(status, 0)
-        reconcile.assert_not_called()
+        notification = reconcile.call_args[0][1]
+        self.assertEqual(notification["kind"], "green")
+        self.assertEqual(notification["run"]["run_number"], 12)
+        self.assertEqual(notification["broke_at"]["run_number"], 10)
+
+    def test_a_surviving_green_of_a_burst_files_for_the_red_whose_notify_was_cancelled(self):
+        """#1681, with the run numbers from 2026-09-16. Eight merges landed in
+        two minutes; the red run, 5928, failed fast and finished before the
+        greens 5926 and 5927 that carry older commits. The concurrency group
+        cancelled 5928's own notify run. The notify runs for 5926 and 5927
+        survived, and under the old rule each deferred to 5928 and exited --
+        so nothing was filed for fourteen hours. Handling 5926 must file
+        against 5928."""
+        burst = [
+            run(5923, "success"),
+            run(5924, "success"),
+            run(5925, "success"),
+            run(5926, "success"),
+            run(5927, "success"),
+            run(5928, "failure", subject="ci(lint): run make shellcheck as a required check (#1651)"),
+        ]
+        status, reconcile = self._main(run(5926, "success"), burst, ["--run-id", "6926"], {"GITHUB_TOKEN": "t"})
+        self.assertEqual(status, 0)
+        notification = reconcile.call_args[0][1]
+        self.assertEqual(notification["kind"], "broken")
+        self.assertEqual(notification["run"]["run_number"], 5928)
+        self.assertEqual(notification["broke_at"]["run_number"], 5928)
+
+    def test_a_history_that_has_not_caught_up_with_the_run_still_counts_it(self):
+        """The list is read seconds after the run completed. If it lags, the
+        run that woke this is known to have completed and must not be lost to
+        the sweep."""
+        status, reconcile = self._main(
+            run(10, "failure"), [run(9, "success")], ["--run-id", "1010"], {"GITHUB_TOKEN": "t"}
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(reconcile.call_args[0][1]["kind"], "broken")
+        self.assertEqual(reconcile.call_args[0][1]["run"]["run_number"], 10)
 
     def test_a_later_run_that_said_nothing_does_not_silence_this_one(self):
         """A `cancelled` run is filtered out by the workflow's `if:` and will
@@ -706,6 +867,89 @@ class MainTest(unittest.TestCase):
     def test_no_token_is_an_error(self):
         with mock.patch.dict("os.environ", {}, clear=True):
             self.assertEqual(notifier.main(["--run-id", "1"]), 1)
+
+    def test_a_run_id_and_a_sweep_are_not_both_accepted(self):
+        with self.assertRaises(SystemExit):
+            notifier.parse_args(["--run-id", "1", "--sweep"])
+        with self.assertRaises(SystemExit):
+            notifier.parse_args([])
+
+
+class SweepTest(unittest.TestCase):
+    """The scheduled path: no run to start from, every watched workflow."""
+
+    def _sweep(self, workflows, histories, argv=("--sweep",)):
+        api = mock.Mock()
+        api.workflows.return_value = workflows
+        api.history.side_effect = lambda workflow_id, branch: histories.get(workflow_id, [])
+        with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
+            "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
+        ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
+            return notifier.main(list(argv)), api, reconcile
+
+    def _workflows(self, names_to_ids):
+        return [{"id": workflow_id, "name": name} for name, workflow_id in names_to_ids.items()]
+
+    def test_every_watched_workflow_is_reconciled_and_nothing_else(self):
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        names_to_ids["Prettier Check"] = 999
+        histories = {workflow_id: [run(2, "success"), run(1, "failure")] for workflow_id in names_to_ids.values()}
+        status, api, reconcile = self._sweep(self._workflows(names_to_ids), histories)
+        self.assertEqual(status, 0)
+        reconciled = sorted(call.args[3] for call in reconcile.call_args_list)
+        self.assertEqual(reconciled, sorted(100 + index for index in range(len(notifier.WATCHED_WORKFLOWS))))
+        self.assertNotIn(999, [call.args[0] for call in api.history.call_args_list])
+
+    def test_a_red_found_by_the_sweep_is_filed(self):
+        """The whole point: a red whose event was never delivered."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        histories = {workflow_id: [run(2, "success"), run(1, "success")] for workflow_id in names_to_ids.values()}
+        histories[100] = [run(3, "failure"), run(2, "success")]
+        status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
+        self.assertEqual(status, 0)
+        by_workflow = {call.args[3]: call.args[1] for call in reconcile.call_args_list}
+        self.assertEqual(by_workflow[100]["kind"], "broken")
+        self.assertEqual(by_workflow[100]["run"]["run_number"], 3)
+        self.assertTrue(all(n["kind"] == "green" for w, n in by_workflow.items() if w != 100))
+
+    def test_a_watched_name_no_workflow_carries_reds_the_sweep_after_doing_the_rest(self):
+        """`workflow_run` matches on `name:`, so a rename silently stops the
+        event path. The sweep is the only thing positioned to notice, and it
+        says so with its exit status -- after reconciling what it could find,
+        because one renamed workflow is no reason to leave the others unread."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS[1:])}
+        histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
+        status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
+        self.assertEqual(status, 1)
+        self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
+
+    def test_a_workflow_with_no_reporting_run_is_skipped(self):
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
+        histories[100] = [run(1, "cancelled")]
+        histories[101] = []
+        status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
+        self.assertEqual(status, 0)
+        self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 2)
+
+    def test_a_dry_run_sweep_writes_nothing(self):
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
+        status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories, ("--sweep", "--dry-run"))
+        self.assertEqual(status, 0)
+        reconcile.assert_not_called()
+
+
+class WatchListTest(unittest.TestCase):
+    def test_the_script_and_the_workflow_watch_the_same_workflows(self):
+        """The `workflow_run` trigger and `WATCHED_WORKFLOWS` are one list
+        written twice, because a workflow cannot read its own triggers. A name
+        on one and not the other is a workflow the event path watches and the
+        sweep does not, or the reverse."""
+        document = yaml.safe_load(WORKFLOW_FILE.read_text())
+        # PyYAML reads a bare `on:` key as the boolean True (YAML 1.1).
+        triggers = document.get("on") or document.get(True)
+        self.assertEqual(sorted(triggers["workflow_run"]["workflows"]), sorted(notifier.WATCHED_WORKFLOWS))
 
 
 if __name__ == "__main__":

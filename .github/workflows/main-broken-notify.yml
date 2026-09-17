@@ -10,7 +10,11 @@ name: Notify on Broken Main
 # further workflows, so this cannot start a loop.
 #
 # `workflows:` matches on the workflow's `name:`, not its filename, and a rename
-# there silently stops this from firing.
+# there silently stops this from firing. The scheduled sweep is what notices: it
+# carries the same list as `WATCHED_WORKFLOWS` in the script -- one list written
+# twice, because a workflow cannot read its own triggers, and
+# `scripts/test_notify_broken_main.py` fails when the two disagree -- and it
+# goes red when a watched name matches no workflow.
 #
 # What may go on the list: a workflow whose green on a push to main is a
 # statement about the tree, not about the push. The script depends on that and
@@ -59,21 +63,39 @@ on:
       - Python Unit Tests
       - Validate Repo Structure
     types: [completed]
+  # The backstop for an event that is never delivered -- a dropped
+  # `workflow_run`, a runner outage -- and for anything the group below drops:
+  # every watched workflow is reconciled against its newest completed push run.
+  # Cheap enough to run often: one history read per watched workflow, and a
+  # reconciliation that finds the issues already right writes nothing.
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
 
-# Serialised per watched workflow. Two merges landing together would otherwise
-# both read "was the previous run failing?" against the same history, reach the
-# same answer, and race to open the same issue -- nothing in the API refuses the
-# second one.
+# Event runs are serialised per watched workflow. Two merges landing together
+# would otherwise both read the same history, reach the same answer, and race
+# to open the same issue -- nothing in the API refuses the second one.
 #
 # `cancel-in-progress: false` does not mean nothing is dropped: GitHub holds at
 # most one run pending per group, and a third arrival cancels the one waiting.
-# So a burst of merges loses the notify runs in the middle. That is survivable
-# only because the script reconciles state rather than reporting transitions --
-# it rebuilds the issue body from the run history, and closes an open issue on
-# any green run rather than only on the green that follows a red. A dropped run
-# therefore costs a "Still failing" comment, not a stuck issue.
+# So a burst of merges loses notify runs, and on 2026-09-16 it lost the only one
+# whose triggering run was red (#1681): the other five deferred to it and main
+# went unreported for fourteen hours. That is survivable now because every
+# notify run reconciles against the newest completed run of its workflow rather
+# than the one that woke it: the last arrival in a group is never cancelled, it
+# runs after every push run of the burst has finished, and it files whatever the
+# newest of them says. The group is evaluated before the job's `if:`, so the
+# `if:` below deliberately filters nothing by conclusion -- a cancelled run's
+# notify can be the last arrival, and it reconciles as well as any other.
+#
+# Sweeps share a group of their own rather than the event runs': one sweep at a
+# time is all the serialisation they need, and holding an event run behind a
+# sweep, or a sweep behind a burst, would buy nothing. A sweep and an event run
+# can therefore both handle a fresh red at once and, in a window of about a
+# second, open the same issue twice; the next reconciliation of either kind
+# closes the duplicate as superseded, and the sweep guarantees there is one.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.workflow_id }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.workflow_id || github.event_name }}
   cancel-in-progress: false
 
 permissions: {}
@@ -85,16 +107,16 @@ jobs:
     # on its own (AGENTS.md, Pull Request Hygiene): a fork inherits the trigger
     # and none of the secrets, so without it every fork sync mails its owner.
     #
-    # `conclusion` is deliberately not narrowed to failure. A success can be the
-    # recovery that closes a breakage, and the script decides which; what is
-    # filtered here is only the two conclusions that say nothing either way.
+    # `conclusion` is deliberately not filtered at all. A success can be the
+    # recovery that closes a breakage, a cancelled run's notify can be the one
+    # arrival of a burst the concurrency group keeps, and the script reads the
+    # workflow's newest completed run rather than this one in any case.
     if: >-
       github.repository == 'gke-labs/kube-agents' &&
-      github.event.workflow_run.event == 'push' &&
-      github.event.workflow_run.head_branch == 'main' &&
-      github.event.workflow_run.head_repository.full_name == github.repository &&
-      github.event.workflow_run.conclusion != 'cancelled' &&
-      github.event.workflow_run.conclusion != 'skipped'
+      (github.event_name != 'workflow_run' ||
+        (github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the script
@@ -116,7 +138,16 @@ jobs:
       # event payload for them, so a stale or spoofed field cannot change what
       # gets filed.
       - name: Report on the run
+        if: github.event_name == 'workflow_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: python3 scripts/notify_broken_main.py --run-id "$RUN_ID"
+
+      # No run to start from: the schedule and a manual dispatch reconcile
+      # every watched workflow against its newest completed push run.
+      - name: Sweep every watched workflow
+        if: github.event_name != 'workflow_run'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/notify_broken_main.py --sweep

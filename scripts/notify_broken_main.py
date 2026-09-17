@@ -26,19 +26,35 @@ it into a single thing that opens, accumulates the commits that landed on top of
 it, and closes itself when main recovers. The alternative -- an issue or a ping
 per red run -- tells a reader about the break and never tells them it was fixed.
 
-It reconciles state; it does not report transitions. That distinction is what
-makes it survive its own delivery being unreliable. A green run closes any open
-issue for its workflow whether or not the run before it was red, and the issue
-body is rebuilt from the run history rather than appended to. So a notify run
-that never happens -- GitHub keeps one run pending per concurrency group and
-cancels the rest of a burst -- costs a comment, not a stuck issue; a re-run of a
+It reconciles state; it does not report transitions. Whichever run woke it, it
+reads the workflow's completed push runs back from the API and brings the issues
+into line with the newest one that said anything. The triggering run is only the
+reason to look: if a later run has finished by the time this one is handled, the
+later run is the current state of main and is the one acted on. A green closes
+any open issue for the workflow whether or not the run before it was red, the
+issue body is rebuilt from the run history rather than appended to, and an issue
+whose body already says what the history says is left alone. So a re-run of a
 red run that goes green closes the issue even though the history around it reads
-green-after-green; and handling the same run twice cannot double a row.
+green-after-green; handling the same run twice writes nothing the second time;
+and two runs handled out of order cannot open a "main is broken" issue against a
+main that is green.
 
-A run whose news is already stale keeps quiet. If a later run of the same
-workflow has finished by the time this one is handled, that later run is the
-current state of main and this one would be announcing the past -- which, out of
-order, means opening a "main is broken" issue against a main that is green.
+That is also what makes a dropped notify run survivable. GitHub keeps one run
+pending per concurrency group and cancels the rest of a burst, and the earlier
+design let each run speak only for itself, deferring to any later run: on
+2026-09-16 eight merges landed within two minutes, the only red run of the burst
+(#1651, `b458323d`) finished before two of the greens, its notify run was the one
+the group cancelled, and every surviving run deferred to it. Nothing was filed
+for fourteen hours, until the next merge produced a fresh run (#1681). Now any
+run of the burst reconciles against that red, and the last arrival in a group is
+never cancelled -- so a burst costs nothing as long as one event is delivered.
+
+Delivery can still fail entirely: a `workflow_run` event that is never sent, a
+runner outage. `--sweep` does the same reconciliation for every workflow in
+`WATCHED_WORKFLOWS` with no run to start from, and the workflow runs it on a
+schedule. It is a backstop, not the primary path -- what it costs is a bounded
+delay -- and it is safe to run at any time because a reconciliation that finds
+nothing to change writes nothing.
 
 What this trusts, and what has to hold for it to be right: a green run means the
 tree is green. A workflow that reports `success` while covering only part of what
@@ -58,6 +74,7 @@ Setup: none. It writes to this repository with the workflow's own `GITHUB_TOKEN`
 and creates the `ci:main-broken` label the first time it needs it.
 
 Run:  python3 scripts/notify_broken_main.py --run-id 123456789 --dry-run
+      python3 scripts/notify_broken_main.py --sweep --dry-run
 Test: cd scripts && python3 -m unittest test_notify_broken_main
 """
 
@@ -100,6 +117,26 @@ REPORTING_CONCLUSIONS = FAILING_CONCLUSIONS | frozenset({"success"})
 # merges is a problem this script is not the answer to.
 HISTORY_DEPTH = 50
 
+# The workflows `--sweep` reconciles, by the `name:` each declares -- the same
+# key `main-broken-notify.yml` matches its `workflow_run` trigger on. That
+# trigger's list and this one are the same list written twice, because a
+# workflow cannot read its own triggers; `test_notify_broken_main.py` fails when
+# they disagree. The workflow's header says what may go on the list and why
+# `Prettier Check` is not on it.
+WATCHED_WORKFLOWS = (
+    "Actionlint",
+    "Docker Build",
+    "Documentation Checks",
+    "Operator Tests",
+    "Python Unit Tests",
+    "Validate Repo Structure",
+)
+
+# Page size for the repository's workflow list, which `--sweep` reads to turn
+# the names above into ids. The endpoint wraps its page in an object with a
+# `total_count`, so the shared client's `get_all` cannot page it.
+WORKFLOWS_PER_PAGE = 100
+
 LABEL = "ci:main-broken"
 LABEL_COLOR = "d73a4a"
 LABEL_DESCRIPTION = "A required check is failing on main"
@@ -112,6 +149,19 @@ LABEL_DESCRIPTION = "A required check is failing on main"
 
 def is_failing(run):
     return run["conclusion"] in FAILING_CONCLUSIONS
+
+
+def newest_reporting_run(runs):
+    """The completed run that is the current state of main, or None.
+
+    Newest by `run_number`, not by position or by completion time: the list is
+    ordered by creation, and a burst of merges finishes out of order -- a red
+    run that fails fast completes before the greens queued ahead of it. A run
+    that concluded `cancelled`, `skipped`, `neutral` or the like is passed over,
+    since it said nothing about the tree and the run before it still stands.
+    """
+    reporting = [run for run in runs if run["conclusion"] in REPORTING_CONCLUSIONS]
+    return max(reporting, key=lambda run: run["run_number"], default=None)
 
 
 def reporting_history(runs, current):
@@ -237,6 +287,17 @@ def _cell(text):
     """A table cell. Only `|` needs escaping -- it is the column separator, and
     a commit subject or an author's display name is free to contain one."""
     return text.replace("|", "\\|")
+
+
+def _normalised(text):
+    """Issue text in a form that survives a round trip through GitHub.
+
+    A body is compared with what the API hands back to decide whether it has
+    changed, and GitHub is free to hand back `\r\n` for the `\n` it was sent
+    or to trim a trailing newline. Either difference would read as a change and
+    make every sweep rewrite the issue and comment on it.
+    """
+    return (text or "").replace("\r\n", "\n").strip()
 
 
 def _commit_link(run, repo):
@@ -375,6 +436,24 @@ class GitHubAPI(BaseGitHubAPI):
     def run(self, run_id):
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}")
 
+    def workflows(self):
+        """Every workflow the repository has, paged to the endpoint's own total.
+
+        The list endpoint returns `{"total_count": n, "workflows": [...]}`, so
+        the shared client's `get_all`, which pages a bare list, cannot read it.
+        An empty page ends the loop as well as reaching the total, so a total
+        that overstates the list cannot spin this.
+        """
+        found = []
+        page = 1
+        while True:
+            query = urllib.parse.urlencode({"per_page": WORKFLOWS_PER_PAGE, "page": page})
+            batch = self.get(f"/repos/{self.repo}/actions/workflows?{query}")
+            found.extend(batch["workflows"])
+            if not batch["workflows"] or len(found) >= batch["total_count"]:
+                return found
+            page += 1
+
     def history(self, workflow_id, branch="main", depth=HISTORY_DEPTH):
         """Completed push runs of one workflow on `branch`, newest first.
 
@@ -471,10 +550,21 @@ def reconcile(api, notification, repo, workflow_id):
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
     else:
-        api.update_issue(current["number"], title=title, body=body)
-        if comment:
+        # Rewrite the issue only when the history says something it does not
+        # yet. A body that already lists this run was written by the notify run
+        # that saw it first, and that run commented then; the scheduled sweep
+        # and a redelivered event both land here, and either commenting again
+        # would add a "Still failing" every fifteen minutes for as long as main
+        # stays red. A hand-edited title is restored without a comment: the
+        # commits it lists are not news.
+        body_changed = _normalised(current.get("body")) != _normalised(body)
+        if body_changed or current.get("title") != title:
+            api.update_issue(current["number"], title=title, body=body)
+            done = f"updated #{current['number']}"
+        else:
+            done = f"#{current['number']} already says so"
+        if comment and body_changed:
             api.comment(current["number"], comment)
-        done = f"updated #{current['number']}"
 
     # An issue for an older breakage of this workflow is still open, which means
     # its recovery never got recorded. Point it at the current one and close it
@@ -493,7 +583,13 @@ def reconcile(api, notification, repo, workflow_id):
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--run-id", type=int, required=True, help="the completed workflow run to report on")
+    what = parser.add_mutually_exclusive_group(required=True)
+    what.add_argument("--run-id", type=int, help="a completed workflow run; its workflow is reconciled")
+    what.add_argument(
+        "--sweep",
+        action="store_true",
+        help="reconcile every watched workflow against its newest completed push run",
+    )
     parser.add_argument(
         "--repo",
         default=os.environ.get("GITHUB_REPOSITORY", "gke-labs/kube-agents"),
@@ -502,6 +598,57 @@ def parse_args(argv):
     parser.add_argument("--branch", default="main", help="the branch whose health is being reported")
     parser.add_argument("--dry-run", action="store_true", help="print the issue instead of writing it")
     return parser.parse_args(argv)
+
+
+def report(api, workflow_id, runs, repo, dry_run):
+    """Bring one workflow's issues into line with its newest run that said anything.
+
+    `runs` is the workflow's completed push history on the branch. The run that
+    caused this to be called, if any, is deliberately not an argument: it may
+    have been overtaken, and the newest reporting run is the state of main
+    whichever run raised the alarm.
+    """
+    current = newest_reporting_run(runs)
+    if current is None:
+        log(f"No completed push run of workflow {workflow_id} says anything about main; nothing to reconcile")
+        return
+
+    notification = decide(current, reporting_history(runs, current))
+
+    if dry_run:
+        log(f"--dry-run: {current['name']} run {current['run_number']} is {notification['kind']}")
+        if notification["kind"] != "green":
+            marker = episode_marker(notification, workflow_id)
+            log(f"\n# {render_title(notification)}\n\n{render_body(notification, repo, marker)}")
+        comment = render_comment(notification, repo)
+        if comment:
+            log(f"\n--- comment, if an issue is open ---\n{comment}")
+        return
+
+    log(f"{current['name']}: {reconcile(api, notification, repo, workflow_id)}")
+
+
+def sweep(api, repo, branch, dry_run):
+    """Reconcile every watched workflow with no run to start from.
+
+    Returns the exit status. A watched name that no workflow carries is the
+    rename the workflow's header warns about -- `workflow_run` matches on
+    `name:`, so the event path has silently stopped firing for it -- and the
+    sweep goes red to say so, after reconciling the workflows it could find.
+    """
+    watched = set(WATCHED_WORKFLOWS)
+    found = set()
+    for workflow in api.workflows():
+        if workflow["name"] not in watched:
+            continue
+        found.add(workflow["name"])
+        report(api, workflow["id"], api.history(workflow["id"], branch), repo, dry_run)
+
+    missing = [name for name in WATCHED_WORKFLOWS if name not in found]
+    if missing:
+        log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing reports on it")
+        return 1
+    return 0
 
 
 def main(argv=None):
@@ -513,6 +660,10 @@ def main(argv=None):
         return 1
 
     api = GitHubAPI(args.repo, token)
+
+    if args.sweep:
+        return sweep(api, args.repo, args.branch, args.dry_run)
+
     current = api.run(args.run_id)
 
     # The workflow's `if:` has already checked these, against the event payload.
@@ -524,42 +675,28 @@ def main(argv=None):
 
     workflow_id = current["workflow_id"]
     runs = api.history(workflow_id, args.branch)
+    # The list is read moments after the run completed and lists can lag the
+    # run they are about; the run that woke this is known to have completed, so
+    # it is put in if the list has not caught up rather than left to the sweep.
+    if all(run["id"] != current["id"] for run in runs):
+        runs = [current] + runs
 
     # Notify runs are queued in the order the runs they watch *finish*, which is
-    # not the order those runs started. Acting on a run that a later one has
-    # already superseded announces the past: out of order, a red run handled
-    # after the green that fixed it opens a "main is broken" issue against a
-    # green main. The later run's own notify carries the whole story -- the body
-    # is rebuilt from this same history -- so there is nothing lost by leaving
-    # it to that one. Only a later run that said something counts; one filtered
-    # out by the workflow's `if:` will never reconcile anything.
-    superseded = [
-        run
-        for run in runs
-        if run["run_number"] > current["run_number"] and run["conclusion"] in REPORTING_CONCLUSIONS
-    ]
-    if superseded:
-        newest = max(run["run_number"] for run in superseded)
-        log(f"Run {current['run_number']} is superseded by run {newest}; leaving it to that one")
-        return 0
+    # not the order those runs started, and a burst of merges drops some of them
+    # outright. So this run's own conclusion is not what gets filed: whatever
+    # the newest completed run of the workflow says is, and this run is only the
+    # reason to look. Out of order, that keeps a red handled after the green
+    # that fixed it from opening an issue against a green main; in a burst, it
+    # lets whichever notify run survives file for the one that was cancelled.
+    newest = newest_reporting_run(runs)
+    if newest is not None and newest["id"] != current["id"]:
+        log(
+            f"Run {current['run_number']} ({current['conclusion']}) woke this; "
+            f"run {newest['run_number']} is the newest completed run of {current['name']} "
+            f"that says anything, so that is the one reconciled"
+        )
 
-    notification = decide(current, reporting_history(runs, current))
-
-    if notification is None:
-        log(f"Run {current['run_number']} concluded {current['conclusion']}, which says nothing about main")
-        return 0
-
-    if args.dry_run:
-        log(f"--dry-run: {notification['kind']}")
-        if notification["kind"] != "green":
-            marker = episode_marker(notification, workflow_id)
-            log(f"\n# {render_title(notification)}\n\n{render_body(notification, args.repo, marker)}")
-        comment = render_comment(notification, args.repo)
-        if comment:
-            log(f"\n--- comment, if an issue is open ---\n{comment}")
-        return 0
-
-    log(reconcile(api, notification, args.repo, workflow_id))
+    report(api, workflow_id, runs, args.repo, args.dry_run)
     return 0
 
 
