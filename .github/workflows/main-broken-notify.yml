@@ -168,10 +168,13 @@ jobs:
       # commit and the history back from the API rather than trusting the
       # event payload for them, so a stale or spoofed field cannot change what
       # gets filed.
+      # `MAIN_BROKEN_ANNOTATE` turns a refusal to write into a warning
+      # annotation on this job; the script's unit tests run without it.
       - name: Report on the run
         if: github.event_name == 'workflow_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAIN_BROKEN_ANNOTATE: "true"
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: python3 scripts/notify_broken_main.py --run-id "$RUN_ID"
 
@@ -184,6 +187,7 @@ jobs:
         if: github.event_name != 'workflow_run'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MAIN_BROKEN_ANNOTATE: "true"
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then

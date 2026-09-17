@@ -58,7 +58,8 @@ def run(number, conclusion, *, sha=None, subject="a commit", run_id=None, name="
 
 
 class DecideTest(unittest.TestCase):
-    """Which of the three kinds a run falls into, or none. This is the whole design."""
+    """Which of the three kinds a run falls into, or none. The bounds on what a
+    kind may then do live in `reconcile`."""
 
     def test_first_failure_announces_a_break(self):
         decision = notifier.decide(run(10, "failure"), [run(9, "success")])
@@ -869,8 +870,9 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["label", "create"])
 
     def test_the_workflows_own_green_close_does_not_dismiss_the_same_run_going_red_again(self):
-        """Run 10 red opened #901; a re-run of 10 went green and the bot closed
-        #901; a further re-run of 10 goes red. The re-run moved run 10's
+        """Run 10 red opened #901; a re-run of 10 went green and #901 was
+        closed (here without a stamp or a closer, so only the timestamps
+        decide); a further re-run of 10 goes red. The re-run moved run 10's
         timestamp past the close, so it is new evidence and files."""
         rerun_red = run(10, "failure")
         rerun_red["updated_at"] = self.LATER_STILL
@@ -887,7 +889,8 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         the close postdating every run in the streak is what keeps a "main is
         broken" issue from opening against a green main. A stamped close is
         caught earlier, as a hole; an unstamped close by the workflow's own
-        token files, as the next test says."""
+        token files, as `test_an_unstamped_close_by_the_workflows_own_token_is_not_a_dismissal`
+        says."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
         self._reconcile(api, decision)
@@ -1519,11 +1522,14 @@ class SweepTest(unittest.TestCase):
 class WarnTest(unittest.TestCase):
     def test_the_annotation_is_emitted_only_on_a_runner(self):
         """The unit tests exercise every refusal and their output is echoed
-        into a CI step, which would otherwise annotate every pull request."""
-        with mock.patch.dict("os.environ", {}, clear=True), mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+        into a CI step where `GITHUB_ACTIONS` is set, so the gate is a
+        variable only the notify workflow sets."""
+        with mock.patch.dict("os.environ", {"GITHUB_ACTIONS": "true"}, clear=True), mock.patch(
+            "sys.stdout", new_callable=io.StringIO
+        ) as out:
             notifier.warn("quiet")
         self.assertEqual(out.getvalue(), "")
-        with mock.patch.dict("os.environ", {notifier.ACTIONS_ENV: "true"}, clear=True), mock.patch(
+        with mock.patch.dict("os.environ", {notifier.ANNOTATE_ENV: "true"}, clear=True), mock.patch(
             "sys.stdout", new_callable=io.StringIO
         ) as out:
             notifier.warn("loud")

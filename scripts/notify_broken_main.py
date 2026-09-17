@@ -213,10 +213,12 @@ _FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+)(?: run=(\d+))? -->")
 # A refusal to write is a log line and exit 0, since a stale page is ordinary
 # and a red job for one would be noise; this prefix makes the line a warning
 # annotation on the job, so a refusal that persists shows up in the summary.
-# Emitted only where a runner reads it: the unit tests exercise every refusal,
-# and their output is echoed into a step that would annotate the pull request.
+# Emitted only when the notify workflow asks for it, through a variable of its
+# own: the unit tests exercise every refusal, and their output is echoed into a
+# CI step where `GITHUB_ACTIONS` is set too, so gating on that would annotate
+# every pull request's test job instead.
 WARNING_PREFIX = "::warning::"
-ACTIONS_ENV = "GITHUB_ACTIONS"
+ANNOTATE_ENV = "MAIN_BROKEN_ANNOTATE"
 
 
 # --------------------------------------------------------------------------- #
@@ -225,9 +227,9 @@ ACTIONS_ENV = "GITHUB_ACTIONS"
 
 
 def warn(message):
-    """A log line that, on a runner, also annotates the job. Stdout, where the
-    runner reads workflow commands."""
-    if os.environ.get(ACTIONS_ENV):
+    """A log line that, when the workflow asks, also annotates the job. Stdout,
+    where the runner reads workflow commands."""
+    if os.environ.get(ANNOTATE_ENV):
         print(f"{WARNING_PREFIX}{message}", flush=True)
     log(message)
 
