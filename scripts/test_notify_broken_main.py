@@ -126,7 +126,7 @@ class DecideTest(unittest.TestCase):
 
 
 class HistoryFilterTest(unittest.TestCase):
-    def test_the_triggering_run_is_removed_from_its_own_history(self):
+    def test_the_current_run_is_removed_from_its_own_history(self):
         """The API list includes it, and left in it would compare against
         itself -- every failure would read as 'still broken'."""
         current = run(10, "failure")
@@ -134,8 +134,8 @@ class HistoryFilterTest(unittest.TestCase):
         self.assertEqual([r["run_number"] for r in history], [9])
 
     def test_a_newer_run_is_not_treated_as_history(self):
-        """Merges land close enough together that the newest run in the list is
-        regularly not the one being handled."""
+        """`current` is the newest run that said anything, but the list can hold
+        newer runs that said nothing, and those are not its past either."""
         current = run(10, "failure")
         history = notifier.reporting_history([run(11, "success"), current, run(9, "success")], current)
         self.assertEqual([r["run_number"] for r in history], [9])
@@ -496,19 +496,14 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(len(api.workflows()), 1)
         self.assertEqual(len(calls), 2)
 
-    def test_the_issue_query_is_scoped_to_the_open_labelled_issues(self):
-        api, calls = self._api([])
-        api.open_issues_for_workflow(77)
-        url = calls[0].full_url
-        self.assertIn("state=open", url)
-        self.assertIn(urllib.parse.quote(notifier.LABEL, safe=""), url)
-
-    def test_the_closed_issue_query_asks_for_closed_labelled_issues(self):
-        api, calls = self._api([])
-        api.closed_issues_for_workflow(77)
-        url = calls[0].full_url
-        self.assertIn("state=closed", url)
-        self.assertIn(urllib.parse.quote(notifier.LABEL, safe=""), url)
+    def test_the_issue_query_is_scoped_to_the_labelled_issues_in_one_state(self):
+        for state in ("open", "closed"):
+            with self.subTest(state=state):
+                api, calls = self._api([])
+                api.issues_for_workflow(77, state)
+                url = calls[0].full_url
+                self.assertIn(f"state={state}", url)
+                self.assertIn(urllib.parse.quote(notifier.LABEL, safe=""), url)
 
     def test_pull_requests_are_excluded_from_the_issue_list(self):
         """`/issues` returns pull requests too. One carrying the marker -- this
@@ -523,7 +518,7 @@ class QueryTest(unittest.TestCase):
                 {"number": 4, "body": None},
             ]
         )
-        self.assertEqual([i["number"] for i in api.open_issues_for_workflow(77)], [2])
+        self.assertEqual([i["number"] for i in api.issues_for_workflow(77, "open")], [2])
 
     def test_the_token_and_api_version_are_sent(self):
         api, calls = self._api({"workflow_runs": []})
@@ -548,10 +543,10 @@ class QueryTest(unittest.TestCase):
 
 
 class FakeAPI:
-    """Records what `reconcile` asks of the API and answers from a list of open
-    issues, which is the whole of the state it reads. The writes land on that
-    list, so a second reconciliation sees what the first one left -- which is
-    how the sweep's idempotency is observed."""
+    """Records what `reconcile` asks of the API and answers from two lists, the
+    open and the closed issues, which are the whole of the state it reads. The
+    writes land on those lists, so a second reconciliation sees what the first
+    one left -- which is how the sweep's idempotency is observed."""
 
     def __init__(self, open_issues=(), closed_issues=()):
         self.open_issues = list(open_issues)
@@ -559,13 +554,10 @@ class FakeAPI:
         self.actions = []
         self.next_number = 900
 
-    def open_issues_for_workflow(self, workflow_id):
+    def issues_for_workflow(self, workflow_id, state):
         prefix = notifier.workflow_marker(workflow_id)
-        return [issue for issue in self.open_issues if prefix in (issue.get("body") or "")]
-
-    def closed_issues_for_workflow(self, workflow_id):
-        prefix = notifier.workflow_marker(workflow_id)
-        return [issue for issue in self.closed_issues if prefix in (issue.get("body") or "")]
+        issues = self.open_issues if state == "open" else self.closed_issues
+        return [issue for issue in issues if prefix in (issue.get("body") or "")]
 
     def ensure_label(self):
         self.actions.append(("label",))
@@ -759,20 +751,64 @@ class HandCloseAndOrderingTest(unittest.TestCase):
     def _reconcile(self, api, decision, workflow_id=77):
         return notifier.reconcile(api, decision, self.REPO, workflow_id)
 
-    def test_an_issue_closed_by_hand_is_not_refiled_while_the_breakage_lasts(self):
-        """Without this the sweep reopens a dismissed issue within fifteen
-        minutes, under a new number, after every close."""
-        api = FakeAPI(closed_issues=[issue(901, 77, 10, state="closed")])
-        result = self._reconcile(api, notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
-        self.assertEqual(api.actions, [])
-        self.assertIn("closed by hand", result)
+    def _closed_listing(self, decision):
+        """An issue the notifier itself wrote for `decision`, then closed."""
+        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
+        return {"number": 901, "state": "closed", "title": notifier.render_title(decision), "body": body}
 
-    def test_the_next_breakage_after_a_hand_close_is_filed(self):
+    def test_an_issue_closed_knowing_the_newest_red_is_not_refiled(self):
+        """Without this the sweep reopens a dismissed issue within fifteen
+        minutes, under a new number, after every close. The closed issue lists
+        run 11, the newest red, so whoever closed it knew what it knows."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(decision)])
+        result = self._reconcile(api, decision)
+        self.assertEqual(api.actions, [])
+        self.assertIn("already lists run 11", result)
+
+    def test_a_red_the_closed_issue_never_saw_is_filed_again(self):
+        """A merged pull request that says `Fixes #901` closes the issue through
+        Prow and then goes red itself. Its run is not in #901's table, so the
+        close is not a dismissal of it, whoever performed the close."""
+        earlier = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(earlier)])
+        later = notifier.decide(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
+        self._reconcile(api, later)
+        self.assertEqual(api.kinds(), ["label", "create"])
+        self.assertIn(run(12, "failure")["html_url"], api.actions[1][3])
+
+    def test_the_bots_own_superseded_close_does_not_silence_a_rerun(self):
+        """Run 10, the episode's first red, is re-run. While it is running the
+        history reads 12, 11 and the episode is 11: #902 opens and #901
+        (episode 10) is closed as superseded by the bot. The re-run finishes
+        red, the episode is 10 again, and the newest red, 12, is not in #901's
+        table -- so it files rather than falling silent behind its own close."""
+        first = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(first)])
+        api.open_issues.append(issue(902, 77, 11))
+        after_rerun = notifier.decide(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
+        self._reconcile(api, after_rerun)
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+        self.assertEqual(api.actions[3][1], 902)
+
+    def test_the_next_breakage_after_a_dismissal_is_filed(self):
         """A dismissal is about one episode. A green in between makes the next
         red a new episode with a new marker, and it opens as usual."""
-        api = FakeAPI(closed_issues=[issue(901, 77, 10, state="closed")])
+        dismissed = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(dismissed)])
         self._reconcile(api, notifier.decide(run(13, "failure"), [run(12, "success"), run(11, "failure")]))
         self.assertEqual(api.kinds(), ["label", "create"])
+
+    def test_two_open_issues_with_one_marker_collapse_to_one(self):
+        """The sweep and an event run both opened the same episode inside the
+        same second. The next reconciliation keeps one and closes the other as
+        superseded -- the workflow header promises this, so it is pinned."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI([issue(901, 77, 10), issue(902, 77, 10)])
+        self._reconcile(api, decision)
+        closed = [action[1] for action in api.actions if action[0] == "close"]
+        self.assertEqual(closed, [902])
+        self.assertEqual(len(api.open_issues), 1)
 
     def test_the_bots_own_close_does_not_read_as_a_dismissal_of_the_next_episode(self):
         """Green at 12 closed the episode that began at 10 -- through the fake,
@@ -867,8 +903,8 @@ class MainTest(unittest.TestCase):
         self.assertEqual(notification["broke_at"]["run_number"], 10)
 
     def test_a_surviving_green_of_a_burst_files_for_the_red_whose_notify_was_cancelled(self):
-        """#1681, with the run numbers from 2026-09-16. Eight merges landed in
-        two minutes; the red run, 5928, failed fast and finished before the
+        """#1681, with the run numbers from 2026-09-16. Six merges landed in a
+        minute; the red run, 5928, failed fast and finished before the
         greens 5926 and 5927 that carry older commits. The concurrency group
         cancelled 5928's own notify run. The notify runs for 5926 and 5927
         survived, and under the old rule each deferred to 5928 and exited --
@@ -1053,10 +1089,12 @@ class SweepTest(unittest.TestCase):
 
 class WatchListTest(unittest.TestCase):
     def test_the_script_and_the_workflow_watch_the_same_workflows(self):
-        """The `workflow_run` trigger and `WATCHED_WORKFLOWS` are one list
-        written twice, because a workflow cannot read its own triggers. A name
-        on one and not the other is a workflow the event path watches and the
-        sweep does not, or the reverse."""
+        """The `workflow_run` trigger and `WATCHED_WORKFLOWS` are the same list,
+        because a workflow cannot read its own triggers; the third copy, the
+        required-check roster in `test_integration_contracts.py`, is a subset
+        the trigger must contain and that test enforces it. A name on one of
+        these two and not the other is a workflow the event path watches and
+        the sweep does not, or the reverse."""
         document = yaml.safe_load(WORKFLOW_FILE.read_text())
         # PyYAML reads a bare `on:` key as the boolean True (YAML 1.1).
         triggers = document.get("on") or document.get(True)

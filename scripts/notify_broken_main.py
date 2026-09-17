@@ -32,7 +32,7 @@ reads the workflow's completed push runs back from the API and brings the issues
 into line with the newest one that said anything. The triggering run is only the
 reason to look: if a later run has finished by the time this one is handled, the
 later run is the current state of main and is the one acted on. A green closes
-any open issue for the workflow whether or not the run before it was red, the
+any open issue about an older red whether or not the run before it was red, the
 issue body is rebuilt from the run history rather than appended to, and an issue
 whose body already says what the history says is left alone. So a re-run of a
 red run that goes green closes the issue even though the history around it reads
@@ -44,17 +44,20 @@ Two bounds keep the reconciliation from undoing a person or a newer run. A
 green closes only issues whose episode is no newer than the green run itself,
 because an issue for a red that finished after this green describes a main this
 green has not seen. And a closed issue that carries the current episode's marker
-is a breakage someone has dealt with by hand -- the workflow's header admits it
-can file on an innocent commit -- so the episode is not filed again; the next
-breakage is a new episode and files as usual.
+and already lists the newest red run is a breakage someone has dealt with -- by
+hand, or by a merge whose description named the issue; the workflow's header
+admits it can file on an innocent commit -- so it is not filed again for a run
+it already knew about. A red run it never listed is new evidence and files as
+usual, and so does the next episode.
 
 That is also what makes a dropped notify run survivable. GitHub keeps one run
 pending per concurrency group and cancels the rest of a burst, and the earlier
 design let each run speak only for itself, deferring to any later run: on
-2026-09-16 eight merges landed within two minutes, the only red run of the burst
+2026-09-16 six merges landed within a minute, the only red run of the burst
 (#1651, `b458323d`) finished before two of the greens, its notify run was the one
 the group cancelled, and every surviving run deferred to it. Nothing was filed
-for fourteen hours, until the next merge produced a fresh run (#1681). Now any
+for fourteen hours, until the next merge produced a fresh run; #1681 is the
+write-up. Now any
 run of the burst reconciles against that red, and the last arrival in a group is
 never cancelled -- so a burst costs nothing as long as one event is delivered.
 
@@ -99,6 +102,7 @@ import urllib.request
 
 from github_api import (
     API_ROOT,
+    PER_PAGE,
     REQUEST_ATTEMPTS,
     REQUEST_RETRY_CEILING,
     REQUEST_RETRY_SECONDS,
@@ -360,7 +364,7 @@ def render_body(notification, repo, marker):
     A table of the commits that have landed since main went red, oldest first.
     It is derived entirely from the run history, so it is idempotent: handling
     the same run twice produces the same body, and a hand-edited issue is
-    restored by the next failure.
+    restored by the next reconciliation.
     """
     run = notification["run"]
     workflow = run["name"]
@@ -494,30 +498,17 @@ class GitHubAPI(BaseGitHubAPI):
         path = f"/repos/{self.repo}/actions/workflows/{workflow_id}/runs?{query}"
         return self.get(path)["workflow_runs"]
 
-    def open_issues_for_workflow(self, workflow_id):
-        """Open `ci:main-broken` issues belonging to one workflow, newest first.
+    def issues_for_workflow(self, workflow_id, state):
+        """`ci:main-broken` issues in `state` belonging to one workflow, newest first.
 
         The list endpoint returns pull requests too -- they are issues as far as
         this API is concerned -- so anything carrying a `pull_request` key is
-        dropped. Deliberately unpaginated: more than a hundred open issues on
-        this label is not a state worth writing code for.
+        dropped. Deliberately one page: more than a hundred open issues on this
+        label is not a state worth writing code for, and the closed list is
+        read only to find an episode still in progress, which is among the
+        newest.
         """
-        query = urllib.parse.urlencode({"labels": LABEL, "state": "open", "per_page": 100})
-        issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
-        prefix = workflow_marker(workflow_id)
-        return [
-            issue for issue in issues if "pull_request" not in issue and prefix in (issue.get("body") or "")
-        ]
-
-    def closed_issues_for_workflow(self, workflow_id):
-        """Closed `ci:main-broken` issues belonging to one workflow, newest first.
-
-        Read only when no open issue carries the current episode's marker,
-        which is the first red of an episode or a hand-closed issue. One page
-        of the newest closed issues is enough to find an episode still in
-        progress; older ones are over and never looked up.
-        """
-        query = urllib.parse.urlencode({"labels": LABEL, "state": "closed", "per_page": 100})
+        query = urllib.parse.urlencode({"labels": LABEL, "state": state, "per_page": PER_PAGE})
         issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
         prefix = workflow_marker(workflow_id)
         return [
@@ -560,7 +551,7 @@ def reconcile(api, notification, repo, workflow_id):
 
     Returns a human-readable account of what it did, for the log.
     """
-    open_issues = api.open_issues_for_workflow(workflow_id)
+    open_issues = api.issues_for_workflow(workflow_id, "open")
     comment = render_comment(notification, repo)
 
     if notification["kind"] == "green":
@@ -595,15 +586,25 @@ def reconcile(api, notification, repo, workflow_id):
 
     if current is None:
         # No open issue for this episode. Before opening one, look for a closed
-        # one: a person closing the issue while main is still red is a decision
-        # about this breakage, and the sweep would otherwise reverse it within
-        # fifteen minutes, and again after every close. The next breakage has a
-        # new episode marker and is filed as usual.
+        # one that already lists the newest red run: someone closed it knowing
+        # what it knows -- by hand, or through a merge whose description named
+        # it -- and the sweep would otherwise reverse that within fifteen
+        # minutes, and again after every close. A closed issue that never saw
+        # this run does not count, whoever closed it: a red that landed after a
+        # "fixes" merge, or after the bot itself closed the issue as superseded,
+        # is new evidence and files. Nothing here can tell a person's close
+        # from a robot's, and it does not have to.
+        newest_red = notification["run"]["html_url"]
         dismissed = [
-            issue for issue in api.closed_issues_for_workflow(workflow_id) if marker in (issue.get("body") or "")
+            issue
+            for issue in api.issues_for_workflow(workflow_id, "closed")
+            if marker in (issue.get("body") or "") and newest_red in (issue.get("body") or "")
         ]
         if dismissed:
-            return f"#{dismissed[0]['number']} was closed by hand while this breakage is still current; leaving it"
+            return (
+                f"#{dismissed[0]['number']} already lists run {notification['run']['run_number']} "
+                f"and was closed; leaving it"
+            )
         api.ensure_label()
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
