@@ -680,16 +680,21 @@ class GitHubAPI(BaseGitHubAPI):
         return self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", {"body": body})
 
     def close_issue(self, issue, stamp):
-        """Close an issue and stamp its body with why, in one write.
+        """Close an issue and stamp its body with why, in one write; False if
+        it was already closed.
 
         One PATCH rather than two, so a failure between them cannot leave an
-        open issue already carrying a stamp. The body is re-read first: the
-        list this issue came from may be minutes old by now, and a note
-        someone wrote in the meantime must not be overwritten.
+        open issue already carrying a stamp. The issue is re-read first: the
+        list it came from may be minutes old by now, so a note someone wrote
+        in the meantime must not be overwritten, and a sweep and an event run
+        reaching the same green together must not both close and comment.
         """
         fresh = self.get(f"/repos/{self.repo}/issues/{issue['number']}") or issue
+        if fresh.get("state") == ISSUE_CLOSED:
+            return False
         body = (fresh.get("body") or "").rstrip() + "\n" + stamp
-        return self.update_issue(issue["number"], body=body, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
+        self.update_issue(issue["number"], body=body, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
+        return True
 
 
 # --------------------------------------------------------------------------- #
@@ -754,10 +759,15 @@ def reconcile(api, notification, repo, workflow_id):
         gaps = incomplete_for(closable)
         if gaps:
             return leave(gaps)
+        # Close, then comment: the close re-reads the issue and says whether it
+        # was still open, so two reconciliations reaching this green together
+        # produce one comment rather than two.
+        closed = []
         for issue in closable:
-            api.comment(issue["number"], comment)
-            api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number, run_id=notification["run"]["id"]))
-        done = "closed " + ", ".join(f"#{issue['number']}" for issue in closable) if closable else "closed nothing"
+            if api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number, run_id=notification["run"]["id"])):
+                api.comment(issue["number"], comment)
+                closed.append(issue)
+        done = "closed " + ", ".join(f"#{issue['number']}" for issue in closed) if closed else "closed nothing"
         if newer:
             done += "; left open " + ", ".join(f"#{issue['number']}" for issue in newer) + " (a newer breakage)"
         if reopened:
@@ -778,8 +788,8 @@ def reconcile(api, notification, repo, workflow_id):
     ]
 
     def supersede(issue, by_number):
-        api.comment(issue["number"], f"Superseded by #{by_number}.")
-        api.close_issue(issue, SUPERSEDED_STAMP.format(number=by_number))
+        if api.close_issue(issue, SUPERSEDED_STAMP.format(number=by_number)):
+            api.comment(issue["number"], f"Superseded by #{by_number}.")
 
     def own_unstamped(issue):
         """A close the script made before it stamped: superseded or recovered,
@@ -939,7 +949,15 @@ def sweep(api, repo, branch, dry_run):
     nothing distinguishes it from a workflow that has not run in a while.
     """
     carriers = {}
-    for workflow in api.workflows():
+    try:
+        workflows = api.workflows()
+    except (urllib.error.HTTPError, urllib.error.URLError) as error:
+        # The one read every workflow depends on. An API incident that outlasts
+        # the client's retries is not ours to fix and must not red the schedule
+        # every fifteen minutes; the next sweep retries.
+        warn(f"The workflow list could not be read ({error}); leaving this sweep to the next one")
+        return 0
+    for workflow in workflows:
         if workflow["name"] in WATCHED_WORKFLOWS:
             carriers.setdefault(workflow["name"], []).append(workflow)
 
