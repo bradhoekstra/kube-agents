@@ -13,8 +13,9 @@ skipped its own steps on a docs change: the push history on `main` reads red
 fix at 2700. It was three hours and forty-five minutes before anyone noticed.
 
 So this writes it down. `.github/workflows/main-broken-notify.yml` hands it the
-run id of a completed push run on `main` for one of the watched workflows, and
-it decides what that run says:
+run id of a completed push run on `main` for one of the watched workflows -- or,
+on a schedule, nothing -- and it decides what that workflow's newest completed
+run says:
 
     failing, previous run green     -> open an issue: "main is broken"
     failing, previous run failing   -> add the commit to that issue, and comment
@@ -38,6 +39,14 @@ red run that goes green closes the issue even though the history around it reads
 green-after-green; handling the same run twice writes nothing the second time;
 and two runs handled out of order cannot open a "main is broken" issue against a
 main that is green.
+
+Two bounds keep the reconciliation from undoing a person or a newer run. A
+green closes only issues whose episode is no newer than the green run itself,
+because an issue for a red that finished after this green describes a main this
+green has not seen. And a closed issue that carries the current episode's marker
+is a breakage someone has dealt with by hand -- the workflow's header admits it
+can file on an innocent commit -- so the episode is not filed again; the next
+breakage is a new episode and files as usual.
 
 That is also what makes a dropped notify run survivable. GitHub keeps one run
 pending per concurrency group and cancels the rest of a burst, and the earlier
@@ -111,18 +120,19 @@ FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
 # cancelled run in the middle of a streak does not read as a recovery.
 REPORTING_CONCLUSIONS = FAILING_CONCLUSIONS | frozenset({"success"})
 
-# Runs of the triggering workflow to look back over. A streak longer than this
+# Completed push runs of a watched workflow to look back over. A streak longer than this
 # would have its episode key fall off the end of the history and open a second
 # issue -- an acceptable failure mode, given that fifty consecutive broken
 # merges is a problem this script is not the answer to.
 HISTORY_DEPTH = 50
 
 # The workflows `--sweep` reconciles, by the `name:` each declares -- the same
-# key `main-broken-notify.yml` matches its `workflow_run` trigger on. That
-# trigger's list and this one are the same list written twice, because a
-# workflow cannot read its own triggers; `test_notify_broken_main.py` fails when
-# they disagree. The workflow's header says what may go on the list and why
-# `Prettier Check` is not on it.
+# key `main-broken-notify.yml` matches its `workflow_run` trigger on. A workflow
+# cannot read its own triggers, so the list exists three times: the trigger,
+# this tuple (`test_notify_broken_main.py` fails when the two differ), and
+# `BROKEN_MAIN_WATCHED_WORKFLOWS` in `test_integration_contracts.py`, the
+# roster of required checks the trigger must contain. The workflow's header says
+# what may go on the list and why `Prettier Check` is not on it.
 WATCHED_WORKFLOWS = (
     "Actionlint",
     "Docker Build",
@@ -167,9 +177,9 @@ def newest_reporting_run(runs):
 def reporting_history(runs, current):
     """`runs` newest-first, minus the current run and anything that said nothing.
 
-    The API list includes the run that triggered this, and filtering it by id
-    rather than by position matters: two merges land close enough together that
-    the newest run is regularly not the one being handled.
+    `current` is the newest reporting run, but the list may hold newer runs
+    that said nothing, so it is filtered by id and run number rather than
+    sliced from the front.
     """
     return [
         run
@@ -206,9 +216,9 @@ def decide(current, history):
     Returns a dict rather than a class: it is rendered straight into an issue
     body and read straight out of the tests, and neither wants a constructor.
     """
-    # A run that concluded `neutral`, `stale` or `action_required` reached here
-    # because the workflow's `if:` only filters `cancelled` and `skipped`. None
-    # of them is a statement about the tree, and anything not in
+    # `report` only ever passes a reporting run, so this is a guard for a
+    # direct caller: a run that concluded `cancelled`, `neutral`, `stale` or
+    # the like is no statement about the tree, and anything not in
     # FAILING_CONCLUSIONS would otherwise be read as green and close the issue.
     if current["conclusion"] not in REPORTING_CONCLUSIONS:
         return None
@@ -277,6 +287,9 @@ def _author(run):
 # request, pointing whoever broke main at the issue about it.
 _PR_SUFFIX = re.compile(r"\(#(\d+)\)\s*$")
 
+# The episode marker, read back off an issue body to learn which run opened it.
+_EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
+
 
 def _pull_request(run):
     match = _PR_SUFFIX.search(_commit_subject(run))
@@ -325,6 +338,16 @@ def episode_marker(notification, workflow_id):
 def workflow_marker(workflow_id):
     """The prefix every episode marker for one workflow shares."""
     return f"<!-- main-broken workflow={workflow_id} "
+
+
+def episode_of(issue):
+    """The run number an issue's marker says broke main, or 0 if it has none.
+
+    Zero rather than None so an issue with a damaged marker still compares as
+    older than any run and is closed by the next green rather than kept open.
+    """
+    match = _EPISODE.search(issue.get("body") or "")
+    return int(match.group(1)) if match else 0
 
 
 def render_title(notification):
@@ -486,6 +509,21 @@ class GitHubAPI(BaseGitHubAPI):
             issue for issue in issues if "pull_request" not in issue and prefix in (issue.get("body") or "")
         ]
 
+    def closed_issues_for_workflow(self, workflow_id):
+        """Closed `ci:main-broken` issues belonging to one workflow, newest first.
+
+        Read only when no open issue carries the current episode's marker,
+        which is the first red of an episode or a hand-closed issue. One page
+        of the newest closed issues is enough to find an episode still in
+        progress; older ones are over and never looked up.
+        """
+        query = urllib.parse.urlencode({"labels": LABEL, "state": "closed", "per_page": 100})
+        issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
+        prefix = workflow_marker(workflow_id)
+        return [
+            issue for issue in issues if "pull_request" not in issue and prefix in (issue.get("body") or "")
+        ]
+
     def ensure_label(self):
         """Create the label if this is the first breakage ever recorded.
 
@@ -531,13 +569,23 @@ def reconcile(api, notification, repo, workflow_id):
             # otherwise. One list request per green run buys the guarantee that
             # an issue is never left open on a green main.
             return "green, and no issue is open for this workflow"
-        # Every open issue for this workflow, not just the episode this run's
-        # streak points at. Whatever the history says, main is green now, and an
-        # issue saying otherwise is wrong.
-        for issue in open_issues:
+        # Every open issue for this workflow whose breakage this green run comes
+        # after, not just the episode this run's streak points at: whatever the
+        # history says, main is green as of this run, and an issue about an
+        # older red is wrong. An issue about a red that ran *after* this green
+        # is not -- a sweep that read the history a moment before that red
+        # finished, or read a list that lagged it, would otherwise close a
+        # correct issue with a "passes again" naming a run that is not the fix.
+        green_number = notification["run"]["run_number"]
+        closable = [issue for issue in open_issues if episode_of(issue) <= green_number]
+        newer = [issue for issue in open_issues if issue not in closable]
+        for issue in closable:
             api.comment(issue["number"], comment)
             api.close_issue(issue["number"])
-        return "closed " + ", ".join(f"#{issue['number']}" for issue in open_issues)
+        done = "closed " + ", ".join(f"#{issue['number']}" for issue in closable) if closable else "closed nothing"
+        if newer:
+            done += "; left open " + ", ".join(f"#{issue['number']}" for issue in newer) + " (a newer breakage)"
+        return done
 
     marker = episode_marker(notification, workflow_id)
     title = render_title(notification)
@@ -546,6 +594,16 @@ def reconcile(api, notification, repo, workflow_id):
     stale = [issue for issue in open_issues if issue is not current]
 
     if current is None:
+        # No open issue for this episode. Before opening one, look for a closed
+        # one: a person closing the issue while main is still red is a decision
+        # about this breakage, and the sweep would otherwise reverse it within
+        # fifteen minutes, and again after every close. The next breakage has a
+        # new episode marker and is filed as usual.
+        dismissed = [
+            issue for issue in api.closed_issues_for_workflow(workflow_id) if marker in (issue.get("body") or "")
+        ]
+        if dismissed:
+            return f"#{dismissed[0]['number']} was closed by hand while this breakage is still current; leaving it"
         api.ensure_label()
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
@@ -628,6 +686,11 @@ def report(api, workflow_id, runs, repo, dry_run):
     log(f"{current['name']}: {reconcile(api, notification, repo, workflow_id)}")
 
 
+def _latest_run_time(runs):
+    """When a workflow last ran: its newest run's creation time, or nothing."""
+    return runs[0]["created_at"] if runs else ""
+
+
 def sweep(api, repo, branch, dry_run):
     """Reconcile every watched workflow with no run to start from.
 
@@ -635,16 +698,36 @@ def sweep(api, repo, branch, dry_run):
     rename the workflow's header warns about -- `workflow_run` matches on
     `name:`, so the event path has silently stopped firing for it -- and the
     sweep goes red to say so, after reconciling the workflows it could find.
-    """
-    watched = set(WATCHED_WORKFLOWS)
-    found = set()
-    for workflow in api.workflows():
-        if workflow["name"] not in watched:
-            continue
-        found.add(workflow["name"])
-        report(api, workflow["id"], api.history(workflow["id"], branch), repo, dry_run)
 
-    missing = [name for name in WATCHED_WORKFLOWS if name not in found]
+    The workflow list keeps entries for files that no longer exist, listed as
+    `active` with their history frozen, so a file renamed under the same
+    `name:` leaves two workflows carrying it. Only the one that ran most
+    recently is the workflow; the other would otherwise be reconciled against
+    a history that can never change, and a red at the end of it would be filed
+    forever. A ghost that is the only carrier of a name still counts as found:
+    nothing distinguishes it from a workflow that has not run in a while.
+    """
+    carriers = {}
+    for workflow in api.workflows():
+        if workflow["name"] in WATCHED_WORKFLOWS:
+            carriers.setdefault(workflow["name"], []).append(workflow)
+
+    missing = []
+    for name in WATCHED_WORKFLOWS:
+        candidates = [(workflow, api.history(workflow["id"], branch)) for workflow in carriers.get(name, [])]
+        if not candidates:
+            missing.append(name)
+            continue
+        if len(candidates) > 1:
+            candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
+            others = ", ".join(f"{w['id']} ({w['path']})" for w, _ in candidates[1:])
+            log(
+                f"{name} is carried by {len(candidates)} workflows; reconciling {candidates[0][0]['id']}, "
+                f"which ran most recently, and not {others}"
+            )
+        workflow, runs = candidates[0]
+        report(api, workflow["id"], runs, repo, dry_run)
+
     if missing:
         log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing reports on it")
         return 1

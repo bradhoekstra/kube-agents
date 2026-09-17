@@ -3,9 +3,10 @@
 
 Run: cd scripts && python3 -m unittest test_notify_broken_main
 
-The notifier cannot be exercised end to end before it is on main -- a
-`workflow_run` workflow only runs from the default branch's copy of itself -- so
-everything that can be decided without a runner is decided here. Four failure
+The event path cannot be exercised end to end before it is on main -- a
+`workflow_run` workflow only runs from the default branch's copy of itself, and
+a dispatch from a branch reaches only the sweep -- so everything that can be
+decided without a runner is decided here. Four failure
 modes are worth more than the rest: staying quiet when main is broken, which
 reproduces the gap this exists to close; opening an issue on a green run, which
 trains everyone to ignore the label; leaving an issue open after main recovers,
@@ -50,11 +51,12 @@ def run(number, conclusion, *, sha=None, subject="a commit", run_id=None, name="
         "triggering_actor": {"login": "google-oss-prow[bot]"},
         "html_url": f"https://github.com/gke-labs/kube-agents/actions/runs/{1000 + number}",
         "workflow_id": 77,
+        "created_at": "2026-09-01T00:00:00Z",
     }
 
 
 class DecideTest(unittest.TestCase):
-    """Which of the four cases a run falls into. This is the whole design."""
+    """Which of the three kinds a run falls into, or none. This is the whole design."""
 
     def test_first_failure_announces_a_break(self):
         decision = notifier.decide(run(10, "failure"), [run(9, "success")])
@@ -72,9 +74,9 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(decision["streak_length"], 0)
 
     def test_a_conclusion_that_says_nothing_says_nothing(self):
-        """`neutral`, `stale` and `action_required` all reach the script -- the
-        workflow's `if:` filters only `cancelled` and `skipped`. Read as green,
-        any of them closes the issue on a main that is still broken."""
+        """`report` never passes one of these, but `decide` is a public seam
+        and a direct caller could. Read as green, any of them closes the issue
+        on a main that is still broken."""
         for conclusion in ("neutral", "stale", "action_required", "cancelled", "skipped", None):
             with self.subTest(conclusion=conclusion):
                 self.assertIsNone(notifier.decide(run(10, conclusion), [run(9, "failure")]))
@@ -501,6 +503,13 @@ class QueryTest(unittest.TestCase):
         self.assertIn("state=open", url)
         self.assertIn(urllib.parse.quote(notifier.LABEL, safe=""), url)
 
+    def test_the_closed_issue_query_asks_for_closed_labelled_issues(self):
+        api, calls = self._api([])
+        api.closed_issues_for_workflow(77)
+        url = calls[0].full_url
+        self.assertIn("state=closed", url)
+        self.assertIn(urllib.parse.quote(notifier.LABEL, safe=""), url)
+
     def test_pull_requests_are_excluded_from_the_issue_list(self):
         """`/issues` returns pull requests too. One carrying the marker -- this
         change's own pull request quotes it -- would be commented on and closed
@@ -544,14 +553,19 @@ class FakeAPI:
     list, so a second reconciliation sees what the first one left -- which is
     how the sweep's idempotency is observed."""
 
-    def __init__(self, open_issues=()):
+    def __init__(self, open_issues=(), closed_issues=()):
         self.open_issues = list(open_issues)
+        self.closed_issues = list(closed_issues)
         self.actions = []
         self.next_number = 900
 
     def open_issues_for_workflow(self, workflow_id):
         prefix = notifier.workflow_marker(workflow_id)
         return [issue for issue in self.open_issues if prefix in (issue.get("body") or "")]
+
+    def closed_issues_for_workflow(self, workflow_id):
+        prefix = notifier.workflow_marker(workflow_id)
+        return [issue for issue in self.closed_issues if prefix in (issue.get("body") or "")]
 
     def ensure_label(self):
         self.actions.append(("label",))
@@ -574,6 +588,7 @@ class FakeAPI:
 
     def close_issue(self, number):
         self.actions.append(("close", number))
+        self.closed_issues += [issue for issue in self.open_issues if issue["number"] == number]
         self.open_issues = [issue for issue in self.open_issues if issue["number"] != number]
 
     def kinds(self):
@@ -734,6 +749,66 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["comment", "close", "comment", "close"])
 
 
+class HandCloseAndOrderingTest(unittest.TestCase):
+    """Two bounds on what a reconciliation may undo: a person's close, and an
+    issue about a red newer than the green being handled. Both matter more now
+    that a sweep reconciles every fifteen minutes."""
+
+    REPO = "gke-labs/kube-agents"
+
+    def _reconcile(self, api, decision, workflow_id=77):
+        return notifier.reconcile(api, decision, self.REPO, workflow_id)
+
+    def test_an_issue_closed_by_hand_is_not_refiled_while_the_breakage_lasts(self):
+        """Without this the sweep reopens a dismissed issue within fifteen
+        minutes, under a new number, after every close."""
+        api = FakeAPI(closed_issues=[issue(901, 77, 10, state="closed")])
+        result = self._reconcile(api, notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("closed by hand", result)
+
+    def test_the_next_breakage_after_a_hand_close_is_filed(self):
+        """A dismissal is about one episode. A green in between makes the next
+        red a new episode with a new marker, and it opens as usual."""
+        api = FakeAPI(closed_issues=[issue(901, 77, 10, state="closed")])
+        self._reconcile(api, notifier.decide(run(13, "failure"), [run(12, "success"), run(11, "failure")]))
+        self.assertEqual(api.kinds(), ["label", "create"])
+
+    def test_the_bots_own_close_does_not_read_as_a_dismissal_of_the_next_episode(self):
+        """Green at 12 closed the episode that began at 10 -- through the fake,
+        so it lands in the closed list exactly as a hand close would. A red at
+        13 is episode 13, finds no closed issue for it, and files."""
+        api = FakeAPI([issue(901, 77, 10)])
+        self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
+        self.assertEqual(api.kinds(), ["comment", "close"])
+        self._reconcile(api, notifier.decide(run(13, "failure"), [run(12, "success")]))
+        self.assertEqual(api.kinds(), ["comment", "close", "label", "create"])
+
+    def test_a_green_does_not_close_an_issue_about_a_newer_red(self):
+        """A sweep read a green history at T; a red finished just after and
+        its event run opened an issue before the sweep listed open issues. The
+        green is older than the red and must leave it alone."""
+        api = FakeAPI([issue(901, 77, 13)])
+        result = self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "success")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("left open #901", result)
+
+    def test_a_green_still_closes_every_older_episode(self):
+        api = FakeAPI([issue(901, 77, 13), issue(902, 77, 10), issue(903, 77, 5)])
+        self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
+        closed = [action[1] for action in api.actions if action[0] == "close"]
+        self.assertEqual(sorted(closed), [902, 903])
+
+    def test_an_issue_with_a_damaged_marker_still_closes_on_green(self):
+        """`episode_of` reads 0 for a body that lost its episode number, which
+        is older than any run -- the issue is closed rather than kept open."""
+        damaged = {"number": 904, "state": "open", "body": notifier.workflow_marker(77) + "-->"}
+        self.assertEqual(notifier.episode_of(damaged), 0)
+        api = FakeAPI([damaged])
+        self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "success")]))
+        self.assertEqual(api.kinds(), ["comment", "close"])
+
+
 class MainTest(unittest.TestCase):
     """The wiring, with the API and the reconciliation stubbed."""
 
@@ -826,9 +901,9 @@ class MainTest(unittest.TestCase):
         self.assertEqual(reconcile.call_args[0][1]["run"]["run_number"], 10)
 
     def test_a_later_run_that_said_nothing_does_not_silence_this_one(self):
-        """A `cancelled` run is filtered out by the workflow's `if:` and will
-        never reconcile anything, so deferring to it drops the notification
-        altogether -- the one outcome this script exists to prevent."""
+        """A newer `cancelled` run is no statement about the tree, so the
+        newest *reporting* run is the one reconciled, and it is red. Read as
+        the current state, the cancelled run would leave nothing to file."""
         status, reconcile = self._main(
             run(11, "failure"),
             [run(12, "cancelled"), run(11, "failure"), run(10, "success")],
@@ -888,7 +963,10 @@ class SweepTest(unittest.TestCase):
             return notifier.main(list(argv)), api, reconcile
 
     def _workflows(self, names_to_ids):
-        return [{"id": workflow_id, "name": name} for name, workflow_id in names_to_ids.items()]
+        return [
+            {"id": workflow_id, "name": name, "path": f".github/workflows/{workflow_id}.yml"}
+            for name, workflow_id in names_to_ids.items()
+        ]
 
     def test_every_watched_workflow_is_reconciled_and_nothing_else(self):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
@@ -931,6 +1009,39 @@ class SweepTest(unittest.TestCase):
         status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
         self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 2)
+
+    def test_two_workflows_carrying_one_name_are_reconciled_as_the_one_that_ran_last(self):
+        """The workflow list keeps a file that was renamed or deleted, listed
+        as `active` with its history frozen. Reconciled too, a red at the end
+        of that frozen history would be filed forever."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        workflows = self._workflows(names_to_ids)
+        ghost_name = notifier.WATCHED_WORKFLOWS[0]
+        workflows.append({"id": 999, "name": ghost_name, "path": ".github/workflows/old.yml"})
+        workflows[0]["path"] = ".github/workflows/new.yml"
+        histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
+        ghost_red = run(40, "failure")
+        ghost_red["created_at"] = "2026-01-01T00:00:00Z"
+        live_green = run(2, "success")
+        live_green["created_at"] = "2026-09-01T00:00:00Z"
+        histories[999] = [ghost_red]
+        histories[100] = [live_green]
+        status, _, reconcile = self._sweep(workflows, histories)
+        self.assertEqual(status, 0)
+        reconciled = [call.args[3] for call in reconcile.call_args_list]
+        self.assertIn(100, reconciled)
+        self.assertNotIn(999, reconciled)
+        self.assertEqual(len(reconciled), len(notifier.WATCHED_WORKFLOWS))
+
+    def test_a_carrier_with_no_runs_loses_to_one_that_has_run(self):
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        workflows = self._workflows(names_to_ids)
+        workflows.append({"id": 999, "name": notifier.WATCHED_WORKFLOWS[0], "path": ".github/workflows/old.yml"})
+        histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
+        histories[999] = []
+        status, _, reconcile = self._sweep(workflows, histories)
+        self.assertEqual(status, 0)
+        self.assertIn(100, [call.args[3] for call in reconcile.call_args_list])
 
     def test_a_dry_run_sweep_writes_nothing(self):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}

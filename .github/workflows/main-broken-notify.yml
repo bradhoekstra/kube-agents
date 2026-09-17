@@ -52,8 +52,9 @@ name: Notify on Broken Main
 
 on:
   # zizmor: ignore[dangerous-triggers] - workflow_run is only dangerous when it checks
-  # out the triggering run's code; this checks out the default branch, runs only for
-  # push-to-main runs of this repository, and passes the event nothing but a run id.
+  # out the triggering run's code; this checks out the ref it runs from (the default
+  # branch, except under a write-gated dispatch), acts only for push-to-main runs of
+  # this repository, and passes the event nothing but a run id.
   workflow_run:
     workflows:
       - Actionlint
@@ -72,9 +73,10 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
-# Event runs are serialised per watched workflow. Two merges landing together
-# would otherwise both read the same history, reach the same answer, and race
-# to open the same issue -- nothing in the API refuses the second one.
+# Push-to-main event runs are serialised per watched workflow. Two merges
+# landing together would otherwise both read the same history, reach the same
+# answer, and race to open the same issue -- nothing in the API refuses the
+# second one.
 #
 # `cancel-in-progress: false` does not mean nothing is dropped: GitHub holds at
 # most one run pending per group, and a third arrival cancels the one waiting.
@@ -84,18 +86,30 @@ on:
 # notify run reconciles against the newest completed run of its workflow rather
 # than the one that woke it: the last arrival in a group is never cancelled, it
 # runs after every push run of the burst has finished, and it files whatever the
-# newest of them says. The group is evaluated before the job's `if:`, so the
-# `if:` below deliberately filters nothing by conclusion -- a cancelled run's
-# notify can be the last arrival, and it reconciles as well as any other.
+# newest of them says.
 #
-# Sweeps share a group of their own rather than the event runs': one sweep at a
-# time is all the serialisation they need, and holding an event run behind a
+# That holds only if nothing else enters the group. `workflow_run` fires for
+# every completion of a watched workflow, pull-request runs included -- about
+# ten of those per push run -- and the group is evaluated before the job's `if:`
+# skips them. Keyed on the workflow alone, a pull-request run's notify arriving
+# mid-burst would cancel the pending push run's notify and then skip itself,
+# leaving the red to the sweep. So the key repeats the `if:`'s push-to-main
+# test: a push run on main joins its workflow's group, and anything else gets a
+# group of its own that cancels nothing. The `if:` below filters nothing by
+# conclusion for the same reason: a cancelled run's notify can be the last
+# arrival, and it reconciles as well as any other.
+#
+# Sweeps (the schedule and a dispatch) share a group of their own: one sweep at
+# a time is all the serialisation they need, and holding an event run behind a
 # sweep, or a sweep behind a burst, would buy nothing. A sweep and an event run
 # can therefore both handle a fresh red at once and, in a window of about a
 # second, open the same issue twice; the next reconciliation of either kind
 # closes the duplicate as superseded, and the sweep guarantees there is one.
+# The other direction -- a sweep that read a green history a moment before a
+# red finished, closing the issue the red's event run just opened -- is what
+# the script's rule that a green closes only older episodes is for.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.workflow_id || github.event_name }}
+  group: ${{ github.workflow }}-${{ github.event_name != 'workflow_run' && 'sweep' || (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.workflow_id || github.run_id) }}
   cancel-in-progress: false
 
 permissions: {}
@@ -120,10 +134,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the script
-      actions: read # read the triggering run and the workflow's run history
+      actions: read # read the triggering run, the workflow list, and each workflow's run history
       issues: write # open, update and close the tracking issue, and its label
     steps:
-      - name: Checkout the default branch
+      # The default branch on every trigger but a dispatch, which checks out the
+      # ref it was dispatched from -- the way to try a branch's script for real.
+      - name: Checkout the script
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
