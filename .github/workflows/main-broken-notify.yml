@@ -10,15 +10,15 @@ name: Notify on Broken Main
 # further workflows, so this cannot start a loop.
 #
 # `workflows:` matches on the workflow's `name:`, not its filename, and a rename
-# there silently stops this from firing. The scheduled sweep is what notices an
-# edit in place (a file moved and renamed together leaves a listed ghost carrying
-# the old name, which it cannot tell from a quiet workflow): it
-# carries the same list as `WATCHED_WORKFLOWS` in the script -- a workflow
-# cannot read its own triggers, so the list exists three times: here, there
+# there silently stops this from firing. The scheduled sweep goes red when a
+# watched name matches no workflow, which catches an edit in place; a file
+# moved and renamed together leaves a listed ghost carrying the old name, which
+# the sweep cannot tell from a quiet workflow. The sweep carries the same list
+# as `WATCHED_WORKFLOWS` in the script, because a workflow cannot read its own
+# triggers, so the list exists three times: here, there
 # (`scripts/test_notify_broken_main.py` fails when the two disagree), and as
 # the required-check roster `BROKEN_MAIN_WATCHED_WORKFLOWS` in
-# `scripts/test_integration_contracts.py` -- and it goes red when a watched
-# name matches no workflow.
+# `scripts/test_integration_contracts.py`.
 #
 # What may go on the list: a workflow whose green on a push to main is a
 # statement about the tree, not about the push. The script depends on that and
@@ -95,21 +95,21 @@ on:
 # newest of them says.
 #
 # That holds only if nothing else enters the group. `workflow_run` fires for
-# every completion of a watched workflow, pull-request runs included -- about
-# five of those per push run -- and the group is evaluated before the job's `if:`
+# every completion of a watched workflow, pull-request runs included -- several
+# of those per push run -- and the group is evaluated before the job's `if:`
 # skips them. Keyed on the workflow alone, a pull-request run's notify arriving
 # mid-burst would cancel the pending push run's notify and then skip itself,
-# leaving the red to the sweep. So the key repeats the `if:`'s push-to-main
-# test: a push run on main joins its workflow's group, and anything else gets a
-# group of its own that cancels nothing. The `if:` below filters nothing by
+# leaving the red to the sweep. So the key repeats the push-to-main half of
+# the `if:`'s test: a push run on main joins its workflow's group, and anything
+# else gets a group of its own that cancels nothing. The `if:` below filters nothing by
 # conclusion for the same reason: a cancelled run's notify can be the last
 # arrival, and it reconciles as well as any other.
 #
 # Sweeps (the schedule and a dispatch) share a group of their own: one sweep at
 # a time is all the serialisation they need, and holding an event run behind a
 # sweep, or a sweep behind a burst, would buy nothing. A sweep and an event run
-# can therefore both handle a fresh red at once and, in a window of about a
-# second, open the same issue twice; the next reconciliation of either kind
+# can therefore both handle a fresh red at once and briefly open the same
+# issue twice; the next reconciliation of either kind
 # closes the duplicate as superseded, and the sweep guarantees there is one.
 # The other direction -- a sweep that read a green history a moment before a
 # red finished, closing the issue the red's event run just opened -- is what
