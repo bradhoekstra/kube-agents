@@ -45,10 +45,9 @@ green closes only issues whose episode is no newer than the green run itself,
 because an issue for a red that finished after this green describes a main this
 green has not seen. And a closed issue that carries the current episode's marker
 and was closed after the last change to any run in the streak is a breakage
-that has been dealt with, whoever closed it -- a person, a merge whose
-description named the issue, or this workflow itself on a green that a stale
-read no longer shows -- so it is not filed again for evidence that predates the
-close. A run re-run after the close, or a new red, moves the streak past it and
+that has been dealt with, whoever closed it -- a person, or a merge whose
+description named the issue -- so it is not filed again for evidence that
+predates the close. A run re-run after the close, or a new red, moves the streak past it and
 files as usual, and so does the next episode. The one close that never counts
 is this workflow's own "superseded": it says another issue covers the
 breakage, not that anyone dealt with it, and the issue is stamped with a hidden
@@ -146,10 +145,11 @@ FAILING_CONCLUSIONS = frozenset({"failure", "timed_out", "startup_failure"})
 # cancelled run in the middle of a streak does not read as a recovery.
 REPORTING_CONCLUSIONS = FAILING_CONCLUSIONS | frozenset({"success"})
 
-# Completed push runs of a watched workflow to look back over. A streak longer than this
-# would have its episode key fall off the end of the history and open a second
-# issue -- an acceptable failure mode, given that fifty consecutive broken
-# merges is a problem this script is not the answer to.
+# Completed push runs of a watched workflow to look back over. A streak longer
+# than this would have its episode key fall off the end of the history, open a
+# second issue and close the first as superseded -- an acceptable failure mode,
+# given that fifty consecutive broken merges is a problem this script is not
+# the answer to.
 HISTORY_DEPTH = 50
 
 # The workflows `--sweep` reconciles, by the `name:` each declares -- the same
@@ -189,8 +189,9 @@ SUPERSEDED_STAMP = "<!-- main-broken superseded-by={number} -->"
 SUPERSEDED_PREFIX = "<!-- main-broken superseded-by="
 FIXED_BY_STAMP = "<!-- main-broken fixed-by={number} -->"
 
-# The episode marker, read back off an issue body to learn which run opened it,
-# and a table row, read back to learn which runs the issue already lists.
+# The episode marker, read back off an issue body to learn which run opened it;
+# a table row, read back to learn which runs the issue already lists; and the
+# fixed-by stamp, read back to learn which green run closed it.
 _EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
 _ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)\)", re.MULTILINE)
 _FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+) -->")
@@ -437,8 +438,8 @@ def render_body(notification, repo, marker):
 
     A table of the commits that have landed since main went red, oldest first.
     It is derived entirely from the run history, so it is idempotent: handling
-    the same run twice produces the same body. It is written only when the
-    table gains a row, so a note someone adds to the body stays until the next
+    the same run twice produces the same body. It is written only when the set
+    of rows changes, so a note someone adds to the body stays until the next
     commit lands on the broken main.
     """
     run = notification["run"]
@@ -729,9 +730,8 @@ def reconcile(api, notification, repo, workflow_id):
         # means the read is short, and a fresh episode built on it is a hole,
         # not a breakage. Then for a dismissal: an issue for this episode closed
         # after the last change to any run in the streak was closed knowing
-        # everything the streak knows -- by a person, by a merge whose
-        # description named it, or by this workflow on a green that a stale
-        # read no longer shows -- and the sweep would otherwise reverse that
+        # everything the streak knows -- by a person, or by a merge whose
+        # description named it -- and the sweep would otherwise reverse that
         # within fifteen minutes, and again after every close. A run re-run
         # after the close, or a red that landed after a "fixes" merge, moves a
         # run's timestamp past the close and is new evidence: it files.
@@ -757,18 +757,22 @@ def reconcile(api, notification, repo, workflow_id):
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
     else:
-        # Rewrite the issue only when the table gains a row. A body that
+        # Rewrite the body only when the set of rows changes. A body that
         # already lists this run was written by the notify run that saw it
         # first, and that run commented then; the scheduled sweep and a
         # redelivered event both land here, and either commenting again would
         # add a "Still failing" every fifteen minutes for as long as main stays
         # red. Comparing rows rather than text also leaves a note someone wrote
         # into the body alone until there is news to rewrite it with. A
-        # hand-edited title is restored without a comment: nothing is news.
+        # hand-edited title is restored on its own, body untouched and without
+        # a comment: nothing is news.
         rows_changed = listed_rows(current) != {run["run_number"] for run in notification["streak"]}
-        if rows_changed or current.get("title") != title:
+        if rows_changed:
             api.update_issue(current["number"], title=title, body=body)
             done = f"updated #{current['number']}"
+        elif current.get("title") != title:
+            api.update_issue(current["number"], title=title)
+            done = f"retitled #{current['number']}"
         else:
             done = f"#{current['number']} already says so"
         if comment and rows_changed:

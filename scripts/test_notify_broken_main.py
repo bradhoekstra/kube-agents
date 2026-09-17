@@ -463,9 +463,9 @@ class QueryTest(unittest.TestCase):
 
     def test_the_workflow_list_is_paged_to_its_own_total(self):
         """The endpoint wraps its page in an object, so the shared client's
-        `get_all` cannot page it. The repository has more workflows than one
-        default page holds, and a watched workflow on the second page would
-        otherwise read as renamed on every sweep."""
+        `get_all` cannot page it. One page at `PER_PAGE` holds every workflow
+        today; the paging is there so a watched workflow past the page cannot
+        one day read as renamed on every sweep."""
         pages = [
             {"total_count": 3, "workflows": [{"id": 1, "name": "a"}, {"id": 2, "name": "b"}]},
             {"total_count": 3, "workflows": [{"id": 3, "name": "c"}]},
@@ -734,11 +734,11 @@ class ReconcileTest(unittest.TestCase):
         body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
         stored = issue(901, 77, 10)
         stored["title"] = "someone renamed this"
-        stored["body"] = body
+        stored["body"] = body.replace("| run | commit |", "A note.\n\n| run | commit |")
         api = FakeAPI([stored])
         self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["update"])
-        self.assertEqual(api.actions[0][2]["title"], notifier.render_title(decision))
+        self.assertEqual(api.actions[0][2], {"title": notifier.render_title(decision)}, "title only; the note stays")
 
     def test_a_new_commit_on_a_broken_main_still_updates_and_comments(self):
         """The idempotency check must not swallow real news: a body that lists
@@ -840,12 +840,14 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["label", "create"])
 
-    def test_a_stale_read_after_the_workflows_own_close_does_not_refile(self):
-        """Main recovered at 12 and the bot closed #901. A later read returns a
-        page from before the recovery: 11 red, 10 red, 9 green. The
-        completeness check passes -- the run the page lacks is the green, which
-        no issue names -- so the close postdating every run in the streak is
-        what keeps a "main is broken" issue from opening against a green main."""
+    def test_a_stale_read_after_an_unstamped_close_does_not_refile(self):
+        """Main recovered at 12 and #901 was closed without a fixed-by stamp:
+        by a person, or by this script before it stamped. A later read returns
+        a page from before the recovery: 11 red, 10 red, 9 green. The
+        completeness check passes -- the page lacks only the green, which the
+        unstamped issue does not name -- so the close postdating every run in
+        the streak is what keeps a "main is broken" issue from opening against
+        a green main. A stamped close is caught earlier, as a hole."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
         self._reconcile(api, decision)
@@ -897,9 +899,9 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.actions, [])
 
     def test_a_note_written_into_the_body_survives_a_sweep_without_a_comment(self):
-        """The body is rewritten only when the table gains a row, so a person's
-        note stays until there is news, and no "Still failing" is posted for a
-        commit that is not news."""
+        """The body is rewritten only when the set of rows changes, so a
+        person's note stays until there is news, and no "Still failing" is
+        posted for a commit that is not news."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
         annotated = issue(901, 77, 10)
