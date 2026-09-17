@@ -62,9 +62,9 @@ on 2026-09-17 a read that lacked runs 5928 and 6008 made run 6009 look like a
 fresh breakage, and the notifier opened a second issue and closed the right one
 as superseded. So before it opens, supersedes, rewrites or closes anything, it
 checks that every run the issues in play name -- open, and closed when it is
-about to open one -- is in the list it read, or is older than a full page, or
-has been deleted from GitHub, which are the honest reasons for a run to be
-absent; and a page shorter than the count the endpoint itself reports is
+about to open one -- is in the list it read, or is older than a full page, or,
+for a run the issue links to, has been deleted from GitHub, which are the
+honest reasons for a run to be absent; and a page shorter than the count the endpoint itself reports is
 refused before any of that. Issues name only red runs, so a green close also
 stamps the issue with the run that fixed it: a later page that has the reds
 around that green but not the green itself is then a hole too, not a relapse. A read that fails writes nothing; the next read is
