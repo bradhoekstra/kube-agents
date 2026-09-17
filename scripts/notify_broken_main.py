@@ -43,24 +43,25 @@ main that is green.
 Two bounds keep the reconciliation from undoing a person or a newer run. A
 green closes only issues whose episode is no newer than the green run itself,
 because an issue for a red that finished after this green describes a main this
-green has not seen. And a closed issue that carries the current episode's marker,
-already lists the newest red run, and was not closed by this workflow's own
-token is a breakage someone has dealt with -- by hand, or by a merge whose
-description named the issue; the workflow's header admits it can file on an
-innocent commit -- so it is not filed again for a run it already knew about. A
-red run it never listed is new evidence and files as usual, and so does the next
-episode; a close the workflow itself made, the green that ended a streak, does
-not silence the same run going red again on a re-run.
+green has not seen. And a closed issue that carries the current episode's marker
+and was closed after the last change to any run in the streak is a breakage
+that has been dealt with, whoever closed it -- a person, a merge whose
+description named the issue, or this workflow itself on a green that a stale
+read no longer shows -- so it is not filed again for evidence that predates the
+close. A run re-run after the close, or a new red, moves the streak past it and
+files as usual, and so does the next episode.
 
 A third bound is about the read rather than the state. The run-history endpoint
 has answered with a page missing recent runs, and once with a page weeks old:
 on 2026-09-17 a read that lacked runs 5928 and 6008 made run 6009 look like a
 fresh breakage, and the notifier opened a second issue and closed the right one
 as superseded. So before it opens, supersedes, rewrites or closes anything, it
-checks that every run the issues in play name is in the list it read -- or is
-older than a full page, which is the one honest reason for a run to be absent.
-A read that fails that test writes nothing; the next read is at most fifteen
-minutes away.
+checks that every run the issues in play name -- open, and closed when it is
+about to open one -- is in the list it read, or is older than a full page,
+which is the one honest reason for a run to be absent. A read that fails that
+test writes nothing; the next read is at most fifteen minutes away, or as long
+as a re-run of a listed run takes, since a run being re-run is not completed and
+is absent from every page until it is.
 
 That is also what makes a dropped notify run survivable. GitHub keeps one run
 pending per concurrency group and cancels the rest of a burst, and the earlier
@@ -165,11 +166,6 @@ LABEL_DESCRIPTION = "A required check is failing on main"
 # The two issue states the reconciliation reads.
 ISSUE_OPEN = "open"
 ISSUE_CLOSED = "closed"
-
-# Who closes an issue when this script does, running on the workflow's own
-# `GITHUB_TOKEN`. A close by anyone else is a decision about the breakage; one
-# by this login is the script's own bookkeeping and silences nothing.
-OWN_CLOSER_LOGIN = "github-actions[bot]"
 
 # The episode marker, read back off an issue body to learn which run opened it,
 # and a table row, read back to learn which runs the issue already lists.
@@ -659,26 +655,29 @@ def reconcile(api, notification, repo, workflow_id):
         return leave(gaps)
 
     if current is None:
-        # No open issue for this episode. Before opening one, look for a closed
-        # one that already lists the newest red run and that this workflow did
-        # not close itself: someone closed it knowing what it knows -- by hand,
-        # or through a merge whose description named it -- and the sweep would
-        # otherwise reverse that within fifteen minutes, and again after every
-        # close. A closed issue that never saw this run does not count, whoever
-        # closed it: a red that landed after a "fixes" merge is new evidence
-        # and files. Nor does a close made on the workflow's own token -- the
-        # green that ended the streak, or a supersede -- since the same run
-        # re-run back to red after that is a breakage nobody has looked at.
-        newest_red = notification["run"]["html_url"]
+        # No open issue for this episode. Before opening one, look at the closed
+        # ones. First for holes: a closed issue naming a run this read lacks
+        # means the read is short, and a fresh episode built on it is a hole,
+        # not a breakage. Then for a dismissal: an issue for this episode closed
+        # after the last change to any run in the streak was closed knowing
+        # everything the streak knows -- by a person, by a merge whose
+        # description named it, or by this workflow on a green that a stale
+        # read no longer shows -- and the sweep would otherwise reverse that
+        # within fifteen minutes, and again after every close. A run re-run
+        # after the close, or a red that landed after a "fixes" merge, moves a
+        # run's timestamp past the close and is new evidence: it files.
+        closed = api.issues_for_workflow(workflow_id, ISSUE_CLOSED)
+        gaps = incomplete_for(closed)
+        if gaps:
+            return leave(gaps)
+        latest_change = max(run["updated_at"] for run in notification["streak"])
         dismissed = [
             issue
-            for issue in api.issues_for_workflow(workflow_id, ISSUE_CLOSED)
-            if marker in (issue.get("body") or "")
-            and newest_red in (issue.get("body") or "")
-            and (issue.get("closed_by") or {}).get("login") != OWN_CLOSER_LOGIN
+            for issue in closed
+            if marker in (issue.get("body") or "") and (issue.get("closed_at") or "") > latest_change
         ]
         if dismissed:
-            done = f"#{dismissed[0]['number']} already lists run {notification['run']['run_number']} and was closed; leaving it"
+            done = f"#{dismissed[0]['number']} was closed after the last of these runs changed; leaving it"
             for issue in stale:
                 api.comment(issue["number"], f"Superseded by #{dismissed[0]['number']}, which was closed.")
                 api.close_issue(issue["number"])

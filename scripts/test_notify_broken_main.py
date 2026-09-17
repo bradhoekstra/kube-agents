@@ -52,6 +52,7 @@ def run(number, conclusion, *, sha=None, subject="a commit", run_id=None, name="
         "html_url": f"https://github.com/gke-labs/kube-agents/actions/runs/{1000 + number}",
         "workflow_id": 77,
         "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z",
     }
 
 
@@ -751,7 +752,11 @@ class HandCloseAndOrderingTest(unittest.TestCase):
     def _reconcile(self, api, decision, workflow_id=77):
         return notifier.reconcile(api, decision, self.REPO, workflow_id)
 
-    def _closed_listing(self, decision, closed_by="a-person"):
+    BEFORE = "2026-08-31T00:00:00Z"  # earlier than every fixture run's updated_at
+    AFTER = "2026-09-02T00:00:00Z"  # later than every fixture run's updated_at
+    LATER_STILL = "2026-09-03T00:00:00Z"
+
+    def _closed_listing(self, decision, closed_at):
         """An issue the notifier itself wrote for `decision`, then closed."""
         body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
         return {
@@ -759,59 +764,79 @@ class HandCloseAndOrderingTest(unittest.TestCase):
             "state": "closed",
             "title": notifier.render_title(decision),
             "body": body,
-            "closed_by": {"login": closed_by},
+            "closed_at": closed_at,
         }
 
-    def test_an_issue_closed_knowing_the_newest_red_is_not_refiled(self):
+    def test_an_issue_closed_after_the_streaks_last_change_is_not_refiled(self):
         """Without this the sweep reopens a dismissed issue within fifteen
-        minutes, under a new number, after every close. The closed issue lists
-        run 11, the newest red, so whoever closed it knew what it knows."""
+        minutes, under a new number, after every close. Whoever closed it did
+        so after run 11, the newest red, last changed."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        api = FakeAPI(closed_issues=[self._closed_listing(decision)])
+        api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
         result = self._reconcile(api, decision)
         self.assertEqual(api.actions, [])
-        self.assertIn("already lists run 11", result)
+        self.assertIn("closed after", result)
 
-    def test_a_red_the_closed_issue_never_saw_is_filed_again(self):
+    def test_a_red_that_finished_after_the_close_is_filed_again(self):
         """A merged pull request that says `Fixes #901` closes the issue through
-        Prow and then goes red itself. Its run is not in #901's table, so the
-        close is not a dismissal of it, whoever performed the close."""
+        Prow and then goes red itself. That run changed after the close, so
+        the close is not a dismissal of it, whoever performed the close."""
         earlier = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        api = FakeAPI(closed_issues=[self._closed_listing(earlier)])
-        later = notifier.decide(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(earlier, self.AFTER)])
+        fix_that_broke = run(12, "failure")
+        fix_that_broke["updated_at"] = self.LATER_STILL
+        later = notifier.decide(fix_that_broke, [run(11, "failure"), run(10, "failure"), run(9, "success")])
         self._reconcile(api, later)
         self.assertEqual(api.kinds(), ["label", "create"])
-        self.assertIn(run(12, "failure")["html_url"], api.actions[1][3])
-
-    def test_the_bots_own_superseded_close_does_not_silence_a_rerun(self):
-        """Run 10, the episode's first red, is re-run. While it is running the
-        history reads 12, 11 and the episode is 11: #902 opens and #901
-        (episode 10) is closed as superseded by the bot. The re-run finishes
-        red, the episode is 10 again, and the newest red, 12, is not in #901's
-        table -- so it files rather than falling silent behind its own close."""
-        first = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        api = FakeAPI(closed_issues=[self._closed_listing(first)])
-        api.open_issues.append(issue(902, 77, 11))
-        after_rerun = notifier.decide(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
-        self._reconcile(api, after_rerun)
-        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
-        self.assertEqual(api.actions[3][1], 902)
 
     def test_the_workflows_own_green_close_does_not_dismiss_the_same_run_going_red_again(self):
         """Run 10 red opened #901; a re-run of 10 went green and the bot closed
-        #901, which lists run 10; a further re-run of 10 goes red. The closed
-        issue matches the marker and lists the newest red, but the close was
-        the bot's own bookkeeping, not anyone's decision, so it files."""
-        decision = notifier.decide(run(10, "failure"), [run(9, "success")])
-        api = FakeAPI(closed_issues=[self._closed_listing(decision, closed_by=notifier.OWN_CLOSER_LOGIN)])
+        #901; a further re-run of 10 goes red. The re-run moved run 10's
+        timestamp past the close, so it is new evidence and files."""
+        rerun_red = run(10, "failure")
+        rerun_red["updated_at"] = self.LATER_STILL
+        decision = notifier.decide(rerun_red, [run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(notifier.decide(run(10, "failure"), [run(9, "success")]), self.AFTER)])
         self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["label", "create"])
+
+    def test_a_stale_read_after_the_workflows_own_close_does_not_refile(self):
+        """Main recovered at 12 and the bot closed #901. A later read returns a
+        page from before the recovery: 11 red, 10 red, 9 green. Nothing is
+        open, so the completeness check has nothing to compare; the close
+        postdating every run in the streak is what keeps a "main is broken"
+        issue from opening against a green main."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
+        self._reconcile(api, decision)
+        self.assertEqual(api.actions, [])
+
+    def test_a_closed_issue_that_predates_the_streak_is_not_a_dismissal(self):
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(decision, self.BEFORE)])
+        self._reconcile(api, decision)
+        self.assertEqual(api.kinds(), ["label", "create"])
+
+    def test_a_superseded_close_left_behind_does_not_silence_a_later_red(self):
+        """State an older version of this script could leave: #901 (episode
+        10) closed as superseded while #902 (episode 11) stayed open, the
+        completed history then reading 12, 11, 10 red again. Run 10's re-run
+        finished after the close, so it files and #902 is superseded."""
+        first = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        api = FakeAPI(closed_issues=[self._closed_listing(first, self.AFTER)])
+        api.open_issues.append(issue(902, 77, 11))
+        rerun = run(10, "failure")
+        rerun["updated_at"] = self.LATER_STILL
+        after_rerun = notifier.decide(run(12, "failure"), [run(11, "failure"), rerun, run(9, "success")])
+        self._reconcile(api, after_rerun)
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+        self.assertEqual(api.actions[3][1], 902)
 
     def test_a_dismissal_still_supersedes_an_older_issue_left_open(self):
         """A stale older-episode issue whose close once failed must not sit
         open behind a dismissed newer episode until the next green."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        api = FakeAPI([issue(880, 77, 3)], closed_issues=[self._closed_listing(decision)])
+        api = FakeAPI([issue(880, 77, 3)], closed_issues=[self._closed_listing(decision, self.AFTER)])
         result = self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["comment", "close"])
         self.assertEqual(api.actions[1][1], 880)
@@ -821,7 +846,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         """A dismissal is about one episode. A green in between makes the next
         red a new episode with a new marker, and it opens as usual."""
         dismissed = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        api = FakeAPI(closed_issues=[self._closed_listing(dismissed)])
+        api = FakeAPI(closed_issues=[self._closed_listing(dismissed, self.AFTER)])
         self._reconcile(api, notifier.decide(run(13, "failure"), [run(12, "success"), run(11, "failure")]))
         self.assertEqual(api.kinds(), ["label", "create"])
 
@@ -835,16 +860,6 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         closed = [action[1] for action in api.actions if action[0] == "close"]
         self.assertEqual(closed, [902])
         self.assertEqual(len(api.open_issues), 1)
-
-    def test_the_bots_own_close_does_not_read_as_a_dismissal_of_the_next_episode(self):
-        """Green at 12 closed the episode that began at 10 -- through the fake,
-        so it lands in the closed list exactly as a hand close would. A red at
-        13 is episode 13, finds no closed issue for it, and files."""
-        api = FakeAPI([issue(901, 77, 10)])
-        self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
-        self.assertEqual(api.kinds(), ["comment", "close"])
-        self._reconcile(api, notifier.decide(run(13, "failure"), [run(12, "success")]))
-        self.assertEqual(api.kinds(), ["comment", "close", "label", "create"])
 
     def test_a_green_does_not_close_an_issue_about_a_newer_red(self):
         """A sweep read a green history at T; a red finished just after and
@@ -942,6 +957,18 @@ class IncompleteReadTest(unittest.TestCase):
         api = FakeAPI([issue(880, 77, 5)])
         self._reconcile(api, self._decision(run(69, "failure"), page))
         self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+
+    def test_a_closed_issue_naming_an_unlisted_run_blocks_a_fresh_episode(self):
+        """Nothing open, and the read is a short page: a closed issue for this
+        workflow names a run the page lacks, so the page is a hole and the
+        fresh episode it suggests is not opened."""
+        old = self._listing(880, self._decision(run(6, "failure"), [run(6, "failure"), run(5, "failure"), run(4, "success")]))
+        old["state"] = "closed"
+        old["closed_at"] = "2026-08-31T00:00:00Z"
+        api = FakeAPI(closed_issues=[old])
+        result = self._reconcile(api, self._decision(run(6, "failure"), [run(6, "failure")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("missing runs", result)
 
     def test_a_short_page_may_omit_nothing(self):
         """Fewer runs than the depth means the workflow's whole history came
