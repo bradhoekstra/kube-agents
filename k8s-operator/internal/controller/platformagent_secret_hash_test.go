@@ -320,6 +320,19 @@ func TestSecretEnvHashIsNotTheUnkeyedDigestOfTheValues(t *testing.T) {
 	if again == got {
 		t.Error("the same values under a different Secret UID digest the same, so the UID is not in the key")
 	}
+
+	// Every Secret the pod reads is in the key, not just the first: recreating
+	// the other one alone moves the digest too.
+	recreatedSlack := secretHashTestSecret("team-slack", slack)
+	recreatedSlack.UID = "a-uid-minted-by-recreating-team-slack"
+	r3, _ := secretHashTestReconciler(secretHashTestSecret("platform-agent-secrets", values), recreatedSlack)
+	third, err := r3.secretEnvHash(ctx, agent, secretHashTestPodSpec())
+	if err != nil {
+		t.Fatalf("secretEnvHash after recreating team-slack: %v", err)
+	}
+	if third == got {
+		t.Error("the same values under a different team-slack UID digest the same, so only the first Secret's UID is in the key")
+	}
 }
 
 // A key the pod does not read is not the pod's environment, and restarting the
