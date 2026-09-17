@@ -76,7 +76,7 @@ on:
   # reconciliation that finds the issues already right writes nothing.
   schedule:
     - cron: "*/15 * * * *"
-  #checkov:skip=CKV_GHA_7:One boolean, dry_run, which decides whether the sweep writes; nothing is built and no input reaches a shell
+  #checkov:skip=CKV_GHA_7:One boolean, dry_run, which decides whether the sweep writes; nothing is built and no input is interpolated into a shell
   workflow_dispatch:
     inputs:
       dry_run:
@@ -94,9 +94,9 @@ on:
 # So a burst of merges loses notify runs, and on 2026-09-16 it lost the only one
 # whose triggering run was red, on the timing (#1681): the survivors deferred
 # to it and main went unreported for nearly fifteen hours. That is survivable
-# now because every
-# notify run reconciles against the newest run of its workflow that said anything rather
-# than the one that woke it: the last arrival in a group is never cancelled, it
+# now because every notify run reconciles against the newest run of its
+# workflow that said anything rather than the one that woke it: the last
+# arrival in a group is never cancelled, it
 # runs after every push run of the burst has finished, and it files whatever the
 # newest of them says.
 #

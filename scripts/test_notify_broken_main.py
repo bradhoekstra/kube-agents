@@ -6,8 +6,8 @@ Run: cd scripts && python3 -m unittest test_notify_broken_main
 The event path cannot be exercised end to end before it is on main -- a
 `workflow_run` workflow only runs from the default branch's copy of itself, and
 a dispatch from a branch reaches only the sweep -- so everything that can be
-decided without a runner is decided here. Four failure
-modes are worth more than the rest: staying quiet when main is broken, which
+decided without a runner is decided here. Four failure modes are worth more
+than the rest: staying quiet when main is broken, which
 reproduces the gap this exists to close; opening an issue on a green run, which
 trains everyone to ignore the label; leaving an issue open after main recovers,
 which does the same thing more slowly; and writing to an issue that already says
@@ -936,8 +936,8 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["label", "create"])
 
     def test_an_unstamped_close_by_the_workflows_own_token_is_not_a_dismissal(self):
-        """The script on main before this change closed as superseded without
-        a stamp. Such a close, met after the change, could be a supersede or a
+        """Before the script stamped its closes, it closed as superseded
+        without one. Such a close, met later, could be a supersede or a
         recovery, so it counts for nothing and the breakage files."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         closed = self._closed_listing(decision, self.AFTER)
@@ -1524,7 +1524,7 @@ class SweepTest(unittest.TestCase):
 
 
 class WarnTest(unittest.TestCase):
-    def test_the_annotation_is_emitted_only_on_a_runner(self):
+    def test_the_annotation_is_emitted_only_when_the_notify_workflow_asks(self):
         """The unit tests exercise every refusal and their output is echoed
         into a CI step where `GITHUB_ACTIONS` is set, so the gate is a
         variable only the notify workflow sets."""
