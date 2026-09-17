@@ -51,8 +51,10 @@ read no longer shows -- so it is not filed again for evidence that predates the
 close. A run re-run after the close, or a new red, moves the streak past it and
 files as usual, and so does the next episode. The one close that never counts
 is this workflow's own "superseded": it says another issue covers the
-breakage, not that anyone dealt with it, and it is marked `not_planned` so it
-can be told apart.
+breakage, not that anyone dealt with it, and the issue is stamped with a hidden
+`superseded-by` line when it is closed so it can be told apart -- a state
+reason cannot do that, since "not planned" is also what a person picks for a
+false alarm.
 
 A third bound is about the read rather than the state. The run-history endpoint
 has answered with a page missing recent runs, and once with a page weeks old:
@@ -63,7 +65,9 @@ checks that every run the issues in play name -- open, and closed when it is
 about to open one -- is in the list it read, or is older than a full page, or
 has been deleted from GitHub, which are the honest reasons for a run to be
 absent; and a page shorter than the count the endpoint itself reports is
-refused before any of that. A read that fails writes nothing; the next read is
+refused before any of that. Issues name only red runs, so a green close also
+stamps the issue with the run that fixed it: a later page that has the reds
+around that green but not the green itself is then a hole too, not a relapse. A read that fails writes nothing; the next read is
 at most fifteen minutes away, or as long as a re-run of a listed run takes,
 since a run being re-run is not completed and is absent from every page until
 it is.
@@ -172,16 +176,24 @@ LABEL_DESCRIPTION = "A required check is failing on main"
 ISSUE_OPEN = "open"
 ISSUE_CLOSED = "closed"
 
-# Why an issue was closed. A recovery or a hand close reads as completed; an
-# issue closed because another issue covers the same breakage is marked
-# distinctly, so that close is never mistaken for someone dealing with it.
+# The state reason every close carries. Not used to mean anything: "not
+# planned" is what a person picks for a false alarm, so a close's meaning is
+# stamped into the body instead (below).
 CLOSE_COMPLETED = "completed"
-CLOSE_SUPERSEDED = "not_planned"
+
+# Hidden lines appended to an issue's body as it is closed. `superseded-by`
+# says another issue covers the breakage, so that close is never read as
+# someone dealing with it; `fixed-by` names the green run that ended the
+# episode, so a later history read that lacks that run reads as a hole.
+SUPERSEDED_STAMP = "<!-- main-broken superseded-by={number} -->"
+SUPERSEDED_PREFIX = "<!-- main-broken superseded-by="
+FIXED_BY_STAMP = "<!-- main-broken fixed-by={number} -->"
 
 # The episode marker, read back off an issue body to learn which run opened it,
 # and a table row, read back to learn which runs the issue already lists.
 _EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
 _ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)\)", re.MULTILINE)
+_FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+) -->")
 
 
 # --------------------------------------------------------------------------- #
@@ -334,17 +346,6 @@ def _cell(text):
     return text.replace("|", "\\|")
 
 
-def _normalised(text):
-    """Issue text in a form that survives a round trip through GitHub.
-
-    A body is compared with what the API hands back to decide whether it has
-    changed, and GitHub is free to hand back `\r\n` for the `\n` it was sent
-    or to trim a trailing newline. Either difference would read as a change and
-    make every sweep rewrite the issue and comment on it.
-    """
-    return (text or "").replace("\r\n", "\n").strip()
-
-
 def _commit_link(run, repo):
     return f"[`{run['head_sha'][:7]}`](https://github.com/{repo}/commit/{run['head_sha']})"
 
@@ -390,10 +391,15 @@ def runs_named(issue):
     """
     body = issue.get("body") or ""
     named = {int(number): int(run_id) for number, run_id in _ROW_RUN.findall(body)}
-    episode = episode_of(issue)
-    if episode:
-        named.setdefault(episode, None)
+    for number in [episode_of(issue)] + [int(n) for n in _FIXED_BY.findall(body)]:
+        if number:
+            named.setdefault(number, None)
     return named
+
+
+def listed_rows(issue):
+    """The run numbers an issue's table lists, which is what counts as news."""
+    return {int(number) for number, _ in _ROW_RUN.findall(issue.get("body") or "")}
 
 
 def history_window(runs):
@@ -431,8 +437,9 @@ def render_body(notification, repo, marker):
 
     A table of the commits that have landed since main went red, oldest first.
     It is derived entirely from the run history, so it is idempotent: handling
-    the same run twice produces the same body, and a hand-edited issue is
-    restored by the next reconciliation.
+    the same run twice produces the same body. It is written only when the
+    table gains a row, so a note someone adds to the body stays until the next
+    commit lands on the broken main.
     """
     run = notification["run"]
     workflow = run["name"]
@@ -618,8 +625,12 @@ class GitHubAPI(BaseGitHubAPI):
     def comment(self, number, body):
         return self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", {"body": body})
 
-    def close_issue(self, number, reason=CLOSE_COMPLETED):
-        return self.update_issue(number, state=ISSUE_CLOSED, state_reason=reason)
+    def close_issue(self, number):
+        return self.update_issue(number, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
+
+    def stamp(self, issue, line):
+        """Append a hidden line to an issue's body, keeping what is there."""
+        return self.update_issue(issue["number"], body=(issue.get("body") or "").rstrip() + "\n" + line)
 
 
 # --------------------------------------------------------------------------- #
@@ -683,6 +694,7 @@ def reconcile(api, notification, repo, workflow_id):
             return leave(gaps)
         for issue in closable:
             api.comment(issue["number"], comment)
+            api.stamp(issue, FIXED_BY_STAMP.format(number=green_number))
             api.close_issue(issue["number"])
         done = "closed " + ", ".join(f"#{issue['number']}" for issue in closable) if closable else "closed nothing"
         if newer:
@@ -692,8 +704,16 @@ def reconcile(api, notification, repo, workflow_id):
     marker = episode_marker(notification, workflow_id)
     title = render_title(notification)
     body = render_body(notification, repo, marker)
-    current = next((issue for issue in open_issues if marker in (issue.get("body") or "")), None)
+    # Of two issues opened for one episode by a sweep and an event run racing,
+    # the older is the one people were notified of; it stays.
+    matching = [issue for issue in open_issues if marker in (issue.get("body") or "")]
+    current = min(matching, key=lambda issue: issue["number"], default=None)
     stale = [issue for issue in open_issues if issue is not current]
+
+    def supersede(issue, by_number):
+        api.comment(issue["number"], f"Superseded by #{by_number}.")
+        api.stamp(issue, SUPERSEDED_STAMP.format(number=by_number))
+        api.close_issue(issue["number"])
 
     # A read that lacks a run these issues name is not a read to act on: a
     # fresh episode it suggests may be a hole in the list, and a shorter streak
@@ -724,42 +744,41 @@ def reconcile(api, notification, repo, workflow_id):
             issue
             for issue in closed
             if marker in (issue.get("body") or "")
-            and issue.get("state_reason") != CLOSE_SUPERSEDED
+            and SUPERSEDED_PREFIX not in (issue.get("body") or "")
             and (issue.get("closed_at") or "") > latest_change
         ]
         if dismissed:
             done = f"#{dismissed[0]['number']} was closed after the last of these runs changed; leaving it"
             for issue in stale:
-                api.comment(issue["number"], f"Superseded by #{dismissed[0]['number']}, which was closed.")
-                api.close_issue(issue["number"], CLOSE_SUPERSEDED)
+                supersede(issue, dismissed[0]["number"])
                 done += f", superseded #{issue['number']}"
             return done
         api.ensure_label()
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
     else:
-        # Rewrite the issue only when the history says something it does not
-        # yet. A body that already lists this run was written by the notify run
-        # that saw it first, and that run commented then; the scheduled sweep
-        # and a redelivered event both land here, and either commenting again
-        # would add a "Still failing" every fifteen minutes for as long as main
-        # stays red. A hand-edited title is restored without a comment: the
-        # commits it lists are not news.
-        body_changed = _normalised(current.get("body")) != _normalised(body)
-        if body_changed or current.get("title") != title:
+        # Rewrite the issue only when the table gains a row. A body that
+        # already lists this run was written by the notify run that saw it
+        # first, and that run commented then; the scheduled sweep and a
+        # redelivered event both land here, and either commenting again would
+        # add a "Still failing" every fifteen minutes for as long as main stays
+        # red. Comparing rows rather than text also leaves a note someone wrote
+        # into the body alone until there is news to rewrite it with. A
+        # hand-edited title is restored without a comment: nothing is news.
+        rows_changed = listed_rows(current) != {run["run_number"] for run in notification["streak"]}
+        if rows_changed or current.get("title") != title:
             api.update_issue(current["number"], title=title, body=body)
             done = f"updated #{current['number']}"
         else:
             done = f"#{current['number']} already says so"
-        if comment and body_changed:
+        if comment and rows_changed:
             api.comment(current["number"], comment)
 
     # An issue for an older breakage of this workflow is still open, which means
     # its recovery never got recorded. Point it at the current one and close it
     # rather than leaving two issues claiming main is broken.
     for issue in stale:
-        api.comment(issue["number"], f"Superseded by #{current['number']}.")
-        api.close_issue(issue["number"], CLOSE_SUPERSEDED)
+        supersede(issue, current["number"])
         done += f", superseded #{issue['number']}"
     return done
 

@@ -519,10 +519,10 @@ class QueryTest(unittest.TestCase):
         self.assertFalse(api.run_exists(1010))
         self.assertTrue(calls[0].full_url.endswith("/actions/runs/1010"))
 
-    def test_a_superseded_close_carries_its_own_reason(self):
+    def test_a_stamp_appends_to_the_body_it_was_given(self):
         api, calls = self._api({})
-        api.close_issue(901, notifier.CLOSE_SUPERSEDED)
-        self.assertEqual(json.loads(calls[0].data)["state_reason"], notifier.CLOSE_SUPERSEDED)
+        api.stamp({"number": 901, "body": "text\n\n<!-- marker -->\n"}, "<!-- main-broken fixed-by=12 -->")
+        self.assertEqual(json.loads(calls[0].data)["body"], "text\n\n<!-- marker -->\n<!-- main-broken fixed-by=12 -->")
 
     def test_the_issue_query_is_scoped_to_the_labelled_issues_in_one_state(self):
         for state in ("open", "closed"):
@@ -610,11 +610,13 @@ class FakeAPI:
     def comment(self, number, body):
         self.actions.append(("comment", number, body))
 
-    def close_issue(self, number, reason=notifier.CLOSE_COMPLETED):
+    def stamp(self, issue, line):
+        self.update_issue(issue["number"], body=(issue.get("body") or "").rstrip() + "\n" + line)
+
+    def close_issue(self, number):
         self.actions.append(("close", number))
         for issue in self.open_issues:
             if issue["number"] == number:
-                issue["state_reason"] = reason
                 issue["closed_at"] = "2026-09-04T00:00:00Z"
                 self.closed_issues.append(issue)
         self.open_issues = [issue for issue in self.open_issues if issue["number"] != number]
@@ -649,11 +651,12 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["update", "comment"])
         self.assertEqual(api.actions[0][1], 901)
 
-    def test_a_recovery_closes_the_issue(self):
+    def test_a_recovery_closes_the_issue_and_stamps_the_fixing_run(self):
         api = FakeAPI([issue(901, 77, 10)])
         self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
-        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
         self.assertIn("Fixed by", api.actions[0][2])
+        self.assertIn(notifier.FIXED_BY_STAMP.format(number=12), api.closed_issues[0]["body"])
 
     def test_a_recovery_with_nothing_open_is_quiet(self):
         """Main was already red when this workflow was added, or someone closed
@@ -678,7 +681,7 @@ class ReconcileTest(unittest.TestCase):
         green; or two runs were handled out of order."""
         api = FakeAPI([issue(901, 77, 10)])
         self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "success")]))
-        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
         self.assertIn("still open", api.actions[0][2])
         self.assertNotIn("Fixed by", api.actions[0][2], "this run is not the fix and must not claim to be")
 
@@ -712,8 +715,8 @@ class ReconcileTest(unittest.TestCase):
         self.assertIn("already says so", result)
 
     def test_a_body_github_hands_back_with_crlf_still_reads_as_current(self):
-        """GitHub may return `\r\n` for the `\n` it was sent. Compared raw,
-        every sweep would see a change, rewrite the body, and comment."""
+        """GitHub may return `\r\n` for the `\n` it was sent. The rows are
+        what is compared, and the row pattern has to survive that too."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
         stored = issue(901, 77, 10)
@@ -765,16 +768,17 @@ class ReconcileTest(unittest.TestCase):
         main is broken is worse than the missed close that caused it."""
         api = FakeAPI([issue(901, 77, 5)])
         self._reconcile(api, notifier.decide(run(10, "failure"), [run(9, "success")]))
-        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "update", "close"])
         self.assertIn("Superseded by #901", api.actions[2][2])
-        self.assertEqual(api.actions[3][1], 901)
+        self.assertEqual(api.actions[4][1], 901)
+        self.assertIn(notifier.SUPERSEDED_PREFIX, api.closed_issues[0]["body"])
 
     def test_a_recovery_closes_every_open_issue_for_the_workflow(self):
         """Same repair: main is green, so nothing about this workflow should
         still be claiming otherwise."""
         api = FakeAPI([issue(901, 77, 10), issue(902, 77, 5)])
         self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
-        self.assertEqual(api.kinds(), ["comment", "close", "comment", "close"])
+        self.assertEqual(api.kinds(), ["comment", "update", "close", "comment", "update", "close"])
 
 
 class HandCloseAndOrderingTest(unittest.TestCase):
@@ -865,8 +869,8 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         rerun["updated_at"] = self.LATER_STILL
         after_rerun = notifier.decide(run(12, "failure"), [run(11, "failure"), rerun, run(9, "success")])
         self._reconcile(api, after_rerun)
-        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
-        self.assertEqual(api.actions[3][1], 902)
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "update", "close"])
+        self.assertEqual(api.actions[4][1], 902)
 
     def test_the_workflows_own_superseded_close_is_never_a_dismissal(self):
         """A read that omitted a green once made run 10 look like the episode
@@ -877,15 +881,33 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         decision = notifier.decide(run(12, "failure"), [run(11, "success"), run(10, "failure")])
         superseded = self._closed_listing(decision, self.AFTER)
         superseded["number"] = 902
-        superseded["state_reason"] = notifier.CLOSE_SUPERSEDED
+        superseded["body"] += "\n" + notifier.SUPERSEDED_STAMP.format(number=903)
         api = FakeAPI(closed_issues=[superseded])
         self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["label", "create"])
 
-    def test_superseding_closes_with_the_superseded_reason(self):
-        api = FakeAPI([issue(880, 77, 3)])
-        self._reconcile(api, notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
-        self.assertEqual(api.closed_issues[0]["state_reason"], notifier.CLOSE_SUPERSEDED)
+    def test_a_persons_close_as_not_planned_is_a_dismissal(self):
+        """"Not planned" is the reason a person picks for a false alarm, so it
+        must count exactly like any other close after the streak's last change."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        closed = self._closed_listing(decision, self.AFTER)
+        closed["state_reason"] = "not_planned"
+        api = FakeAPI(closed_issues=[closed])
+        self._reconcile(api, decision)
+        self.assertEqual(api.actions, [])
+
+    def test_a_note_written_into_the_body_survives_a_sweep_without_a_comment(self):
+        """The body is rewritten only when the table gains a row, so a person's
+        note stays until there is news, and no "Still failing" is posted for a
+        commit that is not news."""
+        decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
+        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
+        annotated = issue(901, 77, 10)
+        annotated["title"] = notifier.render_title(decision)
+        annotated["body"] = body.replace("| run | commit |", "Root cause: X, fix in #1700.\n\n| run | commit |")
+        api = FakeAPI([annotated])
+        self._reconcile(api, decision)
+        self.assertEqual(api.actions, [])
 
     def test_a_dismissal_still_supersedes_an_older_issue_left_open(self):
         """A stale older-episode issue whose close once failed must not sit
@@ -893,8 +915,8 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI([issue(880, 77, 3)], closed_issues=[self._closed_listing(decision, self.AFTER)])
         result = self._reconcile(api, decision)
-        self.assertEqual(api.kinds(), ["comment", "close"])
-        self.assertEqual(api.actions[1][1], 880)
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
+        self.assertEqual(api.actions[2][1], 880)
         self.assertIn("superseded #880", result)
 
     def test_the_next_breakage_after_a_dismissal_is_filed(self):
@@ -910,11 +932,11 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         same second. The next reconciliation keeps one and closes the other as
         superseded -- the workflow header promises this, so it is pinned."""
         decision = notifier.decide(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        api = FakeAPI([issue(901, 77, 10), issue(902, 77, 10)])
+        api = FakeAPI([issue(902, 77, 10), issue(901, 77, 10)])  # newest first, as the API lists them
         self._reconcile(api, decision)
         closed = [action[1] for action in api.actions if action[0] == "close"]
-        self.assertEqual(closed, [902])
-        self.assertEqual(len(api.open_issues), 1)
+        self.assertEqual(closed, [902], "the older issue, the one people were notified of, stays")
+        self.assertEqual([i["number"] for i in api.open_issues], [901])
 
     def test_a_green_does_not_close_an_issue_about_a_newer_red(self):
         """A sweep read a green history at T; a red finished just after and
@@ -938,7 +960,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(notifier.episode_of(damaged), 0)
         api = FakeAPI([damaged])
         self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "success")]))
-        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
 
 
 class IncompleteReadTest(unittest.TestCase):
@@ -974,7 +996,7 @@ class IncompleteReadTest(unittest.TestCase):
         api = FakeAPI([open_issue], deleted_runs={1011})
         holed = [run(12, "failure"), run(10, "failure"), run(9, "success")]
         self._reconcile(api, self._decision(run(12, "failure"), holed))
-        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertEqual(api.kinds(), ["update", "comment"], "the table lost the deleted run's row, which is a change")
 
     def test_a_read_missing_the_episode_does_not_open_a_second_issue(self):
         """2026-09-17 on main: #1677 (episode 5928, rows 5928 and 6008) was
@@ -1013,7 +1035,7 @@ class IncompleteReadTest(unittest.TestCase):
         self._reconcile(api, self._decision(run(12, "success"), [run(12, "success")]))
         self.assertEqual(api.actions, [])
         self._reconcile(api, self._decision(run(12, "success"), [run(12, "success"), run(11, "failure"), run(10, "failure")]))
-        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
         self.assertIn("Fixed by", api.actions[0][2])
 
     def test_a_full_page_may_omit_runs_older_than_itself(self):
@@ -1023,7 +1045,7 @@ class IncompleteReadTest(unittest.TestCase):
         self.assertEqual(len(page), notifier.HISTORY_DEPTH)
         api = FakeAPI([issue(880, 77, 5)])
         self._reconcile(api, self._decision(run(69, "failure"), page))
-        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "update", "close"])
 
     def test_a_closed_issue_naming_an_unlisted_run_blocks_a_fresh_episode(self):
         """Nothing open, and the read is a short page: a closed issue for this
@@ -1036,6 +1058,24 @@ class IncompleteReadTest(unittest.TestCase):
         result = self._reconcile(api, self._decision(run(6, "failure"), [run(6, "failure")]))
         self.assertEqual(api.actions, [])
         self.assertIn("missing runs", result)
+
+    def test_a_page_lacking_the_green_that_ended_an_episode_is_a_hole(self):
+        """True history: 10 red, 11 green, 12 red. The green close stamped
+        #901 with fixed-by=11. A read of 12 red, 10 red, 9 green -- the green
+        missing -- would otherwise reopen episode 10 and blame the fixed
+        commit; the stamp lets the check see the hole."""
+        api = FakeAPI([self._listing(901, self._decision(run(10, "failure"), [run(10, "failure"), run(9, "success")]))])
+        self._reconcile(api, self._decision(run(11, "success"), [run(11, "success"), run(10, "failure"), run(9, "success")]))
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
+        self.assertEqual(notifier.runs_named(api.closed_issues[0]), {10: 1010, 11: None})
+        relapse = self._decision(run(12, "failure"), [run(12, "failure"), run(10, "failure"), run(9, "success")])
+        result = self._reconcile(api, relapse)
+        self.assertEqual(api.kinds(), ["comment", "update", "close"])
+        self.assertIn("11", result)
+        whole = self._decision(run(12, "failure"), [run(12, "failure"), run(11, "success"), run(10, "failure")])
+        self._reconcile(api, whole)
+        self.assertEqual(api.kinds()[-2:], ["label", "create"])
+        self.assertIn("episode=12", api.actions[-1][3])
 
     def test_a_short_page_may_omit_nothing(self):
         """Fewer runs than the depth means the workflow's whole history came
