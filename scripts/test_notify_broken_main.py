@@ -499,13 +499,17 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(len(api.workflows()), 1)
         self.assertEqual(len(calls), 2)
 
-    def test_a_history_page_shorter_than_its_own_count_is_refused(self):
-        """The endpoint says how many runs match; a page with fewer than that
-        (up to the depth asked for) is a read with a hole in it."""
-        api, _ = self._api({"total_count": 3, "workflow_runs": [run(3, "success")]})
+    def test_an_empty_history_page_for_a_workflow_with_runs_is_refused(self):
+        """The endpoint says how many runs match; an empty page against a
+        non-zero count is a read with nothing in it. A page merely shorter
+        than the count is accepted: the count has been seen to change between
+        calls, and a newly watched workflow is short of a page for a while."""
+        api, _ = self._api({"total_count": 3, "workflow_runs": []})
         self.assertIsNone(api.history(77))
-        api, _ = self._api({"total_count": 1, "workflow_runs": [run(3, "success")]})
+        api, _ = self._api({"total_count": 3, "workflow_runs": [run(3, "success")]})
         self.assertEqual(len(api.history(77)), 1)
+        api, _ = self._api({"total_count": 0, "workflow_runs": []})
+        self.assertEqual(api.history(77), [])
         full = [run(n, "success") for n in range(notifier.HISTORY_DEPTH)]
         api, _ = self._api({"total_count": 500, "workflow_runs": full})
         self.assertEqual(len(api.history(77)), notifier.HISTORY_DEPTH)

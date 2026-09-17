@@ -65,8 +65,11 @@ as superseded. So before it opens, supersedes, rewrites or closes anything, it
 checks that every run the issues in play name -- open, and closed when it is
 about to open one -- is in the list it read, or is older than a full page, or,
 for a run the issue links to, has been deleted from GitHub, which are the
-honest reasons for a run to be absent; and a page shorter than the count the
-endpoint itself reports is refused before any of that. Issues name only red
+honest reasons for a run to be absent; and an empty page for a workflow the
+endpoint itself counts runs for is refused before any of that -- only the
+empty one, since the count has been seen to change between two calls and a
+short page is the ordinary state of a newly watched workflow. Issues name only
+red
 runs, so a green close also stamps the issue with the run that fixed it: a
 later page that has the reds around that green but not the green itself is
 then a hole too, not a relapse. A read that fails writes nothing; the next read
@@ -599,8 +602,11 @@ class GitHubAPI(BaseGitHubAPI):
 
     def history(self, workflow_id, branch="main", depth=HISTORY_DEPTH):
         """Completed push runs of one workflow on `branch`, newest first, or
-        None when the page is shorter than the endpoint's own count says it
-        should be -- a read not to build anything on.
+        None when the page is empty although the endpoint's own count says
+        the workflow has runs -- a read not to build anything on. Only that
+        case: the count has been seen to differ between two calls minutes
+        apart, so a page merely shorter than it is not evidence, and a newly
+        watched workflow has fewer runs than a page for a while.
 
         `event=push` keeps pull-request runs of the same workflow out: they
         vastly outnumber the push runs and say nothing about main.
@@ -616,9 +622,8 @@ class GitHubAPI(BaseGitHubAPI):
         path = f"/repos/{self.repo}/actions/workflows/{workflow_id}/runs?{query}"
         page = self.get(path)
         runs = page["workflow_runs"]
-        expected = min(page.get("total_count", len(runs)), depth)
-        if len(runs) < expected:
-            warn(f"history of workflow {workflow_id} came back with {len(runs)} of {expected} runs; not trusting it")
+        if not runs and page.get("total_count", 0) > 0:
+            warn(f"history of workflow {workflow_id} came back empty for {page['total_count']} runs; not trusting it")
             return None
         return runs
 

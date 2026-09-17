@@ -82,7 +82,7 @@ on:
       dry_run:
         description: Print what the sweep would file and file nothing
         type: boolean
-        default: false
+        default: true
 
 # Push-to-main event runs are serialised per watched workflow. Two merges
 # landing together would otherwise both read the same history, reach the same
