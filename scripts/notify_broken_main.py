@@ -53,7 +53,8 @@ is this workflow's own "superseded": it says another issue covers the
 breakage, not that anyone dealt with it, and the issue is stamped with a hidden
 `superseded-by` line when it is closed so it can be told apart -- a state
 reason cannot do that, since "not planned" is also what a person picks for a
-false alarm.
+false alarm. A close on the workflow's own token that carries no stamp at all
+predates the stamps and could be either kind, so it does not count either.
 
 A third bound is about the read rather than the state. The run-history endpoint
 has answered with a page missing recent runs, and once with a page weeks old:
@@ -180,6 +181,12 @@ ISSUE_CLOSED = "closed"
 # planned" is what a person picks for a false alarm, so a close's meaning is
 # stamped into the body instead (below).
 CLOSE_COMPLETED = "completed"
+
+# Who closes an issue when this script does, on the workflow's own token. A
+# close by this login that carries no stamp was made by the script before it
+# stamped closes, and its "superseded" and "recovered" closes look alike, so
+# neither counts as a dismissal; every close the script makes now is stamped.
+OWN_CLOSER_LOGIN = "github-actions[bot]"
 
 # Hidden lines appended to an issue's body as it is closed. `superseded-by`
 # says another issue covers the breakage, so that close is never read as
@@ -535,6 +542,7 @@ class GitHubAPI(BaseGitHubAPI):
             opener=opener,
             sleep=sleep,
         )
+        self._issues = {}
 
     def run(self, run_id):
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}")
@@ -597,12 +605,25 @@ class GitHubAPI(BaseGitHubAPI):
         still in progress, and runs a short page failed to list -- so an older
         closed issue past the page goes unchecked, which errs toward writing.
         """
-        query = urllib.parse.urlencode({"labels": LABEL, "state": state, "per_page": PER_PAGE})
-        issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
         prefix = workflow_marker(workflow_id)
         return [
-            issue for issue in issues if "pull_request" not in issue and prefix in (issue.get("body") or "")
+            issue
+            for issue in self._labelled_issues(state)
+            if "pull_request" not in issue and prefix in (issue.get("body") or "")
         ]
+
+    def _labelled_issues(self, state):
+        """One read of the label's issues per state per process.
+
+        The query does not depend on the workflow, and a sweep asks for it once
+        per watched workflow; each workflow's issues are disjoint by marker, so
+        a list read before another workflow's writes is still current for this
+        one.
+        """
+        if state not in self._issues:
+            query = urllib.parse.urlencode({"labels": LABEL, "state": state, "per_page": PER_PAGE})
+            self._issues[state] = self.get(f"/repos/{self.repo}/issues?{query}") or []
+        return self._issues[state]
 
     def ensure_label(self):
         """Create the label if this is the first breakage ever recorded.
@@ -626,12 +647,14 @@ class GitHubAPI(BaseGitHubAPI):
     def comment(self, number, body):
         return self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", {"body": body})
 
-    def close_issue(self, number):
-        return self.update_issue(number, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
+    def close_issue(self, issue, stamp):
+        """Close an issue and stamp its body with why, in one write.
 
-    def stamp(self, issue, line):
-        """Append a hidden line to an issue's body, keeping what is there."""
-        return self.update_issue(issue["number"], body=(issue.get("body") or "").rstrip() + "\n" + line)
+        One PATCH rather than two, so a failure between them cannot leave an
+        open issue already carrying a stamp.
+        """
+        body = (issue.get("body") or "").rstrip() + "\n" + stamp
+        return self.update_issue(issue["number"], body=body, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
 
 
 # --------------------------------------------------------------------------- #
@@ -646,7 +669,7 @@ def reconcile(api, notification, repo, workflow_id):
     """
     open_issues = api.issues_for_workflow(workflow_id, ISSUE_OPEN)
     comment = render_comment(notification, repo)
-    window = notification.get("window")
+    window = notification["window"]
 
     deleted = {}
 
@@ -660,8 +683,6 @@ def reconcile(api, notification, repo, workflow_id):
 
     def incomplete_for(issues):
         """The issues among `issues` that name runs this read did not list."""
-        if window is None:
-            return {}
         gaps = {}
         for issue in issues:
             missing = sorted(n for n, run_id in unlisted_runs(issue, window).items() if still_exists(run_id))
@@ -695,8 +716,7 @@ def reconcile(api, notification, repo, workflow_id):
             return leave(gaps)
         for issue in closable:
             api.comment(issue["number"], comment)
-            api.stamp(issue, FIXED_BY_STAMP.format(number=green_number))
-            api.close_issue(issue["number"])
+            api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number))
         done = "closed " + ", ".join(f"#{issue['number']}" for issue in closable) if closable else "closed nothing"
         if newer:
             done += "; left open " + ", ".join(f"#{issue['number']}" for issue in newer) + " (a newer breakage)"
@@ -713,8 +733,14 @@ def reconcile(api, notification, repo, workflow_id):
 
     def supersede(issue, by_number):
         api.comment(issue["number"], f"Superseded by #{by_number}.")
-        api.stamp(issue, SUPERSEDED_STAMP.format(number=by_number))
-        api.close_issue(issue["number"])
+        api.close_issue(issue, SUPERSEDED_STAMP.format(number=by_number))
+
+    def own_unstamped(issue):
+        """A close the script made before it stamped: superseded or recovered,
+        and nothing left to say which."""
+        body = issue.get("body") or ""
+        closer = (issue.get("closed_by") or {}).get("login")
+        return closer == OWN_CLOSER_LOGIN and SUPERSEDED_PREFIX not in body and not _FIXED_BY.search(body)
 
     # A read that lacks a run these issues name is not a read to act on: a
     # fresh episode it suggests may be a hole in the list, and a shorter streak
@@ -745,6 +771,7 @@ def reconcile(api, notification, repo, workflow_id):
             for issue in closed
             if marker in (issue.get("body") or "")
             and SUPERSEDED_PREFIX not in (issue.get("body") or "")
+            and not own_unstamped(issue)
             and (issue.get("closed_at") or "") > latest_change
         ]
         if dismissed:
