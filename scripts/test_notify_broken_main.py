@@ -16,6 +16,7 @@ so, which the scheduled sweep would turn into a comment every fifteen minutes.
 
 import io
 import json
+import tempfile
 import re
 import sys
 import unittest
@@ -751,7 +752,7 @@ class ReconcileTest(unittest.TestCase):
         """The failure that would flood the label with one issue per red run."""
         api = FakeAPI([issue(901, 77, 10)])
         self._reconcile(api, decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
-        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "update"])
         self.assertEqual(api.actions[0][1], 901)
 
     def test_a_recovery_closes_the_issue_and_stamps_the_fixing_run(self):
@@ -843,7 +844,7 @@ class ReconcileTest(unittest.TestCase):
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         self._reconcile(api, decision)
         result = self._reconcile(api, decision)
-        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "update"])
         self.assertIn("already says so", result)
 
     def test_a_body_github_hands_back_with_crlf_still_reads_as_current(self):
@@ -876,8 +877,8 @@ class ReconcileTest(unittest.TestCase):
         api = FakeAPI([rendered(earlier, 901)])
         later = decided(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
         self._reconcile(api, later)
-        self.assertEqual(api.kinds(), ["update", "comment"])
-        self.assertIn("3 consecutive failures", api.actions[1][2])
+        self.assertEqual(api.kinds(), ["comment", "update"])
+        self.assertIn("3 consecutive failures", api.actions[0][2])
 
     def test_the_first_failure_reconciled_twice_opens_one_issue(self):
         """A sweep and an event run can both handle a fresh red. The second
@@ -971,9 +972,9 @@ class ReconcileTest(unittest.TestCase):
 
 class HandCloseAndOrderingTest(unittest.TestCase):
     """Two bounds on what a reconciliation may undo: a close made after the
-    streak's last change, whoever made it, and an issue about a red newer than
-    the green being handled. Both matter more now that a sweep reconciles
-    every fifteen minutes."""
+    streak's last change by a person or a merge -- never one on the workflow's
+    own token -- and an issue about a red newer than the green being handled.
+    Both matter more now that a sweep reconciles every fifteen minutes."""
 
     REPO = "gke-labs/kube-agents"
 
@@ -1320,7 +1321,7 @@ class IncompleteReadTest(unittest.TestCase):
         open_issue = self._listing(1677, self._decision(run(6008, "failure"), full[1:]))
         api = FakeAPI([open_issue])
         self._reconcile(api, self._decision(run(6009, "failure"), full))
-        self.assertEqual(api.kinds(), ["update", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "update"])
         self.assertEqual(api.actions[0][1], 1677)
 
     def test_a_read_missing_a_middle_row_does_not_shorten_the_streak(self):
@@ -1663,6 +1664,29 @@ class SweepTest(unittest.TestCase):
         self.assertNotIn(999, reconciled)
         self.assertEqual(len(reconciled), len(notifier.WATCHED_WORKFLOWS))
 
+    def test_the_carrier_whose_file_is_in_the_checkout_wins_whatever_the_recency(self):
+        """A file just renamed has no run yet, or its page is stale, and would
+        lose the recency sort to the ghost's frozen history; the ghost's path
+        is not in the checkout, and that decides."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        workflows = self._workflows(names_to_ids)
+        workflows.insert(0, {"id": 999, "name": notifier.WATCHED_WORKFLOWS[0], "path": ".github/workflows/old.yml"})
+        workflows[1]["path"] = ".github/workflows/new.yml"
+        histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
+        ghost_red = run(40, "failure")
+        ghost_red["created_at"] = "2026-09-10T00:00:00Z"
+        histories[999] = [ghost_red]
+        histories[100] = []  # the live file has not run yet
+        with tempfile.TemporaryDirectory() as root:
+            (Path(root) / ".github" / "workflows").mkdir(parents=True)
+            (Path(root) / ".github" / "workflows" / "new.yml").write_text("name: x\n")
+            with mock.patch.object(notifier, "REPO_ROOT", Path(root)):
+                status, _, reconcile = self._sweep(workflows, histories)
+        self.assertEqual(status, 0)
+        reconciled = [call.args[3] for call in reconcile.call_args_list]
+        self.assertNotIn(999, reconciled, "the ghost must not be reconciled")
+        self.assertNotIn(100, reconciled, "the live file has no reporting run yet, so nothing to reconcile")
+
     def test_a_carrier_with_no_runs_loses_to_one_that_has_run(self):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         workflows = self._workflows(names_to_ids)
@@ -1823,8 +1847,10 @@ class WarnTest(unittest.TestCase):
 
 class WorkflowShapeTest(unittest.TestCase):
     """The burst fix rests on the concurrency key and the job guard, which no
-    linter checks for meaning. Pinned here so a simplification that lets a
-    pull-request run back into a push run's group fails a test."""
+    linter checks for meaning. The key is an Actions expression nothing here
+    can evaluate, so what is pinned is its operands: a simplification that
+    drops the push-to-main test or the per-run fallback fails here, while a
+    rearrangement that keeps every operand does not."""
 
     def setUp(self):
         self.document, self.triggers = workflow_document()

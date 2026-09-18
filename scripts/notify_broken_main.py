@@ -127,6 +127,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from github_api import (
     API_ROOT,
@@ -183,6 +184,11 @@ LABEL_DESCRIPTION = "A required check is failing on main"
 # the first is ours to fix and reds the sweep, the second is retried later.
 HTTP_SERVER_ERROR_FLOOR = 500
 HTTP_TOO_MANY_REQUESTS = 429
+
+# Where the checked-out repository is, relative to this file: the sweep runs
+# from a checkout of the default branch, so a workflow file that exists here is
+# the live one and a listed path that does not is a ghost.
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The two issue states the reconciliation reads.
 ISSUE_OPEN = "open"
@@ -966,6 +972,11 @@ def reconcile(api, notification, repo, workflow_id):
             fresh = api.issue(current["number"]) or current
             if fresh.get("state") == ISSUE_CLOSED:
                 return f"#{current['number']} was closed since the list was read; writing nothing"
+            # Comment first, for the reason `close_issue` gives: a comment that
+            # fails after the rewrite would never be retried, since the next
+            # reconciliation would find the rows already listed.
+            if comment and streak_rows - listed:
+                api.comment(current["number"], comment)
             api.update_issue(current["number"], title=title, body=body)
             done = f"updated #{current['number']}"
         elif current.get("title") != title:
@@ -973,8 +984,6 @@ def reconcile(api, notification, repo, workflow_id):
             done = f"retitled #{current['number']}"
         else:
             done = f"#{current['number']} already says so"
-        if comment and streak_rows - listed:
-            api.comment(current["number"], comment)
 
     # Another issue for this workflow is still open: an older breakage whose
     # recovery never got recorded, or a newer duplicate of this episode from a
@@ -1064,10 +1073,14 @@ def sweep(api, repo, branch, dry_run):
     carriers = {}
     try:
         workflows = api.workflows()
-    except Exception as error:  # noqa: BLE001 - an unreadable list, whatever the shape, is not ours to fix
+    except Exception as error:  # noqa: BLE001 - an unreadable list, whatever the shape, is handled by kind
         # The one read every workflow depends on. An API incident that outlasts
         # the client's retries, or a response of the wrong shape, must not red
-        # the schedule every fifteen minutes; the next sweep retries.
+        # the schedule every fifteen minutes; the next sweep retries. A request
+        # GitHub refused outright is ours to fix, and does.
+        if _is_our_fault(error):
+            log(f"GitHub refused the workflow list ({error}); that is a fault in this repository")
+            return 1
         warn(f"The workflow list could not be read ({type(error).__name__}: {error}); leaving this sweep to the next one")
         return 0
     for workflow in workflows:
@@ -1089,11 +1102,19 @@ def sweep(api, repo, branch, dry_run):
                 warn(f"{name}: a history read came back short; leaving it to the next sweep")
                 continue
             if len(candidates) > 1:
-                candidates.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
+                # The file in the checkout is the live workflow; a ghost's path
+                # is not there. Recency decides only among files that are, or
+                # when none is (a run from outside the checkout), since a live
+                # file that has not run yet, or whose page is stale, would
+                # otherwise lose to a ghost's frozen history.
+                on_disk = [pair for pair in candidates if (REPO_ROOT / pair[0]["path"]).is_file()]
+                pool = on_disk or candidates
+                pool.sort(key=lambda pair: _latest_run_time(pair[1]), reverse=True)
+                candidates = pool + [pair for pair in candidates if pair not in pool]
                 others = ", ".join(f"{w['id']} ({w['path']})" for w, _ in candidates[1:])
                 log(
                     f"{name} is carried by {len(candidates)} workflows; reconciling {candidates[0][0]['id']}, "
-                    f"which ran most recently, and not {others}"
+                    f"{'the file in the checkout' if on_disk else 'which ran most recently'}, and not {others}"
                 )
             workflow, runs = candidates[0]
             report(api, workflow["id"], runs, repo, dry_run)
