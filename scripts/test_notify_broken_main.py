@@ -592,6 +592,14 @@ class QueryTest(unittest.TestCase):
             },
         )
 
+    def test_a_stamp_rereads_then_patches_the_body_alone(self):
+        """A stamp on a closed issue must not touch its state, and must build
+        on the body GitHub has now rather than the one a list carried."""
+        api, calls = self._api({"number": 880, "state": "closed", "body": "text, with a note\n"})
+        api.stamp({"number": 880, "body": "text\n"}, "<!-- main-broken fixed-by=12 run=1012 -->")
+        self.assertEqual([call.method for call in calls], ["GET", "PATCH"])
+        self.assertEqual(json.loads(calls[1].data), {"body": "text, with a note\n<!-- main-broken fixed-by=12 run=1012 -->"})
+
     def test_closing_an_issue_already_closed_does_nothing_after_the_read(self):
         """The re-read is what lets two reconciliations reaching one green
         write one comment: the second finds the issue closed and neither
@@ -865,10 +873,7 @@ class ReconcileTest(unittest.TestCase):
         one commit fewer than the history is a change, and the comment is how
         a subscriber hears about it."""
         earlier = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        stored = issue(901, 77, 10)
-        stored["title"] = notifier.render_title(earlier)
-        stored["body"] = notifier.render_body(earlier, self.REPO, notifier.episode_marker(earlier, 77))
-        api = FakeAPI([stored])
+        api = FakeAPI([rendered(earlier, 901)])
         later = decided(run(12, "failure"), [run(11, "failure"), run(10, "failure"), run(9, "success")])
         self._reconcile(api, later)
         self.assertEqual(api.kinds(), ["update", "comment"])
@@ -933,6 +938,24 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["label", "create", "comment", "close"], "nothing more on the holed page")
         self.assertIn("102", result)
 
+    def test_a_closed_older_episode_is_stamped_when_a_newer_one_is_filed(self):
+        """Reds 1 and 2 opened #A; a person closed it while still red; green 3
+        landed and its notify was cancelled; red 4 landed before a sweep.
+        Filing episode 4 is the one moment the page still shows 3 ended #A's
+        episode, and #A is closed, so neither the green path nor a supersede
+        would stamp it. It is stamped here, and a later page lacking 3 then
+        reads as a hole rather than rebuilding episode 1 over episode 4."""
+        old = rendered(decided(run(2, "failure"), [run(1, "failure")]), 880, state="closed", closed_at="2026-09-02T00:00:00Z", closed_by={"login": "a-person"})
+        api = FakeAPI(closed_issues=[old])
+        page = [run(3, "success"), run(2, "failure"), run(1, "failure")]
+        self._reconcile(api, decided(run(4, "failure"), page))
+        self.assertEqual(api.kinds(), ["stamp", "label", "create"])
+        self.assertIn(notifier.FIXED_BY_STAMP.format(number=3, run_id=1003), api.closed_issues[0]["body"])
+        holed = decided(run(4, "failure"), [run(2, "failure"), run(1, "failure")])
+        result = self._reconcile(api, holed)
+        self.assertEqual(api.kinds(), ["stamp", "label", "create"], "nothing more on the holed page")
+        self.assertIn("3", result)
+
     def test_superseding_a_same_episode_duplicate_stamps_no_green(self):
         api = FakeAPI([issue(902, 77, 10), issue(901, 77, 10)])
         self._reconcile(api, decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
@@ -963,7 +986,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
 
     def _closed_listing(self, decision, closed_at):
         """An issue the notifier itself wrote for `decision`, then closed."""
-        return rendered(decision, 901, state="closed", closed_at=closed_at)
+        return rendered(decision, 880, state="closed", closed_at=closed_at)
 
     def test_an_issue_closed_after_the_streaks_last_change_is_not_refiled(self):
         """Without this the sweep reopens a dismissed issue within fifteen
@@ -1115,11 +1138,11 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         """A stale older-episode issue whose close once failed must not sit
         open behind a dismissed newer episode until the next green."""
         decision = decided(run(100, "failure"), full_page(99, 99))
-        api = FakeAPI([issue(880, 77, 3)], closed_issues=[self._closed_listing(decision, self.AFTER)])
+        api = FakeAPI([issue(870, 77, 3)], closed_issues=[self._closed_listing(decision, self.AFTER)])
         result = self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["comment", "close"])
-        self.assertEqual(api.actions[0][1], 880)
-        self.assertIn("superseded #880", result)
+        self.assertEqual(api.actions[0][1], 870)
+        self.assertIn("superseded #870", result)
 
     def test_the_next_breakage_after_a_dismissal_is_filed(self):
         """A dismissal is about one episode. A green in between makes the next
@@ -1128,7 +1151,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         api = FakeAPI(closed_issues=[self._closed_listing(dismissed, self.AFTER)])
         later = decided(run(13, "failure"), [run(12, "success"), run(11, "failure"), run(10, "failure"), run(9, "success")])
         self._reconcile(api, later)
-        self.assertEqual(api.kinds(), ["label", "create"])
+        self.assertEqual(api.kinds(), ["stamp", "label", "create"], "the dismissed episode is stamped with the green that ended it, then the new one files")
 
     def test_two_open_issues_with_one_marker_collapse_to_one(self):
         """The sweep and an event run both opened the same episode inside the
@@ -1622,8 +1645,10 @@ class SweepTest(unittest.TestCase):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         workflows = self._workflows(names_to_ids)
         ghost_name = notifier.WATCHED_WORKFLOWS[0]
-        workflows.append({"id": 999, "name": ghost_name, "path": ".github/workflows/old.yml"})
-        workflows[0]["path"] = ".github/workflows/new.yml"
+        # The ghost is listed first, so only the "ran most recently" sort can
+        # put the live workflow ahead of it.
+        workflows.insert(0, {"id": 999, "name": ghost_name, "path": ".github/workflows/old.yml"})
+        workflows[1]["path"] = ".github/workflows/new.yml"
         histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
         ghost_red = run(40, "failure")
         ghost_red["created_at"] = "2026-01-01T00:00:00Z"
@@ -1641,7 +1666,7 @@ class SweepTest(unittest.TestCase):
     def test_a_carrier_with_no_runs_loses_to_one_that_has_run(self):
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         workflows = self._workflows(names_to_ids)
-        workflows.append({"id": 999, "name": notifier.WATCHED_WORKFLOWS[0], "path": ".github/workflows/old.yml"})
+        workflows.insert(0, {"id": 999, "name": notifier.WATCHED_WORKFLOWS[0], "path": ".github/workflows/old.yml"})
         histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
         histories[999] = []
         status, _, reconcile = self._sweep(workflows, histories)

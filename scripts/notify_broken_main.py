@@ -929,6 +929,19 @@ def reconcile(api, notification, repo, workflow_id):
                 supersede(issue, dismissed[0]["number"])
                 done += f", superseded #{issue['number']}"
             return done
+        # A closed issue of an older episode that carries no stamp -- closed by
+        # a person or a merge, with the green that then ended its episode
+        # overtaken by this red, so no green path ever stamped it -- gets its
+        # green from the page in hand now, as a superseded open issue does.
+        # Left unstamped, a later page lacking that green would read its reds
+        # and this one as one streak and rebuild its episode over this one.
+        for issue in closed:
+            issue_body = issue.get("body") or ""
+            if marker in issue_body or _FIXED_BY.search(issue_body) or SUPERSEDED_PREFIX in issue_body:
+                continue
+            fixer = _green_that_ended(issue, notification["page"])
+            if fixer is not None:
+                api.stamp(issue, FIXED_BY_STAMP.format(number=fixer["run_number"], run_id=fixer["id"]))
         api.ensure_label()
         current = api.create_issue(title, body)
         done = f"opened #{current['number']}"
