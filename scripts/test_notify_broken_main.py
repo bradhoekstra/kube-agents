@@ -1141,6 +1141,32 @@ class IncompleteReadTest(unittest.TestCase):
         decision = self._decision(run(12, "failure"), [run(12, "failure"), run(11, "failure"), run(10, "failure")])
         self.assertEqual(notifier.runs_named(self._listing(1, decision)), {10: 1010, 11: 1011, 12: 1012})
 
+    def test_a_rerun_row_whose_link_ends_in_an_attempt_is_still_a_row(self):
+        """A re-run's `html_url` may carry `/attempts/N`. A row written from it
+        that the pattern missed would read as a missing row: every sweep would
+        rewrite the body and post "Still failing" for as long as main stayed
+        red."""
+        rerun = run(11, "failure")
+        rerun["html_url"] += "/attempts/2"
+        decision = self._decision(rerun, [rerun, run(10, "failure"), run(9, "success")])
+        listing = self._listing(1, decision)
+        self.assertEqual(notifier.listed_rows(listing), {10, 11})
+        self.assertEqual(notifier.runs_named(listing), {10: 1010, 11: 1011})
+        api = FakeAPI([listing])
+        self._reconcile(api, decision)
+        self.assertEqual(api.actions, [])
+
+    def test_a_refused_write_is_a_warning_annotation(self):
+        """The refusal path in `reconcile` goes through `warn`, which is what
+        makes a persistent hole visible on the job."""
+        full = [run(12, "failure"), run(11, "failure"), run(10, "failure"), run(9, "success")]
+        api = FakeAPI([self._listing(901, self._decision(run(12, "failure"), full))])
+        holed = [run(12, "failure"), run(10, "failure"), run(9, "success")]
+        with mock.patch.object(notifier, "warn") as warn:
+            self._reconcile(api, self._decision(run(12, "failure"), holed))
+        warn.assert_called_once()
+        self.assertIn("missing runs", warn.call_args.args[0])
+
     def test_a_run_deleted_from_github_is_not_a_hole(self):
         """An administrator deleted run 11 (a leaked secret in its log). It
         will never be listed again; a read without it must still act, or the
@@ -1337,11 +1363,12 @@ class MainTest(unittest.TestCase):
         self.assertEqual(notification["run"]["run_number"], 5928)
         self.assertEqual(notification["broke_at"]["run_number"], 5928)
 
-    def test_a_waking_run_put_back_into_a_lagging_list_keeps_run_order(self):
+    def test_a_waking_run_put_back_into_a_lagging_list_does_not_disturb_the_streak(self):
         """Green 5926 finished last and is not yet listed, while the faster
-        5927 and 5928 (both red) are. Prepended without a sort it would sit in
-        front of 5927 and end the streak early: episode 5928 instead of 5927,
-        a duplicate issue, and the right one superseded."""
+        5927 and 5928 (both red) are. Put back at the front, it must not end
+        the streak early -- episode 5928 instead of 5927, a duplicate issue,
+        and the right one superseded -- which `reporting_history` sorting by
+        run number is what prevents."""
         status, reconcile = self._main(
             run(5926, "success"),
             [run(5928, "failure"), run(5927, "failure"), run(5925, "success")],
@@ -1669,6 +1696,7 @@ class WorkflowShapeTest(unittest.TestCase):
     def test_the_sweep_has_a_schedule_and_a_dispatch_with_a_dry_run(self):
         self.assertIn("schedule", self.triggers)
         self.assertIn("dry_run", self.triggers["workflow_dispatch"]["inputs"])
+        self.assertIs(self.triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"], True)
         sweep_step = next(step for step in self.document["jobs"]["notify"]["steps"] if step["name"] == "Sweep every watched workflow")
         self.assertIn("--sweep --dry-run", sweep_step["run"])
 

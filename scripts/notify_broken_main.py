@@ -209,10 +209,12 @@ SUPERSEDED_PREFIX = "<!-- main-broken superseded-by="
 FIXED_BY_STAMP = "<!-- main-broken fixed-by={number} run={run_id} -->"
 
 # The episode marker, read back off an issue body to learn which run opened it;
-# a table row, read back to learn which runs the issue already lists; and the
-# fixed-by stamp, read back to learn which green run closed it.
+# a table row, read back to learn which runs the issue already lists (its link
+# is the run's `html_url` verbatim, which for a re-run may end in
+# `/attempts/N`); and the fixed-by stamp, read back to learn which green run
+# closed it.
 _EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
-_ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)\)", re.MULTILINE)
+_ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)(?:/attempts/\d+)?\)", re.MULTILINE)
 _FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+) run=(\d+) -->")
 
 # A refusal to write is a log line and exit 0, since a stale page is ordinary
@@ -1048,9 +1050,9 @@ def main(argv=None):
     # The list is read moments after the run completed and lists can lag the
     # run they are about, or carry it with the conclusion a re-run has since
     # changed; the run that woke this was read directly and is known to have
-    # completed, so its copy replaces the list's -- and the list is re-sorted,
-    # since a run newer than it may already be there.
-    runs = sorted([current] + [run for run in runs if run["id"] != current["id"]], key=lambda run: run["run_number"], reverse=True)
+    # completed, so its copy replaces the list's. Order does not matter here:
+    # everything downstream picks by run number or sorts for itself.
+    runs = [current] + [run for run in runs if run["id"] != current["id"]]
 
     # Notify runs are queued in the order the runs they watch *finish*, which is
     # not the order those runs started, and a burst of merges drops some of them
