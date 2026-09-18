@@ -266,18 +266,14 @@ def newest_reporting_run(runs):
 def reporting_history(runs, current):
     """`runs` newest-first, minus the current run and anything that said nothing.
 
-    `current` is the newest reporting run, but the list may hold newer runs
-    that said nothing, so it is filtered by id and run number rather than
-    sliced from the front -- and sorted, because the streak is read off the
-    order and the list's order is only as good as the API's, plus whatever
-    `main` had to put back in.
+    `current` is the newest reporting run, so every other reporting run is
+    older; the list may hold newer runs that said nothing, and the conclusion
+    filter drops those. Sorted, because the streak is read off the order and
+    the list's order is only as good as the API's, plus whatever `main` put
+    back in.
     """
     history = [
-        run
-        for run in runs
-        if run["id"] != current["id"]
-        and run["run_number"] < current["run_number"]
-        and run["conclusion"] in REPORTING_CONCLUSIONS
+        run for run in runs if run["id"] != current["id"] and run["conclusion"] in REPORTING_CONCLUSIONS
     ]
     return sorted(history, key=lambda run: run["run_number"], reverse=True)
 
@@ -661,6 +657,11 @@ class GitHubAPI(BaseGitHubAPI):
         against a list read minutes ago."""
         return self.get(f"/repos/{self.repo}/issues/{number}")
 
+    def stamp(self, issue, stamp):
+        """Append a hidden line to an issue's body, re-read first, state kept."""
+        fresh = self.issue(issue["number"]) or issue
+        return self.update_issue(issue["number"], body=(fresh.get("body") or "").rstrip() + "\n" + stamp)
+
     def ensure_label(self):
         """Create the label if this is the first breakage ever recorded.
 
@@ -741,12 +742,27 @@ def reconcile(api, notification, repo, workflow_id):
         return message
 
     if notification["kind"] == "green":
+        # The green that ends a streak stamps the streak's issue with the run
+        # that fixed it, so a later page lacking this green reads as a hole. An
+        # issue a person or a "Fixes #N" merge closed before this run finished
+        # is already closed and would otherwise never carry the stamp; it is
+        # stamped here, closed as it is.
+        stamped = []
+        if notification["streak"]:
+            fix_stamp = FIXED_BY_STAMP.format(number=notification["run"]["run_number"], run_id=notification["run"]["id"])
+            ended = episode_marker(notification, workflow_id)
+            for issue in api.issues_for_workflow(workflow_id, ISSUE_CLOSED):
+                body = issue.get("body") or ""
+                if ended in body and not _FIXED_BY.search(body) and SUPERSEDED_PREFIX not in body:
+                    api.stamp(issue, fix_stamp)
+                    stamped.append(issue)
+        stamped_note = "; stamped " + ", ".join(f"#{issue['number']}" for issue in stamped) if stamped else ""
         if not open_issues:
             # The overwhelmingly common case: main is green and nothing claims
             # otherwise. One list request per green run buys the guarantee that
             # an issue about an older red is never left open on a green main a
             # whole read has seen.
-            return "green, and no issue is open for this workflow"
+            return "green, and no issue is open for this workflow" + stamped_note
         # Every open issue for this workflow whose breakage this green run comes
         # after, not just the episode this run's streak points at: whatever the
         # history says, main is green as of this run, and an issue about an
@@ -784,7 +800,7 @@ def reconcile(api, notification, repo, workflow_id):
             if api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number, run_id=notification["run"]["id"])):
                 api.comment(issue["number"], comment)
                 closed.append(issue)
-        done = "closed " + ", ".join(f"#{issue['number']}" for issue in closed) if closed else "closed nothing"
+        done = ("closed " + ", ".join(f"#{issue['number']}" for issue in closed) if closed else "closed nothing") + stamped_note
         if newer:
             done += "; left open " + ", ".join(f"#{issue['number']}" for issue in newer) + " (a newer breakage)"
         if reopened:

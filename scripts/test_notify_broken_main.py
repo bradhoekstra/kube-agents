@@ -143,13 +143,6 @@ class HistoryFilterTest(unittest.TestCase):
         history = notifier.reporting_history([current, run(9, "success")], current)
         self.assertEqual([r["run_number"] for r in history], [9])
 
-    def test_a_newer_run_is_not_treated_as_history(self):
-        """`current` is the newest run that said anything, but the list can hold
-        newer runs that said nothing, and those are not its past either."""
-        current = run(10, "failure")
-        history = notifier.reporting_history([run(11, "cancelled"), current, run(9, "success")], current)
-        self.assertEqual([r["run_number"] for r in history], [9])
-
     def test_a_cancelled_run_does_not_end_a_streak(self):
         """A concurrency-superseded run says nothing about the tree. Counted as
         a non-failure it would make the next failure look like a fresh break and
@@ -636,8 +629,17 @@ class FakeAPI:
     runs_now = {}
 
     def run(self, run_id):
-        """The run as GitHub has it now; `runs_now` maps id to conclusion."""
-        return {"id": run_id, "conclusion": self.runs_now.get(run_id)} if run_id in self.runs_now else None
+        """The run as GitHub has it now; `runs_now` maps id to conclusion. The
+        real client never answers None here, so a test that reaches a run it
+        did not declare is a test with a hole in it."""
+        assert run_id in self.runs_now, f"test did not say what run {run_id} is now"
+        return {"id": run_id, "conclusion": self.runs_now[run_id]}
+
+    def stamp(self, stamping, line):
+        self.actions.append(("stamp", stamping["number"], line))
+        for issue in self.closed_issues + self.open_issues:
+            if issue["number"] == stamping["number"]:
+                issue["body"] = (issue.get("body") or "").rstrip() + "\n" + line
 
     def issues_for_workflow(self, workflow_id, state):
         prefix = notifier.workflow_marker(workflow_id)
@@ -673,6 +675,7 @@ class FakeAPI:
         for issue in self.open_issues:
             if issue["number"] == number:
                 issue["body"] = (issue.get("body") or "").rstrip() + "\n" + stamp
+                issue["state"] = notifier.ISSUE_CLOSED
                 issue["closed_at"] = "2026-09-04T00:00:00Z"
                 issue["closed_by"] = {"login": notifier.OWN_CLOSER_LOGIN}
                 self.closed_issues.append(issue)
@@ -741,6 +744,23 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["close", "comment"])
         self.assertIn("Fixed by", api.actions[1][2])
         self.assertIn(notifier.FIXED_BY_STAMP.format(number=12, run_id=1012), api.closed_issues[0]["body"])
+
+    def test_a_green_stamps_an_issue_a_merge_closed_before_it_finished(self):
+        """Red 98 opened #A; a "Fixes #A" merge closed it through Prow before
+        its own run, 99, went green. Nothing is open when 99 reconciles, but
+        #A is the streak's issue and carries no fixed-by stamp; without one a
+        later page lacking 99 would read 98 and a new red as one streak and
+        re-file episode 98 over the correct issue. The green stamps it, closed
+        as it is."""
+        red = decided(run(98, "failure"), [run(97, "success")])
+        closed_by_merge = rendered(red, 880, state="closed", closed_at="2026-09-02T00:00:00Z", closed_by={"login": "google-oss-prow[bot]"})
+        api = FakeAPI(closed_issues=[closed_by_merge])
+        result = self._reconcile(api, decided(run(99, "success"), [run(98, "failure"), run(97, "success")]))
+        self.assertEqual(api.kinds(), ["stamp"])
+        self.assertIn(notifier.FIXED_BY_STAMP.format(number=99, run_id=1099), api.closed_issues[0]["body"])
+        self.assertIn("stamped #880", result)
+        self._reconcile(api, decided(run(99, "success"), [run(98, "failure"), run(97, "success")]))
+        self.assertEqual(api.kinds(), ["stamp"], "already stamped: nothing more on the next green")
 
     def test_a_recovery_with_nothing_open_is_quiet(self):
         """Main was already red when this workflow was added, or someone closed
@@ -982,6 +1002,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
                 closed["closed_by"] = {"login": notifier.OWN_CLOSER_LOGIN}
                 closed["body"] += stamp
                 api = FakeAPI(closed_issues=[closed])
+                api.runs_now = {1011: "failure"}
                 self._reconcile(api, decision)
                 self.assertEqual(api.kinds(), ["label", "create"])
 
@@ -1107,7 +1128,12 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         finds it closed, so neither a second close nor a second "passes again"
         comment is written."""
         already = issue(901, 77, 10)
-        api = FakeAPI([already], closed_issues=[dict(already, state="closed")])
+        closed_by_the_other = dict(
+            already,
+            state="closed",
+            body=already["body"] + "\n" + notifier.FIXED_BY_STAMP.format(number=12, run_id=1012),
+        )
+        api = FakeAPI([already], closed_issues=[closed_by_the_other])
         result = self._reconcile(api, decided(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
         self.assertEqual(api.actions, [])
         self.assertIn("closed nothing", result)
@@ -1644,14 +1670,21 @@ class SweepTest(unittest.TestCase):
         api = mock.Mock()
         api.workflows.return_value = self._workflows(names_to_ids)
         api.history.side_effect = lambda workflow_id, branch: histories[workflow_id]
-        for code, expected in ((422, 1), (403, 1), (502, 0)):
-            with self.subTest(code=code):
+        cases = (
+            (urllib.error.HTTPError("u", 422, "no", {}, None), 1),
+            (urllib.error.HTTPError("u", 403, "no", {}, None), 1),
+            (urllib.error.HTTPError("u", 403, "slow down", {"Retry-After": "1"}, None), 0),
+            (urllib.error.HTTPError("u", 429, "wait", {}, None), 0),
+            (urllib.error.HTTPError("u", 502, "bad", {}, None), 0),
+        )
+        for error, expected in cases:
+            with self.subTest(code=error.code, headers=dict(error.headers)):
                 calls = []
 
-                def reconcile(api_, notification, repo, workflow_id, code=code):
+                def reconcile(api_, notification, repo, workflow_id, error=error):
                     calls.append(workflow_id)
                     if workflow_id == 100:
-                        raise urllib.error.HTTPError("u", code, "no", {}, None)
+                        raise error
                     return "done"
 
                 with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
