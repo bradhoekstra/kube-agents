@@ -613,6 +613,7 @@ class FakeAPI:
         self.open_issues = list(open_issues)
         self.closed_issues = list(closed_issues)
         self.deleted_runs = set(deleted_runs)
+        self.runs_now = {}
         self.actions = []
         self.next_number = 900
 
@@ -625,8 +626,6 @@ class FakeAPI:
             if issue["number"] == number:
                 return issue
         return None
-
-    runs_now = {}
 
     def run(self, run_id):
         """The run as GitHub has it now; `runs_now` maps id to conclusion. The
@@ -693,6 +692,7 @@ def decided(current, history):
     page = [current] + list(history)
     notification = notifier.decide(current, notifier.reporting_history(page, current))
     notification["window"] = notifier.history_window(page)
+    notification["page"] = page
     return notification
 
 
@@ -886,6 +886,28 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(api.actions[2][1], 880)
         self.assertEqual([i["number"] for i in api.open_issues], [901])
         self.assertIn(notifier.SUPERSEDED_PREFIX, api.closed_issues[0]["body"])
+
+    def test_superseding_an_older_episode_stamps_the_green_that_ended_it(self):
+        """Red 100 opened #A. Green 101 and red 102 finished together and the
+        red's reconciliation overtook the green's, so 101 never stamped #A.
+        Superseding #A for episode 102 is the one moment the page in hand
+        still shows 101 ended it; the supersede stamps it, and a later page
+        lacking 101 then reads as a hole instead of rebuilding episode 100."""
+        api = FakeAPI([rendered(decided(run(100, "failure"), [run(99, "success")]), 880)])
+        self._reconcile(api, decided(run(102, "failure"), [run(101, "success"), run(100, "failure"), run(99, "success")]))
+        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"])
+        superseded = api.closed_issues[0]
+        self.assertIn(notifier.FIXED_BY_STAMP.format(number=101, run_id=1101), superseded["body"])
+        self.assertIn(notifier.SUPERSEDED_PREFIX, superseded["body"])
+        holed = decided(run(102, "failure"), [run(100, "failure"), run(99, "success")])
+        result = self._reconcile(api, holed)
+        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"], "nothing more on the holed page")
+        self.assertIn("101", result)
+
+    def test_superseding_a_same_episode_duplicate_stamps_no_green(self):
+        api = FakeAPI([issue(902, 77, 10), issue(901, 77, 10)])
+        self._reconcile(api, decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
+        self.assertNotIn("fixed-by", api.closed_issues[0]["body"])
 
     def test_a_recovery_closes_every_open_issue_for_the_workflow(self):
         """Same repair: main is green, so nothing about this workflow should

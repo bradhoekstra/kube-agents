@@ -446,6 +446,23 @@ def listed_rows(issue):
     return {int(number) for number, _ in _ROW_RUN.findall(issue.get("body") or "")}
 
 
+def _green_that_ended(issue, page):
+    """The first reporting run after an issue's last listed red that was not a
+    failure -- the green that ended its episode -- or None if the page in
+    hand shows no such run (the issue is a duplicate of the current episode,
+    or the green is older than the page)."""
+    last_red = max(listed_rows(issue) | {episode_of(issue)}, default=0)
+    later = sorted(
+        (run for run in page if run["run_number"] > last_red and run["conclusion"] in REPORTING_CONCLUSIONS),
+        key=lambda run: run["run_number"],
+    )
+    for run in later:
+        if is_failing(run):
+            return None
+        return run
+    return None
+
+
 def history_window(runs):
     """What one read of the history covered, for judging whether it is whole.
 
@@ -751,11 +768,20 @@ def reconcile(api, notification, repo, workflow_id):
         if notification["streak"]:
             fix_stamp = FIXED_BY_STAMP.format(number=notification["run"]["run_number"], run_id=notification["run"]["id"])
             ended = episode_marker(notification, workflow_id)
-            for issue in api.issues_for_workflow(workflow_id, ISSUE_CLOSED):
-                body = issue.get("body") or ""
-                if ended in body and not _FIXED_BY.search(body) and SUPERSEDED_PREFIX not in body:
-                    api.stamp(issue, fix_stamp)
-                    stamped.append(issue)
+            unstamped = [
+                issue
+                for issue in api.issues_for_workflow(workflow_id, ISSUE_CLOSED)
+                if ended in (issue.get("body") or "")
+                and not _FIXED_BY.search(issue.get("body") or "")
+                and SUPERSEDED_PREFIX not in (issue.get("body") or "")
+            ]
+            # A stamp is a claim about this page; a page with holes makes none.
+            gaps = incomplete_for(unstamped)
+            if gaps:
+                return leave(gaps)
+            for issue in unstamped:
+                api.stamp(issue, fix_stamp)
+                stamped.append(issue)
         stamped_note = "; stamped " + ", ".join(f"#{issue['number']}" for issue in stamped) if stamped else ""
         if not open_issues:
             # The overwhelmingly common case: main is green and nothing claims
@@ -821,7 +847,21 @@ def reconcile(api, notification, repo, workflow_id):
     ]
 
     def supersede(issue, by_number):
-        if api.close_issue(issue, SUPERSEDED_STAMP.format(number=by_number)):
+        """Close an older issue in favour of `by_number`, stamping the green
+        that ended its episode when the page in hand shows one.
+
+        A green whose own reconciliation a following red overtook is never
+        the newest reporting run again, so it never stamps its episode's
+        issue itself; this is the one moment the superseding red still holds
+        that green in its history. Without the stamp a later page lacking the
+        green would read the old reds and the new one as one streak and rebuild
+        the old episode over the correct issue.
+        """
+        stamp = SUPERSEDED_STAMP.format(number=by_number)
+        fixer = _green_that_ended(issue, notification["page"])
+        if fixer is not None:
+            stamp = FIXED_BY_STAMP.format(number=fixer["run_number"], run_id=fixer["id"]) + "\n" + stamp
+        if api.close_issue(issue, stamp):
             api.comment(issue["number"], f"Superseded by #{by_number}.")
 
     def own_close(issue):
@@ -964,6 +1004,7 @@ def report(api, workflow_id, runs, repo, dry_run):
 
     notification = decide(current, reporting_history(runs, current))
     notification["window"] = history_window(runs)
+    notification["page"] = runs
 
     if dry_run:
         log(f"--dry-run: {current['name']} run {current['run_number']} is {notification['kind']}")
