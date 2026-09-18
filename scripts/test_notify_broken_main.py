@@ -35,6 +35,13 @@ import notify_broken_main as notifier
 WORKFLOW_FILE = _HERE.parent / ".github" / "workflows" / "main-broken-notify.yml"
 
 
+def workflow_document():
+    """The notify workflow, parsed once per call with PyYAML's `on` quirk
+    handled: a bare `on:` key reads as the boolean True (YAML 1.1)."""
+    document = yaml.safe_load(WORKFLOW_FILE.read_text())
+    return document, (document.get("on") or document.get(True))
+
+
 def run(number, conclusion, *, sha=None, subject="a commit", run_id=None, name="Operator Tests"):
     """A workflow run, carrying only the fields the notifier reads."""
     return {
@@ -525,14 +532,19 @@ class QueryTest(unittest.TestCase):
         self.assertFalse(api.run_exists(1010))
         self.assertTrue(calls[0].full_url.endswith("/actions/runs/1010"))
 
-    def test_the_labelled_issue_list_is_read_once_per_state(self):
-        """A sweep reconciles every watched workflow; the list they filter is
-        the same list, so it is fetched once."""
+    def test_the_labelled_issue_list_is_read_afresh_on_every_call(self):
+        """Never cached across a sweep: a list read while one workflow was
+        reconciled is stale for the next, and a write against it could
+        rewrite an issue a green has since closed."""
         api, calls = self._api([])
         api.issues_for_workflow(77, "open")
         api.issues_for_workflow(88, "open")
-        api.issues_for_workflow(77, "closed")
         self.assertEqual(len(calls), 2)
+
+    def test_one_issue_is_read_by_number(self):
+        api, calls = self._api({"number": 901, "state": "open"})
+        self.assertEqual(api.issue(901)["state"], "open")
+        self.assertTrue(calls[0].full_url.endswith("/repos/gke-labs/kube-agents/issues/901"))
 
     def test_the_issue_query_is_scoped_to_the_labelled_issues_in_one_state(self):
         for state in ("open", "closed"):
@@ -614,6 +626,13 @@ class FakeAPI:
     def run_exists(self, run_id):
         return run_id not in self.deleted_runs
 
+    def issue(self, number):
+        """The issue as GitHub has it now: a close is the newer truth."""
+        for issue in self.closed_issues + self.open_issues:
+            if issue["number"] == number:
+                return issue
+        return None
+
     runs_now = {}
 
     def run(self, run_id):
@@ -680,6 +699,13 @@ def full_page(newest, *reds):
         run(number, "failure" if number in reds else "success")
         for number in range(newest, newest - notifier.HISTORY_DEPTH, -1)
     ]
+
+
+def rendered(decision, number, state="open", workflow_id=77, **fields):
+    """An issue as the notifier itself would have written it for `decision`,
+    in `state`, with any extra fields (closed_at, closed_by, state_reason)."""
+    body = notifier.render_body(decision, "gke-labs/kube-agents", notifier.episode_marker(decision, workflow_id))
+    return {"number": number, "state": state, "title": notifier.render_title(decision), "body": body, **fields}
 
 
 def issue(number, workflow_id, episode, state="open"):
@@ -757,6 +783,18 @@ class ReconcileTest(unittest.TestCase):
         api = FakeAPI([issue(901, 77, 10)])
         self._reconcile(api, decided(run(10, "failure"), [run(9, "success")]))
         self.assertEqual(api.kinds(), ["update"], "a new break on an existing issue should not comment")
+
+    def test_a_rewrite_is_skipped_when_a_green_closed_the_issue_since_the_list_was_read(self):
+        """A sweep's list showed #901 open with row 10; by the time its history
+        read says 10 and 11 are red, an event run's green has closed and
+        stamped #901. The re-read sees it closed, so the body -- stamp and any
+        note -- is not overwritten and no "Still failing" is posted."""
+        stale_view = issue(901, 77, 10)
+        closed_now = dict(stale_view, state="closed")
+        api = FakeAPI([stale_view], closed_issues=[closed_now])
+        result = self._reconcile(api, decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("closed since the list was read", result)
 
     def test_redelivering_a_follow_up_writes_nothing_the_second_time(self):
         """The scheduled sweep lands here every fifteen minutes for as long as
@@ -857,14 +895,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
 
     def _closed_listing(self, decision, closed_at):
         """An issue the notifier itself wrote for `decision`, then closed."""
-        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        return {
-            "number": 901,
-            "state": "closed",
-            "title": notifier.render_title(decision),
-            "body": body,
-            "closed_at": closed_at,
-        }
+        return rendered(decision, 901, state="closed", closed_at=closed_at)
 
     def test_an_issue_closed_after_the_streaks_last_change_is_not_refiled(self):
         """Without this the sweep reopens a dismissed issue within fifteen
@@ -975,8 +1006,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(api.kinds(), ["close", "comment"])
 
     def _listing_for(self, decision, number):
-        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        return {"number": number, "state": "open", "title": notifier.render_title(decision), "body": body}
+        return rendered(decision, number)
 
     def test_a_persons_close_as_not_planned_is_a_dismissal(self):
         """"Not planned" is the reason a person picks for a false alarm, so it
@@ -1099,11 +1129,10 @@ class IncompleteReadTest(unittest.TestCase):
 
     def _decision(self, current, runs):
         """`decided`, for a page written with `current` already in it."""
-        return decided(current, [r for r in runs if r is not current])
+        return decided(current, [r for r in runs if r["id"] != current["id"]])
 
     def _listing(self, number, decision):
-        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        return {"number": number, "state": "open", "title": notifier.render_title(decision), "body": body}
+        return rendered(decision, number)
 
     def _reconcile(self, api, decision):
         return notifier.reconcile(api, decision, self.REPO, 77)
@@ -1328,6 +1357,16 @@ class MainTest(unittest.TestCase):
         status, reconcile = self._main(run(10, "failure"), None, ["--run-id", "1010"], {"GITHUB_TOKEN": "t"})
         self.assertEqual(status, 0)
         reconcile.assert_not_called()
+
+    def test_the_waking_runs_fresh_conclusion_replaces_the_pages_copy(self):
+        """The page still lists run 10 as green from before its re-run; the
+        run read directly says failure. The direct read wins."""
+        stale_copy = run(10, "success")
+        status, reconcile = self._main(
+            run(10, "failure"), [stale_copy, run(9, "success")], ["--run-id", "1010"], {"GITHUB_TOKEN": "t"}
+        )
+        self.assertEqual(status, 0)
+        self.assertEqual(reconcile.call_args[0][1]["kind"], "broken")
 
     def test_a_history_that_has_not_caught_up_with_the_run_still_counts_it(self):
         """The list is read seconds after the run completed. If it lags, the
@@ -1613,8 +1652,7 @@ class WorkflowShapeTest(unittest.TestCase):
     pull-request run back into a push run's group fails a test."""
 
     def setUp(self):
-        self.document = yaml.safe_load(WORKFLOW_FILE.read_text())
-        self.triggers = self.document.get("on") or self.document.get(True)
+        self.document, self.triggers = workflow_document()
 
     def test_push_to_main_runs_share_a_group_and_nothing_else_joins_it(self):
         group = self.document["concurrency"]["group"]
@@ -1651,9 +1689,7 @@ class WatchListTest(unittest.TestCase):
         the trigger must contain, enforced there. A name on one of
         these two and not the other is a workflow the event path watches and
         the sweep does not, or the reverse."""
-        document = yaml.safe_load(WORKFLOW_FILE.read_text())
-        # PyYAML reads a bare `on:` key as the boolean True (YAML 1.1).
-        triggers = document.get("on") or document.get(True)
+        _, triggers = workflow_document()
         self.assertEqual(sorted(triggers["workflow_run"]["workflows"]), sorted(notifier.WATCHED_WORKFLOWS))
 
 

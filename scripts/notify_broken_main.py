@@ -575,7 +575,6 @@ class GitHubAPI(BaseGitHubAPI):
             opener=opener,
             sleep=sleep,
         )
-        self._issues = {}
 
     def run(self, run_id):
         return self.get(f"/repos/{self.repo}/actions/runs/{run_id}")
@@ -639,26 +638,21 @@ class GitHubAPI(BaseGitHubAPI):
         read for the newest closed issues only -- a dismissal of an episode
         still in progress, and runs a short page failed to list -- so an older
         closed issue past the page goes unchecked, which errs toward writing.
+        Read afresh on every call, never cached across a sweep: a list read
+        while one workflow was reconciled is stale for the next, and a write
+        against it could rewrite an issue a green has since closed.
         """
         prefix = workflow_marker(workflow_id)
+        query = urllib.parse.urlencode({"labels": LABEL, "state": state, "per_page": PER_PAGE})
+        issues = self.get(f"/repos/{self.repo}/issues?{query}") or []
         return [
-            issue
-            for issue in self._labelled_issues(state)
-            if "pull_request" not in issue and prefix in (issue.get("body") or "")
+            issue for issue in issues if "pull_request" not in issue and prefix in (issue.get("body") or "")
         ]
 
-    def _labelled_issues(self, state):
-        """One read of the label's issues per state per process.
-
-        The query does not depend on the workflow, and a sweep asks for it once
-        per watched workflow; each workflow's issues are disjoint by marker, so
-        a list read before another workflow's writes is still current for this
-        one.
-        """
-        if state not in self._issues:
-            query = urllib.parse.urlencode({"labels": LABEL, "state": state, "per_page": PER_PAGE})
-            self._issues[state] = self.get(f"/repos/{self.repo}/issues?{query}") or []
-        return self._issues[state]
+    def issue(self, number):
+        """One issue as GitHub has it now, for a write that must not be made
+        against a list read minutes ago."""
+        return self.get(f"/repos/{self.repo}/issues/{number}")
 
     def ensure_label(self):
         """Create the label if this is the first breakage ever recorded.
@@ -692,7 +686,7 @@ class GitHubAPI(BaseGitHubAPI):
         in the meantime must not be overwritten, and a sweep and an event run
         reaching the same green together must not both close and comment.
         """
-        fresh = self.get(f"/repos/{self.repo}/issues/{issue['number']}") or issue
+        fresh = self.issue(issue["number"]) or issue
         if fresh.get("state") == ISSUE_CLOSED:
             return False
         body = (fresh.get("body") or "").rstrip() + "\n" + stamp
@@ -867,6 +861,12 @@ def reconcile(api, notification, repo, workflow_id):
         listed = listed_rows(current)
         streak_rows = {run["run_number"] for run in notification["streak"]}
         if listed != streak_rows:
+            # Re-read before the one write that replaces a body: the list this
+            # issue came from is older than this history read, and a green
+            # may have closed and stamped it in between.
+            fresh = api.issue(current["number"]) or current
+            if fresh.get("state") == ISSUE_CLOSED:
+                return f"#{current['number']} was closed since the list was read; writing nothing"
             api.update_issue(current["number"], title=title, body=body)
             done = f"updated #{current['number']}"
         elif current.get("title") != title:
@@ -1046,11 +1046,11 @@ def main(argv=None):
         warn("The history read came back short; leaving this to the next run or the sweep")
         return 0
     # The list is read moments after the run completed and lists can lag the
-    # run they are about; the run that woke this is known to have completed, so
-    # it is put in if the list has not caught up rather than left to the sweep
-    # -- and the list re-sorted, since a run newer than it may already be there.
-    if all(run["id"] != current["id"] for run in runs):
-        runs = sorted([current] + runs, key=lambda run: run["run_number"], reverse=True)
+    # run they are about, or carry it with the conclusion a re-run has since
+    # changed; the run that woke this was read directly and is known to have
+    # completed, so its copy replaces the list's -- and the list is re-sorted,
+    # since a run newer than it may already be there.
+    runs = sorted([current] + [run for run in runs if run["id"] != current["id"]], key=lambda run: run["run_number"], reverse=True)
 
     # Notify runs are queued in the order the runs they watch *finish*, which is
     # not the order those runs started, and a burst of merges drops some of them
