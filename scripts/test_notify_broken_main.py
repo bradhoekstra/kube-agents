@@ -618,6 +618,12 @@ class FakeAPI:
     def run_exists(self, run_id):
         return run_id not in self.deleted_runs
 
+    runs_now = {}
+
+    def run(self, run_id):
+        """The run as GitHub has it now; `runs_now` maps id to conclusion."""
+        return {"id": run_id, "conclusion": self.runs_now.get(run_id)} if run_id in self.runs_now else None
+
     def issues_for_workflow(self, workflow_id, state):
         prefix = notifier.workflow_marker(workflow_id)
         issues = self.open_issues if state == "open" else self.closed_issues
@@ -941,16 +947,40 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["label", "create"])
 
-    def test_an_unstamped_close_by_the_workflows_own_token_is_not_a_dismissal(self):
-        """Before the script stamped its closes, it closed as superseded
-        without one. Such a close, met later, could be a supersede or a
-        recovery, so it counts for nothing and the breakage files."""
+    def test_no_close_by_the_workflows_own_token_is_a_dismissal(self):
+        """Stamped or not. An unstamped one predates the stamps and could be
+        a supersede or a recovery; a stamped recovery is protected by its
+        fixed-by line instead. Trusted, a stamped recovery that a stale page
+        made against a run since re-run red would silence that red."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        closed = self._closed_listing(decision, self.AFTER)
-        closed["closed_by"] = {"login": notifier.OWN_CLOSER_LOGIN}
-        api = FakeAPI(closed_issues=[closed])
-        self._reconcile(api, decision)
-        self.assertEqual(api.kinds(), ["label", "create"])
+        for stamp in ("", "\n" + notifier.FIXED_BY_STAMP.format(number=11, run_id=1011)):
+            with self.subTest(stamp=stamp or "unstamped"):
+                closed = self._closed_listing(decision, self.AFTER)
+                closed["closed_by"] = {"login": notifier.OWN_CLOSER_LOGIN}
+                closed["body"] += stamp
+                api = FakeAPI(closed_issues=[closed])
+                self._reconcile(api, decision)
+                self.assertEqual(api.kinds(), ["label", "create"])
+
+    def test_a_green_that_an_open_issue_lists_as_red_is_re_read_before_closing(self):
+        """Run 11 went green, then was re-run red, and the event run filed
+        #902 with rows 10 and 11. A sweep then reads a page from between the
+        two completions, on which 11 is still green. Closing #902 on it would
+        name a red run as the fix, and the close would be the notifier's own;
+        instead the run is re-read and the page left alone."""
+        listed = self._listing_for(decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]), 902)
+        api = FakeAPI([listed])
+        api.runs_now = {1011: "failure"}
+        result = self._reconcile(api, decided(run(11, "success"), [run(10, "failure"), run(9, "success")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("failure now", result)
+        api.runs_now = {1011: "success"}
+        self._reconcile(api, decided(run(11, "success"), [run(10, "failure"), run(9, "success")]))
+        self.assertEqual(api.kinds(), ["close", "comment"])
+
+    def _listing_for(self, decision, number):
+        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
+        return {"number": number, "state": "open", "title": notifier.render_title(decision), "body": body}
 
     def test_a_persons_close_as_not_planned_is_a_dismissal(self):
         """"Not planned" is the reason a person picks for a false alarm, so it
@@ -1157,8 +1187,7 @@ class IncompleteReadTest(unittest.TestCase):
     def test_a_full_page_may_omit_runs_older_than_itself(self):
         """An issue from before the window is the accepted long-streak case,
         not a hole in the read: it is superseded as before."""
-        page = [run(n, "failure") if n == 69 else run(n, "success") for n in range(69, 69 - notifier.HISTORY_DEPTH, -1)]
-        self.assertEqual(len(page), notifier.HISTORY_DEPTH)
+        page = full_page(69, 69)
         api = FakeAPI([issue(880, 77, 5)])
         self._reconcile(api, self._decision(run(69, "failure"), page))
         self.assertEqual(api.kinds(), ["label", "create", "close", "comment"])

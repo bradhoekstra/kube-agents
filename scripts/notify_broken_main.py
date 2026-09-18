@@ -49,13 +49,15 @@ and was closed after the last change to any run in the streak is a breakage
 that has been dealt with, whoever closed it -- a person, or a merge whose
 description named the issue -- so it is not filed again for evidence that
 predates the close. A run re-run after the close, or a new red, moves the streak past it and
-files as usual, and so does the next episode. Two closes never count. One is
-this workflow's own "superseded": it says another issue covers the
-breakage, not that anyone dealt with it, and the issue is stamped with a hidden
-`superseded-by` line when it is closed so it can be told apart -- a state
-reason cannot do that, since "not planned" is also what a person picks for a
-false alarm. A close on the workflow's own token that carries no stamp at all
-predates the stamps and could be either kind, so it does not count either.
+files as usual, and so does the next episode. No close made on this workflow's
+own token ever counts: its "superseded" says another issue covers the breakage,
+not that anyone dealt with it, and its "recovered" is protected another way --
+the issue is stamped with a hidden `fixed-by` line naming the green, so a later
+page that lacks that green reads as a hole rather than as a relapse to dismiss.
+(A "superseded" close is stamped `superseded-by`; a state reason could not tell
+the two apart from a person's, since "not planned" is also what a person picks
+for a false alarm.) Trusting an own close would let a page that still shows a
+re-run green close a real red and then silence it.
 
 A third bound is about the read rather than the state. The run-history endpoint
 has answered with a page missing recent runs, and once with a page weeks old:
@@ -191,10 +193,11 @@ REOPENED = "reopened"
 # stamped into the body instead (below).
 CLOSE_COMPLETED = "completed"
 
-# Who closes an issue when this script does, on the workflow's own token. A
-# close by this login that carries no stamp was made by the script before it
-# stamped closes, and its "superseded" and "recovered" closes look alike, so
-# neither counts as a dismissal; every close the script makes now is stamped.
+# Who closes an issue when this script does, on the workflow's own token. No
+# close by this login counts as a dismissal: a "superseded" says another issue
+# covers the breakage, and a "recovered" is protected by its `fixed-by` stamp
+# instead, since a page that still shows a re-run green could otherwise close
+# a real red and have that close silence it.
 OWN_CLOSER_LOGIN = "github-actions[bot]"
 
 # Hidden lines appended to an issue's body as it is closed. `superseded-by`
@@ -759,6 +762,19 @@ def reconcile(api, notification, repo, workflow_id):
         gaps = incomplete_for(closable)
         if gaps:
             return leave(gaps)
+        # A page can carry a conclusion a re-run has since changed. If an issue
+        # about to be closed lists this green run as a red row, the run has
+        # been red since that issue was written; ask GitHub what it is now
+        # before closing on a page that may predate the re-run.
+        if any(green_number in listed_rows(issue) for issue in closable):
+            fresh = api.run(notification["run"]["id"])
+            if fresh is not None and fresh.get("conclusion") != notification["run"]["conclusion"]:
+                message = (
+                    f"run {green_number} reads {notification['run']['conclusion']} on this page "
+                    f"but {fresh.get('conclusion')} now; writing nothing until a fuller read"
+                )
+                warn(message)
+                return message
         # Close, then comment: the close re-reads the issue and says whether it
         # was still open, so two reconciliations reaching this green together
         # produce one comment rather than two.
@@ -791,12 +807,9 @@ def reconcile(api, notification, repo, workflow_id):
         if api.close_issue(issue, SUPERSEDED_STAMP.format(number=by_number)):
             api.comment(issue["number"], f"Superseded by #{by_number}.")
 
-    def own_unstamped(issue):
-        """A close the script made before it stamped: superseded or recovered,
-        and nothing left to say which."""
-        body = issue.get("body") or ""
-        closer = (issue.get("closed_by") or {}).get("login")
-        return closer == OWN_CLOSER_LOGIN and SUPERSEDED_PREFIX not in body and not _FIXED_BY.search(body)
+    def own_close(issue):
+        """A close the script made itself: never a decision about the breakage."""
+        return (issue.get("closed_by") or {}).get("login") == OWN_CLOSER_LOGIN
 
     # A read that lacks a run these issues name is not a read to act on: a
     # fresh episode it suggests may be a hole in the list, and a shorter streak
@@ -827,7 +840,7 @@ def reconcile(api, notification, repo, workflow_id):
             for issue in closed
             if marker in (issue.get("body") or "")
             and SUPERSEDED_PREFIX not in (issue.get("body") or "")
-            and not own_unstamped(issue)
+            and not own_close(issue)
             and (issue.get("closed_at") or "") > latest_change
         ]
         if dismissed:
