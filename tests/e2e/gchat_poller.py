@@ -101,6 +101,7 @@ class ChatMessagePoller:
         self._denial_types = denial_types
         self._primary_hint = APPROVAL_HINT if primary_credential.is_service_account else USER_SCOPE_HINT
         self.auth_label: str = primary_credential.label
+        self.primary_label: str = primary_credential.label
         self.fell_back: bool = False
         self.fallback_reason: Optional[str] = None
         self.reads: int = 0

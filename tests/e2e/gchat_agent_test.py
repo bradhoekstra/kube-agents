@@ -325,7 +325,8 @@ def test_gchat_agent_math_response(
         else:
             print(f"[E2E Test] No credential read the space; last attempted: {chat_poller.auth_label}")
         if chat_poller.fell_back:
-            print(f"[E2E Test] App auth fell back to the OTA credential because: {chat_poller.fallback_reason}")
+            print(f"[E2E Test] {chat_poller.primary_label} fell back to the OTA user refresh token "
+                  f"because: {chat_poller.fallback_reason}")
 
     # Step 4: Assertions
     assert bot_response_found, f"Timed out after {TEST_TIMEOUT_SEC}s waiting for agent response in {CHAT_SPACE_ID}"
