@@ -633,8 +633,9 @@ class FakeAPI:
 
     def run(self, run_id):
         """The run as GitHub has it now; `runs_now` maps id to conclusion. The
-        real client never answers None here, so a test that reaches a run it
-        did not declare is a test with a hole in it."""
+        real client answers None only for a deleted run, which tests express
+        through `deleted_runs`; a test that reaches a run it declared neither
+        way is a test with a hole in it."""
         assert run_id in self.runs_now, f"test did not say what run {run_id} is now"
         return {"id": run_id, "conclusion": self.runs_now[run_id]}
 
@@ -1748,7 +1749,7 @@ class SweepTest(unittest.TestCase):
 
     def test_one_workflows_failure_does_not_stop_the_rest_of_the_sweep(self):
         """A write that fails on one workflow must not leave the others unread
-        until the next sweep; the failure is logged and annotated, not a red."""
+        until the next sweep; the failure is annotated, not a red."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
         api = mock.Mock()
@@ -1764,9 +1765,10 @@ class SweepTest(unittest.TestCase):
 
         with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
             "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-        ), mock.patch.object(notifier, "reconcile", side_effect=reconcile):
+        ), mock.patch.object(notifier, "reconcile", side_effect=reconcile), mock.patch.object(notifier, "warn") as warn:
             status = notifier.main(["--sweep"])
         self.assertEqual(status, 0)
+        self.assertTrue(any("failed" in call.args[0] for call in warn.call_args_list), warn.call_args_list)
         self.assertEqual(len(calls), len(notifier.WATCHED_WORKFLOWS))
 
     def test_a_dry_run_sweep_writes_nothing(self):
@@ -1819,6 +1821,8 @@ class WorkflowShapeTest(unittest.TestCase):
         self.assertIn("dry_run", self.triggers["workflow_dispatch"]["inputs"])
         self.assertIs(self.triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"], True)
         sweep_step = next(step for step in self.document["jobs"]["notify"]["steps"] if step["name"] == "Sweep every watched workflow")
+        self.assertEqual(sweep_step["env"]["DRY_RUN"], "${{ inputs.dry_run }}", "the default reaches the shell through DRY_RUN")
+        self.assertIn('[ "$DRY_RUN" = "true" ]', sweep_step["run"])
         branches = [line.strip() for line in sweep_step["run"].splitlines() if "notify_broken_main.py" in line]
         self.assertEqual(
             branches,
