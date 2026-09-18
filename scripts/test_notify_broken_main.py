@@ -140,7 +140,7 @@ class HistoryFilterTest(unittest.TestCase):
         """`current` is the newest run that said anything, but the list can hold
         newer runs that said nothing, and those are not its past either."""
         current = run(10, "failure")
-        history = notifier.reporting_history([run(11, "success"), current, run(9, "success")], current)
+        history = notifier.reporting_history([run(11, "cancelled"), current, run(9, "success")], current)
         self.assertEqual([r["run_number"] for r in history], [9])
 
     def test_a_cancelled_run_does_not_end_a_streak(self):
@@ -582,6 +582,14 @@ class QueryTest(unittest.TestCase):
                 "state_reason": notifier.CLOSE_COMPLETED,
             },
         )
+
+    def test_closing_an_issue_already_closed_does_nothing_after_the_read(self):
+        """The re-read is what lets two reconciliations reaching one green
+        write one comment: the second finds the issue closed and neither
+        patches nor reports a close for the caller to comment on."""
+        api, calls = self._api({"number": 901, "state": "closed", "body": "text"})
+        self.assertFalse(api.close_issue({"number": 901, "body": "text"}, "<!-- main-broken fixed-by=12 run=1012 -->"))
+        self.assertEqual([call.method for call in calls], ["GET"])
 
     def test_an_older_fixed_by_stamp_without_a_run_id_still_names_the_run(self):
         stamped = {"number": 1, "body": notifier.workflow_marker(77) + "episode=10 -->\n<!-- main-broken fixed-by=11 -->"}
