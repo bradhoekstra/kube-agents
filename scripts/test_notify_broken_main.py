@@ -576,11 +576,12 @@ class QueryTest(unittest.TestCase):
         the body is the one GitHub has now, not the one a minutes-old list
         carried, so a note written in between survives."""
         api, calls = self._api({"number": 901, "body": "text, with a fresh note\n\n<!-- marker -->\n"})
-        api.close_issue({"number": 901, "body": "text\n\n<!-- marker -->\n"}, "<!-- main-broken fixed-by=12 run=1012 -->")
-        self.assertEqual([call.method for call in calls], ["GET", "PATCH"])
-        self.assertTrue(calls[1].full_url.endswith("/repos/gke-labs/kube-agents/issues/901"))
+        api.close_issue({"number": 901, "body": "text\n\n<!-- marker -->\n"}, "<!-- main-broken fixed-by=12 run=1012 -->", "Fixed.")
+        self.assertEqual([call.method for call in calls], ["GET", "POST", "PATCH"])
+        self.assertTrue(calls[1].full_url.endswith("/issues/901/comments"), "the comment goes before the close")
+        self.assertTrue(calls[2].full_url.endswith("/repos/gke-labs/kube-agents/issues/901"))
         self.assertEqual(
-            json.loads(calls[1].data),
+            json.loads(calls[2].data),
             {
                 "body": "text, with a fresh note\n\n<!-- marker -->\n<!-- main-broken fixed-by=12 run=1012 -->",
                 "state": "closed",
@@ -591,10 +592,20 @@ class QueryTest(unittest.TestCase):
     def test_closing_an_issue_already_closed_does_nothing_after_the_read(self):
         """The re-read is what lets two reconciliations reaching one green
         write one comment: the second finds the issue closed and neither
-        patches nor reports a close for the caller to comment on."""
+        comments nor patches."""
         api, calls = self._api({"number": 901, "state": "closed", "body": "text"})
-        self.assertFalse(api.close_issue({"number": 901, "body": "text"}, "<!-- main-broken fixed-by=12 run=1012 -->"))
+        self.assertFalse(api.close_issue({"number": 901, "body": "text"}, "<!-- main-broken fixed-by=12 run=1012 -->", "Fixed."))
         self.assertEqual([call.method for call in calls], ["GET"])
+
+    def test_a_deleted_run_reads_as_none_rather_than_raising(self):
+        calls = []
+
+        def opener(request):
+            calls.append(request)
+            raise urllib.error.HTTPError("u", 404, "gone", {}, None)
+
+        api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
+        self.assertIsNone(api.run(1010))
 
     def test_creating_an_issue_carries_the_label(self):
         """Without it `issues_for_workflow` never finds the issue again."""
@@ -664,12 +675,15 @@ class FakeAPI:
     def comment(self, number, body):
         self.actions.append(("comment", number, body))
 
-    def close_issue(self, closing, stamp):
-        """Like the real one: re-reads, and reports False if already closed."""
+    def close_issue(self, closing, stamp, comment=None):
+        """Like the real one: re-reads, reports False if already closed, and
+        comments before it closes."""
         number = closing["number"]
         fresh = self.issue(number) or closing
         if fresh.get("state") == notifier.ISSUE_CLOSED:
             return False
+        if comment:
+            self.actions.append(("comment", number, comment))
         self.actions.append(("close", number))
         for issue in self.open_issues:
             if issue["number"] == number:
@@ -741,8 +755,8 @@ class ReconcileTest(unittest.TestCase):
     def test_a_recovery_closes_the_issue_and_stamps_the_fixing_run(self):
         api = FakeAPI([issue(901, 77, 10)])
         self._reconcile(api, decided(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
-        self.assertEqual(api.kinds(), ["close", "comment"])
-        self.assertIn("Fixed by", api.actions[1][2])
+        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertIn("Fixed by", api.actions[0][2])
         self.assertIn(notifier.FIXED_BY_STAMP.format(number=12, run_id=1012), api.closed_issues[0]["body"])
 
     def test_a_green_stamps_an_issue_a_merge_closed_before_it_finished(self):
@@ -785,9 +799,9 @@ class ReconcileTest(unittest.TestCase):
         green; or two runs were handled out of order."""
         api = FakeAPI([issue(901, 77, 10)])
         self._reconcile(api, decided(run(12, "success"), [run(11, "success"), run(10, "success")]))
-        self.assertEqual(api.kinds(), ["close", "comment"])
-        self.assertIn("still open", api.actions[1][2])
-        self.assertNotIn("Fixed by", api.actions[1][2], "this run is not the fix and must not claim to be")
+        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertIn("still open", api.actions[0][2])
+        self.assertNotIn("Fixed by", api.actions[0][2], "this run is not the fix and must not claim to be")
 
     def test_another_workflows_issue_is_left_alone(self):
         """Several workflows are watched and each breaks independently. Closing
@@ -881,9 +895,9 @@ class ReconcileTest(unittest.TestCase):
         either cause."""
         api = FakeAPI([issue(880, 77, 5)])
         self._reconcile(api, decided(run(100, "failure"), full_page(99)))
-        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"])
-        self.assertIn("Superseded by #901", api.actions[3][2])
-        self.assertEqual(api.actions[2][1], 880)
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
+        self.assertIn("Superseded by #901", api.actions[2][2])
+        self.assertEqual(api.actions[3][1], 880)
         self.assertEqual([i["number"] for i in api.open_issues], [901])
         self.assertIn(notifier.SUPERSEDED_PREFIX, api.closed_issues[0]["body"])
 
@@ -895,14 +909,21 @@ class ReconcileTest(unittest.TestCase):
         lacking 101 then reads as a hole instead of rebuilding episode 100."""
         api = FakeAPI([rendered(decided(run(100, "failure"), [run(99, "success")]), 880)])
         self._reconcile(api, decided(run(102, "failure"), [run(101, "success"), run(100, "failure"), run(99, "success")]))
-        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"])
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
         superseded = api.closed_issues[0]
         self.assertIn(notifier.FIXED_BY_STAMP.format(number=101, run_id=1101), superseded["body"])
         self.assertIn(notifier.SUPERSEDED_PREFIX, superseded["body"])
         holed = decided(run(102, "failure"), [run(100, "failure"), run(99, "success")])
         result = self._reconcile(api, holed)
-        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"], "nothing more on the holed page")
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"], "nothing more on the holed page")
         self.assertIn("101", result)
+
+    def test_superseding_an_episode_older_than_the_page_stamps_no_green(self):
+        """The page cannot say which run ended an episode it does not reach
+        back to; its oldest green is not evidence."""
+        api = FakeAPI([issue(880, 77, 5)])
+        self._reconcile(api, decided(run(100, "failure"), full_page(99)))
+        self.assertNotIn("fixed-by", api.closed_issues[0]["body"])
 
     def test_superseding_a_same_episode_duplicate_stamps_no_green(self):
         api = FakeAPI([issue(902, 77, 10), issue(901, 77, 10)])
@@ -914,7 +935,7 @@ class ReconcileTest(unittest.TestCase):
         still be claiming otherwise."""
         api = FakeAPI([issue(901, 77, 98), issue(902, 77, 5)])
         self._reconcile(api, decided(run(100, "success"), full_page(99, 99, 98)))
-        self.assertEqual(api.kinds(), ["close", "comment", "close", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "close", "comment", "close"])
 
 
 class HandCloseAndOrderingTest(unittest.TestCase):
@@ -995,7 +1016,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         rerun["updated_at"] = self.LATER_STILL
         after_rerun = decided(run(12, "failure"), [run(11, "failure"), rerun, run(9, "success")])
         self._reconcile(api, after_rerun)
-        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"])
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
         self.assertEqual(api.actions[2][1], 902)
 
     def test_the_workflows_own_superseded_close_is_never_a_dismissal(self):
@@ -1051,7 +1072,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         two completions, on which 11 is still green. Closing #902 on it would
         name a red run as the fix, and the close would be the notifier's own;
         instead the run is re-read and the page left alone."""
-        listed = self._listing_for(decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]), 902)
+        listed = rendered(decided(run(11, "failure"), [run(10, "failure"), run(9, "success")]), 902)
         api = FakeAPI([listed])
         api.runs_now = {1011: "failure"}
         result = self._reconcile(api, decided(run(11, "success"), [run(10, "failure"), run(9, "success")]))
@@ -1059,10 +1080,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertIn("failure now", result)
         api.runs_now = {1011: "success"}
         self._reconcile(api, decided(run(11, "success"), [run(10, "failure"), run(9, "success")]))
-        self.assertEqual(api.kinds(), ["close", "comment"])
-
-    def _listing_for(self, decision, number):
-        return rendered(decision, number)
+        self.assertEqual(api.kinds(), ["comment", "close"])
 
     def test_a_persons_close_as_not_planned_is_a_dismissal(self):
         """"Not planned" is the reason a person picks for a false alarm, so it
@@ -1091,7 +1109,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         decision = decided(run(100, "failure"), full_page(99, 99))
         api = FakeAPI([issue(880, 77, 3)], closed_issues=[self._closed_listing(decision, self.AFTER)])
         result = self._reconcile(api, decision)
-        self.assertEqual(api.kinds(), ["close", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "close"])
         self.assertEqual(api.actions[0][1], 880)
         self.assertIn("superseded #880", result)
 
@@ -1176,7 +1194,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         self.assertEqual(notifier.episode_of(damaged), 0)
         api = FakeAPI([damaged])
         self._reconcile(api, decided(run(12, "success"), [run(11, "success")]))
-        self.assertEqual(api.kinds(), ["close", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "close"])
 
 
 class IncompleteReadTest(unittest.TestCase):
@@ -1291,8 +1309,8 @@ class IncompleteReadTest(unittest.TestCase):
         self._reconcile(api, self._decision(run(12, "success"), [run(12, "success")]))
         self.assertEqual(api.actions, [])
         self._reconcile(api, self._decision(run(12, "success"), [run(12, "success"), run(11, "failure"), run(10, "failure")]))
-        self.assertEqual(api.kinds(), ["close", "comment"])
-        self.assertIn("Fixed by", api.actions[1][2])
+        self.assertEqual(api.kinds(), ["comment", "close"])
+        self.assertIn("Fixed by", api.actions[0][2])
 
     def test_a_full_page_may_omit_runs_older_than_itself(self):
         """An issue from before the window is the accepted long-streak case,
@@ -1300,7 +1318,7 @@ class IncompleteReadTest(unittest.TestCase):
         page = full_page(69, 69)
         api = FakeAPI([issue(880, 77, 5)])
         self._reconcile(api, self._decision(run(69, "failure"), page))
-        self.assertEqual(api.kinds(), ["label", "create", "close", "comment"])
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"])
 
     def test_a_closed_issue_naming_an_unlisted_run_blocks_a_fresh_episode(self):
         """Nothing open, and the read is a short page: a closed issue for this
@@ -1321,11 +1339,11 @@ class IncompleteReadTest(unittest.TestCase):
         commit; the stamp lets the check see the hole."""
         api = FakeAPI([self._listing(901, self._decision(run(10, "failure"), [run(10, "failure"), run(9, "success")]))])
         self._reconcile(api, self._decision(run(11, "success"), [run(11, "success"), run(10, "failure"), run(9, "success")]))
-        self.assertEqual(api.kinds(), ["close", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "close"])
         self.assertEqual(notifier.runs_named(api.closed_issues[0]), {10: 1010, 11: 1011})
         relapse = self._decision(run(12, "failure"), [run(12, "failure"), run(10, "failure"), run(9, "success")])
         result = self._reconcile(api, relapse)
-        self.assertEqual(api.kinds(), ["close", "comment"])
+        self.assertEqual(api.kinds(), ["comment", "close"])
         self.assertIn("11", result)
         whole = self._decision(run(12, "failure"), [run(12, "failure"), run(11, "success"), run(10, "failure")])
         self._reconcile(api, whole)

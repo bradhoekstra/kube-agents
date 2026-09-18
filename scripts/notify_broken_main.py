@@ -452,6 +452,8 @@ def _green_that_ended(issue, page):
     hand shows no such run (the issue is a duplicate of the current episode,
     or the green is older than the page)."""
     last_red = max(listed_rows(issue) | {episode_of(issue)}, default=0)
+    if not any(run["run_number"] <= last_red for run in page):
+        return None
     later = sorted(
         (run for run in page if run["run_number"] > last_red and run["conclusion"] in REPORTING_CONCLUSIONS),
         key=lambda run: run["run_number"],
@@ -597,7 +599,8 @@ class GitHubAPI(BaseGitHubAPI):
         )
 
     def run(self, run_id):
-        return self.get(f"/repos/{self.repo}/actions/runs/{run_id}")
+        """One run as GitHub has it now, or None if it has been deleted."""
+        return self.get(f"/repos/{self.repo}/actions/runs/{run_id}", tolerate=(404,))
 
     def workflows(self):
         """Every workflow the repository has, paged to the endpoint's own total.
@@ -619,7 +622,7 @@ class GitHubAPI(BaseGitHubAPI):
 
     def run_exists(self, run_id):
         """Whether a run is still there. An administrator can delete one."""
-        return self.get(f"/repos/{self.repo}/actions/runs/{run_id}", tolerate=(404,)) is not None
+        return self.run(run_id) is not None
 
     def history(self, workflow_id, branch="main", depth=HISTORY_DEPTH):
         """Completed push runs of one workflow on `branch`, newest first, or
@@ -701,19 +704,25 @@ class GitHubAPI(BaseGitHubAPI):
     def comment(self, number, body):
         return self.request("POST", f"/repos/{self.repo}/issues/{number}/comments", {"body": body})
 
-    def close_issue(self, issue, stamp):
-        """Close an issue and stamp its body with why, in one write; False if
-        it was already closed.
+    def close_issue(self, issue, stamp, comment=None):
+        """Comment on an issue, then close it with its body stamped in one
+        write; False, and nothing written, if it was already closed.
 
-        One PATCH rather than two, so a failure between them cannot leave an
-        open issue already carrying a stamp. The issue is re-read first: the
-        list it came from may be minutes old by now, so a note someone wrote
-        in the meantime must not be overwritten, and a sweep and an event run
-        reaching the same green together must not both close and comment.
+        The issue is re-read first: the list it came from may be minutes old
+        by now, so a note someone wrote in the meantime must not be
+        overwritten, and a sweep and an event run reaching the same green
+        together must not both close and comment. The comment goes before the
+        close, not after: a comment that fails after a close has landed would
+        never be retried, since no later reconciliation finds the issue open,
+        and a reader told main was broken would never be told it was fixed. A
+        close that fails after the comment is retried by the next
+        reconciliation, at the cost of a repeated comment.
         """
         fresh = self.issue(issue["number"]) or issue
         if fresh.get("state") == ISSUE_CLOSED:
             return False
+        if comment:
+            self.comment(issue["number"], comment)
         body = (fresh.get("body") or "").rstrip() + "\n" + stamp
         self.update_issue(issue["number"], body=body, state=ISSUE_CLOSED, state_reason=CLOSE_COMPLETED)
         return True
@@ -818,13 +827,12 @@ def reconcile(api, notification, repo, workflow_id):
                 )
                 warn(message)
                 return message
-        # Close, then comment: the close re-reads the issue and says whether it
-        # was still open, so two reconciliations reaching this green together
-        # produce one comment rather than two.
+        # The close re-reads the issue and says whether it was still open, so
+        # two reconciliations reaching this green together produce one
+        # comment rather than two.
         closed = []
         for issue in closable:
-            if api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number, run_id=notification["run"]["id"])):
-                api.comment(issue["number"], comment)
+            if api.close_issue(issue, FIXED_BY_STAMP.format(number=green_number, run_id=notification["run"]["id"]), comment):
                 closed.append(issue)
         done = ("closed " + ", ".join(f"#{issue['number']}" for issue in closed) if closed else "closed nothing") + stamped_note
         if newer:
@@ -861,8 +869,7 @@ def reconcile(api, notification, repo, workflow_id):
         fixer = _green_that_ended(issue, notification["page"])
         if fixer is not None:
             stamp = FIXED_BY_STAMP.format(number=fixer["run_number"], run_id=fixer["id"]) + "\n" + stamp
-        if api.close_issue(issue, stamp):
-            api.comment(issue["number"], f"Superseded by #{by_number}.")
+        api.close_issue(issue, stamp, f"Superseded by #{by_number}.")
 
     def own_close(issue):
         """A close the script made itself: never a decision about the breakage."""
