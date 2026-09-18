@@ -21,17 +21,16 @@ import pytest
 try:
     import google.auth
     from google.auth.credentials import Credentials
-    from google.auth.exceptions import RefreshError
+    from google.auth.exceptions import RefreshError, TransportError
     from google.oauth2.credentials import Credentials as UserCredentials
     from googleapiclient.discovery import Resource, build
     from googleapiclient.errors import HttpError
     HAS_GOOGLE_LIBS = True
 except ImportError:
     HAS_GOOGLE_LIBS = False
-
-    class RefreshError(Exception):  # type: ignore[no-redef]
-        """Stand-in so the module imports; the credentials fixture fails before it is used."""
-
+    # Bound so the module imports and the names resolve; every fixture fails before one is used.
+    RefreshError = Exception  # type: ignore
+    TransportError = Exception  # type: ignore
     Credentials = Any  # type: ignore
     UserCredentials = Any  # type: ignore
     Resource = Any  # type: ignore
@@ -173,7 +172,7 @@ def chat_poller() -> ChatMessagePoller:
         primary_credential=describe_credential(poll_creds),
         # A refused token mint (a scope IAM will not grant, an OTA refresh token that no longer
         # exchanges) is a denial; google-auth marks the token endpoint's 5xx as retryable and the
-        # poller lets those propagate.
+        # poller lets those propagate to the poll loop, which retries them.
         denial_types=(RefreshError,),
     )
 
@@ -308,6 +307,14 @@ def test_gchat_agent_math_response(
                 pytest.fail(f"Cannot read the space back: {err}")
             except HttpError as err:
                 print(f"[E2E Test Warning] Polling error: {err}")
+            except RefreshError as err:
+                # The poller answers a refused mint as a denial; what reaches here is the token
+                # endpoint's 5xx/408/429 that google-auth marks retryable. Poll again.
+                if not getattr(err, "retryable", False):
+                    raise
+                print(f"[E2E Test Warning] Transient token error while polling, retrying: {err}")
+            except TransportError as err:
+                print(f"[E2E Test Warning] Transient transport error while polling, retrying: {err}")
 
             if bot_response_found:
                 break
