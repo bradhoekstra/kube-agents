@@ -666,7 +666,8 @@ class FakeAPI:
     def close_issue(self, closing, stamp):
         """Like the real one: re-reads, and reports False if already closed."""
         number = closing["number"]
-        if any(issue["number"] == number for issue in self.closed_issues):
+        fresh = self.issue(number) or closing
+        if fresh.get("state") == notifier.ISSUE_CLOSED:
             return False
         self.actions.append(("close", number))
         for issue in self.open_issues:
@@ -813,10 +814,8 @@ class ReconcileTest(unittest.TestCase):
         """GitHub may return `\r\n` for the `\n` it was sent. The rows are
         what is compared, and the row pattern has to survive that too."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        stored = issue(901, 77, 10)
-        stored["title"] = notifier.render_title(decision)
-        stored["body"] = body.replace("\n", "\r\n") + "\r\n"
+        stored = rendered(decision, 901)
+        stored["body"] = stored["body"].replace("\n", "\r\n") + "\r\n"
         api = FakeAPI([stored])
         self._reconcile(api, decision)
         self.assertEqual(api.actions, [])
@@ -826,10 +825,8 @@ class ReconcileTest(unittest.TestCase):
         the body lists are not news and nobody needs a "Still failing" for a
         rename."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        stored = issue(901, 77, 10)
-        stored["title"] = "someone renamed this"
-        stored["body"] = body.replace("| run | commit |", "A note.\n\n| run | commit |")
+        stored = rendered(decision, 901, title="someone renamed this")
+        stored["body"] = stored["body"].replace("| run | commit |", "A note.\n\n| run | commit |")
         api = FakeAPI([stored])
         self._reconcile(api, decision)
         self.assertEqual(api.kinds(), ["update"])
@@ -905,10 +902,9 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         (11 red, 10 red, 9 green, the green missing): the whole-read check
         passes, since the unstamped issue does not name the green, and this
         rule is what keeps a "main is broken" issue from opening on a green
-        main. A stamped close is caught earlier, as a hole; an unstamped close
-        by the workflow's own token files, as
-        `test_an_unstamped_close_by_the_workflows_own_token_is_not_a_dismissal`
-        says."""
+        main. A stamped close is caught earlier, as a hole; any close by the
+        workflow's own token files, as
+        `test_no_close_by_the_workflows_own_token_is_a_dismissal` says."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         api = FakeAPI(closed_issues=[self._closed_listing(decision, self.AFTER)])
         result = self._reconcile(api, decision)
@@ -989,6 +985,23 @@ class HandCloseAndOrderingTest(unittest.TestCase):
                 self._reconcile(api, decision)
                 self.assertEqual(api.kinds(), ["label", "create"])
 
+    def test_a_red_that_a_closed_issue_names_as_the_fix_is_re_read_before_filing(self):
+        """Run 5000 failed and #Y opened; it was re-run green and the bot
+        closed #Y stamped fixed-by=5000. A sweep is then served a page from
+        before the re-run, on which 5000 is red. Filing on it would open a
+        breakage on a green main; the run is re-read instead."""
+        red = notifier.decide(run(5000, "failure"), [run(4999, "success")])
+        closed = rendered(red, 901, state="closed", closed_at=self.AFTER, closed_by={"login": notifier.OWN_CLOSER_LOGIN})
+        closed["body"] += "\n" + notifier.FIXED_BY_STAMP.format(number=5000, run_id=6000)
+        api = FakeAPI(closed_issues=[closed])
+        api.runs_now = {6000: "success"}
+        result = self._reconcile(api, decided(run(5000, "failure"), [run(4999, "success")]))
+        self.assertEqual(api.actions, [])
+        self.assertIn("success now", result)
+        api.runs_now = {6000: "failure"}
+        self._reconcile(api, decided(run(5000, "failure"), [run(4999, "success")]))
+        self.assertEqual(api.kinds(), ["label", "create"])
+
     def test_a_green_that_an_open_issue_lists_as_red_is_re_read_before_closing(self):
         """Run 11 went green, then was re-run red, and the event run filed
         #902 with rows 10 and 11. A sweep then reads a page from between the
@@ -1023,10 +1036,8 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         person's note stays until there is news, and no "Still failing" is
         posted for a commit that is not news."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
-        body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
-        annotated = issue(901, 77, 10)
-        annotated["title"] = notifier.render_title(decision)
-        annotated["body"] = body.replace("| run | commit |", "Root cause: X, fix in #1700.\n\n| run | commit |")
+        annotated = rendered(decision, 901)
+        annotated["body"] = annotated["body"].replace("| run | commit |", "Root cause: X, fix in #1700.\n\n| run | commit |")
         api = FakeAPI([annotated])
         self._reconcile(api, decision)
         self.assertEqual(api.actions, [])
@@ -1096,7 +1107,7 @@ class HandCloseAndOrderingTest(unittest.TestCase):
         finds it closed, so neither a second close nor a second "passes again"
         comment is written."""
         already = issue(901, 77, 10)
-        api = FakeAPI([already], closed_issues=[already])
+        api = FakeAPI([already], closed_issues=[dict(already, state="closed")])
         result = self._reconcile(api, decided(run(12, "success"), [run(11, "failure"), run(10, "failure")]))
         self.assertEqual(api.actions, [])
         self.assertIn("closed nothing", result)
@@ -1624,6 +1635,31 @@ class SweepTest(unittest.TestCase):
             status = notifier.main(["--sweep"])
         self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
+
+    def test_a_request_github_refused_reds_the_sweep_after_the_rest_ran(self):
+        """A 403 or 422 is a permission or a request of ours that retrying
+        will not change, unlike a 5xx; the others are still reconciled."""
+        names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
+        histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
+        api = mock.Mock()
+        api.workflows.return_value = self._workflows(names_to_ids)
+        api.history.side_effect = lambda workflow_id, branch: histories[workflow_id]
+        for code, expected in ((422, 1), (403, 1), (502, 0)):
+            with self.subTest(code=code):
+                calls = []
+
+                def reconcile(api_, notification, repo, workflow_id, code=code):
+                    calls.append(workflow_id)
+                    if workflow_id == 100:
+                        raise urllib.error.HTTPError("u", code, "no", {}, None)
+                    return "done"
+
+                with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
+                    "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
+                ), mock.patch.object(notifier, "reconcile", side_effect=reconcile):
+                    status = notifier.main(["--sweep"])
+                self.assertEqual(status, expected)
+                self.assertEqual(len(calls), len(notifier.WATCHED_WORKFLOWS))
 
     def test_one_workflows_failure_does_not_stop_the_rest_of_the_sweep(self):
         """A write that fails on one workflow must not leave the others unread

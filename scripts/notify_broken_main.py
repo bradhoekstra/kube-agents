@@ -179,6 +179,11 @@ LABEL = "ci:main-broken"
 LABEL_COLOR = "d73a4a"
 LABEL_DESCRIPTION = "A required check is failing on main"
 
+# Status codes that separate GitHub refusing a request from GitHub failing:
+# the first is ours to fix and reds the sweep, the second is retried later.
+HTTP_SERVER_ERROR_FLOOR = 500
+HTTP_TOO_MANY_REQUESTS = 429
+
 # The two issue states the reconciliation reads.
 ISSUE_OPEN = "open"
 ISSUE_CLOSED = "closed"
@@ -830,6 +835,21 @@ def reconcile(api, notification, repo, workflow_id):
         gaps = incomplete_for(closed)
         if gaps:
             return leave(gaps)
+        # The mirror of the green path's re-read. A closed issue whose stamp
+        # names a run this page shows as red says that run was re-run green
+        # after the page was cut; ask GitHub before filing a breakage on it.
+        streak_ids = {run["run_number"]: run["id"] for run in notification["streak"]}
+        for issue in closed:
+            for number, _ in _FIXED_BY.findall(issue.get("body") or ""):
+                if int(number) in streak_ids:
+                    fresh = api.run(streak_ids[int(number)])
+                    if fresh is not None and fresh.get("conclusion") not in FAILING_CONCLUSIONS:
+                        message = (
+                            f"run {number} reads red on this page but #{issue['number']} names it as the fix "
+                            f"and it is {fresh.get('conclusion')} now; writing nothing until a fuller read"
+                        )
+                        warn(message)
+                        return message
         latest_change = max(run["updated_at"] for run in notification["streak"])
         dismissed = [
             issue
@@ -978,6 +998,7 @@ def sweep(api, repo, branch, dry_run):
 
     missing = []
     failed = []
+    broken = []
     for name in WATCHED_WORKFLOWS:
         if not carriers.get(name):
             missing.append(name)
@@ -1000,7 +1021,7 @@ def sweep(api, repo, branch, dry_run):
             report(api, workflow["id"], runs, repo, dry_run)
         except Exception as error:  # noqa: BLE001 - one workflow's failure, read or write, must not stop the rest
             log(f"{name}: {type(error).__name__}: {error}")
-            failed.append(name)
+            (broken if _is_our_fault(error) else failed).append(name)
 
     if missing:
         log(f"No workflow is named {', '.join(missing)}: renamed or removed, so nothing reports on it")
@@ -1008,10 +1029,23 @@ def sweep(api, repo, branch, dry_run):
         # Logged and annotated, not a red: an API incident that outlasts the
         # client's retries would otherwise red the schedule every fifteen
         # minutes and mail the cron line's last editor each time, for a fault
-        # nobody here can fix. The next sweep retries. A missing name is a red
-        # because it is ours to fix.
+        # nobody here can fix. The next sweep retries. A missing name, or a
+        # request GitHub refused outright, is a red because it is ours to fix.
         warn(f"Reconciling {', '.join(failed)} failed; the rest were reconciled, and the next sweep retries")
-    return 1 if missing else 0
+    if broken:
+        log(f"GitHub refused a request while reconciling {', '.join(broken)}; that is a fault in this repository")
+    return 1 if missing or broken else 0
+
+
+def _is_our_fault(error):
+    """A 4xx other than a rate limit: a permission or a request GitHub rejects,
+    which retrying will not change and a person here has to fix."""
+    return (
+        isinstance(error, urllib.error.HTTPError)
+        and error.code < HTTP_SERVER_ERROR_FLOOR
+        and error.code != HTTP_TOO_MANY_REQUESTS
+        and not _rate_limited(error)
+    )
 
 
 def main(argv=None):
