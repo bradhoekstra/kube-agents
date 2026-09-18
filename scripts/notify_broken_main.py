@@ -1064,11 +1064,13 @@ def sweep(api, repo, branch, dry_run):
 
     The workflow list keeps entries for files that no longer exist, listed as
     `active` with their history frozen, so a file renamed under the same
-    `name:` leaves two workflows carrying it. Only the one that ran most
-    recently is the workflow; the other would otherwise be reconciled against
-    a history that can never change, and a red at the end of it would be filed
-    forever. A ghost that is the only carrier of a name still counts as found:
-    nothing distinguishes it from a workflow that has not run in a while.
+    `name:` leaves two workflows carrying it. The one whose file is in the
+    checkout is the workflow, and when none is (a run from outside the
+    checkout) the one that ran most recently; the other would otherwise be
+    reconciled against a history that can never change, and a red at the end
+    of it would be filed forever. A ghost that is the only carrier of a name
+    still counts as found: nothing distinguishes it from a workflow that has
+    not run in a while.
     """
     carriers = {}
     try:

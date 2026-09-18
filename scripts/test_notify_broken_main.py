@@ -1116,7 +1116,9 @@ class HandCloseAndOrderingTest(unittest.TestCase):
 
     def test_a_persons_close_as_not_planned_is_a_dismissal(self):
         """"Not planned" is the reason a person picks for a false alarm, so it
-        must count exactly like any other close after the streak's last change."""
+        must count exactly like any other close after the streak's last change:
+        the rule reads no state reason at all, and this pins that it never
+        starts to."""
         decision = decided(run(11, "failure"), [run(10, "failure"), run(9, "success")])
         closed = self._closed_listing(decision, self.AFTER)
         closed["state_reason"] = "not_planned"
@@ -1582,14 +1584,25 @@ class MainTest(unittest.TestCase):
 class SweepTest(unittest.TestCase):
     """The scheduled path: no run to start from, every watched workflow."""
 
-    def _sweep(self, workflows, histories, argv=("--sweep",)):
+    def _sweep(self, workflows, histories, argv=("--sweep",), history=None, reconcile=None):
+        """Run `main --sweep` against a fake API. `workflows` may be an
+        exception to raise from the list read; `history` and `reconcile`
+        may be callables that replace the defaults."""
         api = mock.Mock()
-        api.workflows.return_value = workflows
-        api.history.side_effect = lambda workflow_id, branch: histories.get(workflow_id, [])
+        if isinstance(workflows, BaseException):
+            api.workflows.side_effect = workflows
+        else:
+            api.workflows.return_value = workflows
+        api.history.side_effect = history or (lambda workflow_id, branch: histories.get(workflow_id, []))
+        reconcile_patch = (
+            mock.patch.object(notifier, "reconcile", side_effect=reconcile)
+            if reconcile
+            else mock.patch.object(notifier, "reconcile", return_value="done")
+        )
         with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
             "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-        ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
-            return notifier.main(list(argv)), api, reconcile
+        ), reconcile_patch as reconciled:
+            return notifier.main(list(argv)), api, reconciled
 
     def _workflows(self, names_to_ids):
         return [
@@ -1727,19 +1740,22 @@ class SweepTest(unittest.TestCase):
         self.assertNotIn(999, reconciled)
         self.assertNotIn(100, reconciled)
 
-    def test_a_workflow_list_read_that_fails_leaves_the_sweep_to_the_next_one(self):
-        """The one read every workflow depends on. An incident there must not
-        red the schedule every fifteen minutes, whatever shape it arrives in:
-        an HTTP error after the retries, or a 200 whose body is not the list."""
-        for error in (urllib.error.HTTPError("u", 502, "bad gateway", {}, None), TypeError("'NoneType' object")):
-            with self.subTest(error=type(error).__name__):
-                api = mock.Mock()
-                api.workflows.side_effect = error
-                with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
-                    "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-                ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
-                    status = notifier.main(["--sweep"])
-                self.assertEqual(status, 0)
+    def test_a_workflow_list_read_that_fails_is_a_warning_unless_github_refused_it(self):
+        """The one read every workflow depends on. An incident there -- a 5xx
+        after the retries, a 200 whose body is not the list -- must not red
+        the schedule every fifteen minutes; a request GitHub refused outright
+        is ours to fix and does."""
+        cases = (
+            (urllib.error.HTTPError("u", 502, "bad gateway", {}, None), 0),
+            (TypeError("'NoneType' object"), 0),
+            (urllib.error.HTTPError("u", 403, "slow down", {"Retry-After": "1"}, None), 0),
+            (urllib.error.HTTPError("u", 403, "forbidden", {}, None), 1),
+            (urllib.error.HTTPError("u", 422, "no", {}, None), 1),
+        )
+        for error, expected in cases:
+            with self.subTest(error=f"{type(error).__name__} {getattr(error, 'code', '')}"):
+                status, _, reconcile = self._sweep(error, {})
+                self.assertEqual(status, expected)
                 reconcile.assert_not_called()
 
     def test_a_history_read_that_raises_does_not_stop_the_rest_of_the_sweep(self):
@@ -1754,13 +1770,7 @@ class SweepTest(unittest.TestCase):
                 raise urllib.error.HTTPError("u", 502, "bad gateway", {}, None)
             return histories[workflow_id]
 
-        api = mock.Mock()
-        api.workflows.return_value = self._workflows(names_to_ids)
-        api.history.side_effect = history
-        with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
-            "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-        ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
-            status = notifier.main(["--sweep"])
+        status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories, history=history)
         self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
 
@@ -1769,9 +1779,6 @@ class SweepTest(unittest.TestCase):
         will not change, unlike a 5xx; the others are still reconciled."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
-        api = mock.Mock()
-        api.workflows.return_value = self._workflows(names_to_ids)
-        api.history.side_effect = lambda workflow_id, branch: histories[workflow_id]
         cases = (
             (urllib.error.HTTPError("u", 422, "no", {}, None), 1),
             (urllib.error.HTTPError("u", 403, "no", {}, None), 1),
@@ -1789,10 +1796,7 @@ class SweepTest(unittest.TestCase):
                         raise error
                     return "done"
 
-                with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
-                    "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-                ), mock.patch.object(notifier, "reconcile", side_effect=reconcile):
-                    status = notifier.main(["--sweep"])
+                status, _, _ = self._sweep(self._workflows(names_to_ids), histories, reconcile=reconcile)
                 self.assertEqual(status, expected)
                 self.assertEqual(len(calls), len(notifier.WATCHED_WORKFLOWS))
 
@@ -1801,9 +1805,6 @@ class SweepTest(unittest.TestCase):
         until the next sweep; the failure is annotated, not a red."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(2, "failure"), run(1, "success")] for workflow_id in names_to_ids.values()}
-        api = mock.Mock()
-        api.workflows.return_value = self._workflows(names_to_ids)
-        api.history.side_effect = lambda workflow_id, branch: histories[workflow_id]
         calls = []
 
         def reconcile(api_, notification, repo, workflow_id):
@@ -1812,10 +1813,8 @@ class SweepTest(unittest.TestCase):
                 raise RuntimeError("boom")
             return "done"
 
-        with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
-            "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-        ), mock.patch.object(notifier, "reconcile", side_effect=reconcile), mock.patch.object(notifier, "warn") as warn:
-            status = notifier.main(["--sweep"])
+        with mock.patch.object(notifier, "warn") as warn:
+            status, _, _ = self._sweep(self._workflows(names_to_ids), histories, reconcile=reconcile)
         self.assertEqual(status, 0)
         self.assertTrue(any("failed" in call.args[0] for call in warn.call_args_list), warn.call_args_list)
         self.assertEqual(len(calls), len(notifier.WATCHED_WORKFLOWS))
