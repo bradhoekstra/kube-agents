@@ -447,10 +447,15 @@ def listed_rows(issue):
 
 
 def _green_that_ended(issue, page):
-    """The first reporting run after an issue's last listed red that was not a
-    failure -- the green that ended its episode -- or None if the page in
-    hand shows no such run (the issue is a duplicate of the current episode,
-    or the green is older than the page)."""
+    """The first green after an issue's last listed red on the page in hand
+    -- the run that ended its episode -- or None if the page shows no green
+    after it (the issue is a duplicate of the current episode, whose streak
+    runs to the end of the page) or does not reach back to the issue at all.
+
+    Reds between the last listed row and that green are the same episode: an
+    issue's table lags its streak whenever the notify runs that would have
+    added rows were cancelled, which is the burst this exists for.
+    """
     last_red = max(listed_rows(issue) | {episode_of(issue)}, default=0)
     if not any(run["run_number"] <= last_red for run in page):
         return None
@@ -458,11 +463,7 @@ def _green_that_ended(issue, page):
         (run for run in page if run["run_number"] > last_red and run["conclusion"] in REPORTING_CONCLUSIONS),
         key=lambda run: run["run_number"],
     )
-    for run in later:
-        if is_failing(run):
-            return None
-        return run
-    return None
+    return next((run for run in later if not is_failing(run)), None)
 
 
 def history_window(runs):
@@ -1126,6 +1127,9 @@ def main(argv=None):
         return sweep(api, args.repo, args.branch, args.dry_run)
 
     current = api.run(args.run_id)
+    if current is None:
+        log(f"Run {args.run_id} no longer exists; nothing to reconcile from it")
+        return 0
 
     # The workflow's `if:` has already checked these, against the event payload.
     # Reading them back off the run is what makes a hand-run of this script on

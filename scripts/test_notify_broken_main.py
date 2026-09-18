@@ -515,6 +515,8 @@ class QueryTest(unittest.TestCase):
         self.assertEqual(len(api.history(77)), notifier.HISTORY_DEPTH)
 
     def test_a_deleted_run_reads_as_absent(self):
+        """`run` answers None on a 404 rather than raising, and `run_exists`
+        is that answer as a boolean."""
         calls = []
 
         def opener(request):
@@ -522,6 +524,7 @@ class QueryTest(unittest.TestCase):
             raise urllib.error.HTTPError("u", 404, "gone", {}, None)
 
         api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
+        self.assertIsNone(api.run(1010))
         self.assertFalse(api.run_exists(1010))
         self.assertTrue(calls[0].full_url.endswith("/actions/runs/1010"))
 
@@ -596,16 +599,6 @@ class QueryTest(unittest.TestCase):
         api, calls = self._api({"number": 901, "state": "closed", "body": "text"})
         self.assertFalse(api.close_issue({"number": 901, "body": "text"}, "<!-- main-broken fixed-by=12 run=1012 -->", "Fixed."))
         self.assertEqual([call.method for call in calls], ["GET"])
-
-    def test_a_deleted_run_reads_as_none_rather_than_raising(self):
-        calls = []
-
-        def opener(request):
-            calls.append(request)
-            raise urllib.error.HTTPError("u", 404, "gone", {}, None)
-
-        api = notifier.GitHubAPI("gke-labs/kube-agents", "t", opener=opener, sleep=lambda _: None)
-        self.assertIsNone(api.run(1010))
 
     def test_creating_an_issue_carries_the_label(self):
         """Without it `issues_for_workflow` never finds the issue again."""
@@ -924,6 +917,20 @@ class ReconcileTest(unittest.TestCase):
         api = FakeAPI([issue(880, 77, 5)])
         self._reconcile(api, decided(run(100, "failure"), full_page(99)))
         self.assertNotIn("fixed-by", api.closed_issues[0]["body"])
+
+    def test_superseding_an_issue_whose_table_lagged_its_streak_still_finds_the_green(self):
+        """Red 100 opened #A; red 101's notify was cancelled and no sweep
+        landed before green 102 and red 103 completed. #A lists only 100. The
+        red between its last row and the green is its own episode; the green
+        that ended it is 102, and that is what is stamped."""
+        api = FakeAPI([rendered(decided(run(100, "failure"), [run(99, "success")]), 880)])
+        page = [run(102, "success"), run(101, "failure"), run(100, "failure"), run(99, "success")]
+        self._reconcile(api, decided(run(103, "failure"), page))
+        self.assertIn(notifier.FIXED_BY_STAMP.format(number=102, run_id=1102), api.closed_issues[0]["body"])
+        holed = decided(run(103, "failure"), [run(101, "failure"), run(100, "failure"), run(99, "success")])
+        result = self._reconcile(api, holed)
+        self.assertEqual(api.kinds(), ["label", "create", "comment", "close"], "nothing more on the holed page")
+        self.assertIn("102", result)
 
     def test_superseding_a_same_episode_duplicate_stamps_no_green(self):
         api = FakeAPI([issue(902, 77, 10), issue(901, 77, 10)])
@@ -1505,6 +1512,11 @@ class MainTest(unittest.TestCase):
         self.assertEqual(status, 0)
         reconcile.assert_not_called()
 
+    def test_a_waking_run_that_no_longer_exists_is_nothing_to_reconcile_from(self):
+        status, reconcile = self._main(None, [], ["--run-id", "1010"], {"GITHUB_TOKEN": "t"})
+        self.assertEqual(status, 0)
+        reconcile.assert_not_called()
+
     def test_a_run_of_an_unwatched_workflow_is_refused(self):
         """The trigger list keeps this from happening in the workflow; a
         hand-run on a `Prettier Check` run would file for a workflow the sweep
@@ -1807,7 +1819,12 @@ class WorkflowShapeTest(unittest.TestCase):
         self.assertIn("dry_run", self.triggers["workflow_dispatch"]["inputs"])
         self.assertIs(self.triggers["workflow_dispatch"]["inputs"]["dry_run"]["default"], True)
         sweep_step = next(step for step in self.document["jobs"]["notify"]["steps"] if step["name"] == "Sweep every watched workflow")
-        self.assertIn("--sweep --dry-run", sweep_step["run"])
+        branches = [line.strip() for line in sweep_step["run"].splitlines() if "notify_broken_main.py" in line]
+        self.assertEqual(
+            branches,
+            ["python3 scripts/notify_broken_main.py --sweep --dry-run", "python3 scripts/notify_broken_main.py --sweep"],
+            "a dry-run branch and a writing branch, in that order",
+        )
 
     def test_the_job_is_guarded_and_filters_nothing_by_conclusion(self):
         job = self.document["jobs"]["notify"]
