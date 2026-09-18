@@ -591,10 +591,6 @@ class QueryTest(unittest.TestCase):
         self.assertFalse(api.close_issue({"number": 901, "body": "text"}, "<!-- main-broken fixed-by=12 run=1012 -->"))
         self.assertEqual([call.method for call in calls], ["GET"])
 
-    def test_an_older_fixed_by_stamp_without_a_run_id_still_names_the_run(self):
-        stamped = {"number": 1, "body": notifier.workflow_marker(77) + "episode=10 -->\n<!-- main-broken fixed-by=11 -->"}
-        self.assertEqual(notifier.runs_named(stamped), {10: None, 11: None})
-
     def test_creating_an_issue_carries_the_label(self):
         """Without it `issues_for_workflow` never finds the issue again."""
         api, calls = self._api({"number": 901})
@@ -1102,9 +1098,8 @@ class IncompleteReadTest(unittest.TestCase):
     REPO = "gke-labs/kube-agents"
 
     def _decision(self, current, runs):
-        decision = notifier.decide(current, notifier.reporting_history(runs, current))
-        decision["window"] = notifier.history_window(runs)
-        return decision
+        """`decided`, for a page written with `current` already in it."""
+        return decided(current, [r for r in runs if r is not current])
 
     def _listing(self, number, decision):
         body = notifier.render_body(decision, self.REPO, notifier.episode_marker(decision, 77))
@@ -1143,6 +1138,7 @@ class IncompleteReadTest(unittest.TestCase):
         relapse = self._decision(later_red, [later_red, run(10, "failure"), run(9, "success")])
         self._reconcile(api, relapse)
         self.assertEqual(api.kinds()[-2:], ["label", "create"])
+        self.assertIn("episode=10", api.actions[-1][3])
 
     def test_a_read_missing_the_episode_does_not_open_a_second_issue(self):
         """2026-09-17 on main: #1677 (episode 5928, rows 5928 and 6008) was
@@ -1497,12 +1493,19 @@ class SweepTest(unittest.TestCase):
         self.assertIn(100, [call.args[3] for call in reconcile.call_args_list])
 
     def test_a_short_history_read_is_skipped_without_reading_as_a_missing_workflow(self):
+        """Skipped by the guard that names it, not by the catch-all below it:
+        the warning says the read came back short, and nothing is reported as
+        failed."""
         names_to_ids = {name: 100 + index for index, name in enumerate(notifier.WATCHED_WORKFLOWS)}
         histories = {workflow_id: [run(1, "success")] for workflow_id in names_to_ids.values()}
         histories[100] = None
-        status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
+        with mock.patch.object(notifier, "warn") as warn:
+            status, _, reconcile = self._sweep(self._workflows(names_to_ids), histories)
         self.assertEqual(status, 0)
         self.assertEqual(reconcile.call_count, len(notifier.WATCHED_WORKFLOWS) - 1)
+        messages = [call.args[0] for call in warn.call_args_list]
+        self.assertTrue(any("came back short" in m for m in messages), messages)
+        self.assertFalse(any("failed" in m for m in messages), messages)
 
     def test_a_name_with_one_carrier_unread_is_skipped_rather_than_left_to_the_other(self):
         """If the live carrier's read is refused and the ghost's is not, the
@@ -1519,17 +1522,20 @@ class SweepTest(unittest.TestCase):
         self.assertNotIn(999, reconciled)
         self.assertNotIn(100, reconciled)
 
-    def test_a_workflow_list_read_that_raises_leaves_the_sweep_to_the_next_one(self):
+    def test_a_workflow_list_read_that_fails_leaves_the_sweep_to_the_next_one(self):
         """The one read every workflow depends on. An incident there must not
-        red the schedule every fifteen minutes; it warns and exits 0."""
-        api = mock.Mock()
-        api.workflows.side_effect = urllib.error.HTTPError("u", 502, "bad gateway", {}, None)
-        with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
-            "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
-        ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
-            status = notifier.main(["--sweep"])
-        self.assertEqual(status, 0)
-        reconcile.assert_not_called()
+        red the schedule every fifteen minutes, whatever shape it arrives in:
+        an HTTP error after the retries, or a 200 whose body is not the list."""
+        for error in (urllib.error.HTTPError("u", 502, "bad gateway", {}, None), TypeError("'NoneType' object")):
+            with self.subTest(error=type(error).__name__):
+                api = mock.Mock()
+                api.workflows.side_effect = error
+                with mock.patch.object(notifier, "GitHubAPI", return_value=api), mock.patch.dict(
+                    "os.environ", {"GITHUB_TOKEN": "t"}, clear=True
+                ), mock.patch.object(notifier, "reconcile", return_value="done") as reconcile:
+                    status = notifier.main(["--sweep"])
+                self.assertEqual(status, 0)
+                reconcile.assert_not_called()
 
     def test_a_history_read_that_raises_does_not_stop_the_rest_of_the_sweep(self):
         """The 5xx that outlasts the retries arrives from the history read, so

@@ -213,7 +213,7 @@ FIXED_BY_STAMP = "<!-- main-broken fixed-by={number} run={run_id} -->"
 # fixed-by stamp, read back to learn which green run closed it.
 _EPISODE = re.compile(r"<!-- main-broken workflow=\d+ episode=(\d+) -->")
 _ROW_RUN = re.compile(r"^\| \[(\d+)\]\(\S*?/actions/runs/(\d+)\)", re.MULTILINE)
-_FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+)(?: run=(\d+))? -->")
+_FIXED_BY = re.compile(r"<!-- main-broken fixed-by=(\d+) run=(\d+) -->")
 
 # A refusal to write is a log line and exit 0, since a stale page is ordinary
 # and a red job for one would be noise; this prefix makes the line a warning
@@ -425,13 +425,13 @@ def runs_named(issue):
     """Every run an issue names -- marker, table rows, fixed-by stamp -- as run
     number to run id.
 
-    The id comes from a row's link or a stamp's `run=`; the marker and an old
-    stamp carry only the number, so those map to None.
+    The id comes from a row's link or a stamp's `run=`; the marker carries
+    only the number, so an episode with no row of its own maps to None.
     """
     body = issue.get("body") or ""
     named = {int(number): int(run_id) for number, run_id in _ROW_RUN.findall(body)}
     for number, run_id in _FIXED_BY.findall(body):
-        named.setdefault(int(number), int(run_id) if run_id else None)
+        named.setdefault(int(number), int(run_id))
     episode = episode_of(issue)
     if episode:
         named.setdefault(episode, None)
@@ -964,11 +964,11 @@ def sweep(api, repo, branch, dry_run):
     carriers = {}
     try:
         workflows = api.workflows()
-    except (urllib.error.HTTPError, urllib.error.URLError) as error:
+    except Exception as error:  # noqa: BLE001 - an unreadable list, whatever the shape, is not ours to fix
         # The one read every workflow depends on. An API incident that outlasts
-        # the client's retries is not ours to fix and must not red the schedule
-        # every fifteen minutes; the next sweep retries.
-        warn(f"The workflow list could not be read ({error}); leaving this sweep to the next one")
+        # the client's retries, or a response of the wrong shape, must not red
+        # the schedule every fifteen minutes; the next sweep retries.
+        warn(f"The workflow list could not be read ({type(error).__name__}: {error}); leaving this sweep to the next one")
         return 0
     for workflow in workflows:
         if workflow["name"] in WATCHED_WORKFLOWS:
