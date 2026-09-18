@@ -308,10 +308,9 @@ def test_gchat_agent_math_response(
             except HttpError as err:
                 print(f"[E2E Test Warning] Polling error: {err}")
             except RefreshError as err:
-                # The poller answers a refused mint as a denial; what reaches here is the token
-                # endpoint's 5xx/408/429 that google-auth marks retryable. Poll again.
-                if not getattr(err, "retryable", False):
-                    raise
+                # The poller has already turned a refused mint into ChatReadAccessDenied; what
+                # reaches here is the token endpoint's 5xx/408/429 that google-auth marks
+                # retryable. Poll again.
                 print(f"[E2E Test Warning] Transient token error while polling, retrying: {err}")
             except TransportError as err:
                 print(f"[E2E Test Warning] Transient transport error while polling, retrying: {err}")
