@@ -101,7 +101,7 @@ whatever it contains" for the life of the process.
 On the worker path that was harmless by accident. ``dispatch_in_gateway`` moves
 the *dispatcher loop* into the gateway, not the worker —
 ``gateway/kanban_watchers.py``'s ``_kanban_dispatcher_watcher`` calls
-``kanban_db.dispatch_once`` with no ``spawn_fn``, so ``_default_spawn`` still
+``kanban_db_dispatch.dispatch_once`` with no ``spawn_fn``, so ``_default_spawn`` still
 ``subprocess.Popen``s ``hermes -p <profile> chat -q "work kanban task t_…"``.
 One process per dispatch means the set holds one id and dies with the attempt
 that created it.
@@ -323,11 +323,13 @@ NEW_RESULT_DESCRIPTION = (
     "lives, because Google Chat drops tables."
 )
 
+# Upstream's ``_handle_complete`` has raised the check through ``_check`` (a
+# ``_Reject`` the ``_kanban_handler`` wrapper renders as a tool error) since
+# v2026.9.14; the replacement returns ``tool_error`` directly, which the same
+# wrapper passes through unchanged.
 OLD_GATE = (
-    "    if not (summary or result):\n"
-    "        return tool_error(\n"
-    "            \"provide at least one of: summary (preferred), result\"\n"
-    "        )\n"
+    "    _check(summary or result, "
+    "\"provide at least one of: summary (preferred), result\")\n"
 )
 
 # ``summary`` is folded separately because ``require_result`` only owns

@@ -9,7 +9,7 @@ What leaked, and where (issue #603)
 -----------------------------------
 A worker that fetches a token by hand -- ``gcloud auth print-access-token`` or
 the metadata server -- and pastes it into a ``curl`` writes it to disk twice on
-the pinned Hermes (v2026.8.19). Two of the issue's four sinks were already
+the pinned Hermes (v2026.9.14, as on v2026.8.19). Two of the issue's four sinks were already
 redacted upstream: ``hermes_logging.py`` formats ``agent.log`` through
 ``RedactingFormatter``, and ``tools/terminal_tool.py`` passes the terminal
 output spill through ``redact_terminal_output``. Two were not:

@@ -297,7 +297,7 @@ def _stash_submitted_result(conn, task_id: str, result) -> None:
 def require_children_settled(task_id, connect, result=None) -> str | None:
     """The completion gate. ``None`` when the completion may proceed.
 
-    ``connect`` is ``hermes_cli.kanban_db.connect`` (injected by the applier's
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` (injected by the applier's
     import trailer; injected so this module imports cleanly outside the
     image). The connection it returns is closed here. ``result`` is the
     completion's submitted result, passed so a refusal can preserve it on the

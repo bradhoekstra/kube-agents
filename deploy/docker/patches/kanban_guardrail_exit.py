@@ -7,7 +7,8 @@ A dispatcher-spawned worker must finish with ``kanban_complete`` or
 of ``run_conversation``'s *no-tool-calls* branch it calls
 ``build_kanban_stop_nudge`` and, if the worker is about to exit without a
 terminal call, appends a synthetic user turn and continues the loop
-(``agent/conversation_loop.py``, "Kanban worker terminal-tool stop guard").
+(``agent/turn_stop_gates.py``, the kanban stop gate of the text-response
+phase; ``agent/conversation_loop.py`` before the v2026.9.14 split).
 
 That guard sits in one branch of one loop. Every other way out of the loop is a
 bare ``break`` several hundred lines earlier, and each one jumps straight over
@@ -25,7 +26,7 @@ runs and 38 minutes producing nothing. Every run ended the same way::
 
 ``ToolCallGuardrailController._check_loop_cap`` blocks the 51st ``web_search`` of
 a turn, ``_guardrail_block_result`` records the decision on the agent, and
-``conversation_loop.py`` breaks out of the tool-call branch. ``failed`` stays
+``turn_tool_round.py`` ends the turn from the tool round. ``failed`` stays
 ``False``. The model never sees the block result, never gets another turn, and
 never learns that it is one sentence away from a clean completion — it had 173
 successful searches in hand.
@@ -384,8 +385,8 @@ def record_missing_terminal_call(
 ) -> bool:
     """Charge a leaked exit to the card's failure budget. Returns whether it did.
 
-    ``connect`` is ``hermes_cli.kanban_db.connect`` and ``record_failure`` is
-    ``hermes_cli.kanban_db._record_task_failure``, both injected. The
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` and ``record_failure``
+    is ``hermes_cli.kanban_db_dispatch._record_task_failure``, both injected. The
     ``release_claim`` / ``end_run`` pair is the same one the iteration-budget
     path uses: the card is still ``running`` with an open run, and this hands
     both back.
@@ -528,7 +529,7 @@ def record_rate_limit_block(
 ) -> bool:
     """Block the card with the provider's 429 text. Returns whether it did.
 
-    ``connect`` is ``hermes_cli.kanban_db.connect`` and ``block_task`` is
+    ``connect`` is ``hermes_cli.kanban_db_connect.connect`` and ``block_task`` is
     ``hermes_cli.kanban_db.block_task``, both injected. The board is consulted
     first, as everywhere in this module: a card no longer ``running`` was moved
     by a terminal tool or by the other site, and is left alone. ``block_task``
@@ -555,6 +556,18 @@ def record_rate_limit_block(
             pass
 
 
+def _default_connect():
+    """The board opener: ``hermes_cli.kanban_db_connect.connect`` since the
+    v2026.9.14 split of ``kanban_db``, else the pre-split
+    ``hermes_cli.kanban_db.connect`` (the split module only forwards that name
+    through a revert-scheduled compat shim)."""
+    try:
+        from hermes_cli.kanban_db_connect import connect
+    except ImportError:
+        from hermes_cli.kanban_db import connect
+    return connect
+
+
 def block_rate_limited_worker(
     result,
     *,
@@ -569,9 +582,10 @@ def block_rate_limited_worker(
 
     ``result`` is what ``run_conversation`` returned. Anything that is not a
     ``failed`` dict with a rate-limit ``failure_reason`` is not this function's
-    business and returns ``False`` without touching the board. ``connect`` and
-    ``block_task`` default to ``hermes_cli.kanban_db``, imported here so the
-    module stays importable on a host without Hermes.
+    business and returns ``False`` without touching the board. ``connect``
+    defaults to :func:`_default_connect` and ``block_task`` to
+    ``hermes_cli.kanban_db.block_task``, imported here so the module stays
+    importable on a host without Hermes.
     """
     if not isinstance(result, dict) or not result.get("failed"):
         return False
@@ -588,11 +602,12 @@ def block_rate_limited_worker(
         delegated_child=delegated_child,
     ):
         return False
-    if connect is None or block_task is None:
+    if connect is None:
+        connect = _default_connect()
+    if block_task is None:
         from hermes_cli import kanban_db as _kb
 
-        connect = connect or _kb.connect
-        block_task = block_task or _kb.block_task
+        block_task = _kb.block_task
     return record_rate_limit_block(
         task_id=task_id,
         failure_reason=failure_reason,

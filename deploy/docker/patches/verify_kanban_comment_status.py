@@ -52,6 +52,8 @@ os.environ["HERMES_PROFILE"] = "default"
 os.environ.pop("HERMES_KANBAN_TASK", None)
 
 from hermes_cli import kanban_db as K  # noqa: E402
+from hermes_cli import kanban_db_connect as KC  # noqa: E402
+from hermes_cli import kanban_db_notify as KN  # noqa: E402
 import tools.kanban_tools as kt  # noqa: E402
 
 try:
@@ -59,7 +61,10 @@ try:
 except ImportError:  # the module was never COPYd in
     kcs = None
 
-conn = K.connect(DB)
+#: Where upstream's notifier lives since the Sep 2026 split of kanban_watchers.
+NOTIFIER_MODULE = "gateway/kanban_watchers_notifier.py"
+
+conn = KC.connect(DB)
 
 UPSTREAM_KEYS = {"ok", "task_id", "comment_id"}
 
@@ -84,7 +89,7 @@ def card(title: str, status: str = "running") -> str:
 
 
 def subscribe(task_id: str) -> None:
-    K.add_notify_sub(
+    KN.add_notify_sub(
         conn,
         task_id=task_id,
         platform="slack",
@@ -178,9 +183,9 @@ report = "FINDINGS\n" + ("cluster row " * 500)
 K.complete_task(
     conn, incident, result=report, summary="Audited the fleet; 9 findings.",
 )
-# What gateway/kanban_watchers.py does on the tick that carries the terminal
-# event: task_terminal -> _kanban_unsub.
-K.remove_notify_sub(
+# What gateway/kanban_watchers_notifier.py does on the tick that carries the
+# terminal event: ``self.task.status == "archived"`` -> ``unsub()``.
+KN.remove_notify_sub(
     conn,
     task_id=incident,
     platform="slack",
@@ -265,17 +270,20 @@ check(
 # 2026-08-08 incident on a new status. Upstream narrowing only leaves this
 # patch more conservative, which is deliberate and is asserted below.
 print("coupling to the notifier:")
-watchers = Path("gateway/kanban_watchers.py").read_text()
+# The notifier lives in gateway/kanban_watchers_notifier.py since upstream's
+# Sep 2026 split (fd2bfa1893); its terminal test is the ``if`` that guards
+# ``unsub()``: ``if self.task and self.task.status == "archived":``.
+watchers = Path(NOTIFIER_MODULE).read_text()
 # Every way this can fail to parse has to land on the named check below rather
 # than as a traceback out of the module. Two shapes reach it: a non-literal
-# right-hand side (`task.status in TERMINAL`), which literal_eval raises
-# ValueError on, and a second assignment elsewhere in the file, which would
-# leave the old re.search reading whichever came first. Both mean the same thing
-# to the porter — the terminal test moved, re-derive this — which is exactly
-# what "the notifier's terminal test was located" says. A trailing comment is
-# not one of them: `(.+)` swallows it and literal_eval ignores it, so the
-# current shape keeps parsing.
-_terminals = re.findall(r"task_terminal = task and task\.status (==|in) (.+)", watchers)
+# right-hand side (`self.task.status in TERMINAL`), which literal_eval raises
+# ValueError on, and a second test elsewhere in the file, which would leave a
+# re.search reading whichever came first. Both mean the same thing to the
+# porter — the terminal test moved, re-derive this — which is exactly what "the
+# notifier's terminal test was located" says. The trailing colon of the ``if``
+# is excluded by the character class; a trailing comment would not be, and
+# literal_eval would refuse it, which lands on the same check.
+_terminals = re.findall(r"self\.task\.status (==|in) ([^:\n]+)", watchers)
 notifier_terminal = None
 if len(_terminals) == 1:
     _op, _rhs = _terminals[0]
@@ -288,9 +296,9 @@ if len(_terminals) == 1:
 check(
     "the notifier's terminal test was located",
     notifier_terminal is not None,
-    "gateway/kanban_watchers.py no longer assigns task_terminal from "
-    "task.status exactly once against a literal — re-derive this check and "
-    "TERMINAL_STATUSES with it",
+    f"{NOTIFIER_MODULE} no longer tests self.task.status exactly once against "
+    "a literal before unsub() — re-derive this check and TERMINAL_STATUSES "
+    "with it",
 )
 check(
     "every status the notifier unsubscribes on is one this patch calls dead",

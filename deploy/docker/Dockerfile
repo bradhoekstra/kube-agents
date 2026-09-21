@@ -145,19 +145,28 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     opentelemetry-sdk \
     opentelemetry-exporter-otlp-proto-http
 
-# Apply upstream PR #51567 patch to google_chat adapter to fix nested inline formatting leaks (GC0, GC1, etc.) and standalone thread creation bugs
-RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/adapter.py && \
-    /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/adapter.py'); c = p.read_text(); t = 'url = f\"https://chat.googleapis.com/v1/{chat_id}/messages\"'; r = 'url = f\"https://chat.googleapis.com/v1/{chat_id}/messages\"\n    if thread_id:\n        url += \"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD\"'; p.write_text(c.replace(t, r)) if t in c else exit(1)" && \
-    grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
-    grep -q "messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" /opt/hermes/plugins/platforms/google_chat/adapter.py
+# Google Chat: two fixes upstream has not made as of v2026.9.14. (1) cards.format_message (moved out of
+# adapter.py upstream) restores placeholders in insertion order, so a header/bold/link wrapping inline
+# code leaks its \x00GCn\x00 key; reversing the restore fixes nesting (kube-agents #277). (2) The standalone
+# REST send (_standalone_send, used by send_message from cron) posts thread.name without messageReplyOption,
+# which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only.
+# Both edits are exact-count guarded (c.count(t) == 1) until they become an applier + verifier.
+RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/cards.py && \
+    /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/adapter.py'); c = p.read_text(); t = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\", json=_thread_body(message, thread_id),'; r = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\" + (\"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD\" if thread_id else \"\"), json=_thread_body(message, thread_id),'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
+    grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/cards.py && \
+    grep -qF '"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" if thread_id' /opt/hermes/plugins/platforms/google_chat/adapter.py
 
-# Hotfix: Allow explicit target routing for google_chat spaces/threads in send_message_tool
-RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_tool.py'); c = p.read_text(); t = 'def _parse_target_ref(platform_name: str, target_ref: str):\n    \"\"\"Parse a tool target into chat_id/thread_id and whether it is explicit.\"\"\"'; r = t + '\n    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True'; p.write_text(c.replace(t, r)) if t in c else exit(1)"
+# Hotfix: explicit google_chat space/thread targets in send_message. Upstream moved _parse_target_ref to
+# tools/send_message_targets.py (parser table + fallbacks); google_chat has no parser there and registers no
+# parse_target_ref_fn, so "spaces/<id>" and "spaces/<id>:spaces/<id>/threads/<id>" fall through to
+# channel-directory resolution and fail. Exact-count guarded like the step above.
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_targets.py'); c = p.read_text(); t = '    parser = _PLATFORM_PARSERS.get(platform_name)\n'; r = '    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True\n' + t; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
+    grep -qF 'if platform_name == "google_chat":' /opt/hermes/tools/send_message_targets.py
 
 # A dependency-free text utility, copied in on its own and ahead of both of its
 # callers. tools/cron_run_scope.py imports it a few layers below for a different
-# clip entirely, and gateway/kanban_watchers.py is wired to it by the
-# kanban_notifier patch much further down. See the module docstring in
+# clip entirely, and gateway/kanban_watchers_notifier.py is wired to it by
+# the kanban_notifier patch much further down. See the module docstring in
 # deploy/docker/patches/kanban_handoff_clip.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gateway/kanban_handoff_clip.py
 
@@ -165,10 +174,11 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # claim to completion — p50 264s and p90 1102s of nothing on the live board —
 # which is the single biggest reason delegation feels slower than doing the work
 # in the thread. kanban_heartbeat(note=...) already writes the note; the
-# notifier just never delivered that kind. Three anchored edits, so the surgery
-# lives in an applier script. See the module docstring in
+# notifier just never delivered that kind. A handful of anchored edits across
+# gateway/kanban_watchers_notifier.py and tools/kanban_tools_schemas.py, so
+# the surgery lives in an applier script. See the module docstring in
 # deploy/docker/patches/kanban_progress_lines.py.
-# The third edit is what keeps the fix from becoming its own nuisance: the notes
+# The send edit is what keeps the fix from becoming its own nuisance: the notes
 # roll into ONE message per card, edited in place, so a five-milestone card pings
 # the space once instead of five times and the completion is the notification.
 # Every failure mode of that is silent -- an unresolved import, an adapter that
@@ -176,16 +186,18 @@ COPY --chmod=0644 deploy/docker/patches/kanban_handoff_clip.py /opt/hermes/gatew
 # text cap all degrade to one-message-per-note, which is exactly what shipped
 # before and so looks like nothing is wrong. verify_kanban_progress_lines.py
 # therefore drives the patched runtime rather than grepping it.
-# The _WAKE_KINDS grep below pins upstream's tuple as it stands AT THIS POINT in
-# the build, and nothing more: apply_kanban_notifier.py replaces that whole line
-# further down this stage, so the tuple does not exist in the shipped image. The
-# invariant it used to claim -- heartbeat never wakes the creator, because a
-# progress note that costs a full LLM turn is the most expensive thing on the
-# board rather than a free one -- is enforced against the set that actually
-# ships, DEFAULT_WAKE_KINDS in gateway/kanban_notifier.py, by the assertion in
-# the kanban_notifier RUN below. Keep this grep anyway: it fails the build if a
-# base-image bump changes the text apply_kanban_notifier.py anchors on, which is
-# a clearer error than that applier's own anchor miss.
+# The _WAKE_KINDS grep below pins upstream's module-level tuple as upstream
+# text, and nothing more: apply_kanban_notifier.py further down this stage
+# wraps the line that reads the tuple, not the tuple itself, so it is still in
+# the shipped image but no longer decides who is woken. The invariant it used
+# to claim -- heartbeat never wakes the creator, because a progress note that
+# costs a full LLM turn is the most expensive thing on the board rather than a
+# free one -- is enforced against the set that actually decides,
+# DEFAULT_WAKE_KINDS in gateway/kanban_notifier.py, by the assertion in the
+# kanban_notifier RUN below. Keep this grep anyway: it fails the build the
+# moment a base-image bump adds a kind upstream can wake for, which is when
+# DEFAULT_WAKE_KINDS has to be widened to match, and it names the tuple that
+# changed rather than leaving that to verify_kanban_notifier.py's subset check.
 COPY --chmod=0644 deploy/docker/patches/kanban_progress_lines.py /opt/hermes/gateway/kanban_progress_lines.py
 # Applier and verifier share one COPY into a directory, for the same reason the
 # kanban_notifier pair below does: this stage is the base for `platform`, the
@@ -197,23 +209,28 @@ COPY deploy/docker/patches/apply_kanban_progress_lines.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-progress/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lines.py /opt/hermes && \
-    grep -qF 'TERMINAL_KINDS = ' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF '+ ("heartbeat",)' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q 'elif kind == "heartbeat":' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q '_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")' /opt/hermes/gateway/kanban_watchers.py && \
-    /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
+    grep -qF 'TERMINAL_KINDS = ' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '+ ("heartbeat",)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q '^def _fmt_heartbeat(ev, n) -> tuple:' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '"heartbeat": _fmt_heartbeat,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q 'note = _progress_note(ev.payload)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q '_send_res = await _progress_deliver(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'self.runner, adapter, sub, ev.kind, ev, msg, metadata,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'self.progress_header = f"{self.board_tag}{tag}"' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q 'from gateway.kanban_progress_lines import deliver as _progress_deliver' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q '^_WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    /opt/hermes/.venv/bin/python3 -c "import pathlib; p='/opt/hermes/gateway/kanban_watchers_notifier.py'; compile(pathlib.Path(p).read_text(), p, 'exec')" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/verify_kanban_progress_lines.py && \
     rm -rf /tmp/kanban-progress
 
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
-# three fleet-audit streams published wrong ledgers on 2026-08-04. Twelve edits
-# across three files, so the surgery lives in an applier script rather than
-# inline; it fails the build on any anchor that no longer matches.
+# three fleet-audit streams published wrong ledgers on 2026-08-04. Sixteen edits
+# across four files, so the surgery lives in an applier script rather than
+# inline; it fails the build on any anchor that no longer matches. Since
+# v2026.9.14 split the run body, the saved output path rides back on
+# upstream's _RunDelivery record before the out-param is filled in.
 # verify_cron_run_scope.py then exercises the patched code. The applier only
 # proves the anchors matched, and the first regression here was a runtime type
 # error no anchor could have caught: save_job_output returns a pathlib.Path,
@@ -244,7 +261,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_run_scope.py /opt/hermes && \
     grep -q 'with cron_run_scope(job_id, risk=' /opt/hermes/tools/cronjob_tools.py && \
     grep -qF "extra_prompt=extra_prompt, outcome=outcome," /opt/hermes/tools/cronjob_tools.py && \
     grep -q "cron_ownership_violation(tid)" /opt/hermes/tools/kanban_tools.py && \
-    grep -q 'outcome\["output_file"\] = str(output_file)' /opt/hermes/cron/scheduler.py && \
+    grep -q 'd.output_file = str(output_file)' /opt/hermes/cron/scheduler.py && \
     grep -q 'job\["risk"\] = _eff_risk' /opt/hermes/cron/jobs.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 from gateway.kanban_handoff_clip import clip_handoff; \
@@ -258,7 +275,8 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 # The platform profile has no ticker thread -- it is ticked once a minute by
 # spawning `hermes cron tick`, whose body is verbatim `tick(verbose=True)` --
 # so everything Hermes hangs off the ticker's lifetime is absent or wrong there.
-# Three consequences, all fixed by the fourteen anchored edits in the applier:
+# Three consequences; the first two are fixed by the twelve anchored edits in
+# the applier, the third upstream has since closed itself:
 #   * `tick()` defaults to sync=True and held <HERMES_HOME>/cron/.tick.lock
 #     across the whole `as_completed` wait, so a fleet audit starved every other
 #     job for its full runtime. Measured over 17h: 3 of 35
@@ -272,10 +290,14 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 #   * `cronjob(action='run')` took no per-job lock at all, and the
 #     claim_job_for_fire CAS it relied on never blocked a tick, so a dispatched
 #     audit could run on top of a scheduled one and share its output file.
-#   * recover_interrupted_executions() runs only from the two gateway-ticker
+#   * recover_interrupted_executions() ran only from the two gateway-ticker
 #     lifecycles, so nothing ever reaped an abandoned attempt on this profile:
 #     the live ledger held 6 permanently `running` rows, the oldest a day old,
-#     against 0 of 1000 on the default store the gateway does sweep.
+#     against 0 of 1000 on the default store the gateway does sweep. Upstream
+#     closed that before v2026.9.14: tick() now calls _maybe_reap_dead_owners()
+#     itself, so the applier's hermes_cli/cron.py edit is retired, the grep
+#     below pins upstream's call instead, and the verifier still drives the
+#     sweep from a real spawned tick.
 # Must stay AFTER the cron_run_scope block: every anchor was verified against
 # the post-cron_run_scope source.
 # See the module docstring in deploy/docker/patches/cron_tick_lock_scope.py.
@@ -289,8 +311,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope
     grep -q "_tick_lock = AdvisoryLock(lock_fd, fcntl, globals().get(\"msvcrt\"))" /opt/hermes/cron/scheduler.py && \
     grep -q "_job_lock = _job_locks.claim(job_id)" /opt/hermes/cron/scheduler.py && \
     grep -q "_run_lock = _job_locks.claim(job_id)" /opt/hermes/tools/cronjob_tools.py && \
-    grep -q "recover_interrupted_executions" /opt/hermes/hermes_cli/cron.py && \
-    ! grep -q "fcntl.flock(lock_fd, fcntl.LOCK_UN)" /opt/hermes/cron/scheduler.py && \
+    grep -q "_maybe_reap_dead_owners()" /opt/hermes/cron/scheduler.py && \
+    ! grep -q "        _release_tick_lock(lock_fd)" /opt/hermes/cron/scheduler.py && \
     ! grep -q "_job_locks.release(" /opt/hermes/cron/scheduler.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/verify_cron_tick_lock_scope.py && \
     rm -rf /tmp/cron-tick-lock
@@ -341,16 +363,18 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/apply_cron_skip_ledger.p
 # approvals.cron_mode: approve is a fleet-wide default here -- a scheduled run
 # has nobody at the keyboard, so it cannot answer an approval prompt. Upstream
 # read that as permission to skip the Tirith content scan as well: the scanner
-# is called only from the cron `deny` arm of check_all_command_guards, so under
-# `approve` every command in every watchdog run executed unscanned. Measured
+# is called only from _unattended_deny, the `deny` arm check_all_command_guards
+# runs for each unattended context, so under `approve` every command in every
+# watchdog run executed unscanned. Measured
 # against the live image, not inferred: the scanner is consulted 0 times.
 # That is the wrong half to drop. github-issue-resolver fires every 30 minutes
 # over issue text written by anyone with a GitHub account, and Tirith's whole
 # subject is the content-level threats that arrive that way -- homograph and
 # lookalike-TLD URLs, pipe-to-interpreter, terminal escape injection, encoded
-# payloads -- none of which DANGEROUS_PATTERNS is looking for. The patch runs
-# the scan on both arms; the mode goes on deciding only what happens to a
-# pattern-flagged command, which is the part that genuinely needs a human.
+# payloads -- none of which DANGEROUS_PATTERNS is looking for. The patch
+# inserts its own scan ahead of that loop, in every mode; the mode goes on
+# deciding only what happens to a pattern-flagged command, which is the part
+# that genuinely needs a human.
 # The applier proves the anchor matched; it cannot prove the gate now refuses
 # anything, and every way this patch fails is silent -- an unscanned run looks
 # exactly like a clean one. verify_cron_tirith_scan.py drives the real patched
@@ -398,7 +422,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/apply_cron_risk_gate.py /o
 # is the case this has to cover: `deliver` is a field every creation path can
 # set, including the model's own tool call.
 # NOT a patch. Upstream already routes `deliver=<name>` through the platform
-# registry, and cron/scheduler.py::_plugin_cron_env_var says in its own words
+# registry, and cron/scheduler_delivery.py::_plugin_cron_env_var says in its own words
 # that a plugin setting `cron_deliver_env_var` gets "cron delivery support
 # without editing this module". So this is a bundled platform plugin, dropped
 # into plugins/platforms/ where Hermes auto-registers it: zero lines of the
@@ -429,9 +453,11 @@ RUN cd /opt/hermes && \
 
 # One patch for the kanban notifier's terminal-event path, because clipping the
 # handoff, delivering `result`, and deciding whether to wake the creator are
-# three edits to the same twenty lines of gateway/kanban_watchers.py. Three
-# appliers meant four anchors into one function and four ways for an upstream
-# edit to break the build; this is two.
+# three edits to the same few lines of what is now
+# gateway/kanban_watchers_notifier.py. Three appliers meant four anchors into
+# one function and four ways for an upstream edit to break the build; this is
+# three -- the handoff, the wake set, and the incident row, which shared the
+# wake anchor until upstream split the per-event send loop from the wake step.
 #   * Clip: upstream hard-slices the handoff at 200/160 characters and discards
 #     every line after the first, which delivered a severed GitHub link -- a
 #     ledger URL cut to ".../is" -- on 2026-08-03. Both slices are swapped for a
@@ -464,24 +490,25 @@ RUN cd /opt/hermes && \
 #
 # The wake edit is now three greps rather than one because v2026.8.13 gave the
 # subscription its own `delivery_mode`, so the patched line is a parenthesized
-# `_wake_kinds_for(...) if wake_agent else set()` and one grep no longer spans
-# it. All three needles are text the applier itself emits, so -- like the
+# `_wake_kinds_for(...) if self.wake_agent else set()` and one grep no longer
+# spans it. All three needles are text the applier itself emits, so -- like the
 # signature grep above -- they pin that the edit landed in the shape expected,
 # not that upstream still writes `wake_agent`. They cannot fail independently of
-# the applier: WAKE_ANCHOR carries `if wake_agent` too, so upstream dropping the
-# per-subscription gate fails the substitution first.
+# the applier: WAKE_ANCHOR carries `if self.wake_agent` too, so upstream
+# dropping the per-subscription gate fails the substitution first.
 #
 # The pin on upstream is in verify_kanban_notifier.py, which asserts
-# `send_passive = mode != "wake"` is still in the notifier's own source. That
-# string belongs to upstream and no applier writes it, so a rename is caught
-# there -- before the patched line reaches a notifier tick and raises NameError.
+# `self.send_passive = mode != "wake"` is still in the notifier's own source
+# (_KanbanNotification's constructor). That string belongs to upstream and no
+# applier writes it, so a rename is caught there -- before the patched line
+# reaches a notifier tick and raises AttributeError.
 #
-# The first of those greps carries `passive_delivered=send_passive` rather than
-# stopping at `adapter=adapter`, and the argument is not cosmetic: it is the
-# whole difference between narrowing a wake that duplicates a text ping and
-# narrowing one that IS the delivery. `delivery_mode="wake"` skips the ping on a
-# push adapter, so a gate satisfied by `adapter=adapter` alone would pass on a
-# build that drops completions for every wake-only subscriber.
+# The first of those greps carries `passive_delivered=self.send_passive` rather
+# than stopping at `adapter=self.adapter`, and the argument is not cosmetic: it
+# is the whole difference between narrowing a wake that duplicates a text ping
+# and narrowing one that IS the delivery. `delivery_mode="wake"` skips the ping
+# on a push adapter, so a gate satisfied by `adapter=self.adapter` alone would
+# pass on a build that drops completions for every wake-only subscriber.
 #
 # The anchors prove only that the text landed, and every way the wake half can
 # go wrong is silent: it fails towards upstream, so a moved hermes_cli.config, a
@@ -505,13 +532,14 @@ COPY deploy/docker/patches/apply_kanban_notifier.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-notifier/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-notifier/apply_kanban_notifier.py /opt/hermes && \
-    grep -q "h = _clip_handoff(payload_summary)" /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q "r = _clip_handoff(task.result)" /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q "handoff = _kanban_handoff_with_result(handoff, task)" /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF 'd["events"], adapter=adapter, passive_delivered=send_passive' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF 'if wake_agent' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF 'wake_configured=wake_agent,' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q "wake_handoff = _clip_handoff(payload_summary)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q "wake_handoff = _clip_handoff(n.task.result)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q "handoff = _kanban_handoff_with_result(handoff, n.task)" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'self.d["events"], adapter=self.adapter, passive_delivered=self.send_passive' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'if self.wake_agent' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'wake_configured=self.wake_agent,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -q "_kanban_note_suppressed(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF '_kanban_store_incident(ev, self.task, self.sub, posted=self.send_passive)' /opt/hermes/gateway/kanban_watchers_notifier.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 import sys; from gateway.kanban_notifier import DEFAULT_WAKE_KINDS; \
 sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would wake the card creator for a full LLM turn') if 'heartbeat' in DEFAULT_WAKE_KINDS else None" && \
@@ -544,14 +572,14 @@ sys.exit('heartbeat is in DEFAULT_WAKE_KINDS: every mid-run progress note would 
 # The negative gate is on upstream's unfiltered work list rather than on the old
 # `conversations_info(channel=entry["id"])`, which upstream itself no longer
 # writes and so could no longer fail. Be precise about what the replacement
-# buys, because it is less than it looks: the applier's OLD_RESOLVE anchor
-# already contains `unresolved = [ch for ch in channels ...]` and substitute()
-# demands exactly one occurrence, so the ordinary regression -- upstream
-# reinstating the unfiltered list -- fails the applier, not this grep. What is
-# left to the grep is the case substitute() cannot see: a SECOND occurrence of
-# that work list somewhere else in channel_directory.py, which the applier would
-# leave untouched and every positive gate above would still match. That is a
-# narrow catch, and it is the honest description of one.
+# buys, because it is less than it looks: the applier's OLD_GROUPING anchor
+# already contains upstream's `unresolved_by_base.setdefault(...)` grouping
+# line and substitute() demands exactly one occurrence, so the ordinary
+# regression -- upstream reinstating the unfiltered list -- fails the applier,
+# not this grep. What is left to the grep is the case substitute() cannot see:
+# a SECOND occurrence of that work list elsewhere in channel_directory.py,
+# which the applier would leave untouched and every positive gate above would
+# still match. That is a narrow catch, and it is the honest description of one.
 #
 # A grep guard cannot catch this class of bug: the original code resolved every
 # entry, handled the error and logged it, and was wrong only in the value it
@@ -570,10 +598,10 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
     /opt/hermes/.venv/bin/python3 /tmp/channel-directory/apply_channel_directory_threads.py /opt/hermes && \
     grep -qF "conversations_info(channel=base_id)" /opt/hermes/gateway/channel_directory.py && \
     grep -q "from gateway.channel_directory_threads import" /opt/hermes/gateway/channel_directory.py && \
-    grep -qF "unresolved = _unresolved_by_channel(channels)" /opt/hermes/gateway/channel_directory.py && \
+    grep -qF "unresolved_by_base: Dict[str, list] = dict(_unresolved_by_channel(channels))" /opt/hermes/gateway/channel_directory.py && \
     grep -qF "_note_unresolvable(" /opt/hermes/gateway/channel_directory.py && \
     grep -qF "_rename_entry(" /opt/hermes/gateway/channel_directory.py && \
-    ! grep -qF "unresolved = [ch for ch in channels" /opt/hermes/gateway/channel_directory.py && \
+    ! grep -qF "unresolved_by_base.setdefault(" /opt/hermes/gateway/channel_directory.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/channel-directory/verify_channel_directory_threads.py && \
     rm -rf /tmp/channel-directory
@@ -698,7 +726,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
 # The gate is also closed for a delegate_task child, which runs in its parent's
 # own process and inherits its HERMES_KANBAN_TASK: upstream's two kanban gates
 # both draw that line, and a gate that read the env var alone was the only one
-# in the file that called a child a worker. The grep proves the anchors landed;
+# in the file that called a child a worker. Since v2026.9.14 upstream registers
+# the kanban tools from one _TOOLS table in a single loop, so the patch is one
+# _gate override inside that loop rather than a check_fn= per tool. The grep
+# proves the override landed;
 # verify_kanban_worker_tools.py proves the gate answers correctly against the
 # real agent.delegation_context and that the schemas actually disappear.
 # See the module docstring in deploy/docker/patches/kanban_worker_tools.py.
@@ -719,7 +750,8 @@ COPY deploy/docker/patches/kanban_worker_tools.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-worker-tools/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_tools.py /opt/hermes && \
-    test "$(grep -c 'check_fn=_check_kanban_worker_mode' /opt/hermes/tools/kanban_tools.py)" = "7" && \
+    test "$(grep -c '_gate = _check_kanban_worker_mode' /opt/hermes/tools/kanban_tools.py)" = "1" && \
+    grep -q 'no_cache_check_fn(_check_kanban_worker_mode)' /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/verify_kanban_worker_tools.py && \
     rm -rf /tmp/kanban-worker-tools
 
@@ -791,8 +823,8 @@ COPY deploy/docker/patches/apply_kanban_result_required.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-result/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.py /opt/hermes && \
-    grep -q "body = _with_report_format(body)" /opt/hermes/tools/kanban_tools.py && \
-    grep -q "from tools.kanban_report_format import with_report_format" /opt/hermes/tools/kanban_tools.py && \
+    grep -qF 'body=_with_report_format(args.get("body")),' /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_report_format import" /opt/hermes/tools/kanban_tools.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_result_required.py /opt/hermes && \
     grep -q "_result_err, result = _require_result(tid, summary, result)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "_apply_result_schema(KANBAN_COMPLETE_SCHEMA)" /opt/hermes/tools/kanban_tools.py && \
@@ -803,9 +835,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
     rm -rf /tmp/kanban-result
 
 # Hotfix: three kanban scheduler faults, all measured on the cluster 2026-08-07,
-# all in `hermes_cli/kanban_db.py`. One patch, because three appliers rewriting
-# the same file could not see each other's anchors and their ordering lived in a
-# comment rather than in a constraint.
+# all in what is now `hermes_cli/kanban_db.py` plus its `kanban_db_dispatch.py`
+# split. One patch, because three appliers rewriting the same source could not
+# see each other's anchors and their ordering lived in a comment rather than in
+# a constraint.
 #
 #   * Self-parenting deadlock. `task_links` is a predecessor edge, so a card
 #     that creates work with `parents=[<itself>]` and then blocks on it can
@@ -851,7 +884,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 #     in-flight card at once still cannot collapse into one systemic verdict.
 #
 #   * The circuit breaker's trip does not survive the tick that wrote it.
-#     `dispatch_once` calls `detect_crashed_workers` and then, twenty lines
+#     `dispatch_once` calls `detect_crashed_workers` and then, a few lines
 #     later, `recompute_ready`. Both decide whether a card is over its retry
 #     budget, and they do not use the same threshold. `_record_task_failure`
 #     persists `consecutive_failures = old + 1` -- the raw attempt count --
@@ -896,19 +929,22 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # parent-dependency promotion and worker `kanban_block` stickiness all still
 # behave exactly as they did before.
 #
-# The counted greps below are the floor's blast radius: exactly the two trip
-# UPDATEs bind `persisted_failures`, and the two below-threshold UPDATEs still
-# bind the raw `failures`, so a floor that leaked into a retry would show up as
-# 3-and-1. The raw count is 1+1 rather than 2 because v2026.8.13 gave the
-# below-threshold spawn path a leading `retry_status` bind -- it restores the
-# phase it claimed from -- so the two below-threshold binds no longer share a
-# string. Counting them separately keeps both pinned; a single `-c` on the
-# shorter text would have matched neither shape reliably.
+# The counted greps below are the floor's blast radius: exactly one trip UPDATE
+# binds `persisted_failures` (v2026.9.14 merged the spawn-path and crash-path
+# trips into one statement, so the two binds this used to count are one), and
+# the two below-threshold UPDATEs still bind the raw `failures`, so a floor that
+# leaked into a retry would show up as 2-and-1. The raw count is 1+1 rather
+# than 2 because v2026.8.13 gave the below-threshold spawn path a leading
+# `retry_status` bind -- it restores the phase it claimed from -- so the two
+# below-threshold binds do not share a string. Counting them separately keeps
+# both pinned; a single `-c` on the shorter text would have matched neither
+# shape reliably.
 #
 # Must stay ahead of the kanban_wake_nudge block below, which anchors on
-# `create_task`, `complete_task` and `unblock_task` in the same file. The seven
-# anchors here touch none of those three, and test_kanban_scheduling.py asserts
-# that rather than leaving it to a reader.
+# `create_task`, `complete_task` and `unblock_task` in hermes_cli/kanban_db.py.
+# The one anchor here in that file (`block_task`) and the five in
+# kanban_db_dispatch.py touch none of those three, and test_kanban_scheduling.py
+# asserts that rather than leaving it to a reader.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
@@ -924,33 +960,36 @@ COPY deploy/docker/patches/apply_kanban_scheduling.py \
      /tmp/kanban-scheduling/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
     grep -q "_kanban_repair_inverted_deps(conn, task_id, reason)" /opt/hermes/hermes_cli/kanban_db.py && \
-    grep -q "conn, _kanban_claimer, _pid_alive, _resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db.py && \
-    grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db.py && \
-    grep -q "conn, _kanban_reclaimed.chargeable, _record_task_failure" /opt/hermes/hermes_cli/kanban_db.py && \
-    grep -q "persisted_failures = max(failures, effective_limit)" /opt/hermes/hermes_cli/kanban_db.py && \
-    grep -q "return max(0, running - _kanban_count_waiting_on_children(conn))" /opt/hermes/hermes_cli/kanban_db.py && \
-    test "$(grep -c 'lock.startswith(host_prefix)' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
-    test "$(grep -c '(persisted_failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
-    test "$(grep -c '(failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
-    test "$(grep -c '(retry_status, failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
+    grep -q "conn, _kanban_claimer, _kb._pid_alive, _kb._resolve_crash_grace_seconds" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "conn, sweep.reclaimed_chargeable, _record_task_failure" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "reclaimed_chargeable: list\[str\] = field(default_factory=list)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "persisted_failures = max(failures, effective_limit)" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    grep -q "return max(0, running - _kanban_count_waiting_on_children(conn))" /opt/hermes/hermes_cli/kanban_db_dispatch.py && \
+    test "$(grep -c 'lock.startswith(host_prefix)' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c '(persisted_failures, error, task_id),' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c '(failures, error, task_id),' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
+    test "$(grep -c '(retry_status, failures, error, task_id),' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
+    test "$(grep -c 'from hermes_cli.kanban_scheduling import' /opt/hermes/hermes_cli/kanban_db_dispatch.py)" = "1" && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/verify_kanban_scheduling.py && \
     rm -rf /tmp/kanban-scheduling
 
 # Hotfix: kanban workers leaving `run_conversation` without a board write.
 #
-# Upstream guards this in exactly one place -- the end of the no-tool-calls
-# branch, where `build_kanban_stop_nudge` gives a worker that is about to stop
-# talking another turn to call `kanban_complete`/`kanban_block`. Every other way
-# out of that loop is a bare `break` several hundred lines earlier and jumps
-# straight over it. The worker exits rc=0 having never touched the board and the
-# reaper stamps a `protocol_violation` after the fact -- a failure with no
-# explanation in it, because by then the reason is gone.
+# Upstream guards this in exactly one place -- the text-response phase
+# (agent/turn_stop_gates.py), where `build_kanban_stop_nudge` gives a worker
+# that is about to stop talking another turn to call
+# `kanban_complete`/`kanban_block`. Every other way out of that loop is a
+# `return _verdict("break")` from one of the agent/turn_*.py phase helpers and
+# jumps straight over it. The worker exits rc=0 having never touched the board
+# and the reaper stamps a `protocol_violation` after the fact -- a failure with
+# no explanation in it, because by then the reason is gone.
 #
 # Card t_d3efabef burned four runs and 38 minutes this way on 2026-08-07. Each
 # run halted on `loop_web_search_cap` with 173 successful searches in hand and
-# was never told; the halt path breaks out of the tool-call branch without
-# showing the model the block result.
+# was never told; the halt path (agent/turn_tool_round.py) ends the turn from
+# inside the tool round without showing the model the block result.
 #
 #   * kanban_guardrail_exit's first edit makes that halt kanban-aware: reuse
 #     upstream's own nudge helper (already bounded at two attempts, already a
@@ -959,7 +998,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 #     `_tool_guardrail_halt_decision` is mandatory; `reset_for_turn` clears it
 #     per turn, not per iteration.
 #   * The second edit backstops the six sibling exits that leak identically, in
-#     `finalize_turn` -- the single funnel every `break` passes through. An
+#     `finalize_turn` (agent/turn_finalizer.py) -- the single funnel every exit
+#     passes through. An
 #     unexplained protocol violation becomes a counted `timed_out` whose error
 #     text names the exit reason. Goal-mode workers are excluded: they call
 #     `finalize_turn` once per turn, so recording on turn 1 of N would release
@@ -988,25 +1028,29 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # whose 429 retries are exhausted used to leave its card `running` with no
 # reason on the board and exit 75 for the reaper to classify; the storm recorded
 # three `crashed` and a hard block, and the delegating agent reported the
-# delegation's status as its answer. Two more guardrail-exit edits make the
+# delegation's status as its answer. The remaining guardrail-exit edits make the
 # worker block its own card first, `kind=transient` with the provider's 429
-# text as the reason: at the cli.py exit-code site (the return a 429 takes) and,
-# through the finalize_turn backstop, for a retry loop that ends with no
-# response at all. billing keeps the stock exit. transient counts in upstream's
+# text as the reason: at the two sites a failed 429 result reaches on its way
+# out (cli.py's exit-code block and hermes_cli/cli_chat_turn_mixin.py's
+# post-turn render) and, through the finalize_turn backstop fed by a stash in
+# agent/turn_api_error.py, for a retry loop that ends with no response at all.
+# billing keeps the stock exit. transient counts in upstream's
 # unblock-loop breaker like every truly-blocked kind: a card blocked this way,
 # unblocked, and blocked this way again lands in triage, not blocked. The second half,
 # rate_limit_retry_delay, makes the retries land where they can succeed: the
-# loop honoured only a Retry-After header, and Google sends its ~54s window in
-# the body as google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s
-# apart. The retryDelay fallback shares the header path's 600s cap and leaves
-# the retry count alone. Both new files ride this block's COPYs and RUN because
+# loop (agent/turn_recovery.py) honours a Retry-After header and a `retry_after`
+# body field, and Google sends its ~54s window in the message text as
+# google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s apart. The
+# retryDelay fallback shares the header path's 600s cap and leaves the retry
+# count alone. Both new files ride this block's COPYs and RUN because
 # the image is three layers under the ceiling check_image_layers.py enforces.
 # See the module docstrings in deploy/docker/patches/kanban_guardrail_exit.py
 # and deploy/docker/patches/rate_limit_retry_delay.py.
 #
 # state_db_synchronous_full rides the same COPY and RUN for the same reason and
-# shares no line with either: it widens the platform gate in hermes_state.py's
-# _enforce_macos_synchronous_full from Darwin to Linux, so a WAL-mode state.db
+# shares no line with either: it gives hermes_state_wal.py's
+# _enforce_macos_synchronous_full a Linux branch beside its Darwin-only
+# _darwin_pragma delegation, so a WAL-mode state.db
 # or kanban.db that a caller left at synchronous=NORMAL is put back to FULL on
 # every open. That is the function's own defence against the checkpoint race
 # that half-writes btree pages, and #610 met that corruption on a gVisor gofer
@@ -1028,13 +1072,13 @@ COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_synchronous_full.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardrail_exit.py /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_rate_limit_retry_delay.py /opt/hermes && \
-    grep -q 'sys.platform not in ("darwin", "linux"):  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state.py && \
-    grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/conversation_loop.py && \
+    grep -q 'if sys.platform == "linux":  # kube-agents patch: state-db-synchronous-full' /opt/hermes/hermes_state_wal.py && \
+    grep -q "if _kanban_halt_nudge:" /opt/hermes/agent/turn_tool_round.py && \
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
-    grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/conversation_loop.py && \
+    grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/turn_api_error.py && \
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
-    grep -q "_kube_block_rate_limited_chat(result)" /opt/hermes/cli.py && \
-    grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/conversation_loop.py && \
+    grep -q "_kube_block_rate_limited_chat(turn.result)" /opt/hermes/hermes_cli/cli_chat_turn_mixin.py && \
+    grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/turn_recovery.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_state_db_synchronous_full.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \
@@ -1059,8 +1103,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 #
 # Hotfix: a worker's child cards inherit the chat subscription of the card the
 # worker is running. `_maybe_auto_subscribe` needs session context that exists
-# only on inbound user messages, and upstream's create-time inheritance only
-# follows explicit `parents=[...]` edges -- a worker's own card is neither, so
+# only on inbound user messages, and upstream's create-time inheritance followed
+# only explicit `parents=[...]` edges -- a worker's own card is neither, so
 # the user's thread lost the fan-out at the first hop. Measured 2026-08-07
 # 12:58: coordinator t_b9659077 was subscribed, the 4 cards it created as a
 # WORKER were not, and the synthesizer's answer sat undelivered for 91.3s
@@ -1070,6 +1114,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # idempotency as that script, so keeping it around as a back-fill tool
 # double-writes harmlessly. verify_kanban_auto_subscribe.py replays the
 # incident through the real patched create handler on a real board.
+# Since v2026.9.14 upstream's create_task inherits the creator card's
+# subscriptions inside the creation transaction itself, so that verifier passes
+# on the unpatched base except for the wiring check and an idempotent re-create
+# edge; the step is kept green as a retirement candidate rather than dropped by
+# a build break.
 # See the module docstring in deploy/docker/patches/kanban_auto_subscribe.py.
 #
 # Hotfix: kanban_comment tells the caller what the card is doing. On 2026-08-08
@@ -1090,9 +1139,10 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # See the module docstring in deploy/docker/patches/kanban_comment_status.py.
 #
 # Hotfix: the notifier delivered at-MOST-once. `claim_unseen_events_for_sub`
-# committed the subscription's cursor and only then, ~130 lines of control flow
-# later, tried to send -- so anything that killed the process in between
-# destroyed the notification permanently. On 2026-08-09 13:00:29 task
+# committed the subscription's cursor (now in `_Collector._claim_for_sub`,
+# gateway/kanban_watchers_notifier.py) and only then, in `deliver()`, tried to
+# send -- so anything that killed the process in between destroyed the
+# notification permanently. On 2026-08-09 13:00:29 task
 # t_a18254ca's `completed` event (id 971) was claimed, the cursor moved 958 ->
 # 971, and the gateway took a fatal signal 162ms later at the `get_task` on the
 # very next line. The 7,124-byte report was intact in tasks.result and no tick
@@ -1116,7 +1166,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # Kubernetes event reaches the agent over the REST API, and api_server.py's
 # session-context chokepoint binds platform="api_server" with the session id as
 # chat_id -- deliberately, as the structural guard against #10760. One layer
-# down, `_maybe_auto_subscribe` copies those values into kanban_notify_subs and
+# down, `_resolve_notify_target` (split out of `_maybe_auto_subscribe`) copies
+# those values into kanban_notify_subs and
 # writes a well-formed row naming a platform no notifier can deliver to, so the
 # card completes and the root-cause analysis reaches nobody (#630). On the
 # install this was diagnosed against, 14 subscription rows were sitting in that
@@ -1144,10 +1195,11 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # records which running card created which child (kanban_worker_children), and
 # kanban_complete refuses — once, never wedging — to close a card whose
 # recorded children are neither settled nor gated on it, telling the worker to
-# wait and synthesize instead. Must run AFTER apply_kanban_auto_subscribe.py
-# and AFTER apply_kanban_result_required.py (earlier stage): both of its
-# anchors are text those patches introduced, deliberately, because the sites
-# it needs only exist in the patched tree. kanban_result_required.py is copied
+# wait and synthesize instead. Must run AFTER apply_kanban_result_required.py
+# (earlier stage): its completion anchor is text that patch introduced,
+# deliberately, because the site it needs only exists in the patched tree. The
+# create hook anchors on upstream's own line, so apply_kanban_auto_subscribe.py
+# can be retired without breaking it. kanban_result_required.py is copied
 # here again solely so the applier can import the anchor constant; the module
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
@@ -1217,13 +1269,15 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     test "$(grep -c '_kanban_record_wake(conn)' /opt/hermes/hermes_cli/kanban_db.py)" = "3" && \
     test "$(grep -c '_wake_monitor = _KanbanWakeMonitor(_kb.kanban_db_path)' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
     test "$(grep -c 'await _kanban_wait_interval(' /opt/hermes/gateway/kanban_watchers.py)" = "2" && \
-    ! grep -q "Sleep with cancellation checks" /opt/hermes/gateway/kanban_watchers.py && \
+    ! grep -q 'await self._sleep_between_ticks(interval)' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -q 'async def _sleep_between_ticks' /opt/hermes/gateway/kanban_watchers.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_notify_delivery.py /opt/hermes && \
-    ! grep -q '_kb.claim_unseen_events_for_sub(' /opt/hermes/gateway/kanban_watchers.py && \
-    ! grep -q '_kb.rewind_notify_cursor(' /opt/hermes/gateway/kanban_watchers.py && \
-    grep -qF 'old_cursor, cursor, events = _kanban_read_unclaimed(' /opt/hermes/gateway/kanban_watchers.py && \
-    test "$(grep -cF '_kanban_mark_delivered(self, sub, d["cursor"])' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
-    test "$(grep -cF 'self._kanban_advance, sub, d["cursor"], board_slug,' /opt/hermes/gateway/kanban_watchers.py)" = "1" && \
+    ! grep -q 'claim_unseen_events_for_sub(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    ! grep -q '"rewind_notify_cursor"' /opt/hermes/gateway/kanban_watchers.py && \
+    grep -qF 'old_cursor, cursor, events = _kanban_read_unclaimed(' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    grep -qF 'watcher=self.runner,' /opt/hermes/gateway/kanban_watchers_notifier.py && \
+    test "$(grep -cF '_kanban_mark_delivered(self.runner, self.sub, self.d["cursor"])' /opt/hermes/gateway/kanban_watchers_notifier.py)" = "1" && \
+    test "$(grep -c 'await self.advance()' /opt/hermes/gateway/kanban_watchers_notifier.py)" = "1" && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_auto_subscribe.py /opt/hermes && \
     grep -q "_kanban_inherit_worker_subs(conn, new_tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_auto_subscribe import" /opt/hermes/tools/kanban_tools.py && \
@@ -1290,8 +1344,14 @@ RUN mkdir -p /opt/defaults && chown hermes:hermes /opt/defaults
 COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 
 
-# 5.5. Install and enable hermes-otel plugin in /opt/defaults
-RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel && \
+# 5.5. Install and enable hermes-otel plugin in /opt/defaults.
+# Pinned to the plugin's last manifest_version-1 commit (1.6.2, 2026-09-19).
+# The tip moved to manifest_version 2 in 1.7.0, which this Hermes cannot
+# install (`requires manifest_version 2, but this installer only supports up
+# to 1`), and an unpinned tip broke every cache-cold build (#1817). Bumping
+# the ref means checking the installer's supported manifest version first.
+ARG HERMES_OTEL_REF=b7ece46a5c883a619686b6c698b0316d9fd50962
+RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install --ref "${HERMES_OTEL_REF}" briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 

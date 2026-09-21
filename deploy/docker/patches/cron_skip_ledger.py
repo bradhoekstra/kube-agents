@@ -94,8 +94,8 @@ an occurrence where it used to cost nothing.
     missing its ``id``.
 
 ``fire_claim_lost``
-    ``_process_job`` (the worker ``_run_and_release`` runs) re-takes the fire
-    claim at execution time and ``claim_job_for_fire`` refused it. Upstream
+    ``_process_due_job`` (the worker ``_run_and_release`` runs, through
+    ``tick``'s ``_process_job`` closure) re-takes the fire claim at execution time and ``claim_job_for_fire`` refused it. Upstream
     (v2026.8.19) closes the claimed row as ``failed`` with ``Fire claim lost;
     execution was not started.``, which — when the refusal is another owner's
     fresh claim — is ``dispatch_claim_rejected``'s complaint again: an

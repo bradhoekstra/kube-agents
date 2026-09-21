@@ -1,7 +1,7 @@
 """Everything the kanban notifier does with a card's terminal event.
 
 Installed into the image at ``/opt/hermes/gateway/kanban_notifier.py`` and
-wired into ``gateway/kanban_watchers.py`` by
+wired into ``gateway/kanban_watchers_notifier.py`` by
 ``deploy/docker/patches/apply_kanban_notifier.py``.
 
 One module because it is one code path. When a card reaches a terminal state
@@ -118,7 +118,7 @@ __all__ = [
 # the notifier already builds**, rather than a second message, and that is
 # deliberate: the existing send site is wrapped in the notifier's failure
 # counter, cursor rewind, and subscription-drop logic
-# (``gateway/kanban_watchers.py``). One message inherits all of it. A follow-up
+# (``gateway/kanban_watchers_notifier.py``). One message inherits all of it. A follow-up
 # ``adapter.send()`` would sit outside that machinery, after the cursor has
 # advanced, and would need its own — a second failure path guarding the payload
 # that matters most.
@@ -127,12 +127,12 @@ __all__ = [
 # ---------------------------------
 # :func:`handoff_with_result` replaces the notifier's ``handoff`` rather than
 # appending to it, and it has to. Where the completion event carries no
-# ``summary``, ``kanban_watchers.py`` builds the status line out of the very
-# field this code exists to deliver::
+# ``summary``, ``kanban_watchers_notifier.py``'s ``_fmt_completed`` builds the
+# status line out of the very field this code exists to deliver::
 #
-#     elif task and task.result:
-#         r = _clip_handoff(task.result)
-#         handoff = f"\n{r}"
+#     elif n.task and n.task.result:
+#         wake_handoff = _clip_handoff(n.task.result)
+#         handoff = f"\n{wake_handoff}"
 #
 # ``delivered`` is then a 1200-character clip of ``result``, so asking whether
 # ``result`` already appears inside it — the containment test
@@ -388,9 +388,13 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # 2. ``adapter.handle_message(...)`` then injects a synthetic ``MessageEvent``
 #    to *wake the agent that created the card*, which costs a full model turn.
 #
-# Upstream hardcodes which event kinds trigger step 2::
+# Upstream hardcodes which event kinds trigger step 2, as ``_WAKE_KINDS`` in
+# ``gateway/kanban_watchers_notifier.py`` (v2026.9.14; it was a local of the
+# notifier loop in ``gateway/kanban_watchers.py`` before the September
+# decomposition)::
 #
-#     _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+#     _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked",
+#                    "review_requested", "changes_requested", "block_loop_detected")
 #
 # There is no config key for it anywhere in Hermes. For the Chat Agent front
 # door that makes ``completed`` pure overhead: the summary has already been
@@ -425,6 +429,13 @@ DEFAULT_WAKE_KINDS: Tuple[str, ...] = (
     "crashed",
     "timed_out",
     "blocked",
+    # The review-flow kinds v2026.8.13 and v2026.9.14 added upstream. They hand a
+    # decision back to the creator exactly as ``blocked`` does, so they belong in
+    # the default set; an operator narrowing ``kanban.wake_on_events`` to failures
+    # decides for themselves whether a review handoff is worth a turn.
+    "review_requested",
+    "changes_requested",
+    "block_loop_detected",
 )
 
 CONFIG_KEY = "wake_on_events"
@@ -955,7 +966,7 @@ def note_suppressed_completion(
 ) -> bool:
     """Record a terminal event that :func:`wake_kinds_for` chose not to wake for.
 
-    Called from ``gateway/kanban_watchers.py`` immediately after the wake set
+    Called from ``gateway/kanban_watchers_notifier.py`` immediately after the wake set
     is computed, on the path where every text ping for this delivery has
     already been sent — so "the result is in the thread", which is what the
     note asserts, is true by the time it is written.
@@ -1237,7 +1248,7 @@ def store_incident_report(
 ) -> bool:
     """Key the delivered report to its chat thread. True when a row was posted.
 
-    Called from ``gateway/kanban_watchers.py`` on the same path as
+    Called from ``gateway/kanban_watchers_notifier.py`` on the same path as
     :func:`note_suppressed_completion`, where every text ping for this delivery
     has already been sent — so the report this stores is one the reader has, and
     a reply to it is a reply to something.

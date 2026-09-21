@@ -7,8 +7,8 @@ whose CLI body is verbatim ``tick(verbose=True)``. Everything Hermes attaches to
 the ticker's lifetime -- the in-flight job set, the startup recovery sweep, the
 assumption that a tick is a short scheduling pass inside a long-lived process --
 is therefore either absent or wrong on that profile. This module and the
-fourteen anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is
-missing.
+twelve anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is
+missing (v2026.9.14 absorbed the sweep half; see the last section).
 
 Head-of-line blocking: the tick lock covered execution
 ------------------------------------------------------
@@ -87,10 +87,10 @@ The caller owns its claim
 the caller later releases by job id. That is not a style preference; releasing
 by id was a leak.
 
-``tick`` claims on the ticker thread and releases in ``_run_and_release``'s
-``finally``, which runs on a ``ThreadPoolExecutor`` worker -- and, crucially,
-OUTSIDE the ``contextvars.copy_context()`` that ``ctx.run(_process_job, j)``
-enters. A registry keyed by lock path has to recompute that path to release,
+``tick`` (through ``_submit_with_guard``, module-level since v2026.9.14)
+claims on the ticker thread and releases in ``_run_and_release``'s ``finally``,
+which runs on a ``ThreadPoolExecutor`` worker -- and, crucially, OUTSIDE the
+``contextvars.copy_context()`` that ``ctx.run(process_job, j)`` enters. A registry keyed by lock path has to recompute that path to release,
 and the path comes from ``_get_lock_paths`` -> ``get_hermes_home()``, whose
 override is a ``ContextVar`` in ``hermes_constants``. A worker thread starts
 with an empty context, so the recomputed path is the *process* ``HERMES_HOME``,
@@ -183,12 +183,19 @@ one of them was reapable and none had been reaped. A run that dies leaves no
 failure anywhere: ``cron runs`` shows it as still in flight, ``cron_health``
 projects a run that is not running, and the row is immortal.
 
-The fix is one line in ``hermes_cli/cron.py::cron_tick``, which is that
-profile's entire scheduler lifecycle: sweep first, then tick. It cannot reap a
-live run -- ``_owner_is_live`` checks both the pid and its start time, so a
-still-running sibling tick or a live gateway is skipped -- and a sweep that
-raises is logged and stepped over, because nothing about bookkeeping may stop a
-tick from dispatching.
+The fix used to be one line in ``hermes_cli/cron.py::cron_tick``, which is
+that profile's entire scheduler lifecycle: sweep first, then tick. Upstream
+closed the same gap in the run-up to v2026.9.14 (#86721): ``tick`` now calls
+``_maybe_reap_dead_owners``, which runs the sweep behind a 300s throttle held
+in a module global -- unset in every freshly spawned process, so a spawned tick
+sweeps every time -- and ``_try_dispatch_background_run`` reaps before every
+manual dispatch. The applier's edit is therefore retired; what stays is the
+guarantee, which ``verify_cron_tick_lock_scope.py`` pins on upstream's code:
+the reap precedes dispatch, cannot touch a live run (``_owner_is_live`` checks
+both the pid and its start time, so a still-running sibling tick or a live
+gateway is skipped), is wrapped in a ``try`` because nothing about bookkeeping
+may stop a tick from dispatching, and a real stuck row is reaped by a real
+spawned ``cron_tick``.
 
 Testing
 -------
