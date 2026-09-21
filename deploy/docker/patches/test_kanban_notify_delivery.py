@@ -164,7 +164,8 @@ class ReadUnclaimedTest(unittest.TestCase):
         self.assertEqual(old_cursor, 0)
 
     def test_no_events_yields_the_skip_shape(self):
-        # `if not events: continue` upstream — the empty list must survive.
+        # Upstream's empty-events path is `return None` from _claim_for_sub — the
+        # empty list must survive so the caller takes that same exit.
         old_cursor, cursor, events = read_unclaimed(
             _FakeKB([]), conn_at(958), SUB, kinds=TERMINAL_KINDS,
             watcher=_Watcher(),

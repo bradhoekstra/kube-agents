@@ -5,8 +5,10 @@ Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after the applier. The
 applier only proves its one anchor matched. This drives the *real patched*
 handler — the same ``_handle_comment`` a ``kanban_comment`` tool call reaches —
 against a real board, and replays the 2026-08-08 shape that produced the
-incident: a card completed, its report delivered, its subscription torn down,
-and then a comment written to it.
+incident: a card completed, its report delivered, and then a comment written
+to it. (The 2026-08-08 gateway also tore the subscription down in the same
+tick; the v2026.9.14 notifier keeps a done card's row and unsubscribes only on
+``archived``, so the replay leaves the row in place — see section 4.)
 
 Not vacuous, and measured rather than asserted: run against the same image with
 the applier skipped, 16 of the 36 checks fail and the script exits 1, because
