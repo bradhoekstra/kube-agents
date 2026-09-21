@@ -446,8 +446,9 @@ DEFAULT_WAKE_KINDS: Tuple[str, ...] = (
     "blocked",
     # The review-flow kinds v2026.8.13 and v2026.9.14 added upstream. They hand a
     # decision back to the creator exactly as ``blocked`` does, so they belong in
-    # the default set; an operator narrowing ``kanban.wake_on_events`` to failures
-    # decides for themselves whether a review handoff is worth a turn.
+    # the default set -- and, being :data:`DECISION_KINDS`, an operator narrowing
+    # ``kanban.wake_on_events`` to the failures cannot drop them: the key removes
+    # a wake over an answer already delivered, and these have no answer yet.
     "review_requested",
     "changes_requested",
     "block_loop_detected",

@@ -538,8 +538,10 @@ class Patch:
                 # compile(), not ast.parse(). ast.parse accepts a ``continue``
                 # outside a loop and only the compile step rejects it, so a
                 # branch spliced one indent level out of its ``for`` would parse
-                # here and fail at import, inside the running gateway.
-                # apply_kanban_progress_lines.py inserts exactly such a branch.
+                # here and fail at import, inside the running gateway. An
+                # earlier apply_kanban_progress_lines.py inserted exactly such
+                # a branch; nothing in the directory does today, and the
+                # compile step is what keeps the next one honest.
                 compile(self.source, self.relative, "exec")
             except SyntaxError as e:
                 raise SystemExit(

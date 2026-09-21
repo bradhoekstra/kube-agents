@@ -78,6 +78,13 @@ from apply_kanban_wake_nudge import (
     UNBLOCK_ANCHOR as WAKE_UNBLOCK_ANCHOR,
 )
 import apply_kanban_scheduling
+
+#: Either spelling is a board being opened outside ``fresh()``: ``KC`` is
+#: kanban_db_connect, where ``connect`` lives since the split; ``K`` (kanban_db)
+#: is the pre-split spelling, which the compat shim does not serve, so a stray
+#: one fails in the image run rather than here -- this guard is where it should
+#: fail first.
+BOARD_OPEN = re.compile(r"\b(?:K|KC)\.connect\(")
 import kanban_children_settled as children_settled
 from kanban_scheduling import (
     CHILDREN_TABLE,
@@ -1374,7 +1381,7 @@ class ChildrenTableAgreementTest(unittest.TestCase):
     def test_the_dockerfile_greps_for_the_markers_this_file_defines(self):
         """The grep strings live in two files and nothing else ties them.
 
-        Edit 7's marker especially: the Dockerfile's copy is a literal duplicate
+        Edit 6's marker especially: the Dockerfile's copy is a literal duplicate
         of a line inside WAITING_PATCHED, so editing the patch text silently
         stops the build gate checking anything.
         """
@@ -1770,12 +1777,31 @@ class ApplierTest(unittest.TestCase):
 
     def test_floor_is_computed_before_the_update_that_uses_it(self):
         dispatch = self._applied()[DISPATCH_RELATIVE]
-        assign = dispatch.index(BUILD_MARKER)
-        first_use = dispatch.index("(persisted_failures, error, task_id),")
-        self.assertLess(assign, first_use)
-        # And after the below-threshold branch has returned, so a retry never
-        # sees a floored value.
-        self.assertLess(dispatch.index("            return False\n"), assign)
+        fn = next(
+            n for n in ast.parse(dispatch).body
+            if isinstance(n, ast.FunctionDef) and n.name == "_record_task_failure"
+        )
+        lines = dispatch.splitlines()
+        marker_line = next(i for i, l in enumerate(lines, 1) if BUILD_MARKER in l)
+        use_line = next(
+            i for i, l in enumerate(lines, 1) if "(persisted_failures, error, task_id)," in l
+        )
+        # The below-threshold branch: upstream's ``if not (force_trip or
+        # failures >= effective_limit):`` returns before the trip. The floor
+        # must be computed after that branch has ended -- so a retry never sees
+        # a floored value -- and before the UPDATE that stores it.
+        below = next(
+            n for n in ast.walk(fn)
+            if isinstance(n, ast.If) and "force_trip" in ast.unparse(n.test)
+        )
+        self.assertTrue(
+            any(isinstance(n, ast.Return) for n in ast.walk(below)),
+            "the below-threshold branch no longer returns; re-derive this test",
+        )
+        self.assertLess(fn.lineno, below.lineno)
+        self.assertLess(below.end_lineno, marker_line)
+        self.assertLess(marker_line, use_line)
+        self.assertLess(use_line, fn.end_lineno + 1)
 
     def test_every_anchor_is_load_bearing(self):
         """Remove any one of the six from its file and the build must stop."""
@@ -2052,7 +2078,7 @@ class FreshBoardNamingTest(unittest.TestCase):
         connects = [
             line.strip()
             for line in source.splitlines()
-            if "KC.connect(" in line and not line.lstrip().startswith("#")
+            if BOARD_OPEN.search(line) and not line.lstrip().startswith("#")
         ]
         self.assertEqual(
             connects,

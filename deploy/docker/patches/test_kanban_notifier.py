@@ -884,6 +884,53 @@ class DecisionKindsTest(unittest.TestCase):
         )
 
 
+#: The chat profile's instruction files, relative to the repository root. The
+#: test skips when the patches directory is not inside the repository.
+CHAT_SOUL = Path(__file__).resolve().parents[3] / "agents" / "chat" / "SOUL.md"
+CHAT_AGENTS = Path(__file__).resolve().parents[3] / "agents" / "chat" / "AGENTS.md"
+
+#: The tools SOUL.md §2 step 5 must point the front door at for a review wake:
+#: the two it keeps, not one of the nine hidden from it.
+REVIEW_WAKE_TOOLS = ("kanban_show", "kanban_comment")
+
+
+class ChatSoulWakeProseTest(unittest.TestCase):
+    """DECISION_KINDS wake the front door whatever its config says, so the prose
+    that tells it what a wake is has to name every one of them. Before this
+    test the SOUL listed the four failures only, and the only instruction a
+    review wake found was "retry or re-route"."""
+
+    def setUp(self):
+        if not CHAT_SOUL.is_file() or not CHAT_AGENTS.is_file():
+            self.skipTest("agents/chat not beside the patches")
+        soul = CHAT_SOUL.read_text()
+        start = soul.index("## 2. Planning Loop")
+        self.step5 = soul[start:soul.index("## 3.", start)]
+
+    def test_step_5_names_every_kind_that_wakes_the_front_door(self):
+        for kind in DEFAULT_WAKE_KINDS:
+            if kind == "completed":  # the one it says it is *not* woken for
+                continue
+            self.assertIn(f"`{kind}`", self.step5, kind)
+
+    def test_step_5_names_every_decision_kind(self):
+        for kind in DECISION_KINDS:
+            self.assertIn(f"`{kind}`", self.step5, kind)
+
+    def test_a_review_wake_is_handled_with_the_tools_the_front_door_keeps(self):
+        review = self.step5[self.step5.index("`review_requested`"):]
+        for tool in REVIEW_WAKE_TOOLS:
+            self.assertIn(f"`{tool}`", review, tool)
+        # The failure mode the prose exists to prevent.
+        self.assertIn("file", review)
+        self.assertIn("triage", review)
+
+    def test_agents_md_no_longer_says_only_failures_wake(self):
+        agents = CHAT_AGENTS.read_text()
+        self.assertNotIn("woken when a card blocks or fails", agents)
+        self.assertIn("review", agents[agents.index("You are woken"):])
+
+
 class SuppressedKindsTest(unittest.TestCase):
     def test_a_dropped_completion_is_suppressed(self):
         events = [Event("completed"), Event("commented")]
@@ -1580,6 +1627,20 @@ def patch_tree(source):
     return target.read_text()
 
 
+def _enclosing_method(source, needle):
+    """Name of the one ``_KanbanNotification`` method whose source holds ``needle``."""
+    holders = []
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ClassDef) and node.name == "_KanbanNotification":
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    if needle in ast.get_source_segment(source, item):
+                        holders.append(item.name)
+    if len(holders) != 1:
+        raise AssertionError(f"{needle!r} is in {holders or 'no method'}, expected exactly one")
+    return holders[0]
+
+
 def method_source(source, name):
     """Source of one ``_KanbanNotification`` method in ``source``."""
     for node in ast.parse(source).body:
@@ -1823,10 +1884,21 @@ class MinimalDiffTest(unittest.TestCase):
 
     def test_the_incident_row_precedes_the_marker_at_runtime(self):
         # The order the two records matter in: the row the *user's* next message
-        # needs, then the note the *agent's* next turn needs. deliver() runs
-        # _send_pings() (the row) before build_wake_text() (the note).
-        deliver = method_source(patch_tree(UPSTREAM_NOTIFIER), "deliver")
-        self.assertLess(deliver.index("self._send_pings()"), deliver.index("self.build_wake_text()"))
+        # needs, then the note the *agent's* next turn needs. The applier decides
+        # which method each insert lands in; deliver() -- upstream's, untouched,
+        # mirrored by the fixture -- decides the order those methods run. So
+        # read the landing methods out of the patched output rather than
+        # assuming _send_pings / build_wake_text, and assert deliver() calls
+        # the row's method before the marker's.
+        patched = patch_tree(UPSTREAM_NOTIFIER)
+        row_method = _enclosing_method(patched, INCIDENT_CALL.strip())
+        marker_method = _enclosing_method(patched, "_kanban_note_suppressed(")
+        self.assertNotEqual(row_method, marker_method)
+        deliver = method_source(patched, "deliver")
+        self.assertLess(
+            deliver.index(f"self.{row_method}()"),
+            deliver.index(f"self.{marker_method}()"),
+        )
 
     def test_the_wake_call_carries_the_delivery_mode_argument(self):
         # Without `passive_delivered=` the build narrows the wake for

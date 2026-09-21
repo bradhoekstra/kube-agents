@@ -28,11 +28,13 @@ delivery, 2 makes the one remaining post-delivery cursor write survivable and
 dedupe-aware. Anchor 3 neuters the now-vestigial rewind.
 
 **Anchor 2 carries upstream's comment line for the same reason it always
-did.** ``await self.advance()`` occurs twice in ``deliver()`` at identical
-indentation: once on the unknown-platform skip and once on the success path.
-``Patch.substitute`` enforces ``expected=1``, so anchoring on the call alone
-is a guaranteed ``SystemExit``, and raising ``expected`` to 2 would silently
-patch the skip path as well. The comment line above the success-path call is
+did.** ``await self.advance()`` occurs twice in ``deliver()``: once on the
+unknown-platform skip, one indent deeper inside its ``except ValueError:``,
+and once at method depth on the success path. The deeper line still contains
+the method-depth anchor as a substring, so ``Patch.substitute`` (which
+enforces ``expected=1``) would count two on the call alone -- a guaranteed
+``SystemExit`` -- and raising ``expected`` to 2 would silently patch the skip
+path as well. The comment line above the success-path call is
 unique to that site and is load-bearing: if upstream rewords it the build
 fails loudly, which is the intended outcome.
 

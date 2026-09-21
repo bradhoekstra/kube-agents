@@ -142,13 +142,14 @@ synchronously and hand the run to a daemon worker -- and released in a
 only one of them, so guarding the run rather than the entry point is what keeps
 the other three covered.
 
-Guarding there puts the flock AFTER ``claim_job_for_fire``, and that costs one
-thing: the CAS has already advanced ``next_run_at``, so a refusal skips a
-scheduled occurrence of a job this call never ran. It is a deliberate trade, and
-the same one upstream makes two lines above for its own
-``try_register_running_job`` guard. A skipped occurrence of a job that is
-*already executing* is a far smaller harm than the two overlapping runs sharing
-one output file that this patch exists to stop.
+Guarding there puts the flock AFTER ``claim_job_for_fire``. Since v2026.9.11
+every claim on this path is a ``manual`` one -- an off-tick run-now that stamps
+no occurrence identity, so the still-pending ``next_run_at`` slot fires when it
+arrives -- and a refusal therefore no longer skips a scheduled occurrence. What
+it costs is the requested run itself, the same trade upstream makes two lines
+above for its own ``try_register_running_job`` guard, and a far smaller harm
+than the two overlapping runs sharing one output file that this patch exists
+to stop.
 
 A refused dispatch returns immediately rather than waiting for the lock. The
 caller is an agent blocked inside a tool call, the run it would wait for can

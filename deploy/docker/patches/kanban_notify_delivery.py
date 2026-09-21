@@ -241,8 +241,11 @@ def advance_after_delivery(
 ) -> None:
     """Advance the durable cursor after delivery, without unwinding the tick.
 
-    Runs in ``asyncio.to_thread``, exactly where upstream called
-    ``_kanban_advance``. On success the high-water entry is dropped, because the
+    Runs under ``_to_thread_process_service`` -- the helper upstream's own
+    ``advance()`` uses to call ``_kanban_advance``, a fresh Context per call so
+    a lingering delegate_task marker cannot trip ``write_txn``'s guard -- at
+    the success-path tail of ``deliver()``, where upstream awaited
+    ``self.advance()``. On success the high-water entry is dropped, because the
     durable cursor now says everything the entry was standing in for.
     """
     try:

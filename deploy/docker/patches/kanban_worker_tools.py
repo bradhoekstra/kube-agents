@@ -55,6 +55,23 @@ delegated-child rejection, the task-id requirement and
 call it against any card. They join the list; their schema cost was not part
 of the 2026-08-05 measurement.
 
+Hiding them costs the front door no part of the review flow, because upstream
+never gave the card's creator a role in it. ``kanban_request_review`` parks the
+card in ``review``; the dispatcher's review lane (``kanban.review_dispatch``,
+default on) then claims it from ``review`` for a *reviewer worker* -- the
+``reviewer=`` profile, else the assignee, with the bundled ``sdlc-review`` skill
+force-loaded -- and that worker approves with ``kanban_complete`` or returns
+the card with ``kanban_request_changes``. ``kanban_db.request_changes`` refuses
+anything else: it requires the card to be ``running`` under a run whose
+``claimed`` event says ``source_status == "review"``, so an orchestrator
+calling it against a card sitting in ``review`` gets ``task is not in an active
+review run`` whether or not the schema is offered. The human overrides are
+CLI-only (``hermes kanban complete`` approves; ``hermes kanban reopen-review``
+sends back). What the creator does get is the ``review_requested`` /
+``changes_requested`` wake, and ``agents/chat/SOUL.md`` §2 step 5 says what to
+do with it: report, ``kanban_comment`` if there is something the reviewer must
+know, and file nothing.
+
 ``check_kanban_worker_mode`` supplies the missing third gate. Nothing changes
 for a worker: the dispatcher sets ``HERMES_KANBAN_TASK`` before spawning it
 (``hermes_cli/kanban_db_dispatch.py``, ``_default_spawn``), so a worker keeps

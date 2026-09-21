@@ -275,13 +275,16 @@ def check_all_command_guards(command, env_type):
     return {"approved": True, "message": None}
 '''
 
-# _run_approval_gate's unattended loop: the same ``for ctx in
-# _unattended_contexts():`` header, one indent deeper, branching on
-# ``ctx.mode()`` rather than calling ``_unattended_deny`` — which is exactly
-# what the anchor's third line keys on.
+# _run_approval_gate's unattended loop at v2026.9.14: the same ``for ctx in
+# _unattended_contexts():`` header at the same depth (under ``if not is_cli and
+# not is_gateway:``, without ``check_all_command_guards``'s ``and not is_ask``),
+# branching on ``ctx.mode()`` rather than calling ``_unattended_deny``. The
+# anchor's first line rules it out on the ``if``, its third on the call.
 APPROVAL_GATE_TWIN = '''\
 def _run_approval_gate(command, pattern_key, description):
-    if True:
+    is_cli = _is_interactive_cli()
+    is_gateway = _is_gateway_approval_context()
+    if not is_cli and not is_gateway:
         for ctx in _unattended_contexts():
             if ctx.mode() == "deny":
                 return {"approved": False, "message": "gate denied"}

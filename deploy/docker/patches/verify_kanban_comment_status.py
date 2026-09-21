@@ -173,9 +173,11 @@ check(
 
 # --- 3. The 2026-08-08 incident, replayed ------------------------------------
 # t_a8f58a2a completed at 19:09:43, its 6,191-char report reached the Slack
-# thread at 19:09:44, the notifier unsubscribed on the same tick, and at 19:11:30
-# the front door commented on the card and told the user the results would post
-# there when the agent finished.
+# thread at 19:09:44, and at 19:11:30 the front door commented on the card and
+# told the user the results would post there when the agent finished. (The
+# notifier of that day also unsubscribed the card on the same tick; the replay
+# does not reproduce that step, because the v2026.9.14 notifier no longer takes
+# it -- see the next comment -- and the status has to carry the verdict alone.)
 print("2026-08-08 incident replay:")
 incident = card("audit the fleet", "running")
 subscribe(incident)
@@ -226,10 +228,12 @@ check(
 )
 
 # --- 4. Status outranks the subscription row ---------------------------------
-# The unsub happens when the notifier PROCESSES the terminal event, so for up to
-# one tick a done card still has its rows. If the racy field could contradict
-# the durable one, the model would resolve it optimistically -- which is the bug.
-print("done-but-not-yet-unsubscribed:")
+# A done card keeps its subscription rows: the notifier unsubscribes only on
+# ``archived`` (section 3), and even that happens when it PROCESSES the terminal
+# event, a tick after the status changed. So the row can never be read as "this
+# card can still deliver". If it could contradict the status, the model would
+# resolve the contradiction optimistically -- which is the bug.
+print("done-with-its-subscription-row:")
 racy = card("just completed", "running")
 subscribe(racy)
 K.complete_task(conn, racy, result="the answer", summary="done")

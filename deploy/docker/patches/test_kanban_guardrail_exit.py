@@ -917,6 +917,11 @@ FINALIZER_STUB = '''import os
 
 
 def _resolve_budget_fallback(agent, final_response, api_call_count):
+    budget_exhausted = (
+        api_call_count >= agent.max_iterations or agent.iteration_budget.remaining <= 0
+    )
+    if final_response is None and budget_exhausted:
+        return final_response, "budget_exhausted", False
     return final_response, "unknown", False
 
 
@@ -946,6 +951,36 @@ def stage_tree():
     (root / CLI_RELATIVE).write_text(CLI_STUB)
     (root / CHAT_RELATIVE).write_text(CHAT_STUB)
     return root
+
+
+def _assigned_value(fn, name):
+    for n in ast.walk(fn):
+        if (
+            isinstance(n, ast.Assign)
+            and len(n.targets) == 1
+            and isinstance(n.targets[0], ast.Name)
+            and n.targets[0].id == name
+        ):
+            return ast.unparse(n.value)
+    return None
+
+
+def budget_predicates(finalizer_source):
+    """``(upstream, inserted)``: upstream's ``budget_exhausted`` value in
+    ``_resolve_budget_fallback`` and the ``iteration_limit_fallback=`` the
+    inserted call passes, both unparsed so layout does not count."""
+    tree = ast.parse(finalizer_source)
+    defs = {
+        n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    upstream = _assigned_value(defs["_resolve_budget_fallback"], "budget_exhausted")
+    inserted = None
+    for n in ast.walk(defs["finalize_turn"]):
+        if isinstance(n, ast.Call) and ast.unparse(n.func) == "_kanban_should_record_missing":
+            for k in n.keywords:
+                if k.arg == "iteration_limit_fallback":
+                    inserted = ast.unparse(k.value)
+    return upstream, inserted
 
 
 class ApplierTest(unittest.TestCase):
@@ -1027,9 +1062,26 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(finalizer.count(FINALIZER_ANCHOR), 1)
 
     def test_the_budget_exclusion_mirrors_upstreams_predicate(self):
-        finalizer = self._apply_all()["finalizer"]
-        self.assertIn("api_call_count >= agent.max_iterations", finalizer)
-        self.assertIn("agent.iteration_budget.remaining <= 0", finalizer)
+        # Compared the way the verifier compares them in the image: the value
+        # upstream's _resolve_budget_fallback binds to budget_exhausted against
+        # the iteration_limit_fallback= the insert passes, both unparsed.
+        upstream, inserted = budget_predicates(self._apply_all()["finalizer"])
+        self.assertIsNotNone(upstream)
+        self.assertEqual(inserted, upstream)
+
+    def test_the_predicate_comparison_sees_an_upstream_rewording(self):
+        # The check has teeth only if a drifted upstream predicate reads as a
+        # mismatch rather than being satisfied by the insert alone.
+        root = stage_tree()
+        drifted = FINALIZER_STUB.replace(
+            "api_call_count >= agent.max_iterations or", "api_call_count > agent.max_iterations or"
+        )
+        self.assertNotEqual(drifted, FINALIZER_STUB)
+        (root / FINALIZER_RELATIVE).write_text(drifted)
+        apply(root)
+        upstream, inserted = budget_predicates((root / FINALIZER_RELATIVE).read_text())
+        self.assertIsNotNone(upstream)
+        self.assertNotEqual(inserted, upstream)
 
     def test_the_cli_block_runs_before_the_exit_code_is_decided(self):
         cli = self._apply_all()["cli"]

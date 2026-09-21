@@ -401,12 +401,48 @@ if finalize is not None:
         completed is not None and leak_check is not None and leak_check < completed,
         f"backstop at {leak_check}, completed at {completed}",
     )
+    # Upstream's predicate, read from the image's own _resolve_budget_fallback
+    # rather than from this patch's text, so a rewording upstream shows up here
+    # as a mismatch rather than being mirrored by a check that only knows the
+    # insert. ast.unparse normalises both sides' layout.
+    upstream_predicate = None
+    resolve = _def(finalizer_tree, "_resolve_budget_fallback")
+    if resolve is not None:
+        assign = next(
+            (
+                n
+                for n in ast.walk(resolve)
+                if isinstance(n, ast.Assign)
+                and len(n.targets) == 1
+                and isinstance(n.targets[0], ast.Name)
+                and n.targets[0].id == "budget_exhausted"
+            ),
+            None,
+        )
+        if assign is not None:
+            upstream_predicate = ast.unparse(assign.value)
+    inserted_predicate = None
+    if leak_check is not None:
+        call = next(
+            (
+                n
+                for n in ast.walk(body[leak_check])
+                if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "_kanban_should_record_missing"
+            ),
+            None,
+        )
+        keyword = next(
+            (k for k in (call.keywords if call is not None else ()) if k.arg == "iteration_limit_fallback"),
+            None,
+        )
+        if keyword is not None:
+            inserted_predicate = ast.unparse(keyword.value)
     check(
-        "the budget exclusion mirrors upstream's budget_exhausted predicate",
-        leak_check is not None
-        and "agent.iteration_budget.remaining <= 0" in ast.unparse(body[leak_check])
-        and "api_call_count >= agent.max_iterations" in ast.unparse(body[leak_check]),
-        "the budget path records timed_out itself; a different predicate double-counts or misses",
+        "the budget exclusion is upstream's budget_exhausted predicate, read from _resolve_budget_fallback",
+        upstream_predicate is not None and inserted_predicate == upstream_predicate,
+        f"upstream computes {upstream_predicate!r}; the insert passes {inserted_predicate!r}. "
+        "The budget path records timed_out itself; a different predicate double-counts or misses",
     )
     check(
         "the recorder takes the split modules' connect and _record_task_failure",

@@ -53,8 +53,9 @@ Not merged in, deliberately:
   the watcher loops' construction and sleep sites, which stayed in that file.
   Disjoint from every anchor here; it appends its own trailer to its own file.
 * ``gateway/kanban_notify_delivery.py`` edits the claim in
-  ``_Collector._claim_for_sub`` and the advance in
-  ``_KanbanNotification.advance`` — both in this file, neither touched here.
+  ``_Collector._claim_for_sub`` and the ``await self.advance()`` at the
+  success-path tail of ``_KanbanNotification.deliver()`` — both in this file,
+  neither touched here.
 
 Why the changes are needed is documented in the module docstrings of
 ``deploy/docker/patches/kanban_notifier.py`` and

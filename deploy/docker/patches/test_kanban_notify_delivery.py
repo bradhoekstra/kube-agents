@@ -350,9 +350,12 @@ class EndToEndSemanticsTest(unittest.TestCase):
 
 # Upstream's notifier module (v2026.9.14) reduced to the two sites the patch
 # rewrites there, at their real nesting depth because every anchor is
-# indentation-sensitive. Both `await self.advance()` sites are present: they
-# are byte-identical at identical indentation, and that ambiguity is why
-# anchor 2 carries a comment line.
+# indentation-sensitive. Both `await self.advance()` sites are present at
+# upstream's depths: the skip-path one sits one indent deeper inside
+# `except ValueError:`, the success-path one at method depth. The deeper line
+# still contains the method-depth anchor as a substring, so a bare
+# `await self.advance()` anchor counts two, and that is why anchor 2 carries
+# the comment line above the success-path call.
 UPSTREAM_NOTIFIER = '''\
 class _Collector:
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:

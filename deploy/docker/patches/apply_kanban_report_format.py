@@ -39,6 +39,13 @@ import patchlib  # noqa: E402
 
 RELATIVE = "tools/kanban_tools.py"
 
+# The handler the anchor must sit inside. ``body=args.get("body"),`` is unique
+# in the file today, so the count check alone would still pass if upstream
+# moved that keyword to another handler and dropped it from this one -- and
+# the stanza would then be added to the wrong call. The span check below makes
+# that move fail the build instead.
+HANDLER = "_handle_create"
+
 OLD_BODY_ARG = 'body=args.get("body"),'
 
 # Consumes the anchor, so a second run fails on the count check. No comment
@@ -60,6 +67,14 @@ TRAILER = (
 def apply(root: Path) -> None:
     """Apply the patch under ``root``, or raise SystemExit with the reason."""
     patch = patchlib.Patch(root, RELATIVE, prefix="kanban_report_format")
+    handler = patch.find_def(HANDLER, label="create handler")
+    inside = patch.source[handler.start : handler.end].count(OLD_BODY_ARG)
+    if inside != 1:
+        raise SystemExit(
+            f"kanban_report_format patch: {RELATIVE}: expected the create body "
+            f"anchor {OLD_BODY_ARG!r} once inside {HANDLER}(), found {inside} "
+            f"({patch.source.count(OLD_BODY_ARG)} in the whole file). {patch.note}"
+        )
     patch.substitute(OLD_BODY_ARG, NEW_BODY_ARG, label="create body")
     patch.append(TRAILER)
     patch.commit("1 anchor + trailer")
