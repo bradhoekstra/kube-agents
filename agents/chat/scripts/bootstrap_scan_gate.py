@@ -114,6 +114,11 @@ CLUSTER_AUDIT_INSTRUCTIONS_PATHS = (
 # Resolved under the data dir rather than hardcoded: `spec.harness.hermes.agentHome` moves
 # the whole tree, and a missing path here silently files the solo sweep.
 RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
+# Written by that script beside the profiles (docs/designs/multi-project-scope.md §5): which
+# projects the roster covers and which it could not list this run.
+SCOPE_SNAPSHOT_NAME = "fleet_scope.json"
+SCOPE_OUTCOME_OK = "ok"
+SCOPE_OUTCOME_UNKNOWN = "unknown"
 
 # The reconcile that creates the Cluster Agents runs on its own cron at `11 * * * *`,
 # while this gate runs every minute. On a fresh install the gate therefore reaches the
@@ -121,7 +126,7 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 # sweep degrades to the Platform Agent walking the whole fleet alone. So the gate runs
 # the reconcile itself and waits for it, rather than racing it.
 RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
-RECONCILE_TIMEOUT_SECONDS = 240
+RECONCILE_TIMEOUT_SECONDS = 240  # the reconcile bounds its listing phase to LIST_BUDGET_SECONDS (150) and writes its snapshot after
 # `cluster_agent_reconcile.EXIT_ALREADY_RUNNING`. Mutual exclusion lives in that
 # script, because the hourly `cluster-agent-reconcile` job runs it too and the
 # gateway's cron lock is per job id — a lock held here would not keep the two apart.
@@ -179,6 +184,40 @@ def _roster_command() -> str:
     has hit that twice before (see the notes in agents/platform/config.yaml).
     """
     return f"HERMES_HOME={_data_dir()} /opt/hermes/.venv/bin/hermes profile list"
+
+
+def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
+    """Projects in scope the last reconcile could not list, as (project, outcome).
+
+    Read from the scope snapshot. No snapshot, an unreadable one, or one with every
+    project `ok` all answer empty: the sweep then reads the roster as covering the
+    whole scope, which is what it did before scopes existed.
+    """
+    try:
+        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
+        return []
+    out = []
+    projects = snapshot.get("projects") if isinstance(snapshot, dict) else None
+    for entry in projects if isinstance(projects, list) else []:
+        if isinstance(entry, dict) and entry.get("id") and entry.get("outcome") != SCOPE_OUTCOME_OK:
+            out.append((str(entry["id"]), str(entry.get("outcome") or SCOPE_OUTCOME_UNKNOWN)))
+    return sorted(out)
+
+
+def _scope_gap_paragraph(data_dir: Path) -> str:
+    unlisted = _unlisted_projects(data_dir)
+    if not unlisted:
+        return ""
+    named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted)
+    return (
+        "**Some projects in scope have no Cluster Agents for a reason the roster cannot show.** "
+        f"The last reconcile did not list these projects: {named}. The roster holds only the "
+        "clusters of theirs that already had a profile, and you cannot list them yourself. A "
+        "project marked `over-cap` is reachable but past the reconcile's listing cap, and the "
+        "others the last run could not list. Name each one at the top of the report as not fully "
+        "covered, with its reason, so the sweep reads as partial rather than as a clean fleet.\n\n"
+    )
 
 
 def _reconcile_attempts(data_dir: Path) -> int:
@@ -331,19 +370,20 @@ def _task_body() -> str:
         "reference to a step means the same thing in both documents.\n\n"
         "**Step 1 — do not reconcile the roster yourself.** This gate already ran "
         f"`{RECONCILE_SCRIPT_NAME}`, and profile lifecycle belongs to that script alone: it "
-        "holds the `RECONCILE_EXCLUDE` opt-out and the create/prune rules, so a profile you "
+        "holds the scope and its exclusions and the create/prune rules, so a profile you "
         "make by calling `cluster_agent_profile.py` directly is one the next reconcile run may "
         "immediately prune, and you will loop. Do not run it, and do not repair or delete a "
         "profile.\n\n"
         "**The roster may be empty or incomplete, and that is your finding to report, not "
         "yours to fix.** It says which clusters can audit themselves — not which clusters "
-        "count. Audit every cluster the project has: the ones with no Cluster Agent you take "
+        "count. Audit every cluster the projects in scope have: the ones with no Cluster Agent you take "
         "yourself in Step 4, and the report names each one as lacking an agent. A fleet swept "
         "without Cluster Agents is a degraded sweep and must read as one, because this report "
-        "is delivered to the user as the state of their environment. If you cannot list the "
+        "is delivered to the user as the state of their environment. If you cannot list a "
         "project's clusters at all, put that at the top of the report and file it anyway — "
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
+        f"{_scope_gap_paragraph(_data_dir())}"
         "**Step 2 — fan out.** Read the roster with exactly this command, exactly once:\n\n"
         f"    {_roster_command()}\n\n"
         "Cluster Agents are the profiles whose names start `cluster-`. **If that command "

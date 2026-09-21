@@ -3348,12 +3348,13 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// three unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, and the mode switch.
+	// four unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, and the scope path.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
-		kubeagentsModeEnvKey + "=today\n"
+		kubeagentsModeEnvKey + "=today\n" +
+		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n"
 	if bare != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", bare, want)
 	}
