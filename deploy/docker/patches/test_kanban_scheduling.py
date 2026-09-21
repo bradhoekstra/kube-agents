@@ -79,12 +79,6 @@ from apply_kanban_wake_nudge import (
 )
 import apply_kanban_scheduling
 
-#: Either spelling is a board being opened outside ``fresh()``: ``KC`` is
-#: kanban_db_connect, where ``connect`` lives since the split; ``K`` (kanban_db)
-#: is the pre-split spelling, which the compat shim does not serve, so a stray
-#: one fails in the image run rather than here -- this guard is where it should
-#: fail first.
-BOARD_OPEN = re.compile(r"\b(?:K|KC)\.connect\(")
 import kanban_children_settled as children_settled
 from kanban_scheduling import (
     CHILDREN_TABLE,
@@ -112,6 +106,13 @@ from kanban_scheduling import (
     repair_inverted_dependencies,
 )
 import kanban_scheduling
+
+#: Either spelling is a board being opened outside ``fresh()``: ``KC`` is
+#: kanban_db_connect, where ``connect`` lives since the split; ``K`` (kanban_db)
+#: is the pre-split spelling, which the compat shim does not serve, so a stray
+#: one fails in the image run rather than here -- this guard is where it should
+#: fail first.
+BOARD_OPEN = re.compile(r"\b(?:K|KC)\.connect\(")
 
 POD = "platform-agent-gateway-75b5f6ddf6-7dkd7"
 OLD = f"{POD}:4"  # the dispatcher that took the bus error

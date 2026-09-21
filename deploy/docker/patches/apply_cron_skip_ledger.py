@@ -432,7 +432,8 @@ SCHED_FIRE_CLAIM_LOST_PATCHED = '''    if not claimed:
             detail=(
                 "Fire claim was not obtained at execution time; the "
                 "execution was not started. Another owner holds a "
-                "fresh claim, the job is no longer runnable, or the "
+                "fresh claim, the ledger already records this occurrence "
+                "as completed, the job is no longer runnable, or the "
                 "fire fence timed out or could not be opened; the "
                 "scheduler log names which."
             ),

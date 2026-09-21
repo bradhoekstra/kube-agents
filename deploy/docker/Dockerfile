@@ -1219,8 +1219,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # credential-redaction: a kanban worker that pasted a GCP access token into a
 # curl left it in plaintext on the PVC (#603). Upstream already redacts
 # agent.log and the terminal-output spill; the two sinks it did not cover are
-# the worker transcript (<board>/logs/<task>.log, the file kanban_db.py hands
-# Popen as the worker's stdout) and the `💻 $` completion line, which renders
+# the worker transcript (<board>/logs/<task>.log, the file kanban_db_dispatch.py
+# hands Popen as the worker's stdout) and the `💻 $` completion line, which renders
 # the whole command. Registers the ya29. pattern through upstream's own plugin
 # registry from a trailer on agent/redact.py, gives display.py's
 # redact_tool_args_for_display a terminal/execute_code branch, and installs a

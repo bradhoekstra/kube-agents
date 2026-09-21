@@ -53,7 +53,8 @@ Each of those two is recorded at both of its sites — ``tick``'s dispatch loop
 and ``_run_claimed_job``, the run half a manual fire and a background dispatch
 share. The second pair is new at v2026.8.13: the split that gave ``run_one_job``
 four callers put both guards after the fire claim, so a refusal there now costs
-an occurrence where it used to cost nothing.
+the requested run (the fire claim is already stamped) where it used to cost
+nothing; the scheduled slot is untouched, see ``already_running`` above.
 
 ``interpreter_shutdown``
     The gateway began finalizing between ``advance_next_runs`` and
@@ -105,12 +106,13 @@ an occurrence where it used to cost nothing.
     True`` that tells the tick the occurrence was handled is unchanged.
 
     The code is wider than its name. ``claim_job_for_fire`` returns ``False``
-    for four things this call site cannot tell apart: another owner holds a
-    fresh ``fire_claim``; the job is missing, disabled or paused; the per-job
-    fire fence timed out (upstream "fails closed" after
-    ``_JOBS_LOCK_TIMEOUT_SECONDS``); or the fence file could not be opened at
-    all. The first is the guarantee working and the second is benign; the last
-    two are the job being unable to run, and they land under this code too,
+    for five things this call site cannot tell apart: another owner holds a
+    fresh ``fire_claim``; the ledger already records this occurrence as
+    completed (v2026.9.14's ``completed_occurrence`` check); the job is
+    missing, disabled or paused; the per-job fire fence timed out (upstream
+    "fails closed" after ``_JOBS_LOCK_TIMEOUT_SECONDS``); or the fence file
+    could not be opened at all. The first two are the guarantee working and
+    the third is benign; the last two are the job being unable to run, and they land under this code too,
     with the cause only in upstream's fence log line. So a job whose
     occurrences keep arriving under ``fire_claim_lost`` has stopped running,
     whatever the name suggests, and the count of the code — projected as
