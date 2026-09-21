@@ -265,9 +265,11 @@ def check_shape() -> None:
         )
 
     # The same pair of guards, in the run half a manual fire and a background
-    # dispatch share. Both sit after claim_job_for_fire, so both drop a
-    # scheduled occurrence; an unrecorded one is invisible to `hermes cron runs`
-    # and to cron_health, which is the silence this whole module exists to end.
+    # dispatch share. Both sit after claim_job_for_fire, whose manual claim has
+    # stamped the fire claim and re-anchored next_run_at but no occurrence
+    # identity, so both drop the requested run rather than a scheduled slot;
+    # an unrecorded refusal is invisible to `hermes cron runs` and to
+    # cron_health, which is the silence this whole module exists to end.
     tools = HERMES / "tools" / "cronjob_tools.py"
     claimed = function_named(tools, "_run_claimed_job")
     check("_run_claimed_job still holds the dispatch guards", claimed is not None)
@@ -706,8 +708,8 @@ def check_dispatch_guards(sched, reasons) -> None:
     check(
         "an in-process dispatch overlap is recorded",
         bool(rows),
-        "claim_job_for_fire advanced next_run_at before this guard ran, so "
-        "the occurrence is gone and nothing records it",
+        "claim_job_for_fire stamped the fire claim before this guard ran, so "
+        "the requested run is gone and nothing records it",
     )
     check(
         # bool(rows) as well as all(): over an empty set all() is vacuously

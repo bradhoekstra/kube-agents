@@ -40,12 +40,12 @@ from apply_kanban_notifier import (
 from apply_kanban_progress_lines import SEND_ANCHOR, SEND_PATCHED
 from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
-    DECISION_KINDS,
     DEFAULT_WAKE_KINDS,
     MAX_NOTES,
     NOTE_SIGNATURE,
     RESULT_LIMIT,
     SEPARATOR,
+    UNDELIVERED_OUTCOME_KINDS,
     UNSTRUCTURED_MIN_CHARS,
     _warned_config,
     actionable_report,
@@ -815,58 +815,80 @@ COMPLETED_AT = 1786216184.0
 UNSET = object()
 
 
-class DecisionKindsTest(unittest.TestCase):
-    """The review-flow kinds are outside ``kanban.wake_on_events``.
+class UndeliveredOutcomeKindsTest(unittest.TestCase):
+    """The review-flow kinds are governed by ``kanban.wake_on_events`` like every
+    other kind, and are never recorded as a delivered result.
 
     The deployed config (agents/chat/config.yaml and the operator default)
-    lists the four failure kinds and predates ``review_requested`` /
-    ``changes_requested`` / ``block_loop_detected``. Read literally it would
-    leave a card in ``review`` waiting for a creator that is never woken, and
-    then stage a note saying the result was "already delivered". Nothing was.
+    lists the four failure kinds, so on a push adapter a ``review_requested``
+    card does not wake the front door. What must not follow from that is a
+    note telling the creator the result was "already delivered": the card is
+    waiting in ``review``, and nothing was.
     """
 
     def test_the_three_are_the_upstream_review_flow_kinds(self):
         self.assertEqual(
-            DECISION_KINDS,
+            UNDELIVERED_OUTCOME_KINDS,
             ("review_requested", "changes_requested", "block_loop_detected"),
         )
-        for kind in DECISION_KINDS:
+        for kind in UNDELIVERED_OUTCOME_KINDS:
             self.assertIn(kind, DEFAULT_WAKE_KINDS)
 
-    def test_review_requested_wakes_on_a_push_adapter_under_the_four_kind_config(self):
+    def test_review_requested_does_not_wake_on_a_push_adapter_under_the_four_kind_config(self):
+        events = [Event("review_requested")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(wake_kinds_for(events, cfg, adapter=Adapter(True)), set())
+
+    def test_the_config_governs_every_review_flow_kind_on_the_push_path(self):
+        for kind in UNDELIVERED_OUTCOME_KINDS:
+            for kanban in ({"wake_on_events": FAILURE_ONLY}, {"wake_on_events": []},
+                           {"wake_on_events": None}):
+                self.assertEqual(
+                    wake_kinds_for([Event(kind)], loader(kanban), adapter=Adapter(True)),
+                    set(),
+                    (kind, kanban),
+                )
+            # Unset, the default set applies and upstream's behaviour holds.
+            self.assertEqual(
+                wake_kinds_for([Event(kind)], loader({}), adapter=Adapter(True)), {kind}
+            )
+            self.assertEqual(
+                wake_kinds_for([Event(kind)], loader({"wake_on_events": [kind]}),
+                               adapter=Adapter(True)),
+                {kind},
+            )
+
+    def test_review_requested_wakes_where_no_ping_was_sent(self):
         events = [Event("review_requested")]
         cfg = loader({"wake_on_events": FAILURE_ONLY})
         self.assertEqual(
-            wake_kinds_for(events, cfg, adapter=Adapter(True)), {"review_requested"}
+            wake_kinds_for(events, cfg, adapter=Adapter(False)), {"review_requested"}
+        )
+        self.assertEqual(
+            wake_kinds_for(events, cfg, adapter=Adapter(True), passive_delivered=False),
+            {"review_requested"},
         )
 
-    def test_every_decision_kind_wakes_whatever_the_config_says(self):
-        for kind in DECISION_KINDS:
-            for kanban in ({"wake_on_events": FAILURE_ONLY}, {"wake_on_events": []},
-                           {"wake_on_events": None}, {}):
-                self.assertEqual(
-                    wake_kinds_for([Event(kind)], loader(kanban), adapter=Adapter(True)),
-                    {kind},
-                    (kind, kanban),
-                )
-
     def test_the_configured_set_is_still_what_the_operator_wrote(self):
-        # resolve_wake_kinds reports the config; wake_kinds_for adds the three.
         self.assertEqual(
             set(resolve_wake_kinds(loader({"wake_on_events": FAILURE_ONLY}))),
             set(FAILURE_ONLY),
         )
 
-    def test_a_decision_kind_is_never_reported_as_suppressed(self):
-        for kind in DECISION_KINDS:
-            self.assertEqual(suppressed_kinds([Event(kind)], set()), set())
+    def test_a_review_flow_kind_is_never_reported_as_suppressed(self):
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        for kind in UNDELIVERED_OUTCOME_KINDS:
+            events = [Event(kind)]
+            woken = wake_kinds_for(events, cfg, adapter=Adapter(True))
+            self.assertEqual(woken, set(), kind)
+            self.assertEqual(suppressed_kinds(events, woken), set(), kind)
         events = [Event("completed"), Event("review_requested")]
         self.assertEqual(suppressed_kinds(events, set()), {"completed"})
 
     def test_no_completion_note_is_staged_for_a_review_handoff(self):
         _warned_config.clear()
         runner = _Runner()
-        for kind in DECISION_KINDS:
+        for kind in UNDELIVERED_OUTCOME_KINDS:
             staged = note_suppressed_completion(
                 runner, [Event(kind)], set(), _Card(), sub_for(), "", now=COMPLETED_AT
             )
@@ -882,53 +904,6 @@ class DecisionKindsTest(unittest.TestCase):
             suppressed_kinds([Event("completed")], wake_kinds_for([Event("completed")], cfg)),
             {"completed"},
         )
-
-
-#: The chat profile's instruction files, relative to the repository root. The
-#: test skips when the patches directory is not inside the repository.
-CHAT_SOUL = Path(__file__).resolve().parents[3] / "agents" / "chat" / "SOUL.md"
-CHAT_AGENTS = Path(__file__).resolve().parents[3] / "agents" / "chat" / "AGENTS.md"
-
-#: The tools SOUL.md §2 step 5 must point the front door at for a review wake:
-#: the two it keeps, not one of the nine hidden from it.
-REVIEW_WAKE_TOOLS = ("kanban_show", "kanban_comment")
-
-
-class ChatSoulWakeProseTest(unittest.TestCase):
-    """DECISION_KINDS wake the front door whatever its config says, so the prose
-    that tells it what a wake is has to name every one of them. Before this
-    test the SOUL listed the four failures only, and the only instruction a
-    review wake found was "retry or re-route"."""
-
-    def setUp(self):
-        if not CHAT_SOUL.is_file() or not CHAT_AGENTS.is_file():
-            self.skipTest("agents/chat not beside the patches")
-        soul = CHAT_SOUL.read_text()
-        start = soul.index("## 2. Planning Loop")
-        self.step5 = soul[start:soul.index("## 3.", start)]
-
-    def test_step_5_names_every_kind_that_wakes_the_front_door(self):
-        for kind in DEFAULT_WAKE_KINDS:
-            if kind == "completed":  # the one it says it is *not* woken for
-                continue
-            self.assertIn(f"`{kind}`", self.step5, kind)
-
-    def test_step_5_names_every_decision_kind(self):
-        for kind in DECISION_KINDS:
-            self.assertIn(f"`{kind}`", self.step5, kind)
-
-    def test_a_review_wake_is_handled_with_the_tools_the_front_door_keeps(self):
-        review = self.step5[self.step5.index("`review_requested`"):]
-        for tool in REVIEW_WAKE_TOOLS:
-            self.assertIn(f"`{tool}`", review, tool)
-        # The failure mode the prose exists to prevent.
-        self.assertIn("file", review)
-        self.assertIn("triage", review)
-
-    def test_agents_md_no_longer_says_only_failures_wake(self):
-        agents = CHAT_AGENTS.read_text()
-        self.assertNotIn("woken when a card blocks or fails", agents)
-        self.assertIn("review", agents[agents.index("You are woken"):])
 
 
 class SuppressedKindsTest(unittest.TestCase):
@@ -1904,10 +1879,18 @@ class MinimalDiffTest(unittest.TestCase):
         # Without `passive_delivered=` the build narrows the wake for
         # delivery_mode="wake" subscribers, whose wake IS the delivery. It binds
         # upstream's own name for "this mode gets a text ping", not a literal
-        # that would silently stop tracking the mode.
+        # that would silently stop tracking the mode. Asserted on what the
+        # applier inserted -- the lines in the output that are not in the
+        # fixture -- and on the verifier's check that the name upstream still
+        # derives from delivery_mode is the one bound here.
         patched = patch_tree(UPSTREAM_NOTIFIER)
-        self.assertIn("passive_delivered=self.send_passive", patched)
-        self.assertIn('self.send_passive = mode != "wake"', patched)
+        inserted = [
+            line for line in patched.splitlines() if line not in UPSTREAM_NOTIFIER.splitlines()
+        ]
+        wake_call = [line for line in inserted if "passive_delivered=" in line]
+        self.assertEqual(len(wake_call), 1, inserted)
+        self.assertIn("passive_delivered=self.send_passive", wake_call[0])
+        self.assertIn('self.send_passive = mode != "wake"', VERIFIER_SOURCE)
 
 
 class VerifierSendAnchorTest(unittest.TestCase):

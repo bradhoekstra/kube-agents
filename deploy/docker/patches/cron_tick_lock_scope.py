@@ -143,13 +143,16 @@ only one of them, so guarding the run rather than the entry point is what keeps
 the other three covered.
 
 Guarding there puts the flock AFTER ``claim_job_for_fire``. Since v2026.9.11
-every claim on this path is a ``manual`` one -- an off-tick run-now that stamps
-no occurrence identity, so the still-pending ``next_run_at`` slot fires when it
-arrives -- and a refusal therefore no longer skips a scheduled occurrence. What
-it costs is the requested run itself, the same trade upstream makes two lines
-above for its own ``try_register_running_job`` guard, and a far smaller harm
-than the two overlapping runs sharing one output file that this patch exists
-to stop.
+every claim on this path is a ``manual`` one (``cron/jobs.py``,
+``claim_job_for_fire(manual=True)``): it stamps ``fire_claim`` and, for a
+recurring job, rewrites ``next_run_at`` to ``compute_next_run(schedule, now)``
+-- the same slot for a cron expression, now plus one period for an interval --
+but stamps no occurrence identity, so no execution row can make the scheduler
+treat the pending slot as already done. A refusal therefore costs the
+requested run itself, not a scheduled occurrence: the same trade upstream
+makes two lines above for its own ``try_register_running_job`` guard, and a
+far smaller harm than the two overlapping runs sharing one output file that
+this patch exists to stop.
 
 A refused dispatch returns immediately rather than waiting for the lock. The
 caller is an agent blocked inside a tool call, the run it would wait for can
@@ -158,11 +161,11 @@ of a job that has just finished. The refusal is returned as ``claimed: True``
 with an ``error``, which ``cronjob``'s ``run`` branch surfaces to the model as
 ``execution_error``. ``claimed: False`` would read better -- nothing ran, and
 ``result["executed"]`` consequently says ``True`` when it should not -- but it
-would also be a lie about the CAS, which did succeed and did advance
-``next_run_at``. That branch skips ``_notify_provider_jobs_changed_safe()`` on
-an unclaimed result, so reporting the refusal as unclaimed would leave an
-external provider's one-shot un-reconciled against an occurrence this call has
-already consumed.
+would also be a lie about the CAS, which did succeed: the fire claim is
+stamped and ``next_run_at`` rewritten. That branch skips
+``_notify_provider_jobs_changed_safe()`` on an unclaimed result, so reporting
+the refusal as unclaimed would leave an external provider unreconciled against
+the claim and the ``next_run_at`` this call has already written.
 
 A spawned tick is a scheduler restart
 -------------------------------------

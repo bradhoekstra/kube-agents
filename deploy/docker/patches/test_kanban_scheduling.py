@@ -1597,15 +1597,6 @@ def pristine_dispatch():
 PRISTINE = {DB_RELATIVE: pristine_db, DISPATCH_RELATIVE: pristine_dispatch}
 
 
-def edits_in(relative):
-    """The ``(label, anchor, patched)`` triples the applier aims at one file."""
-    return [
-        (label, anchor, patched)
-        for file, label, anchor, patched in EDITS
-        if file == relative
-    ]
-
-
 class ApplierTest(unittest.TestCase):
     """The applier is the thing that fails the build, so exercise it directly."""
 
@@ -1985,7 +1976,7 @@ class FreshBoardNamingTest(unittest.TestCase):
     "fresh" board after a certain point was reopening one file, so the sweep was
     correctly reporting a card an earlier section had left ``running``.
 
-    The trigger is not reproducible off-Linux: ``K.connect`` opens each board in
+    The trigger is not reproducible off-Linux: ``KC.connect`` opens each board in
     WAL mode, and whether closing the last connection unlinks the ``-wal`` and
     ``-shm`` sidecars depends on the SQLite build (it does in the image, it does
     not on macOS). So these tests do not try to reproduce WAL cleanup. They

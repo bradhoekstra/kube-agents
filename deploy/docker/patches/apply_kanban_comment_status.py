@@ -10,8 +10,10 @@ other kanban patches — ``kanban_auto_subscribe``, ``kanban_report_format`` and
 ``kanban_children_settled`` (the ``kanban_create`` handler),
 ``kanban_result_required`` and ``kanban_children_settled`` (the
 ``kanban_complete`` handler), ``kanban_worker_tools`` (the registration loop),
-``kanban_event_routing`` (``_resolve_notify_target``), ``cron_run_scope`` and
-``kanban_progress_lines`` elsewhere — and every anchor added here is another
+``kanban_event_routing`` (``_resolve_notify_target``) and ``cron_run_scope``
+elsewhere (``kanban_progress_lines`` left this file at v2026.9.14; its schema
+edit lives in ``tools/kanban_tools_schemas.py`` now) — and every anchor added
+here is another
 way a base image bump breaks the build. The two lines below are inside
 ``_handle_comment``, which none of those touch, and the schema wording is
 deliberately left alone: this patch fixes what the model reads *back*, and

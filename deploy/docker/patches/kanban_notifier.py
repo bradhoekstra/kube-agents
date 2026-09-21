@@ -10,7 +10,7 @@ model turn waking the agent that created the card. Three separate patches used
 to rewrite that path — a clip, a result delivery, and a wake filter — each with
 its own applier anchored into the same function, each its own way for a
 base-image bump to break the build for a reason that has nothing to do with the
-other two. They are merged here: two anchors, one applier, one verifier.
+other two. They are merged here: three anchors, one applier, one verifier.
 
 The concerns, in the order the notifier reaches them:
 
@@ -75,7 +75,7 @@ __all__ = [
     "unstructured_result",
     "handoff_with_result",
     "DEFAULT_WAKE_KINDS",
-    "DECISION_KINDS",
+    "UNDELIVERED_OUTCOME_KINDS",
     "CONFIG_KEY",
     "resolve_wake_kinds",
     "wake_kinds_for",
@@ -412,18 +412,14 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # need a decision, not for the one that already answered itself".
 #
 # The review-flow kinds upstream added afterwards — ``review_requested``,
-# ``changes_requested``, ``block_loop_detected`` — are the extreme form of
-# that: the card is *waiting* on the creator (in ``review``, or in ``triage``
-# after the loop breaker), and nothing has been answered at all. A config key
-# whose one meaning is "do not re-read an answer already delivered" has no
-# answer to withhold on those, so :data:`DECISION_KINDS` sits outside its
-# reach: :func:`wake_kinds_for` always wakes for them and
-# :func:`suppressed_kinds` never reports them, whatever ``wake_on_events``
-# says. Without that carve-out a deployed config that predates the kinds and
-# lists only the four failures would silently leave every review handoff
-# unanswered — and section 4 would then stage a note telling the creator the
-# result was "already delivered" for a card sitting in ``review`` waiting for
-# its decision.
+# ``changes_requested``, ``block_loop_detected`` — are in the default set, so
+# an image with the key unset wakes for them exactly as upstream does, and an
+# operator's ``wake_on_events`` governs them exactly as it governs the other
+# five: listed, they wake; omitted, they do not. What they are not is a
+# delivered result. The card is *waiting* on the creator (in ``review``, or in
+# ``triage`` after the loop breaker) and nothing has been answered, so section
+# 4 — which records a suppressed kind as "already delivered" — never treats one
+# of them as such: :data:`UNDELIVERED_OUTCOME_KINDS` is the set it leaves out.
 #
 # :func:`resolve_wake_kinds` reads ``kanban.wake_on_events`` from config and
 # falls back to the upstream tuple, so an image built without that key set
@@ -444,27 +440,28 @@ DEFAULT_WAKE_KINDS: Tuple[str, ...] = (
     "crashed",
     "timed_out",
     "blocked",
-    # The review-flow kinds v2026.8.13 and v2026.9.14 added upstream. They hand a
-    # decision back to the creator exactly as ``blocked`` does, so they belong in
-    # the default set -- and, being :data:`DECISION_KINDS`, an operator narrowing
-    # ``kanban.wake_on_events`` to the failures cannot drop them: the key removes
-    # a wake over an answer already delivered, and these have no answer yet.
+    # The review-flow kinds v2026.8.13 and v2026.9.14 added upstream. An
+    # operator's ``kanban.wake_on_events`` governs the ping-then-wake path for
+    # all eight: listed, a kind wakes; omitted, it does not. These three differ
+    # only in section 4 -- being :data:`UNDELIVERED_OUTCOME_KINDS`, a suppressed
+    # one is never noted as a delivered result.
     "review_requested",
     "changes_requested",
     "block_loop_detected",
 )
 
-#: The kinds that hand a *decision* back to the creator rather than a result:
-#: a worker asking for review, a reviewer sending the card back, the loop
-#: breaker routing it to ``triage``. Upstream's ``_WAKE_KINDS`` comment calls
-#: them out the same way ("hand a decision back to the origin, which must take
-#: a turn"). ``kanban.wake_on_events`` cannot suppress these — the key's whole
-#: justification is that the answer is already in the thread, and on these
-#: events there is no answer yet — so :func:`wake_kinds_for` adds them to
-#: whatever the config allows and :func:`suppressed_kinds` never counts them
-#: as a completion the narrowing dropped. Every entry is also in
-#: :data:`DEFAULT_WAKE_KINDS`, which :func:`_check_kinds` asserts at import.
-DECISION_KINDS: Tuple[str, ...] = (
+#: The kinds that carry a decision request or a triage notice rather than a
+#: result: a worker asking for review, a reviewer sending the card back, the
+#: loop breaker routing it to ``triage``. ``kanban.wake_on_events`` governs
+#: whether they wake the creator, as it does every other kind; what it cannot
+#: do is make section 4's note true of them. That note says the card's result
+#: was already delivered to the conversation, and on these events there is no
+#: result — the card is waiting in ``review`` or ``triage`` — so "already
+#: delivered" is never true of them: :func:`suppressed_kinds` leaves them out
+#: and :func:`note_suppressed_completion` stages nothing for them. Every entry
+#: is also in :data:`DEFAULT_WAKE_KINDS`, which :func:`_check_kinds` asserts
+#: at import.
+UNDELIVERED_OUTCOME_KINDS: Tuple[str, ...] = (
     "review_requested",
     "changes_requested",
     "block_loop_detected",
@@ -472,10 +469,10 @@ DECISION_KINDS: Tuple[str, ...] = (
 
 
 def _check_kinds() -> None:
-    missing = [k for k in DECISION_KINDS if k not in DEFAULT_WAKE_KINDS]
+    missing = [k for k in UNDELIVERED_OUTCOME_KINDS if k not in DEFAULT_WAKE_KINDS]
     if missing:
         raise RuntimeError(
-            "kanban notifier: DECISION_KINDS must be a subset of "
+            "kanban notifier: UNDELIVERED_OUTCOME_KINDS must be a subset of "
             f"DEFAULT_WAKE_KINDS; {', '.join(missing)} is not"
         )
 
@@ -565,10 +562,8 @@ def resolve_wake_kinds(
     Only an explicit, well-formed value narrows the set; an explicit empty list
     disables the wake entirely, which is a deliberate choice a user can make.
 
-    This is the *configured* set and nothing more. The kinds the key is not
-    allowed to touch, :data:`DECISION_KINDS`, are added by
-    :func:`wake_kinds_for`, so a caller reading this to learn what an operator
-    wrote sees exactly that.
+    This is the *configured* set and nothing more: :func:`wake_kinds_for`
+    applies it, and widens it only on the paths where no text ping was sent.
     """
     kcfg = _load_kanban_config(load_config)
     if kcfg is None or CONFIG_KEY not in kcfg:
@@ -692,16 +687,14 @@ def wake_kinds_for(
     means "do not spend a turn re-reading an answer already delivered", which
     is not a thing anyone can be asking for where nothing was delivered.
 
-    :data:`DECISION_KINDS` are outside the key on *every* path, for the same
-    reason from the other side: on a review handoff nothing has been answered
-    yet, so there is no delivered answer for the key to be declining to re-read.
-    The three are added to whatever the config allows, and an explicit
-    ``wake_on_events: []`` still wakes for them.
+    :data:`UNDELIVERED_OUTCOME_KINDS` get no special treatment here: a list
+    that omits ``review_requested`` does not wake for it on the ping-then-wake
+    path, and the no-send paths wake for it as for any default kind. Where
+    they differ is section 4, which never records one as a delivered result.
     """
     allowed = set(resolve_wake_kinds(load_config))
     if not passive_delivered or (adapter is not None and not _adapter_can_push(adapter)):
         allowed = set(DEFAULT_WAKE_KINDS)
-    allowed.update(DECISION_KINDS)
     return {ev.kind for ev in events if getattr(ev, "kind", None) in allowed}
 
 
@@ -747,7 +740,7 @@ def wake_kinds_for(
 # notes". ``GatewayRunner._set_pending_turn_sidecar_notes(session_key, notes)``
 # parks strings on ``SessionState.conversation.sidecar_notes``; the next turn's
 # agent setup drains them into ``agent._gateway_turn_context_notes``
-# (``gateway/run.py``), and ``agent/turn_context.py`` appends them to *that
+# (``gateway/run_turn_runner.py``), and ``agent/turn_context.py`` appends them to *that
 # turn's user message* through the ``api_content`` sidecar. Upstream uses it for
 # the auto-reset notice, the first-contact intro, and Discord voice-channel
 # changes.
@@ -791,7 +784,9 @@ def wake_kinds_for(
 # Which completions get one
 # -------------------------
 # Exactly the ones the narrowing suppressed: the terminal kinds upstream would
-# have woken for, minus the ones this delivery is waking for. A kind that still
+# have woken for, minus the ones this delivery is waking for, and never
+# :data:`UNDELIVERED_OUTCOME_KINDS`, which have no delivered result for the
+# note to describe. A kind that still
 # wakes needs no marker (the wake enters the transcript itself), and a gateway
 # with ``kanban.wake_on_events`` unset suppresses nothing, so it writes no notes
 # and behaves exactly as before. That makes the existing config key the on
@@ -823,11 +818,12 @@ def suppressed_kinds(events: Iterable[object], wake_kinds: object) -> set:
     — including the non-push carve-out, where nothing is narrowed and this
     returns the empty set.
 
-    :data:`DECISION_KINDS` are never in the answer. :func:`wake_kinds_for`
-    always wakes for them, so they cannot in fact be dropped; and the note
-    :func:`completion_note` renders for a suppressed kind says the result was
-    already delivered, which on a card waiting in ``review`` for the creator's
-    decision is false. Excluding them here rather than trusting the caller's
+    :data:`UNDELIVERED_OUTCOME_KINDS` are never in the answer, whether or not
+    the narrowing dropped them. The note :func:`completion_note` renders for a
+    suppressed kind says the result was already delivered, which on a card
+    waiting in ``review`` or ``triage`` for the creator's decision is false, so
+    a review handoff the config does not wake for goes unrecorded rather than
+    misdescribed. Excluding them here rather than trusting the caller's
     ``wake_kinds`` keeps that sentence true even for a caller that computed the
     wake set some other way.
     """
@@ -838,7 +834,7 @@ def suppressed_kinds(events: Iterable[object], wake_kinds: object) -> set:
     fired = set()
     for ev in events or ():
         kind = getattr(ev, "kind", None)
-        if kind in DEFAULT_WAKE_KINDS and kind not in DECISION_KINDS:
+        if kind in DEFAULT_WAKE_KINDS and kind not in UNDELIVERED_OUTCOME_KINDS:
             fired.add(kind)
     return fired - woken
 
@@ -884,9 +880,9 @@ def completion_note(
     evidence), and says what to call if it wants the content back.
 
     Every sentence of it presumes a *delivered* result, which is why
-    :data:`DECISION_KINDS` never reach it: :func:`suppressed_kinds` filters
-    them out before :func:`note_suppressed_completion` gets here, and a card
-    in ``review`` or ``triage`` is announced by the wake instead.
+    :data:`UNDELIVERED_OUTCOME_KINDS` never reach it: :func:`suppressed_kinds`
+    filters them out before :func:`note_suppressed_completion` gets here, so a
+    card in ``review`` or ``triage`` is never described as already answered.
     """
     tid = str(task_id or "").strip() or "(unknown)"
     head = NOTE_SIGNATURE + tid
@@ -1317,16 +1313,18 @@ def store_incident_report(
 ) -> bool:
     """Key the delivered report to its chat thread. True when a row was posted.
 
-    Called from ``gateway/kanban_watchers_notifier.py`` on the same path as
-    :func:`note_suppressed_completion`, where every text ping for this delivery
-    has already been sent — so the report this stores is one the reader has, and
-    a reply to it is a reply to something.
+    Called from ``gateway/kanban_watchers_notifier.py`` at the tail of
+    ``_send_pings``, once per event, after ``_send_event`` returned and
+    ``clear_failures()`` ran — so the report this stores is one the reader has,
+    and a reply to it is a reply to something. :func:`note_suppressed_completion`
+    runs later and once, from ``build_wake_text``, after every ping of the
+    delivery is out.
 
     Takes the loop's *current* event, not the delivery's whole event list, which
-    is where it parts company with :func:`note_suppressed_completion` at the
-    same call site. That function is asking what the delivery as a whole
-    suppressed, so it wants every kind; this one is asking whether *this* send
-    was the report, and the call site runs once per event. Reading the list here
+    is where it parts company with :func:`note_suppressed_completion`. That
+    function is asking what the delivery as a whole suppressed, so it wants
+    every kind; this one is asking whether *this* send was the report, and its
+    call site runs once per event. Reading the list here
     would fire on a delivery's ``commented`` event too — writing the row before
     the ``completed`` iteration has sent the report it claims the reader has,
     and again on the iteration that did.

@@ -34,12 +34,13 @@ can also be projected to monitoring):
 
 ``already_running``
     An in-process dedup guard refused: ``job_id`` is still in the scheduler's
-    ``_running_job_ids`` from an earlier fire. The occurrence is genuinely
-    lost, because the schedule has *already* moved past it — in ``tick``,
-    ``advance_next_runs`` moved ``next_run_at`` for the whole due set before
-    dispatch begins; in ``_run_claimed_job``, ``claim_job_for_fire`` moved it
-    for this job before the guard ran. This is the common case above: a job
-    whose run outlives its own period.
+    ``_running_job_ids`` from an earlier fire. What was asked for is genuinely
+    lost — in ``tick``, ``advance_next_runs`` moved ``next_run_at`` for the
+    whole due set before dispatch begins, so the occurrence is gone; in
+    ``_run_claimed_job`` the manual ``claim_job_for_fire`` has stamped the fire
+    claim and re-anchored ``next_run_at`` from now but no occurrence identity,
+    so it is the requested run that is gone, not a scheduled slot. This is the
+    common case above: a job whose run outlives its own period.
 
 ``already_running_elsewhere``
     The cross-process mirror of the same thing — ``_job_locks.claim`` refused,

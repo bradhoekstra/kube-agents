@@ -99,12 +99,14 @@ class ProgressNoteTest(unittest.TestCase):
 
 # --- the applier's own safety net -------------------------------------------
 #
-# The send anchor's replacement awaits, which is only legal where the anchor
-# actually sits: inside ``_KanbanNotification._send_event``, a coroutine. If
-# upstream ever turns that method synchronous, the anchor would still match and
-# the patch would still apply — and ast.parse() would still say the file is
-# fine, because an await outside a coroutine is a compile-time error, not a
-# syntax one. The build would ship an image whose gateway raises on import.
+# The send anchor carries upstream's own ``await``, so a synchronous
+# ``_send_event`` cannot match it; what an anchor cannot check is that the
+# text it matched, or the text it inserted, is legal where it sits. An
+# ``await`` outside a coroutine is exactly what ast.parse() accepts and
+# compile() rejects, so a fixture with a plain ``def`` around the anchor is
+# the one shape that tells the two apart: it pins that patchlib compiles what
+# it wrote rather than parsing it, the same net that catches an inserted
+# branch spliced one indent level out of its ``for``.
 
 # The tuple the applier widens. Spelled out here rather than imported from the
 # applier, because the whole point of locating it by name is that the applier no
@@ -162,7 +164,7 @@ def _notifier_source(coroutine: bool, kinds: str = _KINDS_ASSIGN) -> str:
     survive.
     """
     return (
-        _KINDS_ASSIGN.replace(_KINDS_ASSIGN, kinds)
+        kinds
         + _FORMATTERS_HOST
         + applier.FORMATTERS_ANCHOR
         + _FORMATTERS_BODY

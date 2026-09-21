@@ -82,9 +82,9 @@ import gateway.kanban_watchers_notifier as notifier  # noqa: E402
 from gateway.kanban_notifier import (  # noqa: E402
     CONFIG_KEY,
     DEFAULT_LIMIT,
-    DECISION_KINDS,
     DEFAULT_WAKE_KINDS,
     RESULT_LIMIT,
+    UNDELIVERED_OUTCOME_KINDS,
     _adapter_can_push,
     _load_kanban_config,
     clip_handoff,
@@ -447,28 +447,41 @@ check(
     "keeps narrowing",
     wake_kinds_for(completed, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter) == set(),
 )
-# The deployed config lists the four failure kinds and predates the review
-# flow. A review handoff is a decision the creator owes, not a result already
-# in the thread, so the key cannot narrow it away.
+# The review-flow kinds are governed by the key like every other kind: the
+# deployed config lists the four failure kinds, so on a push adapter a review
+# handoff does not wake the creator. Section 9 checks that it is then left
+# unrecorded rather than noted as "already delivered".
 review = [Event("review_requested")]
 check(
-    "a review request wakes the creator under the four-kind config",
-    wake_kinds_for(review, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter)
-    == {"review_requested"},
-    "the card is sitting in `review` waiting for this agent's decision",
+    "a review request does not wake the creator under the four-kind config",
+    wake_kinds_for(review, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter) == set(),
+    "wake_on_events governs all eight kinds on the ping-then-wake path",
 )
 check(
-    "every decision kind does, even under an explicit empty list",
+    "no review-flow kind wakes under an explicit empty list on a push adapter",
     all(
         wake_kinds_for([Event(kind)], cfg({"wake_on_events": []}), adapter=BasePlatformAdapter)
-        == {kind}
-        for kind in DECISION_KINDS
+        == set()
+        for kind in UNDELIVERED_OUTCOME_KINDS
     ),
 )
 check(
-    "the decision kinds are all kinds upstream wakes for",
-    set(DECISION_KINDS) <= notifier_kinds,
-    f"DECISION_KINDS={DECISION_KINDS!r} upstream={sorted(notifier_kinds)!r}",
+    "every review-flow kind wakes on the api_server path",
+    all(
+        wake_kinds_for([Event(kind)], cfg(FAILURE_ONLY), adapter=APIServerAdapter) == {kind}
+        for kind in UNDELIVERED_OUTCOME_KINDS
+    ),
+    "there the wake self-post is the only delivery",
+)
+check(
+    "a review request listed in the key wakes on a push adapter",
+    wake_kinds_for(review, cfg({"wake_on_events": ["review_requested"]}),
+                   adapter=BasePlatformAdapter) == {"review_requested"},
+)
+check(
+    "the review-flow kinds are all kinds upstream wakes for",
+    set(UNDELIVERED_OUTCOME_KINDS) <= notifier_kinds,
+    f"UNDELIVERED_OUTCOME_KINDS={UNDELIVERED_OUTCOME_KINDS!r} upstream={sorted(notifier_kinds)!r}",
 )
 
 # --- 8. Failure posture -------------------------------------------------------
@@ -639,15 +652,16 @@ check(
                                                adapter=BasePlatformAdapter)) == set(),
 )
 REVIEW = [Event("review_requested")]
+REVIEW_WOKEN = wake_kinds_for(REVIEW, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter)
 check(
-    "a review request is never reported as a suppressed completion",
-    suppressed_kinds(REVIEW, set()) == set(),
+    "a review request the config does not wake for is not reported as suppressed",
+    REVIEW_WOKEN == set() and suppressed_kinds(REVIEW, REVIEW_WOKEN) == set(),
     "the note would tell the creator the result was already delivered while "
     "the card waits in `review` for its decision",
 )
 check(
     "and no note is staged for it",
-    note_suppressed_completion(runner, REVIEW, set(), _Card(), SUB, "") is False,
+    note_suppressed_completion(runner, REVIEW, REVIEW_WOKEN, _Card(), SUB, "") is False,
 )
 check(
     "the marker was staged on the creator's session",
@@ -660,7 +674,7 @@ check(
     and runner._peek_session_state(CREATOR_ID) is None,
 )
 
-# Exactly what gateway/run.py does at the top of the creator's next turn.
+# Exactly what gateway/run_turn_runner.py does at the top of the creator's next turn.
 staged = runner._consume_pending_turn_sidecar_notes(CREATOR_KEY)
 check("the next turn reads back one note", len(staged) == 1, f"got {staged!r}")
 check(

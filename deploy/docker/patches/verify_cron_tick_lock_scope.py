@@ -37,8 +37,10 @@ harmful:
 
    This is where the flock lives *because* of that last assertion. Before the
    split it sat in ``_execute_job_now`` and ran strictly before the store CAS,
-   so a refused claim cost nothing; now the CAS is one frame up and
-   ``next_run_at`` is already advanced when the flock is refused. The trade is
+   so a refused claim cost nothing; now the CAS is one frame up, so the fire
+   claim is stamped and a recurring job's ``next_run_at`` re-anchored from now
+   when the flock is refused (no occurrence identity: the manual claim stamps
+   none, so the pending slot is not marked done). The trade is
    deliberate -- guarding the run body covers every caller, guarding one caller
    covers one -- and it is the trade upstream already makes for its own
    ``try_register_running_job``, which sits directly above the claim, after the
@@ -278,7 +280,9 @@ def check_dispatch_claims_the_flock() -> None:
           "that does not go through _run_claimed_job takes no per-job flock")
 
     # The CAS now happens in the caller, one frame up, so a lost flock is
-    # discovered after next_run_at has already advanced. That is a real cost
+    # discovered after the fire claim is stamped and a recurring job's
+    # next_run_at re-anchored from now (no occurrence identity: the manual
+    # claim stamps none, so the pending slot is not marked done). That is a real cost
     # and it is deliberate: guarding _run_claimed_job covers all four dispatch
     # paths, guarding _execute_job_now covers one, and it is the same trade
     # upstream already makes for its own try_register_running_job — which sits

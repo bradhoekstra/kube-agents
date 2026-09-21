@@ -182,7 +182,8 @@ def expect_not_orchestrator(patch: patchlib.Patch, chosen: patchlib.Assignment) 
 
 
 def expect_gate_choice(patch: patchlib.Patch, gate: patchlib.Assignment) -> None:
-    """Assert ``_gate`` is still the conditional between upstream's two gates."""
+    """Assert ``_gate`` is still the conditional between upstream's two gates,
+    chosen on the loop variable the inserted override reads."""
     value = gate.node.value
     if not (
         isinstance(value, ast.IfExp)
@@ -193,6 +194,21 @@ def expect_gate_choice(patch: patchlib.Patch, gate: patchlib.Assignment) -> None
             f"{GATE_LOCAL} is {patchlib._render(value)} where "
             f"'{ORCHESTRATOR_CHECK_FN} if ... else {UPSTREAM_CHECK_FN}' was "
             f"expected. {patch.note}"
+        )
+    # The override is ``if _name in _WORKER_ONLY_TOOLS``; pin that the choice
+    # upstream makes reads the same loop variable, or a renamed loop target
+    # would pass the two arms above and ship a NameError at import.
+    test = value.test
+    if not (
+        isinstance(test, ast.Compare)
+        and _is_name(test.left, LOOP_TOOL_NAME)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], ast.In)
+    ):
+        raise patch._fail(
+            f"{GATE_LOCAL} chooses on {patchlib._render(test)} where "
+            f"'{LOOP_TOOL_NAME} in ...' was expected; the inserted override "
+            f"reads {LOOP_TOOL_NAME}. {patch.note}"
         )
 
 

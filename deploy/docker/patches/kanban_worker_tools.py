@@ -67,10 +67,11 @@ anything else: it requires the card to be ``running`` under a run whose
 calling it against a card sitting in ``review`` gets ``task is not in an active
 review run`` whether or not the schema is offered. The human overrides are
 CLI-only (``hermes kanban complete`` approves; ``hermes kanban reopen-review``
-sends back). What the creator does get is the ``review_requested`` /
-``changes_requested`` wake, and ``agents/chat/SOUL.md`` §2 step 5 says what to
-do with it: report, ``kanban_comment`` if there is something the reviewer must
-know, and file nothing.
+sends back). The creator sees the outcome the way it sees any other: the
+reviewer's approval completes the card and its result posts to the thread.
+Whether a ``review_requested`` / ``changes_requested`` event wakes the creator
+is ``kanban.wake_on_events``' to say (``gateway/kanban_notifier.py``), and the
+deployed ``agents/chat/config.yaml`` lists the failure kinds only.
 
 ``check_kanban_worker_mode`` supplies the missing third gate. Nothing changes
 for a worker: the dispatcher sets ``HERMES_KANBAN_TASK`` before spawning it

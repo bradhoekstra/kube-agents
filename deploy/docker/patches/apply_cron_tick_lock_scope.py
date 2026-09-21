@@ -196,6 +196,10 @@ SUBMIT_ERR_PATCHED = (
 # v2026.9.14 compacted the docstring but kept the claim it makes about what the
 # claim does ("so a concurrent tick cannot double-fire"), so the correction is
 # still owed. It is load-bearing prose: it is why nobody looked for the overlap.
+# Its other half, "next_run_at advances", is right and stays: the manual claim
+# (cron/jobs.py, claim_job_for_fire(manual=True)) stamps the fire claim and
+# rewrites a recurring job's next_run_at to compute_next_run(schedule, now);
+# what ``manual`` withholds is the occurrence stamp, nothing else.
 DISPATCH_DOC_ANCHOR = (
     '    """Run a job now, outside the scheduler tick: claim via ``claim_job_for_fire`` (the ticker\'s\n'
     "    CAS, so a concurrent tick cannot double-fire and next_run_at advances), then fire through\n"
@@ -203,10 +207,12 @@ DISPATCH_DOC_ANCHOR = (
 )
 DISPATCH_DOC_PATCHED = (
     '    """Run a job now, outside the scheduler tick: claim via ``claim_job_for_fire`` (the ticker\'s\n'
-    "    CAS, which settles a race between two fires of the same occurrence and advances\n"
-    "    next_run_at), then fire through the shared ``run_one_job`` body. What the CAS never did\n"
-    "    is block a *concurrent* tick; ``_run_claimed_job`` takes a per-job flock for that -- see\n"
-    "    the kube-agents patch note there, and ``tools/cron_tick_lock_scope.py``.\n"
+    "    CAS: it stamps the fire claim, so a second claim inside the claim TTL loses, and re-anchors\n"
+    "    a recurring job's next_run_at from now -- the same slot for a cron expression, now plus one\n"
+    "    period for an interval -- but stamps no occurrence identity, because a manual run is not\n"
+    "    the pending slot), then fire through the shared ``run_one_job`` body. What the CAS never\n"
+    "    did is block a *concurrent* tick; ``_run_claimed_job`` takes a per-job flock for that --\n"
+    "    see the kube-agents patch note there, and ``tools/cron_tick_lock_scope.py``.\n"
     '    Returns {"claimed", "success", "error"}."""\n'
 )
 
@@ -218,10 +224,13 @@ DISPATCH_DOC_PATCHED = (
 # three of them go unguarded.
 #
 # That does put it after claim_job_for_fire has run. Since v2026.9.11 every
-# claim on this path is a ``manual`` one, which stamps no occurrence identity,
-# so a refusal here no longer skips a scheduled slot (the pending next_run_at
-# still fires when it arrives); what it costs is the requested run itself,
-# which is the same trade upstream makes for its own try_register_running_job()
+# claim on this path is a ``manual`` one (cron/jobs.py, claim_job_for_fire):
+# it stamps the fire claim and re-anchors a recurring job's next_run_at from
+# now -- the same slot for a cron expression, now plus one period for an
+# interval -- but stamps no occurrence identity, so no execution row can make
+# the scheduler treat the pending slot as already done. A refusal here
+# therefore costs the requested run itself, not a scheduled occurrence; that
+# is the same trade upstream makes for its own try_register_running_job()
 # guard two lines above, and a far smaller harm than two overlapping runs
 # sharing one output file, which is what this patch exists to stop.
 DISPATCH_CLAIM_ANCHOR = (

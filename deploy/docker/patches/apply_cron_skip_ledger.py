@@ -540,10 +540,12 @@ HEALTH_FLUSH_PATCHED = (
 # here, and the kube-agents flock was taken *before* the CAS precisely so that a
 # refusal cost nothing. The split into ``_run_claimed_job`` gave the run half
 # four call sites, so the flock had to follow the run. Since v2026.9.11 the
-# claim on this path is a ``manual`` one that stamps no occurrence identity, so
-# the refusal no longer skips a scheduled slot; what is lost is the requested
-# run, and on the background path its error goes to a daemon worker nobody
-# reads. ``tools/cron_skip_ledger.py`` exists to stop that loss being silent.
+# claim on this path is a ``manual`` one: it stamps the fire claim and
+# re-anchors a recurring job's next_run_at from now, but no occurrence
+# identity, so the refusal does not mark the pending slot done; what is lost
+# is the requested run, and on the background path its error goes to a daemon
+# worker nobody reads. ``tools/cron_skip_ledger.py`` exists to stop that loss
+# being silent.
 #
 # ``source="direct"`` rather than the ``"builtin"`` the tick guards use:
 # ``run_one_job`` — the function these refusals stop us reaching — records its
@@ -588,8 +590,8 @@ TOOLS_REGISTER_GUARD_PATCHED = (
     "                reason=SKIP_ALREADY_RUNNING,\n"
     "                detail=(\n"
     '                    "A run of this job was already in flight in this "\n'
-    '                    "process when the fire was claimed; the occurrence was "\n'
-    '                    "dropped, not queued."\n'
+    '                    "process when the fire was claimed; the requested run "\n'
+    '                    "was dropped, not queued."\n'
     "                ),\n"
     "            )\n"
     '            return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}\n'
@@ -620,7 +622,7 @@ TOOLS_LOCK_GUARD_PATCHED = (
     "                reason=SKIP_ALREADY_RUNNING_ELSEWHERE,\n"
     "                detail=(\n"
     '                    "Another process held this job\'s run lock when the "\n'
-    '                    "fire was claimed; the occurrence was dropped, not "\n'
+    '                    "fire was claimed; the requested run was dropped, not "\n'
     '                    "queued."\n'
     "                ),\n"
     "            )\n"

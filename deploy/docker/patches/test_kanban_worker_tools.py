@@ -404,6 +404,13 @@ class LocatorFailureTest(unittest.TestCase):
         source = upstream_source(loop=LOOP.replace(UPSTREAM_CHECK_FN + "\n", "_check_kanban_task_mode\n"))
         self.assert_refuses(source, "_gate is", "_check_kanban_task_mode", UPSTREAM_CHECK_FN)
 
+    def test_a_renamed_loop_variable_fails_loudly(self):
+        """Both arms intact, but the choice reads a loop variable the override does not."""
+        source = upstream_source(loop=LOOP.replace("_name", "_tool"))
+        self.assert_refuses(
+            source, "_gate chooses on", "_tool in _ORCHESTRATOR_TOOLS", "'_name in ...'"
+        )
+
     def test_a_gate_that_is_no_longer_a_choice_fails_loudly(self):
         source = upstream_source(loop=LOOP.replace(
             f"    _gate = {ORCHESTRATOR_CHECK_FN} if _name in _ORCHESTRATOR_TOOLS else {UPSTREAM_CHECK_FN}\n",

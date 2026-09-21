@@ -252,10 +252,13 @@ def record_worker_child(conn, child_task_id: str, creator_task_id: str) -> bool:
 def maybe_record_worker_child(conn, child_task_id: str) -> bool:
     """Record attribution when this process is a dispatcher-spawned worker.
 
-    The single call the patched ``kanban_create`` handler makes, immediately
-    after ``kanban_auto_subscribe``'s subscription inheritance and under the
-    same worker test. A process with no ``HERMES_KANBAN_TASK`` (chat session,
-    CLI, cron) writes nothing.
+    The single call the patched ``kanban_create`` handler makes, directly
+    after the created card is read back and before ``kanban_auto_subscribe``'s
+    subscription inheritance: both hook the same upstream line, so whichever
+    applier runs last sits first, and the Dockerfile runs this one last. The
+    two are order-independent -- each writes its own table and neither reads
+    the other's -- and share the same worker test. A process with no
+    ``HERMES_KANBAN_TASK`` (chat session, CLI, cron) writes nothing.
     """
     creator = (os.environ.get(WORKER_TASK_ENV) or "").strip()
     if not creator:

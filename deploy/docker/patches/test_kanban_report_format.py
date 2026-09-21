@@ -333,10 +333,6 @@ class WellShapedFixtureTest(unittest.TestCase):
         self.assertEqual(serious_defects(STRUCTURED_RESULT), ())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 # =============================================================================
 # The applier
 # =============================================================================
@@ -398,3 +394,7 @@ class ApplierTest(unittest.TestCase):
         root, _ = self._stage(UPSTREAM_TOOLS.replace("def _handle_create(", "def _handle_make("))
         with self.assertRaises(SystemExit):
             apply(root)
+
+
+if __name__ == "__main__":
+    unittest.main()

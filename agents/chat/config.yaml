@@ -173,10 +173,6 @@ kanban:
   # Which terminal events wake this agent for a follow-up turn. Upstream wakes
   # on every kind in its _WAKE_KINDS tuple and offers no way to say otherwise;
   # the image patches that key in (deploy/docker/patches/kanban_notifier.py).
-  # The review-flow kinds (review_requested, changes_requested,
-  # block_loop_detected) always wake regardless of this list: they hand the
-  # creator a decision, and there is no delivered answer for the list to be
-  # declining to re-read.
   #
   # `completed` is deliberately absent. The notifier has already delivered the
   # worker's own status line and its full `result` to the thread by the time it
