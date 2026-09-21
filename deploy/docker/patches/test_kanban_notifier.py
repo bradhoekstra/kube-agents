@@ -40,6 +40,7 @@ from apply_kanban_notifier import (
 from apply_kanban_progress_lines import SEND_ANCHOR, SEND_PATCHED
 from kanban_handoff_clip import DEFAULT_LIMIT, ELLIPSIS, clip_handoff
 from kanban_notifier import (
+    DECISION_KINDS,
     DEFAULT_WAKE_KINDS,
     MAX_NOTES,
     NOTE_SIGNATURE,
@@ -812,6 +813,75 @@ COMPLETED_AT = 1786216184.0
 #: Distinguishes "the caller passed no task" from "the caller passed None",
 #: which is a case the notifier has to survive and a default cannot express.
 UNSET = object()
+
+
+class DecisionKindsTest(unittest.TestCase):
+    """The review-flow kinds are outside ``kanban.wake_on_events``.
+
+    The deployed config (agents/chat/config.yaml and the operator default)
+    lists the four failure kinds and predates ``review_requested`` /
+    ``changes_requested`` / ``block_loop_detected``. Read literally it would
+    leave a card in ``review`` waiting for a creator that is never woken, and
+    then stage a note saying the result was "already delivered". Nothing was.
+    """
+
+    def test_the_three_are_the_upstream_review_flow_kinds(self):
+        self.assertEqual(
+            DECISION_KINDS,
+            ("review_requested", "changes_requested", "block_loop_detected"),
+        )
+        for kind in DECISION_KINDS:
+            self.assertIn(kind, DEFAULT_WAKE_KINDS)
+
+    def test_review_requested_wakes_on_a_push_adapter_under_the_four_kind_config(self):
+        events = [Event("review_requested")]
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        self.assertEqual(
+            wake_kinds_for(events, cfg, adapter=Adapter(True)), {"review_requested"}
+        )
+
+    def test_every_decision_kind_wakes_whatever_the_config_says(self):
+        for kind in DECISION_KINDS:
+            for kanban in ({"wake_on_events": FAILURE_ONLY}, {"wake_on_events": []},
+                           {"wake_on_events": None}, {}):
+                self.assertEqual(
+                    wake_kinds_for([Event(kind)], loader(kanban), adapter=Adapter(True)),
+                    {kind},
+                    (kind, kanban),
+                )
+
+    def test_the_configured_set_is_still_what_the_operator_wrote(self):
+        # resolve_wake_kinds reports the config; wake_kinds_for adds the three.
+        self.assertEqual(
+            set(resolve_wake_kinds(loader({"wake_on_events": FAILURE_ONLY}))),
+            set(FAILURE_ONLY),
+        )
+
+    def test_a_decision_kind_is_never_reported_as_suppressed(self):
+        for kind in DECISION_KINDS:
+            self.assertEqual(suppressed_kinds([Event(kind)], set()), set())
+        events = [Event("completed"), Event("review_requested")]
+        self.assertEqual(suppressed_kinds(events, set()), {"completed"})
+
+    def test_no_completion_note_is_staged_for_a_review_handoff(self):
+        _warned_config.clear()
+        runner = _Runner()
+        for kind in DECISION_KINDS:
+            staged = note_suppressed_completion(
+                runner, [Event(kind)], set(), _Card(), sub_for(), "", now=COMPLETED_AT
+            )
+            self.assertFalse(staged, kind)
+        self.assertEqual(runner._sessions, {})
+
+    def test_the_four_configured_kinds_behave_as_before(self):
+        cfg = loader({"wake_on_events": FAILURE_ONLY})
+        for kind in FAILURE_ONLY:
+            self.assertEqual(wake_kinds_for([Event(kind)], cfg, adapter=Adapter(True)), {kind})
+        self.assertEqual(wake_kinds_for([Event("completed")], cfg, adapter=Adapter(True)), set())
+        self.assertEqual(
+            suppressed_kinds([Event("completed")], wake_kinds_for([Event("completed")], cfg)),
+            {"completed"},
+        )
 
 
 class SuppressedKindsTest(unittest.TestCase):

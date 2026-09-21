@@ -73,8 +73,6 @@ ORCHESTRATOR_GATES = {
     "kanban_show": "_check_kanban_mode",
     "kanban_comment": "_check_kanban_mode",
     "kanban_create": "_check_kanban_mode",
-    "kanban_request_review": "_check_kanban_mode",
-    "kanban_request_changes": "_check_kanban_mode",
     "kanban_list": "_check_kanban_orchestrator_mode",
     "kanban_unblock": "_check_kanban_orchestrator_mode",
 }
@@ -288,6 +286,33 @@ check(
     "a worker is offered every worker-only tool",
     set(WORKER_ONLY_TOOLS) <= worker_tools,
     f"missing {sorted(set(WORKER_ONLY_TOOLS) - worker_tools)}",
+)
+check(
+    "including the two review-flow tools v2026.9.14 added",
+    {"kanban_request_review", "kanban_request_changes"} <= worker_tools,
+    f"offered {sorted(worker_tools)}",
+)
+
+# The orchestrator/chat profile: no HERMES_KANBAN_TASK, the kanban toolset on.
+# This is the surface the patch exists to shrink, and the one on which
+# upstream's _worker_guard is a no-op — _enforce_worker_task_ownership has no
+# task to enforce against — so a schema that leaks here is a tool the front
+# door can call against any card.
+_worker_task = os.environ.pop("HERMES_KANBAN_TASK", None)
+try:
+    orchestrator_tools = kanban_tool_names()
+finally:
+    if _worker_task is not None:
+        os.environ["HERMES_KANBAN_TASK"] = _worker_task
+check(
+    "an orchestrator profile is offered none of the worker-only tools",
+    not (set(WORKER_ONLY_TOOLS) & orchestrator_tools),
+    f"leaked {sorted(set(WORKER_ONLY_TOOLS) & orchestrator_tools)}",
+)
+check(
+    "and keeps the surface SOUL.md leaves it",
+    {"kanban_create", "kanban_show", "kanban_comment"} <= orchestrator_tools,
+    f"offered {sorted(orchestrator_tools)}",
 )
 
 with delegated_child_context():

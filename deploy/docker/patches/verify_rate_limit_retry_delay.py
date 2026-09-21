@@ -48,6 +48,15 @@ STORM_DELAY_SECONDS = 54.0
 #: Cap on the ``Retry-After`` header path in ``turn_recovery.py``.
 HEADER_CAP_SECONDS = 600.0
 
+#: A ``Retry-After`` header that disagrees with the body's 54 s, to prove the
+#: header still wins; the same number both as the header string and the wait.
+HEADER_RETRY_AFTER_SECONDS = 7
+
+#: Where the storm's requests went, and what the agent called the model. Only
+#: ``compute_error_backoff``'s signature needs them; the values are inert.
+STORM_BASE_URL = "http://litellm/v1"
+STORM_MODEL = "gemini"
+
 GOOGLE_429_BODY = {
     "error": {
         "message": (
@@ -220,7 +229,7 @@ from hermes_cli.rate_limit_retry_delay import (  # noqa: E402
 
 def sdk_error(body):
     """An ``openai.RateLimitError`` the way the SDK raises it off a 429."""
-    request = httpx.Request("POST", "http://litellm/v1/chat/completions")
+    request = httpx.Request("POST", f"{STORM_BASE_URL}/chat/completions")
     response = httpx.Response(429, request=request, json=body)
     return openai.RateLimitError(
         f"Error code: 429 - {body}", response=response, body=body.get("error")
@@ -236,7 +245,7 @@ check(
     and not headers.get("Retry-After"),
     "then the header path already covered it and this patch is moot",
 )
-classified = classify_api_error(storm, provider="openai", model="gemini")
+classified = classify_api_error(storm, provider="openai", model=STORM_MODEL)
 check(
     "the real classifier calls it a rate limit",
     classified.reason == FailoverReason.rate_limit,
@@ -296,7 +305,7 @@ def _wait_for(error, *, is_rate_limited):
     return compute_error_backoff(
         _QuietAgent(), error, retry_count=STORM_RETRY_COUNT, max_retries=STORM_MAX_RETRIES,
         is_rate_limited=is_rate_limited, is_zai_coding_overload=False,
-        base_url="http://litellm/v1", model="gemini",
+        base_url=STORM_BASE_URL, model=STORM_MODEL,
     )
 
 
@@ -316,14 +325,14 @@ check(
         openai.RateLimitError(
             f"Error code: 429 - {GOOGLE_429_BODY}",
             response=httpx.Response(
-                429, request=httpx.Request("POST", "http://litellm/v1/chat/completions"),
-                json=GOOGLE_429_BODY, headers={"retry-after": "7"},
+                429, request=httpx.Request("POST", f"{STORM_BASE_URL}/chat/completions"),
+                json=GOOGLE_429_BODY, headers={"retry-after": str(HEADER_RETRY_AFTER_SECONDS)},
             ),
             body=GOOGLE_429_BODY.get("error"),
         ),
         retry_count=STORM_RETRY_COUNT, max_retries=STORM_MAX_RETRIES, is_rate_limited=True,
-        is_zai_coding_overload=False, base_url="http://litellm/v1", model="gemini",
-    ) == 7,
+        is_zai_coding_overload=False, base_url=STORM_BASE_URL, model=STORM_MODEL,
+    ) == HEADER_RETRY_AFTER_SECONDS,
 )
 
 

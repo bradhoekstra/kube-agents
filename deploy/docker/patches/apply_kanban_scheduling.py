@@ -15,7 +15,7 @@ changes, and both are documented in ``kanban_scheduling.py``.
 
 Hermes v2026.9.14 split ``kanban_db.py`` into an origin module plus
 ``kanban_db_connect.py`` / ``kanban_db_workspace.py`` / ``kanban_db_dispatch.py``
-/ ``kanban_db_notify.py`` (upstream ``e03a680592``). The dispatcher — crash
+/ ``kanban_db_notify.py`` / ``kanban_db_graph.py`` (upstream ``e03a680592``). The dispatcher — crash
 detection, failure accounting, the concurrency counter — now lives in
 ``kanban_db_dispatch.py`` and reaches origin helpers late-bound through
 ``_kb`` (``from hermes_cli import kanban_db as _kb`` at its tail), so that
@@ -82,12 +82,13 @@ identically stopped firing at all. Edit 3 removes the cause that edit was
 reaching for.
 
 The other three host-prefix comparisons (``release_stale_claims`` in the origin
-module; ``_terminate_worker`` and ``enforce_max_runtime`` in the dispatcher, all
-three now through upstream's ``_host_prefix()`` helper) are deliberately left
-alone. Narrowing them is not locally safe: ``_terminate_worker`` reports
-``host_local: False`` by returning a never-attempted termination, which
-``_worker_survived_termination`` then has to interpret, and
-``release_stale_claims`` uses the same flag to choose between extending and
+module; ``_terminate_reclaimed_worker`` and ``enforce_max_runtime`` in the
+dispatcher, all three now through upstream's ``_host_prefix()`` helper) are
+deliberately left alone. Narrowing them is not locally safe:
+``_terminate_reclaimed_worker`` reports ``host_local: False`` by returning a
+never-attempted termination, which ``_worker_survived_termination`` then has to
+interpret, and ``release_stale_claims`` uses the same flag to choose between
+extending and
 reclaiming. Edit 3 makes those paths near-unreachable for foreign claims anyway
 — dead owners are handed back long before their 900s TTL — and the 1-hour
 ``last_heartbeat_at`` backstop still bounds the residual PID-collision case.

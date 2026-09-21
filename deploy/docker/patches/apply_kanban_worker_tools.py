@@ -13,7 +13,7 @@ table-driven since v2026.9.14: a ``_TOOLS`` tuple of
 per row (``_gate = _check_kanban_orchestrator_mode if _name in
 _ORCHESTRATOR_TOOLS else _check_kanban_mode``) and calls ``registry.register``
 once. There is no longer a ``registry.register(name="kanban_complete", ...)``
-statement to locate, so the seven per-tool ``check_fn`` splices this applier
+statement to locate, so the per-tool ``check_fn`` splices this applier
 used to make became a single override of ``_gate`` inside that loop, keyed on
 ``WORKER_ONLY_TOOLS`` imported from the companion module.
 
@@ -94,6 +94,8 @@ HANDLERS = {
     "kanban_attach": "_handle_attach",
     "kanban_attach_url": "_handle_attach_url",
     "kanban_attachments": "_handle_attachments",
+    "kanban_request_review": "_handle_request_review",
+    "kanban_request_changes": "_handle_request_changes",
 }
 
 

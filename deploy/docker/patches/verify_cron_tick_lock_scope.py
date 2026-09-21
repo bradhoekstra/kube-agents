@@ -98,6 +98,10 @@ HERMES = Path(os.environ.get("HERMES_ROOT", "/opt/hermes"))
 if str(HERMES) not in sys.path:
     sys.path.insert(0, str(HERMES))
 
+#: The module global upstream's ``_maybe_reap_dead_owners`` throttles on; the
+#: sweep check reads it back to prove the spawned tick really ran the sweep.
+REAP_THROTTLE_NAME = "_last_dead_owner_reap_at"
+
 FAILURES: list[str] = []
 
 
@@ -309,7 +313,6 @@ def check_dispatch_claims_the_flock() -> None:
 
 
 # --- 4. cron/scheduler.py: upstream's per-tick sweep ------------------------
-REAP_THROTTLE_NAME = "_last_dead_owner_reap_at"
 
 
 def check_spawned_tick_sweeps() -> None:

@@ -75,6 +75,7 @@ __all__ = [
     "unstructured_result",
     "handoff_with_result",
     "DEFAULT_WAKE_KINDS",
+    "DECISION_KINDS",
     "CONFIG_KEY",
     "resolve_wake_kinds",
     "wake_kinds_for",
@@ -410,6 +411,20 @@ def handoff_with_result(delivered: object, task: object) -> str:
 # broke. So this is not "turn the wake off", it is "wake for the events that
 # need a decision, not for the one that already answered itself".
 #
+# The review-flow kinds upstream added afterwards — ``review_requested``,
+# ``changes_requested``, ``block_loop_detected`` — are the extreme form of
+# that: the card is *waiting* on the creator (in ``review``, or in ``triage``
+# after the loop breaker), and nothing has been answered at all. A config key
+# whose one meaning is "do not re-read an answer already delivered" has no
+# answer to withhold on those, so :data:`DECISION_KINDS` sits outside its
+# reach: :func:`wake_kinds_for` always wakes for them and
+# :func:`suppressed_kinds` never reports them, whatever ``wake_on_events``
+# says. Without that carve-out a deployed config that predates the kinds and
+# lists only the four failures would silently leave every review handoff
+# unanswered — and section 4 would then stage a note telling the creator the
+# result was "already delivered" for a card sitting in ``review`` waiting for
+# its decision.
+#
 # :func:`resolve_wake_kinds` reads ``kanban.wake_on_events`` from config and
 # falls back to the upstream tuple, so an image built without that key set
 # behaves exactly as upstream does.
@@ -437,6 +452,34 @@ DEFAULT_WAKE_KINDS: Tuple[str, ...] = (
     "changes_requested",
     "block_loop_detected",
 )
+
+#: The kinds that hand a *decision* back to the creator rather than a result:
+#: a worker asking for review, a reviewer sending the card back, the loop
+#: breaker routing it to ``triage``. Upstream's ``_WAKE_KINDS`` comment calls
+#: them out the same way ("hand a decision back to the origin, which must take
+#: a turn"). ``kanban.wake_on_events`` cannot suppress these — the key's whole
+#: justification is that the answer is already in the thread, and on these
+#: events there is no answer yet — so :func:`wake_kinds_for` adds them to
+#: whatever the config allows and :func:`suppressed_kinds` never counts them
+#: as a completion the narrowing dropped. Every entry is also in
+#: :data:`DEFAULT_WAKE_KINDS`, which :func:`_check_kinds` asserts at import.
+DECISION_KINDS: Tuple[str, ...] = (
+    "review_requested",
+    "changes_requested",
+    "block_loop_detected",
+)
+
+
+def _check_kinds() -> None:
+    missing = [k for k in DECISION_KINDS if k not in DEFAULT_WAKE_KINDS]
+    if missing:
+        raise RuntimeError(
+            "kanban notifier: DECISION_KINDS must be a subset of "
+            f"DEFAULT_WAKE_KINDS; {', '.join(missing)} is not"
+        )
+
+
+_check_kinds()
 
 CONFIG_KEY = "wake_on_events"
 
@@ -520,6 +563,11 @@ def resolve_wake_kinds(
     read is distinguishable from a key nobody set.
     Only an explicit, well-formed value narrows the set; an explicit empty list
     disables the wake entirely, which is a deliberate choice a user can make.
+
+    This is the *configured* set and nothing more. The kinds the key is not
+    allowed to touch, :data:`DECISION_KINDS`, are added by
+    :func:`wake_kinds_for`, so a caller reading this to learn what an operator
+    wrote sees exactly that.
     """
     kcfg = _load_kanban_config(load_config)
     if kcfg is None or CONFIG_KEY not in kcfg:
@@ -642,10 +690,17 @@ def wake_kinds_for(
     always applies — including an explicit ``wake_on_events: []``. That key
     means "do not spend a turn re-reading an answer already delivered", which
     is not a thing anyone can be asking for where nothing was delivered.
+
+    :data:`DECISION_KINDS` are outside the key on *every* path, for the same
+    reason from the other side: on a review handoff nothing has been answered
+    yet, so there is no delivered answer for the key to be declining to re-read.
+    The three are added to whatever the config allows, and an explicit
+    ``wake_on_events: []`` still wakes for them.
     """
-    allowed = resolve_wake_kinds(load_config)
+    allowed = set(resolve_wake_kinds(load_config))
     if not passive_delivered or (adapter is not None and not _adapter_can_push(adapter)):
-        allowed = DEFAULT_WAKE_KINDS
+        allowed = set(DEFAULT_WAKE_KINDS)
+    allowed.update(DECISION_KINDS)
     return {ev.kind for ev in events if getattr(ev, "kind", None) in allowed}
 
 
@@ -766,6 +821,14 @@ def suppressed_kinds(events: Iterable[object], wake_kinds: object) -> set:
     read and stays correct however :func:`resolve_wake_kinds` narrowed the set
     — including the non-push carve-out, where nothing is narrowed and this
     returns the empty set.
+
+    :data:`DECISION_KINDS` are never in the answer. :func:`wake_kinds_for`
+    always wakes for them, so they cannot in fact be dropped; and the note
+    :func:`completion_note` renders for a suppressed kind says the result was
+    already delivered, which on a card waiting in ``review`` for the creator's
+    decision is false. Excluding them here rather than trusting the caller's
+    ``wake_kinds`` keeps that sentence true even for a caller that computed the
+    wake set some other way.
     """
     try:
         woken = set(wake_kinds or ())
@@ -774,7 +837,7 @@ def suppressed_kinds(events: Iterable[object], wake_kinds: object) -> set:
     fired = set()
     for ev in events or ():
         kind = getattr(ev, "kind", None)
-        if kind in DEFAULT_WAKE_KINDS:
+        if kind in DEFAULT_WAKE_KINDS and kind not in DECISION_KINDS:
             fired.add(kind)
     return fired - woken
 
@@ -818,6 +881,11 @@ def completion_note(
     delivered (so it does not re-post it), states *why* there is no record of
     the finish earlier in the transcript (so the absence is not read as
     evidence), and says what to call if it wants the content back.
+
+    Every sentence of it presumes a *delivered* result, which is why
+    :data:`DECISION_KINDS` never reach it: :func:`suppressed_kinds` filters
+    them out before :func:`note_suppressed_completion` gets here, and a card
+    in ``review`` or ``triage`` is announced by the wake instead.
     """
     tid = str(task_id or "").strip() or "(unknown)"
     head = NOTE_SIGNATURE + tid

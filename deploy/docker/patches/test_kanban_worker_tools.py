@@ -150,11 +150,22 @@ class CheckWorkerModeTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HERMES_KANBAN_TASK": ""}):
             self.assertFalse(check_kanban_worker_mode())
 
-    def test_the_forbidden_four_are_all_covered(self):
-        # The four agents/chat/SOUL.md §1.5 names explicitly. If a future edit
+    def test_the_forbidden_six_are_all_covered(self):
+        # The six agents/chat/SOUL.md §1.5 names explicitly. If a future edit
         # trims WORKER_ONLY_TOOLS, the prose and the schema set diverge again.
-        for tool in ("kanban_complete", "kanban_block", "kanban_heartbeat", "kanban_link"):
+        for tool in (
+            "kanban_complete", "kanban_block", "kanban_heartbeat", "kanban_link",
+            "kanban_request_review", "kanban_request_changes",
+        ):
             self.assertIn(tool, WORKER_ONLY_TOOLS)
+
+    def test_the_review_flow_tools_are_worker_only(self):
+        # v2026.9.14 opens both with _worker_guard, whose ownership check is a
+        # no-op without HERMES_KANBAN_TASK — so an orchestrator offered the
+        # schema could call either against any card.
+        self.assertIn("kanban_request_review", WORKER_ONLY_TOOLS)
+        self.assertIn("kanban_request_changes", WORKER_ONLY_TOOLS)
+        self.assertEqual(len(WORKER_ONLY_TOOLS), 9)
 
 
 def with_delegation_context(reader):
@@ -182,7 +193,7 @@ class DelegatedChildTest(unittest.TestCase):
     Upstream's own two gates, ``_check_kanban_mode`` and
     ``_check_kanban_orchestrator_mode``, both open with the same short-circuit;
     without it this was the only kanban gate in the file that said *True* for a
-    child, which would have offered it the seven worker-only tools and none of
+    child, which would have offered it the nine worker-only tools and none of
     the five an orchestrator keeps.
     """
 

@@ -16,8 +16,9 @@ worker cold start, and a fresh worker context per stage. It makes the real
 number worse to improve the perceived one.
 
 **The unlock.** ``kanban_heartbeat(note=...)`` already writes a ``heartbeat``
-event carrying that note (``hermes_cli/kanban_db.py``); the notifier simply
-does not deliver that kind. Two properties make delivering it nearly free:
+event carrying that note (``hermes_cli/kanban_db_dispatch.py``); the notifier
+simply does not deliver that kind. Two properties make delivering it nearly
+free:
 
 1. The per-tool-call auto-heartbeats fired by ``tools/kanban_tools.py`` write
    ``payload=None``. All 2,107 heartbeat rows on the live board are noteless,

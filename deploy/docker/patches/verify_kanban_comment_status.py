@@ -184,16 +184,12 @@ K.complete_task(
     conn, incident, result=report, summary="Audited the fleet; 9 findings.",
 )
 # What gateway/kanban_watchers_notifier.py does on the tick that carries the
-# terminal event: ``self.task.status == "archived"`` -> ``unsub()``.
-KN.remove_notify_sub(
-    conn,
-    task_id=incident,
-    platform="slack",
-    chat_id="C0PLATFORM",
-    thread_id="1723033132.001",
-)
+# terminal event at v2026.9.14: it unsubscribes only when
+# ``self.task.status == "archived"`` — ``done`` is reversible — so a completed
+# card keeps its subscription row. That is the state the front door found on
+# 2026-08-08, and the reason the status has to outrank the row (section 4).
 check("the card is done", K.get_task(conn, incident).status == "done")
-check("its subscription is gone", sub_rows(incident) == 0)
+check("its subscription survives, as the notifier leaves it", sub_rows(incident) == 1)
 
 out = comment(incident, "Any update on this? Posting results here when done.")
 check("the comment still succeeds", out.get("ok") is True)

@@ -18,8 +18,10 @@ Upstream split ``cron/scheduler.py`` in September 2026 (commit ``5a8fbbf16c``,
 ``_is_cron_silence_response`` stayed in ``cron/scheduler.py``; the ``cronjob``
 tool's ``_local_delivery_notice`` is ``tools/cronjob_job_args.py``. Import from
 the module that defines a name, not from one that happens to re-export it
-today: ``cron/scheduler.py`` still imports four of these for its own use, and
-the earlier base failed here with ``ImportError`` the day it stopped.
+today: ``cron/scheduler.py`` still imports ``_deliver_result`` and
+``_resolve_delivery_targets`` for its own use (two of the five names it takes
+from ``scheduler_delivery``; the other three above it never touches), and the
+earlier base failed here with ``ImportError`` the day it stopped.
 
 Why this exists
 ---------------

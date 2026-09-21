@@ -82,6 +82,7 @@ import gateway.kanban_watchers_notifier as notifier  # noqa: E402
 from gateway.kanban_notifier import (  # noqa: E402
     CONFIG_KEY,
     DEFAULT_LIMIT,
+    DECISION_KINDS,
     DEFAULT_WAKE_KINDS,
     RESULT_LIMIT,
     _adapter_can_push,
@@ -446,6 +447,29 @@ check(
     "keeps narrowing",
     wake_kinds_for(completed, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter) == set(),
 )
+# The deployed config lists the four failure kinds and predates the review
+# flow. A review handoff is a decision the creator owes, not a result already
+# in the thread, so the key cannot narrow it away.
+review = [Event("review_requested")]
+check(
+    "a review request wakes the creator under the four-kind config",
+    wake_kinds_for(review, cfg(FAILURE_ONLY), adapter=BasePlatformAdapter)
+    == {"review_requested"},
+    "the card is sitting in `review` waiting for this agent's decision",
+)
+check(
+    "every decision kind does, even under an explicit empty list",
+    all(
+        wake_kinds_for([Event(kind)], cfg({"wake_on_events": []}), adapter=BasePlatformAdapter)
+        == {kind}
+        for kind in DECISION_KINDS
+    ),
+)
+check(
+    "the decision kinds are all kinds upstream wakes for",
+    set(DECISION_KINDS) <= notifier_kinds,
+    f"DECISION_KINDS={DECISION_KINDS!r} upstream={sorted(notifier_kinds)!r}",
+)
 
 # --- 8. Failure posture -------------------------------------------------------
 print("fail-soft posture:")
@@ -613,6 +637,17 @@ check(
     "a card whose wake still fires is not double-announced",
     suppressed_kinds(COMPLETED, wake_kinds_for(COMPLETED, cfg({}),
                                                adapter=BasePlatformAdapter)) == set(),
+)
+REVIEW = [Event("review_requested")]
+check(
+    "a review request is never reported as a suppressed completion",
+    suppressed_kinds(REVIEW, set()) == set(),
+    "the note would tell the creator the result was already delivered while "
+    "the card waits in `review` for its decision",
+)
+check(
+    "and no note is staged for it",
+    note_suppressed_completion(runner, REVIEW, set(), _Card(), SUB, "") is False,
 )
 check(
     "the marker was staged on the creator's session",

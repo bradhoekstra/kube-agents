@@ -79,6 +79,9 @@ WAKE_INDENT = " " * 8
 #: Nesting depth of the post-send lines in ``_send_pings``: method, ``for``,
 #: ``try``.
 PING_INDENT = " " * 16
+#: One block outward from those lines: the ``except`` that closes their
+#: ``try``, which the incident anchor ends on.
+PING_EXCEPT_INDENT = " " * 12
 
 # --- Anchor 1: the completion handoff ----------------------------------------
 #
@@ -207,7 +210,7 @@ WAKE_PATCHED = (
 
 INCIDENT_ANCHOR = (
     f"{PING_INDENT}self.clear_failures()\n"
-    f"{PING_INDENT[:-4]}except Exception as exc:\n"
+    f"{PING_EXCEPT_INDENT}except Exception as exc:\n"
 )
 
 INCIDENT_CALL = (
@@ -218,7 +221,7 @@ INCIDENT_PATCHED = (
     f"{PING_INDENT}self.clear_failures()\n"
     f"{PING_INDENT}# kube-agents patch: see gateway/kanban_notifier.py\n"
 ) + INCIDENT_CALL + (
-    f"{PING_INDENT[:-4]}except Exception as exc:\n"
+    f"{PING_EXCEPT_INDENT}except Exception as exc:\n"
 )
 
 EDITS = (

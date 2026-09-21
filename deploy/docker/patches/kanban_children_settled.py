@@ -7,9 +7,10 @@ and wired into ``tools/kanban_tools.py`` (the ``kanban_create`` and
 
 Why
 ---
-Completing a card IS the delivery: ``gateway/kanban_notifier.py`` posts a
-terminal card's ``result`` into the subscribed chat thread as the answer to
-whoever asked. On 2026-08-27 (issue #1010, eval ``capacity-pinned-pool-probe``,
+Completing a card IS the delivery: ``gateway/kanban_notifier.py`` (this
+repository's companion module, wired into upstream's
+``gateway/kanban_watchers_notifier.py``) posts a terminal card's ``result``
+into the subscribed chat thread as the answer to whoever asked. On 2026-08-27 (issue #1010, eval ``capacity-pinned-pool-probe``,
 build ``2093054394793725952``) the platform worker on ``t_470a97c5`` fanned
 one investigation card out per cluster agent and then completed its own card
 with::

@@ -318,7 +318,8 @@ KANBAN_IMPORT_PATCHED = (
 # There is no _default_task_id edit here any more, and its absence is the
 # patch, not an omission. v2026.8.13 absorbed that half: cron.scheduler.run_job
 # now enters agent.delegation_context.non_dispatcher_owned_context() around the
-# whole run (v2026.9.14 does it from _CronRunScope.enter()), _default_task_id
+# whole run (v2026.9.14 does it from _CronRunScope.enter()/exit() through the
+# enter_/exit_non_dispatcher_owned_context pair), _default_task_id
 # consults it through _is_dispatcher_owned_worker(), and a dispatched job
 # therefore inherits no ambient card upstream-side. Keeping our own rewrite of
 # that function would be a second implementation of a rule upstream now owns,

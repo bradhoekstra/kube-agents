@@ -151,7 +151,7 @@ RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
 # REST send (_standalone_send, used by send_message from cron) posts thread.name without messageReplyOption,
 # which the Chat API ignores by default -- upstream's _create_kwargs docstring says so, SDK path only.
 # Both edits are exact-count guarded (c.count(t) == 1) until they become an applier + verifier.
-RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed(list(placeholders.items())):/' /opt/hermes/plugins/platforms/google_chat/cards.py && \
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/cards.py'); c = p.read_text(); t = 'for key, value in placeholders.items():'; r = 'for key, value in reversed(list(placeholders.items())):'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
     /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/plugins/platforms/google_chat/adapter.py'); c = p.read_text(); t = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\", json=_thread_body(message, thread_id),'; r = 'f\"https://chat.googleapis.com/v1/{chat_id}/messages\" + (\"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD\" if thread_id else \"\"), json=_thread_body(message, thread_id),'; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
     grep -q "reversed(list(placeholders.items()))" /opt/hermes/plugins/platforms/google_chat/cards.py && \
     grep -qF '"?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD" if thread_id' /opt/hermes/plugins/platforms/google_chat/adapter.py
@@ -159,9 +159,12 @@ RUN sed -i 's/for key, value in placeholders.items():/for key, value in reversed
 # Hotfix: explicit google_chat space/thread targets in send_message. Upstream moved _parse_target_ref to
 # tools/send_message_targets.py (parser table + fallbacks); google_chat has no parser there and registers no
 # parse_target_ref_fn, so "spaces/<id>" and "spaces/<id>:spaces/<id>/threads/<id>" fall through to
-# channel-directory resolution and fail. Exact-count guarded like the step above.
-RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_targets.py'); c = p.read_text(); t = '    parser = _PLATFORM_PARSERS.get(platform_name)\n'; r = '    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True\n' + t; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
-    grep -qF 'if platform_name == "google_chat":' /opt/hermes/tools/send_message_targets.py
+# channel-directory resolution and fail. A bare thread name "spaces/<id>/threads/<id>" (no colon) is the
+# space before "/threads/" plus the whole name as the thread, the shape the adapter's thread ids take.
+# Exact-count guarded like the step above.
+RUN /opt/hermes/.venv/bin/python3 -c "import pathlib; p = pathlib.Path('/opt/hermes/tools/send_message_targets.py'); c = p.read_text(); t = '    parser = _PLATFORM_PARSERS.get(platform_name)\n'; r = '    if platform_name == \"google_chat\":\n        parts = target_ref.split(\":\", 1)\n        if len(parts) == 2 and parts[0].startswith(\"spaces/\"):\n            return parts[0].strip(), parts[1].strip(), True\n        elif target_ref.startswith(\"spaces/\") and \"/threads/\" in target_ref:\n            return target_ref.split(\"/threads/\", 1)[0].strip(), target_ref.strip(), True\n        elif target_ref.startswith(\"spaces/\"):\n            return target_ref.strip(), None, True\n' + t; p.write_text(c.replace(t, r)) if c.count(t) == 1 else exit(1)" && \
+    grep -qF 'if platform_name == "google_chat":' /opt/hermes/tools/send_message_targets.py && \
+    grep -qF 'target_ref.split("/threads/", 1)[0]' /opt/hermes/tools/send_message_targets.py
 
 # A dependency-free text utility, copied in on its own and ahead of both of its
 # callers. tools/cron_run_scope.py imports it a few layers below for a different
@@ -273,7 +276,8 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 
 # Fix: give a spawned `hermes cron tick` the scheduler lifecycle it never had.
 # The platform profile has no ticker thread -- it is ticked once a minute by
-# spawning `hermes cron tick`, whose body is verbatim `tick(verbose=True)` --
+# spawning `hermes cron tick`, whose body is `tick(verbose=True)` in a
+# try/except that only reports a `CronTickYielded` --
 # so everything Hermes hangs off the ticker's lifetime is absent or wrong there.
 # Three consequences; the first two are fixed by the twelve anchored edits in
 # the applier, the third upstream has since closed itself:
@@ -311,7 +315,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope
     grep -q "_tick_lock = AdvisoryLock(lock_fd, fcntl, globals().get(\"msvcrt\"))" /opt/hermes/cron/scheduler.py && \
     grep -q "_job_lock = _job_locks.claim(job_id)" /opt/hermes/cron/scheduler.py && \
     grep -q "_run_lock = _job_locks.claim(job_id)" /opt/hermes/tools/cronjob_tools.py && \
-    grep -q "_maybe_reap_dead_owners()" /opt/hermes/cron/scheduler.py && \
+    grep -q '^        _maybe_reap_dead_owners()$' /opt/hermes/cron/scheduler.py && \
     ! grep -q "        _release_tick_lock(lock_fd)" /opt/hermes/cron/scheduler.py && \
     ! grep -q "_job_locks.release(" /opt/hermes/cron/scheduler.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/verify_cron_tick_lock_scope.py && \
@@ -668,19 +672,22 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # Slack: ask for the reactions scope the adapter already spends. `hermes slack
 # manifest` is the only description of the Slack app an installer ever writes --
 # the operator pastes that JSON in and clicks Save -- and its bot_scopes list
-# grants reactions:read and stops. The adapter calls reactions.add three times
-# (eyes on pickup, white_check_mark/x on the outcome) and reactions.remove once,
-# all of which need reactions:write, so Slack answers every one missing_scope
+# grants reactions:read and stops. The adapter calls reactions.add from two
+# sites (eyes on pickup, white_check_mark or x on the outcome) and
+# reactions.remove once, all through its one _react(..., remove=) helper and
+# all needing reactions:write, so Slack answers every one missing_scope
 # and no kube-agents install has ever shown a reaction. The manifest is
 # self-inconsistent rather than merely short: it already subscribes to
 # reaction_added and reaction_removed, so the app it describes is built to hear
 # reactions and not to make any.
 #
-# Nothing surfaces the failure. _add_reaction logs at debug with a comment that
-# names this exact case ("may fail if already reacted or missing scope"),
-# neither caller reads the False it returns, and the turn otherwise succeeds --
-# a dead feature is indistinguishable from a slow agent. SLACK_REACTIONS
-# defaults to true, so it is enabled everywhere and works nowhere.
+# Nothing surfaces the failure. _react swallows every exception at debug level
+# and its docstring names this exact case ("Failures (already reacted, missing
+# scope) are debug-logged only"); _add_reaction/_remove_reaction are one-line
+# wrappers over it, neither processing hook reads the False it returns, and
+# the turn otherwise succeeds -- a dead feature is indistinguishable from a
+# slow agent. SLACK_REACTIONS defaults to true, so it is enabled everywhere and
+# works nowhere.
 #
 # A grep guard is not enough on its own here either. _build_full_manifest
 # appends to bot_scopes on two of its three messaging_experience branches and
@@ -762,12 +769,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-worker-tools/apply_kanban_worker_t
 # dropped it at the kanban_complete call -- because upstream's schema calls
 # `result` a "Short result log line (legacy field)... Use ``summary`` instead"
 # and accepts `summary or result`, while the kernel stores the chat line as
-# `(summary or result).strip().splitlines()[0][:400]`. So the only field that
+# `(summary or result).strip().splitlines()[0][:400]` (`_completed_event_payload`
+# via `_first_line`). So the only field that
 # can carry a report is marked legacy, the field the model is steered to holds
 # one line of 400 characters, and nothing posts `result` to chat at all.
 #
-# Applied last so it composes with the patches above rather than competing for
-# the same lines, and deterministic -- it does not try to classify a card as
+# Applied after the patches above so it composes with them rather than
+# competing for the same lines (later kanban blocks in this file follow it),
+# and deterministic -- it does not try to classify a card as
 # "asked for information", because every card has an answer.
 #   * kanban_result_required: rewrites the schema wording and requires `result`.
 #     Refuses a card once, remembers that refusal for NUDGE_TTL_SECONDS (15
@@ -1085,7 +1094,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
     rm -rf /tmp/kanban-guardrail-exit
 
 # Perf: let a board mutation wake the kanban watchers instead of waiting out a
-# poll. The dispatcher and notifier are pure 5s polls, so every hop of a task
+# poll. The dispatcher and notifier are pure polls -- 5s on the cluster, where
+# agents/chat/config.yaml sets `dispatch_interval_seconds: 5` against upstream's
+# 60s default -- so every hop of a task
 # chain pays avg 2.5s (max 5s) for rows that were already committed: measured
 # 2026-08-07, 4.9s coordinator claim wait + 2.2s synthesizer claim wait +
 # notify delays on an 87s round trip. Workers are separate processes, so the
@@ -1109,7 +1120,8 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # 12:58: coordinator t_b9659077 was subscribed, the 4 cards it created as a
 # WORKER were not, and the synthesizer's answer sat undelivered for 91.3s
 # (gateway.log: zero Slack sends 12:59:02-13:02:15) until the user asked. The
-# manual remedy (scripts/kanban_notify_propagate.py) relies on the worker
+# manual remedy (agents/platform/scripts/kanban_notify_propagate.py) relies on
+# the worker
 # remembering to run it; it didn't. Same column set and INSERT OR IGNORE
 # idempotency as that script, so keeping it around as a back-fill tool
 # double-writes harmlessly. verify_kanban_auto_subscribe.py replays the
@@ -1257,7 +1269,7 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
 # cannot read the result. Same failure agentplugins/lib/plugin_image.sh:798
 # stages against for the plugin image, same cause.
 #
-# The other four land in /opt/hermes/tools and /opt/hermes/gateway, which the
+# The other five land in /opt/hermes/tools and /opt/hermes/gateway, which the
 # `platform` stage normalizes; /opt/hermes/hermes_cli is the one patch
 # destination no loop walks, so it is stated here at the write site.
 RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \

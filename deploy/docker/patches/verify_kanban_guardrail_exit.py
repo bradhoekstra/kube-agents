@@ -1016,10 +1016,47 @@ did = record_missing_terminal_call(
     run_id=other_run,
 )
 check("a non-429 exhaustion is still recorded", did is True)
+conn = board()
+after = block_row(conn, other_card)
 check(
     f"and it is the counted {OUTCOME}, not a block",
-    OUTCOME in [k for k, _ in events(board(), other_card)]
-    and block_row(board(), other_card)["block_kind"] != RATE_LIMIT_BLOCK_KIND,
+    (after["consecutive_failures"] or 0) == 1
+    and OUTCOME in [k for k, _ in events(conn, other_card)]
+    and after["block_kind"] != RATE_LIMIT_BLOCK_KIND,
+    f"failures={after['consecutive_failures']!r} kind={after['block_kind']!r} "
+    f"events={[k for k, _ in events(conn, other_card)]}",
+)
+
+# The recurrence rule the module docstring states, re-derived for v2026.9.14's
+# ``_route_block``: ``unblock_task`` deliberately keeps ``block_kind`` and
+# ``block_recurrences``, so a second block for the same kind counts
+# ``recurrences = 2``, which meets ``BLOCK_RECURRENCE_LIMIT`` (2) and routes the
+# card to ``triage`` with a ``block_loop_detected`` event instead of ``blocked``.
+# If upstream changes that, the docstring lies.
+conn = board()
+check("the cli.py-site card can be unblocked", K.unblock_task(conn, cli_card))
+K.recompute_ready(conn)
+check("and re-claimed", K.claim_task(conn, cli_card))
+re_run = K.get_task(conn, cli_card).current_run_id
+did = block_rate_limited_worker(
+    STORM_RESULT,
+    connect=board,
+    block_task=K.block_task,
+    environ={"HERMES_KANBAN_TASK": cli_card, "HERMES_KANBAN_RUN_ID": str(re_run)},
+    cron_run=False,
+    delegated_child=False,
+)
+check("a second storm on the same card still writes", did is True)
+conn = board()
+after = block_row(conn, cli_card)
+check(
+    "and upstream's loop breaker routes it to triage, as the docstring says",
+    after["status"] == "triage"
+    and after["block_kind"] == RATE_LIMIT_BLOCK_KIND
+    and "block_loop_detected" in [k for k, _ in events(conn, cli_card)],
+    f"status={after['status']!r} kind={after['block_kind']!r} "
+    f"events={[k for k, _ in events(conn, cli_card)]}; "
+    f"BLOCK_RECURRENCE_LIMIT={getattr(K, 'BLOCK_RECURRENCE_LIMIT', None)!r}",
 )
 
 # billing keeps the stock exit at both sites.

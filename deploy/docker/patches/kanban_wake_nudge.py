@@ -14,7 +14,8 @@ The problem, measured
 Both gateway watchers are pure polls. The dispatcher ticks every
 ``kanban.dispatch_interval_seconds`` (upstream defaults to 60s at v2026.9.14;
 5s on the live cluster) and the notifier every 5s (the ``interval`` default on
-``_kanban_notifier_watcher``, spawned with no args from ``gateway/run.py``);
+``_kanban_notifier_watcher``, spawned with no args from
+``gateway/run_startup.py``);
 both doze through the mixin's shared ``_sleep_between_ticks``, a plain
 1s-sliced sleep with no wake primitive behind it. So every hop of a task
 chain — card created →
