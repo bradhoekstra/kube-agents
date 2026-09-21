@@ -352,7 +352,12 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("found 0", str(caught.exception))
 
     def test_the_approval_gate_twin_is_not_mistaken_for_the_cron_arm(self):
-        """Both loop over the contexts; only the _unattended_deny call tells them apart."""
+        """Both loop over the contexts; the anchor keys on the _unattended_deny call.
+
+        The assertions check the consequence: the import landed once, and the
+        gate's loop came through untouched (still branching on ctx.mode(), no
+        _cron_mode local), which it could not have if the anchor had matched it.
+        """
         root, target = self.write(APPROVAL_GATE_TWIN + "\n\n" + UPSTREAM)
         applier.apply(root)
         patched = target.read_text()

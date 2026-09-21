@@ -26,7 +26,7 @@ weaker half of all five concerns here:
   ``t_c31a1f00`` quietly coming back.
 * **Marker.** Worse again, because it writes into gateway session state that
   nothing else in the build reads back. A note parked on a session *id* instead
-  of a session key, a store that dropped ``lookup_by_session_id``, a ``run.py``
+  of a session key, a store that dropped ``lookup_by_session_id``, a ``run_turn_runner.py``
   that stopped draining ``sidecar_notes`` — each is a silent no-op producing
   precisely what the unpatched gateway produced, which is the 9m46s of dead wait
   on task ``t_a8f58a2a``.
@@ -514,7 +514,7 @@ check(
 # Section 7's narrowing is only safe because of this one, and this one is the
 # most silent thing in the patch: it writes into gateway state that nothing else
 # in the build reads back, so a marker parked on the wrong key, a session store
-# that no longer exposes the reverse lookup, or a run.py that stopped draining
+# that no longer exposes the reverse lookup, or a run_turn_runner.py that stopped draining
 # the sidecar notes all produce *exactly* what the unpatched gateway produced —
 # a creator whose transcript never learns the card finished. That is the 9m46s
 # of dead wait on task t_a8f58a2a, and no exception is raised anywhere along the

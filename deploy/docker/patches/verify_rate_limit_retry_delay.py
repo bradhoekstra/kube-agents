@@ -286,7 +286,7 @@ STORM_MAX_RETRIES = 3
 
 
 class _QuietAgent:
-    """The five things compute_error_backoff asks of the agent; all display."""
+    """The four things compute_error_backoff asks of the agent; all display."""
 
     def _buffer_status(self, text):
         pass

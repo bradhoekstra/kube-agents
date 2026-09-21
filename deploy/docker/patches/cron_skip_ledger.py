@@ -255,7 +255,7 @@ SKIP_DISPATCH_CLAIM_REJECTED = "dispatch_claim_rejected"
 #: the schedule had already advanced.
 SKIP_CREATE_EXECUTION_FAILED = "create_execution_failed"
 #: The worker re-took the fire claim at execution time and was refused; the
-#: docstring lists the four refusals this covers.
+#: docstring lists the five refusals this covers.
 SKIP_FIRE_CLAIM_LOST = "fire_claim_lost"
 
 #: Every reason the ledger will accept. An unknown code is coerced rather than

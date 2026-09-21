@@ -97,8 +97,13 @@ CHAT_MIXIN = HERMES / "hermes_cli" / "cli_chat_turn_mixin.py"
 #: ``ast.unparse`` normalises quoting; derive the spellings rather than guess.
 BREAK_VERDICT = ast.unparse(ast.parse('_verdict("break")', mode="eval").body)
 CONTINUE_VERDICT = ast.unparse(ast.parse('_verdict("continue")', mode="eval").body)
-#: The loop locals the nudge path rebinds; the verdict must carry each one.
-REBOUND_LOCALS = ("final_response", "_turn_exit_reason", "messages")
+#: The loop local the nudge path rebinds (``_turn_exit_reason = "unknown"``)
+#: and the one it mutates in place (``append_message(messages, ...)``). Both
+#: reach the loop only through ``_verdict``, which must build the verdict from
+#: those same names; a verdict built from a copy taken earlier would drop the
+#: nudge on the floor with no error.
+REBOUND_LOCALS = ("_turn_exit_reason",)
+MUTATED_LOCALS = ("messages",)
 
 
 def _enclosing_block(tree, stmt):
@@ -245,9 +250,24 @@ verdict_fields = (
     else set()
 )
 check(
-    "the locals the nudge rebinds are fields of ToolRoundVerdict",
-    all(name in verdict_fields for name in REBOUND_LOCALS),
+    "the locals the nudge rebinds or mutates are fields of ToolRoundVerdict",
+    all(name in verdict_fields for name in REBOUND_LOCALS + MUTATED_LOCALS),
     f"verdict fields: {sorted(verdict_fields)}; the loop never sees a rebinding the verdict does not carry",
+)
+# Being a field is necessary, not sufficient: ``_verdict`` has to read the
+# loop's current binding of each name when it builds the verdict.
+verdict_def = _def(round_def, "_verdict") if round_def is not None else None
+verdict_kwargs = {}
+if verdict_def is not None:
+    for node in ast.walk(verdict_def):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", None) == "ToolRoundVerdict":
+            verdict_kwargs = {
+                kw.arg: ast.unparse(kw.value) for kw in node.keywords if kw.arg
+            }
+check(
+    "_verdict builds the verdict from the loop's own bindings of those names",
+    all(verdict_kwargs.get(name) == name for name in REBOUND_LOCALS + MUTATED_LOCALS),
+    f"_verdict keywords: {verdict_kwargs}",
 )
 
 
