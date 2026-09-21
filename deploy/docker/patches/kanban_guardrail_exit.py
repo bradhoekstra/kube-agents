@@ -581,7 +581,10 @@ def block_rate_limited_worker(
     cron_run=None,
     delegated_child=None,
 ) -> bool:
-    """The ``cli.py`` site: block the card for a ``failed`` rate-limit result.
+    """The ``cli.py`` site (``_run_quiet_single_query``): block the card for a
+    ``failed`` rate-limit result. The chat site, ``_chat_render_turn`` in
+    ``hermes_cli/cli_chat_turn_mixin.py``, calls this same function on the
+    turn result.
 
     ``result`` is what ``run_conversation`` returned. Anything that is not a
     ``failed`` dict with a rate-limit ``failure_reason`` is not this function's

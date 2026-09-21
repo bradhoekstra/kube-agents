@@ -224,9 +224,9 @@ class Assignment(_Site):
     """A single-target ``NAME = ...`` located by name, at any nesting depth.
 
     Unlike :class:`Definition` and :class:`CallSite` this looks inside function
-    bodies, because the constants worth pinning are not all module-level: the
-    kind filter the kanban notifier claims events with is a local in the method
-    that uses it. The uniqueness check is what keeps that honest — a name
+    bodies, because the constants worth pinning are not all module-level: a
+    filter tuple or a mode flag a method assigns locally is as much an edit site
+    as a module constant. The uniqueness check is what keeps that honest — a name
     assigned in two places is refused rather than guessed at.
     """
 

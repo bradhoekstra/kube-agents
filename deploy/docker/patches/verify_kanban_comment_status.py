@@ -190,8 +190,9 @@ K.complete_task(
 # What gateway/kanban_watchers_notifier.py does on the tick that carries the
 # terminal event at v2026.9.14: it unsubscribes only when
 # ``self.task.status == "archived"`` — ``done`` is reversible — so a completed
-# card keeps its subscription row. That is the state the front door found on
-# 2026-08-08, and the reason the status has to outrank the row (section 4).
+# card keeps its subscription row. On 2026-08-08 the gateway of the day had
+# also torn the row down; either way the status has to outrank the row, which
+# is what section 4 checks.
 check("the card is done", K.get_task(conn, incident).status == "done")
 check("its subscription survives, as the notifier leaves it", sub_rows(incident) == 1)
 

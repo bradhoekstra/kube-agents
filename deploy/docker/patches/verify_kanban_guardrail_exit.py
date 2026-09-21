@@ -17,7 +17,7 @@ and still be useless:
    clear ``agent._tool_guardrail_halt_decision`` first — ``reset_for_turn``
    clears that once per turn, not per round, so leaving it set sends the next
    round straight back into the branch and out through the same return. The
-   locals it rebinds (``final_response``, ``_turn_exit_reason``, ``messages``)
+   locals it rebinds (``final_response``, ``_turn_exit_reason``) and mutates (``messages``)
    must be fields of ``ToolRoundVerdict``, or the loop never sees them. Also
    asserted: the insert never touches ``_turn_web_search_count``, which would
    hand the model another 50 searches.
@@ -97,12 +97,13 @@ CHAT_MIXIN = HERMES / "hermes_cli" / "cli_chat_turn_mixin.py"
 #: ``ast.unparse`` normalises quoting; derive the spellings rather than guess.
 BREAK_VERDICT = ast.unparse(ast.parse('_verdict("break")', mode="eval").body)
 CONTINUE_VERDICT = ast.unparse(ast.parse('_verdict("continue")', mode="eval").body)
-#: The loop local the nudge path rebinds (``_turn_exit_reason = "unknown"``)
-#: and the one it mutates in place (``append_message(messages, ...)``). Both
-#: reach the loop only through ``_verdict``, which must build the verdict from
-#: those same names; a verdict built from a copy taken earlier would drop the
-#: nudge on the floor with no error.
-REBOUND_LOCALS = ("_turn_exit_reason",)
+#: The loop locals the nudge path rebinds (``final_response = None`` and
+#: ``_turn_exit_reason = "unknown"``) and the one it mutates in place
+#: (``append_message(messages, ...)``). All three reach the loop only through
+#: ``_verdict``, which must build the verdict from those same names; a verdict
+#: built from a copy taken earlier would drop the nudge on the floor with no
+#: error.
+REBOUND_LOCALS = ("final_response", "_turn_exit_reason")
 MUTATED_LOCALS = ("messages",)
 
 

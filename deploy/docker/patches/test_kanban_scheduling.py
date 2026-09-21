@@ -1700,10 +1700,18 @@ class ApplierTest(unittest.TestCase):
             "the repair must land before the event that reports the wait",
         )
         # The event call is generic now; the guard is what keeps the repair off
-        # capability/transient/human blocks.
-        guard = db.rfind('if kind == "dependency":', 0, call)
-        self.assertNotEqual(guard, -1)
-        self.assertNotIn("\n        _", db[guard:call], "no statement between guard and call")
+        # capability/transient/human blocks. Read it off the AST, so a call that
+        # drifted out of the guard's body (dedented, or moved below it) fails
+        # here rather than passing a text search.
+        guards = [
+            node
+            for node in ast.walk(ast.parse(db))
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "kind == 'dependency'"
+            and node.body
+            and "_kanban_repair_inverted_deps" in ast.unparse(node.body[0])
+        ]
+        self.assertEqual(1, len(guards), "the repair call is the first statement of exactly one dependency guard")
 
     def test_host_prefix_comparison_is_gone_from_the_crash_reaper(self):
         dispatch = self._applied()[DISPATCH_RELATIVE]

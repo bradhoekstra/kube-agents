@@ -97,8 +97,9 @@ APPROVAL_CRON_ARM_PATCHED = (
     "            result = _unattended_deny(command, ctx)\n"
 )
 
-# The insert leaves its anchor intact, so the count check alone cannot tell a
-# fresh file from a patched one. This import line exists only after a run.
+# The replacement consumes its anchor, so a second run would already fail on
+# the count; the marker turns that into a named "already patched" refusal.
+# This import line exists only after a run.
 PATCHED_MARKER = "from tools.cron_tirith_scan import cron_tirith_block"
 
 # (relative path, [(anchor, replacement, expected occurrences)])
