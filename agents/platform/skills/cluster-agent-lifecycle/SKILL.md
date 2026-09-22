@@ -80,7 +80,7 @@ both directions:
   cluster kube-agents itself runs on. The scope is the management project alone unless the
   `PlatformAgent` declares `spec.scope`; the only exceptions are clusters named in
   `spec.scope.exclude.clusters` or, for one more release, bare names in `RECONCILE_EXCLUDE`. A
-  project the pod cannot list is recorded with its outcome in `$HERMES_HOME/fleet_scope.json` (written by every run except `--dry-run`) and
+  project the pod cannot list is recorded with its outcome in `fleet_scope.json` at the root of the data volume (`/opt/data`, beside `profiles/`; the reconcile's own `HERMES_HOME`, not a profile's) (written by every run except `--dry-run`) and
   skipped for that run rather than guessed at. The management cluster is included because its own workloads fail like any other cluster's,
   and the agent that triages a Kubernetes event is the one scoped to the cluster that raised it.
 - **Prune** — a profile is deleted when its GKE cluster is definitively gone (a `NotFound` from
