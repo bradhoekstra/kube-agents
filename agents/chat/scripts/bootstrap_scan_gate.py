@@ -366,6 +366,7 @@ def _task_body() -> str:
     multi = _scope_has_other_projects(_data_dir())
     every_cluster = "every cluster the projects in scope have" if multi else "every cluster the project has"
     cannot_list = "a project's clusters" if multi else "the project's clusters"
+    lifecycle_holds = "the scope and its exclusions" if multi else "the `RECONCILE_EXCLUDE` opt-out"
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
@@ -388,7 +389,7 @@ def _task_body() -> str:
         "reference to a step means the same thing in both documents.\n\n"
         "**Step 1 — do not reconcile the roster yourself.** This gate already ran "
         f"`{RECONCILE_SCRIPT_NAME}`, and profile lifecycle belongs to that script alone: it "
-        "holds the scope and its exclusions and the create/prune rules, so a profile you "
+        f"holds {lifecycle_holds} and the create/prune rules, so a profile you "
         "make by calling `cluster_agent_profile.py` directly is one the next reconcile run may "
         "immediately prune, and you will loop. Do not run it, and do not repair or delete a "
         "profile.\n\n"

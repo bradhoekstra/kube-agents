@@ -996,11 +996,43 @@ class ScopeTest(HomesMixin):
             rows = {p["id"]: p["state"] for p in self._snapshot()["projects"]}
             self.assertEqual(rows["p2"], rec.STATE_IN_SCOPE)
             self.assertEqual(self._snapshot()["declared"], declared)
+            self.assertEqual(self._snapshot()["unmanaged"][0]["reason"], "no scope block declared this run; carried forward")
         # A present block with an empty projects list is the declaration that drops p2.
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
         self.assertEqual((deleted, report["retiring"]), ([], ["p2"]))
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
         self.assertEqual(deleted, ["cluster-p2"])
+
+    def test_a_cr_without_a_scope_block_still_has_clean_runs_for_what_an_earlier_block_marked(self):
+        # A project an earlier present block marked retiring, and a management project that changes
+        # identity, are still pruned on a no-block install: the mark came from a real declaration and
+        # the identity change from the metadata server, neither from the absence of the block.
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                          {"id": "gone", "via": [], "state": rec.STATE_RETIRING}],
+             "declared": {"projects": [], "exclude": {"projects": [], "clusters": []}}}), encoding="utf-8")
+        absent = {rec.SCOPE_PRESENT_KEY: False, "projects": [], "exclude": {"projects": [], "clusters": []}}
+        ids = {"cluster-g": _identity("gone", "g"), "cluster-m1": _identity(self.MGMT, "m1")}
+        report, _, deleted = self._run(absent, {self.MGMT: [(self.MGMT, "m1", "us-central1")]},
+                                       profiles=["cluster-g", "cluster-m1"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), (["cluster-g"], []))
+        # The management project changes (metadata names another): retiring on the change tick,
+        # pruned on the next clean run, block or no block.
+        report, _, deleted = self._run(absent, {"new-mgmt": []}, management="new-mgmt",
+                                       profiles=["cluster-m1"], identities={"cluster-m1": _identity(self.MGMT, "m1")})
+        self.assertEqual((deleted, report["retiring"]), ([], [self.MGMT]))
+        report, _, deleted = self._run(absent, {"new-mgmt": []}, management="new-mgmt",
+                                       profiles=["cluster-m1"], identities={"cluster-m1": _identity(self.MGMT, "m1")})
+        self.assertEqual(deleted, ["cluster-m1"])
+
+    def test_an_empty_reconcile_project_reads_as_unset(self):
+        # The operator pins RECONCILE_PROJECT empty; the empty value must not become the project.
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": ""}), \
+             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
+            self.assertEqual(rec._project_source(), ("from-metadata", True))
+        with mock.patch.dict(os.environ, {"RECONCILE_PROJECT": "override"}), \
+             mock.patch.object(rec, "_metadata", return_value="from-metadata"):
+            self.assertEqual(rec._project_source(), ("override", True))
 
     def test_an_unreadable_declaration_with_no_previous_snapshot_excludes_nothing(self):
         os.environ.pop(rec.SCOPE_FILE_ENV, None)

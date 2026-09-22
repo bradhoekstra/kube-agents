@@ -42,9 +42,10 @@ type PlatformAgentSpec struct {
 
 	// Scope declares which GCP projects, beyond the one the agent runs in, the
 	// Cluster Agent reconcile enumerates for GKE clusters, and which projects and
-	// clusters it leaves unmanaged. Absent or empty, the reconcile keeps today's
-	// behaviour: the management project alone. The management project is always in
-	// scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
+	// clusters it leaves unmanaged. Absent, the reconcile lists the management project
+	// alone, keeps the last declaration's exclusions and retires nothing; an empty
+	// projects list in a present block drops the projects an earlier block declared.
+	// The management project is always in scope and cannot be excluded. The design is docs/designs/multi-project-scope.md;
 	// this is its phase 1, explicit projects only.
 	// +optional
 	Scope *ScopeSpec `json:"scope,omitempty"`

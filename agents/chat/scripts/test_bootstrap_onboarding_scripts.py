@@ -604,12 +604,15 @@ class ScopeGapParagraphTest(unittest.TestCase):
             body = bootstrap_scan_gate._task_body()
         self.assertIn("Audit every cluster the project has", body)
         self.assertIn("If you cannot list the project's clusters at all", body)
+        self.assertIn("holds the `RECONCILE_EXCLUDE` opt-out and the create/prune rules", body)
         self.assertNotIn("projects in scope", body)
+        self.assertNotIn("the scope and its exclusions", body)
         data_dir = self._with_snapshot('{"projects": [{"id": "mgmt", "outcome": "ok"}, {"id": "other", "outcome": "ok"}]}')
         with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
             body = bootstrap_scan_gate._task_body()
         self.assertIn("Audit every cluster the projects in scope have", body)
         self.assertIn("If you cannot list a project's clusters at all", body)
+        self.assertIn("holds the scope and its exclusions and the create/prune rules", body)
 
     def test_a_snapshot_whose_projects_is_not_a_list_names_nothing(self):
         for body in ('{"projects": null}', '{"projects": 3}', '{"projects": "x"}', '[1]'):

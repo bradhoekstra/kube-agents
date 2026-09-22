@@ -459,9 +459,7 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 Optional. Which GCP projects, beyond the one the agent runs in, the hourly Cluster Agent reconcile
 enumerates for GKE clusters, and which projects and clusters it leaves unmanaged. Not yet surfaced
 in the Helm chart, which owns the CR on a chart install: until the chart gains the values, the field
-is set by editing the `PlatformAgent` directly. Absent or empty,
-the reconcile keeps its single-project behaviour: every cluster in the management project gets a
-Cluster Agent profile. The management project is always in scope and cannot be excluded.
+is set by editing the `PlatformAgent` directly. Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
 
 ```yaml
 spec:

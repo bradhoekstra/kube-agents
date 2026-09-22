@@ -269,26 +269,28 @@ def _empty_scope() -> dict:
     return {"projects": [], "exclude": {"projects": [], "clusters": []}}
 
 
-def _load_scope() -> tuple[dict, bool]:
-    """The declaration the operator rendered, and whether one is in force.
+def _load_scope() -> tuple[dict, bool, bool]:
+    """The declaration the operator rendered: (scope, readable, present).
 
     The operator renders the file on every install, so a missing, empty,
     unparseable or non-object file means the render did not reach this pod (a
-    rollback to an operator without the field), and a file whose `present` is not
-    true means the CR carries no scope block. Neither is a declaration: in both
-    cases the caller still creates for the management project, under the last
-    declaration's exclusions, but must not run the scope prune, because a
-    declaration that is not there must not become a declaration that deletes. A
-    block can go missing without anyone dropping a project, through a write that
-    passed an older operator's webhook; the operator who wants the projects gone
-    empties `projects` and keeps the block.
+    rollback to an operator without the field): not readable, and the caller must
+    not run the scope prune, because a declaration that cannot be read must not
+    become a declaration that deletes. A file that reads but whose `present` is
+    not true means the CR carries no scope block: readable, so a run can still be
+    clean, but not a declaration, so a project an earlier block declared is
+    carried forward rather than retired. A block can go missing without anyone
+    dropping a project, through a write that passed an older operator's webhook;
+    the operator who wants the projects gone empties `projects` and keeps the
+    block. In both cases the caller creates for the management project alone,
+    under the last declaration's exclusions.
     """
     path = os.environ.get(SCOPE_FILE_ENV)
     if not path:
         # An agent image ahead of its operator: no variable, no render. CREATE under the last
         # declaration's exclusions, and no scope prune, because nothing declared anything.
         log(f"{SCOPE_FILE_ENV} is not set; using the management project alone and skipping the scope prune.")
-        return _empty_scope(), False
+        return _empty_scope(), False, False
     try:
         raw = Path(path).read_text(encoding="utf-8").strip()
         if not raw:
@@ -299,12 +301,11 @@ def _load_scope() -> tuple[dict, bool]:
     except Exception as e:  # noqa: BLE001 - unreadable declaration: fall back, loudly, and prune nothing by scope
         log(f"could not read the scope declaration at {path} ({e}); using the management project "
             "alone and skipping the scope prune this run.")
-        return _empty_scope(), False
+        return _empty_scope(), False, False
     if parsed.get(SCOPE_PRESENT_KEY) is not True:
-        log("the PlatformAgent carries no scope block; using the management project alone and "
-            "retiring nothing (an empty `projects` list in a present block is what drops projects).")
-        return _empty_scope(), False
-    return _normalize_scope(parsed), True
+        # No block on the CR (or a render that predates the marker): nothing declared.
+        return _empty_scope(), True, False
+    return _normalize_scope(parsed), True, True
 
 
 def _normalize_scope(parsed: dict) -> dict:
@@ -613,7 +614,7 @@ def reconcile(dry_run: bool = False) -> dict:
 
     # --- RESOLVE: the management project plus whatever spec.scope declares (design §3).
     management, management_authoritative = _project_source()
-    scope, scope_readable = _load_scope()
+    scope, scope_readable, scope_present = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
     # projects do not carry: nothing is listed or created outside the management project
@@ -622,15 +623,16 @@ def reconcile(dry_run: bool = False) -> dict:
     # such tick reads the same exclusions, and a project it named stays carried in scope
     # rather than retiring: removing the whole block retires nothing.
     declared = scope
-    if not scope_readable:
+    if not scope_present:
         last = _previous_declaration(previous)
         if last:
             scope["exclude"] = last["exclude"]
             declared = last
             carried = len(last["exclude"]["projects"]) + len(last["exclude"]["clusters"])
-            log(f"declaration not readable this run; keeping the {carried} exclusion(s) of the last one read."
-                if carried else "declaration not readable this run; the last one read had no exclusions.")
-    scope_declared = bool(scope["projects"] or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+            state = "not readable" if not scope_readable else "absent from the PlatformAgent"
+            if carried or last["projects"]:
+                log(f"scope declaration {state} this run; keeping the {carried} exclusion(s) of the last one "
+                    f"read and carrying its {len(last['projects'])} project(s) without retiring them.")
     excluded_triples = {
         (c["projectId"], c["clusterName"], c["location"]) for c in scope["exclude"]["clusters"]
     }
@@ -817,7 +819,7 @@ def reconcile(dry_run: bool = False) -> dict:
                 # rather than the old project vanishing from the snapshot as never in scope.
                 deferred_retiring.add(project)
                 reason = "was the management project until this run; retiring, pruned on the next clean run"
-            elif lookups_clean and project in previously_resolved:
+            elif lookups_clean and scope_present and project in previously_resolved:
                 # First clean run the declaration omits it: retiring now, pruned next run.
                 deferred_retiring.add(project)
                 reason = "left the scope this run; retiring, pruned on the next clean run"
@@ -827,11 +829,13 @@ def reconcile(dry_run: bool = False) -> dict:
                 deferred_retiring.add(project)
                 reason = "retiring; waiting for a clean run"
             elif project in previously_resolved:
-                # Absent on a run that could not trust its lookups or read the declaration:
-                # not judged, carried forward in scope so the first clean run is the one
-                # that marks it retiring (design §7). Nothing is forgotten, nothing counted.
+                # Absent on a run that could not trust its lookups, could not read the
+                # declaration, or found no scope block on the CR: not judged, carried forward
+                # in scope so the first clean run under a present block is the one that marks
+                # it retiring (design §7). Nothing is forgotten, nothing counted.
                 carried_in_scope.add(project)
-                reason = "not judged this run: a lookup or the declaration could not be trusted; carried forward"
+                reason = ("no scope block declared this run; carried forward" if lookups_clean and not scope_present
+                          else "not judged this run: a lookup or the declaration could not be trusted; carried forward")
             else:
                 reason = "never in scope"
             # Listed as unmanaged below, once its own cluster is known to exist or the lookup
@@ -870,7 +874,7 @@ def reconcile(dry_run: bool = False) -> dict:
         if pid in deferred_retiring or pid in carried_in_scope:
             continue
         old_management = management_changed and management_listed and pid == previous_management
-        (deferred_retiring if lookups_clean or old_management else carried_in_scope).add(pid)
+        (deferred_retiring if (lookups_clean and scope_present) or old_management else carried_in_scope).add(pid)
 
     # A retiring project stays in the snapshot, eligible for the prune, until every one of
     # its profiles is gone; otherwise a delete that failed on the one tick the third
