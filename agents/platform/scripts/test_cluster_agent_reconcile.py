@@ -713,12 +713,15 @@ class ScopeTest(HomesMixin):
 
     def _run(self, scope, listings, profiles=None, identities=None, exists=True,
              management=MGMT, extra_exclude=frozenset(), delete_removes=True, dry_run=False,
-             authoritative=True):
+             authoritative=True, searches=None, create_raises=None):
         """listings: project -> (clusters list | None, outcome) or a list (ok); or a callable
         used as the lister itself.
 
         delete_removes: whether the stubbed delete also removes the profile home,
         as the real one does; False models a delete that failed.
+        searches: container -> (members dict | None, outcome) for the Asset Inventory stub,
+        or a callable used as the searcher itself. create_raises: an exception every create
+        raises, modelling get-credentials failing.
         """
         self._write_scope(scope)
         profiles = profiles or []
@@ -731,6 +734,12 @@ class ScopeTest(HomesMixin):
             if delete_removes:
                 shutil.rmtree(self.homes / name, ignore_errors=True)
 
+        def create(pr, c, l):
+            if create_raises is not None:
+                raise create_raises
+            created.append((pr, c, l))
+            return f"cluster-{c}"
+
         def list_project(project, timeout=None):
             value = listings.get(project, ([], rec.OUTCOME_OK))
             return value if isinstance(value, tuple) else (value, rec.OUTCOME_OK)
@@ -738,14 +747,16 @@ class ScopeTest(HomesMixin):
         with mock.patch.object(rec, "_project_source", return_value=(management, authoritative)), \
              mock.patch.object(rec, "EXTRA_EXCLUDE", set(extra_exclude)), \
              mock.patch.object(rec, "_list_project", side_effect=listings if callable(listings) else list_project), \
+             mock.patch.object(rec, "_search_container",
+                               side_effect=searches if callable(searches) else
+                               (lambda c, timeout=None: (searches or {}).get(c, (None, rec.OUTCOME_UNREACHABLE)))), \
              mock.patch.object(rec, "list_profiles", return_value=list(profiles)), \
              mock.patch.object(rec, "profile_home", side_effect=_home_factory(self.homes)), \
              mock.patch.object(rec, "read_cluster_identity",
                                side_effect=lambda home: identities.get(home.name)), \
-             mock.patch.object(rec, "_cluster_exists", return_value=exists), \
+             mock.patch.object(rec, "_cluster_exists", **({"side_effect": exists} if callable(exists) else {"return_value": exists})), \
              mock.patch.object(rec, "delete_profile", side_effect=delete), \
-             mock.patch.object(rec, "create_profile",
-                               side_effect=lambda pr, c, l: created.append((pr, c, l)) or f"cluster-{c}"):
+             mock.patch.object(rec, "create_profile", side_effect=create):
             report = rec.reconcile(dry_run=dry_run)
         return report, created, deleted
 
@@ -963,7 +974,7 @@ class ScopeTest(HomesMixin):
             report, created, deleted = self._run(None, {self.MGMT: [(self.MGMT, "kept-out", "us-central1"), (self.MGMT, "m1", "us-central1")]})
             self.assertEqual(created, [(self.MGMT, "m1", "us-central1")])
             self.assertEqual(deleted, [])
-            self.assertEqual(self._snapshot()["declared"], declared)
+            self.assertEqual(self._snapshot()["declared"], rec._normalize_scope(declared))
             self.assertEqual([p["id"] for p in self._snapshot()["projects"]], [self.MGMT])
 
     def test_a_declaration_with_scalar_fields_is_read_as_absent_fields(self):
@@ -998,7 +1009,7 @@ class ScopeTest(HomesMixin):
             self.assertEqual((created, deleted, report["retiring"]), ([], [], []))
             rows = {p["id"]: p["state"] for p in self._snapshot()["projects"]}
             self.assertEqual(rows["p2"], rec.STATE_IN_SCOPE)
-            self.assertEqual(self._snapshot()["declared"], declared)
+            self.assertEqual(self._snapshot()["declared"], rec._normalize_scope(declared))
             self.assertEqual(self._snapshot()["unmanaged"][0]["reason"], "no scope block declared this run; carried forward")
         # A present block with an empty projects list is the declaration that drops p2.
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
@@ -1117,6 +1128,217 @@ class ScopeTest(HomesMixin):
         self.assertLessEqual(cuts["slow"], 1.0)
         time.sleep(1.2)
         self.assertEqual(threading.active_count(), baseline)
+
+    # ---- phase 2: folders and organisations through Cloud Asset Inventory ----
+
+    FOLDER = "folders/123456789012"
+
+    def _asset(self, project, cluster, location, zonal=False):
+        kind = "zones" if zonal else "locations"
+        return {"name": f"//container.googleapis.com/projects/{project}/{kind}/{location}/clusters/{cluster}",
+                "location": location, "project": "projects/757207957170"}
+
+    def test_asset_names_parse_in_both_shapes_and_key_on_the_project_id(self):
+        regional = self._asset("team-a", "prod", "us-central1")
+        zonal = self._asset("team-a", "dev", "us-central1-a", zonal=True)
+        self.assertEqual(rec._parse_asset(regional), ("team-a", "prod", "us-central1"))
+        self.assertEqual(rec._parse_asset(zonal), ("team-a", "dev", "us-central1-a"))
+        self.assertIsNone(rec._parse_asset({"name": "//compute.googleapis.com/projects/x/zones/z/instances/i"}))
+        self.assertIsNone(rec._parse_asset("not a dict"))
+
+    def test_a_folder_resolves_its_members_with_their_clusters_and_via(self):
+        members = {"team-a": [("team-a", "prod", "us-central1")], "team-b": [("team-b", "dev", "us-central1-a")]}
+        report, created, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(sorted(created), [("team-a", "prod", "us-central1"), ("team-b", "dev", "us-central1-a")])
+        snap = self._snapshot()
+        self.assertEqual(snap["resolver"], rec.RESOLVER_ASSET_INVENTORY)
+        self.assertEqual(snap["containers"], [{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 2}])
+        rows = {p["id"]: p for p in snap["projects"]}
+        self.assertEqual((rows["team-a"]["via"], rows["team-a"]["outcome"], rows["team-a"]["clusters"]), ([self.FOLDER], rec.OUTCOME_OK, 1))
+        self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK, "team-a": rec.OUTCOME_OK, "team-b": rec.OUTCOME_OK})
+
+    def test_a_member_that_is_also_explicit_or_the_management_project_keeps_both_vias(self):
+        members = {self.MGMT: [(self.MGMT, "m1", "us-central1")], "team-a": [("team-a", "prod", "us-central1")]}
+        report, created, _ = self._run({"projects": ["team-a"], "folders": ["123456789012"]},
+                                       {self.MGMT: [(self.MGMT, "m1", "us-central1")], "team-a": [("team-a", "prod", "us-central1")]},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        rows = {p["id"]: p["via"] for p in self._snapshot()["projects"]}
+        self.assertEqual(rows[self.MGMT], [self.FOLDER, rec.VIA_MANAGEMENT])
+        self.assertEqual(rows["team-a"], [rec.VIA_EXPLICIT, self.FOLDER])
+        self.assertEqual(sorted(created), [(self.MGMT, "m1", "us-central1"), ("team-a", "prod", "us-central1")])
+
+    def test_an_excluded_member_is_dropped_after_the_folder_resolved(self):
+        members = {"team-scratch": [("team-scratch", "x", "us-central1")], "team-a": [("team-a", "prod", "us-central1")]}
+        report, created, _ = self._run({"folders": ["123456789012"], "exclude": {"projects": ["*-scratch"]}}, {self.MGMT: []},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(created, [("team-a", "prod", "us-central1")])
+        self.assertNotIn("team-scratch", {p["id"] for p in self._snapshot()["projects"]})
+
+    def test_a_folder_that_cannot_be_read_freezes_its_previous_members_and_the_prune(self):
+        # Last run: the folder resolved team-a; an explicit project p2 was in scope too.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE},
+                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("team-a", "prod"), "cluster-p2": _identity("p2", "x")}
+        # This run: the folder is denied and p2 was dropped from the declaration.
+        report, created, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                             profiles=["cluster-a", "cluster-p2"], identities=ids,
+                                             searches={self.FOLDER: (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((created, deleted, report["retiring"]), ([], [], []))
+        snap = self._snapshot()
+        self.assertEqual(snap["containers"], [{"id": self.FOLDER, "outcome": rec.OUTCOME_DENIED, "projects": 1}])
+        rows = {p["id"]: p for p in snap["projects"]}
+        self.assertEqual((rows["team-a"]["outcome"], rows["team-a"]["state"], rows["team-a"]["via"]), (rec.OUTCOME_DENIED, rec.STATE_IN_SCOPE, [self.FOLDER]))
+        # p2 is carried, not retired: the frozen container holds back the prune.
+        self.assertEqual(rows["p2"]["state"], rec.STATE_IN_SCOPE)
+        self.assertIn("cluster-p2", report["unmanaged"])
+
+    def test_an_over_cap_folder_carries_its_members_without_holding_back_the_prune(self):
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE},
+                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("team-a", "prod"), "cluster-p2": _identity("p2", "x")}
+        big = {f"proj-{i:03d}": [(f"proj-{i:03d}", "c", "us-central1")] for i in range(rec.RESOLVED_SET_CAP)}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            report, created, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                                 profiles=["cluster-a", "cluster-p2"], identities=ids,
+                                                 searches={self.FOLDER: (big, rec.OUTCOME_OK)})
+        self.assertEqual(created, [])
+        snap = self._snapshot()
+        self.assertEqual(snap["containers"][0], {"id": self.FOLDER, "outcome": rec.OUTCOME_OVER_CAP, "projects": len(big)})
+        rows = {p["id"]: p for p in snap["projects"]}
+        # The members the run resolved are carried reading over-cap, with no CREATE.
+        self.assertEqual({rows[p]["outcome"] for p in big}, {rec.OUTCOME_OVER_CAP})
+        self.assertEqual(rows["proj-000"]["via"], [self.FOLDER])
+        # over-cap is a decided outcome: the dropped explicit project and the project that
+        # left the folder both start retiring.
+        self.assertEqual(report["retiring"], ["p2", "team-a"])
+
+    def test_a_project_that_moved_into_an_over_cap_folder_is_kept_not_retired(self):
+        # x was reached through F1; it moves to F2, whose membership crosses the cap. The run
+        # knows x is under F2, so x is carried over-cap rather than judged absent.
+        f1, f2 = "folders/111111111111", "folders/222222222222"
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "x", "via": [f1], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-x": _identity("x", "c")}
+        big = {f"q-{i}": [(f"q-{i}", "c", "us-central1")] for i in range(4)} | {"x": [("x", "c", "us-central1")]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            for _ in range(2):
+                report, _, deleted = self._run({"folders": [f1[8:], f2[8:]]}, {self.MGMT: []}, profiles=["cluster-x"], identities=ids,
+                                               searches={f1: ({}, rec.OUTCOME_OK), f2: (big, rec.OUTCOME_OK)})
+                self.assertEqual((deleted, report["retiring"]), ([], []))
+                rows = {p["id"]: p for p in self._snapshot()["projects"]}
+                self.assertEqual((rows["x"]["outcome"], rows["x"]["via"]), (rec.OUTCOME_OVER_CAP, [f2]))
+
+    def test_a_project_under_two_containers_takes_the_live_listing_whichever_sorted_first(self):
+        # F1 (sorts first) is denied and carries x frozen; F2 lists x live: the listing wins.
+        f1, f2 = "folders/111111111111", "folders/222222222222"
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "x", "via": [f1, f2], "state": rec.STATE_IN_SCOPE}])
+        report, created, _ = self._run({"folders": [f1[8:], f2[8:]]}, {self.MGMT: []},
+                                       searches={f1: (None, rec.OUTCOME_DENIED), f2: ({"x": [("x", "c", "us-central1")]}, rec.OUTCOME_OK)})
+        self.assertEqual(created, [("x", "c", "us-central1")])
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["x"]["outcome"], rows["x"]["via"], rows["x"]["clusters"]), (rec.OUTCOME_OK, [f1, f2], 1))
+        # The denied container still holds the prune.
+        self.assertEqual(report["retiring"], [])
+
+    def test_a_first_run_with_a_frozen_or_over_cap_container_contributes_what_it_knows(self):
+        big = {f"q-{i}": [(f"q-{i}", "c", "us-central1")] for i in range(5)}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            report, created, _ = self._run({"folders": ["111111111111", "222222222222"]}, {self.MGMT: []},
+                                           searches={"folders/111111111111": (None, rec.OUTCOME_UNREACHABLE), "folders/222222222222": (big, rec.OUTCOME_OK)})
+        self.assertEqual(created, [])
+        containers = {c["id"]: c for c in self._snapshot()["containers"]}
+        self.assertEqual(containers["folders/111111111111"], {"id": "folders/111111111111", "outcome": rec.OUTCOME_UNREACHABLE, "projects": 0})
+        self.assertEqual(containers["folders/222222222222"]["projects"], 5)
+        self.assertEqual(len([p for p in self._snapshot()["projects"] if p["outcome"] == rec.OUTCOME_OVER_CAP]), 5)
+
+    def test_a_403_on_create_marks_a_member_denied_and_never_an_explicit_project(self):
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        report, _, _ = self._run({"projects": ["p2"], "folders": ["123456789012"]},
+                                 {self.MGMT: [], "p2": [("p2", "x", "us-central1")]},
+                                 searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                 create_raises=SystemExit("ERROR: code=403 PERMISSION_DENIED"))
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
+        # The explicit project's own listing decides its outcome; a per-cluster 403 there is not a revision.
+        self.assertEqual(report["projects"]["p2"], rec.OUTCOME_OK)
+        self.assertEqual(sorted(report["create_failed"]), ["prod/us-central1", "x/us-central1"])
+
+    def test_container_searches_share_the_listing_budget_and_the_management_listing_comes_first(self):
+        import time
+        calls: dict[str, float] = {}
+        order: list[str] = []
+
+        def search(container, timeout=None):
+            order.append(container)
+            calls[container] = timeout
+            time.sleep(min(1.5, timeout if timeout is not None else 1.5))
+            return None, rec.OUTCOME_UNREACHABLE
+
+        def lister(project, timeout=None):
+            order.append(project)
+            calls[project] = timeout
+            return [], rec.OUTCOME_OK
+        start = time.monotonic()
+        with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
+            report, _, _ = self._run({"projects": ["p2"], "folders": ["111111111111"]}, lister, searches=search)
+        self.assertLess(time.monotonic() - start, 1.5)
+        # Management first, with its full timeout; the container and the explicit project are
+        # cut to the budget left, which is the floor once the container has spent it.
+        self.assertEqual(order[0], self.MGMT)
+        self.assertIsNone(calls[self.MGMT])
+        self.assertLessEqual(calls["folders/111111111111"], 1.0)
+        self.assertLessEqual(calls["p2"], 1.0)
+        self.assertTrue(report["create_pass_ran"])
+        self.assertEqual(self._snapshot()["containers"][0]["outcome"], rec.OUTCOME_UNREACHABLE)
+
+    def test_a_project_that_left_the_folder_retires_over_two_clean_runs(self):
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual(deleted, ["cluster-a"])
+
+    def test_a_member_whose_describe_answers_403_reads_denied(self):
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        ids = {"cluster-a": _identity("team-a", "prod")}
+
+        def describe(project, cluster, location):
+            rec._denied_this_run.add(project)
+            return None
+        report, _, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                 searches={self.FOLDER: (members, rec.OUTCOME_OK)}, exists=describe)
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
+        self.assertEqual({p["id"]: p["outcome"] for p in self._snapshot()["projects"]}["team-a"], rec.OUTCOME_DENIED)
+
+    def test_describe_classifies_a_403_as_denied_for_the_project(self):
+        err = subprocess.CalledProcessError(1, ["gcloud"], stderr='ERROR: (gcloud.container.clusters.describe) ResponseError: code=403, message=Required "container.clusters.get" permission')
+        with mock.patch.object(rec.sandbox_exec, "run", side_effect=err):
+            rec._denied_this_run.clear()
+            self.assertIsNone(rec._cluster_exists("team-a", "prod", "us-central1"))
+            self.assertEqual(rec._denied_this_run, {"team-a"})
+
+    def test_search_container_parses_results_and_classifies_failures(self):
+        out = json.dumps([self._asset("team-a", "prod", "us-central1"), self._asset("team-a", "dev", "us-central1-a", zonal=True),
+                          {"name": "//compute.googleapis.com/projects/x/zones/z/instances/i"}])
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout=out)) as run:
+            members, outcome = rec._search_container(self.FOLDER)
+        self.assertEqual(outcome, rec.OUTCOME_OK)
+        self.assertEqual(members, {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1-a")]})
+        self.assertIn(f"--scope={self.FOLDER}", run.call_args[0][0])
+        self.assertIn(f"--asset-types={rec.ASSET_TYPE_CLUSTER}", run.call_args[0][0])
+        for stderr, want in (("PERMISSION_DENIED", rec.OUTCOME_DENIED),
+                             ("Cloud Asset API has not been used in project 1 before or it is disabled", rec.OUTCOME_API_DISABLED),
+                             ("connection reset", rec.OUTCOME_UNREACHABLE)):
+            err = subprocess.CalledProcessError(1, ["gcloud"], stderr=stderr)
+            with mock.patch.object(rec.sandbox_exec, "run", side_effect=err):
+                self.assertEqual(rec._search_container(self.FOLDER), (None, want), stderr)
 
     def test_an_unrelated_profile_of_unknown_identity_does_not_keep_a_project_retiring(self):
         # gone's last profile goes this tick; a hand-made directory with no identity, never

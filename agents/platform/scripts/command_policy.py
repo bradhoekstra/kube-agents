@@ -427,6 +427,12 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # below, so the manifest comes back on stdout.
         ("container", "ai", "profiles", "manifests", "create"),
         ("container", "ai", "profiles", "models", "list"),
+        # Cloud Asset Inventory search: how the Cluster Agent reconcile resolves a
+        # folder or organisation in spec.scope to the GKE clusters beneath it, one
+        # call per container (docs/designs/multi-project-scope.md §4). A pure read
+        # of the asset index; `asset export`, `feeds` and `saved-queries` writes
+        # stay refused, and the tests hold that door.
+        ("asset", "search-all-resources"),
         ("container", "clusters", "describe"),
         ("container", "clusters", "list"),
         # Writes a kubeconfig in the sidecar and nothing in the cloud. It is
@@ -464,6 +470,10 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--billing-project", "--sort-by", "--limit", "--trace-token",
         "--flatten", "--access-token-file", "-z", "--page-size", "--freshness",
         "--cluster", "--model",
+        # `asset search-all-resources` selectors: the reconcile passes both, and
+        # a verb whose flags are not listed is admitted and unreachable at once
+        # (see the `logging read` note below).
+        "--scope", "--asset-types",
         # `logging read` selectors. The command was allowlisted without them,
         # which refused every spelling the repo actually ships: both
         # log-autoscaler-events.sh scripts pass `--order=asc`, and the two

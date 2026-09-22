@@ -7,9 +7,9 @@
 # Policy: **every cluster in every project in scope gets a Cluster Agent profile**, including
 # the management cluster where kube-agents itself runs. The scope is the management project
 # alone unless the PlatformAgent declares `spec.scope` (docs/designs/multi-project-scope.md),
-# which the operator renders to the file KUBEAGENTS_SCOPE_FILE names: explicit projects to
-# add, project IDs or globs to drop, and single clusters (by project, location and name) to
-# leave unmanaged. RECONCILE_EXCLUDE, a bare-name list matched across every project, keeps
+# which the operator renders to the file KUBEAGENTS_SCOPE_FILE names: explicit projects,
+# folders and organisations (resolved through Cloud Asset Inventory) to add, project IDs or
+# globs to drop, and single clusters (by project, location and name) to leave unmanaged. RECONCILE_EXCLUDE, a bare-name list matched across every project, keeps
 # working for one release alongside `exclude.clusters`. Per run this deterministic engine:
 #   • CREATE — scaffolds a profile for every cluster in scope that doesn't have one yet;
 #   • PRUNE  — deletes a profile whose cluster is *definitively* gone (a NotFound/404 from
@@ -51,6 +51,7 @@ import fcntl
 import fnmatch
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -89,8 +90,21 @@ SCOPE_PRESENT_KEY = "present"
 # so a profile the scope never produced is never deleted by it.
 SNAPSHOT_FILE = "fleet_scope.json"
 RESOLVER_EXPLICIT = "explicit"
-# The listing phase is bounded: the management project lists first, the rest LIST_WORKERS at a
-# time, and a listing still running when LIST_BUDGET_SECONDS is spent reads unreachable. The
+# Set when a folder or organisation is declared: containers resolve through Cloud Asset
+# Inventory, one call per container (design §4).
+RESOLVER_ASSET_INVENTORY = "asset-inventory"
+CONTAINER_KINDS = ("folders", "organizations")
+ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
+# Regional clusters render as .../locations/<L>/clusters/<C>, zonal ones as
+# .../zones/<Z>/clusters/<C>; a parser written to one shape drops the other (design §4).
+_ASSET_NAME = re.compile(r"^//container\.googleapis\.com/projects/(?P<project>[^/]+)/(?:locations|zones)/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)$")
+# Projects whose per-cluster describe or get-credentials answered 403 this run: a container
+# member's outcome starts as `ok` because Asset Inventory listed its clusters without a
+# per-project call, and these two calls are what revise it to `denied` (design §4).
+_denied_this_run: set[str] = set()
+# The listing phase is bounded: the management project lists first and alone, then the
+# containers resolve LIST_WORKERS at a time, then the explicit projects LIST_WORKERS at a
+# time, and a lookup still running when LIST_BUDGET_SECONDS is spent reads unreachable. The
 # bootstrap gate runs this script under its own ceiling (RECONCILE_TIMEOUT_SECONDS there, 240s)
 # and kills it on expiry with nothing written; two hanging projects listed in turn at
 # LIST_TIMEOUT_SECONDS each would already overrun it. Creates still run in the fixed order.
@@ -188,12 +202,41 @@ def _classify_list_failure(stderr: str) -> str:
     return OUTCOME_UNREACHABLE
 
 
-def _list_projects(projects: list[str], first: str | None) -> dict[str, tuple[list | None, str]]:
+def _search_containers(containers: list[str], deadline: float) -> dict[str, tuple[dict | None, str]]:
+    """Resolve every container concurrently within the run's listing budget.
+
+    A search still pending at the deadline reads `unreachable`, which freezes the
+    container (design §4); the worker's own timeout is cut to the budget left so no
+    thread outlives the run.
+    """
+    if not containers:
+        return {}
+
+    def within_budget(container: str) -> tuple[dict | None, str]:
+        return _search_container(container, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
+
+    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(containers)))
+    futures = {container: pool.submit(within_budget, container) for container in containers}
+    done, _ = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
+    results: dict[str, tuple[dict | None, str]] = {}
+    for container, future in futures.items():
+        if future in done:
+            results[container] = future.result()
+        else:
+            log(f"resolving {container} did not finish within the run's {LIST_BUDGET_SECONDS}s listing "
+                f"budget ({OUTCOME_UNREACHABLE}; its previous members are carried forward).")
+            results[container] = (None, OUTCOME_UNREACHABLE)
+    pool.shutdown(wait=False, cancel_futures=True)
+    return results
+
+
+def _list_projects(projects: list[str], first: str | None, deadline: float | None = None) -> dict[str, tuple[list | None, str]]:
     """List every project, `first` alone and then the rest concurrently, within one budget.
 
-    The management project goes first and on its own: its listing decides
-    `create_pass_ran`, and when it reaches the sandbox its ssh opens the multiplexed
-    connection the pool then shares. The rest run LIST_WORKERS at a time. Every
+    The management project goes first and on its own (the caller passes it alone, at
+    the start of the budget): its listing decides `create_pass_ran`, and when it reaches
+    the sandbox its ssh opens the multiplexed connection the pools then share. The rest
+    run LIST_WORKERS at a time. Every
     worker's own gcloud timeout is cut to the budget left when it starts, so no
     worker outlives the deadline by more than LIST_GRACE_SECONDS: the interpreter
     joins the pool's threads at exit, and a worker still blocked on gcloud would
@@ -201,7 +244,8 @@ def _list_projects(projects: list[str], first: str | None) -> dict[str, tuple[li
     at the deadline reads `unreachable` (no CREATE, scope prune off), and the run
     goes on to write its snapshot.
     """
-    deadline = time.monotonic() + LIST_BUDGET_SECONDS
+    if deadline is None:
+        deadline = time.monotonic() + LIST_BUDGET_SECONDS
     listings: dict[str, tuple[list | None, str]] = {}
     rest = list(projects)
     if first in rest:
@@ -266,7 +310,7 @@ def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 
 def _empty_scope() -> dict:
-    return {"projects": [], "exclude": {"projects": [], "clusters": []}}
+    return {"projects": [], "folders": [], "organizations": [], "exclude": {"projects": [], "clusters": []}}
 
 
 def _load_scope() -> tuple[dict, bool, bool]:
@@ -317,6 +361,8 @@ def _normalize_scope(parsed: dict) -> dict:
 
     scope = _empty_scope()
     scope["projects"] = strings(parsed.get("projects"))
+    for kind in CONTAINER_KINDS:
+        scope[kind] = [c for c in strings(parsed.get(kind)) if c.isdigit()]
     exclude = parsed.get("exclude") if isinstance(parsed.get("exclude"), dict) else {}
     scope["exclude"]["projects"] = strings(exclude.get("projects"))
     clusters = exclude.get("clusters")
@@ -347,14 +393,83 @@ def _excluded_by(project: str, patterns: list[str]) -> str | None:
     return None
 
 
-def _resolve_projects(management: str | None, scope: dict) -> tuple[list[dict], list[dict]]:
+def _container_ids(scope: dict) -> list[str]:
+    """The declared containers as `folders/<id>` and `organizations/<id>`, sorted by ID."""
+    return sorted(f"{kind}/{cid}" for kind in CONTAINER_KINDS for cid in set(scope.get(kind) or []))
+
+
+def _parse_asset(asset: dict) -> tuple[str, str, str] | None:
+    """(project, cluster, location) from one search-all-resources result, or None.
+
+    The project ID is the segment after `projects/` in the asset name: the `project`
+    field carries the project number, which nothing downstream keys on. The location is
+    the asset's `location` field when present, else the path segment (design §4).
+    """
+    if not isinstance(asset, dict):
+        return None
+    m = _ASSET_NAME.match(str(asset.get("name") or ""))
+    if not m:
+        return None
+    location = asset.get("location") if isinstance(asset.get("location"), str) and asset.get("location") else m.group("location")
+    return m.group("project"), m.group("cluster"), location
+
+
+def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[dict[str, list[tuple[str, str, str]]] | None, str]:
+    """Every GKE cluster under a folder or organisation, grouped by project ID, and the outcome.
+
+    One Cloud Asset Inventory call per container, through the broker (design §4). (None,
+    outcome) means the container could not be read; its previous members are then carried
+    forward under that outcome by the caller, and the scope prune stays off for the run.
+    """
+    cmd = ["gcloud", "asset", "search-all-resources", f"--scope={container}",
+           f"--asset-types={ASSET_TYPE_CLUSTER}", "--format=json"]
+    try:
+        result = sandbox_exec.run(cmd, check=True, timeout=timeout)
+        assets = json.loads(result.stdout or "[]")
+        if not isinstance(assets, list):
+            raise ValueError("asset search did not return a list")
+    except subprocess.CalledProcessError as e:
+        outcome = _classify_list_failure(e.stderr or "")
+        log(f"resolving {container} through Cloud Asset Inventory failed ({outcome}; its previous "
+            f"members are carried forward, no CREATE under them): {(e.stderr or '').strip()}")
+        return None, outcome
+    except subprocess.TimeoutExpired:
+        log(f"resolving {container} timed out ({OUTCOME_UNREACHABLE}); its previous members are carried forward.")
+        return None, OUTCOME_UNREACHABLE
+    except Exception as e:  # noqa: BLE001 - a failed lookup is never a resolved-empty container
+        log(f"resolving {container} errored ({OUTCOME_UNREACHABLE}; its previous members are carried forward): {e}")
+        return None, OUTCOME_UNREACHABLE
+    members: dict[str, list[tuple[str, str, str]]] = {}
+    for asset in assets:
+        triple = _parse_asset(asset)
+        if triple:
+            members.setdefault(triple[0], []).append(triple)
+    return members, OUTCOME_OK
+
+
+def _previous_container_members(previous: dict | None, container: str) -> list[str]:
+    """Project IDs the last snapshot reached through this container, for the freeze rule."""
+    if not previous:
+        return []
+    return sorted({
+        p["id"] for p in previous.get("projects", [])
+        if isinstance(p, dict) and p.get("id") and container in (p.get("via") or [])
+    })
+
+
+def _resolve_projects(management: str | None, scope: dict,
+                      searches: dict[str, tuple[dict | None, str]] | None = None,
+                      previous: dict | None = None) -> tuple[list[dict], list[dict], list[dict]]:
     """Turn the declaration into the ordered resolved set (design §3).
 
-    Returns (entries, ignored_excludes). Each entry is {id, via, outcome}, where
-    outcome is None for a project still to be listed and `over-cap` for one past
-    RESOLVED_SET_CAP. The order is fixed so the cap binds the same way every run:
-    the management project, then explicit projects sorted by ID. A glob that
-    matches the management project is recorded and not applied.
+    Returns (entries, ignored_excludes, containers). Each entry is {id, via, outcome},
+    where outcome is None for a project still to be listed, `ok` for a container member
+    whose clusters Asset Inventory already named (kept under `clusters`), a container's
+    own outcome for a member carried forward under the freeze rule, and `over-cap` for a
+    project past RESOLVED_SET_CAP. The order is fixed so the cap binds the same way every
+    run: the management project, then explicit projects sorted by ID, then containers
+    sorted by ID (design §3). A glob that matches the management project is recorded and
+    not applied. `searches` holds each container's Asset Inventory result.
     """
     patterns = scope["exclude"]["projects"]
     entries: list[dict] = []
@@ -382,7 +497,68 @@ def _resolve_projects(management: str | None, scope: dict) -> tuple[list[dict], 
         if outcome:
             log(f"{project} is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
         entries.append({"id": project, "via": [VIA_EXPLICIT], "outcome": outcome})
-    return entries, ignored
+
+    def add_via(project: str, container: str) -> None:
+        for entry in entries:
+            if entry["id"] == project and container not in entry["via"]:
+                entry["via"] = sorted(entry["via"] + [container])
+
+    def frozen_entry(project: str) -> dict | None:
+        for entry in entries:
+            if entry["id"] == project and entry.get("frozen"):
+                return entry
+        return None
+
+    containers: list[dict] = []
+    for container in _container_ids(scope):
+        members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
+        if members is not None:
+            fresh = [p for p in sorted(members) if p not in seen and not _excluded_by(p, patterns)]
+            if len(entries) + len(fresh) > RESOLVED_SET_CAP:
+                # The lookup succeeded and the run holds the full member list, but listing
+                # them would cross the cap: the members the run just resolved are carried
+                # reading over-cap and get no CREATE, and because the run knows they are
+                # under the container, over-cap does not hold back the prune (design §3).
+                log(f"{container} resolved {len(members)} project(s), which would cross the resolved-set "
+                    f"cap of {RESOLVED_SET_CAP}; over-cap, its members are carried without CREATE.")
+                outcome, carried, members = OUTCOME_OVER_CAP, sorted(members), None
+            else:
+                carried = []
+        else:
+            # Frozen (design §4): the members the last snapshot reached through this
+            # container are carried forward under the container's outcome, so a failed
+            # lookup never reads as "no projects", and nothing is created under them.
+            carried = _previous_container_members(previous, container)
+        if members is None:
+            for project in carried:
+                if project in seen:
+                    add_via(project, container)
+                    continue
+                if _excluded_by(project, patterns):
+                    continue
+                seen.add(project)
+                entries.append({"id": project, "via": [container], "outcome": outcome, "frozen": True})
+            containers.append({"id": container, "outcome": outcome, "projects": len(carried)})
+            continue
+        for project in sorted(members):
+            if project in seen:
+                add_via(project, container)
+                # Listed by this container but carried frozen by an earlier one: the live
+                # listing wins, whichever container sorted first.
+                frozen = frozen_entry(project)
+                if frozen:
+                    frozen.pop("frozen")
+                    frozen["outcome"] = OUTCOME_OK
+                    frozen["clusters"] = sorted(members[project])
+                continue
+            if _excluded_by(project, patterns):
+                continue
+            seen.add(project)
+            entries.append({"id": project, "via": [container], "outcome": OUTCOME_OK, "clusters": sorted(members[project])})
+        containers.append({"id": container, "outcome": OUTCOME_OK, "projects": len(members)})
+    for entry in entries:
+        entry.pop("frozen", None)
+    return entries, ignored, containers
 
 
 def _snapshot_path() -> Path:
@@ -488,6 +664,8 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
         stderr = e.stderr or ""
         if "NotFound" in stderr or "not found" in stderr.lower() or "404" in stderr:
             return False
+        if _classify_list_failure(stderr) == OUTCOME_DENIED:
+            _denied_this_run.add(project)
         log(f"describe {cluster} ({project}/{location}) failed (treating as unknown): {stderr.strip()}")
         return None
     except subprocess.TimeoutExpired:
@@ -615,6 +793,7 @@ def reconcile(dry_run: bool = False) -> dict:
 
     # --- RESOLVE: the management project plus whatever spec.scope declares (design §3).
     management, management_authoritative = _project_source()
+    _denied_this_run.clear()
     scope, scope_readable, scope_present = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
@@ -654,7 +833,17 @@ def reconcile(dry_run: bool = False) -> dict:
     # project that merely changed from one the scope dropped, and nothing is created under
     # a project this tick could not confirm is still the pod's own.
     carried_management = _previous_management(previous) if not management else None
-    entries, ignored_excludes = _resolve_projects(management or carried_management, scope)
+    # One budget for the whole listing phase (LIST_BUDGET_SECONDS): the management project
+    # lists first, at the start of it, so its listing, the one that decides whether the
+    # roster is reconciled, is never cut short by a slow container; then the containers,
+    # one Asset Inventory call each; then the explicit projects. Container members arrive
+    # with their clusters, so no per-project listing follows for them (design §4).
+    listing_deadline = time.monotonic() + LIST_BUDGET_SECONDS
+    listings: dict[str, tuple[list | None, str]] = {}
+    if management:
+        listings.update(_list_projects([management], management, listing_deadline))
+    searches = _search_containers(_container_ids(scope), listing_deadline)
+    entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous)
     if carried_management:
         for entry in entries:
             # Declared explicitly too: the declaration vouches for it, so it lists as any
@@ -674,8 +863,12 @@ def reconcile(dry_run: bool = False) -> dict:
     #     managed like any other — the metadata-server self-identification this used to
     #     gate on existed solely to recognise the cluster being skipped.
     cluster_counts: dict[str, int | None] = {}
-    to_list = [e["id"] for e in entries if e["outcome"] not in (OUTCOME_OVER_CAP, OUTCOME_UNREACHABLE)]
-    listings = _list_projects(to_list, management)
+    to_list = [e["id"] for e in entries if e["outcome"] is None and e["id"] not in listings]
+    listings.update(_list_projects(to_list, None, listing_deadline))
+    for entry in entries:
+        # A container member: Asset Inventory named its clusters already.
+        if "clusters" in entry and entry["id"] not in listings:
+            listings[entry["id"]] = (entry["clusters"], OUTCOME_OK)
     for entry in entries:
         project = entry["id"]
         if project not in listings:
@@ -714,6 +907,8 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"created profile {name} for {cluster} ({proj}/{location}).")
                 report["created"].append(name)
             except (SystemExit, Exception) as e:  # noqa: BLE001 - one failure never aborts the sweep
+                if _classify_list_failure(str(e)) == OUTCOME_DENIED:
+                    _denied_this_run.add(proj)
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
                 report["create_failed"].append(f"{cluster}/{location}")
     for entry in entries:
@@ -721,8 +916,8 @@ def reconcile(dry_run: bool = False) -> dict:
 
     # A project the scope has dropped is pruned only under three conditions (design §7):
     # no selector produced it this run, every listed project resolved without an error
-    # that could hide a project (phase 1 has no containers, so this is every explicit
-    # project not reading unreachable), and the previous snapshot had it in scope. The
+    # that could hide a project (no explicit project unreachable, every container `ok` or
+    # `over-cap`), and the previous snapshot had it in scope. The
     # third protects every profile the scope never produced, above all the ones
     # onboarded by hand before a scope existed. On top of that the prune takes two clean
     # runs: the first clean run a project is absent marks it retiring, the next clean run
@@ -757,7 +952,8 @@ def reconcile(dry_run: bool = False) -> dict:
             "list its clusters; the old project is carried forward and nothing is judged this run.")
     lookups_clean = (management is not None and management_listed and scope_readable
                      and not management_changed
-                     and all(e["outcome"] != OUTCOME_UNREACHABLE for e in entries))
+                     and all(e["outcome"] != OUTCOME_UNREACHABLE for e in entries)
+                     and all(c["outcome"] in (OUTCOME_OK, OUTCOME_OVER_CAP) for c in containers))
     if not lookups_clean and not management_changed:
         why = ("the management project did not list its own clusters" if management and not management_listed
                else "a lookup or the declaration could not be trusted")
@@ -895,6 +1091,17 @@ def reconcile(dry_run: bool = False) -> dict:
     }
     report["retiring"] = sorted(still_retiring)
 
+    # A container member whose describe or get-credentials answered 403 reads `denied`:
+    # an IAM deny on a member project blocks the inherited grant without hiding the
+    # cluster from the asset index, and these calls are the only ones that see it.
+    for entry in entries:
+        if (entry["outcome"] == OUTCOME_OK and entry["id"] in _denied_this_run
+                and not ({VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]))):
+            entry["outcome"] = OUTCOME_DENIED
+            report["projects"][entry["id"]] = OUTCOME_DENIED
+            log(f"{entry['id']} (via {', '.join(entry['via'])}) answered 403 on a per-cluster call; "
+                f"its outcome is {OUTCOME_DENIED} this run.")
+
     # Fill order decided the cap above; the written order is sorted by ID so an
     # unchanged fleet writes an unchanged file (design §3, "Resolution is deterministic").
     snapshot_projects = sorted([
@@ -914,8 +1121,8 @@ def reconcile(dry_run: bool = False) -> dict:
         _write_snapshot({
             "resolvedAt": datetime.now(timezone.utc).strftime(SNAPSHOT_TIME_FORMAT),
             "declared": declared,
-            "resolver": RESOLVER_EXPLICIT,
-            "containers": [],
+            "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
+            "containers": sorted(containers, key=lambda c: c["id"]),
             # Every profile by project: as read this run, or as last read for one whose
             # identity could not be read this run and whose home is still on the volume, so
             # the attribution survives any number of unreadable runs. A pruned name is dropped
