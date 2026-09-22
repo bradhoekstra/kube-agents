@@ -133,8 +133,7 @@ Rules:
   and it cannot be excluded, because the management cluster's own alerts need a profile to be
   delegated to (the reasoning in `cluster_agent_reconcile.py:17-27` still holds).
   `RECONCILE_PROJECT` is an override of that lookup, not a synonym for it: an install that runs
-  with it pointed at another project today migrates by naming that project in `projects`, and the
-  variable retires on the same schedule as `RECONCILE_EXCLUDE`.
+  with it pointed at another project today migrates by naming that project in `projects`. The operator pins the variable empty in the managed `.env` from phase 1 on, because a management identity that changes now retires the old project's profiles and a line in the agent-writable PVC `.env` must not be able to move it; the empty value reads as unset.
 - **Selectors union; exclusions subtract afterwards.** A project reached through a folder and named
   explicitly appears once. An excluded project is dropped whether it was reached through a list or a
   container.
