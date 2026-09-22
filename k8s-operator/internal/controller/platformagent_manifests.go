@@ -252,11 +252,13 @@ type scopeExcludeDeclaration struct {
 }
 
 // renderScopeJSON renders spec.scope for the pod. It is rendered on every install,
-// an empty declaration when the CR has no scope -- no block, an empty block, or a
-// block whose every list is empty all render the same bytes -- so that the reconcile
-// can tell "the operator declared nothing" from "the declaration never reached this
-// pod": the second is what a rollback to an operator without the field looks like,
-// and the reconcile must not prune on it (docs/designs/multi-project-scope.md §7).
+// an empty declaration when the CR has no scope, so that the reconcile can tell
+// "the operator declared nothing" from "the declaration never reached this pod":
+// the second is what a rollback to an operator without the field looks like, and
+// the reconcile must not prune on it (docs/designs/multi-project-scope.md §7). The
+// `present` flag tells a CR with no block (false) from one whose block is present
+// but empty (true): an empty block and a block whose every list is empty render the
+// same bytes, and a missing block renders differently by that one field.
 func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 	scope := agent.Spec.Scope
 	if scope == nil {

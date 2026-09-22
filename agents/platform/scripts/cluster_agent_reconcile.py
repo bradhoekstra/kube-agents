@@ -590,7 +590,8 @@ def reconcile(dry_run: bool = False) -> dict:
         "retiring": [],          # project the scope dropped whose profiles are being removed
     }
     # Per-project outcome (design §4), keyed by project ID. Not a bucket of names: the
-    # bootstrap gate reads it to name the projects a roster is missing.
+    # same outcomes go into the snapshot, which the bootstrap gate reads to name the
+    # projects a roster is missing.
     report["projects"] = {}
     # Not a bucket: whether the CREATE direction ran for at least one project this run.
     # Every failure below is caught and logged so a cron producer can always exit 0,

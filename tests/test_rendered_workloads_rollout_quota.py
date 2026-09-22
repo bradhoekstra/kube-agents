@@ -18,7 +18,7 @@ untested. This suite reads the output side instead:
                                                emit (golden_test.go keeps these
                                                equal to the operator's output)
 
-The golden half reaches only what the golden cases render. All six set
+The golden half reaches only what the golden cases render. All seven set
 `spec.mode: default`, so the `mode: next` stack is in none of them: the A2A
 gateway's strategy is asserted by `TestBuildA2AGatewayIdentityAndOwnerWiring`
 in `k8s-operator/internal/controller/`, and the A2A auth callout (two replicas,

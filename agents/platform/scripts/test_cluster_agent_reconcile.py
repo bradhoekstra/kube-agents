@@ -376,7 +376,10 @@ class CreatePassSignalTest(unittest.TestCase):
             self.assertIsNone(rec.main())
 
     def test_a_failed_create_is_recorded_rather_than_only_logged(self):
-        with mock.patch.object(rec, "list_profiles", return_value=[]), \
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}), \
+             mock.patch.object(rec, "list_profiles", return_value=[]), \
              mock.patch.object(rec, "_project_source", return_value=("p", True)), \
              mock.patch.object(rec, "_list_project", return_value=_listing([("p", "alpha", "us-central1")])), \
              mock.patch.object(rec, "create_profile", side_effect=SystemExit("no credentials")), \
@@ -1197,8 +1200,9 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["unmanaged"], ["cluster-o"])
 
     def test_an_empty_declaration_from_the_operator_is_a_declaration(self):
-        # The operator renders {"projects": [], "exclude": {...}} when the CR has no scope;
-        # that is a readable declaration, and a project dropped from it retires.
+        # The operator renders {"present": true, "projects": [], "exclude": {...}} for a CR
+        # whose scope block is present but empty; that is a declaration, and a project
+        # dropped from it retires (an absent block, present=false, is the case that does not).
         self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
         report, _, deleted = self._run({"projects": [], "exclude": {"projects": [], "clusters": []}},
                                        {self.MGMT: []}, profiles=["cluster-g"],
