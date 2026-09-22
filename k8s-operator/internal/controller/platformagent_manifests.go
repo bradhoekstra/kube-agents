@@ -236,6 +236,12 @@ const credentialProxyPolicyJSON = `{
 // sorted before rendering so an unchanged CR renders byte-identical bytes and the
 // config hash does not move.
 type scopeDeclaration struct {
+	// Present says whether the CR carries a scope block at all. The reconcile reads a
+	// block that is absent as "nothing declared": it lists the management project alone
+	// and retires nothing, because the ordinary way a block goes missing is a write
+	// through an older operator's webhook, not an operator dropping every project. An
+	// empty `projects` list in a present block is the declaration that drops projects.
+	Present  bool                    `json:"present"`
 	Projects []string                `json:"projects"`
 	Exclude  scopeExcludeDeclaration `json:"exclude"`
 }
@@ -257,6 +263,7 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
+		Present:  agent.Spec.Scope != nil,
 		Projects: append([]string{}, scope.Projects...),
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
@@ -443,7 +450,7 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
-	// UNCONDITIONAL, and one of the four pins here that are not about chat. Every chat key
+	// UNCONDITIONAL, and one of the five pins here that are not about chat. Every chat key
 	// below exists because the agent could otherwise write a competing value into the PVC
 	// .env; this one exists because something already does, on every boot, without being
 	// asked.
@@ -500,6 +507,15 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// would hand it a declaration it authored; with it, save_env_value refuses the key
 	// and the ConfigMap stays the only answer to "what is declared".
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
+
+	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
+	// ahead of the metadata server, and since the scope prune exists a management
+	// identity that changes retires the old project's profiles. Unpinned, one line in
+	// the PVC .env would re-point it, and two clean runs later every profile of the
+	// real management project would be gone. Nothing in the operator or the chart sets
+	// it, so pinning it empty costs no install anything; the script treats an empty
+	// value as unset and asks the metadata server.
+	add(reconcileProjectEnvKey, "")
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -758,6 +774,9 @@ const (
 	// scopeFileEnvKey tells cluster_agent_reconcile.py where the declaration is. One
 	// reader, by design; a second code site naming this key is a review comment.
 	scopeFileEnvKey = "KUBEAGENTS_SCOPE_FILE"
+	// reconcileProjectEnvKey is the reconcile's management-project override, pinned
+	// empty in the managed .env (see renderManagedEnv) so the agent cannot write it.
+	reconcileProjectEnvKey = "RECONCILE_PROJECT"
 
 	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
 	// volume into the agent container so skills can read managed repositories directly from disk.
@@ -2637,6 +2656,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  scopeFileEnvKey,
 		Value: scopeDir + "/" + scopeFileName,
 	})
+	// The managed .env pins RECONCILE_PROJECT empty (renderManagedEnv says why), and the
+	// two renders must agree, so the container env carries the same empty value.
+	envVars = append(envVars, corev1.EnvVar{Name: reconcileProjectEnvKey, Value: ""})
 	// The other half of the umask note at the top of this file. That umask governs what
 	// the entrypoints create; this governs what Hermes then re-tightens. Hermes chmods
 	// HERMES_HOME and ten named subdirectories to 0700 on every process start, and a cron

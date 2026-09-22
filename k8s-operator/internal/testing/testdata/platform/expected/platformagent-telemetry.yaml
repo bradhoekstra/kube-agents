@@ -311,11 +311,13 @@ data:
     HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=today
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    RECONCILE_PROJECT=
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
   scope.json: |
     {
+      "present": false,
       "projects": [],
       "exclude": {
         "projects": [],
@@ -1152,6 +1154,7 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
             - name: HERMES_WRITE_SAFE_ROOT

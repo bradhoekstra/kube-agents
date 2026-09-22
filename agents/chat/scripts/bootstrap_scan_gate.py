@@ -205,6 +205,21 @@ def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def _scope_has_other_projects(data_dir: Path) -> bool:
+    """Whether the last reconcile resolved more than one project.
+
+    The task body speaks of "the project" on an install with no scope, exactly as it
+    did before scopes existed, and of "the projects in scope" only once the snapshot
+    names more than one, so a single-project install renders the same prompt as before.
+    """
+    try:
+        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: one project, as before
+        return False
+    projects = snapshot.get("projects") if isinstance(snapshot, dict) else None
+    return isinstance(projects, list) and len([p for p in projects if isinstance(p, dict) and p.get("id")]) > 1
+
+
 def _scope_gap_paragraph(data_dir: Path) -> str:
     unlisted = _unlisted_projects(data_dir)
     if not unlisted:
@@ -348,6 +363,9 @@ def should_skip(data_dir: Path) -> bool:
 
 
 def _task_body() -> str:
+    multi = _scope_has_other_projects(_data_dir())
+    every_cluster = "every cluster the projects in scope have" if multi else "every cluster the project has"
+    cannot_list = "a project's clusters" if multi else "the project's clusters"
     instruction_list = "\n".join(f"  - {p}" for p in INSTRUCTIONS_PATHS)
     prioritize_list = "\n".join(f"  - {p}" for p in PRIORITIZE_INSTRUCTIONS_PATHS)
     cluster_audit_list = "\n".join(f"  - {p}" for p in CLUSTER_AUDIT_INSTRUCTIONS_PATHS)
@@ -376,11 +394,11 @@ def _task_body() -> str:
         "profile.\n\n"
         "**The roster may be empty or incomplete, and that is your finding to report, not "
         "yours to fix.** It says which clusters can audit themselves — not which clusters "
-        "count. Audit every cluster the projects in scope have: the ones with no Cluster Agent you take "
+        f"count. Audit {every_cluster}: the ones with no Cluster Agent you take "
         "yourself in Step 4, and the report names each one as lacking an agent. A fleet swept "
         "without Cluster Agents is a degraded sweep and must read as one, because this report "
-        "is delivered to the user as the state of their environment. If you cannot list a "
-        "project's clusters at all, put that at the top of the report and file it anyway — "
+        "is delivered to the user as the state of their environment. If you cannot list "
+        f"{cannot_list} at all, put that at the top of the report and file it anyway — "
         "onboarding runs once, and a report saying discovery failed is worth more than a thin "
         "one that reads as a clean fleet.\n\n"
         f"{_scope_gap_paragraph(_data_dir())}"

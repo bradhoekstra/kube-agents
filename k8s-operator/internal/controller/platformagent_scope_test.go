@@ -23,20 +23,29 @@ func scopeTestAgent(scope *agentv1alpha1.ScopeSpec) *agentv1alpha1.PlatformAgent
 
 func TestRenderScopeJSONRendersAnEmptyDeclarationForNoScope(t *testing.T) {
 	// The file is rendered on every install so the reconcile can tell "nothing
-	// declared" from "no render reached this pod" (a rollback); the three ways of
-	// declaring nothing render the same bytes, so none of them moves the hash.
-	want := renderScopeJSON(scopeTestAgent(nil))
-	if !strings.Contains(want, `"projects": []`) || !strings.Contains(want, `"clusters": []`) {
-		t.Fatalf("no-scope render is not an empty declaration: %q", want)
+	// declared" from "no render reached this pod" (a rollback). A CR with no scope
+	// block renders the empty declaration with present=false; the ways of declaring
+	// an empty block render the same bytes as each other, with present=true, so an
+	// operator who empties the lists is telling the reconcile to drop the projects
+	// and an operator (or an older webhook) that removes the block is not.
+	absent := renderScopeJSON(scopeTestAgent(nil))
+	if !strings.Contains(absent, `"present": false`) || !strings.Contains(absent, `"projects": []`) || !strings.Contains(absent, `"clusters": []`) {
+		t.Fatalf("no-scope render is not an absent empty declaration: %q", absent)
+	}
+	if got, ok := buildConfigMapData(scopeTestAgent(nil), nil)[scopeConfigKey]; !ok || got != absent {
+		t.Fatalf("ConfigMap must always carry %s, with the absent declaration when the CR has no scope", scopeConfigKey)
+	}
+	want := renderScopeJSON(scopeTestAgent(&agentv1alpha1.ScopeSpec{}))
+	if !strings.Contains(want, `"present": true`) {
+		t.Fatalf("an empty scope block must render present=true: %q", want)
 	}
 	for name, scope := range map[string]*agentv1alpha1.ScopeSpec{
-		"empty block":  {},
 		"empty lists":  {Projects: []string{}, Exclude: &agentv1alpha1.ScopeExcludeSpec{}},
 		"empty nested": {Exclude: &agentv1alpha1.ScopeExcludeSpec{Projects: []string{}, Clusters: []agentv1alpha1.ScopeClusterRef{}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := renderScopeJSON(scopeTestAgent(scope)); got != want {
-				t.Fatalf("%s renders differently from a nil block:\n%s\nvs\n%s", name, got, want)
+				t.Fatalf("%s renders differently from an empty block:\n%s\nvs\n%s", name, got, want)
 			}
 			if got, ok := buildConfigMapData(scopeTestAgent(scope), nil)[scopeConfigKey]; !ok || got != want {
 				t.Fatalf("%s: ConfigMap must always carry %s with the empty declaration", name, scopeConfigKey)

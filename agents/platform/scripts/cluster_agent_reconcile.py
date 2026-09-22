@@ -81,6 +81,8 @@ EXTRA_EXCLUDE = {c for c in os.environ.get("RECONCILE_EXCLUDE", "").split(",") i
 # operator renders it on every install, an empty declaration when the CR has no scope, so a
 # missing or empty file means the render did not reach this pod (see _load_scope).
 SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
+# The rendered file says whether the CR carries a scope block at all (see _load_scope).
+SCOPE_PRESENT_KEY = "present"
 # The resolved membership, rewritten by every run but --dry-run beside the profiles (design §5). The
 # previous run's copy is an input: a project in the resolved set last time and absent now
 # is marked `retiring`, and only a project the previous copy marked `retiring` is pruned,
@@ -148,10 +150,13 @@ def _metadata(path: str):
 def _project_source() -> tuple[str | None, bool]:
     """The management project and whether the answer is authoritative.
 
-    RECONCILE_PROJECT and the metadata server are authoritative: each names the
-    project on purpose. The gcloud config fallback is not: it answers whatever the
-    broker was bootstrapped with, so a metadata timeout can make it name a project
-    the pod does not run in, and the reconcile must not read that as the management
+    The metadata server is authoritative, and so is RECONCILE_PROJECT where it
+    still reaches this script: the operator pins it empty in the managed .env, so
+    that a line in the PVC .env cannot re-point the management project and have
+    the scope prune retire the real one, and an empty value reads as unset. The
+    gcloud config fallback is not authoritative: it answers whatever the broker
+    was bootstrapped with, so a metadata timeout can make it name a project the
+    pod does not run in, and the reconcile must not read that as the management
     project having changed.
     """
     p = os.environ.get("RECONCILE_PROJECT") or _metadata("project/project-id")
@@ -265,15 +270,18 @@ def _empty_scope() -> dict:
 
 
 def _load_scope() -> tuple[dict, bool]:
-    """The declaration the operator rendered, and whether it could be read.
+    """The declaration the operator rendered, and whether one is in force.
 
-    The operator renders the file on every install, an empty declaration when
-    the CR has no scope, so a missing, empty, unparseable or non-object file all
-    mean the render did not reach this pod: the caller still creates for the
-    management project, under the last declaration's exclusions, but must not run
-    the scope prune, because a declaration that cannot be read must not become a
-    declaration that deletes. A rollback
-    to an operator without the field is the ordinary way to get here.
+    The operator renders the file on every install, so a missing, empty,
+    unparseable or non-object file means the render did not reach this pod (a
+    rollback to an operator without the field), and a file whose `present` is not
+    true means the CR carries no scope block. Neither is a declaration: in both
+    cases the caller still creates for the management project, under the last
+    declaration's exclusions, but must not run the scope prune, because a
+    declaration that is not there must not become a declaration that deletes. A
+    block can go missing without anyone dropping a project, through a write that
+    passed an older operator's webhook; the operator who wants the projects gone
+    empties `projects` and keeps the block.
     """
     path = os.environ.get(SCOPE_FILE_ENV)
     if not path:
@@ -291,6 +299,10 @@ def _load_scope() -> tuple[dict, bool]:
     except Exception as e:  # noqa: BLE001 - unreadable declaration: fall back, loudly, and prune nothing by scope
         log(f"could not read the scope declaration at {path} ({e}); using the management project "
             "alone and skipping the scope prune this run.")
+        return _empty_scope(), False
+    if parsed.get(SCOPE_PRESENT_KEY) is not True:
+        log("the PlatformAgent carries no scope block; using the management project alone and "
+            "retiring nothing (an empty `projects` list in a present block is what drops projects).")
         return _empty_scope(), False
     return _normalize_scope(parsed), True
 
@@ -603,11 +615,12 @@ def reconcile(dry_run: bool = False) -> dict:
     management, management_authoritative = _project_source()
     scope, scope_readable = _load_scope()
     previous = _load_previous_snapshot()
-    # An unreadable declaration keeps the exclusions of the last one read. The projects
-    # do not carry: nothing is listed or created outside the management project on such
-    # a tick, but a cluster the operator excluded stays excluded, so a rollback cannot
-    # re-onboard it. The snapshot keeps naming that last declaration, so a second
-    # unreadable tick reads the same exclusions.
+    # An unreadable or absent declaration keeps the exclusions of the last one read. The
+    # projects do not carry: nothing is listed or created outside the management project
+    # on such a tick, but a cluster the operator excluded stays excluded, so a rollback
+    # cannot re-onboard it. The snapshot keeps naming that last declaration, so a second
+    # such tick reads the same exclusions, and a project it named stays carried in scope
+    # rather than retiring: removing the whole block retires nothing.
     declared = scope
     if not scope_readable:
         last = _previous_declaration(previous)
@@ -648,9 +661,10 @@ def reconcile(dry_run: bool = False) -> dict:
     resolved_ids = {e["id"] for e in entries}
     if not management:
         log("could not resolve the management project — its clusters are not reconciled this run.")
-    elif scope_declared and os.environ.get("RECONCILE_PROJECT"):
-        log("RECONCILE_PROJECT overrides the management project; name that project in "
-            "spec.scope.projects instead, the variable retires with RECONCILE_EXCLUDE.")
+    elif os.environ.get("RECONCILE_PROJECT"):
+        log("RECONCILE_PROJECT overrides the management project; the operator pins it empty in the "
+            "managed .env, so this install is running without that pin. Name the project in "
+            "spec.scope.projects instead; the variable retires with RECONCILE_EXCLUDE.")
 
     # --- CREATE: ensure every cluster in every listable project (except exclusions) has a
     #     profile. Requires only a resolvable project now that the management cluster is

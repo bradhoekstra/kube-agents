@@ -597,6 +597,20 @@ class ScopeGapParagraphTest(unittest.TestCase):
     def test_an_unreadable_snapshot_names_nothing(self):
         self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot("{nope")), "")
 
+    def test_the_task_body_speaks_of_one_project_unless_the_snapshot_names_more(self):
+        # An install with no scope renders the prompt it rendered before scopes existed.
+        data_dir = self._with_snapshot(None)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("Audit every cluster the project has", body)
+        self.assertIn("If you cannot list the project's clusters at all", body)
+        self.assertNotIn("projects in scope", body)
+        data_dir = self._with_snapshot('{"projects": [{"id": "mgmt", "outcome": "ok"}, {"id": "other", "outcome": "ok"}]}')
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("Audit every cluster the projects in scope have", body)
+        self.assertIn("If you cannot list a project's clusters at all", body)
+
     def test_a_snapshot_whose_projects_is_not_a_list_names_nothing(self):
         for body in ('{"projects": null}', '{"projects": 3}', '{"projects": "x"}', '[1]'):
             self.assertEqual(bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(body)), "", body)

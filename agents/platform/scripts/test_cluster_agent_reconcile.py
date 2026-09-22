@@ -694,6 +694,10 @@ class ScopeTest(HomesMixin):
         if scope is None:
             return
         path = Path(self._tmp.name) / "scope.json"
+        # The operator writes `present` on every render; a test that passes a dict without
+        # it is declaring a block, as the operator would for a CR that carries one.
+        if isinstance(scope, dict) and rec.SCOPE_PRESENT_KEY not in scope:
+            scope = {rec.SCOPE_PRESENT_KEY: True, **scope}
         path.write_text(json.dumps(scope), encoding="utf-8")
         os.environ[rec.SCOPE_FILE_ENV] = str(path)
 
@@ -972,6 +976,31 @@ class ScopeTest(HomesMixin):
         self._write_scope({"projects": "abc", "exclude": {"clusters": 7}})
         report, created, _ = self._run(None, {self.MGMT: [(self.MGMT, "m1", "us-central1")]})
         self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+
+    def test_a_cr_without_a_scope_block_retires_nothing_and_keeps_the_last_exclusions(self):
+        # The operator renders present=false when the CR has no scope block, which is what a
+        # write through an older webhook leaves behind: the previously explicit project is
+        # carried in scope, its profiles kept, and the last declaration's exclusions still hold.
+        declared = {"projects": ["p2"], "exclude": {"projects": [], "clusters": [
+            {"projectId": self.MGMT, "location": "us-central1", "clusterName": "kept-out"}]}}
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(
+            {"projects": [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                          {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}],
+             "declared": declared, "profiles": {"cluster-p2": "p2"}}), encoding="utf-8")
+        ids = {"cluster-p2": _identity("p2", "x")}
+        for _ in range(3):
+            report, created, deleted = self._run({rec.SCOPE_PRESENT_KEY: False, "projects": [], "exclude": {"projects": [], "clusters": []}},
+                                                 {self.MGMT: [(self.MGMT, "kept-out", "us-central1")]},
+                                                 profiles=["cluster-p2"], identities=ids)
+            self.assertEqual((created, deleted, report["retiring"]), ([], [], []))
+            rows = {p["id"]: p["state"] for p in self._snapshot()["projects"]}
+            self.assertEqual(rows["p2"], rec.STATE_IN_SCOPE)
+            self.assertEqual(self._snapshot()["declared"], declared)
+        # A present block with an empty projects list is the declaration that drops p2.
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), ([], ["p2"]))
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-p2"], identities=ids)
+        self.assertEqual(deleted, ["cluster-p2"])
 
     def test_an_unreadable_declaration_with_no_previous_snapshot_excludes_nothing(self):
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
