@@ -105,10 +105,10 @@ spec:
     projects: # explicit project IDs
       - payments-prod
       - payments-staging
-    folders: # Resource Manager folders, resolved to every project beneath them
-      - folders/123456789012
-    organizations: # an entire organisation; see §9 before using this
-      - organizations/987654321098
+    folders: # Resource Manager folder IDs (numeric), resolved to every project beneath them
+      - "123456789012"
+    organizations: # organisation IDs (numeric)
+      - "987654321098"
     exclude:
       projects: # IDs or shell-style globs; dropped after resolution, even if a folder above contains them
         - payments-sandbox
