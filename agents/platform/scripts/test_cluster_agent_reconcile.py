@@ -724,7 +724,7 @@ class ScopeTest(HomesMixin):
             if delete_removes:
                 shutil.rmtree(self.homes / name, ignore_errors=True)
 
-        def list_project(project):
+        def list_project(project, timeout=None):
             value = listings.get(project, ([], rec.OUTCOME_OK))
             return value if isinstance(value, tuple) else (value, rec.OUTCOME_OK)
 
@@ -985,7 +985,7 @@ class ScopeTest(HomesMixin):
         seen: list[str] = []
         lock = threading.Lock()
 
-        def slow_list(project):
+        def slow_list(project, timeout=None):
             with lock:
                 seen.append(project)
             time.sleep(delay)
@@ -1016,7 +1016,7 @@ class ScopeTest(HomesMixin):
         spans: dict[str, tuple[float, float]] = {}
         lock = threading.Lock()
 
-        def lister(project):
+        def lister(project, timeout=None):
             start = time.monotonic(); time.sleep(delay); end = time.monotonic()
             with lock:
                 spans[project] = (start, end)
@@ -1029,12 +1029,18 @@ class ScopeTest(HomesMixin):
         import time
         self._write_previous([{"id": "gone", "state": rec.STATE_RETIRING}])
 
-        def lister(project):
+        import threading
+        cuts: dict[str, float] = {}
+
+        def lister(project, timeout=None):
+            cuts[project] = timeout
             if project == "slow":
-                time.sleep(1.5)
+                # Honours the timeout the way gcloud's would: sleeps no longer than it.
+                time.sleep(min(1.5, timeout if timeout is not None else 1.5))
             return [], rec.OUTCOME_OK
+        baseline = threading.active_count()
         start = time.monotonic()
-        with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3):
+        with mock.patch.object(rec, "LIST_BUDGET_SECONDS", 0.3), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({"projects": ["slow", "quick"]}, lister,
                                            profiles=["cluster-g"], identities={"cluster-g": _identity("gone", "g")})
         self.assertLess(time.monotonic() - start, 1.2)
@@ -1042,6 +1048,11 @@ class ScopeTest(HomesMixin):
         # Unreachable switches the scope prune off; the snapshot is still written.
         self.assertEqual((deleted, report["retiring"]), ([], ["gone"]))
         self.assertEqual({p["id"]: p["outcome"] for p in self._snapshot()["projects"]}["slow"], rec.OUTCOME_UNREACHABLE)
+        # The worker's own timeout was cut to the budget left, so no thread outlives the run
+        # by more than the grace: the interpreter joins the pool's threads at exit.
+        self.assertLessEqual(cuts["slow"], 1.0)
+        time.sleep(1.2)
+        self.assertEqual(threading.active_count(), baseline)
 
     def test_an_unrelated_profile_of_unknown_identity_does_not_keep_a_project_retiring(self):
         # gone's last profile goes this tick; a hand-made directory with no identity, never

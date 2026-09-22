@@ -95,6 +95,7 @@ RESOLVER_EXPLICIT = "explicit"
 LIST_WORKERS = 8
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
+LIST_GRACE_SECONDS = 5
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
 # Two caps of 100 (the number is the open question in design §11): the CRD caps each declared list, and this caps the resolved
@@ -186,12 +187,14 @@ def _list_projects(projects: list[str], first: str | None) -> dict[str, tuple[li
     """List every project, `first` alone and then the rest concurrently, within one budget.
 
     The management project goes first and on its own: its listing decides
-    `create_pass_ran`, and the first ssh to the sandbox opens the multiplexed
-    connection the pool then shares, so the pool never races on a cold socket. The
-    rest run LIST_WORKERS at a time. A listing still running when the budget is
-    spent reads `unreachable` (no CREATE, scope prune off), and the run goes on to
-    write its snapshot rather than being killed by the bootstrap gate's ceiling
-    with nothing written; the thread finishes on its own timeout in the background.
+    `create_pass_ran`, and when it reaches the sandbox its ssh opens the multiplexed
+    connection the pool then shares. The rest run LIST_WORKERS at a time. Every
+    worker's own gcloud timeout is cut to the budget left when it starts, so no
+    worker outlives the deadline by more than LIST_GRACE_SECONDS: the interpreter
+    joins the pool's threads at exit, and a worker still blocked on gcloud would
+    hold the exit code past the bootstrap gate's ceiling. A listing still pending
+    at the deadline reads `unreachable` (no CREATE, scope prune off), and the run
+    goes on to write its snapshot.
     """
     deadline = time.monotonic() + LIST_BUDGET_SECONDS
     listings: dict[str, tuple[list | None, str]] = {}
@@ -201,9 +204,13 @@ def _list_projects(projects: list[str], first: str | None) -> dict[str, tuple[li
         listings[first] = _list_project(first)
     if not rest:
         return listings
+
+    def within_budget(project: str) -> tuple[list | None, str]:
+        return _list_project(project, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
+
     pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(rest)))
-    futures = {project: pool.submit(_list_project, project) for project in rest}
-    done, pending = wait(futures.values(), timeout=max(0.0, deadline - time.monotonic()))
+    futures = {project: pool.submit(within_budget, project) for project in rest}
+    done, pending = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
     for project, future in futures.items():
         if future in done:
             listings[project] = future.result()
@@ -215,7 +222,7 @@ def _list_projects(projects: list[str], first: str | None) -> dict[str, tuple[li
     return listings
 
 
-def _list_project(project: str) -> tuple[list | None, str]:
+def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
     """Every cluster in the project as (project, name, location) tuples, and the outcome.
 
     `check=True` matters: without it a failed `gcloud` (expired auth, no network,
@@ -232,7 +239,7 @@ def _list_project(project: str) -> tuple[list | None, str]:
         r = sandbox_exec.run(
             ["gcloud", "container", "clusters", "list", "--project", project,
              "--format=value(name,location)"],
-            check=True, timeout=LIST_TIMEOUT_SECONDS,
+            check=True, timeout=timeout,
         )
     except subprocess.CalledProcessError as e:
         # CalledProcessError stringifies to just the exit status; gcloud puts the
