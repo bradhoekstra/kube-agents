@@ -2024,7 +2024,9 @@ class InstallEnvInputTest(unittest.TestCase):
                 ],
                 capture_output=True,
                 text=True,
-                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": ""}),
+                # HOME too: with no helper beside the copy, install.sh falls
+                # through to $HOME/kube-agents/install.env, the default clone.
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": "", "HOME": tmp}),
                 cwd=str(home),
             )
             self.assertIn("rc=0 P=payments-prod", proc.stdout, proc.stderr + proc.stdout)
