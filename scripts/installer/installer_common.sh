@@ -136,10 +136,6 @@ readonly SCOPE_LIST_MAX_ENTRIES=100
 # kubectl's wording for a resource type the cluster does not serve: a cluster
 # with no kube-agents CRD on it, which is every first adoption.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could not find the requested resource"
-# helm's wording for a release that does not exist, which is the pre-Terraform
-# install whose scope was set by hand; any other failure is a read that did
-# not happen.
-readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -1577,12 +1573,13 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 # `helm upgrade --set-json` that must leave the CR's scope exactly as it is.
 # upgrade.sh's harness and operator modes run no Terraform, so no scope may
 # change through them -- not the keys, which would list a project with no
-# grant or retire one with its grants still bound, and not the release's
-# record, which a hand edit the guard accepted is not in -- and the chart's
-# default is empty lists, so a retag that said nothing would empty it. Reads
-# through the install's context by name and fails, with kubectl's message,
-# when it cannot read the CR or finds none: the caller refuses the retag
-# rather than guess. A CR with no scope block is the empty declaration.
+# grant or retire one with its grants still bound -- and the chart's default
+# is empty lists, so a retag that said nothing would empty it. Reads through
+# the install's context by name and fails, with kubectl's message, when it
+# cannot read the CR or finds none. A CR with no scope block prints nothing
+# and succeeds: absent is a declaration of its own (the reconcile carries the
+# last declaration forward) that a present-empty block would overwrite, so
+# the caller refuses the retag and leaves the roll-forward to full mode.
 live_scope_json() {
   local ns="$1" context
   context="$(gke_context_name)"
@@ -1592,7 +1589,9 @@ items = json.load(sys.stdin).get("items", [])
 if not items:
     print("no PlatformAgent found", file=sys.stderr)
     sys.exit(1)
-scope = (items[0].get("spec") or {}).get("scope") or {}
+scope = (items[0].get("spec") or {}).get("scope")
+if scope is None:
+    sys.exit(0)
 exclude = scope.get("exclude") or {}
 print(json.dumps({"projects": scope.get("projects") or [],
                   "exclude": {"projects": exclude.get("projects") or [],
@@ -1615,33 +1614,29 @@ sys.exit(0 if shape(json.loads(sys.argv[1] or "{}")) == shape(json.loads(sys.arg
 ' "$1" "$2"
 }
 
-# Refuses to regenerate over a PlatformAgent whose spec.scope was set by hand
-# and declares something the SCOPE_* keys do not carry. Before install.env
-# carried the keys, editing the CR was the documented way to set the field;
-# the chart now renders the block from those keys on every apply, empty lists
-# included, and the reconcile reads a project missing from `projects` as the
-# declaration that drops it, so an apply over such a CR would retire every
-# Cluster Agent profile the hand-set scope produced.
+# Refuses to regenerate when the live PlatformAgent names projects in
+# spec.scope and SCOPE_PROJECTS names none. Before install.env carried the
+# keys, editing the CR was the documented way to set the field; the chart now
+# renders the block from the keys on every apply, empty lists included, and
+# the reconcile reads a project missing from `projects` as the declaration
+# that drops it, so an apply from empty keys over such a CR would retire every
+# Cluster Agent profile the hand-set scope produced. One rule, on purpose: a
+# key that names any project is the declaration and changes the scope freely
+# (removing a project retires its profiles, which is what the operator asked
+# for), and the only run refused is the one that would drop every project
+# without naming one -- the pre-key install, a partial install.env, an empty
+# flag. Emptying the scope on purpose is SCOPE_GUARD_ENABLED=false for one
+# run. Nothing is read from the Helm release: what the chart last rendered is
+# no guide once a retag copies the CR's scope into the release too.
 #
-# "Set by hand" is decided against the Helm release, not against the keys: a
-# scope the chart itself rendered on the last apply is recorded in the
-# release's values (`helm get values`), so a live scope equal to that record
-# is chart-owned, and editing the keys is the ordinary way to change it --
-# removing a project retires its profiles on purpose, and that run must not be
-# refused. A live scope that differs from the record (or a release that
-# recorded no scope at all) is a hand edit, and then every live entry has to
-# be in its key; a partial install.env is refused with the three lines that
-# carry the whole live declaration printed.
-#
-# Reads the CR and the release through the install's own kubeconfig context
-# by name, not the current context, and says so when it cannot read the CR,
-# since a silent skip here is a silent deletion later. SCOPE_GUARD_ENABLED=false
-# turns it off: uninstall.sh sets it, since a destroy keeps nothing either
-# way, and an operator who means to drop a hand-set scope sets it for one run.
-# SCOPE_GUARD_REFUSES=false keeps the check and its message but lets the run
-# go on: upgrade.sh sets it for --plan, which applies nothing and is the
-# artefact that shows what the refusal protects, and for its harness and
-# operator modes, which leave the CR's scope exactly as it is.
+# Reads the CR through the install's own kubeconfig context by name, not the
+# current context, and says so when it cannot, since a silent skip here is a
+# silent deletion later. SCOPE_GUARD_ENABLED=false turns it off: uninstall.sh
+# sets it, since a destroy keeps nothing either way. SCOPE_GUARD_REFUSES=false
+# keeps the check and its message but lets the run go on: upgrade.sh sets it
+# for --plan, which applies nothing and is the artefact that shows what the
+# refusal protects, and for its harness and operator modes, which leave the
+# CR's scope exactly as it is.
 guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local context
@@ -1657,86 +1652,56 @@ guard_hand_declared_scope() {
     if printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN"; then
       return 0
     fi
-    print_warning "Could not read the PlatformAgent in '${ns}' through kubectl context '${context}' (${kubectl_err:-no detail}), so the hand-declared-scope check did not run. If that CR carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+    print_warning "Could not read the PlatformAgent in '${ns}' through kubectl context '${context}' (${kubectl_err:-no detail}), so the hand-declared-scope check did not run. If that CR names projects in spec.scope and install.env's SCOPE_PROJECTS names none, this apply empties the scope and retires those projects' Cluster Agent profiles."
     return 0
   fi
   # The comparison runs in python3, which the state readers above already
   # need; a machine where it cannot run gets the same loud skip as an
   # unreadable CR, never a silent pass.
   if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import json' >/dev/null 2>&1; then
-    print_warning "python3 is not available, so the hand-declared-scope check did not run. If the PlatformAgent in '${ns}' carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+    rm -f "$err_file"
+    print_warning "python3 is not available, so the hand-declared-scope check did not run. If the PlatformAgent in '${ns}' names projects in spec.scope and install.env's SCOPE_PROJECTS names none, this apply empties the scope and retires those projects' Cluster Agent profiles."
     return 0
   fi
-  # The release's recorded values. No release at all is `{}`: nothing is then
-  # known to be chart-owned, which is the pre-key install whose scope was set
-  # by hand and the case this guard is for. Any other failure is a read that
-  # did not happen, and gets the same loud skip as an unreadable CR rather
-  # than a wrong "hand-set" verdict on an ordinary shrink.
-  local release_json helm_err
-  if ! release_json="$(helm --kube-context "$context" get values "$KUBE_AGENTS_HELM_RELEASE" -n "$ns" -o json 2>"$err_file")"; then
-    helm_err="$(cat "$err_file" 2>/dev/null)"
-    if ! printf '%s' "$helm_err" | grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN"; then
-      rm -f "$err_file"
-      print_warning "Could not read the values of Helm release '${KUBE_AGENTS_HELM_RELEASE}' in '${ns}' through kubectl context '${context}' (${helm_err:-no detail}), so the hand-declared-scope check did not run. If the PlatformAgent there carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
-      return 0
-    fi
-    release_json="{}"
-  fi
-  [ -n "$release_json" ] || release_json="{}"
   local missing
-  missing="$(printf '%s\n---\n%s' "$cr_json" "$release_json" | SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
-    SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" python3 -c '
+  missing="$(printf '%s' "$cr_json" | SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" python3 -c '
 import json, os, re, sys
-split = lambda key: [item for item in re.split(r"[ ,\t\n]+", os.environ.get(key, "")) if item]
+keys = [item for item in re.split(r"[ ,\t\n]+", os.environ.get("SCOPE_PROJECTS", "")) if item]
 sep = os.environ["SCOPE_SEP"]
-
-def shape(scope):
-    scope = scope or {}
-    exclude = scope.get("exclude") or {}
-    return {
-        "SCOPE_PROJECTS": scope.get("projects") or [],
-        "SCOPE_EXCLUDE_PROJECTS": exclude.get("projects") or [],
-        "SCOPE_EXCLUDE_CLUSTERS": [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", "")))
-                                   for c in exclude.get("clusters") or []],
-    }
-
-cr_text, _, release_text = sys.stdin.read().partition("\n---\n")
 try:
-    items = json.loads(cr_text).get("items", [])
-    release = json.loads(release_text or "{}") or {}
+    items = json.load(sys.stdin).get("items", [])
 except Exception as exc:
     print("unreadable: %s" % exc, file=sys.stderr)
     sys.exit(2)
-recorded = shape(((release.get("platformAgent") or {}).get("scope")))
 for item in items:
-    live = shape((item.get("spec") or {}).get("scope"))
-    if all(sorted(live[key]) == sorted(recorded[key]) for key in live):
-        continue  # what the chart last rendered: chart-owned, the keys decide
-    missing = {key: [v for v in values if v not in split(key)] for key, values in live.items()}
-    if not any(missing.values()):
+    scope = (item.get("spec") or {}).get("scope") or {}
+    projects = scope.get("projects") or []
+    if not projects or keys:
         continue
-    print("# " + "; ".join("%s lacks %s" % (key, " ".join(values)) for key, values in missing.items() if values))
-    for key, values in live.items():
-        merged = split(key) + [v for v in values if v not in split(key)]
-        print("%s=\"%s\"" % (key, " ".join(merged)))
+    exclude = scope.get("exclude") or {}
+    clusters = [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []]
+    print("# the PlatformAgent names %s and SCOPE_PROJECTS names nothing" % " ".join(projects))
+    print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
+    print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(exclude.get("projects") or []))
+    print("SCOPE_EXCLUDE_CLUSTERS=\"%s\"" % " ".join(clusters))
     break
 ' 2>"$err_file")" || {
     kubectl_err="$(cat "$err_file" 2>/dev/null)"; rm -f "$err_file"
-    print_warning "The hand-declared-scope check could not compare the PlatformAgent in '${ns}' against install.env (${kubectl_err:-python3 failed}), so it did not run. If that CR carries a spec.scope the SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+    print_warning "The hand-declared-scope check could not read the PlatformAgent in '${ns}' (${kubectl_err:-python3 failed}), so it did not run. If that CR names projects in spec.scope and install.env's SCOPE_PROJECTS names none, this apply empties the scope and retires those projects' Cluster Agent profiles."
     return 0
   }
   rm -f "$err_file"
   [ -n "$missing" ] || return 0
   if ! is_truthy "${SCOPE_GUARD_REFUSES:-true}"; then
-    print_warning "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. This run applies nothing; an apply from these keys would rewrite the CR: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
+    print_warning "The PlatformAgent in '${ns}' names projects in spec.scope and install.env's SCOPE_PROJECTS names none. This run applies nothing; a full apply from these keys would empty the scope and retire those projects' Cluster Agent profiles."
     print_info "Record the live declaration in install.env before the apply:"
     printf '%s\n' "$missing"
     return 0
   fi
-  print_error "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
-  print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run; a full upgrade is what applies it (a harness or operator retag leaves the CR's scope as it is):"
+  print_error "The PlatformAgent in '${ns}' names projects in spec.scope and install.env's SCOPE_PROJECTS names none. Applying would empty the scope and retire those projects' Cluster Agent profiles."
+  print_info "The keys own the field from now on. Record the live declaration in install.env and re-run; a full upgrade is what applies it (a harness or operator retag leaves the CR's scope as it is):"
   printf '%s\n' "$missing"
-  print_info "To drop those entries on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
+  print_info "To drop every project on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
   return 1
 }
 

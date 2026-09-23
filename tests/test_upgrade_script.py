@@ -453,12 +453,11 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         """
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('keys_json="$(scope_values_json)" || return 1', retag)
-        self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
+        self.assertIn('if [ -n "${RETAG_SCOPE_JSON:-}" ]; then', retag)
+        self.assertIn('--set-json "platformAgent.scope=${RETAG_SCOPE_JSON}"', retag)
         # Only when the engine has the helper: on the curl path an older
         # installer_common.sh has neither the function nor a chart key to set.
-        self.assertIn("if declare -F scope_values_json", retag)
-        self.assertLess(retag.index("if declare -F scope_values_json"), retag.index('keys_json="$(scope_values_json)"'))
+        self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F scope_values_json', text)
 
     def test_a_retag_carries_the_crs_own_scope_or_refuses(self):
         """harness and operator mode run no Terraform, so no scope may change
@@ -469,13 +468,19 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         rather than guess; keys that differ are said out loud for full mode."""
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('if ! scope_json="$(live_scope_json "$target_namespace")"; then', retag)
-        self.assertIn("return 1", retag[retag.index("live_scope_json"):])
-        self.assertIn('if ! scope_json_equal "$scope_json" "$keys_json"; then', retag)
-        self.assertIn("--upgrade-mode=full to apply the change", retag)
-        self.assertNotIn('scope_json="$keys_json"', retag, "the keys never travel through a retag")
-        self.assertNotIn("release_scope_json", retag)
-        self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
+        self.assertIn('--set-json "platformAgent.scope=${RETAG_SCOPE_JSON}"', retag)
+        self.assertNotIn("scope_values_json)", retag, "the keys never travel through a retag")
+        self.assertNotIn("release_scope_json", text)
+        # Read before the mode dispatch, so a failed read or an absent block
+        # refuses before the CRD apply rather than between it and the rollout.
+        read_at = text.index('RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"')
+        dispatch_at = text.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
+        self.assertLess(read_at, dispatch_at)
+        pre = text[read_at:dispatch_at]
+        self.assertIn("exit 1", pre)
+        self.assertIn("carries no spec.scope block", pre)
+        self.assertIn('if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then', pre)
+        self.assertIn("--upgrade-mode=full to apply the change", pre)
 
     def test_only_a_full_upgrade_lets_the_scope_guard_refuse(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

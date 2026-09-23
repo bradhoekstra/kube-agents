@@ -910,17 +910,11 @@ main() {
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
-    if declare -F scope_values_json >/dev/null 2>&1; then
-      local keys_json scope_json
-      keys_json="$(scope_values_json)" || return 1
-      if ! scope_json="$(live_scope_json "$target_namespace")"; then
-        print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read, or run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
-        return 1
-      fi
-      if ! scope_json_equal "$scope_json" "$keys_json"; then
-        print_warning "install.env's SCOPE_* keys differ from the scope the PlatformAgent carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and leaves the CR's scope as it is; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
-      fi
-      set_args+=(--set-json "platformAgent.scope=${scope_json}")
+    # RETAG_SCOPE_JSON was read, and its absence refused, before the mode
+    # dispatch below, ahead of the CRD apply, so the read cannot stop an
+    # operator upgrade half-done. Empty means the engine has no scope input.
+    if [ -n "${RETAG_SCOPE_JSON:-}" ]; then
+      set_args+=(--set-json "platformAgent.scope=${RETAG_SCOPE_JSON}")
     fi
     helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reset-then-reuse-values \
@@ -985,6 +979,29 @@ main() {
         ;;
     esac
     exit "$plan_status"
+  fi
+
+  # What a retag carries for platformAgent.scope: the CR's own live scope,
+  # read here before anything is applied. A read that fails, or a CR with no
+  # scope block (absent is a declaration of its own that a present-empty
+  # block would overwrite), refuses the retag now rather than after the CRD
+  # apply; full mode renders the scope from install.env. Only when the
+  # engine has the scope input at all (see helm_retag).
+  RETAG_SCOPE_JSON=""
+  if [ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F scope_values_json >/dev/null 2>&1; then
+    if ! RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"; then
+      print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read, or run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
+      exit 1
+    fi
+    if [ -z "$RETAG_SCOPE_JSON" ]; then
+      print_error "The PlatformAgent in '${target_namespace}' carries no spec.scope block (a write through an older operator drops it); a ${PARAM_UPGRADE_MODE} upgrade would render an empty block over it and the reconcile would retire the projects the last declaration carried. Run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
+      exit 1
+    fi
+    local retag_keys_json
+    retag_keys_json="$(scope_values_json)" || exit 1
+    if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
+      print_warning "install.env's SCOPE_* keys differ from the scope the PlatformAgent carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and leaves the CR's scope as it is; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
+    fi
   fi
 
   case "$PARAM_UPGRADE_MODE" in
