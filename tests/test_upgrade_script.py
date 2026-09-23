@@ -442,19 +442,38 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
         self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
 
-    def test_a_retag_renders_no_scope_block(self):
+    def test_a_retag_carries_the_crs_own_scope_or_none_at_all(self):
         """harness and operator mode run no Terraform, so no scope may change
-        through them. The retag sets the chart's platformAgent.scope.omit,
-        which renders no block: Helm leaves a field neither manifest carries
-        alone and drops one the previous manifest had, and the reconcile reads
-        an absent block as carrying the last declaration forward. Only when
-        the engine has the scope input (an older chart has no such key)."""
+        through them: the live spec.scope is read before the mode dispatch
+        (ahead of the CRD apply) and passed back as it is; a CR with no block
+        gets no block through platformAgent.scope.omit, so absent stays
+        absent; a failed read refuses before anything is applied; keys that
+        differ are said out loud and left for full mode."""
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('if declare -F hcl_scope_block >/dev/null 2>&1; then', retag)
+        self.assertIn('if [ "${RETAG_SCOPE_OMIT:-}" = "true" ]; then', retag)
         self.assertIn('set_args+=(--set "platformAgent.scope.omit=true")', retag)
-        for gone in ("scope_values_json", "live_scope_json", "release_scope_json", "RETAG_SCOPE_JSON", "--set-json"):
-            self.assertNotIn(gone, text, f"{gone} is no longer part of the retag")
+        self.assertIn('set_args+=(--set "platformAgent.scope.omit=false" --set-json "platformAgent.scope=${RETAG_SCOPE_JSON}")', retag)
+        self.assertNotIn("scope_values_json)", retag, "the keys never travel through a retag")
+        read_at = text.index('RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"')
+        dispatch_at = text.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
+        self.assertLess(read_at, dispatch_at)
+        pre = text[read_at:dispatch_at]
+        self.assertIn("exit 1", pre)
+        self.assertIn('RETAG_SCOPE_OMIT="true"', pre)
+        self.assertIn('if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then', pre)
+        self.assertIn("--upgrade-mode=full to apply the change", pre)
+        self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block', text)
+
+    def test_a_full_upgrade_checks_the_scope_block_after_the_apply(self):
+        # The apply that introduces spec.scope can write the CR through the
+        # previous operator's webhook, which drops the field; the check runs
+        # after the apply and fails the run with the way out.
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        full = text[text.index("    full)") : text.index("  esac", text.index("    full)"))]
+        apply_at = full.index("apply -auto-approve -input=false")
+        check_at = full.index('verify_scope_block_after_apply "$target_namespace" || exit 1')
+        self.assertLess(apply_at, check_at)
 
     def test_the_scope_guard_runs_only_for_a_full_apply(self):
         # A plan applies nothing and is what shows the destroys the guard

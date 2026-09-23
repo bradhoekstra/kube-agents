@@ -567,8 +567,8 @@ binds them from its `scope` variable and fills this value from the same object, 
 bare `helm install` leaves the grant to you. The
 [PlatformAgent CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md)
 owns the field. `platformAgent.scope.omit` renders no block at all; it exists for `upgrade.sh`'s
-image retags, which run no Terraform and must leave the CR's scope alone, and is not for an
-install to set by hand.
+image retags, which pass the CR's own scope back as it is and set this for a CR that has no block,
+and is not for an install to set by hand.
 
 ### ServiceAccount ownership
 

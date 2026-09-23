@@ -5016,6 +5016,12 @@ main() {
   # install.sh is the one front door allowed to mint an API_SERVER_KEY, and only
   # after the generator has tried the live Secret. upgrade.sh and uninstall.sh
   # leave this unset so an unfindable key stays an error for them.
+  #
+  # A dry run or a generate-only run applies nothing, so the hand-declared
+  # scope check speaks without refusing, the way upgrade.sh --plan does.
+  if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    export SCOPE_GUARD_REFUSES="false"
+  fi
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
     write_tfvars_from_state "$tfvars_file" "$image_tag"
   # After the generator, because its Secret-recovery loop is the thing that can
@@ -5291,6 +5297,9 @@ main() {
     print_error "Namespace '${namespace}' was not created. Installation is incomplete."
     exit 1
   fi
+  # A declared scope written through a previous operator's webhook is dropped
+  # silently; the function says what to run when it was.
+  verify_scope_block_after_apply "$namespace" || exit 1
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
     if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then

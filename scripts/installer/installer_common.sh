@@ -1543,6 +1543,94 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
 }
 
 
+# The three SCOPE_* keys as the chart value `platformAgent.scope`, in JSON,
+# for comparing against what the CR carries.
+scope_values_json() {
+  SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
+  SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" \
+  python3 -c '
+import json, os, re
+split = lambda key: [item for item in re.split(r"[ ,\t\n]+", os.environ.get(key, "")) if item]
+sep = os.environ["SCOPE_SEP"]
+clusters = []
+for triple in split("SCOPE_EXCLUDE_CLUSTERS"):
+    project, location, cluster = triple.split(sep)
+    clusters.append({"projectId": project, "location": location, "clusterName": cluster})
+print(json.dumps({"projects": split("SCOPE_PROJECTS"),
+                  "exclude": {"projects": split("SCOPE_EXCLUDE_PROJECTS"), "clusters": clusters}},
+                 separators=(",", ":")))
+'
+}
+
+# The live PlatformAgent's spec.scope, in JSON with every list present, for a
+# `helm upgrade --set-json` that must leave the CR's scope exactly as it is.
+# upgrade.sh's harness and operator modes run no Terraform, so no scope may
+# change through them (the keys would list a project with no grant or retire
+# one with its grants still bound), and the chart's default is empty lists, so
+# a retag that said nothing would empty it; and an absent block cannot be
+# dropped for a present one either, since the reconcile lists the management
+# project alone without the block. Reads through the install's context by
+# name and fails, with kubectl's message, when it cannot read the CR or finds
+# none. A CR with no scope block prints nothing and succeeds: the caller
+# renders no block (`platformAgent.scope.omit`) so absent stays absent.
+live_scope_json() {
+  local ns="$1" context
+  context="$(gke_context_name)"
+  kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json | python3 -c '
+import json, sys
+items = json.load(sys.stdin).get("items", [])
+if not items:
+    print("no PlatformAgent found", file=sys.stderr)
+    sys.exit(1)
+scope = (items[0].get("spec") or {}).get("scope")
+if scope is None:
+    sys.exit(0)
+exclude = scope.get("exclude") or {}
+print(json.dumps({"projects": scope.get("projects") or [],
+                  "exclude": {"projects": exclude.get("projects") or [],
+                              "clusters": [{"projectId": c.get("projectId", ""), "location": c.get("location", ""),
+                                            "clusterName": c.get("clusterName", "")} for c in exclude.get("clusters") or []]}},
+                 separators=(",", ":")))
+'
+}
+
+# Whether two `platformAgent.scope` JSON values declare the same sets.
+scope_json_equal() {
+  python3 -c '
+import json, sys
+def shape(scope):
+    scope = scope or {}
+    exclude = scope.get("exclude") or {}
+    return (sorted(scope.get("projects") or []), sorted(exclude.get("projects") or []),
+            sorted(json.dumps(c, sort_keys=True) for c in exclude.get("clusters") or []))
+sys.exit(0 if shape(json.loads(sys.argv[1] or "{}")) == shape(json.loads(sys.argv[2] or "{}")) else 1)
+' "$1" "$2"
+}
+
+# After a full apply that declared a scope: is the block on the live CR? The
+# apply that introduces the field writes the CR in the same Helm pass that
+# rolls the operator, so the write can pass the previous operator's defaulting
+# webhook, which drops a field its struct does not have. The apply reports
+# success, the release records the block, and the CR has none; and because
+# Helm patches a custom resource from the difference between its recorded and
+# rendered manifests, a plain second apply renders the same block and sends
+# no patch. Nothing else would say so: the guard sees a CR that names no
+# projects. Prints the way out: an operator-mode retag, which records no block
+# (the CR is absent, so the retag renders none), then a full upgrade, which
+# renders it again against the new webhook.
+verify_scope_block_after_apply() {
+  local ns="$1"
+  [ -n "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ] || return 0
+  local live
+  if ! live="$(live_scope_json "$ns" 2>/dev/null)"; then
+    print_warning "Could not read the PlatformAgent in '${ns}' after the apply to confirm it carries the declared spec.scope. If the operator before this apply predated the field, its webhook may have dropped the block; check with: kubectl get platformagent -n ${ns} -o jsonpath='{.items[0].spec.scope}'"
+    return 0
+  fi
+  [ -z "$live" ] || return 0
+  print_error "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent in '${ns}' carries no spec.scope block: the CR was written through the previous operator's webhook, which dropped the field. The IAM is bound; the reconcile lists the management project alone until the block is on the CR, and a plain re-apply renders the same block and sends no patch. Run ./upgrade.sh --upgrade-mode=operator (a retag over an absent block records none) and then ./upgrade.sh (full), which renders the block again against the new operator's webhook."
+  return 1
+}
+
 # Refuses to regenerate when the live PlatformAgent declares a scope by hand
 # that install.env's SCOPE_* keys would empty. Before install.env carried the
 # keys, editing the CR was the documented way to set the field; the chart now

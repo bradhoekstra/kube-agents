@@ -241,12 +241,18 @@ removing a project from `SCOPE_PROJECTS` and running `upgrade.sh` is never refus
 scope on purpose is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
 destroy keeps nothing either way. The check reads the CR through the install's own kubeconfig
 context by name and fails closed: a read it cannot make refuses the run with the same override,
-because the apply that follows would not stop. `upgrade.sh`'s `harness` and `operator` modes render
-no scope block at all (the chart's `platformAgent.scope.omit`), since they run no Terraform: Helm
-then leaves a field neither manifest carries alone and drops one the previous manifest had, the
-reconcile carries the last declaration forward and retires nothing, and the next full `upgrade.sh`
-renders the block from the keys again; in those modes the check does not run, and under `--plan` it
-warns rather than refuses. `install.sh` takes the same three as `--scope-projects`,
+because the apply that follows would not stop. `upgrade.sh`'s `harness` and `operator` modes leave the CR's scope exactly as it is on every Helm
+retag, hand edits included, since they run no Terraform: the retag reads the live scope back before
+anything is applied and passes it as it is, renders no block for a CR that has none (the chart's
+`platformAgent.scope.omit`), refuses when it cannot read the CR, and says so when the keys differ,
+leaving the change for `full` mode, which binds the IAM and renders the CR together; in those modes
+the check does not run, and under `--plan`, `install.sh --dry-run` and `--generate-only` it warns
+rather than refuses. One more thing a full apply checks afterwards: the apply that introduces
+`spec.scope` writes the CR in the same Helm pass that rolls the operator, so the write can pass the
+previous operator's webhook, which drops the field, and a plain re-apply renders the same block and
+sends no patch. When the keys declare a scope and the CR carries no block after the apply, the run
+fails and names the way out: `upgrade.sh --upgrade-mode=operator`, which records no block, then
+`upgrade.sh`, which renders it again against the new operator. `install.sh` takes the same three as `--scope-projects`,
 `--scope-exclude-projects` and `--scope-exclude-clusters` on a first install, which records them; on
 an existing `install.env` a flag that disagrees with the recorded key, or a value the file does not
 record arriving from a flag or the environment, is refused rather than applied for one run, because

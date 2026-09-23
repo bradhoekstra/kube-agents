@@ -1048,6 +1048,95 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
             self.assertIn("  projects = []", dest.read_text())
 
+    def test_live_scope_json_reads_the_crs_own_scope_or_fails(self):
+        # A retag carries the CR's scope exactly as it is, so the reader has
+        # to print it with every list present, print nothing for a CR without
+        # the block (absent stays absent through `omit`), and fail (never
+        # guess) when it cannot read the CR or finds none; scope_json_equal
+        # compares the sets and scope_values_json renders the keys.
+        with_scope = self._run(
+            'live_scope_json kubeagents-system',
+            kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
+        )
+        self.assertEqual(with_scope.returncode, 0, with_scope.stderr)
+        self.assertEqual(
+            json.loads(with_scope.stdout),
+            {"projects": ["payments-prod"], "exclude": {"projects": ["*-sandbox"],
+             "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
+        )
+        no_block = self._run(
+            'live_scope_json kubeagents-system; echo "[$?]"',
+            kubectl_script=(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            ),
+        )
+        self.assertEqual(no_block.stdout.strip(), "[0]", no_block.stderr)
+        unreadable = self._run('live_scope_json kubeagents-system; echo "rc=$?"', kubectl_script="#!/usr/bin/env bash\nexit 1\n")
+        self.assertIn("rc=1", unreadable.stdout, unreadable.stderr)
+        none = self._run(
+            'live_scope_json kubeagents-system; echo "rc=$?"',
+            kubectl_script=(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"get platformagents"*) echo \'{"items":[]}\'; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            ),
+        )
+        self.assertIn("rc=1", none.stdout, none.stderr)
+        equal = self._run(
+            'scope_json_equal \'{"projects":["b","a"],"exclude":{"projects":[],"clusters":[]}}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
+        )
+        self.assertIn("rc=0", equal.stdout, equal.stderr)
+        keys = self._run(
+            'scope_values_json',
+            env={"SCOPE_PROJECTS": "payments-prod, payments-staging", "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
+        )
+        self.assertEqual(
+            json.loads(keys.stdout),
+            {"projects": ["payments-prod", "payments-staging"],
+             "exclude": {"projects": [], "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
+        )
+
+    def test_a_scope_the_webhook_dropped_fails_the_apply_with_the_way_out(self):
+        # The apply that introduces spec.scope writes the CR through the
+        # previous operator's webhook, which drops the field, and a plain
+        # re-apply sends no patch. With keys declared and no block on the CR
+        # the check fails and names the retag-then-full recovery; with no keys,
+        # a block present, or an unreadable CR it does not fail the run.
+        absent = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
+            "esac\n"
+            "exit 1\n"
+        )
+        dropped = self._run(
+            'verify_scope_block_after_apply kubeagents-system; echo "rc=$?"',
+            env={"SCOPE_PROJECTS": "payments-prod"},
+            kubectl_script=absent,
+        )
+        self.assertIn("rc=1", dropped.stdout, dropped.stderr)
+        self.assertIn("carries no spec.scope block", dropped.stdout + dropped.stderr)
+        self.assertIn("--upgrade-mode=operator", dropped.stdout + dropped.stderr)
+        for label, env, script in (
+            ("no keys", {}, absent),
+            ("block present", {"SCOPE_PROJECTS": "payments-prod"}, self._scoped_cr_kubectl(["payments-prod"])),
+            ("unreadable", {"SCOPE_PROJECTS": "payments-prod"}, "#!/usr/bin/env bash\nexit 1\n"),
+        ):
+            with self.subTest(label=label):
+                proc = self._run(
+                    'print_warning() { echo "WARN: $*"; }; verify_scope_block_after_apply kubeagents-system; echo "rc=$?"',
+                    env=env, kubectl_script=script,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                if label == "unreadable":
+                    self.assertIn("Could not read the PlatformAgent", proc.stdout + proc.stderr)
+
     def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
         # A first adoption: the cluster exists, kube-agents has never been on
         # it, kubectl says there is no such resource type. Nothing to protect,

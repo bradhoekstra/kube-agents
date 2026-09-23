@@ -6930,6 +6930,25 @@ class NoChatTerminalAccessTest(unittest.TestCase):
         return self.source[start : self.source.index("\n  }\n", start)]
 
 
+class ScopeGuardModesTest(unittest.TestCase):
+    """install.sh's dealings with the hand-declared-scope check."""
+
+    def test_a_dry_run_or_generate_only_run_lets_the_check_speak_without_refusing(self):
+        text = _INSTALL_SH.read_text()
+        export_at = text.index('if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n    export SCOPE_GUARD_REFUSES="false"')
+        generate_at = text.index('KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n    write_tfvars_from_state "$tfvars_file" "$image_tag"', export_at)
+        self.assertLess(export_at, generate_at)
+
+    def test_the_scope_block_is_checked_after_the_apply(self):
+        # A declared scope written through a previous operator's webhook is
+        # dropped silently; the check runs once the namespace is confirmed and
+        # fails the run with the way out.
+        text = _INSTALL_SH.read_text()
+        ns_at = text.index("Namespace '${namespace}' was not created. Installation is incomplete.")
+        check_at = text.index('verify_scope_block_after_apply "$namespace" || exit 1')
+        self.assertLess(ns_at, check_at)
+
+
 class BannerColourVariablesAreDefinedTest(unittest.TestCase):
     """Every C_* install.sh interpolates is one install.sh itself defines.
 

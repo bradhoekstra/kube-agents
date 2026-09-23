@@ -462,8 +462,7 @@ the chart owns the CR and renders the block from `platformAgent.scope`, always p
 included; the Terraform composition fills that value from its `scope` variable, which the installer
 writes from `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`.
 A scope set by editing the CR by hand on an installer-managed install is replaced by those keys on
-the next full `upgrade.sh` (the `harness` and `operator` modes re-tag images and render no scope block, which the reconcile
-reads as carrying the last declaration forward), so record it in `install.env` first; a full run
+the next full `upgrade.sh` (the `harness` and `operator` modes re-tag images and pass the CR's scope back as it is), so record it in `install.env` first; a full run
 refuses while the CR declares by hand what the keys would empty, and prints the lines to add. A key
 that names any project is the declaration and changes the scope freely, in full mode.
 Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
