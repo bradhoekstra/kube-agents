@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 1's IAM bindings, installer path and `platform_mcp_server.py` change, and steps 2 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 1's IAM bindings and installer path ship too (the `scope` input on `kube-agents-iam` and the composition, `platformAgent.scope` in the chart, `SCOPE_*` in `install.env`); its `platform_mcp_server.py` change, and steps 2 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -355,9 +355,10 @@ owns them, which is the property #588 lost when its revocation lived in a bash f
 ## 7. The onboarding lifecycle
 
 **Adding a project.** Under a declared folder or organisation: nothing to do; it is discovered at
-the next tick. As an explicit project: add it to `scope.projects` in the tfvars and run
-`upgrade.sh`, which binds the IAM and renders the CR from the same value (a hand-applied CR is
-edited separately, and §11 says why that split is the weak point). The binding then exists before
+the next tick. As an explicit project: add it to `SCOPE_PROJECTS` in `install.env` and run
+`upgrade.sh` in its default full mode, which regenerates the tfvars, binds the IAM and renders the CR
+from the same value; a hand-driven composition sets `scope.projects` in its own tfvars (a hand-applied
+CR is edited separately, and §11 says why that split is the weak point). The binding then exists before
 the reconcile tries the list, and the project's
 outcome goes from `denied` to `ok` at the following tick. The order matters and the snapshot shows
 it: a project added to the CR before Terraform has run reads `denied`, which is correct and visible,

@@ -142,7 +142,9 @@ absent destroys the stockout log sink, its alerts topic and subscription, and th
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
 composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
-and drops the custom roles.
+and drops the custom roles; `SCOPE_PROJECTS` absent renders an empty scope, which revokes every
+scope binding and retires those projects' Cluster Agent profiles over the reconcile's next two clean
+runs.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -229,8 +231,8 @@ and the chart renders the CR. The block is always written, empty lists included,
 that drops a project makes the next `upgrade.sh` revoke its grants and retire its
 profiles. A triple that is not three non-empty parts fails the generator before any file
 is written. `install.sh` takes the same three as `--scope-projects`,
-`--scope-exclude-projects` and `--scope-exclude-clusters`; the Day-2 menu does not edit
-them, so change them in the file and run `upgrade.sh`.
+`--scope-exclude-projects` and `--scope-exclude-clusters`; the interview never asks for them and
+the Day-2 menu does not edit them, so change them in the file and run `upgrade.sh`.
 
 ### The predecessor: `vars.sh`
 
