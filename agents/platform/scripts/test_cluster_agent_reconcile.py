@@ -740,6 +740,10 @@ class ScopeTest(HomesMixin):
             created.append((pr, c, l))
             return f"cluster-{c}"
 
+        # A test that patched create_profile itself keeps its own stub; the harness only
+        # supplies one when the caller did not.
+        create_stub = rec.create_profile if isinstance(rec.create_profile, mock.Mock) else create
+
         def list_project(project, timeout=None):
             value = listings.get(project, ([], rec.OUTCOME_OK))
             return value if isinstance(value, tuple) else (value, rec.OUTCOME_OK)
@@ -756,7 +760,7 @@ class ScopeTest(HomesMixin):
                                side_effect=lambda home: identities.get(home.name)), \
              mock.patch.object(rec, "_cluster_exists", **({"side_effect": exists} if callable(exists) else {"return_value": exists})), \
              mock.patch.object(rec, "delete_profile", side_effect=delete), \
-             mock.patch.object(rec, "create_profile", side_effect=create):
+             mock.patch.object(rec, "create_profile", side_effect=create_stub):
             report = rec.reconcile(dry_run=dry_run)
         return report, created, deleted
 
@@ -1268,10 +1272,52 @@ class ScopeTest(HomesMixin):
         report, created, _ = self._run({"projects": ["p2"], "folders": ["123456789012"]},
                                        {self.MGMT: [], "p2": [("p2", "x", "us-central1")]},
                                        searches={self.FOLDER: (members, rec.OUTCOME_OK)}, exists=describe)
-        self.assertEqual(probes, [("team-a", "dev")])  # one probe, the first cluster in sorted order
+        self.assertEqual(probes, [("team-a", "dev")])  # the first cluster answers 403; the second is not probed
         self.assertEqual(created, [("p2", "x", "us-central1")])  # the explicit project is not probed
         self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
         self.assertEqual(report["create_failed"], [])
+
+    def test_a_member_cluster_the_index_still_names_but_describe_says_is_gone_is_skipped(self):
+        members = {"team-a": [("team-a", "gone", "us-central1"), ("team-a", "live", "us-central1")]}
+        answers = {"gone": False, "live": True}
+        report, created, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                       exists=lambda project, cluster, location: answers[cluster])
+        self.assertEqual(created, [("team-a", "live", "us-central1")])
+        self.assertEqual(report["create_failed"], [])
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_OK)
+
+    def test_a_local_permission_error_on_create_is_not_an_iam_denial_and_skips_nothing_else(self):
+        # An EACCES writing the profile home, or the shim's own "Permission denied", must not read
+        # as a 403: the next cluster in the same project is still attempted, in a member project
+        # and in the management project alike.
+        members = {"team-a": [("team-a", "a1", "us-central1"), ("team-a", "a2", "us-central1")]}
+        attempts: list[str] = []
+
+        def failing_create(pr, c, l):
+            attempts.append(c)
+            raise OSError(13, "Permission denied", f"/opt/data/profiles/cluster-{c}")
+        with mock.patch.object(rec, "create_profile", side_effect=failing_create):
+            report, created, _ = self._run({"folders": ["123456789012"]},
+                                           {self.MGMT: [(self.MGMT, "m1", "us-central1"), (self.MGMT, "m2", "us-central1")]},
+                                           searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                           create_raises=None)
+        self.assertEqual(sorted(attempts), ["a1", "a2", "m1", "m2"])
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_OK)
+        self.assertEqual(len(report["create_failed"]), 4)
+
+    def test_a_carried_row_keeps_the_via_it_had(self):
+        # An unjudged run carries a member with its container via, so a freeze on a later run
+        # still finds it among the container's previous members.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        # Unclean tick: an explicit project unreachable; the folder itself is not declared this run.
+        report, _, deleted = self._run({"projects": ["flaky"]}, {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=["cluster-a"], identities=ids)
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["team-a"]["state"], rows["team-a"]["via"]), (rec.STATE_IN_SCOPE, [self.FOLDER]))
+        self.assertEqual(rec._previous_container_members(self._snapshot(), self.FOLDER), ["team-a"])
 
     def test_a_403_on_create_marks_a_member_denied_and_never_an_explicit_project(self):
         members = {"team-a": [("team-a", "prod", "us-central1")]}
@@ -1283,6 +1329,17 @@ class ScopeTest(HomesMixin):
         # The explicit project's own listing decides its outcome; a per-cluster 403 there is not a revision.
         self.assertEqual(report["projects"]["p2"], rec.OUTCOME_OK)
         self.assertEqual(sorted(report["create_failed"]), ["prod/us-central1", "x/us-central1"])
+
+    def test_a_403_on_create_in_an_explicit_project_skips_none_of_its_other_clusters(self):
+        attempts: list[str] = []
+
+        def failing_create(pr, c, l):
+            attempts.append(c)
+            raise SystemExit("ERROR: failed to fetch credentials for 'x': ResponseError: code=403, message=Required permission")
+        with mock.patch.object(rec, "create_profile", side_effect=failing_create):
+            report, _, _ = self._run({"projects": []}, {self.MGMT: [(self.MGMT, "a", "us-central1"), (self.MGMT, "b", "us-central1"), (self.MGMT, "c", "us-central1")]})
+        self.assertEqual(attempts, ["a", "b", "c"])
+        self.assertEqual(report["projects"][self.MGMT], rec.OUTCOME_OK)
 
     def test_container_searches_share_the_listing_budget_and_the_management_listing_comes_first(self):
         import time

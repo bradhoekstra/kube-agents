@@ -239,12 +239,13 @@ def _scope_has_other_projects(data_dir: Path) -> bool:
 
 
 def _scope_gap_paragraph(data_dir: Path) -> str:
-    """The sweep's note on projects the reconcile could not list, on a scoped install.
+    """The sweep's note on projects and containers the reconcile could not resolve.
 
-    Rendered only when the snapshot names more than one project: an install with no
-    scope renders the prompt it rendered before scopes existed, whatever its one
-    project's outcome, and that prompt already tells the worker what to do when the
-    project cannot be listed.
+    Rendered when a declared folder or organisation could not be resolved, or when the
+    snapshot names more than one project and one of them was not listed. An install with
+    no scope renders the prompt it rendered before scopes existed, whatever its one
+    project's outcome: that prompt already tells the worker what to do when the project
+    cannot be listed.
     """
     containers = _unresolved_containers(data_dir)
     unlisted = _unlisted_projects(data_dir)

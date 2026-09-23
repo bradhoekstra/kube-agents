@@ -139,6 +139,10 @@ SNAPSHOT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # What gcloud says when the account is not granted in a project, and when the GKE API is
 # off there. Anything else is unreachable: the run learned nothing and keeps everything.
 _DENIED_MARKERS = ("PERMISSION_DENIED", "403", "does not have permission", "Permission denied")
+# The create path reads a narrower set: its exception text also carries the shim's own
+# "[Errno 13] Permission denied" on a data-volume or sandbox-directory fault, which is
+# not an IAM answer, so only gcloud's 403 wording counts there.
+_CREATE_DENIED_MARKERS = ("PERMISSION_DENIED", "code=403", "does not have permission")
 _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not been used",
                          "is not enabled", "has not been enabled")
 
@@ -243,9 +247,9 @@ def _list_projects(projects: list[str], deadline: float) -> dict[str, tuple[list
     """List every project, `first` alone and then the rest concurrently, within one budget.
 
     The caller lists the management project first and on its own, at the start of the
-    budget: its listing decides `create_pass_ran`, and when it reaches the sandbox its ssh
-    opens the multiplexed connection the pools then share. The rest run LIST_WORKERS at
-    a time. Every
+    budget, before calling this for the explicit projects: its listing decides
+    `create_pass_ran`, and when it reaches the sandbox its ssh opens the multiplexed
+    connection the pools then share. Here the projects run LIST_WORKERS at a time. Every
     worker's own gcloud timeout is cut to the budget left when it starts, so no
     worker outlives the deadline by more than LIST_GRACE_SECONDS: the interpreter
     joins the pool's threads at exit, and a worker still blocked on gcloud would
@@ -493,12 +497,15 @@ def _resolve_projects(management: str | None, scope: dict,
             ignored.append({"project": management, "pattern": pattern})
         entries.append({"id": management, "via": [VIA_MANAGEMENT], "outcome": None})
         seen.add(management)
+    def add_via(project: str, source: str) -> None:
+        for entry in entries:
+            if entry["id"] == project and source not in entry["via"]:
+                entry["via"] = sorted(entry["via"] + [source])
+
     for project in sorted(set(scope["projects"])):
         if project in seen:
             # Declared explicitly as well as being the management project: both vias.
-            for entry in entries:
-                if entry["id"] == project and VIA_EXPLICIT not in entry["via"]:
-                    entry["via"] = sorted(entry["via"] + [VIA_EXPLICIT])
+            add_via(project, VIA_EXPLICIT)
             continue
         seen.add(project)
         if _excluded_by(project, patterns):
@@ -507,11 +514,6 @@ def _resolve_projects(management: str | None, scope: dict,
         if outcome:
             log(f"{project} is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
         entries.append({"id": project, "via": [VIA_EXPLICIT], "outcome": outcome})
-
-    def add_via(project: str, container: str) -> None:
-        for entry in entries:
-            if entry["id"] == project and container not in entry["via"]:
-                entry["via"] = sorted(entry["via"] + [container])
 
     def frozen_entry(project: str) -> dict | None:
         for entry in entries:
@@ -598,6 +600,14 @@ def _write_snapshot(snapshot: dict) -> None:
         os.replace(tmp, path)
     except Exception as e:  # noqa: BLE001 - the snapshot is a report; failing to write it never fails the run
         log(f"could not write the scope snapshot at {path}: {e}")
+
+
+def _previous_via(previous: dict | None, project: str) -> list[str]:
+    """The `via` the last snapshot recorded for a project, or [] when it had none."""
+    for p in (previous or {}).get("projects", []):
+        if isinstance(p, dict) and p.get("id") == project:
+            return [v for v in (p.get("via") or []) if isinstance(v, str)]
+    return []
 
 
 def _previous_management(previous: dict | None) -> str | None:
@@ -907,7 +917,6 @@ def reconcile(dry_run: bool = False) -> dict:
         # such a project answers the question cheaply; a 403 skips its creates for the
         # run and reads the project `denied` (design §4).
         member_only = not ({VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]))
-        probed = False
         for (proj, cluster, location) in sorted(listed):
             if (proj, cluster, location) in existing_keys:
                 continue
@@ -917,13 +926,23 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"{cluster} ({proj}/{location}) is skipped by RECONCILE_EXCLUDE, a bare name; "
                     "move it to spec.scope.exclude.clusters, the variable retires next release.")
                 continue
-            if member_only and not dry_run and not probed:
-                probed = True
-                _cluster_exists(proj, cluster, location)
-            if proj in _denied_this_run:
-                log(f"{cluster} ({proj}/{location}) has no profile and the project answered 403; "
-                    f"no CREATE under it this run ({OUTCOME_DENIED}).")
-                continue
+            if member_only and not dry_run:
+                # Per cluster: the index lags real state by minutes, so a member's cluster the
+                # index still names may be gone, and the first cluster answering says nothing
+                # about the second.
+                if proj in _denied_this_run:
+                    log(f"{cluster} ({proj}/{location}) has no profile and the project answered 403; "
+                        f"no CREATE under it this run ({OUTCOME_DENIED}).")
+                    continue
+                exists = _cluster_exists(proj, cluster, location)
+                if exists is False:
+                    log(f"{cluster} ({proj}/{location}) is in the asset index but describe says it is gone "
+                        "(deleted, or the index is behind); no profile made for it this run.")
+                    continue
+                if proj in _denied_this_run:
+                    log(f"{cluster} ({proj}/{location}) has no profile and the project answered 403; "
+                        f"no CREATE under it this run ({OUTCOME_DENIED}).")
+                    continue
             if dry_run:
                 log(f"{cluster} ({proj}/{location}) has no profile — WOULD create (dry-run).")
                 report["created"].append(f"{cluster}/{location}")
@@ -933,10 +952,10 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"created profile {name} for {cluster} ({proj}/{location}).")
                 report["created"].append(name)
             except (SystemExit, Exception) as e:  # noqa: BLE001 - one failure never aborts the sweep
-                # create_profile's message is "ERROR: failed to fetch credentials for '<cluster>': <stderr>";
-                # classify the stderr half, not the cluster name.
-                stderr_part = re.sub(r"^ERROR: [^:]*credentials for '[^']*': ", "", str(e))
-                if _classify_list_failure(stderr_part) == OUTCOME_DENIED:
+                # A container-only member's get-credentials 403 revises the project (design §4);
+                # an explicit or management project's own listing already decided its outcome,
+                # and a local "Permission denied" is not an IAM answer, so neither counts here.
+                if member_only and any(m in str(e) for m in _CREATE_DENIED_MARKERS):
                     _denied_this_run.add(proj)
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
                 report["create_failed"].append(f"{cluster}/{location}")
@@ -1138,7 +1157,9 @@ def reconcile(dry_run: bool = False) -> dict:
          "clusters": cluster_counts.get(e["id"])}
         for e in entries
     ] + [
-        {"id": pid, "via": [], "outcome": OUTCOME_UNREACHABLE, "state": STATE_IN_SCOPE,
+        # Carried with the via it had, so a container frozen on a later run still finds the
+        # members an unjudged run carried, and the gate still sees what produced them.
+        {"id": pid, "via": _previous_via(previous, pid), "outcome": OUTCOME_UNREACHABLE, "state": STATE_IN_SCOPE,
          "clusters": remaining(pid)}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
