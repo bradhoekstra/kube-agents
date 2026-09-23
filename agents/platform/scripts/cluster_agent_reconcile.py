@@ -136,6 +136,12 @@ STATE_IN_SCOPE = "in-scope"
 STATE_RETIRING = "retiring"
 SNAPSHOT_TMP_SUFFIX = ".tmp"
 SNAPSHOT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# How long a project reached only through a container is kept after the asset index stops
+# placing it under one, before the ordinary two-run retire applies. Covers the index's lag
+# after a move (minutes to hours, measured) without keeping a deleted project's profiles for
+# ever; a project deleted answers 403 to describe, never NotFound, so nothing else retires it.
+INDEX_LAG_GRACE_SECONDS = 24 * 3600
+ABSENT_SINCE_KEY = "absentSince"
 # What gcloud says when the account is not granted in a project, and when the GKE API is
 # off there. Anything else is unreachable: the run learned nothing and keeps everything.
 _DENIED_MARKERS = ("PERMISSION_DENIED", "403", "does not have permission", "Permission denied")
@@ -596,6 +602,14 @@ def _previous_via(previous: dict | None, project: str) -> list[str]:
     return []
 
 
+def _previous_absent_since(previous: dict | None, project: str) -> str | None:
+    """When the last snapshot first found a container member absent from the index, if it did."""
+    for p in (previous or {}).get("projects", []):
+        if isinstance(p, dict) and p.get("id") == project and isinstance(p.get(ABSENT_SINCE_KEY), str):
+            return p[ABSENT_SINCE_KEY]
+    return None
+
+
 def _previous_management(previous: dict | None) -> str | None:
     """The management project the last run resolved, from its `via`, or None."""
     if not previous:
@@ -995,21 +1009,38 @@ def reconcile(dry_run: bool = False) -> dict:
     declared_containers = set(_container_ids(scope))
     exclude_patterns = scope["exclude"]["projects"]
 
+    now = datetime.now(timezone.utc)
+    absent_since: dict[str, str] = {}
+
     def index_dropped(project: str) -> bool:
         """A project reached only through containers that the index no longer places under one.
 
         The asset index lags a move by minutes to hours, and a project moved between two
         declared folders vanishes from both meanwhile; the declaration did not change, so the
-        scope rule must not retire it. It retires when the declaration speaks: the container
-        removed from the CR, or an `exclude.projects` entry naming it. A render that predates
-        containers (a rollback to the previous release) declares nothing about them either.
+        scope rule must not retire it yet. It is kept for INDEX_LAG_GRACE_SECONDS from the
+        first run that found it absent (`absentSince` on its row), then the ordinary two-run
+        retire applies, which is what retires a project that was deleted or moved under a
+        parent the CR does not declare. It retires sooner when the declaration speaks: the
+        container removed from the CR, or an `exclude.projects` entry naming it. A render
+        that predates containers (a rollback to the previous release) declares nothing about
+        them, and keeps their members without a clock.
         """
         via = _previous_via(previous, project)
         if not via or not all(v.split("/")[0] in CONTAINER_KINDS for v in via):
             return False
         if _excluded_by(project, exclude_patterns):
             return False
-        return not containers_known or any(v in declared_containers for v in via)
+        if not containers_known:
+            return True
+        if not any(v in declared_containers for v in via):
+            return False
+        since = _previous_absent_since(previous, project) or now.strftime(SNAPSHOT_TIME_FORMAT)
+        absent_since[project] = since
+        try:
+            first_absent = datetime.strptime(since, SNAPSHOT_TIME_FORMAT).replace(tzinfo=timezone.utc)
+        except ValueError:
+            first_absent = now
+        return (now - first_absent).total_seconds() < INDEX_LAG_GRACE_SECONDS
 
     retiring: dict[str, list[str]] = {}
     deferred_retiring: set[str] = set()
@@ -1074,8 +1105,9 @@ def reconcile(dry_run: bool = False) -> dict:
                 # asset index this run: the index dropped it, not the declaration. Kept, listed,
                 # and back in scope the run the index places it again.
                 carried_in_scope.add(project)
-                reason = ("not under any declared container in the asset index this run (a move, or the "
-                          "index behind); kept" if containers_known
+                reason = (f"not under any declared container in the asset index this run (a move, or the "
+                          f"index behind); kept until {INDEX_LAG_GRACE_SECONDS // 3600}h after {absent_since.get(project, '')}"
+                          if containers_known
                           else "reached through a container the running render does not know; kept")
             elif lookups_clean and scope_present and project in previously_resolved:
                 # First clean run the declaration omits it: retiring now, pruned next run.
@@ -1174,7 +1206,7 @@ def reconcile(dry_run: bool = False) -> dict:
         # Carried with the via it had, so a container frozen on a later run still finds the
         # members an unjudged run carried, and the gate still sees what produced them.
         {"id": pid, "via": _previous_via(previous, pid), "outcome": OUTCOME_UNREACHABLE, "state": STATE_IN_SCOPE,
-         "clusters": remaining(pid)}
+         "clusters": remaining(pid), **({ABSENT_SINCE_KEY: absent_since[pid]} if pid in absent_since else {})}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
         {"id": pid, "via": [], "outcome": OUTCOME_OK, "state": STATE_RETIRING,

@@ -1378,6 +1378,7 @@ class ScopeTest(HomesMixin):
                 {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE}]
         self._write_previous(prev)
         ids = {"cluster-a": _identity("team-a", "prod")}
+        stamps = set()
         for _ in range(3):
             report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
                                            searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
@@ -1385,10 +1386,24 @@ class ScopeTest(HomesMixin):
             rows = {p["id"]: p for p in self._snapshot()["projects"]}
             self.assertEqual((rows["team-a"]["state"], rows["team-a"]["via"]), (rec.STATE_IN_SCOPE, [self.FOLDER]))
             self.assertIn("asset index", self._snapshot()["unmanaged"][0]["reason"])
-        # The index places it again: back in scope, nothing lost.
+            stamps.add(rows["team-a"][rec.ABSENT_SINCE_KEY])
+        self.assertEqual(len(stamps), 1)  # the first absent run's time, carried, not restarted
+        # The index places it again: back in scope, nothing lost, the clock gone.
         report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
                                        searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
         self.assertEqual((deleted, report["unmanaged"], report["kept"]), ([], [], ["cluster-a"]))
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, {p["id"]: p for p in self._snapshot()["projects"]}["team-a"])
+        # A project deleted, or moved under a parent the CR does not declare: absent past the
+        # grace, the ordinary two-run retire applies, so the leak has a ceiling.
+        old = "2020-01-01T00:00:00Z"
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE, rec.ABSENT_SINCE_KEY: old}])
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual(deleted, ["cluster-a"])
         # The declaration speaks, two ways: the folder leaves the CR, or a glob names the project.
         for scope in ({"projects": []}, {"folders": ["123456789012"], "exclude": {"projects": ["team-*"]}}):
             self._write_previous(prev)

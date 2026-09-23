@@ -256,8 +256,6 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     # carried no project rows (a first run, or a container the snapshot never reached).
     if not containers and not (unlisted and _scope_has_other_projects(data_dir)):
         return ""
-    if not unlisted and not containers:
-        return ""
     container_note = ""
     if containers:
         container_note = (
