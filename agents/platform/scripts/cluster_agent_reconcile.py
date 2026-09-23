@@ -140,7 +140,8 @@ SNAPSHOT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # placing it under one, before the ordinary two-run retire applies. Covers the index's lag
 # after a move (minutes to hours, measured) without keeping a deleted project's profiles for
 # ever; a project deleted answers 403 to describe, never NotFound, so nothing else retires it.
-INDEX_LAG_GRACE_SECONDS = 24 * 3600
+SECONDS_PER_HOUR = 3600
+INDEX_LAG_GRACE_SECONDS = 24 * SECONDS_PER_HOUR
 ABSENT_SINCE_KEY = "absentSince"
 # What gcloud says when the account is not granted in a project, and when the GKE API is
 # off there. Anything else is unreachable: the run learned nothing and keeps everything.
@@ -1106,7 +1107,7 @@ def reconcile(dry_run: bool = False) -> dict:
                 # and back in scope the run the index places it again.
                 carried_in_scope.add(project)
                 reason = (f"not under any declared container in the asset index this run (a move, or the "
-                          f"index behind); kept until {INDEX_LAG_GRACE_SECONDS // 3600}h after {absent_since.get(project, '')}"
+                          f"index behind); kept until {INDEX_LAG_GRACE_SECONDS // SECONDS_PER_HOUR}h after {absent_since.get(project, '')}"
                           if containers_known
                           else "reached through a container the running render does not know; kept")
             elif lookups_clean and scope_present and project in previously_resolved:
@@ -1204,9 +1205,13 @@ def reconcile(dry_run: bool = False) -> dict:
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the
-        # members an unjudged run carried, and the gate still sees what produced them.
+        # members an unjudged run carried, and the gate still sees what produced them; and
+        # with the index-lag stamp it had, so a frozen or unjudged run in between does not
+        # restart the day.
         {"id": pid, "via": _previous_via(previous, pid), "outcome": OUTCOME_UNREACHABLE, "state": STATE_IN_SCOPE,
-         "clusters": remaining(pid), **({ABSENT_SINCE_KEY: absent_since[pid]} if pid in absent_since else {})}
+         "clusters": remaining(pid),
+         **({ABSENT_SINCE_KEY: absent_since.get(pid) or _previous_absent_since(previous, pid)}
+            if (pid in absent_since or _previous_absent_since(previous, pid)) else {})}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
         {"id": pid, "via": [], "outcome": OUTCOME_OK, "state": STATE_RETIRING,

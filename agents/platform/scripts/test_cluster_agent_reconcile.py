@@ -1388,6 +1388,12 @@ class ScopeTest(HomesMixin):
             self.assertIn("asset index", self._snapshot()["unmanaged"][0]["reason"])
             stamps.add(rows["team-a"][rec.ABSENT_SINCE_KEY])
         self.assertEqual(len(stamps), 1)  # the first absent run's time, carried, not restarted
+        # An unclean run in between (an explicit project unreachable) carries the stamp too.
+        report, _, deleted = self._run({"projects": ["flaky"], "folders": ["123456789012"]},
+                                       {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
+                                       profiles=["cluster-a"], identities=ids, searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual(deleted, [])
+        self.assertEqual({p["id"]: p.get(rec.ABSENT_SINCE_KEY) for p in self._snapshot()["projects"]}["team-a"], next(iter(stamps)))
         # The index places it again: back in scope, nothing lost, the clock gone.
         report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
                                        searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})

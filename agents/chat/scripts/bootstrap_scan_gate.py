@@ -224,11 +224,12 @@ def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
 
 
 def _scope_has_other_projects(data_dir: Path) -> bool:
-    """Whether the last reconcile resolved more than one project.
+    """Whether the last reconcile's scope reaches beyond one project.
 
-    The task body speaks of "the project" on an install with no scope, exactly as it
-    did before scopes existed, and of "the projects in scope" only once the snapshot
-    names more than one, so a single-project install renders the same prompt as before.
+    True when the snapshot names more than one project, or any declared folder or
+    organisation. The task body speaks of "the project" on an install with no scope,
+    exactly as it did before scopes existed, and of "the projects in scope" only then,
+    so a single-project install renders the same prompt as before.
     """
     try:
         snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
