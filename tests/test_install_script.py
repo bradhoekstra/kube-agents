@@ -1944,6 +1944,24 @@ class InstallEnvInputTest(unittest.TestCase):
                 cwd=str(_REPO_ROOT),
             )
 
+    def test_a_flagless_run_is_never_refused_however_the_key_is_spelled(self):
+        # The recorded side is what bash gave the key when the file was
+        # sourced, not a second reading of the text, so a trailing comment or
+        # an expansion never refuses a run that passed no flag; and a flag
+        # equal to the sourced value passes for the same reason.
+        for contents in (
+            'PROJECT_ID=p\nSCOPE_PROJECTS="payments-prod" # the payments fleet\n',
+            "PROJECT_ID=p\nSCOPE_PROJECTS=payments-prod # comment\n",
+            'PROJECT_ID=p\nFLEET=payments-prod\nSCOPE_PROJECTS="$FLEET"\n',
+        ):
+            for flags in ("", "--scope-projects=payments-prod"):
+                with self.subTest(contents=contents, flags=flags):
+                    proc = self._source_with_env_file(
+                        f'parse_args {flags}; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+                        contents=contents,
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
     def test_an_empty_scope_flag_over_a_recorded_key_is_refused(self):
         # `--scope-projects=` is the natural gesture for "remove every scoped
         # project" and would be applied for one run, then reversed by the next

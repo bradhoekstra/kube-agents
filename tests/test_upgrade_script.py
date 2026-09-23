@@ -453,12 +453,27 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         """
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('scope_json="$(scope_values_json)" || return 1', retag)
+        self.assertIn('keys_json="$(scope_values_json)" || return 1', retag)
         self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
         # Only when the engine has the helper: on the curl path an older
         # installer_common.sh has neither the function nor a chart key to set.
         self.assertIn("if declare -F scope_values_json", retag)
-        self.assertLess(retag.index("if declare -F scope_values_json"), retag.index('scope_json="$(scope_values_json)"'))
+        self.assertLess(retag.index("if declare -F scope_values_json"), retag.index('keys_json="$(scope_values_json)"'))
+
+    def test_a_retag_carries_the_releases_scope_not_a_changed_one(self):
+        """harness and operator mode run no Terraform, so a scope edited in
+        install.env must not reach the CR through them: a project added would
+        be listed with no grant, one dropped retired with its grants bound.
+        The release's recorded scope travels; the keys only when the release
+        recorded none; a difference is said out loud and points at full mode."""
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
+        self.assertIn('recorded_json="$(release_scope_json "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"', retag)
+        self.assertIn('if [ -n "$recorded_json" ]; then\n        scope_json="$recorded_json"', retag)
+        self.assertIn('if ! scope_json_equal "$recorded_json" "$keys_json"; then', retag)
+        self.assertIn("--upgrade-mode=full to apply the change", retag)
+        self.assertIn('scope_json="$keys_json"', retag)
+        self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
 
     def test_a_plan_does_not_let_the_scope_guard_stop_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

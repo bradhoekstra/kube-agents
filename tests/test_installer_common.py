@@ -1060,6 +1060,31 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
             self.assertIn("  projects = []", dest.read_text())
 
+    def test_release_scope_json_reports_what_the_release_recorded(self):
+        # A retag carries the release's scope forward, so the reader has to
+        # say "none" for a release from before the value and print the scope
+        # otherwise; scope_json_equal compares the sets, not the spelling.
+        with_scope = self._run(
+            'release_scope_json kube-agents kubeagents-system',
+            helm_script=self._release_values_helm({"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}),
+        )
+        self.assertEqual(json.loads(with_scope.stdout), {"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}})
+        without = self._run(
+            'release_scope_json kube-agents kubeagents-system; echo "[$?]"',
+            helm_script=self._release_values_helm(None),
+        )
+        self.assertEqual(without.stdout.strip(), "[0]")
+        none = self._run('release_scope_json kube-agents kubeagents-system; echo "[$?]"')
+        self.assertEqual(none.stdout.strip(), "[0]")
+        equal = self._run(
+            'scope_json_equal \'{"projects":["b","a"],"exclude":{"projects":[],"clusters":[]}}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
+        )
+        self.assertIn("rc=0", equal.stdout, equal.stderr)
+        differ = self._run(
+            'scope_json_equal \'{"projects":["a"]}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
+        )
+        self.assertIn("rc=1", differ.stdout, differ.stderr)
+
     def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
         # A first adoption: the cluster exists, kube-agents has never been on
         # it, kubectl says there is no such resource type. Nothing to protect,

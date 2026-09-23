@@ -1573,6 +1573,41 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 '
 }
 
+# The scope the Helm release recorded as `platformAgent.scope`, in JSON, or
+# nothing when the release has none (a release from before the value, or none
+# at all). A retag carries this forward: upgrade.sh's harness and operator
+# modes run no Terraform, so a scope that changed in install.env must not
+# reach the CR through them, or a project would be listed with no grant or
+# retired with its grants still bound; full mode moves the IAM and the CR
+# together. Reads through the install's context by name, like the guard.
+release_scope_json() {
+  local release="$1" ns="$2" context
+  context="$(gke_context_name)"
+  { helm --kube-context "$context" get values "$release" -n "$ns" -o json 2>/dev/null || true; } | python3 -c '
+import json, sys
+try:
+    values = json.load(sys.stdin) or {}
+except Exception:
+    sys.exit(0)
+scope = (values.get("platformAgent") or {}).get("scope")
+if scope is not None:
+    print(json.dumps(scope, separators=(",", ":")))
+'
+}
+
+# Whether two `platformAgent.scope` JSON values declare the same sets.
+scope_json_equal() {
+  python3 -c '
+import json, sys
+def shape(scope):
+    scope = scope or {}
+    exclude = scope.get("exclude") or {}
+    return (sorted(scope.get("projects") or []), sorted(exclude.get("projects") or []),
+            sorted(json.dumps(c, sort_keys=True) for c in exclude.get("clusters") or []))
+sys.exit(0 if shape(json.loads(sys.argv[1] or "{}")) == shape(json.loads(sys.argv[2] or "{}")) else 1)
+' "$1" "$2"
+}
+
 # Refuses to regenerate over a PlatformAgent whose spec.scope was set by hand
 # and declares something the SCOPE_* keys do not carry. Before install.env
 # carried the keys, editing the CR was the documented way to set the field;

@@ -228,8 +228,8 @@ the third a list of `project/location/cluster` triples. The generator renders th
 composition's `scope` object, from which Terraform binds the read roles in each project
 and the chart renders the CR. The block is always written, empty lists included, so an
 `install.env` that never set these keys declares the management project alone, and one
-that drops a project makes the next `upgrade.sh` revoke its grants and retire its
-profiles. An entry that is not what the CRD accepts (a project ID, an exclude ID or glob, a
+that drops a project makes the next full `upgrade.sh` (the default mode) revoke its grants and
+retire its profiles. An entry that is not what the CRD accepts (a project ID, an exclude ID or glob, a
 `project/location/cluster` triple of names up to 63 characters), a repeat, or a list past 100 entries
 fails the generator before any file is written, and so before a `harness` or `operator` retag could
 carry it to the API server. An install whose `PlatformAgent` carries a `spec.scope` set by hand, before the keys existed, that
@@ -239,8 +239,9 @@ it drops. Hand-set means different from what the chart last rendered, which the 
 recorded values say; a scope the installer rendered is chart-owned and the keys change it freely,
 so removing a project from `SCOPE_PROJECTS` and running `upgrade.sh` is never refused. The check
 reads the CR and the release through the install's own kubeconfig context by name and says so when it
-cannot, and `upgrade.sh` passes the keys on every Helm retag so the `harness` and `operator` modes
-carry the scope too; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop a
+cannot, and `upgrade.sh`'s `harness` and `operator` modes carry the release's recorded scope forward on
+every Helm retag, never a changed one, since they run no Terraform: a scope edit waits for `full`
+mode, which binds the IAM and renders the CR together, and a retag over changed keys says so; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop a
 hand-set scope on purpose, and `uninstall.sh` sets it because a destroy keeps nothing either way. `install.sh` takes the same three as `--scope-projects`,
 `--scope-exclude-projects` and `--scope-exclude-clusters` on a first install, which records them; on
 an existing `install.env` a flag that disagrees with the recorded key is refused rather than applied

@@ -891,8 +891,14 @@ main() {
   # takes platformAgent.scope as empty lists, and a release whose last full
   # apply predates the value recorded none to re-apply, so a retag that said
   # nothing would render `projects: []` over a scope the CR carries and the
-  # reconcile would retire those projects. The keys install.env carries (the
-  # generator has just validated them) are what the CR gets, in every mode.
+  # reconcile would retire those projects. What travels is the scope the
+  # release recorded, not the keys: these modes run no Terraform, so a scope
+  # changed in install.env must wait for full mode, which binds the IAM and
+  # renders the CR together -- carried through a retag, an added project
+  # would be listed with no grant and a dropped one retired with its grants
+  # still bound. A release that recorded no scope (from before the value)
+  # gets the keys, which the generator's guard has just checked against the
+  # live CR.
   #
   # Only when the engine has the helper. On the curl path this script is the
   # one the site serves while installer_common.sh comes from the clone at
@@ -906,8 +912,17 @@ main() {
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
     if declare -F scope_values_json >/dev/null 2>&1; then
-      local scope_json
-      scope_json="$(scope_values_json)" || return 1
+      local keys_json recorded_json scope_json
+      keys_json="$(scope_values_json)" || return 1
+      recorded_json="$(release_scope_json "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"
+      if [ -n "$recorded_json" ]; then
+        scope_json="$recorded_json"
+        if ! scope_json_equal "$recorded_json" "$keys_json"; then
+          print_warning "install.env's SCOPE_* keys differ from the scope the release carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and keeps the release's scope; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
+        fi
+      else
+        scope_json="$keys_json"
+      fi
       set_args+=(--set-json "platformAgent.scope=${scope_json}")
     fi
     helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \

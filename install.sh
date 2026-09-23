@@ -398,6 +398,12 @@ PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
 PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
 PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
+# Whether each --scope-* flag was passed at all, kept apart from its value:
+# an empty flag is a decision and a seeded value is not, and only a passed
+# flag is ever compared against the recorded key.
+PARAM_SCOPE_PROJECTS_FLAGGED="false"
+PARAM_SCOPE_EXCLUDE_PROJECTS_FLAGGED="false"
+PARAM_SCOPE_EXCLUDE_CLUSTERS_FLAGGED="false"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
@@ -738,9 +744,9 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
-      --scope-projects=*) PARAM_SCOPE_PROJECTS="${1#*=}"; shift ;;
-      --scope-exclude-projects=*) PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; shift ;;
-      --scope-exclude-clusters=*) PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; shift ;;
+      --scope-projects=*) PARAM_SCOPE_PROJECTS="${1#*=}"; PARAM_SCOPE_PROJECTS_FLAGGED="true"; shift ;;
+      --scope-exclude-projects=*) PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; PARAM_SCOPE_EXCLUDE_PROJECTS_FLAGGED="true"; shift ;;
+      --scope-exclude-clusters=*) PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; PARAM_SCOPE_EXCLUDE_CLUSTERS_FLAGGED="true"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -1389,20 +1395,24 @@ normalised_scope_list() {
 refuse_unrecorded_scope_flags() {
   local file="$1"
   [ -f "$file" ] || return 0
-  local key flag value recorded refused=""
+  local key flag value flagged recorded refused=""
   for key in SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
     case "$key" in
-      SCOPE_PROJECTS) flag="--scope-projects"; value="${PARAM_SCOPE_PROJECTS:-}" ;;
-      SCOPE_EXCLUDE_PROJECTS) flag="--scope-exclude-projects"; value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
-      *) flag="--scope-exclude-clusters"; value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
+      SCOPE_PROJECTS) flag="--scope-projects"; value="${PARAM_SCOPE_PROJECTS:-}"; flagged="$PARAM_SCOPE_PROJECTS_FLAGGED" ;;
+      SCOPE_EXCLUDE_PROJECTS) flag="--scope-exclude-projects"; value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"; flagged="$PARAM_SCOPE_EXCLUDE_PROJECTS_FLAGGED" ;;
+      *) flag="--scope-exclude-clusters"; value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"; flagged="$PARAM_SCOPE_EXCLUDE_CLUSTERS_FLAGGED" ;;
     esac
+    # Only a flag that was passed is compared, an empty one included. The
+    # recorded side is the value bash gave the key when the file was sourced
+    # (still in the environment here, ahead of main's exports), never a second
+    # reading of the file's text: a trailing comment or an expansion the text
+    # reader would misparse must not refuse a run that passed no flag.
+    [ "$flagged" = "true" ] || continue
+    recorded="${!key:-}"
     if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
-      # Compared whenever the key is recorded, empty flag included: the PARAM_*
-      # was seeded from this very value, so on a flagless run the two agree and
-      # only a flag can make them differ -- `--scope-projects=` against a
-      # recorded list is the one-run emptying this exists to refuse. As lists,
-      # so a comma spelling against a space spelling is not a disagreement.
-      recorded="$(recorded_install_env_value "$file" "$key")"
+      # As lists, so a comma spelling against a space spelling is agreement;
+      # `--scope-projects=` against a recorded list is the one-run emptying
+      # this exists to refuse.
       [ "$(normalised_scope_list "$recorded")" != "$(normalised_scope_list "$value")" ] || continue
       print_error "${flag}=\"${value}\" disagrees with ${key}=\"${recorded}\" in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and reverses it, retiring the Cluster Agent profiles of every project the flag added or bringing back every project it removed."
     else
