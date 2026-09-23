@@ -497,6 +497,21 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
     would read as a fix and change nothing.
     """
 
+    def test_uninstall_neutralises_the_scope_before_generating_tfvars(self):
+        # The generator validates every SCOPE_* list and refuses a bad one
+        # before writing; a destroy keeps nothing the scope binds, so a typo in
+        # a SCOPE_* line must not be what stops a teardown, and the guard that
+        # protects a hand-declared scope has nothing to protect either.
+        text = _UNINSTALL_SH.read_text()
+        guard_at = text.find('export SCOPE_GUARD_ENABLED="false"')
+        keys_at = text.find('export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
+        call = re.search(r"^\s*write_tfvars_from_state \"", text, re.MULTILINE)
+        self.assertIsNotNone(call)
+        for name, at in (("SCOPE_GUARD_ENABLED", guard_at), ("the SCOPE_* keys", keys_at)):
+            with self.subTest(export=name):
+                self.assertNotEqual(at, -1, f"uninstall.sh must neutralise {name}")
+                self.assertLess(at, call.start(), f"{name} must be exported before the generator runs")
+
     def test_uninstall_forces_gvisor_off_before_generating_tfvars(self):
         text = _UNINSTALL_SH.read_text()
         export_at = text.find('export ENABLE_GVISOR="false"')

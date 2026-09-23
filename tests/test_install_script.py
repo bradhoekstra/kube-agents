@@ -1944,6 +1944,48 @@ class InstallEnvInputTest(unittest.TestCase):
                 cwd=str(_REPO_ROOT),
             )
 
+    def test_a_scope_flag_that_the_existing_file_does_not_record_is_refused(self):
+        """A scope cannot be set for one run: the next upgrade.sh regenerates
+        from the file, the guard reads the CR as chart-owned, and the flag's
+        projects are retired. So the flag is refused before the apply, with
+        the line to add, whether the key disagrees or is absent."""
+        for contents, flag in (
+            ("PROJECT_ID=p\nSCOPE_PROJECTS=payments-prod\n", "--scope-projects=payments-staging"),
+            ("PROJECT_ID=p\n", "--scope-projects=payments-staging"),
+            ("PROJECT_ID=p\nSCOPE_EXCLUDE_PROJECTS=*-sandbox\n", "--scope-exclude-projects=*-scratch"),
+            ("PROJECT_ID=p\n", "--scope-exclude-clusters=payments-prod/us-central1/scratch"),
+        ):
+            with self.subTest(flag=flag, contents=contents):
+                proc = self._source_with_env_file(
+                    f'parse_args {flag}; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+                    contents=contents,
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr + proc.stdout)
+                self.assertIn("cannot be set for one run", proc.stdout + proc.stderr)
+                self.assertIn("re-run without", proc.stdout + proc.stderr)
+
+    def test_a_scope_flag_that_matches_the_file_or_is_absent_passes(self):
+        for contents, flags in (
+            ("PROJECT_ID=p\nSCOPE_PROJECTS=payments-prod\n", "--scope-projects=payments-prod"),
+            ("PROJECT_ID=p\nSCOPE_PROJECTS=payments-prod\n", ""),
+            ("PROJECT_ID=p\n", ""),
+        ):
+            with self.subTest(flags=flags, contents=contents):
+                proc = self._source_with_env_file(
+                    f'parse_args {flags}; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+                    contents=contents,
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
+    def test_a_first_install_records_the_scope_flags_and_refuses_nothing(self):
+        # No file yet: the flags are what the new install.env will carry.
+        proc = self._source_with_env_file(
+            'parse_args --scope-projects=payments-prod; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc P=$PARAM_SCOPE_PROJECTS"',
+            contents=None,
+            env={"KUBE_AGENTS_INSTALL_ENV": ""},
+        )
+        self.assertIn("rc=0 P=payments-prod", proc.stdout, proc.stderr + proc.stdout)
+
     def test_values_reach_the_parameter_block(self):
         """The whole point: a value in the file arrives as a PARAM_*."""
         proc = self._source_with_env_file(

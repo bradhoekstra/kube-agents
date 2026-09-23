@@ -242,8 +242,11 @@ reads the CR and the release through the install's own kubeconfig context by nam
 cannot, and `upgrade.sh` passes the keys on every Helm retag so the `harness` and `operator` modes
 carry the scope too; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop a
 hand-set scope on purpose, and `uninstall.sh` sets it because a destroy keeps nothing either way. `install.sh` takes the same three as `--scope-projects`,
-`--scope-exclude-projects` and `--scope-exclude-clusters`; the interview never asks for them and
-the Day-2 menu does not edit them, so change them in the file and run `upgrade.sh`.
+`--scope-exclude-projects` and `--scope-exclude-clusters` on a first install, which records them; on
+an existing `install.env` a flag that disagrees with the recorded key is refused rather than applied
+for one run, because the next `upgrade.sh` would regenerate from the file and retire what the flag
+added. The interview never asks for them and the Day-2 menu does not edit them, so change them in
+the file and run `upgrade.sh`.
 
 ### The predecessor: `vars.sh`
 

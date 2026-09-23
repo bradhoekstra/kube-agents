@@ -552,7 +552,10 @@ Flags for AI Agents & Automation:
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
   --scope-projects=IDS          GCP projects beyond the host project whose GKE clusters get a
                                 Cluster Agent (space- or comma-separated). The read roles are
-                                bound in each; one the agent cannot list is reported, not fatal
+                                bound in each; one the agent cannot list is reported, not fatal.
+                                On an existing install.env the three --scope-* flags must match
+                                the recorded SCOPE_* keys: edit the file instead, since the next
+                                upgrade.sh regenerates from it
   --scope-exclude-projects=IDS  Project IDs or shell-style globs to leave unmanaged
   --scope-exclude-clusters=TRIPLES
                                 Clusters to leave unmanaged, as project/location/cluster
@@ -1363,6 +1366,42 @@ warn_flag_beats_unrecorded_file_value() {
   fi
   print_info "$consequence"
   print_info "Set ${key}=${value} in ${file}, or repeat ${flag} on ${repeat_on}."
+}
+
+# The scope flags are the one override that cannot be "this run only". The
+# other flag-beats-file cases above are warned about because the next run
+# re-reads the file and the reversal shows: a namespace moves a release, a
+# backup plan is destroyed in the plan. A scope set by flag is different: the
+# composition renders it into the CR and records it in the Helm release, so the
+# next upgrade.sh (any mode) regenerates from the file, finds the CR equal to
+# the release's record, treats the scope as chart-owned and lets the keys
+# decide -- projects: [] -- and the reconcile retires those projects' Cluster
+# Agent profiles with nothing having said so. So on an existing install.env a
+# --scope-* value that the file does not already record is refused before the
+# apply, with the line to add. A first install records the flags into the file
+# it writes, and this returns 0 there.
+refuse_unrecorded_scope_flags() {
+  local file="$1"
+  [ -f "$file" ] || return 0
+  local key flag value recorded refused=""
+  for key in SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+    case "$key" in
+      SCOPE_PROJECTS) flag="--scope-projects"; value="${PARAM_SCOPE_PROJECTS:-}" ;;
+      SCOPE_EXCLUDE_PROJECTS) flag="--scope-exclude-projects"; value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
+      *) flag="--scope-exclude-clusters"; value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
+    esac
+    [ -n "$value" ] || continue
+    if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
+      recorded="$(recorded_install_env_value "$file" "$key")"
+      [ "$recorded" != "$value" ] || continue
+      print_error "${flag}=${value} disagrees with ${key}=${recorded} in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project the flag added."
+    else
+      print_error "${flag}=${value} is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project the flag added."
+    fi
+    print_info "Set ${key}=\"${value}\" in ${file} and re-run without ${flag}; the generator reads it on every run."
+    refused="true"
+  done
+  [ -z "$refused" ] || return 1
 }
 
 bootstrap_install_env_file() {
@@ -4623,6 +4662,9 @@ main() {
   local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
+  # Before anything is applied: a scope flag the existing install.env does
+  # not record would be undone by the next upgrade.sh (see the function).
+  refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || exit 1
   # No `:-` fallback: resolve_shared_defaults already applied
   # DEFAULT_ENABLE_GVISOR with ${VAR-...}, which leaves `--enable-gvisor=` (set, but
   # empty) empty on purpose so the validator below rejects it instead of

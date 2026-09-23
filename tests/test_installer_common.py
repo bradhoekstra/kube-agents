@@ -145,6 +145,7 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud = bin_dir / "gcloud"
             gcloud.write_text(
                 "#!/usr/bin/env bash\n"
+                'printf "%s\\n" "$*" >> "${GCLOUD_CALL_LOG:-/dev/null}"\n'
                 'case "$*" in\n'
                 f"  *\"clusters describe\"*) {describe_stub} ;;\n"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
@@ -1044,6 +1045,46 @@ class InstallerCommonTest(unittest.TestCase):
                 proc = self._run(f"rc=0; {script} >/dev/null || rc=$?; echo \"rc=$rc\"")
                 self.assertIn("rc=1", proc.stdout, proc.stderr)
                 self.assertIn(message, proc.stdout + proc.stderr)
+
+    def test_the_credentials_fetch_keeps_the_dns_endpoint(self):
+        # The generator writes the same kubeconfig entry the front doors do.
+        # upgrade.sh has just fetched with the DNS endpoint when the cluster
+        # publishes one; a fetch here without it would swap that entry back to
+        # an IP endpoint that may not be reachable. The caller's value is used
+        # as it stands; the helper is only called when the caller sourced it
+        # and left the variable unset (install.sh).
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            log = pathlib.Path(out_dir) / "gcloud.log"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GKE_DNS_ENDPOINT_FLAG": "--dns-endpoint", "GCLOUD_CALL_LOG": str(log)},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
+            self.assertEqual(1, len(fetches), fetches)
+            self.assertIn("--dns-endpoint", fetches[0])
+            log.unlink()
+            proc = self._run(
+                'gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
+            self.assertEqual(1, len(fetches), fetches)
+            self.assertIn("--dns-endpoint", fetches[0])
+            log.unlink()
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
+            self.assertEqual(1, len(fetches), fetches)
+            self.assertNotIn("--dns-endpoint", fetches[0])
 
     def test_scope_values_json_renders_the_keys_as_the_chart_value(self):
         proc = self._run(

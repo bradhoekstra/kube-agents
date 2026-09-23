@@ -535,6 +535,9 @@ main() {
   # scope the CR carries and install.env does not. A destroy keeps neither, so
   # it must not be refusable on that difference.
   export SCOPE_GUARD_ENABLED="false"
+  # The scope binds nothing a destroy keeps, and its validation is for the
+  # apply's sake; a typo in a SCOPE_* line must not be what stops a teardown.
+  export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

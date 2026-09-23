@@ -1799,9 +1799,22 @@ write_tfvars_from_state() {
   # below reads the live CR through this install's context by name, and a
   # re-run of install.sh over a cluster its own state created has fetched no
   # credentials yet at this point.
+  #
+  # With the DNS endpoint when the cluster publishes one: this writes the same
+  # kubeconfig entry as the front doors' own fetch, and upgrade.sh has just
+  # written it with the flag, so a fetch without it would swap the DNS
+  # endpoint back for an IP endpoint that may not be reachable from here.
+  # GKE_DNS_ENDPOINT_FLAG is taken as the caller left it (upgrade.sh sets it,
+  # empty or not, at its connect step) and resolved here only when the caller
+  # has sourced the helper and not resolved it yet (install.sh).
   if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+    if [ -z "${GKE_DNS_ENDPOINT_FLAG+set}" ] && declare -F gke_dns_endpoint_flag >/dev/null 2>&1; then
+      gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
+    fi
+    # Unquoted on purpose: empty must contribute no argument at all.
+    # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
-      --project "${PROJECT_ID}" >/dev/null 2>&1 || true
+      --project "${PROJECT_ID}" ${GKE_DNS_ENDPOINT_FLAG:-} >/dev/null 2>&1 || true
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
