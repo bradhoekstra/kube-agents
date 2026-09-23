@@ -550,7 +550,10 @@ def _resolve_projects(management: str | None, scope: dict,
                 if _excluded_by(project, patterns):
                     continue
                 seen.add(project)
-                entries.append({"id": project, "via": [container], "outcome": outcome, "frozen": True})
+                # `indexed`: an over-cap member was placed by the index this run (the lookup
+                # succeeded); a frozen one was not. The snapshot's index-lag stamp reads it.
+                entries.append({"id": project, "via": [container], "outcome": outcome, "frozen": True,
+                                "indexed": outcome == OUTCOME_OVER_CAP})
             containers.append({"id": container, "outcome": outcome, "projects": len(carried)})
             continue
         for project in sorted(members):
@@ -1032,20 +1035,25 @@ def reconcile(dry_run: bool = False) -> dict:
         them, and keeps their members without a clock.
         """
         via = _previous_via(previous, project)
-        if not via or not all(v.split("/")[0] in CONTAINER_KINDS for v in via):
+        container_vias = [v for v in via if v.split("/")[0] in CONTAINER_KINDS]
+        # Explicit-only or management: the declaration itself decides. A project that was
+        # also explicit and lost that entry keeps the container route the operator still
+        # declares, which is the ordinary way a project is moved from `projects` to a folder.
+        if not container_vias or VIA_MANAGEMENT in via:
             return False
         if _excluded_by(project, exclude_patterns):
             return False
         if not containers_known:
             return True
-        if not any(v in declared_containers for v in via):
+        if not any(v in declared_containers for v in container_vias):
             return False
         since = _previous_absent_since(previous, project) or now.strftime(SNAPSHOT_TIME_FORMAT)
-        absent_since[project] = since
         try:
             first_absent = datetime.strptime(since, SNAPSHOT_TIME_FORMAT).replace(tzinfo=timezone.utc)
         except ValueError:
-            first_absent = now
+            # A stamp this run cannot read restarts the clock rather than keeping for ever.
+            first_absent, since = now, now.strftime(SNAPSHOT_TIME_FORMAT)
+        absent_since[project] = since
         return (now - first_absent).total_seconds() < INDEX_LAG_GRACE_SECONDS
 
     retiring: dict[str, list[str]] = {}
@@ -1205,12 +1213,12 @@ def reconcile(dry_run: bool = False) -> dict:
     # Fill order decided the cap above; the written order is sorted by ID so an
     # unchanged fleet writes an unchanged file (design §3, "Resolution is deterministic").
     snapshot_projects = sorted([
-        # A member a frozen or over-cap container carried (no `clusters`: the index did not
-        # place it this run) keeps its index-lag stamp; one the index placed clears it.
+        # A member a frozen container carried (the index did not place it this run) keeps its
+        # index-lag stamp; one the index placed, listed or over-cap, clears it.
         {"id": e["id"], "via": e["via"], "outcome": e["outcome"], "state": STATE_IN_SCOPE,
          "clusters": cluster_counts.get(e["id"]),
          **({ABSENT_SINCE_KEY: _previous_absent_since(previous, e["id"])}
-            if "clusters" not in e and _previous_absent_since(previous, e["id"]) else {})}
+            if "clusters" not in e and not e.get("indexed") and _previous_absent_since(previous, e["id"]) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the

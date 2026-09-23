@@ -1426,6 +1426,44 @@ class ScopeTest(HomesMixin):
                                            searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
             self.assertEqual(deleted, ["cluster-a"], scope)
 
+    def test_dropping_the_explicit_entry_of_a_project_still_under_a_declared_folder_keeps_it(self):
+        # The ordinary migration: the project moves into the folder and leaves `projects` in the
+        # same edit, while the index is still behind on the move. The container route is still
+        # declared, so the keep-for-a-day rule applies.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.FOLDER], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        for _ in range(2):
+            report, _, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                           profiles=["cluster-a"], identities=ids, searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+            self.assertEqual((deleted, report["retiring"], report["unmanaged"]), ([], [], ["cluster-a"]))
+        # The index catches up: listed through the folder, nothing lost.
+        report, created, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                             profiles=["cluster-a"], identities=ids,
+                                             searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["kept"]), ([], ["cluster-a"]))
+
+    def test_an_over_cap_members_stamp_clears_because_the_index_placed_it(self):
+        old = "2020-01-01T00:00:00Z"
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE, rec.ABSENT_SINCE_KEY: old}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        big = {f"q-{i}": [(f"q-{i}", "c", "us-central1")] for i in range(4)} | {"team-a": [("team-a", "prod", "us-central1")]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 2):
+            report, _, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                     searches={self.FOLDER: (big, rec.OUTCOME_OK)})
+        row = {p["id"]: p for p in self._snapshot()["projects"]}["team-a"]
+        self.assertEqual(row["outcome"], rec.OUTCOME_OVER_CAP)
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, row)
+        # A malformed stamp restarts the clock instead of keeping for ever or retiring at once.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE, rec.ABSENT_SINCE_KEY: "yesterday"}])
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["retiring"]), ([], []))
+        stamp = {p["id"]: p for p in self._snapshot()["projects"]}["team-a"][rec.ABSENT_SINCE_KEY]
+        self.assertNotEqual(stamp, "yesterday")
+
     def test_a_render_that_predates_containers_keeps_their_members(self):
         # Rollback to the previous release: its render has present and projects but no folders
         # or organizations key, and the CRD pruned the lists from the stored CR. It declares
