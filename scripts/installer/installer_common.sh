@@ -1573,25 +1573,32 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 '
 }
 
-# The scope the Helm release recorded as `platformAgent.scope`, in JSON, or
-# nothing when the release has none (a release from before the value, or none
-# at all). A retag carries this forward: upgrade.sh's harness and operator
-# modes run no Terraform, so a scope that changed in install.env must not
-# reach the CR through them, or a project would be listed with no grant or
-# retired with its grants still bound; full mode moves the IAM and the CR
-# together. Reads through the install's context by name, like the guard.
-release_scope_json() {
-  local release="$1" ns="$2" context
+# The live PlatformAgent's spec.scope, in JSON with every list present, for a
+# `helm upgrade --set-json` that must leave the CR's scope exactly as it is.
+# upgrade.sh's harness and operator modes run no Terraform, so no scope may
+# change through them -- not the keys, which would list a project with no
+# grant or retire one with its grants still bound, and not the release's
+# record, which a hand edit the guard accepted is not in -- and the chart's
+# default is empty lists, so a retag that said nothing would empty it. Reads
+# through the install's context by name and fails, with kubectl's message,
+# when it cannot read the CR or finds none: the caller refuses the retag
+# rather than guess. A CR with no scope block is the empty declaration.
+live_scope_json() {
+  local ns="$1" context
   context="$(gke_context_name)"
-  { helm --kube-context "$context" get values "$release" -n "$ns" -o json 2>/dev/null || true; } | python3 -c '
+  kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json | python3 -c '
 import json, sys
-try:
-    values = json.load(sys.stdin) or {}
-except Exception:
-    sys.exit(0)
-scope = (values.get("platformAgent") or {}).get("scope")
-if scope is not None:
-    print(json.dumps(scope, separators=(",", ":")))
+items = json.load(sys.stdin).get("items", [])
+if not items:
+    print("no PlatformAgent found", file=sys.stderr)
+    sys.exit(1)
+scope = (items[0].get("spec") or {}).get("scope") or {}
+exclude = scope.get("exclude") or {}
+print(json.dumps({"projects": scope.get("projects") or [],
+                  "exclude": {"projects": exclude.get("projects") or [],
+                              "clusters": [{"projectId": c.get("projectId", ""), "location": c.get("location", ""),
+                                            "clusterName": c.get("clusterName", "")} for c in exclude.get("clusters") or []]}},
+                 separators=(",", ":")))
 '
 }
 
@@ -1632,8 +1639,9 @@ sys.exit(0 if shape(json.loads(sys.argv[1] or "{}")) == shape(json.loads(sys.arg
 # turns it off: uninstall.sh sets it, since a destroy keeps nothing either
 # way, and an operator who means to drop a hand-set scope sets it for one run.
 # SCOPE_GUARD_REFUSES=false keeps the check and its message but lets the run
-# go on: upgrade.sh --plan sets it, because a plan applies nothing and is the
-# artefact that shows the operator what the refusal is protecting.
+# go on: upgrade.sh sets it for --plan, which applies nothing and is the
+# artefact that shows what the refusal protects, and for its harness and
+# operator modes, which leave the CR's scope exactly as it is.
 guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local context
@@ -1726,7 +1734,7 @@ for item in items:
     return 0
   fi
   print_error "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
-  print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run:"
+  print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run; a full upgrade is what applies it (a harness or operator retag leaves the CR's scope as it is):"
   printf '%s\n' "$missing"
   print_info "To drop those entries on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
   return 1

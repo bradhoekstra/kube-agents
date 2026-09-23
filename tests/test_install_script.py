@@ -1944,6 +1944,27 @@ class InstallEnvInputTest(unittest.TestCase):
                 cwd=str(_REPO_ROOT),
             )
 
+    def test_a_scope_from_the_environment_over_a_file_without_the_key_is_refused(self):
+        # The other door: `SCOPE_PROJECTS=x ./install.sh` over an install.env
+        # that lacks the key (every file written before the keys existed).
+        # The file does not clear an inherited value it does not carry, so
+        # the value would be applied and undone by the next upgrade.sh.
+        proc = self._source_with_env_file(
+            'parse_args; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+            contents="PROJECT_ID=p\n",
+            env={"SCOPE_PROJECTS": "payments-prod"},
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr + proc.stdout)
+        self.assertIn("from --scope-projects or the environment", proc.stdout + proc.stderr)
+        # A file that carries the key overrides the environment, so nothing
+        # to refuse there.
+        proc = self._source_with_env_file(
+            'parse_args; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+            contents="PROJECT_ID=p\nSCOPE_PROJECTS=payments-staging\n",
+            env={"SCOPE_PROJECTS": "payments-prod"},
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
     def test_a_flagless_run_is_never_refused_however_the_key_is_spelled(self):
         # The recorded side is what bash gave the key when the file was
         # sourced, not a second reading of the text, so a trailing comment or

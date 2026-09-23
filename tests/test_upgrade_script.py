@@ -460,20 +460,26 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertIn("if declare -F scope_values_json", retag)
         self.assertLess(retag.index("if declare -F scope_values_json"), retag.index('keys_json="$(scope_values_json)"'))
 
-    def test_a_retag_carries_the_releases_scope_not_a_changed_one(self):
-        """harness and operator mode run no Terraform, so a scope edited in
-        install.env must not reach the CR through them: a project added would
-        be listed with no grant, one dropped retired with its grants bound.
-        The release's recorded scope travels; the keys only when the release
-        recorded none; a difference is said out loud and points at full mode."""
+    def test_a_retag_carries_the_crs_own_scope_or_refuses(self):
+        """harness and operator mode run no Terraform, so no scope may change
+        through them: not the keys (a project added would be listed with no
+        grant, one dropped retired with its grants bound) and not the
+        release's record (a hand edit the guard accepted is not in it). The
+        live spec.scope travels as it is; a read that fails refuses the retag
+        rather than guess; keys that differ are said out loud for full mode."""
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('recorded_json="$(release_scope_json "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"', retag)
-        self.assertIn('if [ -n "$recorded_json" ]; then\n        scope_json="$recorded_json"', retag)
-        self.assertIn('if ! scope_json_equal "$recorded_json" "$keys_json"; then', retag)
+        self.assertIn('if ! scope_json="$(live_scope_json "$target_namespace")"; then', retag)
+        self.assertIn("return 1", retag[retag.index("live_scope_json"):])
+        self.assertIn('if ! scope_json_equal "$scope_json" "$keys_json"; then', retag)
         self.assertIn("--upgrade-mode=full to apply the change", retag)
-        self.assertIn('scope_json="$keys_json"', retag)
+        self.assertNotIn('scope_json="$keys_json"', retag, "the keys never travel through a retag")
+        self.assertNotIn("release_scope_json", retag)
         self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
+
+    def test_only_a_full_upgrade_lets_the_scope_guard_refuse(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        self.assertIn('if [ "$PARAM_PLAN" = "true" ] || [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n      export SCOPE_GUARD_REFUSES="false"', text)
 
     def test_a_plan_does_not_let_the_scope_guard_stop_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

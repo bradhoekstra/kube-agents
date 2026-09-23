@@ -1060,22 +1060,45 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
             self.assertIn("  projects = []", dest.read_text())
 
-    def test_release_scope_json_reports_what_the_release_recorded(self):
-        # A retag carries the release's scope forward, so the reader has to
-        # say "none" for a release from before the value and print the scope
-        # otherwise; scope_json_equal compares the sets, not the spelling.
+    def test_live_scope_json_reads_the_crs_own_scope_or_fails(self):
+        # A retag carries the CR's scope exactly as it is, so the reader has
+        # to print it with every list present, print the empty declaration
+        # for a CR without the block, and fail (never guess) when it cannot
+        # read the CR or finds none; scope_json_equal compares the sets.
         with_scope = self._run(
-            'release_scope_json kube-agents kubeagents-system',
-            helm_script=self._release_values_helm({"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}),
+            'live_scope_json kubeagents-system',
+            kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
         )
-        self.assertEqual(json.loads(with_scope.stdout), {"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}})
-        without = self._run(
-            'release_scope_json kube-agents kubeagents-system; echo "[$?]"',
-            helm_script=self._release_values_helm(None),
+        self.assertEqual(with_scope.returncode, 0, with_scope.stderr)
+        self.assertEqual(
+            json.loads(with_scope.stdout),
+            {"projects": ["payments-prod"], "exclude": {"projects": ["*-sandbox"],
+             "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
         )
-        self.assertEqual(without.stdout.strip(), "[0]")
-        none = self._run('release_scope_json kube-agents kubeagents-system; echo "[$?]"')
-        self.assertEqual(none.stdout.strip(), "[0]")
+        no_block = self._run(
+            'live_scope_json kubeagents-system',
+            kubectl_script=(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            ),
+        )
+        self.assertEqual(json.loads(no_block.stdout), {"projects": [], "exclude": {"projects": [], "clusters": []}})
+        unreadable = self._run('live_scope_json kubeagents-system; echo "rc=$?"')
+        self.assertIn("rc=1", unreadable.stdout, unreadable.stderr)
+        none = self._run(
+            'live_scope_json kubeagents-system; echo "rc=$?"',
+            kubectl_script=(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"get platformagents"*) echo \'{"items":[]}\'; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            ),
+        )
+        self.assertIn("rc=1", none.stdout, none.stderr)
         equal = self._run(
             'scope_json_equal \'{"projects":["b","a"],"exclude":{"projects":[],"clusters":[]}}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
         )

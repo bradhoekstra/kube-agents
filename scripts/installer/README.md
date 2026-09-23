@@ -239,14 +239,16 @@ it drops. Hand-set means different from what the chart last rendered, which the 
 recorded values say; a scope the installer rendered is chart-owned and the keys change it freely,
 so removing a project from `SCOPE_PROJECTS` and running `upgrade.sh` is never refused. The check
 reads the CR and the release through the install's own kubeconfig context by name and says so when it
-cannot, and `upgrade.sh`'s `harness` and `operator` modes carry the release's recorded scope forward on
-every Helm retag, never a changed one, since they run no Terraform: a scope edit waits for `full`
-mode, which binds the IAM and renders the CR together, and a retag over changed keys says so; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop a
+cannot, and `upgrade.sh`'s `harness` and `operator` modes leave the CR's scope exactly as it is on every
+Helm retag, hand edits included, since they run no Terraform: the retag reads the live scope back and
+refuses when it cannot, says so when the keys differ, and leaves the change for `full` mode, which
+binds the IAM and renders the CR together; under `--plan` and in those two modes the check warns
+rather than refuses; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop a
 hand-set scope on purpose, and `uninstall.sh` sets it because a destroy keeps nothing either way. `install.sh` takes the same three as `--scope-projects`,
 `--scope-exclude-projects` and `--scope-exclude-clusters` on a first install, which records them; on
-an existing `install.env` a flag that disagrees with the recorded key is refused rather than applied
-for one run, because the next `upgrade.sh` would regenerate from the file and retire what the flag
-added. The interview never asks for them and the Day-2 menu does not edit them, so change them in
+an existing `install.env` a flag that disagrees with the recorded key, or a value the file does not
+record arriving from a flag or the environment, is refused rather than applied for one run, because
+the next `upgrade.sh` would regenerate from the file and retire what it added. The interview never asks for them and the Day-2 menu does not edit them, so change them in
 the file and run `upgrade.sh`.
 
 ### The predecessor: `vars.sh`

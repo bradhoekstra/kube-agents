@@ -1402,22 +1402,28 @@ refuse_unrecorded_scope_flags() {
       SCOPE_EXCLUDE_PROJECTS) flag="--scope-exclude-projects"; value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"; flagged="$PARAM_SCOPE_EXCLUDE_PROJECTS_FLAGGED" ;;
       *) flag="--scope-exclude-clusters"; value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"; flagged="$PARAM_SCOPE_EXCLUDE_CLUSTERS_FLAGGED" ;;
     esac
-    # Only a flag that was passed is compared, an empty one included. The
-    # recorded side is the value bash gave the key when the file was sourced
-    # (still in the environment here, ahead of main's exports), never a second
-    # reading of the file's text: a trailing comment or an expansion the text
-    # reader would misparse must not refuse a run that passed no flag.
-    [ "$flagged" = "true" ] || continue
-    recorded="${!key:-}"
     if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
-      # As lists, so a comma spelling against a space spelling is agreement;
+      # A recorded key is overridden only by a flag (the file is sourced with
+      # set -a, so it beats an inherited value), and only a flag that was
+      # passed is compared, an empty one included. The recorded side is the
+      # value bash gave the key when the file was sourced (still in the
+      # environment here, ahead of main's exports), never a second reading of
+      # the file's text: a trailing comment or an expansion the text reader
+      # would misparse must not refuse a run that passed no flag. As lists, so
+      # a comma spelling against a space spelling is agreement;
       # `--scope-projects=` against a recorded list is the one-run emptying
       # this exists to refuse.
+      [ "$flagged" = "true" ] || continue
+      recorded="${!key:-}"
       [ "$(normalised_scope_list "$recorded")" != "$(normalised_scope_list "$value")" ] || continue
       print_error "${flag}=\"${value}\" disagrees with ${key}=\"${recorded}\" in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and reverses it, retiring the Cluster Agent profiles of every project the flag added or bringing back every project it removed."
     else
+      # Not recorded: a value here came from the flag or from the process
+      # environment (every install.env written before the keys existed lacks
+      # them, and the file does not clear an inherited value it does not
+      # carry). Either door leads to the same reversal on the next upgrade.
       [ -n "$value" ] || continue
-      print_error "${flag}=\"${value}\" is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project the flag added."
+      print_error "${key}=\"${value}\" (from ${flag} or the environment) is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project it added."
     fi
     print_info "Set ${key}=\"${value}\" in ${file} and re-run without ${flag}; the generator reads it on every run."
     refused="true"

@@ -887,18 +887,17 @@ main() {
   # the release's own overrides on top, which is what the redeploy workflows
   # already do for the same reason.
   #
-  # The scope travels with every retag. Resetting to the checkout's defaults
-  # takes platformAgent.scope as empty lists, and a release whose last full
-  # apply predates the value recorded none to re-apply, so a retag that said
-  # nothing would render `projects: []` over a scope the CR carries and the
-  # reconcile would retire those projects. What travels is the scope the
-  # release recorded, not the keys: these modes run no Terraform, so a scope
-  # changed in install.env must wait for full mode, which binds the IAM and
-  # renders the CR together -- carried through a retag, an added project
-  # would be listed with no grant and a dropped one retired with its grants
-  # still bound. A release that recorded no scope (from before the value)
-  # gets the keys, which the generator's guard has just checked against the
-  # live CR.
+  # The scope travels with every retag, and what travels is the CR's own.
+  # Resetting to the checkout's defaults takes platformAgent.scope as empty
+  # lists, so a retag that said nothing would render `projects: []` over a
+  # scope the CR carries and the reconcile would retire those projects. These
+  # modes run no Terraform, so no scope may change through them: not the
+  # keys, which would list a project with no grant or retire one with its
+  # grants still bound, and not the release's record, which a hand edit is
+  # not in. The live spec.scope is read back and passed as it is; a read that
+  # fails refuses the retag rather than guess, and keys that differ from the
+  # CR are said out loud and left for full mode, which binds the IAM and
+  # renders the CR together.
   #
   # Only when the engine has the helper. On the curl path this script is the
   # one the site serves while installer_common.sh comes from the clone at
@@ -912,16 +911,14 @@ main() {
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
     if declare -F scope_values_json >/dev/null 2>&1; then
-      local keys_json recorded_json scope_json
+      local keys_json scope_json
       keys_json="$(scope_values_json)" || return 1
-      recorded_json="$(release_scope_json "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace")"
-      if [ -n "$recorded_json" ]; then
-        scope_json="$recorded_json"
-        if ! scope_json_equal "$recorded_json" "$keys_json"; then
-          print_warning "install.env's SCOPE_* keys differ from the scope the release carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and keeps the release's scope; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
-        fi
-      else
-        scope_json="$keys_json"
+      if ! scope_json="$(live_scope_json "$target_namespace")"; then
+        print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read, or run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
+        return 1
+      fi
+      if ! scope_json_equal "$scope_json" "$keys_json"; then
+        print_warning "install.env's SCOPE_* keys differ from the scope the PlatformAgent carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and leaves the CR's scope as it is; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
       fi
       set_args+=(--set-json "platformAgent.scope=${scope_json}")
     fi
@@ -953,10 +950,11 @@ main() {
   # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
-    # A plan applies nothing, so the hand-declared-scope check speaks without
-    # refusing: the plan is the artefact that shows the destroys it protects
-    # against, and the operator reads it before recording the keys.
-    if [ "$PARAM_PLAN" = "true" ]; then
+    # The hand-declared-scope check protects a full apply. A plan applies
+    # nothing and is the artefact that shows the destroys it protects
+    # against; harness and operator mode leave the CR's scope as it is. In
+    # all three the check speaks without refusing.
+    if [ "$PARAM_PLAN" = "true" ] || [ "$PARAM_UPGRADE_MODE" != "full" ]; then
       export SCOPE_GUARD_REFUSES="false"
     fi
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
