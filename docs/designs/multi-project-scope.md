@@ -199,11 +199,8 @@ matches the immediate parent only, so a walk that stops early misses every proje
 silently. An organisation policy that forbids the Asset API is an open question (§11), not a code
 path.
 
-The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS` in
-`command_policy.py` admits `container clusters list` and `projects list` but no `asset`
-command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
-refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2, with the resolver that needs it,
-and so is adding `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
+The discovery verb was absent from the broker's read allowlist until phase 2: `GCLOUD_READ_COMMANDS` in `command_policy.py` admitted `container clusters list` and `projects list` but no `asset` command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
+refused fail-closed with no signal. Phase 2 added `("asset", "search-all-resources")` with the resolver that needs it, and `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
 flag it does not know the arity of before it matches the command path, so a verb whose flags are
 not listed is admitted and unreachable at once, which the set's own comment records as having
 happened to `logging read`.

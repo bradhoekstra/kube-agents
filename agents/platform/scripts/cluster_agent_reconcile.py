@@ -112,6 +112,10 @@ LIST_WORKERS = 8
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
 LIST_GRACE_SECONDS = 5
+# How many unlisted projects the chat notification names before it counts the rest: a
+# container can resolve to thousands of projects, a chat message has a size ceiling, and
+# a message the platform drops for its size takes the created/pruned summary with it.
+NOTIFY_UNLISTED_LIMIT = 8
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
 # Two caps of 100 (the number is the open question in design §11): the CRD caps each declared list, and this caps the resolved
@@ -844,6 +848,7 @@ def reconcile(dry_run: bool = False) -> dict:
         listings.update(_list_projects([management], management, listing_deadline))
     searches = _search_containers(_container_ids(scope), listing_deadline)
     entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous)
+    report["containers"] = [dict(c) for c in containers]
     if carried_management:
         for entry in entries:
             # Declared explicitly too: the declaration vouches for it, so it lists as any
@@ -1163,11 +1168,21 @@ def _format_notification(report: dict) -> str:
             f"  ⚠️ {len(report['skipped_error'])} profile(s) could not be verified this run "
             f"(left untouched): {', '.join(f'`{n}`' for n in report['skipped_error'])}."
         )
-    unlisted = {p: o for p, o in (report.get("projects") or {}).items() if o != OUTCOME_OK}
-    if unlisted:
+    # Containers first, one line each: a container that failed or read over-cap stands
+    # for every member it carried, which is what keeps the next line short.
+    bad_containers = [c for c in (report.get("containers") or []) if c.get("outcome") != OUTCOME_OK]
+    if bad_containers:
         lines.append(
-            f"  ⚠️ {len(unlisted)} project(s) in scope could not be listed (profiles kept): "
-            + ", ".join(f"`{p}` ({o})" for p, o in sorted(unlisted.items())) + "."
+            f"  ⚠️ {len(bad_containers)} folder(s)/organisation(s) could not be resolved (members carried, profiles kept): "
+            + ", ".join(f"`{c['id']}` ({c['outcome']}, {c.get('projects', 0)} project(s))" for c in sorted(bad_containers, key=lambda c: c["id"])) + "."
+        )
+    unlisted = sorted((p, o) for p, o in (report.get("projects") or {}).items() if o != OUTCOME_OK)
+    if unlisted:
+        named = ", ".join(f"`{p}` ({o})" for p, o in unlisted[:NOTIFY_UNLISTED_LIMIT])
+        rest = len(unlisted) - NOTIFY_UNLISTED_LIMIT
+        lines.append(
+            f"  ⚠️ {len(unlisted)} project(s) in scope could not be listed (profiles kept): {named}"
+            + (f", and {rest} more (see fleet_scope.json)." if rest > 0 else ".")
         )
     return "\n".join(lines)
 

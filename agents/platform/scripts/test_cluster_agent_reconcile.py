@@ -1340,6 +1340,18 @@ class ScopeTest(HomesMixin):
             with mock.patch.object(rec.sandbox_exec, "run", side_effect=err):
                 self.assertEqual(rec._search_container(self.FOLDER), (None, want), stderr)
 
+    def test_the_notification_counts_unlisted_projects_past_a_limit_and_names_containers(self):
+        report = {"created": ["cluster-x"], "pruned": [], "create_failed": [], "skipped_error": [],
+                  "projects": {f"proj-{i:04d}": rec.OUTCOME_OVER_CAP for i in range(30)} | {self.MGMT: rec.OUTCOME_OK},
+                  "containers": [{"id": "organizations/111", "outcome": rec.OUTCOME_OVER_CAP, "projects": 30}]}
+        text = rec._format_notification(report)
+        self.assertIn("1 folder(s)/organisation(s) could not be resolved", text)
+        self.assertIn("`organizations/111` (over-cap, 30 project(s))", text)
+        self.assertIn("30 project(s) in scope could not be listed", text)
+        self.assertIn(f"and {30 - rec.NOTIFY_UNLISTED_LIMIT} more (see fleet_scope.json)", text)
+        self.assertEqual(text.count("`proj-"), rec.NOTIFY_UNLISTED_LIMIT)
+        self.assertLess(len(text), 1500)
+
     def test_an_unrelated_profile_of_unknown_identity_does_not_keep_a_project_retiring(self):
         # gone's last profile goes this tick; a hand-made directory with no identity, never
         # attributed to gone, must not pin gone in the snapshot, or a cluster onboarded there

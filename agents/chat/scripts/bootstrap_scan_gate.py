@@ -119,6 +119,9 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 SCOPE_SNAPSHOT_NAME = "fleet_scope.json"
 SCOPE_OUTCOME_OK = "ok"
 SCOPE_OUTCOME_UNKNOWN = "unknown"
+# How many unlisted projects the sweep's task prompt names before it counts the rest; a
+# folder or organisation can carry thousands, and the prompt names the container instead.
+SCOPE_GAP_NAMED_LIMIT = 20
 
 # The reconcile that creates the Cluster Agents runs on its own cron at `11 * * * *`,
 # while this gate runs every minute. On a fresh install the gate therefore reaches the
@@ -205,6 +208,21 @@ def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
     return sorted(out)
 
 
+def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
+    """Folders and organisations the last reconcile could not resolve, as (id, outcome, projects)."""
+    try:
+        snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
+        return []
+    containers = snapshot.get("containers") if isinstance(snapshot, dict) else None
+    out = []
+    for entry in containers if isinstance(containers, list) else []:
+        if isinstance(entry, dict) and entry.get("id") and entry.get("outcome") != SCOPE_OUTCOME_OK:
+            count = entry.get("projects") if isinstance(entry.get("projects"), int) else 0
+            out.append((str(entry["id"]), str(entry.get("outcome") or SCOPE_OUTCOME_UNKNOWN), count))
+    return sorted(out)
+
+
 def _scope_has_other_projects(data_dir: Path) -> bool:
     """Whether the last reconcile resolved more than one project.
 
@@ -233,10 +251,21 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     unlisted = _unlisted_projects(data_dir)
     if not unlisted:
         return ""
-    named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted)
+    containers = _unresolved_containers(data_dir)
+    container_note = ""
+    if containers:
+        container_note = (
+            "The last reconcile could not resolve "
+            + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in containers)
+            + ", so every project beneath is unlisted and the container is what to name. "
+        )
+    named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted[:SCOPE_GAP_NAMED_LIMIT])
+    rest = len(unlisted) - SCOPE_GAP_NAMED_LIMIT
+    if rest > 0:
+        named += f", and {rest} more (the full list is in `fleet_scope.json`)"
     return (
         "**Some projects in scope have no Cluster Agents for a reason the roster cannot show.** "
-        f"The last reconcile did not list these projects: {named}. The roster holds only the "
+        f"{container_note}The last reconcile did not list these projects: {named}. The roster holds only the "
         "clusters of theirs that already had a profile, and you cannot list them yourself. A "
         "project marked `over-cap` is reachable but past the reconcile's listing cap, and the "
         "others the last run could not list. Name each one at the top of the report as not fully "

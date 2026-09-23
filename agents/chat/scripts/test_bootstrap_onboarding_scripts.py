@@ -614,6 +614,16 @@ class ScopeGapParagraphTest(unittest.TestCase):
         self.assertIn("If you cannot list a project's clusters at all", body)
         self.assertIn("holds the scope and its exclusions and the create/prune rules", body)
 
+    def test_the_paragraph_names_the_container_and_counts_members_past_a_limit(self):
+        import json as _json
+        rows = [{"id": "mgmt", "outcome": "ok"}] + [{"id": f"p-{i:03d}", "outcome": "over-cap", "via": ["folders/9"]} for i in range(25)]
+        snap = _json.dumps({"projects": rows, "containers": [{"id": "folders/9", "outcome": "over-cap", "projects": 25}]})
+        paragraph = bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(snap))
+        self.assertIn("could not resolve `folders/9` (over-cap, 25 project(s) carried)", paragraph)
+        self.assertEqual(paragraph.count("`p-"), bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT)
+        self.assertIn(f"and {25 - bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT} more", paragraph)
+        self.assertLess(len(paragraph), 2500)
+
     def test_a_single_project_install_gets_no_paragraph_whatever_its_outcome(self):
         # The give-up path on a scope-less install: one project, not ok. The prompt stays main's.
         data_dir = self._with_snapshot('{"projects": [{"id": "mgmt", "outcome": "unreachable"}]}')
