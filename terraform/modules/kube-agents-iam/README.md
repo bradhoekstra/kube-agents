@@ -34,6 +34,27 @@ stay there until per-cluster RBAC lands. The site's
 owns the topic, including how the mapping reaches the credential broker and
 what the pool does and does not bound.
 
+## Projects in scope
+
+`scope` mirrors `spec.scope` on the `PlatformAgent` CR: `projects` beyond `project_id`
+whose GKE clusters the Cluster Agent reconcile enumerates, and an `exclude` block the
+module carries for the composition to render into the CR but does not bind. Each project
+in `scope.projects` gets `local.scope_roles` ([`scope.tf`](scope.tf)): a fixed read
+allowlist intersected with `project_roles`, never `project_roles` itself, so a `custom`
+list stays at home. Empty, the default, binds nothing. The `scope_projects` and
+`scope_roles` outputs say what was bound where. Folders and organisations are not inputs
+yet.
+
+```hcl
+scope = {
+  projects = ["payments-prod", "payments-staging"]
+  exclude = {
+    projects = ["*-sandbox"]
+    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch" }]
+  }
+}
+```
+
 ## Usage
 
 ```hcl

@@ -260,6 +260,7 @@ module "kube_agents_iam" {
   namespace          = var.namespace
   project_roles      = local.agent_project_roles
   scoped_clusters    = var.scoped_clusters
+  scope              = var.scope
   service_account_id = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
@@ -617,6 +618,25 @@ resource "helm_release" "kube_agents" {
             serviceAccountEmail = module.kube_agents_iam.scoped_service_accounts[key]
           }
         ]
+      }
+      # The same object the IAM module bound above, so the CR never declares a
+      # project the agent cannot list. Always rendered, empty lists included:
+      # the reconcile reads a present block with an empty projects list as the
+      # declaration that drops projects, and an absent block as no declaration
+      # at all (docs/designs/multi-project-scope.md §7), so removing the last
+      # scoped project here has to reach the CR as an emptied block.
+      scope = {
+        projects = var.scope.projects
+        exclude = {
+          projects = var.scope.exclude.projects
+          clusters = [
+            for cluster in var.scope.exclude.clusters : {
+              projectId   = cluster.project_id
+              location    = cluster.location
+              clusterName = cluster.cluster_name
+            }
+          ]
+        }
       }
       credentials = {
         create = true

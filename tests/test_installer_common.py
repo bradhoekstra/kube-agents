@@ -699,6 +699,63 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("accept_no_network_policy   = false", dest.read_text())
 
+    # ── write_tfvars_from_state: the multi-project scope block ───────────────
+
+    def test_tfvars_render_an_empty_scope_block_when_no_key_is_set(self):
+        # Always a present block: the reconcile reads an emptied `projects` as
+        # the declaration that drops projects and an absent block as no
+        # declaration, so an install.env that never set SCOPE_* has to reach
+        # the composition as empty lists rather than as nothing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn("scope = {\n  projects = []\n  exclude = {\n    projects = []\n    clusters = []\n  }\n}", content)
+
+    def test_tfvars_carry_the_scope_keys(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "SCOPE_PROJECTS": "payments-prod, payments-staging",
+                    "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                    "SCOPE_EXCLUDE_CLUSTERS": "payments-staging/us-central1/scratch payments-prod/us-east1-b/old",
+                },
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('  projects = ["payments-prod", "payments-staging"]', content)
+            self.assertIn('    projects = ["*-sandbox"]', content)
+            self.assertIn(
+                '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch" }, '
+                '{ project_id = "payments-prod", location = "us-east1-b", cluster_name = "old" }]',
+                content,
+            )
+
+    def test_tfvars_refuse_a_malformed_exclude_cluster_before_writing(self):
+        # A triple that is not project/location/cluster fails the generator,
+        # names the entry, and leaves no file behind: the check runs before the
+        # redirected block, not inside it.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "payments-staging/us-central1"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("payments-staging/us-central1", proc.stdout + proc.stderr)
+            self.assertFalse(dest.exists(), "a malformed scope must not produce a tfvars")
+            self.assertFalse(dest.with_suffix(".tfvars.tmp").exists(), "no partial file either")
+
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "ACCEPT_NO_NETWORK_POLICY": "true"},

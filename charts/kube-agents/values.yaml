@@ -807,6 +807,40 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+  # Which GCP projects, beyond the one the agent runs in, the hourly Cluster
+  # Agent reconcile enumerates for GKE clusters, and which projects and
+  # clusters it leaves unmanaged: spec.scope on the PlatformAgent CR. The
+  # agent's service account needs the read roles in each listed project
+  # (roles/container.clusterViewer, container.viewer, compute.viewer,
+  # monitoring.viewer, logging.viewer, iam.securityReviewer); the
+  # terraform/examples/full-install composition binds them from its `scope`
+  # variable and fills this in from the same value. A project the account
+  # cannot list is reported, not an error.
+  #
+  # Always rendered, empty lists included. The reconcile reads a present block
+  # with an empty projects list as the declaration that drops projects, and an
+  # absent block as no declaration at all (a block goes missing on its own
+  # when a CR write passes an older operator's webhook), so removing the last
+  # project here has to reach the CR as an emptied block rather than as no
+  # block. The management project is always in scope and cannot be excluded.
+  #
+  # exclude.projects takes project IDs or shell-style globs; exclude.clusters
+  # names single clusters by the full triple, because a cluster name is unique
+  # only within a project and location. Each list carries at most 100 entries.
+  #
+  #   scope:
+  #     projects: [payments-prod, payments-staging]
+  #     exclude:
+  #       projects: ["*-sandbox"]
+  #       clusters:
+  #         - projectId: payments-staging
+  #           location: us-central1
+  #           clusterName: scratch-cluster
+  scope:
+    projects: []
+    exclude:
+      projects: []
+      clusters: []
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

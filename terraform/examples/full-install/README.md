@@ -469,6 +469,24 @@ equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
 
+### Projects in scope (`scope`)
+
+`scope` declares the GCP projects beyond `project_id` whose GKE clusters get a Cluster
+Agent, and what to leave unmanaged, as one object that reaches both halves of the
+install: the `kube-agents-iam` module binds its read allowlist (the read subset of the
+default roles, intersected with what the host project got) in every `scope.projects`
+entry, and the chart renders the same object into the `PlatformAgent` CR as
+`spec.scope`. The block is always rendered, empty lists included, because the reconcile
+reads an emptied `projects` list as the declaration that drops projects and an absent
+block as no declaration; removing a project here revokes its grants and retires its
+profiles over the reconcile's next two clean runs. `exclude.projects` takes IDs or
+shell-style globs, `exclude.clusters` the full `{project_id, location, cluster_name}`
+triple; neither changes IAM. The installer writes this from `SCOPE_PROJECTS`,
+`SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+([`scripts/installer/README.md`](../../../scripts/installer/README.md)). Folders and
+organisations are not inputs yet. The `scope_projects` and `scope_roles` outputs report
+what was bound.
+
 ### Backups
 
 `enable_backup_agent` (default `true`) turns on the Backup for GKE addon. It

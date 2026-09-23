@@ -392,6 +392,12 @@ PARAM_KMS_KEY="${KMS_KEY:-}"
 # helpers are sourced, so no default is spelled twice.
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+# The multi-project scope. Empty means the management project alone, which is
+# also what the generator renders, so an install that never set these keys
+# declares exactly what it declared before they existed.
+PARAM_SCOPE_PROJECTS="${SCOPE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}"
+PARAM_SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}"
 # Empty means "not chosen", like PARAM_MODEL_PROVIDER above; resolve_shared_defaults
 # fills in install.defaults.env's answer once the helpers are sourced.
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-}"
@@ -544,6 +550,12 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: DEFAULT_PERMISSION_SET, currently read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
+  --scope-projects=IDS          GCP projects beyond the host project whose GKE clusters get a
+                                Cluster Agent (space- or comma-separated). The read roles are
+                                bound in each; one the agent cannot list is reported, not fatal
+  --scope-exclude-projects=IDS  Project IDs or shell-style globs to leave unmanaged
+  --scope-exclude-clusters=TRIPLES
+                                Clusters to leave unmanaged, as project/location/cluster
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -723,6 +735,9 @@ parse_args() {
       --kms-key=*) PARAM_KMS_KEY="${1#*=}"; shift ;;
       --permission-set=*) PARAM_PERMISSION_SET="${1#*=}"; shift ;;
       --custom-roles=*) PARAM_CUSTOM_ROLES="${1#*=}"; shift ;;
+      --scope-projects=*) PARAM_SCOPE_PROJECTS="${1#*=}"; shift ;;
+      --scope-exclude-projects=*) PARAM_SCOPE_EXCLUDE_PROJECTS="${1#*=}"; shift ;;
+      --scope-exclude-clusters=*) PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
@@ -1218,7 +1233,8 @@ warn_unrecorded_interview_answers() {
   for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
     CHAT_TOPIC_NAME CHAT_SUB_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME MODEL_MAX_TOKENS PLATFORM_AGENT_PERMISSION_SET \
-    PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
+    PLATFORM_AGENT_CUSTOM_ROLES SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS \
+    ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
     recorded="$(recorded_install_env_value "$file" "$key")"
@@ -1420,6 +1436,9 @@ bootstrap_install_env_file() {
   if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
     write_env_var "$tmp" PLATFORM_AGENT_CUSTOM_ROLES "${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   fi
+  write_env_var "$tmp" SCOPE_PROJECTS "${SCOPE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_PROJECTS "${SCOPE_EXCLUDE_PROJECTS:-}"
+  write_env_var "$tmp" SCOPE_EXCLUDE_CLUSTERS "${SCOPE_EXCLUDE_CLUSTERS:-}"
   write_env_var "$tmp" GITOPS_ORG "${GITOPS_ORG:-}"
   write_env_var "$tmp" GITOPS_REPO "${GITOPS_REPO:-}"
   write_env_var "$tmp" GITHUB_APP_ID "${GITHUB_APP_ID:-}"
@@ -4598,6 +4617,12 @@ main() {
   if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
     warn_on_overreaching_custom_roles "$custom_roles"
   fi
+  # The multi-project scope, from the --scope-* flags or the loaded SCOPE_*
+  # keys. The generator validates the exclude.clusters triples before it
+  # writes anything, and the CRD validates the IDs at admission.
+  local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
+  local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
+  local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"
   # No `:-` fallback: resolve_shared_defaults already applied
   # DEFAULT_ENABLE_GVISOR with ${VAR-...}, which leaves `--enable-gvisor=` (set, but
   # empty) empty on purpose so the validator below rejects it instead of
@@ -4885,6 +4910,9 @@ main() {
   export API_SERVER_KEY="$api_server_key"
   export PLATFORM_AGENT_PERMISSION_SET="$permission_set"
   export PLATFORM_AGENT_CUSTOM_ROLES="$custom_roles"
+  export SCOPE_PROJECTS="$scope_projects"
+  export SCOPE_EXCLUDE_PROJECTS="$scope_exclude_projects"
+  export SCOPE_EXCLUDE_CLUSTERS="$scope_exclude_clusters"
   export GITOPS_ORG="$github_org"
   export GITOPS_REPO="$github_repo"
   # One release of overlap: the agent runtime and the chart still speak

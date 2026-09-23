@@ -217,6 +217,21 @@ aborts before making any cluster changes.
 `ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
 pre-existing clusters (testing environments only).
 
+### Projects in scope
+
+`SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` are the
+multi-project scope, `spec.scope` on the `PlatformAgent` CR. The first two are comma- or
+space-separated lists (an exclude entry may be a shell-style glob such as `*-sandbox`),
+the third a list of `project/location/cluster` triples. The generator renders them as the
+composition's `scope` object, from which Terraform binds the read roles in each project
+and the chart renders the CR. The block is always written, empty lists included, so an
+`install.env` that never set these keys declares the management project alone, and one
+that drops a project makes the next `upgrade.sh` revoke its grants and retire its
+profiles. A triple that is not three non-empty parts fails the generator before any file
+is written. `install.sh` takes the same three as `--scope-projects`,
+`--scope-exclude-projects` and `--scope-exclude-clusters`; the Day-2 menu does not edit
+them, so change them in the file and run `upgrade.sh`.
+
 ### The predecessor: `vars.sh`
 
 `k8s-operator/scripts/vars.sh` was the generated state file `install.env` replaces. No

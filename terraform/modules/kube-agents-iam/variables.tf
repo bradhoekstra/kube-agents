@@ -118,3 +118,54 @@ variable "scoped_clusters" {
     error_message = "scoped_clusters repeats a cluster. One cluster maps to one service account; two entries would silently keep whichever the provider applied last."
   }
 }
+
+variable "scope" {
+  description = <<-EOT
+    The projects beyond project_id whose GKE clusters the Cluster Agent
+    reconcile enumerates, mirroring `spec.scope` on the PlatformAgent CR
+    (docs/designs/multi-project-scope.md §3). Each project in `projects` gets
+    the read roles in `local.scope_roles` (scope.tf): the module's read
+    allowlist intersected with project_roles, never project_roles itself.
+    `exclude` travels with the declaration so the composition can render the CR
+    from one object; it binds nothing here.
+
+    Empty, the default, binds nothing and the reconcile lists project_id alone.
+    Folders and organisations are not inputs yet; they arrive with the
+    container half of the design.
+  EOT
+  type = object({
+    projects = optional(list(string), [])
+    exclude = optional(object({
+      projects = optional(list(string), [])
+      clusters = optional(list(object({
+        project_id   = string
+        location     = string
+        cluster_name = string
+      })), [])
+    }), {})
+  })
+  nullable = false
+  default  = {}
+
+  validation {
+    condition     = length(var.scope.projects) <= 100
+    error_message = "scope.projects carries at most 100 project IDs, the cap the CRD enforces on the same list."
+  }
+
+  validation {
+    condition = alltrue([
+      for project in var.scope.projects : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", project))
+    ])
+    error_message = "Each scope.projects entry must be a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$), the pattern the CRD accepts for the same field."
+  }
+
+  validation {
+    condition = alltrue([
+      for cluster in var.scope.exclude.clusters :
+      can(regex("^[a-z0-9][a-z0-9-]*$", cluster.project_id))
+      && can(regex("^[a-z0-9][a-z0-9-]*$", cluster.location))
+      && can(regex("^[a-z0-9][a-z0-9-]*$", cluster.cluster_name))
+    ])
+    error_message = "Each scope.exclude.clusters entry names one cluster by project_id, location and cluster_name, each matching ^[a-z0-9][a-z0-9-]*$."
+  }
+}

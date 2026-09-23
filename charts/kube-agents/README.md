@@ -553,6 +553,21 @@ before any GKE call. The
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
+### Projects in scope
+
+`platformAgent.scope` is `spec.scope` on the CR: the GCP projects beyond the one the
+agent runs in whose GKE clusters the Cluster Agent reconcile enumerates, and the
+projects and clusters it leaves unmanaged. The chart renders the block on every
+install, empty lists included, and never drops it the way its other optional groups
+are dropped: the reconcile reads an emptied `projects` list as the declaration that
+drops projects and an absent block as no declaration at all, so removing the last
+project has to reach the CR as an emptied block. The agent's service account needs the
+read roles in each listed project; the `terraform/examples/full-install` composition
+binds them from its `scope` variable and fills this value from the same object, and a
+bare `helm install` leaves the grant to you. The
+[PlatformAgent CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md)
+owns the field.
+
 ### ServiceAccount ownership
 
 Exactly one owner creates the agent's KSA, depending on

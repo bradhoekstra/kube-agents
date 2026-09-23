@@ -122,6 +122,8 @@ readonly TF_STATE_OBJECT="default.tfstate"
 # error as absence.
 readonly GCS_OBJECT_ABSENT_PATTERN='matched no objects|NotFoundException|HTTPError 404|not found|does not exist'
 readonly TF_STATE_RC_UNREADABLE=2
+# One SCOPE_EXCLUDE_CLUSTERS entry in install.env is project/location/cluster.
+readonly SCOPE_CLUSTER_TRIPLE_SEPARATOR="/"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -796,6 +798,35 @@ hcl_csv_list() {
     first=false
   done
   printf '%s]' "$out"
+}
+
+# The multi-project scope block (the composition's `scope` variable, which is
+# spec.scope on the PlatformAgent CR), from the three SCOPE_* keys install.env
+# carries: SCOPE_PROJECTS and SCOPE_EXCLUDE_PROJECTS are comma- or
+# space-separated lists (an exclude entry may be a shell-style glob), and
+# SCOPE_EXCLUDE_CLUSTERS is a list of project/location/cluster triples. Always
+# emitted, empty lists included: the reconcile reads an emptied block as the
+# declaration that drops projects and an absent one as no declaration, so a
+# scope removed from install.env has to reach the CR as empty lists. Returns 1,
+# naming the entry, for a triple that is not exactly three non-empty parts.
+hcl_scope_block() {
+  local projects="${1:-}" exclude_projects="${2:-}" exclude_clusters="${3:-}"
+  local clusters="[" first=true item project location cluster rest
+  local IFS=$', \t\n'
+  for item in $exclude_clusters; do
+    [ -n "$item" ] || continue
+    IFS="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" read -r project location cluster rest <<< "$item"
+    if [ -z "$project" ] || [ -z "$location" ] || [ -z "$cluster" ] || [ -n "$rest" ]; then
+      print_error "SCOPE_EXCLUDE_CLUSTERS entry '${item}' is not a project${SCOPE_CLUSTER_TRIPLE_SEPARATOR}location${SCOPE_CLUSTER_TRIPLE_SEPARATOR}cluster triple." >&2
+      return 1
+    fi
+    $first || clusters+=", "
+    clusters+="{ project_id = $(hcl_str "$project"), location = $(hcl_str "$location"), cluster_name = $(hcl_str "$cluster") }"
+    first=false
+  done
+  clusters+="]"
+  printf 'scope = {\n  projects = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+    "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$exclude_projects")" "$clusters"
 }
 
 # The raw state object, as this install keeps it in GCS. Read straight from
@@ -1760,6 +1791,12 @@ write_tfvars_from_state() {
     return 1
   fi
 
+  # The multi-project scope, rendered here rather than inside the redirected
+  # block below so a malformed SCOPE_EXCLUDE_CLUSTERS triple fails before any
+  # partial file exists.
+  local scope_block
+  scope_block="$(hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}")" || return 1
+
   local old_umask
   old_umask="$(umask)"
   umask 077
@@ -1834,6 +1871,10 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
+    echo "# Multi-project scope (spec.scope): the IAM module binds the read roles in"
+    echo "# each project and the chart renders the same object into the CR. Empty"
+    echo "# lists declare the management project alone."
+    echo "$scope_block"
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
     if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then

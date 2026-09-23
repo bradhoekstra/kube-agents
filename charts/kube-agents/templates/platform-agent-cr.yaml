@@ -187,6 +187,22 @@ spec:
       serviceAccountEmail: {{ $wif.serviceAccountEmail | quote }}
     {{- end }}
   {{- /*
+    Always present, empty lists included, and deliberately not through
+    compactFields: the reconcile reads a present block whose `projects` is empty
+    as the declaration that drops projects, and an absent block as no
+    declaration at all (the operator marks it absent, because a block goes
+    missing on its own when a CR write passes an older operator's webhook).
+    Dropping the group when every list is empty would turn "remove the last
+    scoped project and upgrade" into a no-op that keeps the old projects in scope.
+  */}}
+  {{- $scope := .Values.platformAgent.scope | default dict }}
+  {{- $scopeExclude := $scope.exclude | default dict }}
+  scope:
+    projects: {{ $scope.projects | default list | toJson }}
+    exclude:
+      projects: {{ $scopeExclude.projects | default list | toJson }}
+      clusters: {{ $scopeExclude.clusters | default list | toJson }}
+  {{- /*
     `with`, not `if`: an empty value must OMIT the field, not render it as "". Omitting is
     what leaves the operator free to discover a collector; an explicit "" would look like
     a decision the chart made.

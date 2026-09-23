@@ -457,9 +457,11 @@ The Workload Identity target GSA (`kubeagents-platform-gsa@<project>.iam.gservic
 ## `spec.scope`
 
 Optional. Which GCP projects, beyond the one the agent runs in, the hourly Cluster Agent reconcile
-enumerates for GKE clusters, and which projects and clusters it leaves unmanaged. Not yet surfaced
-in the Helm chart, which owns the CR on a chart install: until the chart gains the values, the field
-is set by editing the `PlatformAgent` directly. Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
+enumerates for GKE clusters, and which projects and clusters it leaves unmanaged. On a chart install
+the chart owns the CR and renders the block from `platformAgent.scope`, always present, empty lists
+included; the Terraform composition fills that value from its `scope` variable, which the installer
+writes from `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`.
+Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
 
 ```yaml
 spec:
@@ -479,8 +481,7 @@ spec:
 - `projects` — project IDs whose clusters get profiles. The agent's service account needs the
   read roles in each one (`roles/container.clusterViewer`, `roles/container.viewer`,
   `roles/compute.viewer`, `roles/monitoring.viewer`, `roles/logging.viewer`,
-  `roles/iam.securityReviewer`, the read subset of the `read_only_roles` the Terraform composition binds in the management project). No installer path grants them yet: until the Terraform
-  composition gains a scope input, grant them by hand in each project. A project it cannot list is reported as `denied` (no role left that grants `container.clusters.list`; `roles/iam.securityReviewer` alone keeps a project listable, so a project reads `denied` only once every such role is gone), `api-disabled` (GKE API off in that project) or `unreachable` (anything else, including a listing that did not finish within the run's listing budget) and its existing profiles are kept. Each list is capped at 100
+  `roles/iam.securityReviewer`, the read subset of the `read_only_roles` the Terraform composition binds in the management project). The Terraform composition binds them in every project its `scope.projects` names, through the `kube-agents-iam` module's `scope` input; a CR edited by hand needs the same grants made by hand. A project it cannot list is reported as `denied` (no role left that grants `container.clusters.list`; `roles/iam.securityReviewer` alone keeps a project listable, so a project reads `denied` only once every such role is gone), `api-disabled` (GKE API off in that project) or `unreachable` (anything else, including a listing that did not finish within the run's listing budget) and its existing profiles are kept. Each list is capped at 100
   entries, and the run lists at most 100 projects in total, the management project included; an
   explicit project past that reads `over-cap` and is likewise kept but not listed.
 - `exclude.projects` — IDs or globs matched against every resolved project ID. An entry that matches
