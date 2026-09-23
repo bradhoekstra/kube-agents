@@ -914,9 +914,9 @@ def reconcile(dry_run: bool = False) -> dict:
         # A container member arrives from the asset index without any per-project
         # permission check, so a project the account holds no GKE role in would otherwise
         # be scaffolded (registered with Hermes, stamped, pushed to the sandbox) and fail
-        # only at get-credentials, every run. One describe before the first create in
-        # such a project answers the question cheaply; a 403 skips its creates for the
-        # run and reads the project `denied` (design §4).
+        # only at get-credentials, every run. One describe per cluster before its create
+        # answers cheaply: a NotFound skips the cluster the index still names, a 403 skips
+        # the project's remaining creates and reads it `denied` (design §4).
         member_only = not ({VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]))
         for (proj, cluster, location) in sorted(listed):
             if (proj, cluster, location) in existing_keys:
@@ -1200,16 +1200,22 @@ def reconcile(dry_run: bool = False) -> dict:
     # Fill order decided the cap above; the written order is sorted by ID so an
     # unchanged fleet writes an unchanged file (design §3, "Resolution is deterministic").
     snapshot_projects = sorted([
+        # A member a frozen or over-cap container carried (no `clusters`: the index did not
+        # place it this run) keeps its index-lag stamp; one the index placed clears it.
         {"id": e["id"], "via": e["via"], "outcome": e["outcome"], "state": STATE_IN_SCOPE,
-         "clusters": cluster_counts.get(e["id"])}
+         "clusters": cluster_counts.get(e["id"]),
+         **({ABSENT_SINCE_KEY: _previous_absent_since(previous, e["id"])}
+            if "clusters" not in e and _previous_absent_since(previous, e["id"]) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the
         # members an unjudged run carried, and the gate still sees what produced them; and
         # with the index-lag stamp it had, so a frozen or unjudged run in between does not
         # restart the day.
-        {"id": pid, "via": _previous_via(previous, pid), "outcome": OUTCOME_UNREACHABLE, "state": STATE_IN_SCOPE,
-         "clusters": remaining(pid),
+        # Without the `management` marker: that marker is the management slot's alone, and a
+        # carried old management project must not answer _previous_management next run.
+        {"id": pid, "via": [v for v in _previous_via(previous, pid) if v != VIA_MANAGEMENT], "outcome": OUTCOME_UNREACHABLE,
+         "state": STATE_IN_SCOPE, "clusters": remaining(pid),
          **({ABSENT_SINCE_KEY: absent_since.get(pid) or _previous_absent_since(previous, pid)}
             if (pid in absent_since or _previous_absent_since(previous, pid)) else {})}
         for pid in sorted(carried_in_scope - resolved_ids)

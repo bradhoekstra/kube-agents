@@ -1388,6 +1388,12 @@ class ScopeTest(HomesMixin):
             self.assertIn("asset index", self._snapshot()["unmanaged"][0]["reason"])
             stamps.add(rows["team-a"][rec.ABSENT_SINCE_KEY])
         self.assertEqual(len(stamps), 1)  # the first absent run's time, carried, not restarted
+        # The member's own folder freezing in between carries the stamp too: the frozen
+        # container pulls the member back in as an entry, and the stamp rides along.
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(deleted, [])
+        self.assertEqual({p["id"]: p.get(rec.ABSENT_SINCE_KEY) for p in self._snapshot()["projects"]}["team-a"], next(iter(stamps)))
         # An unclean run in between (an explicit project unreachable) carries the stamp too.
         report, _, deleted = self._run({"projects": ["flaky"], "folders": ["123456789012"]},
                                        {self.MGMT: [], "flaky": (None, rec.OUTCOME_UNREACHABLE)},
