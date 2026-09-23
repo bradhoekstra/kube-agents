@@ -1464,6 +1464,27 @@ class ScopeTest(HomesMixin):
         stamp = {p["id"]: p for p in self._snapshot()["projects"]}["team-a"][rec.ABSENT_SINCE_KEY]
         self.assertNotEqual(stamp, "yesterday")
 
+    def test_a_stamp_on_a_project_listed_as_explicit_or_placed_by_a_later_container_clears(self):
+        old = "2020-01-01T00:00:00Z"
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        # Explicit and under the folder, with a stamp from an earlier lag: listed live, the
+        # stamp clears, so removing the explicit entry weeks later starts a fresh day.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.FOLDER], "state": rec.STATE_IN_SCOPE, rec.ABSENT_SINCE_KEY: old}])
+        self._run({"projects": ["team-a"], "folders": ["123456789012"]}, {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")]},
+                  profiles=["cluster-a"], identities=ids, searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, {p["id"]: p for p in self._snapshot()["projects"]}["team-a"])
+        # A container sorted first freezes and carries it; a later over-cap container's
+        # successful lookup places it: the index saw it, the stamp clears.
+        f1, f2 = "folders/111111111111", "folders/222222222222"
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [f1], "state": rec.STATE_IN_SCOPE, rec.ABSENT_SINCE_KEY: old}])
+        big = {f"q-{i}": [(f"q-{i}", "c", "us-central1")] for i in range(4)} | {"team-a": [("team-a", "prod", "us-central1")]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 2):
+            self._run({"folders": [f1[8:], f2[8:]]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                      searches={f1: (None, rec.OUTCOME_DENIED), f2: (big, rec.OUTCOME_OK)})
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, {p["id"]: p for p in self._snapshot()["projects"]}["team-a"])
+
     def test_a_render_that_predates_containers_keeps_their_members(self):
         # Rollback to the previous release: its render has present and projects but no folders
         # or organizations key, and the CRD pruned the lists from the stored CR. It declares

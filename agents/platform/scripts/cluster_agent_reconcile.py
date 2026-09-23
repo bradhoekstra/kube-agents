@@ -143,6 +143,8 @@ SNAPSHOT_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 SECONDS_PER_HOUR = 3600
 INDEX_LAG_GRACE_SECONDS = 24 * SECONDS_PER_HOUR
 ABSENT_SINCE_KEY = "absentSince"
+# How much of an unreadable search row the log quotes.
+LOG_ROW_PREVIEW_CHARS = 200
 # What gcloud says when the account is not granted in a project, and when the GKE API is
 # off there. Anything else is unreachable: the run learned nothing and keeps everything.
 _DENIED_MARKERS = ("PERMISSION_DENIED", "403", "does not have permission", "Permission denied")
@@ -456,7 +458,7 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
             # retire every member a day later while the container reported healthy; a
             # failed lookup freezes instead (design §4).
             log(f"resolving {container}: a search row has a shape this run cannot read "
-                f"({str(asset)[:200]!r}); {OUTCOME_UNREACHABLE}, its previous members are carried forward.")
+                f"({str(asset)[:LOG_ROW_PREVIEW_CHARS]!r}); {OUTCOME_UNREACHABLE}, its previous members are carried forward.")
             return None, OUTCOME_UNREACHABLE
         members.setdefault(triple[0], []).append(triple)
     return members, OUTCOME_OK
@@ -522,6 +524,14 @@ def _resolve_projects(management: str | None, scope: dict,
                 return entry
         return None
 
+    def mark_indexed(project: str) -> None:
+        # A successful lookup placed the project under this container; whatever else the
+        # entry is (explicit, management, carried frozen by an earlier container), the index
+        # saw it this run, which is what the snapshot's index-lag stamp asks.
+        for entry in entries:
+            if entry["id"] == project:
+                entry["indexed"] = True
+
     containers: list[dict] = []
     for container in _container_ids(scope):
         members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
@@ -546,6 +556,8 @@ def _resolve_projects(management: str | None, scope: dict,
             for project in carried:
                 if project in seen:
                     add_via(project, container)
+                    if outcome == OUTCOME_OVER_CAP:
+                        mark_indexed(project)
                     continue
                 if _excluded_by(project, patterns):
                     continue
@@ -559,6 +571,7 @@ def _resolve_projects(management: str | None, scope: dict,
         for project in sorted(members):
             if project in seen:
                 add_via(project, container)
+                mark_indexed(project)
                 # Listed by this container but carried frozen by an earlier one: the live
                 # listing wins, whichever container sorted first.
                 frozen = frozen_entry(project)
@@ -1122,7 +1135,8 @@ def reconcile(dry_run: bool = False) -> dict:
                 reason = (f"not under any declared container in the asset index this run (a move, or the "
                           f"index behind); kept until {INDEX_LAG_GRACE_SECONDS // SECONDS_PER_HOUR}h after {absent_since.get(project, '')}"
                           if containers_known
-                          else "reached through a container the running render does not know; kept")
+                          else "reached through a container the running render does not know; kept" if scope_readable
+                          else "not judged this run: the declaration could not be read; carried forward")
             elif lookups_clean and scope_present and project in previously_resolved:
                 # First clean run the declaration omits it: retiring now, pruned next run.
                 deferred_retiring.add(project)
@@ -1213,12 +1227,13 @@ def reconcile(dry_run: bool = False) -> dict:
     # Fill order decided the cap above; the written order is sorted by ID so an
     # unchanged fleet writes an unchanged file (design §3, "Resolution is deterministic").
     snapshot_projects = sorted([
-        # A member a frozen container carried (the index did not place it this run) keeps its
-        # index-lag stamp; one the index placed, listed or over-cap, clears it.
+        # Only a member a frozen container carried, and nothing else placed this run, keeps its
+        # index-lag stamp (`indexed` is False on exactly those rows); a project the index
+        # placed, or that lists on its own as explicit or management, clears it.
         {"id": e["id"], "via": e["via"], "outcome": e["outcome"], "state": STATE_IN_SCOPE,
          "clusters": cluster_counts.get(e["id"]),
          **({ABSENT_SINCE_KEY: _previous_absent_since(previous, e["id"])}
-            if "clusters" not in e and not e.get("indexed") and _previous_absent_since(previous, e["id"]) else {})}
+            if e.get("indexed") is False and _previous_absent_since(previous, e["id"]) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the
