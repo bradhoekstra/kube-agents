@@ -154,8 +154,7 @@ Rules:
 - **Two caps of 100, enforced in different places.** Each declared list (`projects`, `folders`,
   `organizations`, both `exclude` lists, and the phase 3 selectors when they land) carries
   `MaxItems=100` on the CRD, the ceiling `scopedServiceAccounts` already has, so an oversized
-  declaration is refused at admission. The reconcile lists at most 100 projects of the resolved
-  set, the management project included, because one folder can resolve to any number. The set is
+  declaration is refused at admission. The reconcile lists at most 100 projects of the resolved set, the management project included, because one folder can resolve to any number. The number is the pool's ceiling and not a measurement of the reconcile, and the estate that asked for this design is already above it: #1354 describes about 200 projects with one cluster each. That estate runs as two installs with disjoint scopes until the two ceilings lift together (§11); lifting the listing cap alone would discover clusters the pool cannot credential. The set is
   filled in a fixed order so the cap binds the same way on every run: the management project, then
   explicit projects sorted by ID, then the phase 3 selectors' projects sorted by ID, then
   containers sorted by ID; a container that does not fit is skipped and the next one is still tried,
@@ -439,14 +438,13 @@ because no selector produced it or because an `exclude.projects` entry removed i
 the set is present in the snapshot with whatever outcome it read, `ok` or not, and is never pruned
 by this rule; every selector the run resolves at runtime, the declared containers and the phase 3 shared-VPC-host and metrics-scope lookups alike, resolved this run, `ok` or `over-cap` (§4), the management project itself resolved and listed its own clusters, and the declaration file was read, so that the absence is the declaration speaking
 and not a failed lookup; and the project was present in the previous snapshot's `projects` array, as `in-scope` or
-`retiring`, so that removal is a transition the scope made and not a state it merely finds. A CR that carries no `scope` block at all declares nothing: the run lists the management project alone, keeps the last recorded declaration's exclusions, carries its projects forward as in scope, and retires nothing, because a block goes missing on its own when a CR write passes an older operator's webhook; dropping projects is done by emptying `projects` inside a present block. The prune takes two clean runs: the first clean run that finds a project absent writes it to the snapshot as `retiring`, and the next clean run that still finds it absent deletes its profiles, so a declaration edit has one clean run to be reverted before anything is removed. A run that is not clean neither marks nor counts: a project newly absent on it is carried forward as `in-scope` with no `via`, and one already `retiring` stays so. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) is marked `retiring` on the run the change is seen, once the new project has listed its own clusters, unless the declaration names the old one; an answer from the gcloud config fallback that disagrees with the previous snapshot is treated as unresolved, not as a change. The third condition is what
+`retiring`, so that removal is a transition the scope made and not a state it merely finds. A CR that carries no `scope` block at all declares nothing: the run lists the management project alone, keeps the last recorded declaration's exclusions, carries its projects forward as in scope, and retires nothing, because a block goes missing on its own when a CR write passes an older operator's webhook; dropping projects is done by emptying `projects` inside a present block. The rule therefore binds the renderer: once an install carries a scope value, the chart's `PlatformAgent` template emits `spec.scope` as a present block, empty lists included, rather than dropping the group the way its other optional groups are dropped when every value is empty, so that removing the last project from the tfvars and running `upgrade.sh` reads as the declaration that drops it and not as no declaration. The absent marker exists for CR writes the chart did not make. The prune takes two clean runs: the first clean run that finds a project absent writes it to the snapshot as `retiring`, and the next clean run that still finds it absent deletes its profiles, so a declaration edit has one clean run to be reverted before anything is removed. A run that is not clean neither marks nor counts: a project newly absent on it is carried forward as `in-scope` with no `via`, and one already `retiring` stays so. A management project that changes identity (`RECONCILE_PROJECT` re-pointed, or the metadata server naming another project) is marked `retiring` on the run the change is seen, once the new project has listed its own clusters, unless the declaration names the old one; an answer from the gcloud config fallback that disagrees with the previous snapshot is treated as unresolved, not as a change. The third condition is what
 protects profiles the scope never produced. The `manage-cluster` skill onboards a cluster with an
 explicit `--project` today, and those profiles exist on installs that will upgrade into phase 1
 with an empty scope; without it, the first tick would delete every one of them, which is the
 deletion `cluster_agent_reconcile.py:11-15` exists to never do. A profile whose project is outside
 the scope and was never in it is kept, verified by PRUNE against its own project as today, and
-listed in the snapshot's `unmanaged` array (§5) so the operator can declare it or delete it. A
-project the rule has decided to retire is written to the snapshot with `state: retiring` and stays there, still
+listed in the snapshot's `unmanaged` array (§5) so the operator can declare it or delete it. That is decision 3 of 2026-09-21 on #1354 as the design behaves: discovery never aborts over a stray profile; a project the scope dropped retires under the three conditions; a profile whose project was never in scope is kept and reported. The issue's wording, "pruned and recorded in the snapshot with the reason", holds for the dropped project and not for the never-in-scope one, which is recorded and kept. A project the rule has decided to retire is written to the snapshot with `state: retiring` and stays there, still
 eligible for the prune, until every one of its profiles is gone; otherwise a delete that failed on
 the one tick the third condition held would leave the profile `unmanaged` for good. A project that
 became `denied` because a binding was revoked without editing the scope is not pruned; the
@@ -456,7 +454,8 @@ profiles stay, the outcome is reported, and an operator resolves it one way or t
 stop appearing in the resolved set, and PRUNE's per-profile `describe --project=<P>` now returns a
 403, because the folder binding no longer covers it, which `_cluster_exists` classifies as unknown
 and keeps (`cluster_agent_reconcile.py:135-163`). It is the out-of-scope rule above, not NotFound,
-that retires those profiles, and only once the containers have resolved `ok`. Moved to a different
+that retires those profiles, and only once every container has resolved `ok` or `over-cap`, the
+second condition above. Moved to a different
 declared folder: no change, because resolution is by project and the `via` field merely records
 the new path.
 
@@ -552,9 +551,10 @@ into a second project the tester controls.
 
 1. **Explicit projects.** `spec.scope.projects` and `spec.scope.exclude` on the CRD; the operator renders the scope file on every install, empty and marked absent when the CR has no scope block, so that a block stripped by a CR write through an older operator's webhook reads as no declaration (management project alone, nothing retired) rather than as every project dropped, while an empty `projects` list in a present block is the declaration that drops projects; `cluster_agent_reconcile.py` iterates the list,
    applies the three-condition prune, and writes `fleet_scope.json` with per-project outcomes and
-   `unmanaged` and `retiring` entries; `kube-agents-iam` binds `scope_roles` per explicit project;
-   the bootstrap
-   gate names non-`ok` projects; `session_kv_server.py` and `platform_mcp_server.py` read the
+   `unmanaged` and `retiring` entries; `kube-agents-iam` binds `scope_roles` per explicit project; the chart's `PlatformAgent`
+   template renders `spec.scope` as a present block, empty lists included, whenever the install
+   carries the value (§7 says why an omitted block must not stand in for an emptied one); the
+   bootstrap gate names non-`ok` projects; `session_kv_server.py` and `platform_mcp_server.py` read the
    project from the event or the profile identity rather than one environment value; the
    `RECONCILE_EXCLUDE` mentions §8 lists point at the new field. Phase 1 also carries the
    `MaxItems=100` caps on its lists, `over-cap` as a project outcome for an explicit project past
@@ -591,8 +591,10 @@ into a second project the tester controls.
   projects means one chat front door, one reconcile job, and one hourly sweep for all of them. The
   reconcile's per-profile `describe` in PRUNE is already O(clusters); at what fleet size does an
   install want two Platform Agents with disjoint scopes, and does anything need to prevent overlap?
-- **The number in the cap.** §3 fixes the mechanism, two caps of 100; whether 100 is the right
-  number is open until phase 2 has run against a real folder.
+- **The number in the cap.** §3 fixes the mechanism, two caps of 100, and records that the
+  estate behind #1354 (about 200 projects, one cluster each) is above it and splits into two
+  installs. Whether the listing cap and the `scopedServiceAccounts` ceiling become one declared
+  value with 100 as its default is open; they move together, and neither moves in this design.
 - **Deriving `scopedServiceAccounts` from scope.** Once the pool grants authority, hand-listing
   every cluster in `spec.security.scopedServiceAccounts` duplicates what resolution already found.
   Terraform cannot read the snapshot, so either the pool moves to per-project accounts or the
