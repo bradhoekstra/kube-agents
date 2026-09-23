@@ -164,9 +164,10 @@ class InstallerCommonTest(unittest.TestCase):
             kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
             # Hermetic helm too: the scope guard asks the release what the
             # chart last rendered, and a developer's real release must never
-            # answer a unit test. Absent by default (exit 1 = no release).
+            # answer a unit test. No release by default, in helm's own words,
+            # since any other failure is a read the guard reports as not run.
             helm = bin_dir / "helm"
-            helm.write_text(helm_script or "#!/usr/bin/env bash\nexit 1\n")
+            helm.write_text(helm_script or '#!/usr/bin/env bash\necho "Error: release: not found" >&2\nexit 1\n')
             helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
             for name, content in (extra_bins or {}).items():
                 target = bin_dir / name
@@ -989,6 +990,57 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertNotIn("hand-declared-scope check", proc.stdout + proc.stderr)
+
+    def test_a_failed_release_read_is_a_loud_skip_not_a_hand_set_verdict(self):
+        # helm forbidden on the release Secret, or a damaged release: the guard
+        # cannot tell chart-owned from hand-set, so it says it did not run
+        # rather than refusing an ordinary shrink with the wrong diagnosis.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
+                helm_script='#!/usr/bin/env bash\necho "Error: secrets \\"sh.helm.release.v1.kube-agents.v3\\" is forbidden" >&2; exit 1\n',
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not read the values of Helm release", proc.stdout + proc.stderr)
+            self.assertNotIn("was not rendered by the chart", proc.stdout + proc.stderr)
+
+    def test_no_release_still_compares_against_the_keys(self):
+        # "release: not found" is the pre-key install: nothing is chart-owned,
+        # the live scope is a hand edit, and a key that drops one of its
+        # projects is refused.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
+                helm_script='#!/usr/bin/env bash\necho "Error: release: not found" >&2; exit 1\n',
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("# SCOPE_PROJECTS lacks payments-staging", proc.stdout)
+
+    def test_a_teardown_fetches_no_credentials_for_a_cluster_its_state_created(self):
+        # uninstall.sh turns the guard off; the fetch that exists for the guard
+        # stays off with it, so the teardown neither rewrites the kubeconfig
+        # nor opens the Secret recovery on a state-managed cluster.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            log = pathlib.Path(out_dir) / "gcloud.log"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_GUARD_ENABLED": "false", "GCLOUD_CALL_LOG": str(log)},
+                describe_stub="printf '\\n'; exit 0",
+                gcloud_stdout=MANAGED_CLUSTER_STATE,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("create_cluster             = true", dest.read_text())
+            self.assertEqual([], [line for line in log.read_text().splitlines() if "get-credentials" in line])
 
     def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
         # A first adoption: the cluster exists, kube-agents has never been on

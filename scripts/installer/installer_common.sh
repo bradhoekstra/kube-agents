@@ -136,6 +136,10 @@ readonly SCOPE_LIST_MAX_ENTRIES=100
 # kubectl's wording for a resource type the cluster does not serve: a cluster
 # with no kube-agents CRD on it, which is every first adoption.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could not find the requested resource"
+# helm's wording for a release that does not exist, which is the pre-Terraform
+# install whose scope was set by hand; any other failure is a read that did
+# not happen.
+readonly HELM_RELEASE_NOT_FOUND_PATTERN="release: not found"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -1617,10 +1621,21 @@ guard_hand_declared_scope() {
     print_warning "python3 is not available, so the hand-declared-scope check did not run. If the PlatformAgent in '${ns}' carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
     return 0
   fi
-  # The release's recorded values, or `{}` when there is no release or helm
-  # cannot read it: then nothing is known to be chart-owned.
-  local release_json
-  release_json="$(helm --kube-context "$context" get values "$KUBE_AGENTS_HELM_RELEASE" -n "$ns" -o json 2>/dev/null || true)"
+  # The release's recorded values. No release at all is `{}`: nothing is then
+  # known to be chart-owned, which is the pre-key install whose scope was set
+  # by hand and the case this guard is for. Any other failure is a read that
+  # did not happen, and gets the same loud skip as an unreadable CR rather
+  # than a wrong "hand-set" verdict on an ordinary shrink.
+  local release_json helm_err
+  if ! release_json="$(helm --kube-context "$context" get values "$KUBE_AGENTS_HELM_RELEASE" -n "$ns" -o json 2>"$err_file")"; then
+    helm_err="$(cat "$err_file" 2>/dev/null)"
+    if ! printf '%s' "$helm_err" | grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN"; then
+      rm -f "$err_file"
+      print_warning "Could not read the values of Helm release '${KUBE_AGENTS_HELM_RELEASE}' in '${ns}' through kubectl context '${context}' (${helm_err:-no detail}), so the hand-declared-scope check did not run. If the PlatformAgent there carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+      return 0
+    fi
+    release_json="{}"
+  fi
   [ -n "$release_json" ] || release_json="{}"
   local missing
   missing="$(printf '%s\n---\n%s' "$cr_json" "$release_json" | SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
@@ -1807,7 +1822,13 @@ write_tfvars_from_state() {
   # GKE_DNS_ENDPOINT_FLAG is taken as the caller left it (upgrade.sh sets it,
   # empty or not, at its connect step) and resolved here only when the caller
   # has sourced the helper and not resolved it yet (install.sh).
-  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
+  #
+  # The widening is for the guard: with the guard off (uninstall.sh), the
+  # fetch stays what it was, an adoption's alone, so a teardown of a cluster
+  # this state created neither rewrites the operator's kubeconfig nor opens
+  # the Secret recovery below.
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 &&
+    { [ "$create_cluster" = "false" ] || is_truthy "${SCOPE_GUARD_ENABLED:-true}"; }; then
     if [ -z "${GKE_DNS_ENDPOINT_FLAG+set}" ] && declare -F gke_dns_endpoint_flag >/dev/null 2>&1; then
       gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
     fi

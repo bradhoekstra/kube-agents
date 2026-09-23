@@ -1380,6 +1380,13 @@ warn_flag_beats_unrecorded_file_value() {
 # --scope-* value that the file does not already record is refused before the
 # apply, with the line to add. A first install records the flags into the file
 # it writes, and this returns 0 there.
+# A scope list as the set it declares: split on the separators every reader
+# accepts, sorted, one per line. Two spellings of one list compare equal, and
+# an empty value compares as the empty set rather than as "no flag".
+normalised_scope_list() {
+  printf '%s' "${1:-}" | tr ', \t' '\n\n\n' | sed '/^$/d' | sort
+}
+
 refuse_unrecorded_scope_flags() {
   local file="$1"
   [ -f "$file" ] || return 0
@@ -1390,13 +1397,18 @@ refuse_unrecorded_scope_flags() {
       SCOPE_EXCLUDE_PROJECTS) flag="--scope-exclude-projects"; value="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}" ;;
       *) flag="--scope-exclude-clusters"; value="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}" ;;
     esac
-    [ -n "$value" ] || continue
     if grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null; then
+      # Compared whenever the key is recorded, empty flag included: the PARAM_*
+      # was seeded from this very value, so on a flagless run the two agree and
+      # only a flag can make them differ -- `--scope-projects=` against a
+      # recorded list is the one-run emptying this exists to refuse. As lists,
+      # so a comma spelling against a space spelling is not a disagreement.
       recorded="$(recorded_install_env_value "$file" "$key")"
-      [ "$recorded" != "$value" ] || continue
-      print_error "${flag}=${value} disagrees with ${key}=${recorded} in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project the flag added."
+      [ "$(normalised_scope_list "$recorded")" != "$(normalised_scope_list "$value")" ] || continue
+      print_error "${flag}=\"${value}\" disagrees with ${key}=\"${recorded}\" in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and reverses it, retiring the Cluster Agent profiles of every project the flag added or bringing back every project it removed."
     else
-      print_error "${flag}=${value} is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project the flag added."
+      [ -n "$value" ] || continue
+      print_error "${flag}=\"${value}\" is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project the flag added."
     fi
     print_info "Set ${key}=\"${value}\" in ${file} and re-run without ${flag}; the generator reads it on every run."
     refused="true"

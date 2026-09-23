@@ -1944,6 +1944,35 @@ class InstallEnvInputTest(unittest.TestCase):
                 cwd=str(_REPO_ROOT),
             )
 
+    def test_an_empty_scope_flag_over_a_recorded_key_is_refused(self):
+        # `--scope-projects=` is the natural gesture for "remove every scoped
+        # project" and would be applied for one run, then reversed by the next
+        # upgrade.sh. Compared like any other disagreement.
+        for key, flag in (
+            ("SCOPE_PROJECTS=payments-prod", "--scope-projects="),
+            ("SCOPE_EXCLUDE_PROJECTS=*-sandbox", "--scope-exclude-projects="),
+            ("SCOPE_EXCLUDE_CLUSTERS=payments-prod/us-central1/scratch", "--scope-exclude-clusters="),
+        ):
+            with self.subTest(flag=flag):
+                proc = self._source_with_env_file(
+                    f'parse_args {flag}; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+                    contents=f"PROJECT_ID=p\n{key}\n",
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr + proc.stdout)
+                self.assertIn("disagrees with", proc.stdout + proc.stderr)
+
+    def test_an_equivalent_spelling_of_the_recorded_list_is_not_a_disagreement(self):
+        for contents, flag in (
+            ("SCOPE_PROJECTS=\"payments-prod payments-staging\"", "--scope-projects=payments-staging,payments-prod"),
+            ("SCOPE_EXCLUDE_PROJECTS=\"*-sandbox, *-scratch\"", "--scope-exclude-projects='*-scratch *-sandbox'"),
+        ):
+            with self.subTest(flag=flag):
+                proc = self._source_with_env_file(
+                    f'parse_args {flag}; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc"',
+                    contents=f"PROJECT_ID=p\n{contents}\n",
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
+
     def test_a_scope_flag_that_the_existing_file_does_not_record_is_refused(self):
         """A scope cannot be set for one run: the next upgrade.sh regenerates
         from the file, the guard reads the CR as chart-owned, and the flag's
@@ -1978,13 +2007,27 @@ class InstallEnvInputTest(unittest.TestCase):
                 self.assertIn("rc=0", proc.stdout, proc.stderr + proc.stdout)
 
     def test_a_first_install_records_the_scope_flags_and_refuses_nothing(self):
-        # No file yet: the flags are what the new install.env will carry.
-        proc = self._source_with_env_file(
-            'parse_args --scope-projects=payments-prod; rc=0; refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; echo "rc=$rc P=$PARAM_SCOPE_PROJECTS"',
-            contents=None,
-            env={"KUBE_AGENTS_INSTALL_ENV": ""},
-        )
-        self.assertIn("rc=0 P=payments-prod", proc.stdout, proc.stderr + proc.stdout)
+        # No file yet: the flags are what the new install.env will carry. A
+        # copy of install.sh in an empty directory, so a developer's own
+        # install.env beside the real script cannot decide the result.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            (home / "install.sh").write_text(_INSTALL_SH.read_text())
+            proc = subprocess.run(
+                [
+                    "bash",
+                    "-c",
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{home}/install.sh"; '
+                    'parse_args --scope-projects=payments-prod; rc=0; '
+                    'refuse_unrecorded_scope_flags "$INSTALL_ENV_FILE" || rc=$?; '
+                    'echo "rc=$rc P=$PARAM_SCOPE_PROJECTS"',
+                ],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": ""}),
+                cwd=str(home),
+            )
+            self.assertIn("rc=0 P=payments-prod", proc.stdout, proc.stderr + proc.stdout)
 
     def test_values_reach_the_parameter_block(self):
         """The whole point: a value in the file arrives as a PARAM_*."""
