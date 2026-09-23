@@ -1462,12 +1462,18 @@ class ScopeTest(HomesMixin):
             self.assertEqual(rec._denied_this_run, {"team-a"})
 
     def test_search_container_parses_results_and_classifies_failures(self):
-        out = json.dumps([self._asset("team-a", "prod", "us-central1"), self._asset("team-a", "dev", "us-central1-a", zonal=True),
-                          {"name": "//compute.googleapis.com/projects/x/zones/z/instances/i"}])
+        out = json.dumps([self._asset("team-a", "prod", "us-central1"), self._asset("team-a", "dev", "us-central1-a", zonal=True)])
         with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout=out)) as run:
             members, outcome = rec._search_container(self.FOLDER)
         self.assertEqual(outcome, rec.OUTCOME_OK)
         self.assertEqual(members, {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1-a")]})
+        # A row this parser cannot read is a shape this run does not know, not a foreign asset
+        # to skip: the search is filtered to clusters, so the container freezes rather than
+        # resolving empty and retiring every member a day later.
+        odd = json.dumps([self._asset("team-a", "prod", "us-central1"), {"name": "//container.googleapis.com/projects/x/regions/r/clusters/c"}])
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout=odd)), mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
+        self.assertIn("shape this run cannot read", " ".join(str(c) for c in logged.call_args_list))
         self.assertIn(f"--scope={self.FOLDER}", run.call_args[0][0])
         self.assertIn(f"--asset-types={rec.ASSET_TYPE_CLUSTER}", run.call_args[0][0])
         self.assertIn(f"--format={rec.ASSET_SEARCH_FORMAT}", run.call_args[0][0])

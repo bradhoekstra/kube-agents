@@ -449,8 +449,16 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
     members: dict[str, list[tuple[str, str, str]]] = {}
     for asset in assets:
         triple = _parse_asset(asset)
-        if triple:
-            members.setdefault(triple[0], []).append(triple)
+        if triple is None:
+            # The search is filtered to one asset type, so a row this parser cannot read is
+            # not a foreign asset to skip but a shape this run does not know (a name format
+            # change, a projection that dropped `name`). Reading it as "no clusters" would
+            # retire every member a day later while the container reported healthy; a
+            # failed lookup freezes instead (design §4).
+            log(f"resolving {container}: a search row has a shape this run cannot read "
+                f"({str(asset)[:200]!r}); {OUTCOME_UNREACHABLE}, its previous members are carried forward.")
+            return None, OUTCOME_UNREACHABLE
+        members.setdefault(triple[0], []).append(triple)
     return members, OUTCOME_OK
 
 
@@ -894,9 +902,9 @@ def reconcile(dry_run: bool = False) -> dict:
     for entry in entries:
         project = entry["id"]
         if project not in listings:
-            # over-cap is decided; unreachable here is the carried-forward management
-            # project, skipped so nothing is created under a project this tick could not
-            # confirm is still the pod's own.
+            # Not listed this run: over-cap is decided, a frozen container's member carries
+            # its container's outcome, and unreachable is the carried-forward management
+            # project; nothing is created under any of them this tick.
             cluster_counts[project] = None
             continue
         listed, outcome = listings[project]
@@ -930,12 +938,9 @@ def reconcile(dry_run: bool = False) -> dict:
             if member_only and not dry_run:
                 # Per cluster: the index lags real state by minutes, so a member's cluster the
                 # index still names may be gone, and the first cluster answering says nothing
-                # about the second.
-                if proj in _denied_this_run:
-                    log(f"{cluster} ({proj}/{location}) has no profile and the project answered 403; "
-                        f"no CREATE under it this run ({OUTCOME_DENIED}).")
-                    continue
-                exists = _cluster_exists(proj, cluster, location)
+                # about the second. A 403 seen earlier in the project, or on this describe,
+                # skips the create.
+                exists = None if proj in _denied_this_run else _cluster_exists(proj, cluster, location)
                 if exists is False:
                     log(f"{cluster} ({proj}/{location}) is in the asset index but describe says it is gone "
                         "(deleted, or the index is behind); no profile made for it this run.")
