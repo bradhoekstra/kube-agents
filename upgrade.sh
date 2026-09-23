@@ -648,7 +648,10 @@ main() {
   print_info "Upgrade Mode: ${C_BOLD}${PARAM_UPGRADE_MODE}${C_RESET}"
   print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
 
-  local required_tools=(gcloud kubectl helm)
+  # python3: the Terraform-state readers and the hand-declared-scope guard in
+  # installer_common.sh run in it, and scope_values_json renders the retag's
+  # scope value with it.
+  local required_tools=(gcloud kubectl helm python3)
   # jq: the harness step's plugin re-tag reads the release's values with it,
   # and the post-upgrade image check that harness and full modes run has
   # needed it all along. The operator step does neither.

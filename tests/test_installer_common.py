@@ -119,6 +119,7 @@ class InstallerCommonTest(unittest.TestCase):
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
         helm_script=None,
+        extra_bins=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
 
@@ -166,6 +167,10 @@ class InstallerCommonTest(unittest.TestCase):
             helm = bin_dir / "helm"
             helm.write_text(helm_script or "#!/usr/bin/env bash\nexit 1\n")
             helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
+            for name, content in (extra_bins or {}).items():
+                target = bin_dir / name
+                target.write_text(content)
+                target.chmod(target.stat().st_mode | stat.S_IEXEC)
             full_env = get_isolated_test_env(
                 overrides={
                     "PROJECT_ID": "test-project",
@@ -800,7 +805,7 @@ class InstallerCommonTest(unittest.TestCase):
         cr = {"items": [{"spec": {"scope": {
             "projects": projects,
             "exclude": {"projects": ["*-sandbox"],
-                        "clusters": [{"projectId": "p2", "location": "us-central1", "clusterName": "scratch"}]},
+                        "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]},
         }}}]}
         return (
             "#!/usr/bin/env bash\n"
@@ -813,19 +818,19 @@ class InstallerCommonTest(unittest.TestCase):
 
     def test_tfvars_refuse_to_empty_a_hand_declared_scope(self):
         # The CR carries a scope, install.env carries none: the apply would
-        # render an empty block and the reconcile would retire p2's profiles.
+        # render an empty block and the reconcile would retire payments-prod's profiles.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn('SCOPE_PROJECTS="p2 p3"', proc.stdout)
+            self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_PROJECTS="*-sandbox"', proc.stdout)
-            self.assertIn('SCOPE_EXCLUDE_CLUSTERS="p2/us-central1/scratch"', proc.stdout)
+            self.assertIn('SCOPE_EXCLUDE_CLUSTERS="payments-prod/us-central1/scratch"', proc.stdout)
             self.assertFalse(dest.exists())
 
     def test_tfvars_proceed_when_install_env_carries_the_scope(self):
@@ -833,30 +838,30 @@ class InstallerCommonTest(unittest.TestCase):
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2 p3",
-                     "SCOPE_EXCLUDE_PROJECTS": "*-sandbox", "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod payments-staging",
+                     "SCOPE_EXCLUDE_PROJECTS": "*-sandbox", "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn('projects = ["p2", "p3"]', dest.read_text())
+            self.assertIn('projects = ["payments-prod", "payments-staging"]', dest.read_text())
 
     def test_tfvars_refuse_a_partial_install_env_that_drops_live_projects(self):
         # The exclude recorded, the projects not: the run would render
-        # projects = [] over a live [p2, p3]. Refused, with the whole
+        # projects = [] over a live [payments-prod, payments-staging]. Refused, with the whole
         # declaration printed, not only the missing key.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                     "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                     "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("# SCOPE_PROJECTS lacks p2 p3", proc.stdout)
-            self.assertIn('SCOPE_PROJECTS="p2 p3"', proc.stdout)
+            self.assertIn("# SCOPE_PROJECTS lacks payments-prod payments-staging", proc.stdout)
+            self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
             self.assertFalse(dest.exists())
 
     def _release_values_helm(self, scope):
@@ -870,25 +875,25 @@ class InstallerCommonTest(unittest.TestCase):
             "exit 1\n"
         )
 
-    _RENDERED_SCOPE = {"projects": ["p2", "p3"], "exclude": {"projects": ["*-sandbox"],
-                       "clusters": [{"projectId": "p2", "location": "us-central1", "clusterName": "scratch"}]}}
+    _RENDERED_SCOPE = {"projects": ["payments-prod", "payments-staging"], "exclude": {"projects": ["*-sandbox"],
+                       "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}}
 
     def test_an_installer_rendered_scope_shrinks_through_the_keys(self):
-        # The documented lifecycle: remove p3 from SCOPE_PROJECTS, run
+        # The documented lifecycle: remove payments-staging from SCOPE_PROJECTS, run
         # upgrade.sh. The release recorded the same scope the CR carries, so
-        # the CR is chart-owned and the run proceeds with projects = ["p2"].
+        # the CR is chart-owned and the run proceeds with projects = ["payments-prod"].
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                     "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                     "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
                 helm_script=self._release_values_helm(self._RENDERED_SCOPE),
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn('  projects = ["p2"]', dest.read_text())
+            self.assertIn('  projects = ["payments-prod"]', dest.read_text())
 
     def test_an_installer_rendered_scope_can_be_emptied_through_the_keys(self):
         # Every key removed from install.env on a chart-owned scope: the
@@ -899,46 +904,46 @@ class InstallerCommonTest(unittest.TestCase):
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
                 helm_script=self._release_values_helm(self._RENDERED_SCOPE),
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("  projects = []", dest.read_text())
 
     def test_a_hand_edit_after_the_chart_rendered_is_still_caught(self):
-        # The release recorded [p2]; someone then added p3 on the CR by hand
-        # and install.env still says p2. The CR differs from the record, so
-        # the comparison against the keys runs and p3 is the missing entry.
+        # The release recorded [payments-prod]; someone then added payments-staging on the CR by hand
+        # and install.env still says payments-prod. The CR differs from the record, so
+        # the comparison against the keys runs and payments-staging is the missing entry.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                     "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                     "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
-                helm_script=self._release_values_helm({"projects": ["p2"], "exclude": self._RENDERED_SCOPE["exclude"]}),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
+                helm_script=self._release_values_helm({"projects": ["payments-prod"], "exclude": self._RENDERED_SCOPE["exclude"]}),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("# SCOPE_PROJECTS lacks p3", proc.stdout)
+            self.assertIn("# SCOPE_PROJECTS lacks payments-staging", proc.stdout)
             self.assertFalse(dest.exists())
 
     def test_tfvars_refuse_when_one_live_project_is_missing_from_the_key(self):
         # No release record (a pre-key install whose scope was set by hand):
-        # SCOPE_PROJECTS carries p2 but the CR also names p3, so p3 would
+        # SCOPE_PROJECTS carries payments-prod but the CR also names payments-staging, so payments-staging would
         # retire. The printed line is the union, ready to paste.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                     "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                     "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("# SCOPE_PROJECTS lacks p3", proc.stdout)
-            self.assertIn('SCOPE_PROJECTS="p2 p3"', proc.stdout)
+            self.assertIn("# SCOPE_PROJECTS lacks payments-staging", proc.stdout)
+            self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
 
     def test_the_scope_guard_reads_through_the_installs_context_not_the_current_one(self):
         # kubectl pointed at another cluster: the Secret recovery stands down,
@@ -949,10 +954,10 @@ class InstallerCommonTest(unittest.TestCase):
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["p2"], current_context="some-other-context"),
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod"], current_context="some-other-context"),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn('SCOPE_PROJECTS="p2"', proc.stdout)
+            self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
 
     def test_the_scope_guard_says_so_when_it_cannot_read_the_cr(self):
         # No such context in the kubeconfig, or the read failed: the run
@@ -984,18 +989,74 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertNotIn("hand-declared-scope check", proc.stdout + proc.stderr)
 
+    def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
+        # A first adoption: the cluster exists, kube-agents has never been on
+        # it, kubectl says there is no such resource type. Nothing to protect,
+        # so no warning either -- a warning here would be ignored where it counts.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in\n'
+                    '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
+                    "esac\n"
+                    "exit 1\n"
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("hand-declared-scope check", proc.stdout + proc.stderr)
+
+    def test_the_scope_guard_is_loud_when_python_cannot_run(self):
+        # python3 missing or broken must be the same loud skip as an unreadable
+        # CR, never a silent pass over a hand-declared scope.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
+                extra_bins={"python3": "#!/usr/bin/env bash\nexit 1\n"},
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("python3 is not available, so the hand-declared-scope check did not run", proc.stdout + proc.stderr)
+
+    def test_the_generator_checks_every_scope_list_the_way_the_crd_will(self):
+        # harness and operator retags carry the keys to the API server with no
+        # Terraform plan in between, so the generator is the only gate.
+        cases = {
+            'hcl_scope_block "Payments-Prod" "" ""': "SCOPE_PROJECTS entry 'Payments-Prod'",
+            'hcl_scope_block "abc" "" ""': "SCOPE_PROJECTS entry 'abc'",
+            'hcl_scope_block "payments-prod payments-prod" "" ""': "names 'payments-prod' twice",
+            'hcl_scope_block "" "*-sandbox *-sandbox" ""': "names '*-sandbox' twice",
+            'hcl_scope_block "" "" "Team/us-central1/x"': "'Team' is not a name",
+            'hcl_scope_block "" "" "a/b/c a/b/c"': "names 'a/b/c' twice",
+            'hcl_scope_block "$(seq -f project-%03g 1 101 | tr "\\n" " ")" "" ""': "carries 101 entries",
+        }
+        for script, message in cases.items():
+            with self.subTest(script=script):
+                proc = self._run(f"rc=0; {script} >/dev/null || rc=$?; echo \"rc=$rc\"")
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(message, proc.stdout + proc.stderr)
+
     def test_scope_values_json_renders_the_keys_as_the_chart_value(self):
         proc = self._run(
             'scope_values_json',
-            env={"SCOPE_PROJECTS": "p2, p3", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                 "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+            env={"SCOPE_PROJECTS": "payments-prod, payments-staging", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                 "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
             json.loads(proc.stdout),
-            {"projects": ["p2", "p3"],
+            {"projects": ["payments-prod", "payments-staging"],
              "exclude": {"projects": ["*-sandbox"],
-                         "clusters": [{"projectId": "p2", "location": "us-central1", "clusterName": "scratch"}]}},
+                         "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
         )
         empty = self._run('scope_values_json')
         self.assertEqual(json.loads(empty.stdout), {"projects": [], "exclude": {"projects": [], "clusters": []}})

@@ -124,10 +124,18 @@ readonly GCS_OBJECT_ABSENT_PATTERN='matched no objects|NotFoundException|HTTPErr
 readonly TF_STATE_RC_UNREADABLE=2
 # One SCOPE_EXCLUDE_CLUSTERS entry in install.env is project/location/cluster.
 readonly SCOPE_CLUSTER_TRIPLE_SEPARATOR="/"
-# What the CRD accepts for one exclude.projects entry (an ID or a shell-style
-# glob); checked here so a typo fails before IAM is applied rather than at the
-# CR's admission after it.
+# What the CRD accepts for the scope lists, checked here so a typo fails on the
+# operator's machine before IAM is applied or a retag reaches the API server,
+# rather than at the CR's admission after either: a project ID, an
+# exclude.projects entry (an ID or a shell-style glob), one part of a cluster
+# triple, and the size of each list.
+readonly SCOPE_PROJECT_ID_PATTERN='^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
 readonly SCOPE_EXCLUDE_PROJECT_PATTERN='^[]a-z0-9*?[!-]{1,63}$'
+readonly SCOPE_TRIPLE_PART_PATTERN='^[a-z0-9][a-z0-9-]{0,62}$'
+readonly SCOPE_LIST_MAX_ENTRIES=100
+# kubectl's wording for a resource type the cluster does not serve: a cluster
+# with no kube-agents CRD on it, which is every first adoption.
+readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could not find the requested resource"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -832,6 +840,30 @@ hcl_scope_block() {
   local sep="$SCOPE_CLUSTER_TRIPLE_SEPARATOR"
   local triple_pattern="^[^${sep}]+${sep}[^${sep}]+${sep}[^${sep}]+\$"
   local IFS=$', \t\n'
+  # Each list is checked the way the CRD will check it (pattern, repeats, size)
+  # so the message names the install.env line. `seen` is a space-padded string
+  # rather than an associative array, which bash 3.2 lacks.
+  local seen=" " count=0
+  for item in $projects; do
+    [ -n "$item" ] || continue
+    if ! [[ "$item" =~ $SCOPE_PROJECT_ID_PATTERN ]]; then
+      $had_noglob || set +f
+      print_error "SCOPE_PROJECTS entry '${item}' is not a GCP project ID (6 to 30 characters: a lowercase letter, then lowercase letters, digits or hyphens, not ending in a hyphen)." >&2
+      return 1
+    fi
+    case "$seen" in *" $item "*)
+      $had_noglob || set +f
+      print_error "SCOPE_PROJECTS names '${item}' twice." >&2
+      return 1 ;;
+    esac
+    seen+="$item "; count=$((count + 1))
+  done
+  if [ "$count" -gt "$SCOPE_LIST_MAX_ENTRIES" ]; then
+    $had_noglob || set +f
+    print_error "SCOPE_PROJECTS carries ${count} entries; the PlatformAgent accepts at most ${SCOPE_LIST_MAX_ENTRIES}." >&2
+    return 1
+  fi
+  seen=" "; count=0
   for item in $exclude_projects; do
     [ -n "$item" ] || continue
     if ! [[ "$item" =~ $SCOPE_EXCLUDE_PROJECT_PATTERN ]]; then
@@ -839,7 +871,19 @@ hcl_scope_block() {
       print_error "SCOPE_EXCLUDE_PROJECTS entry '${item}' is not a project ID or glob the PlatformAgent accepts (lowercase letters, digits, - * ? [ ] !)." >&2
       return 1
     fi
+    case "$seen" in *" $item "*)
+      $had_noglob || set +f
+      print_error "SCOPE_EXCLUDE_PROJECTS names '${item}' twice." >&2
+      return 1 ;;
+    esac
+    seen+="$item "; count=$((count + 1))
   done
+  if [ "$count" -gt "$SCOPE_LIST_MAX_ENTRIES" ]; then
+    $had_noglob || set +f
+    print_error "SCOPE_EXCLUDE_PROJECTS carries ${count} entries; the PlatformAgent accepts at most ${SCOPE_LIST_MAX_ENTRIES}." >&2
+    return 1
+  fi
+  seen=" "; count=0
   for item in $exclude_clusters; do
     [ -n "$item" ] || continue
     # The whole entry, so a trailing separator or an empty middle part fails
@@ -850,11 +894,29 @@ hcl_scope_block() {
       return 1
     fi
     IFS="$sep" read -r project location cluster <<< "$item"
+    local part
+    for part in "$project" "$location" "$cluster"; do
+      if ! [[ "$part" =~ $SCOPE_TRIPLE_PART_PATTERN ]]; then
+        $had_noglob || set +f
+        print_error "SCOPE_EXCLUDE_CLUSTERS entry '${item}': '${part}' is not a name the PlatformAgent accepts (lowercase letters, digits and hyphens, up to 63 characters)." >&2
+        return 1
+      fi
+    done
+    case "$seen" in *" $item "*)
+      $had_noglob || set +f
+      print_error "SCOPE_EXCLUDE_CLUSTERS names '${item}' twice." >&2
+      return 1 ;;
+    esac
+    seen+="$item "; count=$((count + 1))
     $first || clusters+=", "
     clusters+="{ project_id = $(hcl_str "$project"), location = $(hcl_str "$location"), cluster_name = $(hcl_str "$cluster") }"
     first=false
   done
   $had_noglob || set +f
+  if [ "$count" -gt "$SCOPE_LIST_MAX_ENTRIES" ]; then
+    print_error "SCOPE_EXCLUDE_CLUSTERS carries ${count} entries; the PlatformAgent accepts at most ${SCOPE_LIST_MAX_ENTRIES}." >&2
+    return 1
+  fi
   clusters+="]"
   printf 'scope = {\n  projects = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$exclude_projects")" "$clusters"
@@ -1487,7 +1549,9 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
 # which re-tag images with --reset-then-reuse-values: the checkout's chart
 # defaults the block to empty lists, so a retag that said nothing would render
 # `projects: []` over whatever the CR carries). The keys are the ones
-# write_tfvars_from_state has already validated on the same run.
+# write_tfvars_from_state has already validated on the same run, every list
+# against the CRD's own pattern, size and uniqueness rules, so what reaches
+# the API server here is what admission accepts.
 scope_values_json() {
   SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
   SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" \
@@ -1532,9 +1596,25 @@ guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local context
   context="$(gke_context_name)"
-  local cr_json
-  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json 2>/dev/null)"; then
-    print_warning "Could not read the PlatformAgent in '${ns}' through kubectl context '${context}', so the hand-declared-scope check did not run. If that CR carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+  local cr_json kubectl_err
+  local err_file
+  err_file="$(mktemp)"
+  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json 2>"$err_file")"; then
+    kubectl_err="$(cat "$err_file" 2>/dev/null)"; rm -f "$err_file"
+    # No CRD means no kube-agents on the cluster yet (every first adoption):
+    # there is no CR to protect, and a warning here would train operators to
+    # ignore the one below.
+    if printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN"; then
+      return 0
+    fi
+    print_warning "Could not read the PlatformAgent in '${ns}' through kubectl context '${context}' (${kubectl_err:-no detail}), so the hand-declared-scope check did not run. If that CR carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+    return 0
+  fi
+  # The comparison runs in python3, which the state readers above already
+  # need; a machine where it cannot run gets the same loud skip as an
+  # unreadable CR, never a silent pass.
+  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import json' >/dev/null 2>&1; then
+    print_warning "python3 is not available, so the hand-declared-scope check did not run. If the PlatformAgent in '${ns}' carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
     return 0
   fi
   # The release's recorded values, or `{}` when there is no release or helm
@@ -1563,8 +1643,9 @@ cr_text, _, release_text = sys.stdin.read().partition("\n---\n")
 try:
     items = json.loads(cr_text).get("items", [])
     release = json.loads(release_text or "{}") or {}
-except Exception:
-    sys.exit(0)
+except Exception as exc:
+    print("unreadable: %s" % exc, file=sys.stderr)
+    sys.exit(2)
 recorded = shape(((release.get("platformAgent") or {}).get("scope")))
 for item in items:
     live = shape((item.get("spec") or {}).get("scope"))
@@ -1578,7 +1659,12 @@ for item in items:
         merged = split(key) + [v for v in values if v not in split(key)]
         print("%s=\"%s\"" % (key, " ".join(merged)))
     break
-' 2>/dev/null || true)"
+' 2>"$err_file")" || {
+    kubectl_err="$(cat "$err_file" 2>/dev/null)"; rm -f "$err_file"
+    print_warning "The hand-declared-scope check could not compare the PlatformAgent in '${ns}' against install.env (${kubectl_err:-python3 failed}), so it did not run. If that CR carries a spec.scope the SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+    return 0
+  }
+  rm -f "$err_file"
   [ -n "$missing" ] || return 0
   print_error "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
   print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run:"

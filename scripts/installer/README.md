@@ -229,8 +229,10 @@ composition's `scope` object, from which Terraform binds the read roles in each 
 and the chart renders the CR. The block is always written, empty lists included, so an
 `install.env` that never set these keys declares the management project alone, and one
 that drops a project makes the next `upgrade.sh` revoke its grants and retire its
-profiles. A triple that is not three non-empty parts, or an exclude entry outside the character class
-the CRD accepts for a project ID or glob, fails the generator before any file is written. An install whose `PlatformAgent` carries a `spec.scope` set by hand, before the keys existed, that
+profiles. An entry that is not what the CRD accepts (a project ID, an exclude ID or glob, a
+`project/location/cluster` triple of names up to 63 characters), a repeat, or a list past 100 entries
+fails the generator before any file is written, and so before a `harness` or `operator` retag could
+carry it to the API server. An install whose `PlatformAgent` carries a `spec.scope` set by hand, before the keys existed, that
 these keys do not carry is refused too, with the three lines that carry the whole live declaration
 printed, because the apply would rewrite the CR from the keys and retire the profiles of every project
 it drops. Hand-set means different from what the chart last rendered, which the Helm release's

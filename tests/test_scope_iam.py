@@ -137,6 +137,9 @@ class ScopeAllowlistTest(unittest.TestCase):
         block = re.search(r'^variable\s+"scope"\s*\{(.*?)^\}', self.module_vars, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(block, "variable scope moved or was renamed")
         self.assertIn("length(var.scope.projects) <= 100", block.group(1))
+        self.assertIn("length(var.scope.exclude.projects) <= 100", block.group(1))
+        self.assertIn("length(var.scope.exclude.clusters) <= 100", block.group(1))
+        self.assertIn('{0,62}$", cluster.cluster_name)', block.group(1))
 
     def test_the_variable_refuses_what_the_crd_would_refuse_at_admission(self):
         # A repeat (the CRD lists are sets, the cluster list a map) or an

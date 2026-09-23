@@ -148,8 +148,12 @@ variable "scope" {
   default  = {}
 
   validation {
-    condition     = length(var.scope.projects) <= 100
-    error_message = "scope.projects carries at most 100 project IDs, the cap the CRD enforces on the same list."
+    condition = (
+      length(var.scope.projects) <= 100
+      && length(var.scope.exclude.projects) <= 100
+      && length(var.scope.exclude.clusters) <= 100
+    )
+    error_message = "scope.projects, scope.exclude.projects and scope.exclude.clusters each carry at most 100 entries, the cap the CRD enforces on the same lists."
   }
 
   validation {
@@ -162,11 +166,11 @@ variable "scope" {
   validation {
     condition = alltrue([
       for cluster in var.scope.exclude.clusters :
-      can(regex("^[a-z0-9][a-z0-9-]*$", cluster.project_id))
-      && can(regex("^[a-z0-9][a-z0-9-]*$", cluster.location))
-      && can(regex("^[a-z0-9][a-z0-9-]*$", cluster.cluster_name))
+      can(regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.project_id))
+      && can(regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.location))
+      && can(regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.cluster_name))
     ])
-    error_message = "Each scope.exclude.clusters entry names one cluster by project_id, location and cluster_name, each matching ^[a-z0-9][a-z0-9-]*$."
+    error_message = "Each scope.exclude.clusters entry names one cluster by project_id, location and cluster_name, each matching ^[a-z0-9][a-z0-9-]*$ and at most 63 characters, as the CRD requires."
   }
 
   validation {
