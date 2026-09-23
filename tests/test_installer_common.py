@@ -1042,6 +1042,24 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = true", dest.read_text())
             self.assertEqual([], [line for line in log.read_text().splitlines() if "get-credentials" in line])
 
+    def test_a_plan_sees_the_hand_declared_scope_message_and_goes_on(self):
+        # upgrade.sh --plan applies nothing, and the plan is what shows the
+        # operator the destroys the refusal protects against, so the check
+        # speaks and the run continues.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_GUARD_REFUSES": "false"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("This run applies nothing", proc.stdout + proc.stderr)
+            self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
+            self.assertIn("  projects = []", dest.read_text())
+
     def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
         # A first adoption: the cluster exists, kube-agents has never been on
         # it, kubectl says there is no such resource type. Nothing to protect,

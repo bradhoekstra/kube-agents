@@ -455,6 +455,17 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
         self.assertIn('scope_json="$(scope_values_json)" || return 1', retag)
         self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
+        # Only when the engine has the helper: on the curl path an older
+        # installer_common.sh has neither the function nor a chart key to set.
+        self.assertIn("if declare -F scope_values_json", retag)
+        self.assertLess(retag.index("if declare -F scope_values_json"), retag.index('scope_json="$(scope_values_json)"'))
+
+    def test_a_plan_does_not_let_the_scope_guard_stop_it(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        export_at = text.find('export SCOPE_GUARD_REFUSES="false"')
+        self.assertNotEqual(export_at, -1, "plan mode must let the scope guard speak without refusing")
+        generate_at = text.find('write_tfvars_from_state "')
+        self.assertLess(export_at, generate_at, "the export has to precede the generator")
 
     def test_jq_is_required_for_the_modes_that_read_with_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

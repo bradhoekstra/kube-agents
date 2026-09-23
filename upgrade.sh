@@ -893,17 +893,26 @@ main() {
   # nothing would render `projects: []` over a scope the CR carries and the
   # reconcile would retire those projects. The keys install.env carries (the
   # generator has just validated them) are what the CR gets, in every mode.
+  #
+  # Only when the engine has the helper. On the curl path this script is the
+  # one the site serves while installer_common.sh comes from the clone at
+  # --image-tag; an engine from before the scope input has no
+  # scope_values_json, and its chart has no platformAgent.scope to set, so
+  # the retag runs as it always did rather than stopping after the CRD apply.
   helm_retag() {
     local set_args=()
     local set_key
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
-    local scope_json
-    scope_json="$(scope_values_json)" || return 1
+    if declare -F scope_values_json >/dev/null 2>&1; then
+      local scope_json
+      scope_json="$(scope_values_json)" || return 1
+      set_args+=(--set-json "platformAgent.scope=${scope_json}")
+    fi
     helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reset-then-reuse-values \
-      "${set_args[@]}" --set-json "platformAgent.scope=${scope_json}" --wait --timeout 10m
+      "${set_args[@]}" --wait --timeout 10m
   }
 
   # The release guard runs before the tfvars generation on purpose: a
@@ -929,6 +938,12 @@ main() {
   # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
+    # A plan applies nothing, so the hand-declared-scope check speaks without
+    # refusing: the plan is the artefact that shows the destroys it protects
+    # against, and the operator reads it before recording the keys.
+    if [ "$PARAM_PLAN" = "true" ]; then
+      export SCOPE_GUARD_REFUSES="false"
+    fi
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
 
   if [ "$PARAM_PLAN" = "true" ]; then

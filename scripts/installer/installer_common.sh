@@ -1596,6 +1596,9 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 # since a silent skip here is a silent deletion later. SCOPE_GUARD_ENABLED=false
 # turns it off: uninstall.sh sets it, since a destroy keeps nothing either
 # way, and an operator who means to drop a hand-set scope sets it for one run.
+# SCOPE_GUARD_REFUSES=false keeps the check and its message but lets the run
+# go on: upgrade.sh --plan sets it, because a plan applies nothing and is the
+# artefact that shows the operator what the refusal is protecting.
 guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local context
@@ -1681,6 +1684,12 @@ for item in items:
   }
   rm -f "$err_file"
   [ -n "$missing" ] || return 0
+  if ! is_truthy "${SCOPE_GUARD_REFUSES:-true}"; then
+    print_warning "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. This run applies nothing; an apply from these keys would rewrite the CR: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
+    print_info "Record the live declaration in install.env before the apply:"
+    printf '%s\n' "$missing"
+    return 0
+  fi
   print_error "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
   print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run:"
   printf '%s\n' "$missing"
