@@ -162,9 +162,10 @@ variable "scope" {
     install from this one value. The kube-agents-iam module binds its read
     allowlist (scope_roles: the read subset of the default project roles,
     intersected with the roles the host project got) in each project, and the
-    chart renders the same object into the CR, so a project is listable by the
-    time the reconcile first tries it and the IAM and the declaration cannot
-    name different projects.
+    chart renders the same object into the CR, so the IAM and the declaration
+    cannot name different projects and a project is listable by the time the
+    reconcile first tries it (the module refuses the plan when the host role
+    set carries no read role for the scope to bind).
 
     Empty, the default, binds nothing and renders a scope block with empty
     lists, which declares that the management project alone is in scope.

@@ -619,8 +619,10 @@ resource "helm_release" "kube_agents" {
           }
         ]
       }
-      # The same object the IAM module bound above, so the CR never declares a
-      # project the agent cannot list. Always rendered, empty lists included:
+      # The same object the IAM module bound above, so the CR declares no
+      # project the module did not also bind (the module refuses the plan when
+      # the host role set carries no read role to bind). Always rendered, empty
+      # lists included:
       # the reconcile reads a present block with an empty projects list as the
       # declaration that drops projects, and an absent block as no declaration
       # at all (docs/designs/multi-project-scope.md §7), so removing the last

@@ -2,6 +2,20 @@ resource "google_service_account" "agent" {
   project      = var.project_id
   account_id   = var.service_account_id
   display_name = var.display_name
+
+  # The scope's bindings are `local.scope_role_allowlist` intersected with
+  # project_roles (scope.tf). A project_roles that carries none of those read
+  # roles -- `custom` with an admin-only list, or [] -- would leave every
+  # scoped project declared in the CR and bound to nothing, reading `denied`
+  # on every run while Terraform said nothing. Held here because the scope
+  # binding's for_each is empty in exactly that case and cannot carry the
+  # precondition itself.
+  lifecycle {
+    precondition {
+      condition     = length(local.scope_projects) == 0 || length(local.scope_roles) > 0
+      error_message = "scope.projects names projects but project_roles carries none of the read roles the scope may bind (local.scope_role_allowlist in scope.tf), so every scoped project would read denied. Add a read role to project_roles or empty scope.projects."
+    }
+  }
 }
 
 resource "google_service_account_iam_member" "workload_identity" {

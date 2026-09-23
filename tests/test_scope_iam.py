@@ -124,6 +124,15 @@ class ScopeAllowlistTest(unittest.TestCase):
         self.assertIsNotNone(projects, "local.scope_projects moved or was renamed")
         self.assertIn("!= var.project_id", projects.group(1))
 
+    def test_a_scope_with_nothing_to_bind_fails_the_plan(self):
+        # A `custom` project_roles with no read role leaves scope_bindings empty
+        # and every scoped project `denied`; the precondition on the service
+        # account, which always exists, is what turns that into a plan error.
+        main = (IAM_MODULE / "main.tf").read_text(encoding="utf-8")
+        account = _resource_block(main, "google_service_account", "agent")
+        self.assertIn("precondition", account)
+        self.assertIn("length(local.scope_projects) == 0 || length(local.scope_roles) > 0", account)
+
     def test_the_variable_caps_the_list_where_the_crd_does(self):
         block = re.search(r'^variable\s+"scope"\s*\{(.*?)^\}', self.module_vars, re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(block, "variable scope moved or was renamed")

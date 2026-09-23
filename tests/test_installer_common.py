@@ -756,6 +756,112 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertFalse(dest.exists(), "a malformed scope must not produce a tfvars")
             self.assertFalse(dest.with_suffix(".tfvars.tmp").exists(), "no partial file either")
 
+    def test_a_trailing_separator_is_not_a_triple(self):
+        for entry in ("a/b/c/", "a//c", "/b/c", "a/b/c/d"):
+            with self.subTest(entry=entry):
+                proc = self._run(
+                    f'rc=0; hcl_scope_block "" "" "{entry}" || rc=$?; echo "rc=$rc"',
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(entry, proc.stdout + proc.stderr)
+
+    def test_a_glob_in_a_list_is_never_expanded_against_the_working_directory(self):
+        # `*-sandbox` is the documented exclusion. Splitting an unquoted list
+        # with pathname expansion on would replace it with whatever file names
+        # match in the cwd, silently -- the clone for install.sh, wherever the
+        # operator stood for upgrade.sh.
+        with tempfile.TemporaryDirectory() as cwd:
+            for name in ("team-a-sandbox", "team-b-sandbox"):
+                (pathlib.Path(cwd) / name).touch()
+            proc = self._run(
+                f'cd "{cwd}"; hcl_csv_list "*-sandbox"; echo; '
+                'hcl_scope_block "" "*-sandbox" ""; '
+                'case "$-" in *f*) echo "noglob-left-on" ;; *) echo "noglob-restored" ;; esac',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn('["*-sandbox"]', proc.stdout)
+            self.assertIn('projects = ["*-sandbox"]', proc.stdout)
+            self.assertNotIn("team-a-sandbox", proc.stdout)
+            self.assertIn("noglob-restored", proc.stdout)
+
+    # ── write_tfvars_from_state: the hand-declared scope guard ──────────────
+
+    def _scoped_cr_kubectl(self, projects):
+        cr = {"items": [{"spec": {"scope": {
+            "projects": projects,
+            "exclude": {"projects": ["*-sandbox"],
+                        "clusters": [{"projectId": "p2", "location": "us-central1", "clusterName": "scratch"}]},
+        }}}]}
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+            f"  *\"get platformagents\"*) cat <<'JSON'\n{json.dumps(cr)}\nJSON\nexit 0 ;;\n"
+            "esac\n"
+            "exit 1\n"
+        )
+
+    def test_tfvars_refuse_to_empty_a_hand_declared_scope(self):
+        # The CR carries a scope, install.env carries none: the apply would
+        # render an empty block and the reconcile would retire p2's profiles.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn('SCOPE_PROJECTS="p2 p3"', proc.stdout)
+            self.assertIn('SCOPE_EXCLUDE_PROJECTS="*-sandbox"', proc.stdout)
+            self.assertIn('SCOPE_EXCLUDE_CLUSTERS="p2/us-central1/scratch"', proc.stdout)
+            self.assertFalse(dest.exists())
+
+    def test_tfvars_proceed_when_install_env_carries_the_scope(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2 p3"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('projects = ["p2", "p3"]', dest.read_text())
+
+    def test_the_scope_guard_can_be_turned_off_for_one_run(self):
+        # uninstall.sh sets this; so does an operator dropping the projects on
+        # purpose. The empty block is then written.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_GUARD_ENABLED": "false"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["p2"]),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("  projects = []", dest.read_text())
+
+    def test_the_scope_guard_ignores_a_cr_without_a_scope(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in\n'
+                    '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+                    '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
+                    "esac\n"
+                    "exit 1\n"
+                ),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "ACCEPT_NO_NETWORK_POLICY": "true"},

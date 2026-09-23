@@ -531,6 +531,10 @@ main() {
   # node pool goes with the cluster in any case; the only thing these two
   # values change here is whether the floor check gets to abort.
   export ENABLE_GVISOR="false"
+  # The hand-declared-scope guard exists to stop an apply from emptying a
+  # scope the CR carries and install.env does not. A destroy keeps neither, so
+  # it must not be refusable on that difference.
+  export SCOPE_GUARD_ENABLED="false"
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

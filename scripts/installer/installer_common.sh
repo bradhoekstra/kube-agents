@@ -786,8 +786,15 @@ hcl_bool() {
 # Comma- or space-separated string → HCL list of strings, dropping empty
 # items. Both separators, because --custom-roles documents "space- or
 # comma-separated".
+# Globbing is off while the list is split: an entry such as `*-sandbox` (a
+# scope exclusion) would otherwise expand against the working directory and
+# the file names would replace the pattern, silently. Saved and restored by
+# hand rather than with `local -`, which bash 3.2 lacks.
 hcl_csv_list() {
   local csv="${1:-}" out="[" first=true item
+  local had_noglob=false
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
   local IFS=$', \t\n'
   for item in $csv; do
     item="${item#"${item%%[![:space:]]*}"}"
@@ -797,6 +804,7 @@ hcl_csv_list() {
     out+="$(hcl_str "$item")"
     first=false
   done
+  $had_noglob || set +f
   printf '%s]' "$out"
 }
 
@@ -811,19 +819,30 @@ hcl_csv_list() {
 # naming the entry, for a triple that is not exactly three non-empty parts.
 hcl_scope_block() {
   local projects="${1:-}" exclude_projects="${2:-}" exclude_clusters="${3:-}"
-  local clusters="[" first=true item project location cluster rest
+  local clusters="[" first=true item project location cluster
+  # Same globbing rule as hcl_csv_list: a triple never carries a glob, but the
+  # split must not consult the working directory either.
+  local had_noglob=false
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  local sep="$SCOPE_CLUSTER_TRIPLE_SEPARATOR"
+  local triple_pattern="^[^${sep}]+${sep}[^${sep}]+${sep}[^${sep}]+\$"
   local IFS=$', \t\n'
   for item in $exclude_clusters; do
     [ -n "$item" ] || continue
-    IFS="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" read -r project location cluster rest <<< "$item"
-    if [ -z "$project" ] || [ -z "$location" ] || [ -z "$cluster" ] || [ -n "$rest" ]; then
-      print_error "SCOPE_EXCLUDE_CLUSTERS entry '${item}' is not a project${SCOPE_CLUSTER_TRIPLE_SEPARATOR}location${SCOPE_CLUSTER_TRIPLE_SEPARATOR}cluster triple." >&2
+    # The whole entry, so a trailing separator or an empty middle part fails
+    # rather than being dropped by `read`.
+    if ! [[ "$item" =~ $triple_pattern ]]; then
+      $had_noglob || set +f
+      print_error "SCOPE_EXCLUDE_CLUSTERS entry '${item}' is not a project${sep}location${sep}cluster triple." >&2
       return 1
     fi
+    IFS="$sep" read -r project location cluster <<< "$item"
     $first || clusters+=", "
     clusters+="{ project_id = $(hcl_str "$project"), location = $(hcl_str "$location"), cluster_name = $(hcl_str "$cluster") }"
     first=false
   done
+  $had_noglob || set +f
   clusters+="]"
   printf 'scope = {\n  projects = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$exclude_projects")" "$clusters"
@@ -1450,6 +1469,48 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
 }
 
 
+# Refuses to regenerate over a PlatformAgent whose spec.scope was declared by
+# hand while install.env declares nothing. Before install.env carried the
+# SCOPE_* keys, editing the CR was the documented way to set the field; the
+# chart now renders the block from those keys on every apply, empty lists
+# included, and the reconcile reads an emptied `projects` list as the
+# declaration that drops those projects, so the apply would retire every
+# Cluster Agent profile the hand-set scope produced. Prints the install.env
+# lines that carry the live declaration forward. Runs only when kubectl's
+# current context is this install's cluster (the caller checks), and only
+# when SCOPE_GUARD_ENABLED is not false: uninstall.sh turns it off, since a
+# destroy keeps nothing either way, and an operator who means to drop the
+# projects turns it off for one run.
+guard_hand_declared_scope() {
+  local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  local live
+  live="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json 2>/dev/null || true; } | python3 -c '
+import json, sys
+try:
+    items = json.load(sys.stdin).get("items", [])
+except Exception:
+    sys.exit(0)
+for item in items:
+    scope = (item.get("spec") or {}).get("scope") or {}
+    exclude = scope.get("exclude") or {}
+    projects = scope.get("projects") or []
+    excluded = exclude.get("projects") or []
+    clusters = ["%s/%s/%s" % (c.get("projectId", ""), c.get("location", ""), c.get("clusterName", "")) for c in exclude.get("clusters") or []]
+    if projects or excluded or clusters:
+        print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
+        print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(excluded))
+        print("SCOPE_EXCLUDE_CLUSTERS=\"%s\"" % " ".join(clusters))
+        break
+' 2>/dev/null || true)"
+  [ -n "$live" ] || return 0
+  [ -z "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ] || return 0
+  print_error "The PlatformAgent in '${ns}' declares a spec.scope and install.env declares none. Applying would replace it with an empty scope and retire the Cluster Agent profiles of every project it names."
+  print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run:"
+  printf '%s\n' "$live"
+  print_info "To drop those projects on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
+  return 1
+}
+
 # Writes the terraform.tfvars the full-install composition consumes, from the
 # install.env variable set in the environment (load it first). The same
 # generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
@@ -1612,6 +1673,12 @@ write_tfvars_from_state() {
         print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
       fi
     done
+    # Same gate as the recovery above: the live CR is only this install's when
+    # the context is. A hand-declared scope the keys do not carry refuses the
+    # run before anything is written.
+    if is_truthy "${SCOPE_GUARD_ENABLED:-true}"; then
+      guard_hand_declared_scope || return 1
+    fi
   fi
 
   # Minting the key happens HERE, after the recovery loop above, and only for a
