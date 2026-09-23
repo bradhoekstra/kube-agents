@@ -76,6 +76,9 @@ _CERT_MANAGER_PRESENT_KUBECTL = (
     'case "$*" in\n'
     '  *"get deployment cert-manager"*) exit 0 ;;\n'
     '  *"current-context"*) echo "some-other-context"; exit 0 ;;\n'
+    # A reachable cluster with cert-manager and no kube-agents on it yet: the
+    # fail-closed scope guard passes a cluster that serves no PlatformAgent.
+    '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
     "esac\n"
     "exit 1\n"
 )
