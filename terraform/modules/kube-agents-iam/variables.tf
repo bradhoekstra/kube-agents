@@ -168,4 +168,23 @@ variable "scope" {
     ])
     error_message = "Each scope.exclude.clusters entry names one cluster by project_id, location and cluster_name, each matching ^[a-z0-9][a-z0-9-]*$."
   }
+
+  validation {
+    condition = alltrue([
+      for entry in var.scope.exclude.projects : can(regex("^[a-z0-9*?\\[\\]!-]{1,63}$", entry))
+    ])
+    error_message = "Each scope.exclude.projects entry is a project ID or a shell-style glob (lowercase letters, digits, - * ? [ ] !, up to 63 characters), the pattern the CRD accepts for the same field."
+  }
+
+  # The CRD declares the two project lists as sets and the cluster list as a
+  # map keyed on the triple, so a repeated entry that Terraform let through
+  # would bind IAM and then fail the CR at admission, after the apply.
+  validation {
+    condition = (
+      length(distinct(var.scope.projects)) == length(var.scope.projects)
+      && length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)
+      && length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)
+    )
+    error_message = "scope.projects, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
+  }
 }

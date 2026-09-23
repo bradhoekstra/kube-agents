@@ -883,15 +883,24 @@ main() {
   # Resetting first takes the checkout's defaults for the new keys and re-applies
   # the release's own overrides on top, which is what the redeploy workflows
   # already do for the same reason.
+  #
+  # The scope travels with every retag. Resetting to the checkout's defaults
+  # takes platformAgent.scope as empty lists, and a release whose last full
+  # apply predates the value recorded none to re-apply, so a retag that said
+  # nothing would render `projects: []` over a scope the CR carries and the
+  # reconcile would retire those projects. The keys install.env carries (the
+  # generator has just validated them) are what the CR gets, in every mode.
   helm_retag() {
     local set_args=()
     local set_key
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
+    local scope_json
+    scope_json="$(scope_values_json)" || return 1
     helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reset-then-reuse-values \
-      "${set_args[@]}" --wait --timeout 10m
+      "${set_args[@]}" --set-json "platformAgent.scope=${scope_json}" --wait --timeout 10m
   }
 
   # The release guard runs before the tfvars generation on purpose: a

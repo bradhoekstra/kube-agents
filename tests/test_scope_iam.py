@@ -138,6 +138,17 @@ class ScopeAllowlistTest(unittest.TestCase):
         self.assertIsNotNone(block, "variable scope moved or was renamed")
         self.assertIn("length(var.scope.projects) <= 100", block.group(1))
 
+    def test_the_variable_refuses_what_the_crd_would_refuse_at_admission(self):
+        # A repeat (the CRD lists are sets, the cluster list a map) or an
+        # exclude glob outside the CRD's class would bind IAM and then fail the
+        # CR after the apply; both fail the plan instead.
+        block = re.search(r'^variable\s+"scope"\s*\{(.*?)^\}', self.module_vars, re.MULTILINE | re.DOTALL)
+        body = block.group(1)
+        self.assertIn("length(distinct(var.scope.projects)) == length(var.scope.projects)", body)
+        self.assertIn("length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)", body)
+        self.assertIn("for c in var.scope.exclude.clusters", body)
+        self.assertIn('for entry in var.scope.exclude.projects : can(regex("^[a-z0-9*?', body)
+
 
 class ScopeReachesBothHalvesTest(unittest.TestCase):
     """One value, two consumers: the IAM module and the CR the chart renders."""

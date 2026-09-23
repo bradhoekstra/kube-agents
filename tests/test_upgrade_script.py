@@ -442,6 +442,20 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
         self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
 
+    def test_every_retag_carries_the_scope_from_install_env(self):
+        """harness and operator mode never go through the composition.
+
+        --reset-then-reuse-values takes the checkout's default for
+        platformAgent.scope (empty lists) on a release that recorded none, and
+        the chart renders the block unconditionally, so a retag that said
+        nothing would empty a scope the CR carries and retire its projects. The
+        keys install.env carries are passed on every retag.
+        """
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
+        self.assertIn('scope_json="$(scope_values_json)" || return 1', retag)
+        self.assertIn('--set-json "platformAgent.scope=${scope_json}"', retag)
+
     def test_jq_is_required_for_the_modes_that_read_with_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then\n    required_tools+=(jq)', text)

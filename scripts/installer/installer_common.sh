@@ -124,6 +124,10 @@ readonly GCS_OBJECT_ABSENT_PATTERN='matched no objects|NotFoundException|HTTPErr
 readonly TF_STATE_RC_UNREADABLE=2
 # One SCOPE_EXCLUDE_CLUSTERS entry in install.env is project/location/cluster.
 readonly SCOPE_CLUSTER_TRIPLE_SEPARATOR="/"
+# What the CRD accepts for one exclude.projects entry (an ID or a shell-style
+# glob); checked here so a typo fails before IAM is applied rather than at the
+# CR's admission after it.
+readonly SCOPE_EXCLUDE_PROJECT_PATTERN='^[]a-z0-9*?[!-]{1,63}$'
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -828,6 +832,14 @@ hcl_scope_block() {
   local sep="$SCOPE_CLUSTER_TRIPLE_SEPARATOR"
   local triple_pattern="^[^${sep}]+${sep}[^${sep}]+${sep}[^${sep}]+\$"
   local IFS=$', \t\n'
+  for item in $exclude_projects; do
+    [ -n "$item" ] || continue
+    if ! [[ "$item" =~ $SCOPE_EXCLUDE_PROJECT_PATTERN ]]; then
+      $had_noglob || set +f
+      print_error "SCOPE_EXCLUDE_PROJECTS entry '${item}' is not a project ID or glob the PlatformAgent accepts (lowercase letters, digits, - * ? [ ] !)." >&2
+      return 1
+    fi
+  done
   for item in $exclude_clusters; do
     [ -n "$item" ] || continue
     # The whole entry, so a trailing separator or an empty middle part fails
@@ -1469,23 +1481,59 @@ sys.exit(0 if any(r.get("status") in served for r in revisions) else 1)
 }
 
 
-# Refuses to regenerate over a PlatformAgent whose spec.scope was declared by
-# hand while install.env declares nothing. Before install.env carried the
-# SCOPE_* keys, editing the CR was the documented way to set the field; the
-# chart now renders the block from those keys on every apply, empty lists
-# included, and the reconcile reads an emptied `projects` list as the
-# declaration that drops those projects, so the apply would retire every
-# Cluster Agent profile the hand-set scope produced. Prints the install.env
-# lines that carry the live declaration forward. Runs only when kubectl's
-# current context is this install's cluster (the caller checks), and only
-# when SCOPE_GUARD_ENABLED is not false: uninstall.sh turns it off, since a
-# destroy keeps nothing either way, and an operator who means to drop the
-# projects turns it off for one run.
+# The three SCOPE_* keys as the chart value `platformAgent.scope`, in JSON,
+# for a `helm upgrade --set-json` that must carry the declaration when it is
+# not going through the composition (upgrade.sh's harness and operator modes,
+# which re-tag images with --reset-then-reuse-values: the checkout's chart
+# defaults the block to empty lists, so a retag that said nothing would render
+# `projects: []` over whatever the CR carries). The keys are the ones
+# write_tfvars_from_state has already validated on the same run.
+scope_values_json() {
+  SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
+  SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" \
+  python3 -c '
+import json, os, re
+split = lambda key: [item for item in re.split(r"[ ,\t\n]+", os.environ.get(key, "")) if item]
+sep = os.environ["SCOPE_SEP"]
+clusters = []
+for triple in split("SCOPE_EXCLUDE_CLUSTERS"):
+    project, location, cluster = triple.split(sep)
+    clusters.append({"projectId": project, "location": location, "clusterName": cluster})
+print(json.dumps({"projects": split("SCOPE_PROJECTS"),
+                  "exclude": {"projects": split("SCOPE_EXCLUDE_PROJECTS"), "clusters": clusters}},
+                 separators=(",", ":")))
+'
+}
+
+# Refuses to regenerate over a PlatformAgent whose spec.scope declares
+# something the SCOPE_* keys do not carry. Before install.env carried the
+# keys, editing the CR was the documented way to set the field; the chart now
+# renders the block from those keys on every apply, empty lists included, and
+# the reconcile reads a project missing from `projects` as the declaration
+# that drops it, so the apply would retire every Cluster Agent profile the
+# hand-set scope produced. Each live entry has to be in its key: a partial
+# install.env (an exclude recorded, the projects not) is refused too, with the
+# three lines that carry the whole live declaration printed. Reads the CR
+# through the install's own kubeconfig context by name, not the current
+# context, and says so when it cannot read it, since a silent skip here is a
+# silent deletion later. SCOPE_GUARD_ENABLED=false turns it off: uninstall.sh
+# sets it, since a destroy keeps nothing either way, and an operator who means
+# to drop the projects sets it for one run.
 guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
-  local live
-  live="$({ kubectl get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json 2>/dev/null || true; } | python3 -c '
-import json, sys
+  local context
+  context="$(gke_context_name)"
+  local cr_json
+  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json 2>/dev/null)"; then
+    print_warning "Could not read the PlatformAgent in '${ns}' through kubectl context '${context}', so the hand-declared-scope check did not run. If that CR carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
+    return 0
+  fi
+  local missing
+  missing="$(printf '%s' "$cr_json" | SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
+    SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" python3 -c '
+import json, os, re, sys
+split = lambda key: [item for item in re.split(r"[ ,\t\n]+", os.environ.get(key, "")) if item]
+sep = os.environ["SCOPE_SEP"]
 try:
     items = json.load(sys.stdin).get("items", [])
 except Exception:
@@ -1493,20 +1541,25 @@ except Exception:
 for item in items:
     scope = (item.get("spec") or {}).get("scope") or {}
     exclude = scope.get("exclude") or {}
-    projects = scope.get("projects") or []
-    excluded = exclude.get("projects") or []
-    clusters = ["%s/%s/%s" % (c.get("projectId", ""), c.get("location", ""), c.get("clusterName", "")) for c in exclude.get("clusters") or []]
-    if projects or excluded or clusters:
-        print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
-        print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(excluded))
-        print("SCOPE_EXCLUDE_CLUSTERS=\"%s\"" % " ".join(clusters))
-        break
+    live = {
+        "SCOPE_PROJECTS": scope.get("projects") or [],
+        "SCOPE_EXCLUDE_PROJECTS": exclude.get("projects") or [],
+        "SCOPE_EXCLUDE_CLUSTERS": [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", "")))
+                                   for c in exclude.get("clusters") or []],
+    }
+    missing = {key: [v for v in values if v not in split(key)] for key, values in live.items()}
+    if not any(missing.values()):
+        continue
+    print("# " + "; ".join("%s lacks %s" % (key, " ".join(values)) for key, values in missing.items() if values))
+    for key, values in live.items():
+        merged = split(key) + [v for v in values if v not in split(key)]
+        print("%s=\"%s\"" % (key, " ".join(merged)))
+    break
 ' 2>/dev/null || true)"
-  [ -n "$live" ] || return 0
-  [ -z "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ] || return 0
-  print_error "The PlatformAgent in '${ns}' declares a spec.scope and install.env declares none. Applying would replace it with an empty scope and retire the Cluster Agent profiles of every project it names."
+  [ -n "$missing" ] || return 0
+  print_error "The PlatformAgent in '${ns}' declares a spec.scope that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys and retire the Cluster Agent profiles of every project it drops."
   print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run:"
-  printf '%s\n' "$live"
+  printf '%s\n' "$missing"
   print_info "To drop those projects on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
   return 1
 }
@@ -1633,7 +1686,11 @@ write_tfvars_from_state() {
   # recovery loop below — adoption is exactly the case where the credentials
   # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
-  if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
+  # Any existing cluster, not only an adoption: the hand-declared-scope guard
+  # below reads the live CR through this install's context by name, and a
+  # re-run of install.sh over a cluster its own state created has fetched no
+  # credentials yet at this point.
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1; then
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
       --project "${PROJECT_ID}" >/dev/null 2>&1 || true
   fi
@@ -1673,12 +1730,13 @@ write_tfvars_from_state() {
         print_info "Recovered ${secret_key} from the live '${PLATFORM_AGENT_SECRET}' Secret (install.env does not persist it)."
       fi
     done
-    # Same gate as the recovery above: the live CR is only this install's when
-    # the context is. A hand-declared scope the keys do not carry refuses the
-    # run before anything is written.
-    if is_truthy "${SCOPE_GUARD_ENABLED:-true}"; then
-      guard_hand_declared_scope || return 1
-    fi
+  fi
+  # Not behind the current-context gate: the guard names the install's context
+  # itself, and a cluster that exists is the only kind that can carry a CR. A
+  # hand-declared scope the keys do not carry refuses the run before anything
+  # is written.
+  if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 && is_truthy "${SCOPE_GUARD_ENABLED:-true}"; then
+    guard_hand_declared_scope || return 1
   fi
 
   # Minting the key happens HERE, after the recovery loop above, and only for a
