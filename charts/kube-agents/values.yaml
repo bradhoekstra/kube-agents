@@ -841,6 +841,13 @@ platformAgent:
     exclude:
       projects: []
       clusters: []
+    # Render no scope block at all. For upgrade.sh's harness and operator
+    # modes, which re-tag images and run no Terraform: they set this so the
+    # retag neither rewrites the CR's scope from stale values nor renders the
+    # empty default over it. Without the block the reconcile carries the last
+    # declaration forward and retires nothing, and the next full apply renders
+    # it again from the composition. Not for an install to set by hand.
+    omit: false
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

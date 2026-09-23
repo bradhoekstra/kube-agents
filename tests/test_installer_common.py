@@ -158,9 +158,18 @@ class InstallerCommonTest(unittest.TestCase):
             gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
             # Hermetic kubectl: the generator recovers credentials from the
             # live Secret when it can, and a developer's real kube context
-            # must never answer a unit test.
+            # must never answer a unit test. By default it answers as a
+            # cluster with no kube-agents on it (no PlatformAgent type), the
+            # ordinary adoption, which the fail-closed scope guard lets pass;
+            # a test about an unreadable CR hands in a stub that just fails.
             kubectl = bin_dir / "kubectl"
-            kubectl.write_text(kubectl_script or "#!/usr/bin/env bash\nexit 1\n")
+            kubectl.write_text(kubectl_script or (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            ))
             kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
             # Hermetic helm too: the scope guard asks the release what the
             # chart last rendered, and a developer's real release must never
@@ -927,22 +936,66 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=1", proc.stdout, proc.stderr)
             self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
 
-    def test_the_scope_guard_says_so_when_it_cannot_read_the_cr(self):
-        # No such context in the kubeconfig, or the read failed: the run
-        # proceeds (a fresh clone with no credentials is the ordinary case) but
-        # the skip is printed, because a silent skip here is a silent deletion.
+    def test_the_scope_guard_fails_closed_when_it_cannot_read_the_cr(self):
+        # A context missing from the kubeconfig, an unreachable endpoint, a
+        # 403: the apply that follows authenticates on its own and would not
+        # stop, and a scripted run never sees a warning, so the run is refused
+        # with the override named; under --plan it says so and goes on.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
-                'print_warning() { echo "WARN: $*"; }; '
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub="printf '\\n'; exit 0",
                 kubectl_script="#!/usr/bin/env bash\nexit 1\n",
             )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn("hand-declared-scope check did not run", proc.stdout + proc.stderr)
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("hand-declared-scope check could not run", proc.stdout + proc.stderr)
             self.assertIn("gke_test-project_us-central1_test-cluster", proc.stdout + proc.stderr)
+            self.assertIn("SCOPE_GUARD_ENABLED=false", proc.stdout + proc.stderr)
+            self.assertFalse(dest.exists())
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_GUARD_REFUSES": "false"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script="#!/usr/bin/env bash\nexit 1\n",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("hand-declared-scope check could not run", proc.stdout + proc.stderr)
+
+    def test_an_exclude_only_hand_scope_is_protected_too(self):
+        # The shape the manage-cluster skill produces: no projects, a hand-set
+        # exclusion. With no key at all the apply would render empty excludes
+        # and re-onboard the cluster, so it is refused; any key set is the
+        # declaration and proceeds.
+        cr = {"items": [{"spec": {"scope": {"exclude": {"clusters": [
+            {"projectId": "test-project", "location": "us-central1", "clusterName": "scratch"}]}}}}]}
+        kubectl = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f"  *\"--context gke_test-project_us-central1_test-cluster get platformagents\"*) cat <<'JSON'\n{json.dumps(cr)}\nJSON\nexit 0 ;;\n"
+            "esac\n"
+            "exit 1\n"
+        )
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=kubectl,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("excludes test-project/us-central1/scratch and no SCOPE_* key is set", proc.stdout)
+            self.assertIn('SCOPE_EXCLUDE_CLUSTERS="test-project/us-central1/scratch"', proc.stdout)
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "test-project/us-central1/scratch"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=kubectl,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
 
     def test_the_scope_guard_does_not_run_for_a_cluster_that_does_not_exist(self):
         # Nothing to read on a fresh create, so no warning either.
@@ -992,56 +1045,6 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
             self.assertIn("  projects = []", dest.read_text())
 
-    def test_live_scope_json_reads_the_crs_own_scope_or_fails(self):
-        # A retag carries the CR's scope exactly as it is, so the reader has
-        # to print it with every list present, print nothing for a CR without
-        # the block (absent is its own declaration; the caller refuses), and
-        # fail (never guess) when it cannot read the CR or finds none;
-        # scope_json_equal compares the sets.
-        with_scope = self._run(
-            'live_scope_json kubeagents-system',
-            kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
-        )
-        self.assertEqual(with_scope.returncode, 0, with_scope.stderr)
-        self.assertEqual(
-            json.loads(with_scope.stdout),
-            {"projects": ["payments-prod"], "exclude": {"projects": ["*-sandbox"],
-             "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
-        )
-        no_block = self._run(
-            'live_scope_json kubeagents-system',
-            kubectl_script=(
-                "#!/usr/bin/env bash\n"
-                'case "$*" in\n'
-                '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
-                "esac\n"
-                "exit 1\n"
-            ),
-        )
-        self.assertEqual(no_block.returncode, 0, no_block.stderr)
-        self.assertEqual(no_block.stdout.strip(), "", "an absent block is a declaration of its own; the caller refuses the retag")
-        unreadable = self._run('live_scope_json kubeagents-system; echo "rc=$?"')
-        self.assertIn("rc=1", unreadable.stdout, unreadable.stderr)
-        none = self._run(
-            'live_scope_json kubeagents-system; echo "rc=$?"',
-            kubectl_script=(
-                "#!/usr/bin/env bash\n"
-                'case "$*" in\n'
-                '  *"get platformagents"*) echo \'{"items":[]}\'; exit 0 ;;\n'
-                "esac\n"
-                "exit 1\n"
-            ),
-        )
-        self.assertIn("rc=1", none.stdout, none.stderr)
-        equal = self._run(
-            'scope_json_equal \'{"projects":["b","a"],"exclude":{"projects":[],"clusters":[]}}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
-        )
-        self.assertIn("rc=0", equal.stdout, equal.stderr)
-        differ = self._run(
-            'scope_json_equal \'{"projects":["a"]}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
-        )
-        self.assertIn("rc=1", differ.stdout, differ.stderr)
-
     def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
         # A first adoption: the cluster exists, kube-agents has never been on
         # it, kubectl says there is no such resource type. Nothing to protect,
@@ -1064,21 +1067,20 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertNotIn("hand-declared-scope check", proc.stdout + proc.stderr)
 
-    def test_the_scope_guard_is_loud_when_python_cannot_run(self):
-        # python3 missing or broken must be the same loud skip as an unreadable
-        # CR, never a silent pass over a hand-declared scope.
+    def test_the_scope_guard_fails_closed_when_python_cannot_run(self):
+        # python3 missing or broken is the same refusal as an unreadable CR,
+        # never a silent pass over a hand-declared scope.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
-                'print_warning() { echo "WARN: $*"; }; '
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub="printf '\\n'; exit 0",
                 kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
                 extra_bins={"python3": "#!/usr/bin/env bash\nexit 1\n"},
             )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn("python3 is not available, so the hand-declared-scope check did not run", proc.stdout + proc.stderr)
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("python3 is not available", proc.stdout + proc.stderr)
 
     def test_the_generator_checks_every_scope_list_the_way_the_crd_will(self):
         # harness and operator retags carry the keys to the API server with no
@@ -1137,22 +1139,6 @@ class InstallerCommonTest(unittest.TestCase):
             fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
             self.assertEqual(1, len(fetches), fetches)
             self.assertNotIn("--dns-endpoint", fetches[0])
-
-    def test_scope_values_json_renders_the_keys_as_the_chart_value(self):
-        proc = self._run(
-            'scope_values_json',
-            env={"SCOPE_PROJECTS": "payments-prod, payments-staging", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                 "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(
-            json.loads(proc.stdout),
-            {"projects": ["payments-prod", "payments-staging"],
-             "exclude": {"projects": ["*-sandbox"],
-                         "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
-        )
-        empty = self._run('scope_values_json')
-        self.assertEqual(json.loads(empty.stdout), {"projects": [], "exclude": {"projects": [], "clusters": []}})
 
     def test_an_exclude_glob_outside_the_crds_class_fails_before_writing(self):
         for entry, ok in (("*-sandbox", True), ("kube-agents-demo-0[2-9]", True), ("!scratch?", True),

@@ -197,11 +197,18 @@ spec:
   */}}
   {{- $scope := .Values.platformAgent.scope | default dict }}
   {{- $scopeExclude := $scope.exclude | default dict }}
+  {{- /*
+    scope.omit is the one way to render no block: upgrade.sh's image retags set it so
+    the CR's scope is left alone (Helm drops a field neither manifest carries, and the
+    reconcile reads an absent block as "carry the last declaration forward").
+  */}}
+  {{- if not $scope.omit }}
   scope:
     projects: {{ $scope.projects | default list | toJson }}
     exclude:
       projects: {{ $scopeExclude.projects | default list | toJson }}
       clusters: {{ $scopeExclude.clusters | default list | toJson }}
+  {{- end }}
   {{- /*
     `with`, not `if`: an empty value must OMIT the field, not render it as "". Omitting is
     what leaves the operator free to discover a collector; an explicit "" would look like

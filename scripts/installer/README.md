@@ -232,19 +232,21 @@ that drops a project makes the next full `upgrade.sh` (the default mode) revoke 
 retire its profiles. An entry that is not what the CRD accepts (a project ID, an exclude ID or glob, a
 `project/location/cluster` triple of names up to 63 characters), a repeat, or a list past 100 entries
 fails the generator before any file is written, and so before a `harness` or `operator` retag could
-carry it to the API server. An install whose `PlatformAgent` names projects in `spec.scope` while `SCOPE_PROJECTS` names none is
-refused too, with the three lines that carry the whole live declaration printed, because the apply
-would empty the scope and retire those projects' profiles: that is the install whose scope was set by
-hand before the keys existed, or an `install.env` that recorded an exclusion but not the projects. A
-key that names any project is the declaration and changes the scope freely, so removing a project
-from `SCOPE_PROJECTS` and running `upgrade.sh` is never refused; emptying it on purpose is
-`SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a destroy keeps nothing
-either way. The check reads the CR through the install's own kubeconfig context by name and says so
-when it cannot. `upgrade.sh`'s `harness` and `operator` modes leave the CR's scope exactly as it is on
-every Helm retag, hand edits included, since they run no Terraform: the retag reads the live scope
-back before anything is applied, refuses when it cannot or when the CR has no scope block, says so
-when the keys differ, and leaves the change for `full` mode, which binds the IAM and renders the CR
-together; under `--plan` and in those two modes the check warns rather than refuses. `install.sh` takes the same three as `--scope-projects`,
+carry it to the API server. An install whose `PlatformAgent` declares a scope by hand that these keys would empty is refused
+too, with the three lines that carry the whole live declaration printed: the CR names projects and
+`SCOPE_PROJECTS` names none, or the CR carries exclusions and no `SCOPE_*` key is set at all, which
+is the install whose scope was set by hand before the keys existed or an `install.env` that recorded
+part of it. A key that names any project is the declaration and changes the scope freely, so
+removing a project from `SCOPE_PROJECTS` and running `upgrade.sh` is never refused; emptying the
+scope on purpose is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
+destroy keeps nothing either way. The check reads the CR through the install's own kubeconfig
+context by name and fails closed: a read it cannot make refuses the run with the same override,
+because the apply that follows would not stop. `upgrade.sh`'s `harness` and `operator` modes render
+no scope block at all (the chart's `platformAgent.scope.omit`), since they run no Terraform: Helm
+then leaves a field neither manifest carries alone and drops one the previous manifest had, the
+reconcile carries the last declaration forward and retires nothing, and the next full `upgrade.sh`
+renders the block from the keys again; in those modes the check does not run, and under `--plan` it
+warns rather than refuses. `install.sh` takes the same three as `--scope-projects`,
 `--scope-exclude-projects` and `--scope-exclude-clusters` on a first install, which records them; on
 an existing `install.env` a flag that disagrees with the recorded key, or a value the file does not
 record arriving from a flag or the environment, is refused rather than applied for one run, because

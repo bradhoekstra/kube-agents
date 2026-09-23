@@ -75,6 +75,13 @@ class ChartScopeBlockTest(unittest.TestCase):
             pathlib.Path(values_file).unlink()
         self.assertEqual(_SCOPE_VALUES["platformAgent"]["scope"], spec["scope"])
 
+    def test_omit_renders_no_block_at_all(self):
+        # upgrade.sh's image retags set this so the CR's scope is left alone:
+        # no block, not an empty one, since the reconcile reads an empty
+        # present block as the declaration that drops projects.
+        spec = self._render("--set", "platformAgent.scope.omit=true")["spec"]
+        self.assertNotIn("scope", spec)
+
     def test_an_unknown_scope_key_fails_the_render(self):
         # values.schema.json closes the object, so a misspelt key fails here
         # rather than rendering a CR that silently declares less than asked.

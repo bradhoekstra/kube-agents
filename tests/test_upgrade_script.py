@@ -442,60 +442,30 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
         self.assertIn('set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")', retag)
 
-    def test_every_retag_carries_the_scope_from_install_env(self):
-        """harness and operator mode never go through the composition.
-
-        --reset-then-reuse-values takes the checkout's default for
-        platformAgent.scope (empty lists) on a release that recorded none, and
-        the chart renders the block unconditionally, so a retag that said
-        nothing would empty a scope the CR carries and retire its projects. The
-        keys install.env carries are passed on every retag.
-        """
-        text = (_REPO_ROOT / "upgrade.sh").read_text()
-        retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('if [ -n "${RETAG_SCOPE_JSON:-}" ]; then', retag)
-        self.assertIn('--set-json "platformAgent.scope=${RETAG_SCOPE_JSON}"', retag)
-        # Only when the engine has the helper: on the curl path an older
-        # installer_common.sh has neither the function nor a chart key to set.
-        self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F scope_values_json', text)
-
-    def test_a_retag_carries_the_crs_own_scope_or_refuses(self):
+    def test_a_retag_renders_no_scope_block(self):
         """harness and operator mode run no Terraform, so no scope may change
-        through them: not the keys (a project added would be listed with no
-        grant, one dropped retired with its grants bound) and not the
-        release's record (a hand edit the guard accepted is not in it). The
-        live spec.scope travels as it is; a read that fails refuses the retag
-        rather than guess; keys that differ are said out loud for full mode."""
+        through them. The retag sets the chart's platformAgent.scope.omit,
+        which renders no block: Helm leaves a field neither manifest carries
+        alone and drops one the previous manifest had, and the reconcile reads
+        an absent block as carrying the last declaration forward. Only when
+        the engine has the scope input (an older chart has no such key)."""
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         retag = text[text.index("  helm_retag() {") : text.index("  }", text.index("  helm_retag() {"))]
-        self.assertIn('--set-json "platformAgent.scope=${RETAG_SCOPE_JSON}"', retag)
-        self.assertNotIn("scope_values_json)", retag, "the keys never travel through a retag")
-        self.assertNotIn("release_scope_json", text)
-        # Read before the mode dispatch, so a failed read or an absent block
-        # refuses before the CRD apply rather than between it and the rollout.
-        read_at = text.index('RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"')
-        dispatch_at = text.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
-        self.assertLess(read_at, dispatch_at)
-        pre = text[read_at:dispatch_at]
-        self.assertIn("exit 1", pre)
-        self.assertIn("carries no spec.scope block", pre)
-        self.assertIn('if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then', pre)
-        self.assertIn("--upgrade-mode=full to apply the change", pre)
+        self.assertIn('if declare -F hcl_scope_block >/dev/null 2>&1; then', retag)
+        self.assertIn('set_args+=(--set "platformAgent.scope.omit=true")', retag)
+        for gone in ("scope_values_json", "live_scope_json", "release_scope_json", "RETAG_SCOPE_JSON", "--set-json"):
+            self.assertNotIn(gone, text, f"{gone} is no longer part of the retag")
 
-    def test_only_a_full_upgrade_lets_the_scope_guard_refuse(self):
+    def test_the_scope_guard_runs_only_for_a_full_apply(self):
+        # A plan applies nothing and is what shows the destroys the guard
+        # protects against, so it speaks without refusing; harness and
+        # operator render no scope block, so the guard does not run.
         text = (_REPO_ROOT / "upgrade.sh").read_text()
-        self.assertIn('if [ "$PARAM_PLAN" = "true" ] || [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n      export SCOPE_GUARD_REFUSES="false"', text)
-
-    def test_a_plan_does_not_let_the_scope_guard_stop_it(self):
-        text = (_REPO_ROOT / "upgrade.sh").read_text()
-        export_at = text.find('export SCOPE_GUARD_REFUSES="false"')
-        self.assertNotEqual(export_at, -1, "plan mode must let the scope guard speak without refusing")
+        block = text[text.index('if [ "$PARAM_PLAN" = "true" ]; then\n      export SCOPE_GUARD_REFUSES="false"'):]
+        block = block[: block.index("fi\n") + 3]
+        self.assertIn('elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n      export SCOPE_GUARD_ENABLED="false"', block)
         generate_at = text.find('write_tfvars_from_state "')
-        self.assertLess(export_at, generate_at, "the export has to precede the generator")
-
-    def test_jq_is_required_for_the_modes_that_read_with_it(self):
-        text = (_REPO_ROOT / "upgrade.sh").read_text()
-        self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then\n    required_tools+=(jq)', text)
+        self.assertLess(text.index('export SCOPE_GUARD_REFUSES="false"'), generate_at)
 
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

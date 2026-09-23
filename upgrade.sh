@@ -649,8 +649,7 @@ main() {
   print_info "Target Image Tag: ${C_BOLD}${PARAM_IMAGE_TAG}${C_RESET}"
 
   # python3: the Terraform-state readers and the hand-declared-scope guard in
-  # installer_common.sh run in it, and scope_values_json renders the retag's
-  # scope value with it.
+  # installer_common.sh run in it.
   local required_tools=(gcloud kubectl helm python3)
   # jq: the harness step's plugin re-tag reads the release's values with it,
   # and the post-upgrade image check that harness and full modes run has
@@ -887,34 +886,28 @@ main() {
   # the release's own overrides on top, which is what the redeploy workflows
   # already do for the same reason.
   #
-  # The scope travels with every retag, and what travels is the CR's own.
-  # Resetting to the checkout's defaults takes platformAgent.scope as empty
-  # lists, so a retag that said nothing would render `projects: []` over a
-  # scope the CR carries and the reconcile would retire those projects. These
-  # modes run no Terraform, so no scope may change through them: not the
-  # keys, which would list a project with no grant or retire one with its
-  # grants still bound, and not the release's record, which a hand edit is
-  # not in. The live spec.scope is read back and passed as it is; a read that
-  # fails refuses the retag rather than guess, and keys that differ from the
-  # CR are said out loud and left for full mode, which binds the IAM and
-  # renders the CR together.
+  # A retag renders no scope block. Resetting to the checkout's defaults would
+  # take platformAgent.scope as empty lists and render `projects: []` over a
+  # scope the CR carries, and re-applying the release's recorded values would
+  # write back whatever the last full apply rendered; either way a retag
+  # would change a scope these modes have no Terraform to back. With the
+  # block omitted Helm leaves a field neither manifest carries alone and drops
+  # one the previous manifest had, and the reconcile reads an absent block as
+  # "carry the last declaration forward, retire nothing". The next full apply
+  # renders the block from install.env again.
   #
-  # Only when the engine has the helper. On the curl path this script is the
-  # one the site serves while installer_common.sh comes from the clone at
-  # --image-tag; an engine from before the scope input has no
-  # scope_values_json, and its chart has no platformAgent.scope to set, so
-  # the retag runs as it always did rather than stopping after the CRD apply.
+  # Only when the engine has the scope input at all. On the curl path this
+  # script is the one the site serves while installer_common.sh comes from the
+  # clone at --image-tag; an engine from before it (no hcl_scope_block) has a
+  # chart with no platformAgent.scope key, and the retag runs as it always did.
   helm_retag() {
     local set_args=()
     local set_key
     for set_key in "$@"; do
       set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
     done
-    # RETAG_SCOPE_JSON was read, and its absence refused, before the mode
-    # dispatch below, ahead of the CRD apply, so the read cannot stop an
-    # operator upgrade half-done. Empty means the engine has no scope input.
-    if [ -n "${RETAG_SCOPE_JSON:-}" ]; then
-      set_args+=(--set-json "platformAgent.scope=${RETAG_SCOPE_JSON}")
+    if declare -F hcl_scope_block >/dev/null 2>&1; then
+      set_args+=(--set "platformAgent.scope.omit=true")
     fi
     helm upgrade "$KUBE_AGENTS_HELM_RELEASE" "${repo_dir}/charts/kube-agents" \
       --namespace "$target_namespace" --reset-then-reuse-values \
@@ -946,10 +939,12 @@ main() {
   NAMESPACE="$target_namespace" \
     # The hand-declared-scope check protects a full apply. A plan applies
     # nothing and is the artefact that shows the destroys it protects
-    # against; harness and operator mode leave the CR's scope as it is. In
-    # all three the check speaks without refusing.
-    if [ "$PARAM_PLAN" = "true" ] || [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+    # against, so it speaks without refusing; harness and operator mode
+    # render no scope block at all (helm_retag), so it does not run.
+    if [ "$PARAM_PLAN" = "true" ]; then
       export SCOPE_GUARD_REFUSES="false"
+    elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+      export SCOPE_GUARD_ENABLED="false"
     fi
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
 
@@ -979,29 +974,6 @@ main() {
         ;;
     esac
     exit "$plan_status"
-  fi
-
-  # What a retag carries for platformAgent.scope: the CR's own live scope,
-  # read here before anything is applied. A read that fails, or a CR with no
-  # scope block (absent is a declaration of its own that a present-empty
-  # block would overwrite), refuses the retag now rather than after the CRD
-  # apply; full mode renders the scope from install.env. Only when the
-  # engine has the scope input at all (see helm_retag).
-  RETAG_SCOPE_JSON=""
-  if [ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F scope_values_json >/dev/null 2>&1; then
-    if ! RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"; then
-      print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read, or run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
-      exit 1
-    fi
-    if [ -z "$RETAG_SCOPE_JSON" ]; then
-      print_error "The PlatformAgent in '${target_namespace}' carries no spec.scope block (a write through an older operator drops it); a ${PARAM_UPGRADE_MODE} upgrade would render an empty block over it and the reconcile would retire the projects the last declaration carried. Run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
-      exit 1
-    fi
-    local retag_keys_json
-    retag_keys_json="$(scope_values_json)" || exit 1
-    if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
-      print_warning "install.env's SCOPE_* keys differ from the scope the PlatformAgent carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and leaves the CR's scope as it is; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
-    fi
   fi
 
   case "$PARAM_UPGRADE_MODE" in

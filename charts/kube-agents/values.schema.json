@@ -675,6 +675,9 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
+            "omit": {
+              "type": "boolean"
+            },
             "projects": {
               "type": "array",
               "maxItems": 100,
