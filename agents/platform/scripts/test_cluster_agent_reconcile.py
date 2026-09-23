@@ -1255,6 +1255,24 @@ class ScopeTest(HomesMixin):
         self.assertEqual(containers["folders/222222222222"]["projects"], 5)
         self.assertEqual(len([p for p in self._snapshot()["projects"] if p["outcome"] == rec.OUTCOME_OVER_CAP]), 5)
 
+    def test_a_member_project_the_account_cannot_read_is_probed_once_and_not_scaffolded(self):
+        # The index names the member's clusters without a permission check; one describe
+        # before the first create answers 403, and nothing is scaffolded under it this run.
+        members = {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1")]}
+        probes: list[tuple] = []
+
+        def describe(project, cluster, location):
+            probes.append((project, cluster))
+            rec._denied_this_run.add(project)
+            return None
+        report, created, _ = self._run({"projects": ["p2"], "folders": ["123456789012"]},
+                                       {self.MGMT: [], "p2": [("p2", "x", "us-central1")]},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)}, exists=describe)
+        self.assertEqual(probes, [("team-a", "dev")])  # one probe, the first cluster in sorted order
+        self.assertEqual(created, [("p2", "x", "us-central1")])  # the explicit project is not probed
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
+        self.assertEqual(report["create_failed"], [])
+
     def test_a_403_on_create_marks_a_member_denied_and_never_an_explicit_project(self):
         members = {"team-a": [("team-a", "prod", "us-central1")]}
         report, _, _ = self._run({"projects": ["p2"], "folders": ["123456789012"]},
@@ -1333,6 +1351,13 @@ class ScopeTest(HomesMixin):
         self.assertEqual(members, {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1-a")]})
         self.assertIn(f"--scope={self.FOLDER}", run.call_args[0][0])
         self.assertIn(f"--asset-types={rec.ASSET_TYPE_CLUSTER}", run.call_args[0][0])
+        self.assertIn(f"--format={rec.ASSET_SEARCH_FORMAT}", run.call_args[0][0])
+        # Output the proxy cut at its cap is not a transient: the log names the cause, the
+        # outcome stays unreachable, and the container freezes rather than resolving empty.
+        cut = mock.Mock(stdout='[{"name": "//container.googleapis.com/projects/a/locations/l/clu', stderr="credential proxy output truncated at 8388608 bytes")
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=cut), mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
+        self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
         for stderr, want in (("PERMISSION_DENIED", rec.OUTCOME_DENIED),
                              ("Cloud Asset API has not been used in project 1 before or it is disabled", rec.OUTCOME_API_DISABLED),
                              ("connection reset", rec.OUTCOME_UNREACHABLE)):

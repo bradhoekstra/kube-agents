@@ -174,7 +174,7 @@ schedule and the operator deliberately holds no GCP credential.
 gcloud asset search-all-resources \
   --scope=folders/123456789012 \
   --asset-types=container.googleapis.com/Cluster \
-  --format='value(name,location)'
+  --format='json(name,location)'
 ```
 
 One call returns every cluster under the container, including in projects created since the last

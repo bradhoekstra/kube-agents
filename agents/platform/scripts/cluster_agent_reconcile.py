@@ -95,6 +95,11 @@ RESOLVER_EXPLICIT = "explicit"
 RESOLVER_ASSET_INVENTORY = "asset-inventory"
 CONTAINER_KINDS = ("folders", "organizations")
 ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
+# The two fields the resolver reads, projected so a container of thousands of clusters
+# stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
+ASSET_SEARCH_FORMAT = "json(name,location)"
+# The credential proxy's stderr note when it cut a stream at its output cap.
+_PROXY_TRUNCATED_MARKER = "truncated"
 # Regional clusters render as .../locations/<L>/clusters/<C>, zonal ones as
 # .../zones/<Z>/clusters/<C>; a parser written to one shape drops the other (design §4).
 _ASSET_NAME = re.compile(r"^//container\.googleapis\.com/projects/(?P<project>[^/]+)/(?:locations|zones)/(?P<location>[^/]+)/clusters/(?P<cluster>[^/]+)$")
@@ -234,13 +239,13 @@ def _search_containers(containers: list[str], deadline: float) -> dict[str, tupl
     return results
 
 
-def _list_projects(projects: list[str], first: str | None, deadline: float | None = None) -> dict[str, tuple[list | None, str]]:
+def _list_projects(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]]:
     """List every project, `first` alone and then the rest concurrently, within one budget.
 
-    The management project goes first and on its own (the caller passes it alone, at
-    the start of the budget): its listing decides `create_pass_ran`, and when it reaches
-    the sandbox its ssh opens the multiplexed connection the pools then share. The rest
-    run LIST_WORKERS at a time. Every
+    The caller lists the management project first and on its own, at the start of the
+    budget: its listing decides `create_pass_ran`, and when it reaches the sandbox its ssh
+    opens the multiplexed connection the pools then share. The rest run LIST_WORKERS at
+    a time. Every
     worker's own gcloud timeout is cut to the budget left when it starts, so no
     worker outlives the deadline by more than LIST_GRACE_SECONDS: the interpreter
     joins the pool's threads at exit, and a worker still blocked on gcloud would
@@ -248,13 +253,8 @@ def _list_projects(projects: list[str], first: str | None, deadline: float | Non
     at the deadline reads `unreachable` (no CREATE, scope prune off), and the run
     goes on to write its snapshot.
     """
-    if deadline is None:
-        deadline = time.monotonic() + LIST_BUDGET_SECONDS
     listings: dict[str, tuple[list | None, str]] = {}
     rest = list(projects)
-    if first in rest:
-        rest.remove(first)
-        listings[first] = _list_project(first)
     if not rest:
         return listings
 
@@ -426,10 +426,16 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
     forward under that outcome by the caller, and the scope prune stays off for the run.
     """
     cmd = ["gcloud", "asset", "search-all-resources", f"--scope={container}",
-           f"--asset-types={ASSET_TYPE_CLUSTER}", "--format=json"]
+           f"--asset-types={ASSET_TYPE_CLUSTER}", f"--format={ASSET_SEARCH_FORMAT}"]
     try:
         result = sandbox_exec.run(cmd, check=True, timeout=timeout)
-        assets = json.loads(result.stdout or "[]")
+        try:
+            assets = json.loads(result.stdout or "[]")
+        except ValueError as e:
+            if _PROXY_TRUNCATED_MARKER in (result.stderr or ""):
+                raise ValueError("the credential proxy cut the search output at its cap; the container "
+                                 "holds more clusters than one search can return through it") from e
+            raise
         if not isinstance(assets, list):
             raise ValueError("asset search did not return a list")
     except subprocess.CalledProcessError as e:
@@ -845,7 +851,7 @@ def reconcile(dry_run: bool = False) -> dict:
     listing_deadline = time.monotonic() + LIST_BUDGET_SECONDS
     listings: dict[str, tuple[list | None, str]] = {}
     if management:
-        listings.update(_list_projects([management], management, listing_deadline))
+        listings[management] = _list_project(management)
     searches = _search_containers(_container_ids(scope), listing_deadline)
     entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous)
     report["containers"] = [dict(c) for c in containers]
@@ -869,7 +875,7 @@ def reconcile(dry_run: bool = False) -> dict:
     #     gate on existed solely to recognise the cluster being skipped.
     cluster_counts: dict[str, int | None] = {}
     to_list = [e["id"] for e in entries if e["outcome"] is None and e["id"] not in listings]
-    listings.update(_list_projects(to_list, None, listing_deadline))
+    listings.update(_list_projects(to_list, listing_deadline))
     for entry in entries:
         # A container member: Asset Inventory named its clusters already.
         if "clusters" in entry and entry["id"] not in listings:
@@ -894,6 +900,14 @@ def reconcile(dry_run: bool = False) -> dict:
         # prevent. Explicit projects listing on their own do not count.
         if project == management:
             report["create_pass_ran"] = True
+        # A container member arrives from the asset index without any per-project
+        # permission check, so a project the account holds no GKE role in would otherwise
+        # be scaffolded (registered with Hermes, stamped, pushed to the sandbox) and fail
+        # only at get-credentials, every run. One describe before the first create in
+        # such a project answers the question cheaply; a 403 skips its creates for the
+        # run and reads the project `denied` (design §4).
+        member_only = not ({VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]))
+        probed = False
         for (proj, cluster, location) in sorted(listed):
             if (proj, cluster, location) in existing_keys:
                 continue
@@ -902,6 +916,13 @@ def reconcile(dry_run: bool = False) -> dict:
             if cluster in EXTRA_EXCLUDE:
                 log(f"{cluster} ({proj}/{location}) is skipped by RECONCILE_EXCLUDE, a bare name; "
                     "move it to spec.scope.exclude.clusters, the variable retires next release.")
+                continue
+            if member_only and not dry_run and not probed:
+                probed = True
+                _cluster_exists(proj, cluster, location)
+            if proj in _denied_this_run:
+                log(f"{cluster} ({proj}/{location}) has no profile and the project answered 403; "
+                    f"no CREATE under it this run ({OUTCOME_DENIED}).")
                 continue
             if dry_run:
                 log(f"{cluster} ({proj}/{location}) has no profile — WOULD create (dry-run).")
@@ -912,7 +933,10 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"created profile {name} for {cluster} ({proj}/{location}).")
                 report["created"].append(name)
             except (SystemExit, Exception) as e:  # noqa: BLE001 - one failure never aborts the sweep
-                if _classify_list_failure(str(e)) == OUTCOME_DENIED:
+                # create_profile's message is "ERROR: failed to fetch credentials for '<cluster>': <stderr>";
+                # classify the stderr half, not the cluster name.
+                stderr_part = re.sub(r"^ERROR: [^:]*credentials for '[^']*': ", "", str(e))
+                if _classify_list_failure(stderr_part) == OUTCOME_DENIED:
                     _denied_this_run.add(proj)
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
                 report["create_failed"].append(f"{cluster}/{location}")

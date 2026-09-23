@@ -246,26 +246,30 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     project's outcome, and that prompt already tells the worker what to do when the
     project cannot be listed.
     """
-    if not _scope_has_other_projects(data_dir):
-        return ""
-    unlisted = _unlisted_projects(data_dir)
-    if not unlisted:
-        return ""
     containers = _unresolved_containers(data_dir)
+    unlisted = _unlisted_projects(data_dir)
+    # A container the reconcile could not resolve is a gap on its own, even when it
+    # carried no project rows (a first run, or a container the snapshot never reached).
+    if not containers and not (unlisted and _scope_has_other_projects(data_dir)):
+        return ""
     container_note = ""
     if containers:
         container_note = (
             "The last reconcile could not resolve "
             + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in containers)
-            + ", so every project beneath is unlisted and the container is what to name. "
+            + ", so every project beneath it is unlisted and the container is what to name. "
         )
-    named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted[:SCOPE_GAP_NAMED_LIMIT])
-    rest = len(unlisted) - SCOPE_GAP_NAMED_LIMIT
-    if rest > 0:
-        named += f", and {rest} more (the full list is in `fleet_scope.json`)"
+    if unlisted:
+        named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted[:SCOPE_GAP_NAMED_LIMIT])
+        rest = len(unlisted) - SCOPE_GAP_NAMED_LIMIT
+        if rest > 0:
+            named += f", and {rest} more (the full list is in `fleet_scope.json`)"
+        project_note = f"The last reconcile did not list these projects: {named}. "
+    else:
+        project_note = "Every project it did resolve was listed. "
     return (
         "**Some projects in scope have no Cluster Agents for a reason the roster cannot show.** "
-        f"{container_note}The last reconcile did not list these projects: {named}. The roster holds only the "
+        f"{container_note}{project_note}The roster holds only the "
         "clusters of theirs that already had a profile, and you cannot list them yourself. A "
         "project marked `over-cap` is reachable but past the reconcile's listing cap, and the "
         "others the last run could not list. Name each one at the top of the report as not fully "
