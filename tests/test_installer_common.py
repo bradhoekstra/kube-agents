@@ -118,6 +118,7 @@ class InstallerCommonTest(unittest.TestCase):
         kms_versions="",
         sa_describe_stub="exit 1",
         gcloud_stderr=None,
+        helm_script=None,
     ):
         """Source installer_common.sh with print stubs and run `script`.
 
@@ -159,6 +160,12 @@ class InstallerCommonTest(unittest.TestCase):
             kubectl = bin_dir / "kubectl"
             kubectl.write_text(kubectl_script or "#!/usr/bin/env bash\nexit 1\n")
             kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            # Hermetic helm too: the scope guard asks the release what the
+            # chart last rendered, and a developer's real release must never
+            # answer a unit test. Absent by default (exit 1 = no release).
+            helm = bin_dir / "helm"
+            helm.write_text(helm_script or "#!/usr/bin/env bash\nexit 1\n")
+            helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
             full_env = get_isolated_test_env(
                 overrides={
                     "PROJECT_ID": "test-project",
@@ -852,9 +859,74 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('SCOPE_PROJECTS="p2 p3"', proc.stdout)
             self.assertFalse(dest.exists())
 
+    def _release_values_helm(self, scope):
+        # `helm get values` answering with what the chart last rendered.
+        values = {"platformAgent": {"scope": scope}} if scope is not None else {}
+        return (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            f"  *\"get values kube-agents\"*) cat <<'JSON'\n{json.dumps(values)}\nJSON\nexit 0 ;;\n"
+            "esac\n"
+            "exit 1\n"
+        )
+
+    _RENDERED_SCOPE = {"projects": ["p2", "p3"], "exclude": {"projects": ["*-sandbox"],
+                       "clusters": [{"projectId": "p2", "location": "us-central1", "clusterName": "scratch"}]}}
+
+    def test_an_installer_rendered_scope_shrinks_through_the_keys(self):
+        # The documented lifecycle: remove p3 from SCOPE_PROJECTS, run
+        # upgrade.sh. The release recorded the same scope the CR carries, so
+        # the CR is chart-owned and the run proceeds with projects = ["p2"].
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                     "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                helm_script=self._release_values_helm(self._RENDERED_SCOPE),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('  projects = ["p2"]', dest.read_text())
+
+    def test_an_installer_rendered_scope_can_be_emptied_through_the_keys(self):
+        # Every key removed from install.env on a chart-owned scope: the
+        # empty block is the declaration, not a hand edit being overwritten.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                helm_script=self._release_values_helm(self._RENDERED_SCOPE),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("  projects = []", dest.read_text())
+
+    def test_a_hand_edit_after_the_chart_rendered_is_still_caught(self):
+        # The release recorded [p2]; someone then added p3 on the CR by hand
+        # and install.env still says p2. The CR differs from the record, so
+        # the comparison against the keys runs and p3 is the missing entry.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "p2", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                     "SCOPE_EXCLUDE_CLUSTERS": "p2/us-central1/scratch"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["p2", "p3"]),
+                helm_script=self._release_values_helm({"projects": ["p2"], "exclude": self._RENDERED_SCOPE["exclude"]}),
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("# SCOPE_PROJECTS lacks p3", proc.stdout)
+            self.assertFalse(dest.exists())
+
     def test_tfvars_refuse_when_one_live_project_is_missing_from_the_key(self):
-        # SCOPE_PROJECTS carries p2 but the CR also names p3: p3 would retire.
-        # The printed line is the union, ready to paste.
+        # No release record (a pre-key install whose scope was set by hand):
+        # SCOPE_PROJECTS carries p2 but the CR also names p3, so p3 would
+        # retire. The printed line is the union, ready to paste.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(

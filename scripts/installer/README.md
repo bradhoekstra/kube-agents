@@ -230,13 +230,16 @@ and the chart renders the CR. The block is always written, empty lists included,
 `install.env` that never set these keys declares the management project alone, and one
 that drops a project makes the next `upgrade.sh` revoke its grants and retire its
 profiles. A triple that is not three non-empty parts, or an exclude entry outside the character class
-the CRD accepts for a project ID or glob, fails the generator before any file is written. An install whose `PlatformAgent` carries a `spec.scope` entry these keys do not, set by hand
-before the keys existed, is refused too, with the three lines that carry the whole live declaration
+the CRD accepts for a project ID or glob, fails the generator before any file is written. An install whose `PlatformAgent` carries a `spec.scope` set by hand, before the keys existed, that
+these keys do not carry is refused too, with the three lines that carry the whole live declaration
 printed, because the apply would rewrite the CR from the keys and retire the profiles of every project
-it drops; the check reads the CR through the install's own kubeconfig context by name and says so when
-it cannot, and `upgrade.sh` passes the keys on every Helm retag so the `harness` and `operator` modes
-carry the scope too; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop
-those projects on purpose, and `uninstall.sh` sets it because a destroy keeps nothing either way. `install.sh` takes the same three as `--scope-projects`,
+it drops. Hand-set means different from what the chart last rendered, which the Helm release's
+recorded values say; a scope the installer rendered is chart-owned and the keys change it freely,
+so removing a project from `SCOPE_PROJECTS` and running `upgrade.sh` is never refused. The check
+reads the CR and the release through the install's own kubeconfig context by name and says so when it
+cannot, and `upgrade.sh` passes the keys on every Helm retag so the `harness` and `operator` modes
+carry the scope too; `SCOPE_GUARD_ENABLED=false` for one run is the way to drop a
+hand-set scope on purpose, and `uninstall.sh` sets it because a destroy keeps nothing either way. `install.sh` takes the same three as `--scope-projects`,
 `--scope-exclude-projects` and `--scope-exclude-clusters`; the interview never asks for them and
 the Day-2 menu does not edit them, so change them in the file and run `upgrade.sh`.
 

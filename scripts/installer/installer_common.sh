@@ -1505,20 +1505,29 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 '
 }
 
-# Refuses to regenerate over a PlatformAgent whose spec.scope declares
-# something the SCOPE_* keys do not carry. Before install.env carried the
-# keys, editing the CR was the documented way to set the field; the chart now
-# renders the block from those keys on every apply, empty lists included, and
-# the reconcile reads a project missing from `projects` as the declaration
-# that drops it, so the apply would retire every Cluster Agent profile the
-# hand-set scope produced. Each live entry has to be in its key: a partial
-# install.env (an exclude recorded, the projects not) is refused too, with the
-# three lines that carry the whole live declaration printed. Reads the CR
-# through the install's own kubeconfig context by name, not the current
-# context, and says so when it cannot read it, since a silent skip here is a
-# silent deletion later. SCOPE_GUARD_ENABLED=false turns it off: uninstall.sh
-# sets it, since a destroy keeps nothing either way, and an operator who means
-# to drop the projects sets it for one run.
+# Refuses to regenerate over a PlatformAgent whose spec.scope was set by hand
+# and declares something the SCOPE_* keys do not carry. Before install.env
+# carried the keys, editing the CR was the documented way to set the field;
+# the chart now renders the block from those keys on every apply, empty lists
+# included, and the reconcile reads a project missing from `projects` as the
+# declaration that drops it, so an apply over such a CR would retire every
+# Cluster Agent profile the hand-set scope produced.
+#
+# "Set by hand" is decided against the Helm release, not against the keys: a
+# scope the chart itself rendered on the last apply is recorded in the
+# release's values (`helm get values`), so a live scope equal to that record
+# is chart-owned, and editing the keys is the ordinary way to change it --
+# removing a project retires its profiles on purpose, and that run must not be
+# refused. A live scope that differs from the record (or a release that
+# recorded no scope at all) is a hand edit, and then every live entry has to
+# be in its key; a partial install.env is refused with the three lines that
+# carry the whole live declaration printed.
+#
+# Reads the CR and the release through the install's own kubeconfig context
+# by name, not the current context, and says so when it cannot read the CR,
+# since a silent skip here is a silent deletion later. SCOPE_GUARD_ENABLED=false
+# turns it off: uninstall.sh sets it, since a destroy keeps nothing either
+# way, and an operator who means to drop a hand-set scope sets it for one run.
 guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local context
@@ -1528,25 +1537,39 @@ guard_hand_declared_scope() {
     print_warning "Could not read the PlatformAgent in '${ns}' through kubectl context '${context}', so the hand-declared-scope check did not run. If that CR carries a spec.scope that install.env's SCOPE_* keys do not, this apply replaces it and retires those projects' Cluster Agent profiles."
     return 0
   fi
+  # The release's recorded values, or `{}` when there is no release or helm
+  # cannot read it: then nothing is known to be chart-owned.
+  local release_json
+  release_json="$(helm --kube-context "$context" get values "$KUBE_AGENTS_HELM_RELEASE" -n "$ns" -o json 2>/dev/null || true)"
+  [ -n "$release_json" ] || release_json="{}"
   local missing
-  missing="$(printf '%s' "$cr_json" | SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
+  missing="$(printf '%s\n---\n%s' "$cr_json" "$release_json" | SCOPE_PROJECTS="${SCOPE_PROJECTS:-}" SCOPE_EXCLUDE_PROJECTS="${SCOPE_EXCLUDE_PROJECTS:-}" \
     SCOPE_EXCLUDE_CLUSTERS="${SCOPE_EXCLUDE_CLUSTERS:-}" SCOPE_SEP="$SCOPE_CLUSTER_TRIPLE_SEPARATOR" python3 -c '
 import json, os, re, sys
 split = lambda key: [item for item in re.split(r"[ ,\t\n]+", os.environ.get(key, "")) if item]
 sep = os.environ["SCOPE_SEP"]
-try:
-    items = json.load(sys.stdin).get("items", [])
-except Exception:
-    sys.exit(0)
-for item in items:
-    scope = (item.get("spec") or {}).get("scope") or {}
+
+def shape(scope):
+    scope = scope or {}
     exclude = scope.get("exclude") or {}
-    live = {
+    return {
         "SCOPE_PROJECTS": scope.get("projects") or [],
         "SCOPE_EXCLUDE_PROJECTS": exclude.get("projects") or [],
         "SCOPE_EXCLUDE_CLUSTERS": [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", "")))
                                    for c in exclude.get("clusters") or []],
     }
+
+cr_text, _, release_text = sys.stdin.read().partition("\n---\n")
+try:
+    items = json.loads(cr_text).get("items", [])
+    release = json.loads(release_text or "{}") or {}
+except Exception:
+    sys.exit(0)
+recorded = shape(((release.get("platformAgent") or {}).get("scope")))
+for item in items:
+    live = shape((item.get("spec") or {}).get("scope"))
+    if all(sorted(live[key]) == sorted(recorded[key]) for key in live):
+        continue  # what the chart last rendered: chart-owned, the keys decide
     missing = {key: [v for v in values if v not in split(key)] for key, values in live.items()}
     if not any(missing.values()):
         continue
@@ -1557,10 +1580,10 @@ for item in items:
     break
 ' 2>/dev/null || true)"
   [ -n "$missing" ] || return 0
-  print_error "The PlatformAgent in '${ns}' declares a spec.scope that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys and retire the Cluster Agent profiles of every project it drops."
+  print_error "The PlatformAgent in '${ns}' carries a spec.scope that was not rendered by the chart (it differs from the Helm release's recorded values) and that install.env's SCOPE_* keys do not carry. Applying would rewrite the CR from the keys: a project it drops has its Cluster Agent profiles retired, an exclusion it drops brings those clusters into scope."
   print_info "The chart owns the field from now on. Record the live declaration in install.env and re-run:"
   printf '%s\n' "$missing"
-  print_info "To drop those projects on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
+  print_info "To drop those entries on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
   return 1
 }
 
