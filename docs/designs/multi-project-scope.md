@@ -154,7 +154,7 @@ Rules:
 - **Two caps of 100, enforced in different places.** Each declared list (`projects`, `folders`,
   `organizations`, both `exclude` lists, and the phase 3 selectors when they land) carries
   `MaxItems=100` on the CRD, the ceiling `scopedServiceAccounts` already has, so an oversized
-  declaration is refused at admission. The reconcile lists at most 100 projects of the resolved set, the management project included, because one folder can resolve to any number. The number is the pool's ceiling and not a measurement of the reconcile, and the estate that asked for this design is already above it: #1354 describes about 200 projects with one cluster each. That estate runs as two installs with disjoint scopes until the two ceilings lift together (§11); lifting the listing cap alone would discover clusters the pool cannot credential. The set is
+  declaration is refused at admission. The reconcile lists at most `spec.scope.maxProjects` projects of the resolved set, the management project included, because one folder can resolve to any number; the cap is a declared value with 100 as its default, and the listing budget (§4) scales with it rather than staying fixed. The default sits below the estate that asked for this design, about 200 projects with one cluster each (#1354), and that install declares a higher cap rather than splitting in two; what bounds an install above the default is the pod, not the reconcile (§11). The set is
   filled in a fixed order so the cap binds the same way on every run: the management project, then
   explicit projects sorted by ID, then the phase 3 selectors' projects sorted by ID, then
   containers sorted by ID; a container that does not fit is skipped and the next one is still tried,
@@ -162,8 +162,7 @@ Rules:
   `over-cap` as its project outcome (§4: profiles kept, CREATE skipped); a container whose members would cross the cap reads `over-cap` as its container outcome: its members are carried forward reading `over-cap` and get no CREATE, as under §4's freeze, but because the lookup itself succeeded and the run
   holds the full member list, `over-cap` does not hold back §7's prune the way a failed lookup
   does. Nothing is truncated silently and the snapshot
-  stays deterministic. Decided 2026-09-21; the number is revisited once phase 2 has run against a
-  real folder (§11).
+  stays deterministic. Decided 2026-09-21 as two fixed caps of 100; the resolved-set cap became a declared value on 2026-09-23, when the estate on #1354 turned out to be twice the fixed number.
 - **`exclude.clusters` names one cluster, not one name.** Entries are the triple of `projectId`,
   `location`, and `clusterName` that `scopedServiceAccounts` already uses, because cluster names
   are unique only within a project and location; `prod` and `cluster-1` recur across a folder, and
@@ -420,6 +419,8 @@ Prerequisites the design has to state and the installer has to preflight:
 Uninstall revokes what install granted: `terraform destroy` removes the bindings because Terraform
 owns them, which is the property #588 lost when its revocation lived in a bash function.
 
+**The scoped service account pool moves to per-project accounts.** Decided 2026-09-23. The pool is keyed on the cluster today (`scoped_pool.tf`, one account per `{project_id, location, cluster_name}` row, hand-listed in `spec.security.scopedServiceAccounts` under a cap of 100), and the broker refuses a request for a cluster with no member rather than widening. At one cluster per project that cap is the ceiling on the fleet, and a hand-maintained list of 200 rows duplicates what resolution already found. The pool therefore becomes one account per project in the resolved set: Terraform derives the members from the same `scope` input that binds `scope_roles`, without reading the runtime snapshot, so an explicit project or a folder member gets its account when it gets its grant; the broker's mapping key becomes the project and its refusal rule is unchanged, a request for a cluster in a project with no account is refused, not served on the ambient credential. The blast radius of a compromised sandbox becomes the project rather than the cluster: two clusters in one project share an account. The design accepts that because the project is the IAM unit the declaration is written in and the unit the customer's estate is cut in, and because per-cluster accounts cannot be derived from a folder at all. The move is a follow-up to phase 2, before `organizations` is offered in a release (§9).
+
 ## 7. The onboarding lifecycle
 
 **Adding a project.** Under a declared folder or organisation: nothing to do; it is discovered at
@@ -514,8 +515,8 @@ lets the agent, not only the reconcile job, read the metadata of every resource 
 container's asset index, since the allowlist matches the verb and not its arguments. Both are
 reads, and both are wider than today. That is the argument for landing the scoped service
 account pool's authority (`scoped_pool.tf`, currently granting nothing) before offering
-`organizations` in a release: a per-cluster credential bounds what a compromised sandbox reads to
-one cluster regardless of how wide discovery is. Until then the design recommends `projects` and
+`organizations` in a release: a per-project credential (§6) bounds what a compromised sandbox reads to
+one project regardless of how wide discovery is. Until then the design recommends `projects` and
 `folders` for a fleet an operator would be comfortable reading with one account, and documents
 `organizations` as available but wide.
 
@@ -565,7 +566,11 @@ into a second project the tester controls.
    container outcomes, the freeze rule and `over-cap` as a container outcome (§3); folder- and
    organisation-level bindings of `scope_roles` plus `roles/cloudasset.viewer`; the installer
    preflight for container IAM permissions and for the Asset API under organisation policy (§6);
-   `via` and `containers` in the snapshot.
+   `via` and `containers` in the snapshot. A follow-up to phase 2 makes the resolved-set cap a
+   declared value (`spec.scope.maxProjects`, default 100) with the listing budget scaled to it, and
+   runs PRUNE's per-profile `describe` under the same bounded parallel map as the listing, because
+   at 200 clusters a sequential walk is minutes of every hourly tick; a second follow-up moves the
+   pool to per-project accounts (§6).
 3. **Shared VPC and Metrics Scope selectors.** `sharedVpcHosts` from the Compute API and
    `metricsScopes` from the Monitoring API (§3), each resolving to explicit projects with a
    per-project binding, since nothing is inherited through them. Terraform resolves the project
@@ -587,18 +592,14 @@ into a second project the tester controls.
 
 - **Snapshot in `.status`?** §5 keeps the resolved membership on the PVC because the pod has no
   channel to the operator. If one arrives for another reason, the snapshot should ride it.
-- **Cardinality at organisation scale.** One Platform Agent for an organisation of hundreds of
-  projects means one chat front door, one reconcile job, and one hourly sweep for all of them. The
-  reconcile's per-profile `describe` in PRUNE is already O(clusters); at what fleet size does an
-  install want two Platform Agents with disjoint scopes, and does anything need to prevent overlap?
-- **The number in the cap.** §3 fixes the mechanism, two caps of 100, and records that the
-  estate behind #1354 (about 200 projects, one cluster each) is above it and splits into two
-  installs. Whether the listing cap and the `scopedServiceAccounts` ceiling become one declared
-  value with 100 as its default is open; they move together, and neither moves in this design.
-- **Deriving `scopedServiceAccounts` from scope.** Once the pool grants authority, hand-listing
-  every cluster in `spec.security.scopedServiceAccounts` duplicates what resolution already found.
-  Terraform cannot read the snapshot, so either the pool moves to per-project accounts or the
-  snapshot becomes a Terraform input through a data source; neither is settled.
+- **Cardinality at organisation scale.** One Platform Agent for hundreds of projects means one chat
+  front door, one reconcile job, and one hourly sweep for all of them. The cap question is settled
+  (§3: a declared value, default 100) and the pool no longer counts clusters (§6), so what bounds an
+  install above the default is the pod: 200 cluster profiles means 200 sweeps per hourly tick and a
+  200-profile PRUNE walk, and no install has run at that size. #1913 measures it with synthetic
+  profiles before a real fleet; until it does, the design states the mechanism and not the number a
+  pod can carry, nor the size at which an install wants two Platform Agents with disjoint scopes.
+
 - **`mcp.toolUser` across projects.** If the GKE MCP server checks `roles/mcp.toolUser` in the
   project a call targets rather than in the caller's project, MCP-backed reads of a scoped project
   fail while `gcloud` reads succeed, and the role has to join `scope_roles`. One call against a
