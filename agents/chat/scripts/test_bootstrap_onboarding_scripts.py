@@ -624,6 +624,14 @@ class ScopeGapParagraphTest(unittest.TestCase):
         self.assertIn(f"and {25 - bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT} more", paragraph)
         self.assertLess(len(paragraph), 2500)
 
+    def test_a_declared_container_makes_the_prompt_multi_project_even_with_one_row(self):
+        snap = '{"projects": [{"id": "mgmt", "outcome": "ok"}], "containers": [{"id": "folders/9", "outcome": "unreachable", "projects": 0}]}'
+        data_dir = self._with_snapshot(snap)
+        with mock.patch.object(bootstrap_scan_gate, "_data_dir", return_value=data_dir):
+            body = bootstrap_scan_gate._task_body()
+        self.assertIn("Audit every cluster the projects in scope have", body)
+        self.assertIn("could not resolve `folders/9`", body)
+
     def test_an_unresolved_container_with_no_members_is_still_named(self):
         # First run under a declaration whose folder could not be resolved: no member rows,
         # but a whole folder is missing from the roster and the sweep must hear it.

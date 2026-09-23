@@ -436,8 +436,7 @@ read. The
 agent's service account carries `roles/container.viewer`, which "lets an identity read Kubernetes
 objects in every cluster in the project" (`kube-agents-iam/main.tf:30-31`); bound on a folder it
 reads every cluster in every project beneath, and the `asset search-all-resources` allowlist entry
-lets the agent, not only the reconcile job, read the metadata of every resource type in the
-container's asset index, since the allowlist matches the verb and not its arguments. Both are
+lets the agent, not only the reconcile job, search the container's asset index for GKE clusters, since the allowlist admits the verb for that one asset type and any declared scope. Both are
 reads, and both are wider than today. That is the argument for landing the scoped service
 account pool's authority (`scoped_pool.tf`, currently granting nothing) before offering
 `organizations` in a release: a per-cluster credential bounds what a compromised sandbox reads to

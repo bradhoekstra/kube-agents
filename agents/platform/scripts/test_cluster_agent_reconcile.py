@@ -697,10 +697,11 @@ class ScopeTest(HomesMixin):
         if scope is None:
             return
         path = Path(self._tmp.name) / "scope.json"
-        # The operator writes `present` on every render; a test that passes a dict without
-        # it is declaring a block, as the operator would for a CR that carries one.
-        if isinstance(scope, dict) and rec.SCOPE_PRESENT_KEY not in scope:
-            scope = {rec.SCOPE_PRESENT_KEY: True, **scope}
+        # The operator writes `present`, `folders` and `organizations` on every render; a test
+        # that passes a dict without them is declaring a block the way the operator would for
+        # a CR that carries one. A test modelling an older render writes the file itself.
+        if isinstance(scope, dict):
+            scope = {rec.SCOPE_PRESENT_KEY: True, "folders": [], "organizations": [], **scope}
         path.write_text(json.dumps(scope), encoding="utf-8")
         os.environ[rec.SCOPE_FILE_ENV] = str(path)
 
@@ -1215,9 +1216,10 @@ class ScopeTest(HomesMixin):
         # The members the run resolved are carried reading over-cap, with no CREATE.
         self.assertEqual({rows[p]["outcome"] for p in big}, {rec.OUTCOME_OVER_CAP})
         self.assertEqual(rows["proj-000"]["via"], [self.FOLDER])
-        # over-cap is a decided outcome: the dropped explicit project and the project that
-        # left the folder both start retiring.
-        self.assertEqual(report["retiring"], ["p2", "team-a"])
+        # over-cap is a decided outcome: the dropped explicit project starts retiring; team-a, a
+        # member the index no longer places under the still-declared folder, is kept instead.
+        self.assertEqual(report["retiring"], ["p2"])
+        self.assertEqual(rows["team-a"]["state"], rec.STATE_IN_SCOPE)
 
     def test_a_project_that_moved_into_an_over_cap_folder_is_kept_not_retired(self):
         # x was reached through F1; it moves to F2, whose membership crosses the cap. The run
@@ -1369,16 +1371,49 @@ class ScopeTest(HomesMixin):
         self.assertTrue(report["create_pass_ran"])
         self.assertEqual(self._snapshot()["containers"][0]["outcome"], rec.OUTCOME_UNREACHABLE)
 
-    def test_a_project_that_left_the_folder_retires_over_two_clean_runs(self):
+    def test_a_member_the_index_no_longer_places_under_its_folder_is_kept_until_the_declaration_speaks(self):
+        # The asset index lags a move by minutes to hours; the declaration did not change, so the
+        # member is kept and listed, run after run, and returns to scope when the index does.
+        prev = [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE}]
+        self._write_previous(prev)
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        for _ in range(3):
+            report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                           searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+            self.assertEqual((deleted, report["retiring"], report["unmanaged"]), ([], [], ["cluster-a"]))
+            rows = {p["id"]: p for p in self._snapshot()["projects"]}
+            self.assertEqual((rows["team-a"]["state"], rows["team-a"]["via"]), (rec.STATE_IN_SCOPE, [self.FOLDER]))
+            self.assertIn("asset index", self._snapshot()["unmanaged"][0]["reason"])
+        # The index places it again: back in scope, nothing lost.
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["unmanaged"], report["kept"]), ([], [], ["cluster-a"]))
+        # The declaration speaks, two ways: the folder leaves the CR, or a glob names the project.
+        for scope in ({"projects": []}, {"folders": ["123456789012"], "exclude": {"projects": ["team-*"]}}):
+            self._write_previous(prev)
+            report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                           searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+            self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]), scope)
+            report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                           searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+            self.assertEqual(deleted, ["cluster-a"], scope)
+
+    def test_a_render_that_predates_containers_keeps_their_members(self):
+        # Rollback to the previous release: its render has present and projects but no folders
+        # or organizations key, and the CRD pruned the lists from the stored CR. It declares
+        # nothing about containers, so a member reached through one is kept, not retired.
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE}])
         ids = {"cluster-a": _identity("team-a", "prod")}
-        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
-                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
-        self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
-        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
-                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
-        self.assertEqual(deleted, ["cluster-a"])
+        old_render = {rec.SCOPE_PRESENT_KEY: True, "projects": [], "exclude": {"projects": [], "clusters": []}}
+        path = Path(self._tmp.name) / "scope.json"
+        path.write_text(json.dumps(old_render), encoding="utf-8")
+        os.environ[rec.SCOPE_FILE_ENV] = str(path)
+        for _ in range(2):
+            report, _, deleted = self._run(None, {self.MGMT: []}, profiles=["cluster-a"], identities=ids)
+            self.assertEqual((deleted, report["retiring"], report["unmanaged"]), ([], [], ["cluster-a"]))
+            self.assertIn("does not know", self._snapshot()["unmanaged"][0]["reason"])
 
     def test_a_member_whose_describe_answers_403_reads_denied(self):
         members = {"team-a": [("team-a", "prod", "us-central1")]}

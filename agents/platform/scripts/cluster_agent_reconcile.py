@@ -215,68 +215,50 @@ def _classify_list_failure(stderr: str) -> str:
     return OUTCOME_UNREACHABLE
 
 
-def _search_containers(containers: list[str], deadline: float) -> dict[str, tuple[dict | None, str]]:
-    """Resolve every container concurrently within the run's listing budget.
+def _bounded_map(lookup, keys: list[str], deadline: float, what: str) -> dict:
+    """Run `lookup(key, timeout=...)` for every key, LIST_WORKERS at a time, within the deadline.
 
-    A search still pending at the deadline reads `unreachable`, which freezes the
-    container (design §4); the worker's own timeout is cut to the budget left so no
-    thread outlives the run.
+    Each worker's own timeout is cut to the budget left when it starts, so no thread
+    outlives the run by more than LIST_GRACE_SECONDS: the interpreter joins the pool's
+    threads at exit, and a worker still blocked on gcloud would hold the exit code past
+    the bootstrap gate's ceiling. A lookup still pending at the deadline reads
+    `(None, unreachable)`: no CREATE under it, scope prune off, the run goes on to write
+    its snapshot.
     """
-    if not containers:
+    if not keys:
         return {}
 
-    def within_budget(container: str) -> tuple[dict | None, str]:
-        return _search_container(container, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
+    def within_budget(key: str):
+        return lookup(key, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
 
-    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(containers)))
-    futures = {container: pool.submit(within_budget, container) for container in containers}
+    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(keys)))
+    futures = {key: pool.submit(within_budget, key) for key in keys}
     done, _ = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
-    results: dict[str, tuple[dict | None, str]] = {}
-    for container, future in futures.items():
+    results: dict = {}
+    for key, future in futures.items():
         if future in done:
-            results[container] = future.result()
+            results[key] = future.result()
         else:
-            log(f"resolving {container} did not finish within the run's {LIST_BUDGET_SECONDS}s listing "
-                f"budget ({OUTCOME_UNREACHABLE}; its previous members are carried forward).")
-            results[container] = (None, OUTCOME_UNREACHABLE)
+            log(f"{what} {key} did not finish within the run's {LIST_BUDGET_SECONDS}s listing budget "
+                f"({OUTCOME_UNREACHABLE}; skipping create for it this run).")
+            results[key] = (None, OUTCOME_UNREACHABLE)
     pool.shutdown(wait=False, cancel_futures=True)
     return results
 
 
+def _search_containers(containers: list[str], deadline: float) -> dict[str, tuple[dict | None, str]]:
+    """Resolve every container within the run's listing budget; a pending one freezes (design §4)."""
+    return _bounded_map(_search_container, containers, deadline, "resolving")
+
+
 def _list_projects(projects: list[str], deadline: float) -> dict[str, tuple[list | None, str]]:
-    """List every project, `first` alone and then the rest concurrently, within one budget.
+    """List every explicit project within the run's listing budget, LIST_WORKERS at a time.
 
     The caller lists the management project first and on its own, at the start of the
-    budget, before calling this for the explicit projects: its listing decides
-    `create_pass_ran`, and when it reaches the sandbox its ssh opens the multiplexed
-    connection the pools then share. Here the projects run LIST_WORKERS at a time. Every
-    worker's own gcloud timeout is cut to the budget left when it starts, so no
-    worker outlives the deadline by more than LIST_GRACE_SECONDS: the interpreter
-    joins the pool's threads at exit, and a worker still blocked on gcloud would
-    hold the exit code past the bootstrap gate's ceiling. A listing still pending
-    at the deadline reads `unreachable` (no CREATE, scope prune off), and the run
-    goes on to write its snapshot.
+    budget, before calling this: its listing decides `create_pass_ran`, and when it
+    reaches the sandbox its ssh opens the multiplexed connection the pool then shares.
     """
-    listings: dict[str, tuple[list | None, str]] = {}
-    rest = list(projects)
-    if not rest:
-        return listings
-
-    def within_budget(project: str) -> tuple[list | None, str]:
-        return _list_project(project, timeout=max(1.0, min(LIST_TIMEOUT_SECONDS, deadline - time.monotonic())))
-
-    pool = ThreadPoolExecutor(max_workers=min(LIST_WORKERS, len(rest)))
-    futures = {project: pool.submit(within_budget, project) for project in rest}
-    done, pending = wait(futures.values(), timeout=max(0.0, deadline + LIST_GRACE_SECONDS - time.monotonic()))
-    for project, future in futures.items():
-        if future in done:
-            listings[project] = future.result()
-        else:
-            log(f"listing clusters in {project} did not finish within the run's {LIST_BUDGET_SECONDS}s "
-                "listing budget (unreachable; skipping create for it this run).")
-            listings[project] = (None, OUTCOME_UNREACHABLE)
-    pool.shutdown(wait=False, cancel_futures=True)
-    return listings
+    return _bounded_map(_list_project, projects, deadline, "listing clusters in")
 
 
 def _list_project(project: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[list | None, str]:
@@ -321,8 +303,8 @@ def _empty_scope() -> dict:
     return {"projects": [], "folders": [], "organizations": [], "exclude": {"projects": [], "clusters": []}}
 
 
-def _load_scope() -> tuple[dict, bool, bool]:
-    """The declaration the operator rendered: (scope, readable, present).
+def _load_scope() -> tuple[dict, bool, bool, bool]:
+    """The declaration the operator rendered: (scope, readable, present, containers_known).
 
     The operator renders the file on every install, so a missing, empty,
     unparseable or non-object file means the render did not reach this pod (a
@@ -335,14 +317,17 @@ def _load_scope() -> tuple[dict, bool, bool]:
     dropping a project, through a write that passed an older operator's webhook;
     the operator who wants the projects gone empties `projects` and keeps the
     block. In both cases the caller creates for the management project alone,
-    under the last declaration's exclusions.
+    under the last declaration's exclusions. `containers_known` says whether the
+    render carries the `folders` and `organizations` keys at all: a render from an
+    operator that predates them (a rollback) declares nothing about containers, so a
+    project reached through one is carried, not retired.
     """
     path = os.environ.get(SCOPE_FILE_ENV)
     if not path:
         # An agent image ahead of its operator: no variable, no render. CREATE under the last
         # declaration's exclusions, and no scope prune, because nothing declared anything.
         log(f"{SCOPE_FILE_ENV} is not set; using the management project alone and skipping the scope prune.")
-        return _empty_scope(), False, False
+        return _empty_scope(), False, False, False
     try:
         raw = Path(path).read_text(encoding="utf-8").strip()
         if not raw:
@@ -353,11 +338,12 @@ def _load_scope() -> tuple[dict, bool, bool]:
     except Exception as e:  # noqa: BLE001 - unreadable declaration: fall back, loudly, and prune nothing by scope
         log(f"could not read the scope declaration at {path} ({e}); using the management project "
             "alone and skipping the scope prune this run.")
-        return _empty_scope(), False, False
+        return _empty_scope(), False, False, False
+    containers_known = any(kind in parsed for kind in CONTAINER_KINDS)
     if parsed.get(SCOPE_PRESENT_KEY) is not True:
         # No block on the CR (or a render that predates the marker): nothing declared.
-        return _empty_scope(), True, False
-    return _normalize_scope(parsed), True, True
+        return _empty_scope(), True, False, containers_known
+    return _normalize_scope(parsed), True, True, containers_known
 
 
 def _normalize_scope(parsed: dict) -> dict:
@@ -530,7 +516,7 @@ def _resolve_projects(management: str | None, scope: dict,
                 # The lookup succeeded and the run holds the full member list, but listing
                 # them would cross the cap: the members the run just resolved are carried
                 # reading over-cap and get no CREATE, and because the run knows they are
-                # under the container, over-cap does not hold back the prune (design §3).
+                # under the container, over-cap does not hold back the prune (design §3/§4 as revised).
                 log(f"{container} resolved {len(members)} project(s), which would cross the resolved-set "
                     f"cap of {RESOLVED_SET_CAP}; over-cap, its members are carried without CREATE.")
                 outcome, carried, members = OUTCOME_OVER_CAP, sorted(members), None
@@ -814,7 +800,7 @@ def reconcile(dry_run: bool = False) -> dict:
     # --- RESOLVE: the management project plus whatever spec.scope declares (design §3).
     management, management_authoritative = _project_source()
     _denied_this_run.clear()
-    scope, scope_readable, scope_present = _load_scope()
+    scope, scope_readable, scope_present, containers_known = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
     # projects do not carry: nothing is listed or created outside the management project
@@ -1006,6 +992,25 @@ def reconcile(dry_run: bool = False) -> dict:
         why = ("the management project did not list its own clusters" if management and not management_listed
                else "a lookup or the declaration could not be trusted")
         log(f"scope prune skipped this run: {why}.")
+    declared_containers = set(_container_ids(scope))
+    exclude_patterns = scope["exclude"]["projects"]
+
+    def index_dropped(project: str) -> bool:
+        """A project reached only through containers that the index no longer places under one.
+
+        The asset index lags a move by minutes to hours, and a project moved between two
+        declared folders vanishes from both meanwhile; the declaration did not change, so the
+        scope rule must not retire it. It retires when the declaration speaks: the container
+        removed from the CR, or an `exclude.projects` entry naming it. A render that predates
+        containers (a rollback to the previous release) declares nothing about them either.
+        """
+        via = _previous_via(previous, project)
+        if not via or not all(v.split("/")[0] in CONTAINER_KINDS for v in via):
+            return False
+        if _excluded_by(project, exclude_patterns):
+            return False
+        return not containers_known or any(v in declared_containers for v in via)
+
     retiring: dict[str, list[str]] = {}
     deferred_retiring: set[str] = set()
     carried_in_scope: set[str] = set()
@@ -1064,6 +1069,14 @@ def reconcile(dry_run: bool = False) -> dict:
                 # rather than the old project vanishing from the snapshot as never in scope.
                 deferred_retiring.add(project)
                 reason = "was the management project until this run; retiring, pruned on the next clean run"
+            elif project in previously_resolved and index_dropped(project):
+                # Reached only through a container that is still declared, and absent from the
+                # asset index this run: the index dropped it, not the declaration. Kept, listed,
+                # and back in scope the run the index places it again.
+                carried_in_scope.add(project)
+                reason = ("not under any declared container in the asset index this run (a move, or the "
+                          "index behind); kept" if containers_known
+                          else "reached through a container the running render does not know; kept")
             elif lookups_clean and scope_present and project in previously_resolved:
                 # First clean run the declaration omits it: retiring now, pruned next run.
                 deferred_retiring.add(project)
@@ -1119,7 +1132,8 @@ def reconcile(dry_run: bool = False) -> dict:
         if pid in deferred_retiring or pid in carried_in_scope:
             continue
         old_management = management_changed and management_listed and pid == previous_management
-        (deferred_retiring if (lookups_clean and scope_present) or old_management else carried_in_scope).add(pid)
+        (deferred_retiring if ((lookups_clean and scope_present and not index_dropped(pid)) or old_management)
+         else carried_in_scope).add(pid)
 
     # A retiring project stays in the snapshot, eligible for the prune, until every one of
     # its profiles is gone; otherwise a delete that failed on the one tick the third

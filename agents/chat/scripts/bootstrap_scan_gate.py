@@ -235,6 +235,9 @@ def _scope_has_other_projects(data_dir: Path) -> bool:
     except Exception:  # noqa: BLE001 - absent or unreadable: one project, as before
         return False
     projects = snapshot.get("projects") if isinstance(snapshot, dict) else None
+    containers = snapshot.get("containers") if isinstance(snapshot, dict) else None
+    if isinstance(containers, list) and any(isinstance(c, dict) and c.get("id") for c in containers):
+        return True
     return isinstance(projects, list) and len([p for p in projects if isinstance(p, dict) and p.get("id")]) > 1
 
 
@@ -242,7 +245,7 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     """The sweep's note on projects and containers the reconcile could not resolve.
 
     Rendered when a declared folder or organisation could not be resolved, or when the
-    snapshot names more than one project and one of them was not listed. An install with
+    snapshot names more than one project (or any container) and one project was not listed. An install with
     no scope renders the prompt it rendered before scopes existed, whatever its one
     project's outcome: that prompt already tells the worker what to do when the project
     cannot be listed.
@@ -252,6 +255,8 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     # A container the reconcile could not resolve is a gap on its own, even when it
     # carried no project rows (a first run, or a container the snapshot never reached).
     if not containers and not (unlisted and _scope_has_other_projects(data_dir)):
+        return ""
+    if not unlisted and not containers:
         return ""
     container_note = ""
     if containers:
