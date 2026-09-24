@@ -153,8 +153,7 @@ Rules:
   the snapshot is written.
 - **Two caps of 100, enforced in different places.** Each declared list (`projects`, `folders`,
   `organizations`, both `exclude` lists, and the phase 3 selectors when they land) carries
-  `MaxItems=100` on the CRD, the ceiling `scopedServiceAccounts` already has, so an oversized
-  declaration is refused at admission. The reconcile lists at most `spec.scope.maxProjects` projects of the resolved set, the management project included, because one folder can resolve to any number; the cap is a declared value with 100 as its default, and the listing budget (§4) scales with it rather than staying fixed. The default sits below the estate that asked for this design, about 200 projects with one cluster each (#1354), and that install declares a higher cap rather than splitting in two; what bounds an install above the default is the pod, not the reconcile (§11). The set is
+  `MaxItems=100` on the CRD, so an oversized declaration is refused at admission. That cap outlives the pool's move to per-project accounts (§6) for a reason of its own: a hand-written list past a hundred entries is the shape containers exist for, and the cap is where the CRD says so; an estate with more than a hundred explicit projects declares folders rather than raising anything. The reconcile lists at most `spec.scope.maxProjects` projects of the resolved set, the management project included, because one folder can resolve to any number; the cap is a declared value with 100 as its default, and the listing budget (§4) scales with it rather than staying fixed. The default sits below the estate that asked for this design, about 200 projects with one cluster each grouped by folder (#1354), and that install declares its folders and a higher cap rather than splitting in two; an estate that wanted two hundred explicit projects is refused at admission and declares folders instead; what bounds an install above the default is the pod, not the reconcile (§11). The set is
   filled in a fixed order so the cap binds the same way on every run: the management project, then
   explicit projects sorted by ID, then the phase 3 selectors' projects sorted by ID, then
   containers sorted by ID; a container that does not fit is skipped and the next one is still tried,
@@ -391,8 +390,7 @@ measured here, so it stays host-only until it is (§11).
 
 Inheritance is the point of offering containers at all. A folder-level binding reaches every
 project beneath it, including one created tomorrow, so onboarding a new project under a declared
-folder is zero-touch: it appears at the next hourly reconcile with no change to the CR, the tfvars,
-or the IAM. That is the answer to "maintaining the list over time": the list is a container, and
+folder is zero-touch for discovery and IAM: it appears at the next hourly reconcile with no change to the CR, the tfvars, or the IAM. With the pool armed (below), its account arrives with the next apply, and its clusters are refused by the broker until then. That is the answer to "maintaining the list over time": the list is a container, and
 GCP maintains it.
 
 The same inheritance widens the blast radius of the one service account that holds these roles,
@@ -400,8 +398,7 @@ which §9 takes up.
 
 Prerequisites the design has to state and the installer has to preflight:
 
-- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or
-  `resourcemanager.organizations.setIamPolicy` for an organisation. Today it needs only
+- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Today it needs only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
   than failing on the first.
 - A project in scope with `container.googleapis.com` disabled resolves to zero clusters (§4's
@@ -419,7 +416,7 @@ Prerequisites the design has to state and the installer has to preflight:
 Uninstall revokes what install granted: `terraform destroy` removes the bindings because Terraform
 owns them, which is the property #588 lost when its revocation lived in a bash function.
 
-**The scoped service account pool moves to per-project accounts.** Decided 2026-09-23. The pool is keyed on the cluster today (`scoped_pool.tf`, one account per `{project_id, location, cluster_name}` row, hand-listed in `spec.security.scopedServiceAccounts` under a cap of 100), and the broker refuses a request for a cluster with no member rather than widening. At one cluster per project that cap is the ceiling on the fleet, and a hand-maintained list of 200 rows duplicates what resolution already found. The pool therefore becomes one account per project in the resolved set: Terraform derives the members from the same `scope` input that binds `scope_roles`, without reading the runtime snapshot, so an explicit project or a folder member gets its account when it gets its grant; the broker's mapping key becomes the project and its refusal rule is unchanged, a request for a cluster in a project with no account is refused, not served on the ambient credential. The blast radius of a compromised sandbox becomes the project rather than the cluster: two clusters in one project share an account. The design accepts that because the project is the IAM unit the declaration is written in and the unit the customer's estate is cut in, and because per-cluster accounts cannot be derived from a folder at all. The move is a follow-up to phase 2, before `organizations` is offered in a release (§9).
+**The scoped service account pool moves to per-project accounts.** Decided 2026-09-23. The pool is keyed on the cluster today (`scoped_pool.tf`, one account per `{project_id, location, cluster_name}` row, hand-listed in `spec.security.scopedServiceAccounts` under a cap of 100), and the broker refuses a request for a cluster with no member rather than widening. At one cluster per project that cap is the ceiling on the fleet, and a hand-maintained list of 200 rows duplicates what resolution already found. The pool therefore becomes one account per project in the resolved set: Terraform derives the members from the same `scope` input that binds `scope_roles`, without reading the runtime snapshot, so an explicit project gets its account when it gets its grant, and a folder's or organisation's members are listed at plan time, with the same Asset Inventory search the reconcile runs, and get theirs on that apply: pool membership under a container lags to the next `upgrade.sh`, as §10 step 3 says of the phase 3 selectors, while the container-level grant and discovery stay zero-touch, so a project created under the folder between applies is discovered and gets its profile, and every kubectl for it is refused until the next apply adds its account. The broker's mapping key becomes the project, the mapping the operator renders becomes one row per project (`projectId`, `serviceAccountEmail`) in place of the per-cluster triple, and the refusal rule is unchanged, a request for a cluster in a project with no account is refused, not served on the ambient credential. The blast radius of a compromised sandbox becomes the project rather than the cluster: two clusters in one project share an account. The design accepts that because the project is the IAM unit the declaration is written in and the unit the customer's estate is cut in. Arming stays a separate, explicit switch, off by default and independent of the scope: `spec.security.scopedServiceAccountPool.enabled` on the CR and `scoped_pool_enabled` in the composition (the follow-up settles the spelling), so declaring `projects` on its own arms nothing, the mode is read from that field and from the broker's `CREDENTIAL_PROXY_SCOPED_SA_POOL` as today, and the pool is turned off without touching the scope; the hand-listed `spec.security.scopedServiceAccounts` rows give way to the derived mapping. The move is a follow-up to phase 2, before `organizations` is offered in a release (§9).
 
 ## 7. The onboarding lifecycle
 
@@ -451,14 +448,17 @@ the one tick the third condition held would leave the profile `unmanaged` for go
 became `denied` because a binding was revoked without editing the scope is not pruned; the
 profiles stay, the outcome is reported, and an operator resolves it one way or the other.
 
-**A project that disappears.** Deleted, or moved out from under a declared folder: its clusters
-stop appearing in the resolved set, and PRUNE's per-profile `describe --project=<P>` now returns a
-403, because the folder binding no longer covers it, which `_cluster_exists` classifies as unknown
-and keeps (`cluster_agent_reconcile.py:135-163`). It is the out-of-scope rule above, not NotFound,
-that retires those profiles, and only once every container has resolved `ok` or `over-cap`, the
-second condition above. Moved to a different
-declared folder: no change, because resolution is by project and the `via` field merely records
-the new path.
+**A project that disappears.** Deleted, or moved out from under a declared folder: the index stops
+placing it under the container while the container itself still resolves `ok`. The reconcile does not
+retire it on that reading alone, because the index lags a move by minutes and a run in that window
+would otherwise retire a project that merely moved: the member is kept, with `absentSince` stamped on
+its row, for a day (`INDEX_LAG_GRACE_SECONDS`), and only after that does it retire over the ordinary
+two clean runs; the declaration speaking, an `exclude.projects` entry or the container removed from
+the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `describe --project=<P>`
+meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
+classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
+is by project; the `via` field records the new path and any placement clears the stamp, including a
+placement during the lag by the folder the project left.
 
 **Never on ambiguity.** The rule at `cluster_agent_reconcile.py:11-15` holds: auth, network, quota,
 and unclassified errors leave profiles untouched.
