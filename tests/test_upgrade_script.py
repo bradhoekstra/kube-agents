@@ -461,6 +461,8 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         pre = text[read_at:dispatch_at]
         self.assertIn("exit 1", pre)
         self.assertIn('RETAG_SCOPE_OMIT="true"', pre)
+        # No block and keys recorded: the retag renders none and says so.
+        self.assertIn("carries SCOPE_* keys but the PlatformAgent carries no spec.scope block", pre)
         self.assertIn('if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then', pre)
         self.assertIn("--upgrade-mode=full to apply the change", pre)
         self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block', text)

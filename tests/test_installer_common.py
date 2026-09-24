@@ -995,6 +995,21 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('  projects = ["payments-prod"]', dest.read_text())
 
+    def test_clearing_the_exclusions_of_an_installer_rendered_scope_is_not_refused(self):
+        # The CR carries the same projects the keys name, so it reads as
+        # rendered from them; clearing the exclusion keys is the ordinary way
+        # to stop excluding, and proceeds.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("    projects = []\n    clusters = []", dest.read_text())
+
     def test_the_scope_guard_reads_through_the_installs_context_not_the_current_one(self):
         # kubectl pointed at another cluster: the Secret recovery stands down,
         # the guard does not, because it names the install's context itself.
@@ -1060,7 +1075,7 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=kubectl,
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("excludes test-project/us-central1/scratch and neither SCOPE_EXCLUDE_* key is set", proc.stdout)
+            self.assertIn("excludes test-project/us-central1/scratch while neither SCOPE_EXCLUDE_* key is set", proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_CLUSTERS="test-project/us-central1/scratch"', proc.stdout)
             # Recording the projects alone, the first step the docs send a
             # pre-key install through, does not stand in for the exclusions.

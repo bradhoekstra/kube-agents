@@ -1672,14 +1672,15 @@ verify_scope_block_after_apply() {
 # and the reconcile reads a present block as the declaration, so an apply
 # from empty keys over such a CR would retire every Cluster Agent profile the
 # hand-set projects produced and re-onboard every cluster the hand-set
-# exclusions kept out. The rule, one half per kind of entry: refuse when the
-# CR names projects and SCOPE_PROJECTS names none, and refuse when the CR
-# carries exclusions and neither SCOPE_EXCLUDE_* key is set. A key of the
-# same kind is the declaration for that kind and changes it freely (removing
-# a project retires its profiles, removing an exclusion re-onboards its
-# clusters, which is what the operator asked for); recording the projects
-# alone does not stand in for the exclusions, since that is the first step
-# the docs send a pre-key install through. Emptying either kind on purpose is
+# exclusions kept out. The rule: refuse when the CR names projects and
+# SCOPE_PROJECTS names none; and refuse when the CR carries exclusions,
+# neither SCOPE_EXCLUDE_* key is set, and the CR's projects disagree with
+# SCOPE_PROJECTS, since that is a scope the keys have not taken over (a hand
+# set, or the partial install.env that recorded the projects alone). Once the
+# projects agree the CR reads as rendered from these keys, and a key of each
+# kind changes its kind freely: removing a project retires its profiles,
+# clearing the exclusion keys re-onboards the excluded clusters, which is what
+# the operator asked for. Emptying the projects on purpose is
 # SCOPE_GUARD_ENABLED=false for one run. Nothing is read from the Helm
 # release: what the chart last rendered is no guide to what the CR carries.
 #
@@ -1752,14 +1753,19 @@ for item in items:
     excluded = exclude.get("projects") or []
     clusters = [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []]
     drops_projects = bool(projects) and not key_projects
-    drops_exclusions = bool(excluded or clusters) and not key_exclusions
+    # An exclusion is protected while no key names a project, or while the projects on the
+    # CR disagree with SCOPE_PROJECTS: either is a scope the keys have not taken over
+    # (hand-set, or a partial install.env). Once the projects agree the CR reads as
+    # rendered from these keys, and clearing the exclusion keys is the ordinary way to
+    # stop excluding.
+    drops_exclusions = bool(excluded or clusters) and not key_exclusions and (not key_projects or sorted(projects) != sorted(key_projects))
     if not (drops_projects or drops_exclusions):
         continue
     what = []
     if drops_projects:
         what.append("names %s and SCOPE_PROJECTS names nothing" % " ".join(projects))
     if drops_exclusions:
-        what.append("excludes %s and neither SCOPE_EXCLUDE_* key is set" % " ".join(excluded + clusters))
+        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and its projects differ from SCOPE_PROJECTS" % " ".join(excluded + clusters))
     print("# the PlatformAgent " + "; ".join(what))
     print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
     print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(excluded))

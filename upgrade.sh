@@ -995,6 +995,12 @@ main() {
     fi
     if [ -z "$RETAG_SCOPE_JSON" ]; then
       RETAG_SCOPE_OMIT="true"
+      # The keys recorded but never applied (a pre-key install the first time
+      # someone records them, or a block an older webhook dropped): the retag
+      # renders no block, and says so, since only full mode applies the keys.
+      if [ -n "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ]; then
+        print_warning "install.env carries SCOPE_* keys but the PlatformAgent carries no spec.scope block. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and renders no block; run ./upgrade.sh --upgrade-mode=full to apply the keys, which binds the IAM and renders the CR together."
+      fi
     else
       local retag_keys_json
       retag_keys_json="$(scope_values_json)" || exit 1

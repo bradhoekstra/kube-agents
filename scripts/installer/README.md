@@ -234,11 +234,12 @@ retire its profiles. An entry that is not what the CRD accepts (a project ID, an
 fails the generator before any file is written, and so before a `harness` or `operator` retag could
 carry it to the API server. An install whose `PlatformAgent` declares a scope by hand that these keys would empty is refused
 too, with the three lines that carry the whole live declaration printed: the CR names projects and
-`SCOPE_PROJECTS` names none, or the CR carries exclusions and neither `SCOPE_EXCLUDE_*` key is set,
-which is the install whose scope was set by hand before the keys existed or an `install.env` that
-recorded part of it. A key of the same kind is the declaration for that kind and changes it freely,
-so removing a project from `SCOPE_PROJECTS`, or an exclusion from its key, and running `upgrade.sh`
-is never refused; emptying the
+`SCOPE_PROJECTS` names none, or the CR carries exclusions while neither `SCOPE_EXCLUDE_*` key is set and its
+projects disagree with `SCOPE_PROJECTS`, which is the install whose scope was set by hand before the
+keys existed or an `install.env` that recorded the projects alone. Once the projects agree the CR
+reads as rendered from these keys, and a key of each kind changes its kind freely, so removing a
+project from `SCOPE_PROJECTS`, or clearing the exclusion keys, and running `upgrade.sh` is never
+refused; emptying the
 scope on purpose is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
 destroy keeps nothing either way. The check reads the CR through the install's own kubeconfig
 context by name and fails closed: a read it cannot make refuses the run with the same override,
