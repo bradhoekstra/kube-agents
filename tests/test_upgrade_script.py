@@ -474,6 +474,10 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         apply_at = full.index("apply -auto-approve -input=false")
         check_at = full.index('verify_scope_block_after_apply "$target_namespace" || exit 1')
         self.assertLess(apply_at, check_at)
+        # Behind an engine guard, like the retag's helpers: an older
+        # installer_common.sh on the curl path has no such function, and a
+        # completed apply must not be reported as a failure for its absence.
+        self.assertIn("if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then", full[:check_at])
 
     def test_the_scope_guard_runs_only_for_a_full_apply(self):
         # A plan applies nothing and is what shows the destroys the guard

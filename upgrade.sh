@@ -1057,8 +1057,12 @@ main() {
         apply -auto-approve -input=false
       # The apply that introduces spec.scope can write the CR through the
       # previous operator's webhook, which drops the field; the function says
-      # what to run when it did.
-      verify_scope_block_after_apply "$target_namespace" || exit 1
+      # what to run when it did. Only when the engine has it: on the curl path
+      # an older engine renders no scope block, so there is nothing to check
+      # and no function to call.
+      if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then
+        verify_scope_block_after_apply "$target_namespace" || exit 1
+      fi
       print_success "Full atomic upgrade completed successfully!"
       ;;
   esac
