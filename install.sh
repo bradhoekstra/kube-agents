@@ -4699,8 +4699,8 @@ main() {
     warn_on_overreaching_custom_roles "$custom_roles"
   fi
   # The multi-project scope, from the --scope-* flags or the loaded SCOPE_*
-  # keys. The generator validates the exclude.clusters triples before it
-  # writes anything, and the CRD validates the IDs at admission.
+  # keys. The generator validates every list the way the CRD will before it
+  # writes anything, naming the install.env line.
   local scope_projects="${PARAM_SCOPE_PROJECTS:-}"
   local scope_exclude_projects="${PARAM_SCOPE_EXCLUDE_PROJECTS:-}"
   local scope_exclude_clusters="${PARAM_SCOPE_EXCLUDE_CLUSTERS:-}"

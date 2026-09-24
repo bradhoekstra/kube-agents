@@ -1783,7 +1783,7 @@ for item in items:
     if drops_projects:
         what.append("names %s and SCOPE_PROJECTS names nothing" % " ".join(projects))
     if drops_exclusions:
-        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS names a project the CR does not carry" % " ".join(excluded + clusters))
+        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS %s" % (" ".join(excluded + clusters), "names nothing" if not key_projects else "names a project the CR does not carry"))
     print("# the PlatformAgent " + "; ".join(what))
     print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
     print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(excluded))

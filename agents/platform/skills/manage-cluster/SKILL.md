@@ -38,7 +38,10 @@ This is the explicit, user-driven counterpart to onboarding-time creation (`gke-
 Because reconciliation manages **all** clusters in every project in scope, deleting a still-existing cluster's profile alone won't stick — the next reconcile recreates it. To stop managing a cluster:
 
 - **Tear down the cluster** (see `gke-cluster-creation`); reconcile prunes its profile automatically.
-- Or **exclude it**: add the cluster's project, location and name to `spec.scope.exclude.clusters` on the `PlatformAgent` (the operator delivers it to the reconcile, which prunes the profile on its next run). The older `RECONCILE_EXCLUDE` bare-name variable on the `cluster-agent-reconcile` cron still works for one release.
+- Or **exclude it**, as a `project/location/cluster` triple in `spec.scope.exclude.clusters`. Where the triple goes depends on who owns the CR:
+  - **Installer-managed install** (the `PlatformAgent` carries Helm's `meta.helm.sh/release-name` annotation): the chart renders `spec.scope` from `install.env` on every full `upgrade.sh`, so the triple belongs in `SCOPE_EXCLUDE_CLUSTERS` there. You cannot edit that file from the pod: patch the CR for the immediate effect if the user wants it now, and tell them, in the report, the exact line to record (`SCOPE_EXCLUDE_CLUSTERS="<project>/<location>/<cluster>"`, space-separated with any existing entries) before their next full upgrade. A CR patch alone lasts until that upgrade; the installer refuses to drop a hand-set exclusion only on an install whose `SCOPE_PROJECTS` names nothing.
+  - **Hand-managed CR**: patch `spec.scope.exclude.clusters` on the `PlatformAgent`; the operator delivers it to the reconcile, which prunes the profile on its next run.
+  - The older `RECONCILE_EXCLUDE` bare-name variable on the `cluster-agent-reconcile` cron still works for one release.
 
 ## Notes
 

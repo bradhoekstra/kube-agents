@@ -235,9 +235,12 @@ retire its profiles. An entry that is not what the CRD accepts (a project ID, an
 fails the generator before any file is written, whichever front door runs it. An install whose `PlatformAgent` declares a scope that these keys would empty is refused
 too, with the three lines that carry the whole live declaration printed: the CR names projects and
 `SCOPE_PROJECTS` names none, or the CR carries exclusions while neither `SCOPE_EXCLUDE_*` key is set and
-`SCOPE_PROJECTS` names a project the CR does not carry. That is the install whose scope was set by hand before the
+`SCOPE_PROJECTS` names nothing or names a project the CR does not carry. That is the install whose scope was set by hand before the
 keys existed, or an `install.env` that recorded part of it, and it is also what removing the last
-project looks like: the check cannot tell them apart, so it stops both. Keys that name the CR's
+project looks like: the check cannot tell them apart, so it stops both. It does not protect an
+exclusion added to the CR by hand (the `manage-cluster` skill's route) on an install whose
+`SCOPE_PROJECTS` names the CR's projects: record the triple in `SCOPE_EXCLUDE_CLUSTERS` before the
+next full upgrade, or that upgrade drops it and the reconcile re-onboards the cluster. Keys that name the CR's
 projects, or a subset of them, are the declaration for every kind, so removing a project (other than
 the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or both in one edit, and running
 `upgrade.sh` is never refused; emptying the

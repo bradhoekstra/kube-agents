@@ -461,7 +461,7 @@ enumerates for GKE clusters, and which projects and clusters it leaves unmanaged
 the chart owns the CR and renders the block from `platformAgent.scope`, always present, empty lists
 included; the Terraform composition fills that value from its `scope` variable, which the installer
 writes from `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`.
-A scope set by editing the CR by hand on an installer-managed install is replaced by those keys on
+A scope set by editing the CR by hand on an installer-managed install, an exclusion the `manage-cluster` skill adds included, is replaced by those keys on
 the next full `upgrade.sh` (the `harness` and `operator` modes re-tag images and pass the CR's scope back as it is), so record it in `install.env` first; a full run
 refuses while the CR declares what the keys would empty, and prints the lines to add. Keys that name
 the CR's projects, or a subset of them, are the declaration for every kind, in full mode: removing a

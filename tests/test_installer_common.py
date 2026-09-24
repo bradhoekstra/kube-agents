@@ -1052,7 +1052,7 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=kubectl,
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("excludes test-project/us-central1/scratch while neither SCOPE_EXCLUDE_* key is set", proc.stdout)
+            self.assertIn("excludes test-project/us-central1/scratch while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS names nothing", proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_CLUSTERS="test-project/us-central1/scratch"', proc.stdout)
             # Recording the projects alone, the first step the docs send a
             # pre-key install through, does not stand in for the exclusions.
@@ -1063,7 +1063,7 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=kubectl,
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("neither SCOPE_EXCLUDE_* key is set", proc.stdout)
+            self.assertIn("neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS names a project the CR does not carry", proc.stdout)
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "test-project/us-central1/scratch"},
@@ -1353,8 +1353,9 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("python3 is not available", proc.stdout + proc.stderr)
 
     def test_the_generator_checks_every_scope_list_the_way_the_crd_will(self):
-        # harness and operator retags carry the keys to the API server with no
-        # Terraform plan in between, so the generator is the only gate.
+        # A full apply reaches the CRD only through Terraform, and a retag never
+        # carries the keys, so the generator is where an entry is refused with
+        # its install.env line named rather than at admission.
         cases = {
             'hcl_scope_block "Payments-Prod" "" ""': "SCOPE_PROJECTS entry 'Payments-Prod'",
             'hcl_scope_block "abc" "" ""': "SCOPE_PROJECTS entry 'abc'",

@@ -536,6 +536,15 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         # The NAMESPACE prefix is joined to the generator call itself: a
         # continuation onto a comment line would leave it a bare assignment.
         self.assertIn('NAMESPACE="$target_namespace" \\\n    write_tfvars_from_state "', text)
+        # A retag never applies the keys, so the generator runs with them empty
+        # (a malformed line must not stop a retag) and gets them back after,
+        # for the retag's own comparison against the live scope.
+        empty_at = text.index('export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
+        self.assertLess(empty_at, generate_at)
+        self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n    retag_saved_scope=(', text[:empty_at])
+        restore_at = text.index('export SCOPE_PROJECTS="${retag_saved_scope[0]}"')
+        self.assertLess(generate_at, restore_at)
+        self.assertLess(restore_at, text.index('RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"'))
 
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
