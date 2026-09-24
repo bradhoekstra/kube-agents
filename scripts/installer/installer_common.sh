@@ -31,6 +31,10 @@
 # path nobody knows in advance.
 _installer_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
 INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-${_installer_common_dir}/../../install.defaults.env}"
+if [ -r "${_installer_common_dir}/gke_dns_endpoint.sh" ]; then
+  # shellcheck source=scripts/installer/gke_dns_endpoint.sh
+  . "${_installer_common_dir}/gke_dns_endpoint.sh"
+fi
 unset _installer_common_dir
 if [ -r "$INSTALL_DEFAULTS_FILE" ]; then
   # shellcheck source=/dev/null
@@ -43,6 +47,9 @@ else
   echo "  ℹ It ships with the repository. Re-clone, or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy." >&2
   return 1 2>/dev/null || exit 1
 fi
+
+# Request timeout for kubectl probes against live clusters in the installer.
+readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
@@ -1905,10 +1912,9 @@ write_tfvars_from_state() {
   # With the DNS endpoint when the cluster publishes one: this writes the same
   # kubeconfig entry as the front doors' own fetch, and upgrade.sh has just
   # written it with the flag, so a fetch without it would swap the DNS
-  # endpoint back for an IP endpoint that may not be reachable from here.
-  # GKE_DNS_ENDPOINT_FLAG is taken as the caller left it (upgrade.sh sets it,
-  # empty or not, at its connect step) and resolved here only when the caller
-  # has sourced the helper and not resolved it yet (install.sh).
+  # endpoint back for an IP endpoint that may not be reachable from here. The
+  # flag is resolved here whenever the helper is sourced (both front doors
+  # source it) and otherwise taken as the caller left it.
   #
   # The widening is for the guard: with the guard off (uninstall.sh), the
   # fetch stays what it was, an adoption's alone, so a teardown of a cluster
@@ -1916,7 +1922,8 @@ write_tfvars_from_state() {
   # the Secret recovery below.
   if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 &&
     { [ "$create_cluster" = "false" ] || is_truthy "${SCOPE_GUARD_ENABLED:-true}"; }; then
-    if [ -z "${GKE_DNS_ENDPOINT_FLAG+set}" ] && declare -F gke_dns_endpoint_flag >/dev/null 2>&1; then
+    if type gke_dns_endpoint_flag >/dev/null 2>&1; then
+      GKE_DNS_ENDPOINT_FLAG=""
       gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
     fi
     # Unquoted on purpose: empty must contribute no argument at all.
@@ -1953,7 +1960,8 @@ write_tfvars_from_state() {
       # just destroyed black-holes TCP instead of refusing, and eight keys
       # times a hung connect stalls the install for minutes.
       secret_val="$({ kubectl get secret "${PLATFORM_AGENT_SECRET}" -n "${NAMESPACE:-$DEFAULT_NAMESPACE}" \
-        --request-timeout=10s \
+        --context "$expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" \
         -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
       if [ -n "$secret_val" ]; then
         export "${secret_key}=${secret_val}"
@@ -2010,7 +2018,13 @@ write_tfvars_from_state() {
     print_info "SKIP_CERT_MANAGER=true: the composition will not install cert-manager. The operator webhooks need one serving before the apply."
   elif [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
     # Credentials were fetched above, on the same adoption branch.
-    if kubectl get deployment cert-manager -n cert-manager >/dev/null 2>&1; then
+    # Check that current-context actually points to this cluster; a stale context
+    # must not probe another cluster and wrongly disable cert-manager on this one.
+    local cert_expected_ctx
+    cert_expected_ctx="$(gke_context_name)"
+    if [ "$(kubectl config current-context 2>/dev/null || true)" = "$cert_expected_ctx" ] &&
+      kubectl get deployment cert-manager -n cert-manager --context "$cert_expected_ctx" \
+        --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" >/dev/null 2>&1; then
       # The Deployment alone cannot say whose it is. On a retry after an
       # apply that died past the cert-manager release, and on every
       # upgrade.sh regeneration of an existing-cluster install, the
