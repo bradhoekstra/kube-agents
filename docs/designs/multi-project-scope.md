@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, and `via` and `containers` in the snapshot. Steps 1 and 2's IAM bindings and installer paths, step 1's `platform_mcp_server.py` change, and steps 3 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Steps 1 and 2's IAM bindings and installer paths, step 1's `platform_mcp_server.py` change, and steps 3 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -107,7 +107,7 @@ spec:
       - payments-staging
     folders: # Resource Manager folder IDs (numeric), resolved to every project beneath them
       - "123456789012"
-    organizations: # organisation IDs (numeric)
+    organizations: # organisation IDs (numeric); see §9 before using this
       - "987654321098"
     exclude:
       projects: # never resolved, even if a folder above contains them
@@ -378,13 +378,17 @@ the one tick the third condition held would leave the profile `unmanaged` for go
 became `denied` because a binding was revoked without editing the scope is not pruned; the
 profiles stay, the outcome is reported, and an operator resolves it one way or the other.
 
-**A project that disappears.** Deleted, or moved out from under a declared folder: its clusters
-stop appearing in the resolved set, and PRUNE's per-profile `describe --project=<P>` now returns a
-403, because the folder binding no longer covers it, which `_cluster_exists` classifies as unknown
-and keeps (`cluster_agent_reconcile.py:135-163`). It is the out-of-scope rule above, not NotFound,
-that retires those profiles, and only once the containers have resolved `ok`. Moved to a different
-declared folder: no change, because resolution is by project and the `via` field merely records
-the new path.
+**A project that disappears.** Deleted, or moved out from under a declared folder: the index stops
+placing it under the container while the container itself still resolves `ok`. The reconcile does not
+retire it on that reading alone, because the index lags a move by minutes and a run in that window
+would otherwise retire a project that merely moved: the member is kept, with `absentSince` stamped on
+its row, for a day (`INDEX_LAG_GRACE_SECONDS`), and only after that does it retire over the ordinary
+two clean runs; the declaration speaking, an `exclude.projects` entry or the container removed from
+the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `describe --project=<P>`
+meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
+classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
+is by project; the `via` field records the new path and any placement clears the stamp, including a
+placement during the lag by the folder the project left.
 
 **Never on ambiguity.** The rule at `cluster_agent_reconcile.py:11-15` holds: auth, network, quota,
 and unclassified errors leave profiles untouched.
