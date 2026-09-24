@@ -74,6 +74,9 @@ _CERT_MANAGER_PRESENT_KUBECTL = (
     'case "$*" in\n'
     '  *"get deployment cert-manager"*) exit 0 ;;\n'
     '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+    # A reachable cluster with cert-manager and no kube-agents on it yet: the
+    # fail-closed scope guard passes a cluster that serves no PlatformAgent.
+    '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
     "esac\n"
     "exit 1\n"
 )
@@ -1291,33 +1294,30 @@ class InstallerCommonTest(unittest.TestCase):
                 self.assertIn(message, proc.stdout + proc.stderr)
 
     def test_the_credentials_fetch_keeps_the_dns_endpoint(self):
-        # The generator writes the same kubeconfig entry the front doors do.
-        # upgrade.sh has just fetched with the DNS endpoint when the cluster
-        # publishes one; a fetch here without it would swap that entry back to
-        # an IP endpoint that may not be reachable. The caller's value is used
-        # as it stands; the helper is only called when the caller sourced it
-        # and left the variable unset (install.sh).
+        # The generator writes the same kubeconfig entry the front doors do,
+        # and upgrade.sh has just fetched with the DNS endpoint when the
+        # cluster publishes one; a fetch here without it would swap that entry
+        # back to an IP endpoint that may not be reachable. The flag is
+        # resolved whenever the helper is sourced (installer_common.sh sources
+        # it), from the cluster's own endpoint config.
+        dns_describe = (
+            'case "$*" in\n'
+            '  *controlPlaneEndpointsConfig*) printf "cluster-dns.gke.goog\\tTrue\\n"; exit 0 ;;\n'
+            '  *) printf "\\n"; exit 0 ;;\n'
+            'esac'
+        )
+        get_cred = 'case "$*" in *--help*) echo "--dns-endpoint"; exit 0 ;; *) exit 0 ;; esac'
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             log = pathlib.Path(out_dir) / "gcloud.log"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "GKE_DNS_ENDPOINT_FLAG": "--dns-endpoint", "GCLOUD_CALL_LOG": str(log)},
-                describe_stub="printf '\\n'; exit 0",
-            )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
-            self.assertEqual(1, len(fetches), fetches)
-            self.assertIn("--dns-endpoint", fetches[0])
-            log.unlink()
-            proc = self._run(
-                'gke_dns_endpoint_flag() { GKE_DNS_ENDPOINT_FLAG="--dns-endpoint"; }; '
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
-                describe_stub="printf '\\n'; exit 0",
+                describe_stub=dns_describe,
+                get_credentials_stub=get_cred,
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
-            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
+            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]
             self.assertEqual(1, len(fetches), fetches)
             self.assertIn("--dns-endpoint", fetches[0])
             log.unlink()
@@ -1325,8 +1325,10 @@ class InstallerCommonTest(unittest.TestCase):
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
                 describe_stub="printf '\\n'; exit 0",
+                get_credentials_stub=get_cred,
             )
-            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line]
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]
             self.assertEqual(1, len(fetches), fetches)
             self.assertNotIn("--dns-endpoint", fetches[0])
 
