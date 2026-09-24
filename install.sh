@@ -5272,17 +5272,20 @@ main() {
   # is already there -- adopted, or created by this state on the attempt that
   # died -- and only for a release no revision of which ever served. The
   # generator fetches credentials for an adoption, and for its scope check on
-  # a run that can refuse; fetch them here for the rest, and the check itself
+  # a run that can refuse, and says so (KUBECONFIG_CONTEXT_FETCHED); fetch
+  # them here only for the rest (the guard turned off), and the check itself
   # refuses to look at any other context.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
-    # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
-    # a DNS-endpoint-only cluster, the context gate below does not match, and
-    # the check skips exactly the retry it exists for.
-    GKE_DNS_ENDPOINT_FLAG=""
-    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
-      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    if [ "${KUBECONFIG_CONTEXT_FETCHED:-false}" != "true" ]; then
+      # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
+      # a DNS-endpoint-only cluster, the context gate below does not match, and
+      # the check skips exactly the retry it exists for.
+      GKE_DNS_ENDPOINT_FLAG=""
+      gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+      # shellcheck disable=SC2086
+      gcloud container clusters get-credentials "$cluster_name" --location "$region" \
+        --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
+    fi
     clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
   fi
 

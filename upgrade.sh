@@ -1002,12 +1002,20 @@ main() {
   # when the CR has none. Only when the engine has the scope input.
   RETAG_SCOPE_JSON=""
   RETAG_SCOPE_OMIT=""
+  local live_scope_rc=0
   if [ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block >/dev/null 2>&1; then
-    if ! RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"; then
+    RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")" || live_scope_rc=$?
+    if [ "$live_scope_rc" -eq "${LIVE_SCOPE_NO_CR_RC:-2}" ]; then
+      # No chart PlatformAgent on the cluster (deleted by hand): nothing to
+      # carry, so the retag passes neither a block nor omit, and Helm renders
+      # the CR again from the release's recorded values; the next full
+      # upgrade renders the scope from install.env.
+      print_warning "No PlatformAgent '${PLATFORM_AGENT_CR_NAME:-platform-agent}' in '${target_namespace}'; this ${PARAM_UPGRADE_MODE} upgrade renders it again from the release's recorded values. Run ./upgrade.sh --upgrade-mode=full to render its scope from install.env."
+      RETAG_SCOPE_JSON=""
+    elif [ "$live_scope_rc" -ne 0 ]; then
       print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read: a full upgrade reads the CR the same way for its hand-declared-scope check and is refused the same way (SCOPE_GUARD_ENABLED=false skips that check, and a run that skips it renders the scope from install.env over whatever the CR carries)."
       exit 1
-    fi
-    if [ -z "$RETAG_SCOPE_JSON" ]; then
+    elif [ -z "$RETAG_SCOPE_JSON" ]; then
       RETAG_SCOPE_OMIT="true"
       # The keys recorded but never applied (a pre-key install the first time
       # someone records them, or a block an older webhook dropped): the retag
@@ -1029,12 +1037,12 @@ main() {
         # declaration, not to run full. A CR carrying the empty block every
         # full apply renders declares nothing, and nothing needs recording.
         print_warning "install.env records no SCOPE_* key while the PlatformAgent carries a spec.scope. A ${PARAM_UPGRADE_MODE} upgrade leaves the CR's scope as it is; before a full upgrade, record the live declaration in install.env (a full upgrade with the keys empty is refused, since it would empty the scope):"
-        printf '%s' "$RETAG_SCOPE_JSON" | python3 -c '
-import json, sys
-scope = json.load(sys.stdin); exclude = scope.get("exclude") or {}
+        printf '%s' "$RETAG_SCOPE_JSON" | SCOPE_SEP="${SCOPE_CLUSTER_TRIPLE_SEPARATOR:-/}" python3 -c '
+import json, os, sys
+scope = json.load(sys.stdin); exclude = scope.get("exclude") or {}; sep = os.environ["SCOPE_SEP"]
 print("SCOPE_PROJECTS=\"%s\"" % " ".join(scope.get("projects") or []))
 print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(exclude.get("projects") or []))
-print("SCOPE_EXCLUDE_CLUSTERS=\"%s\"" % " ".join("/".join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []))
+print("SCOPE_EXCLUDE_CLUSTERS=\"%s\"" % " ".join(sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []))
 ' || true
       elif ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
         if declare -F scope_json_full_apply_refused >/dev/null 2>&1 && scope_json_full_apply_refused "$RETAG_SCOPE_JSON" "$retag_keys_json"; then

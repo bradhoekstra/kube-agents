@@ -4292,15 +4292,17 @@ class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):
     def test_it_is_gated_on_the_cluster_existing_and_fetches_its_credentials(self):
         # Existing, not adopted: a cluster this state created on the attempt
         # that died exists with create_cluster = true, and its retry hits the
-        # same Helm refusal. The generator fetched credentials on the adoption
-        # path alone, so this branch fetches them itself.
+        # same Helm refusal. The generator fetches credentials for an adoption
+        # and for its scope check and says so; this branch fetches only when
+        # it did not, so a re-run makes one fetch, not two.
         clear = self.source.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"')
         gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
         self.assertGreater(gate, 0)
         credentials = self.source.index('gcloud container clusters get-credentials "$cluster_name"', gate)
         self.assertLess(credentials, clear)
-        # Nothing else opens between the gate and the call.
+        # Nothing but the fetched-already check opens between the gate and the call.
         self.assertNotIn("\n  fi\n", self.source[gate:clear])
+        self.assertIn('if [ "${KUBECONFIG_CONTEXT_FETCHED:-false}" != "true" ]; then', self.source[gate:credentials])
         # The fetch reaches a DNS-endpoint-only cluster the way step 13's does;
         # a plain one fails there, and the context gate then skips the check.
         flag = self.source.index('gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id"', gate)

@@ -489,19 +489,21 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         # Keys that share no project with the CR are the one disagreement a full
         # upgrade refuses, so that notice names the override; a grow says "run full".
         exclude_only = '{"projects": [], "exclude": {"projects": ["*-sandbox"], "clusters": []}}'
-        for live, keys, expect in ((empty, no_keys, None), (declared, no_keys, "record"),
+        for live, keys, expect in ((empty, no_keys, None), (declared, no_keys, "record"), (None, no_keys, "no-cr"),
                                    (declared, {**no_keys, "SCOPE_PROJECTS": "other-project"}, "refused"),
                                    (exclude_only, {**no_keys, "SCOPE_PROJECTS": "payments-new"}, "refused"),
                                    (declared, {**no_keys, "SCOPE_PROJECTS": "payments-prod payments-new"}, "differ")):
             with self.subTest(live=live, keys=keys):
+                # A None row stubs the read as "no such CR" (LIVE_SCOPE_NO_CR_RC).
+                live_stub = f"live_scope_json() {{ printf '%s' '{live}'; }}\n" if live is not None else "live_scope_json() { return 2; }\n"
                 script = (
                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
                     # Source-only mode loads no engine; the block's readers live there.
                     f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
                     'print_warning() { echo "WARN: $*"; }; hcl_scope_block() { :; }\n'
-                    f"live_scope_json() {{ printf '%s' '{live}'; }}\n"
+                    + live_stub +
                     'PARAM_UPGRADE_MODE=harness; target_namespace=kubeagents-system\n'
-                    f'retag_scope_check() {{\n{block}\n}}\nretag_scope_check; echo "rc=$?"\n'
+                    f'retag_scope_check() {{\n{block}\n}}\nretag_scope_check; echo "rc=$? RETAG_SCOPE_OMIT=$RETAG_SCOPE_OMIT RETAG_SCOPE_JSON=$RETAG_SCOPE_JSON"\n'
                 )
                 proc = subprocess.run(
                     ["bash", "-c", script], capture_output=True, text=True, cwd=str(_REPO_ROOT),
@@ -509,7 +511,11 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
                 )
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
                 out = proc.stdout + proc.stderr
-                if expect == "record":
+                if expect == "no-cr":
+                    # No chart CR: nothing to carry, neither omit nor a block, the release's values render it again.
+                    self.assertIn("No PlatformAgent 'platform-agent'", out)
+                    self.assertIn("RETAG_SCOPE_OMIT= RETAG_SCOPE_JSON=", out)
+                elif expect == "record":
                     self.assertIn("records no SCOPE_* key while the PlatformAgent carries a spec.scope", out)
                     self.assertIn('SCOPE_PROJECTS="payments-prod"', out)
                 elif expect == "refused":

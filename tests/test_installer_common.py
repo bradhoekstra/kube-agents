@@ -791,6 +791,13 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("accept_no_network_policy   = false", dest.read_text())
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "ACCEPT_NO_NETWORK_POLICY": "true"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("accept_no_network_policy   = true", dest.read_text())
 
     # ── write_tfvars_from_state: the multi-project scope block ───────────────
 
@@ -887,12 +894,16 @@ class InstallerCommonTest(unittest.TestCase):
         if exclusions:
             scope["exclude"] = {"projects": ["*-sandbox"],
                                 "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}
-        cr = {"items": [{"spec": {"scope": scope}}]}
+        chart_cr = {"metadata": {"name": "platform-agent"}, "spec": {"scope": scope}}
+        # The list carries a second, hand-made CR that sorts first: the guard
+        # reads every item, the retag reads the chart's by name.
+        other_cr = {"metadata": {"name": "aaa-other"}, "spec": {"scope": {"projects": ["other-project"]}}}
         return (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
             f'  *"current-context"*) echo "{current_context}"; exit 0 ;;\n'
-            f"  *\"--context gke_test-project_us-central1_test-cluster get platformagents\"*) cat <<'JSON'\n{json.dumps(cr)}\nJSON\nexit 0 ;;\n"
+            f"  *\"--context gke_test-project_us-central1_test-cluster get platformagents.kubeagents.x-k8s.io platform-agent\"*) cat <<'JSON'\n{json.dumps(chart_cr)}\nJSON\nexit 0 ;;\n"
+            f"  *\"--context gke_test-project_us-central1_test-cluster get platformagents\"*) cat <<'JSON'\n{json.dumps({'items': [other_cr, chart_cr]})}\nJSON\nexit 0 ;;\n"
             "esac\n"
             "exit 1\n"
         )
@@ -1060,8 +1071,8 @@ class InstallerCommonTest(unittest.TestCase):
         # exclusion. With no key at all the apply would render empty excludes
         # and re-onboard the cluster, so it is refused; any key set is the
         # declaration and proceeds.
-        cr = {"items": [{"spec": {"scope": {"exclude": {"clusters": [
-            {"projectId": "test-project", "location": "us-central1", "clusterName": "scratch"}]}}}}]}
+        cr = {"spec": {"scope": {"exclude": {"clusters": [
+            {"projectId": "test-project", "location": "us-central1", "clusterName": "scratch"}]}}}}
         kubectl = (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
@@ -1192,13 +1203,14 @@ class InstallerCommonTest(unittest.TestCase):
                 dest = pathlib.Path(out_dir) / "terraform.tfvars"
                 log = pathlib.Path(out_dir) / "gcloud.log"
                 proc = self._run(
-                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$? fetched=${{KUBECONFIG_CONTEXT_FETCHED:-}}"',
                     env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log), **fetched},
                     describe_stub="printf '\\n'; exit 0",
                     gcloud_stdout=MANAGED_CLUSTER_STATE,
                     kubectl_script=held,
                 )
-                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                # Either way the marker is set afterwards, so install.sh's own later fetch can skip.
+                self.assertIn("rc=0 fetched=true", proc.stdout, proc.stderr)
                 fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]
                 self.assertEqual(expected_fetches, len(fetches), fetches)
 
@@ -1246,11 +1258,13 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("  projects = []", dest.read_text())
 
     def test_live_scope_json_reads_the_crs_own_scope_or_fails(self):
-        # A retag carries the CR's scope exactly as it is, so the reader has
-        # to print it with every list present, print nothing for a CR without
-        # the block (absent stays absent through `omit`), and fail (never
-        # guess) when it cannot read the CR or finds none; scope_json_equal
-        # compares the sets and scope_values_json renders the keys.
+        # A retag carries the chart CR's scope exactly as it is, so the reader
+        # has to read that CR by name (a second PlatformAgent sorting first in
+        # the list must not stand in for it), print it with every list present,
+        # print nothing for a CR without the block (absent stays absent through
+        # `omit`), exit LIVE_SCOPE_NO_CR_RC with nothing printed when there is
+        # no such CR, and fail (never guess) when it cannot read the cluster;
+        # scope_json_equal compares the sets and scope_values_json renders the keys.
         with_scope = self._run(
             'live_scope_json kubeagents-system',
             kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
@@ -1262,16 +1276,17 @@ class InstallerCommonTest(unittest.TestCase):
              "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
         )
         no_block = self._run(
-            'live_scope_json kubeagents-system; echo "[$?]"',
+            'live_scope_json kubeagents-system | wc -c | tr -d " "; echo "rc=${PIPESTATUS[0]}"',
             kubectl_script=(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
-                '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
+                '  *"get platformagents.kubeagents.x-k8s.io platform-agent"*) echo \'{"spec":{}}\'; exit 0 ;;\n'
                 "esac\n"
                 "exit 1\n"
             ),
         )
-        self.assertEqual(no_block.stdout.strip(), "[0]", no_block.stderr)
+        self.assertIn("rc=0", no_block.stdout, no_block.stderr)
+        self.assertEqual(no_block.stdout.strip().split("\n")[0], "0", no_block.stderr)
         unreadable = self._run('live_scope_json kubeagents-system; echo "rc=$?"',
                                kubectl_script='#!/usr/bin/env bash\necho "error: context was not found for specified context: gke_x" >&2\nexit 1\n')
         self.assertIn("rc=1", unreadable.stdout, unreadable.stderr)
@@ -1283,14 +1298,14 @@ class InstallerCommonTest(unittest.TestCase):
             kubectl_script=(
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
-                '  *"get platformagents"*) echo \'{"items":[]}\'; exit 0 ;;\n'
+                '  *"get platformagents.kubeagents.x-k8s.io platform-agent"*) echo \'Error from server (NotFound): platformagents.kubeagents.x-k8s.io "platform-agent" not found\' >&2; exit 1 ;;\n'
                 "esac\n"
                 "exit 1\n"
             ),
         )
-        self.assertIn("rc=1", none.stdout, none.stderr)
+        self.assertEqual(none.stdout.strip(), "rc=2", none.stderr)
         equal = self._run(
-            'scope_json_equal \'{"projects":["b","a"],"exclude":{"projects":[],"clusters":[]}}\' \'{"projects":["a","b"]}\'; echo "rc=$?"'
+            'scope_json_equal \'{"projects":["b","a"],"exclude":{"projects":[],"clusters":[]}}\' \'{"projects":["a","b"]}\'; echo "rc=$?"',
         )
         self.assertIn("rc=0", equal.stdout, equal.stderr)
         keys = self._run(
@@ -1316,15 +1331,15 @@ class InstallerCommonTest(unittest.TestCase):
             return (
                 "#!/usr/bin/env bash\n"
                 'case "$*" in\n'
-                '  *"get platformagents"*)\n'
-                '    if [ -f "$KUBECTL_STATE" ]; then echo \'' + second + '\'; else touch "$KUBECTL_STATE"; echo \'{"items":[{"spec":{}}]}\'; fi; exit 0 ;;\n'
+                '  *"get platformagents.kubeagents.x-k8s.io platform-agent"*)\n'
+                '    if [ -f "$KUBECTL_STATE" ]; then echo \'' + second + '\'; else touch "$KUBECTL_STATE"; echo \'{"spec":{}}\'; fi; exit 0 ;;\n'
                 '  *"get crd"*) if [ -n "${CRD_READ_FAILS:-}" ]; then echo "crd unreadable in this test" >&2; exit 1; fi; printf "%s" "${CRD_SERVES_SCOPE-object}"; exit 0 ;;\n'
                 "esac\n"
                 "exit 1\n"
             )
         helm_logging = '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$HELM_CALL_LOG"\nexit 0\n'
-        present = '{"items":[{"spec":{"scope":{"projects":["payments-prod"]}}}]}'
-        absent = '{"items":[{"spec":{}}]}'
+        present = '{"spec":{"scope":{"projects":["payments-prod"]}}}'
+        absent = '{"spec":{}}'
         with tempfile.TemporaryDirectory() as tmp:
             state = pathlib.Path(tmp) / "kubectl.state"
             log = pathlib.Path(tmp) / "helm.log"
@@ -1519,20 +1534,12 @@ class InstallerCommonTest(unittest.TestCase):
                     "#!/usr/bin/env bash\n"
                     'case "$*" in\n'
                     '  *"current-context"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
-                    '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
+                    '  *"get platformagents"*) echo \'{"spec":{}}\'; exit 0 ;;\n'
                     "esac\n"
                     "exit 1\n"
                 ),
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
-
-            proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "ACCEPT_NO_NETWORK_POLICY": "true"},
-                describe_stub="printf '\\n'; exit 0",
-            )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn("accept_no_network_policy   = true", dest.read_text())
 
     def test_tfvars_carry_model_max_tokens(self):
         # Empty and unset both take DEFAULT_MODEL_MAX_TOKENS (0), which renders

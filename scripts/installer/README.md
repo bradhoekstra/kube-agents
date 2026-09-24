@@ -248,7 +248,7 @@ kind, so adding a project, removing a project (other than
 the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or any of these in one edit, and running
 `upgrade.sh` is never refused; emptying the
 scope on purpose, the last project included, or replacing the list outright, is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
-destroy keeps nothing either way. The check reads the CR through the install's own kubeconfig
+destroy keeps nothing either way. The check reads the chart's own `PlatformAgent`, by name, through the install's own kubeconfig
 context by name and fails closed: a read it cannot make refuses the run with the same override,
 because the apply that follows would not stop. `upgrade.sh`'s `harness` and `operator` modes leave the CR's scope exactly as it is on every Helm
 retag, hand edits included, since they run no Terraform: the retag reads the live scope back before

@@ -149,6 +149,16 @@ readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could no
 # Where the served PlatformAgent CRD's schema carries spec.scope, for a served-CRD check.
 readonly CRD_SCOPE_FIELD_JSONPATH='{.spec.versions[*].schema.openAPIV3Schema.properties.spec.properties.scope.type}'
 readonly PLATFORMAGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+# The chart's PlatformAgent, `platformAgent.name` in charts/kube-agents/values.yaml,
+# which the composition does not rename: the CR a retag reads and writes back.
+readonly PLATFORM_AGENT_CR_NAME="platform-agent"
+# kubectl's wording for a named object the API server does not hold ("Error from server
+# (NotFound): ... not found"); the server's marker alone, since a missing kubeconfig
+# context also says "not found" and is a failed read, not an absent object.
+readonly KUBECTL_NOT_FOUND_PATTERN='\(NotFound\)'
+# live_scope_json's exit code for a cluster with no such PlatformAgent (nothing to carry),
+# distinct from 1, a read that failed.
+readonly LIVE_SCOPE_NO_CR_RC=2
 # kubectl naming a --context the kubeconfig does not hold (two wordings across releases).
 readonly KUBECTL_NO_CONTEXT_PATTERN="context was not found for specified context|context .* does not exist"
 
@@ -1584,28 +1594,32 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 # one with its grants still bound), and the chart's default is empty lists, so
 # a retag that said nothing would empty it; and an absent block cannot be
 # dropped for a present one either, since the reconcile lists the management
-# project alone without the block. Reads through the install's context by
-# name and fails, with kubectl's message, when it cannot read the CR or finds
-# none. A CR with no scope block prints nothing and succeeds: the caller
-# renders no block (`platformAgent.scope.omit`) so absent stays absent.
+# project alone without the block. Reads the chart's own CR, by name (a second
+# PlatformAgent in the namespace, admitted while the webhook was not serving,
+# must not have its scope written onto the chart's), through the install's
+# context by name, and fails, with kubectl's message, when it cannot read it.
+# No such CR, or no CRD served, exits LIVE_SCOPE_NO_CR_RC with nothing
+# printed: there is nothing to carry, and the caller decides. A CR with no
+# scope block prints nothing and succeeds: the caller renders no block
+# (`platformAgent.scope.omit`) so absent stays absent.
 live_scope_json() {
-  local ns="$1" context cr_json err_file
+  local ns="$1" context cr_json err_file kubectl_err
   context="$(gke_context_name)"
   # kubectl's own failure is the message; python never sees an empty stdin.
   err_file="$(mktemp)"
-  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json 2>"$err_file")"; then
-    cat "$err_file" >&2
+  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io "$PLATFORM_AGENT_CR_NAME" -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json 2>"$err_file")"; then
+    kubectl_err="$(cat "$err_file" 2>/dev/null)"
     rm -f "$err_file"
+    if printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NOT_FOUND_PATTERN|$KUBECTL_NO_RESOURCE_TYPE_PATTERN"; then
+      return "$LIVE_SCOPE_NO_CR_RC"
+    fi
+    printf '%s\n' "$kubectl_err" >&2
     return 1
   fi
   rm -f "$err_file"
   printf '%s' "$cr_json" | python3 -c '
 import json, sys
-items = json.load(sys.stdin).get("items", [])
-if not items:
-    print("no PlatformAgent found", file=sys.stderr)
-    sys.exit(1)
-scope = (items[0].get("spec") or {}).get("scope")
+scope = (json.load(sys.stdin).get("spec") or {}).get("scope")
 if scope is None:
     sys.exit(0)
 exclude = scope.get("exclude") or {}
@@ -1737,7 +1751,8 @@ verify_scope_block_after_apply() {
 # SCOPE_GUARD_ENABLED=false for one run. Nothing is read from the Helm
 # release: what the chart last rendered is no guide to what the CR carries.
 #
-# Fails closed. The check reads the CR through the install's own kubeconfig
+# Fails closed. The check reads the chart's own PlatformAgent, by name (the
+# one CR the apply rewrites), through the install's own kubeconfig
 # context by name, not the current context, and when it cannot (a context
 # missing from the kubeconfig, an endpoint unreachable from here, a 403, no
 # python3) it refuses rather than proceed: the apply that follows
@@ -1770,11 +1785,14 @@ guard_hand_declared_scope() {
   local cr_json kubectl_err
   local err_file
   err_file="$(mktemp)"
-  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json 2>"$err_file")"; then
+  # The chart's own CR, by name: the apply rewrites that one and no other, so
+  # a second PlatformAgent in the namespace is neither protected nor compared.
+  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io "$PLATFORM_AGENT_CR_NAME" -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json 2>"$err_file")"; then
     kubectl_err="$(cat "$err_file" 2>/dev/null)"; rm -f "$err_file"
-    # No CRD means no kube-agents on the cluster yet (every first adoption):
-    # there is no CR to protect, and a refusal here would block every adoption.
-    if printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN"; then
+    # No CRD means no kube-agents on the cluster yet (every first adoption),
+    # and no such CR means nothing the apply would rewrite: nothing to
+    # protect either way, and a refusal here would block every adoption.
+    if printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN|$KUBECTL_NOT_FOUND_PATTERN"; then
       return 0
     fi
     # A run that applies nothing fetches no credentials, so on a machine that
@@ -1803,7 +1821,7 @@ sep = os.environ["SCOPE_SEP"]
 key_projects = split("SCOPE_PROJECTS")
 key_exclusions = bool(split("SCOPE_EXCLUDE_PROJECTS") or split("SCOPE_EXCLUDE_CLUSTERS"))
 try:
-    items = json.load(sys.stdin).get("items", [])
+    items = [json.load(sys.stdin)]
 except Exception as exc:
     print("unreadable: %s" % exc, file=sys.stderr)
     sys.exit(2)
@@ -1995,11 +2013,12 @@ write_tfvars_from_state() {
   #
   # The widening is for the guard, and only for a run the guard can refuse
   # whose caller has not fetched already: with the guard off (uninstall.sh)
-  # or speaking without refusing (install.sh --dry-run / --generate-only,
-  # upgrade.sh --plan), the fetch stays what it was, an adoption's alone, and
-  # a caller that fetched this run (upgrade.sh, which exports
-  # KUBECONFIG_CONTEXT_FETCHED after its own get-credentials) is not made to
-  # fetch twice. A context the kubeconfig merely holds is not trusted as is:
+  # or speaking without refusing (install.sh --dry-run, upgrade.sh --plan),
+  # the fetch stays what it was, an adoption's alone, and a caller that
+  # fetched this run (upgrade.sh, which exports KUBECONFIG_CONTEXT_FETCHED
+  # after its own get-credentials) is not made to fetch twice; the same
+  # marker is exported after the fetch below, so install.sh's own later fetch
+  # can skip it too. A context the kubeconfig merely holds is not trusted as is:
   # it may point at an earlier cluster of the same name (a first install that
   # died past the create and is re-run), and a fetch is what refreshes it. So
   # a teardown or a dry run over a cluster this state created neither
@@ -2017,6 +2036,7 @@ write_tfvars_from_state() {
     # shellcheck disable=SC2086
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
       --project "${PROJECT_ID}" ${GKE_DNS_ENDPOINT_FLAG:-} >/dev/null 2>&1 || true
+    export KUBECONFIG_CONTEXT_FETCHED="true"
   fi
 
   # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
