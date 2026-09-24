@@ -546,7 +546,12 @@ def _resolve_projects(management: str | None, scope: dict,
         members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
         if members is not None:
             fresh = [p for p in sorted(members) if p not in seen and not _excluded_by(p, patterns)]
-            if listed_count() + len(fresh) > RESOLVED_SET_CAP:
+            # A member an earlier container carried over-cap is in the set but not listed;
+            # this container would list it (the live listing wins below), so it counts here
+            # like a fresh one, or a second, overlapping container would lift a whole
+            # over-cap folder past the cap without a check.
+            lifted = [p for p in members if p in seen and (frozen_entry(p) or {}).get("outcome") == OUTCOME_OVER_CAP]
+            if listed_count() + len(fresh) + len(lifted) > RESOLVED_SET_CAP:
                 # The lookup succeeded and the run holds the full member list, but listing
                 # them would cross the cap: the members the run just resolved are carried
                 # reading over-cap and get no CREATE, and because the run knows they are
@@ -582,7 +587,8 @@ def _resolve_projects(management: str | None, scope: dict,
                 add_via(project, container)
                 mark_indexed(project)
                 # Listed by this container but carried frozen by an earlier one: the live
-                # listing wins, whichever container sorted first.
+                # listing wins, whichever container sorted first (an over-cap one was counted
+                # against the cap above before this container read ok).
                 frozen = frozen_entry(project)
                 if frozen:
                     frozen.pop("frozen")

@@ -1540,6 +1540,38 @@ class ScopeTest(HomesMixin):
         rows = {p["id"]: p for p in self._snapshot()["projects"]}
         self.assertEqual((rows["q-0"]["outcome"], rows["small"]["outcome"]), (rec.OUTCOME_OVER_CAP, rec.OUTCOME_OK))
 
+    def test_a_later_container_cannot_lift_an_over_cap_members_past_the_cap(self):
+        # Cap 3, management plus explicit p and q already listed. F1 = {a} crosses the cap and
+        # carries a over-cap; F2 = {a} would list a live, so a counts against the cap for F2
+        # and F2 reads over-cap too: nothing is created, three projects listed.
+        f1, f2 = "folders/111111111111", "folders/222222222222"
+        a = {"a": [("a", "c", "us-central1")]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            report, created, _ = self._run({"projects": ["p", "q"], "folders": [f1[8:], f2[8:]]},
+                                           {self.MGMT: [], "p": [], "q": []},
+                                           searches={f1: (a, rec.OUTCOME_OK), f2: (a, rec.OUTCOME_OK)})
+        self.assertEqual(created, [])
+        containers = {c["id"]: c for c in self._snapshot()["containers"]}
+        self.assertEqual((containers[f1]["outcome"], containers[f2]["outcome"]), (rec.OUTCOME_OVER_CAP, rec.OUTCOME_OVER_CAP))
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["a"]["outcome"], rows["a"]["via"]), (rec.OUTCOME_OVER_CAP, [f1, f2]))
+        self.assertEqual(len([p for p in rows.values() if p["outcome"] != rec.OUTCOME_OVER_CAP]), 3)
+
+    def test_a_sub_folder_that_fits_lifts_its_members_out_of_the_parents_over_cap(self):
+        # The CRD page's remedy: the parent crosses the cap, the declared sub-folder that holds
+        # the clusters fits, and its members take the live listing; the rest stay over-cap.
+        parent, sub = "folders/111111111111", "folders/222222222222"
+        big = {f"q-{i}": [(f"q-{i}", "c", "us-central1")] for i in range(5)}
+        small = {"q-0": big["q-0"], "q-1": big["q-1"]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            report, created, _ = self._run({"folders": [parent[8:], sub[8:]]}, {self.MGMT: []},
+                                           searches={parent: (big, rec.OUTCOME_OK), sub: (small, rec.OUTCOME_OK)})
+        self.assertEqual(created, [("q-0", "c", "us-central1"), ("q-1", "c", "us-central1")])
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["q-0"]["outcome"], rows["q-2"]["outcome"]), (rec.OUTCOME_OK, rec.OUTCOME_OVER_CAP))
+        containers = {c["id"]: c for c in self._snapshot()["containers"]}
+        self.assertEqual((containers[parent]["outcome"], containers[sub]["outcome"]), (rec.OUTCOME_OVER_CAP, rec.OUTCOME_OK))
+
     def test_an_over_cap_members_stamp_clears_because_the_index_placed_it(self):
         old = "2020-01-01T00:00:00Z"
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
