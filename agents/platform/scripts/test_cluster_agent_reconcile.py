@@ -705,9 +705,13 @@ class ScopeTest(HomesMixin):
         path.write_text(json.dumps(scope), encoding="utf-8")
         os.environ[rec.SCOPE_FILE_ENV] = str(path)
 
-    def _write_previous(self, projects: list[dict]):
-        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(
-            json.dumps({"projects": projects}), encoding="utf-8")
+    def _write_previous(self, projects: list[dict], containers: list[dict] | None = None):
+        # No `containers` key stands for a snapshot from before folders, or one written with
+        # none declared: every container declared next run then reads as newly declared.
+        snapshot = {"projects": projects}
+        if containers is not None:
+            snapshot["containers"] = containers
+        (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(snapshot), encoding="utf-8")
 
     def _snapshot(self) -> dict:
         return json.loads((Path(self._tmp.name) / rec.SNAPSHOT_FILE).read_text(encoding="utf-8"))
@@ -1200,9 +1204,12 @@ class ScopeTest(HomesMixin):
         self.assertIn("cluster-p2", report["unmanaged"])
 
     def test_an_over_cap_folder_carries_its_members_without_holding_back_the_prune(self):
+        # The folder was declared before this run (the previous snapshot carries it), so the
+        # dropped explicit project is the declaration's to retire, not a same-edit migration.
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE},
-                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}],
+                             containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1}])
         ids = {"cluster-a": _identity("team-a", "prod"), "cluster-p2": _identity("p2", "x")}
         big = {f"proj-{i:03d}": [(f"proj-{i:03d}", "c", "us-central1")] for i in range(rec.RESOLVED_SET_CAP)}
         with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
@@ -1442,6 +1449,41 @@ class ScopeTest(HomesMixin):
                                              profiles=["cluster-a"], identities=ids,
                                              searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
         self.assertEqual((deleted, report["kept"]), ([], ["cluster-a"]))
+
+    def test_a_project_moved_into_a_folder_declared_in_the_same_edit_is_kept_through_the_lag(self):
+        # The other ordering of the migration: the folder is declared and the explicit entry
+        # dropped in one edit, within the index's lag after the move. The previous row's via
+        # names no container, so the newly declared container is what keeps it, for a day.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        stamps = set()
+        for _ in range(3):
+            report, _, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                           profiles=["cluster-a"], identities=ids, searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+            self.assertEqual((deleted, report["retiring"], report["unmanaged"]), ([], [], ["cluster-a"]))
+            rows = {p["id"]: p for p in self._snapshot()["projects"]}
+            self.assertEqual(rows["team-a"]["state"], rec.STATE_IN_SCOPE)
+            stamps.add(rows["team-a"][rec.ABSENT_SINCE_KEY])
+        self.assertEqual(len(stamps), 1)  # the container is no longer new on the later runs; the stamp carries
+        # The index catches up: listed through the folder, nothing lost, the clock gone.
+        report, _, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=["cluster-a"], identities=ids,
+                                       searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["kept"]), ([], ["cluster-a"]))
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, {p["id"]: p for p in self._snapshot()["projects"]}["team-a"])
+        # Past the grace, the ordinary two-run retire: the leak has the same ceiling.
+        old = "2020-01-01T00:00:00Z"
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit"], "state": rec.STATE_IN_SCOPE, rec.ABSENT_SINCE_KEY: old}])
+        report, _, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=["cluster-a"], identities=ids, searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
+        # Dropped from `projects` with no new container declared: the declaration decides, as before.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
 
     def test_an_over_cap_members_stamp_clears_because_the_index_placed_it(self):
         old = "2020-01-01T00:00:00Z"
