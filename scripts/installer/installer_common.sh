@@ -146,6 +146,8 @@ readonly SCOPE_LIST_MAX_ENTRIES=100
 # kubectl's wording for a resource type the cluster does not serve: a cluster
 # with no kube-agents CRD on it, which is every first adoption.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could not find the requested resource"
+# kubectl naming a --context the kubeconfig does not hold (two wordings across releases).
+readonly KUBECTL_NO_CONTEXT_PATTERN="context was not found for specified context|context .* does not exist"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
 # provider name everything downstream reads. The inverse of install.sh's
@@ -1723,6 +1725,13 @@ guard_hand_declared_scope() {
     if printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NO_RESOURCE_TYPE_PATTERN"; then
       return 0
     fi
+    # A run that applies nothing fetches no credentials, so on a machine that
+    # never held this cluster's context the check has nothing to read through.
+    # The apply fetches them and runs the check for real.
+    if [ "$refuses" = "false" ] && printf '%s' "$kubectl_err" | grep -qiE "$KUBECTL_NO_CONTEXT_PATTERN"; then
+      print_info "The hand-declared-scope check did not run: this machine holds no kubeconfig context '${context}', and a run that applies nothing fetches none. The apply fetches credentials and runs the check."
+      return 0
+    fi
     _scope_guard_skipped "could not read the PlatformAgent in '${ns}' through kubectl context '${context}' (${kubectl_err:-no detail})"
     return $?
   fi
@@ -1925,12 +1934,16 @@ write_tfvars_from_state() {
   # flag is resolved here whenever the helper is sourced (both front doors
   # source it) and otherwise taken as the caller left it.
   #
-  # The widening is for the guard: with the guard off (uninstall.sh), the
-  # fetch stays what it was, an adoption's alone, so a teardown of a cluster
-  # this state created neither rewrites the operator's kubeconfig nor opens
-  # the Secret recovery below.
+  # The widening is for the guard, and only for a run the guard can refuse:
+  # with the guard off (uninstall.sh) or speaking without refusing (install.sh
+  # --dry-run / --generate-only, upgrade.sh --plan), the fetch stays what it
+  # was, an adoption's alone. So a teardown or a dry run over a cluster this
+  # state created neither rewrites the operator's kubeconfig nor opens the
+  # Secret recovery below; a warn-only run reads the CR through a context the
+  # machine already holds, and says so when it holds none.
   if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 &&
-    { [ "$create_cluster" = "false" ] || is_truthy "${SCOPE_GUARD_ENABLED:-true}"; }; then
+    { [ "$create_cluster" = "false" ] ||
+      { is_truthy "${SCOPE_GUARD_ENABLED:-true}" && is_truthy "${SCOPE_GUARD_REFUSES:-true}"; }; }; then
     if type gke_dns_endpoint_flag >/dev/null 2>&1; then
       GKE_DNS_ENDPOINT_FLAG=""
       gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true

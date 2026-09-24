@@ -1377,14 +1377,17 @@ warn_flag_beats_unrecorded_file_value() {
 # other flag-beats-file cases above are warned about because the next run
 # re-reads the file and the reversal shows: a namespace moves a release, a
 # backup plan is destroyed in the plan. A scope set by flag is different: the
-# composition renders it into the CR and records it in the Helm release, so the
-# next upgrade.sh (any mode) regenerates from the file, finds the CR equal to
-# the release's record, treats the scope as chart-owned and lets the keys
-# decide -- projects: [] -- and the reconcile retires those projects' Cluster
-# Agent profiles with nothing having said so. So on an existing install.env a
-# --scope-* value that the file does not already record is refused before the
-# apply, with the line to add. A first install records the flags into the file
-# it writes, and this returns 0 there.
+# composition renders it into the CR, and the next upgrade.sh regenerates from
+# the file without it. Where the file's keys would drop what the CR carries,
+# the hand-declared-scope guard (installer_common.sh) refuses that full
+# upgrade until the file records it, and a harness/operator retag carries the
+# CR's scope forward with a warning: the install is stuck one edit away from
+# upgradable, on a later day, for a reason the operator has to rediscover.
+# Where the file records a different list instead, nothing refuses, and the
+# reconcile retires the profiles of every project the flag added. So on an
+# existing install.env a --scope-* value that the file does not already
+# record is refused before the apply, with the line to add. A first install
+# records the flags into the file it writes, and this returns 0 there.
 # A scope list as the set it declares: split on the separators every reader
 # accepts, sorted, one per line. Two spellings of one list compare equal, and
 # an empty value compares as the empty set rather than as "no flag".
@@ -1416,14 +1419,14 @@ refuse_unrecorded_scope_flags() {
       [ "$flagged" = "true" ] || continue
       recorded="${!key:-}"
       [ "$(normalised_scope_list "$recorded")" != "$(normalised_scope_list "$value")" ] || continue
-      print_error "${flag}=\"${value}\" disagrees with ${key}=\"${recorded}\" in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and reverses it, retiring the Cluster Agent profiles of every project the flag added or bringing back every project it removed."
+      print_error "${flag}=\"${value}\" disagrees with ${key}=\"${recorded}\" in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and reverses it, retiring the Cluster Agent profiles of every project the flag added or bringing back every project it removed, or is refused by the hand-declared-scope check where the file's value would drop what the CR carries."
     else
       # Not recorded: a value here came from the flag or from the process
       # environment (every install.env written before the keys existed lacks
       # them, and the file does not clear an inherited value it does not
       # carry). Either door leads to the same reversal on the next upgrade.
       [ -n "$value" ] || continue
-      print_error "${key}=\"${value}\" (from ${flag} or the environment) is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file and retires the Cluster Agent profiles of every project it added."
+      print_error "${key}=\"${value}\" (from ${flag} or the environment) is not recorded in ${file}, and a scope cannot be set for one run: the next upgrade.sh regenerates from the file without it, and its hand-declared-scope check refuses the apply until the file records what the CR carries."
     fi
     print_info "Set ${key}=\"${value}\" in ${file} and re-run without ${flag}; the generator reads it on every run."
     refused="true"

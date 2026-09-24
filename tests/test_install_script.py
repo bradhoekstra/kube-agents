@@ -2086,9 +2086,11 @@ class InstallEnvInputTest(unittest.TestCase):
 
     def test_a_scope_flag_that_the_existing_file_does_not_record_is_refused(self):
         """A scope cannot be set for one run: the next upgrade.sh regenerates
-        from the file, the guard reads the CR as chart-owned, and the flag's
-        projects are retired. So the flag is refused before the apply, with
-        the line to add, whether the key disagrees or is absent."""
+        from the file, and either the hand-declared-scope check refuses it
+        (the file would drop what the CR carries) or, where the file records a
+        different list, the flag's projects are retired. So the flag is
+        refused before the apply, with the line to add, whether the key
+        disagrees or is absent."""
         for contents, flag in (
             ("PROJECT_ID=p\nSCOPE_PROJECTS=payments-prod\n", "--scope-projects=payments-staging"),
             ("PROJECT_ID=p\n", "--scope-projects=payments-staging"),

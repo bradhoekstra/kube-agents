@@ -948,8 +948,8 @@ class InstallerCommonTest(unittest.TestCase):
 
     def test_an_installer_rendered_scope_shrinks_through_the_keys(self):
         # The documented lifecycle: remove payments-staging from SCOPE_PROJECTS, run
-        # upgrade.sh. The release recorded the same scope the CR carries, so
-        # the CR is chart-owned and the run proceeds with projects = ["payments-prod"].
+        # upgrade.sh. SCOPE_PROJECTS still names a project, so the guard reads the
+        # edit as the shrink it is and the run proceeds with projects = ["payments-prod"].
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -1124,6 +1124,50 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("create_cluster             = true", dest.read_text())
             self.assertEqual([], [line for line in log.read_text().splitlines() if "get-credentials" in line])
+
+    def test_a_warn_only_run_fetches_no_credentials_for_a_cluster_its_state_created(self):
+        # install.sh --dry-run / --generate-only and upgrade.sh --plan apply
+        # nothing, so the fetch that exists for the guard stays off: a dry run
+        # over a cluster this state created leaves the operator's kubeconfig
+        # alone, and when the machine holds no context for the cluster the
+        # check says it did not run and points at the apply, as information.
+        no_context = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"current-context"*) echo "some-other-context"; exit 0 ;;\n'
+            "esac\n"
+            'echo "Error in configuration: context was not found for specified context: gke_test-project_us-central1_test-cluster" >&2\n'
+            "exit 1\n"
+        )
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            log = pathlib.Path(out_dir) / "gcloud.log"
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; print_info() { echo "INFO: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_GUARD_REFUSES": "false", "GCLOUD_CALL_LOG": str(log)},
+                describe_stub="printf '\\n'; exit 0",
+                gcloud_stdout=MANAGED_CLUSTER_STATE,
+                kubectl_script=no_context,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("create_cluster             = true", dest.read_text())
+            self.assertEqual([], [line for line in log.read_text().splitlines() if "get-credentials" in line])
+            self.assertIn("INFO: The hand-declared-scope check did not run", proc.stdout)
+            self.assertNotIn("WARN:", proc.stdout)
+            # A run that refuses still fetches, and a context it then cannot
+            # read through is the refusal it always was.
+            log.unlink()
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
+                describe_stub="printf '\\n'; exit 0",
+                gcloud_stdout=MANAGED_CLUSTER_STATE,
+                kubectl_script=no_context,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertEqual(1, len([line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]))
+            self.assertIn("could not run", proc.stdout + proc.stderr)
 
     def test_a_plan_sees_the_hand_declared_scope_message_and_goes_on(self):
         # upgrade.sh --plan applies nothing, and the plan is what shows the
