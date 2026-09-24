@@ -1175,6 +1175,31 @@ class InstallerCommonTest(unittest.TestCase):
                 fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]
                 self.assertEqual(expected_fetches, len(fetches), fetches)
 
+    def test_a_retag_is_not_stopped_by_a_scope_entry_it_never_applies(self):
+        # upgrade.sh's harness and operator modes set SCOPE_INVALID_STOPS=false:
+        # a triple the CRD would refuse is a warning and terraform.tfvars is left
+        # as it was, never rewritten with a scope install.env does not declare;
+        # every other run still refuses before writing.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            dest.write_text("# the previous run's file\n")
+            proc = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "prod/us-central1/", "SCOPE_INVALID_STOPS": "false",
+                     "SCOPE_GUARD_ENABLED": "false"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("WARN: install.env's SCOPE_* keys carry an entry the CRD would refuse", proc.stdout)
+            self.assertEqual(dest.read_text(), "# the previous run's file\n")
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "prod/us-central1/", "SCOPE_GUARD_ENABLED": "false"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+
     def test_a_plan_sees_the_hand_declared_scope_message_and_goes_on(self):
         # upgrade.sh --plan applies nothing, and the plan is what shows the
         # operator the destroys the refusal protects against, so the check
@@ -1220,8 +1245,12 @@ class InstallerCommonTest(unittest.TestCase):
             ),
         )
         self.assertEqual(no_block.stdout.strip(), "[0]", no_block.stderr)
-        unreadable = self._run('live_scope_json kubeagents-system; echo "rc=$?"', kubectl_script="#!/usr/bin/env bash\nexit 1\n")
+        unreadable = self._run('live_scope_json kubeagents-system; echo "rc=$?"',
+                               kubectl_script='#!/usr/bin/env bash\necho "error: context was not found for specified context: gke_x" >&2\nexit 1\n')
         self.assertIn("rc=1", unreadable.stdout, unreadable.stderr)
+        # kubectl's message, not a Python traceback over an empty stdin.
+        self.assertIn("context was not found", unreadable.stderr)
+        self.assertNotIn("Traceback", unreadable.stderr)
         none = self._run(
             'live_scope_json kubeagents-system; echo "rc=$?"',
             kubectl_script=(

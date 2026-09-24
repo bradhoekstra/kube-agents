@@ -1591,9 +1591,17 @@ kubeconfig_holds_context() {
 # none. A CR with no scope block prints nothing and succeeds: the caller
 # renders no block (`platformAgent.scope.omit`) so absent stays absent.
 live_scope_json() {
-  local ns="$1" context
+  local ns="$1" context cr_json err_file
   context="$(gke_context_name)"
-  kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json | python3 -c '
+  # kubectl's own failure is the message; python never sees an empty stdin.
+  err_file="$(mktemp)"
+  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json 2>"$err_file")"; then
+    cat "$err_file" >&2
+    rm -f "$err_file"
+    return 1
+  fi
+  rm -f "$err_file"
+  printf '%s' "$cr_json" | python3 -c '
 import json, sys
 items = json.load(sys.stdin).get("items", [])
 if not items:
@@ -2197,9 +2205,17 @@ write_tfvars_from_state() {
 
   # The multi-project scope, rendered here rather than inside the redirected
   # block below so a malformed SCOPE_EXCLUDE_CLUSTERS triple fails before any
-  # partial file exists.
+  # partial file exists. A run that applies none of the keys (upgrade.sh's
+  # harness and operator retags, which set SCOPE_INVALID_STOPS=false) warns
+  # and leaves the file as it was instead: the file stays faithful to the
+  # keys that last rendered, never carrying a scope install.env does not
+  # declare, and the retag goes on.
   local scope_block
-  scope_block="$(hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}")" || return 1
+  if ! scope_block="$(hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}")"; then
+    is_truthy "${SCOPE_INVALID_STOPS:-true}" && return 1
+    print_warning "install.env's SCOPE_* keys carry an entry the CRD would refuse (named above). This run applies none of them, so terraform.tfvars is left as it was; fix the line before a full upgrade, which renders the keys."
+    return 0
+  fi
 
   local old_umask
   old_umask="$(umask)"

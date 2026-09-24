@@ -950,21 +950,17 @@ main() {
     export SCOPE_GUARD_ENABLED="false"
   fi
   # A retag never applies the SCOPE_* keys (helm_retag passes the CR's scope
-  # back), so a malformed line in them must not stop it, the way it must not
-  # stop a teardown: the generator runs with the keys empty and they come
-  # back afterwards, for the retag's own comparison against the live scope.
-  local -a retag_saved_scope=()
-  if [ "$PARAM_UPGRADE_MODE" != "full" ]; then
-    retag_saved_scope=("${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}")
-    export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  # back), so a malformed line in them must not stop it: the generator warns
+  # and leaves terraform.tfvars as it was, which keeps the file faithful to
+  # install.env for a hand-run apply. A plan renders what a full upgrade
+  # would, in every mode, so it keeps the keys and the refusal.
+  if [ "$PARAM_PLAN" != "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+    export SCOPE_INVALID_STOPS="false"
   fi
   # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
-  if [ "$PARAM_UPGRADE_MODE" != "full" ]; then
-    export SCOPE_PROJECTS="${retag_saved_scope[0]}" SCOPE_EXCLUDE_PROJECTS="${retag_saved_scope[1]}" SCOPE_EXCLUDE_CLUSTERS="${retag_saved_scope[2]}"
-  fi
 
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"

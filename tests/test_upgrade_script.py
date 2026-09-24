@@ -536,15 +536,13 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         # The NAMESPACE prefix is joined to the generator call itself: a
         # continuation onto a comment line would leave it a bare assignment.
         self.assertIn('NAMESPACE="$target_namespace" \\\n    write_tfvars_from_state "', text)
-        # A retag never applies the keys, so the generator runs with them empty
-        # (a malformed line must not stop a retag) and gets them back after,
-        # for the retag's own comparison against the live scope.
-        empty_at = text.index('export SCOPE_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""')
-        self.assertLess(empty_at, generate_at)
-        self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n    retag_saved_scope=(', text[:empty_at])
-        restore_at = text.index('export SCOPE_PROJECTS="${retag_saved_scope[0]}"')
-        self.assertLess(generate_at, restore_at)
-        self.assertLess(restore_at, text.index('RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"'))
+        # A retag never applies the keys, so a malformed line is a warning that
+        # leaves terraform.tfvars as it was rather than a stop; the keys are
+        # never blanked (the file must stay faithful to install.env for a
+        # hand-run apply), and a plan keeps the refusal in every mode.
+        switch_at = text.index('if [ "$PARAM_PLAN" != "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n    export SCOPE_INVALID_STOPS="false"')
+        self.assertLess(switch_at, generate_at)
+        self.assertNotIn('export SCOPE_PROJECTS=""', text)
 
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
