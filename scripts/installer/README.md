@@ -237,14 +237,14 @@ fails the generator before any file is written, on every run that applies the ke
 file then keeps the previous run's scope block and image tag until a full upgrade). An install whose `PlatformAgent` declares a scope that these keys would empty is refused
 too, with the three lines that carry the whole live declaration printed: the CR names projects and
 `SCOPE_PROJECTS` names none of them, or the CR carries exclusions while neither `SCOPE_EXCLUDE_*` key is set and
-`SCOPE_PROJECTS` names nothing or names a project the CR does not carry. That is the install whose scope was set by hand before the
+`SCOPE_PROJECTS` names nothing or names none of the CR's projects. That is the install whose scope was set by hand before the
 keys existed, or an `install.env` that recorded part of it (the project to add rather than the live list), and it is also what removing the last
 project, or replacing the whole list, looks like: the check cannot tell them apart, so it stops both. It does not protect an
 exclusion added to the CR by hand (the `manage-cluster` skill's route) on an install whose
 `SCOPE_PROJECTS` names the CR's projects: record the triple in `SCOPE_EXCLUDE_CLUSTERS` before the
-next full upgrade, or that upgrade drops it and the reconcile re-onboards the cluster. A key that shares a project with the CR grows and shrinks the list freely, and keys that name the CR's
-projects, or a subset of them, are the declaration for every kind, so adding a project, removing a project (other than
-the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or both in one edit, and running
+next full upgrade, or that upgrade drops it and the reconcile re-onboards the cluster. A key that shares a project with the CR was derived from it and is the declaration for every
+kind, so adding a project, removing a project (other than
+the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or any of these in one edit, and running
 `upgrade.sh` is never refused; emptying the
 scope on purpose, the last project included, or replacing the list outright, is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
 destroy keeps nothing either way. The check reads the CR through the install's own kubeconfig

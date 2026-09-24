@@ -485,8 +485,13 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         block = text[start:end]
         empty = '{"projects": [], "exclude": {"projects": [], "clusters": []}}'
         declared = '{"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}'
-        for live, expect_notice in ((empty, False), (declared, True)):
-            with self.subTest(live=live):
+        no_keys = {"SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+        # Keys that share no project with the CR are the one disagreement a full
+        # upgrade refuses, so that notice names the override; a grow says "run full".
+        for live, keys, expect in ((empty, no_keys, None), (declared, no_keys, "record"),
+                                   (declared, {**no_keys, "SCOPE_PROJECTS": "other-project"}, "disjoint"),
+                                   (declared, {**no_keys, "SCOPE_PROJECTS": "payments-prod payments-new"}, "differ")):
+            with self.subTest(live=live, keys=keys):
                 script = (
                     f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
                     # Source-only mode loads no engine; the block's readers live there.
@@ -498,13 +503,19 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
                 )
                 proc = subprocess.run(
                     ["bash", "-c", script], capture_output=True, text=True, cwd=str(_REPO_ROOT),
-                    env=get_isolated_test_env(overrides={"SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}),
+                    env=get_isolated_test_env(overrides=keys),
                 )
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
                 out = proc.stdout + proc.stderr
-                if expect_notice:
+                if expect == "record":
                     self.assertIn("records no SCOPE_* key while the PlatformAgent carries a spec.scope", out)
                     self.assertIn('SCOPE_PROJECTS="payments-prod"', out)
+                elif expect == "disjoint":
+                    self.assertIn("shares no project with the scope the PlatformAgent carries", out)
+                    self.assertIn("SCOPE_GUARD_ENABLED=false", out)
+                elif expect == "differ":
+                    self.assertIn("keys differ from the scope the PlatformAgent carries", out)
+                    self.assertNotIn("SCOPE_GUARD_ENABLED=false", out)
                 else:
                     self.assertNotIn("WARN:", out)
 
@@ -546,6 +557,12 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         switch_at = text.index('if [ "$PARAM_PLAN" != "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n    export SCOPE_INVALID_STOPS="false"')
         self.assertLess(switch_at, generate_at)
         self.assertNotIn('export SCOPE_PROJECTS=""', text)
+        # upgrade.sh fetches credentials itself and tells the generator so,
+        # which is what spares the second fetch; the generator trusts no held
+        # context on its own.
+        fetched_at = text.index('export KUBECONFIG_CONTEXT_FETCHED="true"')
+        self.assertLess(text.index("gcloud container clusters get-credentials"), fetched_at)
+        self.assertLess(fetched_at, generate_at)
 
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

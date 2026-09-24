@@ -183,8 +183,10 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIsNotNone(scope, "the scope block moved or is now conditional")
         self.assertIn("projects: {{ $scope.projects | default list | toJson }}", scope.group(1))
         self.assertIn("clusters: {{ $scopeExclude.clusters | default list | toJson }}", scope.group(1))
+        # The one condition on the block is the omit switch the retag path sets;
+        # nothing else (a `with`, an `if` on the values) may gate it.
         before = template[: scope.start()].rstrip().splitlines()[-1]
-        self.assertNotIn("with", before, "scope is rendered unconditionally")
+        self.assertEqual(before.strip(), "{{- if not $scope.omit }}", "scope is gated by nothing but scope.omit")
 
 
 if __name__ == "__main__":

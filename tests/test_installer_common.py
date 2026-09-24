@@ -999,7 +999,8 @@ class InstallerCommonTest(unittest.TestCase):
         # ordinary way to stop excluding, alone or in the same edit that
         # removes a project (the exclusion that belonged to it), and proceeds.
         for cr_projects, keys in ((["payments-prod"], "payments-prod"),
-                                  (["payments-prod", "payments-staging"], "payments-prod")):
+                                  (["payments-prod", "payments-staging"], "payments-prod"),
+                                  (["payments-prod"], "payments-prod payments-new")):
             with self.subTest(cr=cr_projects), tempfile.TemporaryDirectory() as out_dir:
                 dest = pathlib.Path(out_dir) / "terraform.tfvars"
                 proc = self._run(
@@ -1009,7 +1010,7 @@ class InstallerCommonTest(unittest.TestCase):
                     kubectl_script=self._scoped_cr_kubectl(cr_projects),
                 )
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
-                self.assertIn('  projects = ["payments-prod"]', dest.read_text())
+                self.assertIn('  projects = ["payments-prod"', dest.read_text())
                 self.assertIn("    projects = []\n    clusters = []", dest.read_text())
 
     def test_the_scope_guard_reads_through_the_installs_context_not_the_current_one(self):
@@ -1088,7 +1089,7 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=kubectl,
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS names a project the CR does not carry", proc.stdout)
+            self.assertIn("neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS names none of the projects the CR carries", proc.stdout)
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "test-project/us-central1/scratch"},
@@ -1171,30 +1172,31 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(1, len([line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]))
             self.assertIn("could not run", proc.stdout + proc.stderr)
 
-    def test_a_context_the_kubeconfig_already_holds_is_not_fetched_again(self):
-        # upgrade.sh fetches credentials before it generates; the guard reads
-        # the CR through that context as it is rather than fetching a second
-        # time over it. A kubeconfig without the context still fetches.
-        def kubectl(holds):
-            listed = "gke_test-project_us-central1_test-cluster" if holds else "some-other-context"
-            return (
-                "#!/usr/bin/env bash\n"
-                'case "$*" in\n'
-                f'  *"config get-contexts"*) echo "{listed}"; exit 0 ;;\n'
-                '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
-                "esac\n"
-                "exit 1\n"
-            )
-        for holds, expected_fetches in ((True, 0), (False, 1)):
-            with self.subTest(holds=holds), tempfile.TemporaryDirectory() as out_dir:
+    def test_a_caller_that_fetched_this_run_is_not_made_to_fetch_again(self):
+        # upgrade.sh fetches credentials before it generates and says so
+        # (KUBECONFIG_CONTEXT_FETCHED); the guard then reads through that
+        # context. Without the marker the generator fetches even when the
+        # kubeconfig holds a context of the install's name: that context may
+        # point at an earlier cluster of the same name (a first install that
+        # died past the create and is re-run), and the fetch refreshes it.
+        held = (
+            "#!/usr/bin/env bash\n"
+            'case "$*" in\n'
+            '  *"config get-contexts"*) echo "gke_test-project_us-central1_test-cluster"; exit 0 ;;\n'
+            '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
+            "esac\n"
+            "exit 1\n"
+        )
+        for fetched, expected_fetches in (({"KUBECONFIG_CONTEXT_FETCHED": "true"}, 0), ({}, 1)):
+            with self.subTest(fetched=fetched), tempfile.TemporaryDirectory() as out_dir:
                 dest = pathlib.Path(out_dir) / "terraform.tfvars"
                 log = pathlib.Path(out_dir) / "gcloud.log"
                 proc = self._run(
                     f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                    env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
+                    env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log), **fetched},
                     describe_stub="printf '\\n'; exit 0",
                     gcloud_stdout=MANAGED_CLUSTER_STATE,
-                    kubectl_script=kubectl(holds),
+                    kubectl_script=held,
                 )
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
                 fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]
@@ -1316,7 +1318,7 @@ class InstallerCommonTest(unittest.TestCase):
                 'case "$*" in\n'
                 '  *"get platformagents"*)\n'
                 '    if [ -f "$KUBECTL_STATE" ]; then echo \'' + second + '\'; else touch "$KUBECTL_STATE"; echo \'{"items":[{"spec":{}}]}\'; fi; exit 0 ;;\n'
-                '  *"get crd"*) printf "%s" "${CRD_SERVES_SCOPE-object}"; exit 0 ;;\n'
+                '  *"get crd"*) if [ -n "${CRD_READ_FAILS:-}" ]; then echo "crd unreadable in this test" >&2; exit 1; fi; printf "%s" "${CRD_SERVES_SCOPE-object}"; exit 0 ;;\n'
                 "esac\n"
                 "exit 1\n"
             )
@@ -1367,13 +1369,25 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("CRD this cluster serves has no spec.scope", stale_crd.stdout + stale_crd.stderr)
             self.assertIn("--upgrade-mode=full", stale_crd.stdout + stale_crd.stderr)
             self.assertFalse(log.exists(), "stale CRD: no Helm upgrade may run")
+            # A CRD read that fails says nothing about the schema: the check
+            # warns, tries the re-render anyway, and succeeds when it takes.
+            state.unlink(missing_ok=True); log.unlink(missing_ok=True)
+            crd_unreadable = self._run(
+                'print_warning() { echo "WARN: $*"; }; '
+                f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
+                env={**env, "CRD_READ_FAILS": "1"}, kubectl_script=kubectl_absent_then(present), helm_script=helm_logging,
+            )
+            self.assertIn("rc=0", crd_unreadable.stdout, crd_unreadable.stderr)
+            self.assertIn("WARN: Could not read the PlatformAgent CRD", crd_unreadable.stdout)
+            self.assertIn("crd unreadable in this test", crd_unreadable.stdout)
+            self.assertEqual(2, len(log.read_text().splitlines()))
             for label, env2, script in (
                 ("no keys", {}, kubectl_absent_then(absent)),
                 ("block present", {"SCOPE_PROJECTS": "payments-prod"}, self._scoped_cr_kubectl(["payments-prod"])),
                 ("unreadable", {"SCOPE_PROJECTS": "payments-prod"}, "#!/usr/bin/env bash\nexit 1\n"),
             ):
                 with self.subTest(label=label):
-                    state.unlink(missing_ok=True)
+                    state.unlink(missing_ok=True); log.unlink(missing_ok=True)
                     proc = self._run(
                         'print_warning() { echo "WARN: $*"; }; '
                         f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',

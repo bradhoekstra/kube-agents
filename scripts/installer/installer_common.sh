@@ -146,10 +146,10 @@ readonly SCOPE_LIST_MAX_ENTRIES=100
 # kubectl's wording for a resource type the cluster does not serve: a cluster
 # with no kube-agents CRD on it, which is every first adoption.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could not find the requested resource"
-# kubectl naming a --context the kubeconfig does not hold (two wordings across releases).
 # Where the served PlatformAgent CRD's schema carries spec.scope, for a served-CRD check.
 readonly CRD_SCOPE_FIELD_JSONPATH='{.spec.versions[*].schema.openAPIV3Schema.properties.spec.properties.scope.type}'
 readonly PLATFORMAGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
+# kubectl naming a --context the kubeconfig does not hold (two wordings across releases).
 readonly KUBECTL_NO_CONTEXT_PATTERN="context was not found for specified context|context .* does not exist"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
@@ -1577,11 +1577,6 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 '
 }
 
-# Does the kubeconfig kubectl reads hold this context, by name? Read-only.
-kubeconfig_holds_context() {
-  kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$1"
-}
-
 # The live PlatformAgent's spec.scope, in JSON with every list present, for a
 # `helm upgrade --set-json` that must leave the CR's scope exactly as it is.
 # upgrade.sh's harness and operator modes run no Terraform, so no scope may
@@ -1620,6 +1615,18 @@ print(json.dumps({"projects": scope.get("projects") or [],
                                             "clusterName": c.get("clusterName", "")} for c in exclude.get("clusters") or []]}},
                  separators=(",", ":")))
 '
+}
+
+# Whether the live scope (first) names projects and the keys' scope (second)
+# shares none of them: the list the hand-declared-scope check refuses a full
+# apply for, so a retag can say so rather than send the operator to it.
+scope_json_projects_disjoint() {
+  python3 -c '
+import json, sys
+live = set((json.loads(sys.argv[1] or "{}") or {}).get("projects") or [])
+keys = set((json.loads(sys.argv[2] or "{}") or {}).get("projects") or [])
+sys.exit(0 if live and not (live & keys) else 1)
+' "$1" "$2"
 }
 
 # Whether two `platformAgent.scope` JSON values declare the same sets.
@@ -1666,11 +1673,19 @@ verify_scope_block_after_apply() {
   # which the API server prunes against and no Helm upgrade can get past.
   # install.sh applies no CRD update (upgrade.sh does, before its apply), so a
   # re-run of install.sh over a pre-field install lands here; say which it is.
-  local served_scope
-  served_scope="$(kubectl --context "$context" get crd "$PLATFORMAGENT_CRD_NAME" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o jsonpath="$CRD_SCOPE_FIELD_JSONPATH" 2>/dev/null || true)"
-  if [ -z "$served_scope" ]; then
-    print_error "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent CRD this cluster serves has no spec.scope, so the API server pruned the block on write. install.sh applies no CRD update: run ./upgrade.sh --upgrade-mode=full, which applies the chart's CRDs before its apply and re-renders the block, or apply charts/kube-agents/crds/ by hand and re-run. The IAM is bound; the reconcile lists the management project alone until the block is on the CR."
-    return 1
+  local served_scope crd_err
+  crd_err="$(mktemp)"
+  if ! served_scope="$(kubectl --context "$context" get crd "$PLATFORMAGENT_CRD_NAME" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o jsonpath="$CRD_SCOPE_FIELD_JSONPATH" 2>"$crd_err")"; then
+    # A read that failed says nothing about the schema: try the re-render, and
+    # name the other cause if it does not take.
+    print_warning "Could not read the PlatformAgent CRD to tell a CRD from before spec.scope from the previous operator's webhook ($(cat "$crd_err" 2>/dev/null)); trying the re-render."
+    rm -f "$crd_err"
+  else
+    rm -f "$crd_err"
+    if [ -z "$served_scope" ]; then
+      print_error "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent CRD this cluster serves has no spec.scope, so the API server pruned the block on write. install.sh applies no CRD update: run ./upgrade.sh --upgrade-mode=full, which applies the chart's CRDs before its apply and re-renders the block, or apply charts/kube-agents/crds/ by hand and re-run. The IAM is bound; the reconcile lists the management project alone until the block is on the CR."
+      return 1
+    fi
   fi
   print_warning "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent in '${ns}' carries no spec.scope block: the CR was written through the previous operator's webhook, which dropped the field. Re-rendering it against the new operator (two Helm upgrades: one recording no block, one adding it back)..."
   if [ -z "$chart_dir" ] || [ ! -d "$chart_dir" ]; then
@@ -1687,7 +1702,7 @@ verify_scope_block_after_apply() {
     fi
   done
   if ! live="$(live_scope_json "$ns" 2>/dev/null)" || [ -z "$live" ]; then
-    print_error "spec.scope is still missing from the PlatformAgent in '${ns}' after re-rendering it, so the operator serving now also drops the field. The IAM is bound; the reconcile lists the management project alone until the block is on the CR: kubectl get platformagent -n ${ns} -o yaml"
+    print_error "spec.scope is still missing from the PlatformAgent in '${ns}' after re-rendering it: either the operator serving now also drops the field, or the served CRD predates it (apply charts/kube-agents/crds/, as ./upgrade.sh --upgrade-mode=full does, and re-run). The IAM is bound; the reconcile lists the management project alone until the block is on the CR: kubectl get platformagent -n ${ns} -o yaml"
     return 1
   fi
   print_success "spec.scope re-rendered onto the PlatformAgent in '${ns}'."
@@ -1704,12 +1719,12 @@ verify_scope_block_after_apply() {
 # exclusions kept out. The rule: refuse when the CR names projects and
 # SCOPE_PROJECTS names none of them; and refuse when the CR carries
 # exclusions, neither SCOPE_EXCLUDE_* key is set, and SCOPE_PROJECTS names
-# nothing or a project the CR does not carry, since that is a scope the keys
-# have not taken over (a hand set, or the partial install.env that recorded
-# part of it). Keys that share a project with the CR were derived from it,
-# and keys naming the CR's projects or a subset are the declaration for every
-# kind: removing a project retires its profiles, clearing the exclusion keys
-# re-onboards the excluded clusters, which is what the operator asked for.
+# nothing or none of the CR's projects, since that is a scope the keys have
+# not taken over (a hand set, or the partial install.env that recorded part
+# of it). A key that shares a project with the CR was derived from it and is
+# the declaration for every kind: adding a project binds it, removing one
+# retires its profiles, clearing the exclusion keys re-onboards the excluded
+# clusters, which is what the operator asked for.
 # Emptying the projects on purpose, or replacing the whole list, is
 # SCOPE_GUARD_ENABLED=false for one run. Nothing is read from the Helm
 # release: what the chart last rendered is no guide to what the CR carries.
@@ -1797,19 +1812,20 @@ for item in items:
     # SCOPE_GUARD_ENABLED=false. A key that shares a project with the CR was derived from
     # it: it grows and shrinks the list freely.
     drops_projects = bool(projects) and not (set(key_projects) & set(projects))
-    # An exclusion is protected while no key names a project, or while SCOPE_PROJECTS
-    # names a project the CR does not carry: either way the keys were not derived from
-    # this CR (hand-set, or a partial install.env). Keys that name the projects the CR
-    # carries, or a subset of them, are the declaration for every kind, so removing a project and
-    # clearing the exclusion keys, in one edit or two, is the ordinary way to stop.
-    drops_exclusions = bool(excluded or clusters) and not key_exclusions and (not key_projects or not set(key_projects) <= set(projects))
+    # An exclusion is protected while SCOPE_PROJECTS names nothing, or names none of the
+    # projects the CR carries: either way the keys were not derived from this CR
+    # (hand-set, or a partial install.env). The same rule as the projects above: a key
+    # that shares a project with the CR is the declaration for every kind, so adding or
+    # removing a project and clearing the exclusion keys, in one edit or two, is the
+    # ordinary way to change the scope.
+    drops_exclusions = bool(excluded or clusters) and not key_exclusions and not (set(key_projects) & set(projects))
     if not (drops_projects or drops_exclusions):
         continue
     what = []
     if drops_projects:
         what.append("names %s and SCOPE_PROJECTS %s" % (" ".join(projects), "names nothing" if not key_projects else "names none of them"))
     if drops_exclusions:
-        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS %s" % (" ".join(excluded + clusters), "names nothing" if not key_projects else "names a project the CR does not carry"))
+        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS %s" % (" ".join(excluded + clusters), "names nothing" if not key_projects else "names none of the projects the CR carries"))
     print("# the PlatformAgent " + "; ".join(what))
     print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
     print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(excluded))
@@ -1970,19 +1986,21 @@ write_tfvars_from_state() {
   # source it) and otherwise taken as the caller left it.
   #
   # The widening is for the guard, and only for a run the guard can refuse
-  # on a machine that does not already hold the install's context: with the
-  # guard off (uninstall.sh) or speaking without refusing (install.sh
-  # --dry-run / --generate-only, upgrade.sh --plan), the fetch stays what it
-  # was, an adoption's alone, and a context already in the kubeconfig
-  # (upgrade.sh fetches one before it generates) is read through as it is.
-  # So a teardown or a dry run over a cluster this state created neither
+  # whose caller has not fetched already: with the guard off (uninstall.sh)
+  # or speaking without refusing (install.sh --dry-run / --generate-only,
+  # upgrade.sh --plan), the fetch stays what it was, an adoption's alone, and
+  # a caller that fetched this run (upgrade.sh, which exports
+  # KUBECONFIG_CONTEXT_FETCHED after its own get-credentials) is not made to
+  # fetch twice. A context the kubeconfig merely holds is not trusted as is:
+  # it may point at an earlier cluster of the same name (a first install that
+  # died past the create and is re-run), and a fetch is what refreshes it. So
+  # a teardown or a dry run over a cluster this state created neither
   # rewrites the operator's kubeconfig nor opens the Secret recovery below,
-  # upgrade.sh does not fetch twice, and a warn-only run says so when the
-  # machine holds no context.
+  # and a warn-only run says so when the machine holds no context.
   if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 &&
     { [ "$create_cluster" = "false" ] ||
       { is_truthy "${SCOPE_GUARD_ENABLED:-true}" && is_truthy "${SCOPE_GUARD_REFUSES:-true}" &&
-        ! kubeconfig_holds_context "$(gke_context_name)"; }; }; then
+        ! is_truthy "${KUBECONFIG_CONTEXT_FETCHED:-false}"; }; }; then
     if type gke_dns_endpoint_flag >/dev/null 2>&1; then
       GKE_DNS_ENDPOINT_FLAG=""
       gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
