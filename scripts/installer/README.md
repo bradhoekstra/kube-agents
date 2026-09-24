@@ -251,8 +251,8 @@ rather than refuses. One more thing a full apply checks afterwards: the apply th
 `spec.scope` writes the CR in the same Helm pass that rolls the operator, so the write can pass the
 previous operator's webhook, which drops the field, and a plain re-apply renders the same block and
 sends no patch. When the keys declare a scope and the CR carries no block after the apply, the run
-fails and names the way out: `upgrade.sh --upgrade-mode=operator`, which records no block, then
-`upgrade.sh`, which renders it again against the new operator. `install.sh` takes the same three as `--scope-projects`,
+re-renders it through two Helm upgrades against the release, one recording no block and one adding
+it back against the new operator, and fails only if the block is still missing afterwards. `install.sh` takes the same three as `--scope-projects`,
 `--scope-exclude-projects` and `--scope-exclude-clusters` on a first install, which records them; on
 an existing `install.env` a flag that disagrees with the recorded key, or a value the file does not
 record arriving from a flag or the environment, is refused rather than applied for one run, because

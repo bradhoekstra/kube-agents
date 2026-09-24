@@ -1102,40 +1102,73 @@ class InstallerCommonTest(unittest.TestCase):
              "exclude": {"projects": [], "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}},
         )
 
-    def test_a_scope_the_webhook_dropped_fails_the_apply_with_the_way_out(self):
+    def test_a_scope_the_webhook_dropped_is_re_rendered_after_the_apply(self):
         # The apply that introduces spec.scope writes the CR through the
-        # previous operator's webhook, which drops the field, and a plain
-        # re-apply sends no patch. With keys declared and no block on the CR
-        # the check fails and names the retag-then-full recovery; with no keys,
-        # a block present, or an unreadable CR it does not fail the run.
-        absent = (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"get platformagents"*) echo \'{"items":[{"spec":{}}]}\'; exit 0 ;;\n'
-            "esac\n"
-            "exit 1\n"
-        )
-        dropped = self._run(
-            'verify_scope_block_after_apply kubeagents-system; echo "rc=$?"',
-            env={"SCOPE_PROJECTS": "payments-prod"},
-            kubectl_script=absent,
-        )
-        self.assertIn("rc=1", dropped.stdout, dropped.stderr)
-        self.assertIn("carries no spec.scope block", dropped.stdout + dropped.stderr)
-        self.assertIn("--upgrade-mode=operator", dropped.stdout + dropped.stderr)
-        for label, env, script in (
-            ("no keys", {}, absent),
-            ("block present", {"SCOPE_PROJECTS": "payments-prod"}, self._scoped_cr_kubectl(["payments-prod"])),
-            ("unreadable", {"SCOPE_PROJECTS": "payments-prod"}, "#!/usr/bin/env bash\nexit 1\n"),
-        ):
-            with self.subTest(label=label):
-                proc = self._run(
-                    'print_warning() { echo "WARN: $*"; }; verify_scope_block_after_apply kubeagents-system; echo "rc=$?"',
-                    env=env, kubectl_script=script,
-                )
-                self.assertIn("rc=0", proc.stdout, proc.stderr)
-                if label == "unreadable":
-                    self.assertIn("Could not read the PlatformAgent", proc.stdout + proc.stderr)
+        # previous operator's webhook, which drops the field, and neither a
+        # re-apply nor Terraform would send a patch. With keys declared and no
+        # block on the CR the check drives two Helm upgrades (omit=true, then
+        # omit=false) against the release and re-reads; a block that appears
+        # is success, a Helm failure or a block still missing fails the run;
+        # no keys, a block already present, or an unreadable CR do nothing.
+        def kubectl_absent_then(second):
+            # First read: no block. Later reads: whatever `second` is.
+            return (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                '  *"get platformagents"*)\n'
+                '    if [ -f "$KUBECTL_STATE" ]; then echo \'' + second + '\'; else touch "$KUBECTL_STATE"; echo \'{"items":[{"spec":{}}]}\'; fi; exit 0 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            )
+        helm_logging = '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "$HELM_CALL_LOG"\nexit 0\n'
+        present = '{"items":[{"spec":{"scope":{"projects":["payments-prod"]}}}]}'
+        absent = '{"items":[{"spec":{}}]}'
+        with tempfile.TemporaryDirectory() as tmp:
+            state = pathlib.Path(tmp) / "kubectl.state"
+            log = pathlib.Path(tmp) / "helm.log"
+            chart = pathlib.Path(tmp) / "chart"
+            chart.mkdir()
+            env = {"SCOPE_PROJECTS": "payments-prod", "KUBECTL_STATE": str(state), "HELM_CALL_LOG": str(log)}
+            healed = self._run(
+                f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
+                env=env, kubectl_script=kubectl_absent_then(present), helm_script=helm_logging,
+            )
+            self.assertIn("rc=0", healed.stdout, healed.stderr)
+            calls = log.read_text().splitlines()
+            self.assertEqual(2, len(calls), calls)
+            self.assertIn("--set platformAgent.scope.omit=true", calls[0])
+            self.assertIn("--set platformAgent.scope.omit=false", calls[1])
+            for call in calls:
+                self.assertIn("--kube-context gke_test-project_us-central1_test-cluster upgrade kube-agents", call)
+                self.assertIn("--reset-then-reuse-values", call)
+            state.unlink(); log.unlink()
+            still_missing = self._run(
+                f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
+                env=env, kubectl_script=kubectl_absent_then(absent), helm_script=helm_logging,
+            )
+            self.assertIn("rc=1", still_missing.stdout, still_missing.stderr)
+            self.assertIn("still missing", still_missing.stdout + still_missing.stderr)
+            state.unlink(); log.unlink()
+            helm_fails = self._run(
+                f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
+                env=env, kubectl_script=kubectl_absent_then(present), helm_script="#!/usr/bin/env bash\nexit 1\n",
+            )
+            self.assertIn("rc=1", helm_fails.stdout, helm_fails.stderr)
+            self.assertIn("failed at the Helm upgrade", helm_fails.stdout + helm_fails.stderr)
+            for label, env2, script in (
+                ("no keys", {}, kubectl_absent_then(absent)),
+                ("block present", {"SCOPE_PROJECTS": "payments-prod"}, self._scoped_cr_kubectl(["payments-prod"])),
+                ("unreadable", {"SCOPE_PROJECTS": "payments-prod"}, "#!/usr/bin/env bash\nexit 1\n"),
+            ):
+                with self.subTest(label=label):
+                    state.unlink(missing_ok=True)
+                    proc = self._run(
+                        'print_warning() { echo "WARN: $*"; }; '
+                        f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
+                        env={**env2, "KUBECTL_STATE": str(state)}, kubectl_script=script, helm_script=helm_logging,
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    self.assertFalse(log.exists(), f"{label}: no Helm upgrade may run")
 
     def test_the_scope_guard_is_silent_on_a_cluster_without_the_crd(self):
         # A first adoption: the cluster exists, kube-agents has never been on

@@ -100,6 +100,9 @@ readonly HELM_STATUS_PENDING_INSTALL="pending-install"
 readonly HELM_SERVED_REVISION_STATUSES="deployed superseded"
 # Timeout for uninstalling a failed release no revision of which ever served.
 readonly HELM_FAILED_RELEASE_UNINSTALL_TIMEOUT="5m"
+# Each of the two Helm upgrades that re-render a spec.scope block the previous
+# operator's webhook dropped (verify_scope_block_after_apply).
+readonly HELM_SCOPE_HEAL_TIMEOUT="10m"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-authorized-keys"
 
@@ -1607,28 +1610,52 @@ sys.exit(0 if shape(json.loads(sys.argv[1] or "{}")) == shape(json.loads(sys.arg
 ' "$1" "$2"
 }
 
-# After a full apply that declared a scope: is the block on the live CR? The
-# apply that introduces the field writes the CR in the same Helm pass that
-# rolls the operator, so the write can pass the previous operator's defaulting
-# webhook, which drops a field its struct does not have. The apply reports
-# success, the release records the block, and the CR has none; and because
-# Helm patches a custom resource from the difference between its recorded and
-# rendered manifests, a plain second apply renders the same block and sends
-# no patch. Nothing else would say so: the guard sees a CR that names no
-# projects. Prints the way out: an operator-mode retag, which records no block
-# (the CR is absent, so the retag renders none), then a full upgrade, which
-# renders it again against the new webhook.
+# After a full apply that declared a scope: is the block on the live CR, and
+# if not, put it there. The apply that introduces the field writes the CR in
+# the same Helm pass that rolls the operator, so the write can pass the
+# previous operator's defaulting webhook, which drops a field its struct does
+# not have. The apply reports success, the release records the block, and the
+# CR has none. Nothing else would say so: the guard sees a CR that names no
+# projects. And nothing else would fix it: Helm patches a custom resource
+# from the difference between its recorded and rendered manifests, so a
+# re-apply with the same keys renders the same block and sends no patch, and
+# the Terraform provider, which does not read the release back, plans no
+# upgrade at all. So this re-renders it here, the way the retag path already
+# drives Helm out of band: one upgrade with the block omitted, which records
+# a manifest without it, then one with the block, whose patch adds it back
+# against the new operator's webhook, now the only one serving. Both reuse
+# the release's recorded values (the keys' block among them), so nothing
+# else moves. Fails the run only if the block is still missing afterwards.
 verify_scope_block_after_apply() {
-  local ns="$1"
+  local ns="$1" chart_dir="${2:-}"
   [ -n "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ] || return 0
-  local live
+  local context live
+  context="$(gke_context_name)"
   if ! live="$(live_scope_json "$ns" 2>/dev/null)"; then
     print_warning "Could not read the PlatformAgent in '${ns}' after the apply to confirm it carries the declared spec.scope. If the operator before this apply predated the field, its webhook may have dropped the block; check with: kubectl get platformagent -n ${ns} -o jsonpath='{.items[0].spec.scope}'"
     return 0
   fi
   [ -z "$live" ] || return 0
-  print_error "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent in '${ns}' carries no spec.scope block: the CR was written through the previous operator's webhook, which dropped the field. The IAM is bound; the reconcile lists the management project alone until the block is on the CR, and a plain re-apply renders the same block and sends no patch. Run ./upgrade.sh --upgrade-mode=operator (a retag over an absent block records none) and then ./upgrade.sh (full), which renders the block again against the new operator's webhook."
-  return 1
+  print_warning "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent in '${ns}' carries no spec.scope block: the CR was written through the previous operator's webhook, which dropped the field. Re-rendering it against the new operator (two Helm upgrades: one recording no block, one adding it back)..."
+  if [ -z "$chart_dir" ] || [ ! -d "$chart_dir" ]; then
+    print_error "Cannot re-render the block: no chart directory to upgrade from${chart_dir:+ (${chart_dir})}. The IAM is bound; the reconcile lists the management project alone until spec.scope is on the CR."
+    return 1
+  fi
+  local omit
+  for omit in true false; do
+    if ! helm --kube-context "$context" upgrade "$KUBE_AGENTS_HELM_RELEASE" "$chart_dir" \
+      --namespace "$ns" --reset-then-reuse-values \
+      --set "platformAgent.scope.omit=${omit}" --wait --timeout "$HELM_SCOPE_HEAL_TIMEOUT"; then
+      print_error "Re-rendering spec.scope failed at the Helm upgrade with platformAgent.scope.omit=${omit}. The IAM is bound; the reconcile lists the management project alone until spec.scope is on the CR: helm status ${KUBE_AGENTS_HELM_RELEASE} -n ${ns}"
+      return 1
+    fi
+  done
+  if ! live="$(live_scope_json "$ns" 2>/dev/null)" || [ -z "$live" ]; then
+    print_error "spec.scope is still missing from the PlatformAgent in '${ns}' after re-rendering it, so the operator serving now also drops the field. The IAM is bound; the reconcile lists the management project alone until the block is on the CR: kubectl get platformagent -n ${ns} -o yaml"
+    return 1
+  fi
+  print_success "spec.scope re-rendered onto the PlatformAgent in '${ns}'."
+  return 0
 }
 
 # Refuses to regenerate when the live PlatformAgent declares a scope by hand

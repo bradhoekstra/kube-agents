@@ -476,7 +476,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         full = text[text.index("    full)") : text.index("  esac", text.index("    full)"))]
         apply_at = full.index("apply -auto-approve -input=false")
-        check_at = full.index('verify_scope_block_after_apply "$target_namespace" || exit 1')
+        check_at = full.index('verify_scope_block_after_apply "$target_namespace" "${repo_dir}/charts/kube-agents" || exit 1')
         self.assertLess(apply_at, check_at)
         # Behind an engine guard, like the retag's helpers: an older
         # installer_common.sh on the curl path has no such function, and a

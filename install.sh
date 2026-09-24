@@ -5302,7 +5302,7 @@ main() {
   # has it: a newer install.sh can clone an older engine at --image-tag, which
   # renders no scope block and has no such function.
   if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then
-    verify_scope_block_after_apply "$namespace" || exit 1
+    verify_scope_block_after_apply "$namespace" "${repo_dir}/charts/kube-agents" || exit 1
   fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do

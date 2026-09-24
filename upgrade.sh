@@ -1061,7 +1061,7 @@ main() {
       # an older engine renders no scope block, so there is nothing to check
       # and no function to call.
       if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then
-        verify_scope_block_after_apply "$target_namespace" || exit 1
+        verify_scope_block_after_apply "$target_namespace" "${repo_dir}/charts/kube-agents" || exit 1
       fi
       print_success "Full atomic upgrade completed successfully!"
       ;;
