@@ -6947,6 +6947,8 @@ class ScopeGuardModesTest(unittest.TestCase):
         ns_at = text.index("Namespace '${namespace}' was not created. Installation is incomplete.")
         check_at = text.index('verify_scope_block_after_apply "$namespace" || exit 1')
         self.assertLess(ns_at, check_at)
+        # Behind an engine guard: a newer install.sh can clone an older engine.
+        self.assertIn("if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then", text[ns_at:check_at])
 
 
 class BannerColourVariablesAreDefinedTest(unittest.TestCase):

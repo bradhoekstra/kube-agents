@@ -5298,8 +5298,12 @@ main() {
     exit 1
   fi
   # A declared scope written through a previous operator's webhook is dropped
-  # silently; the function says what to run when it was.
-  verify_scope_block_after_apply "$namespace" || exit 1
+  # silently; the function says what to run when it was. Only when the engine
+  # has it: a newer install.sh can clone an older engine at --image-tag, which
+  # renders no scope block and has no such function.
+  if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then
+    verify_scope_block_after_apply "$namespace" || exit 1
+  fi
   local slow_rollouts=()
   for deployment in "$KUBE_AGENTS_OPERATOR_DEPLOYMENT" "$LITELLM_DEPLOYMENT" "$PLATFORM_AGENT_DEPLOYMENT"; do
     if ! wait_for_deployment_object "$deployment" "$namespace" "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then

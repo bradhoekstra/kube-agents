@@ -465,6 +465,10 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertIn("--upgrade-mode=full to apply the change", pre)
         self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block', text)
 
+    def test_jq_is_required_for_the_modes_that_read_with_it(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then\n    required_tools+=(jq)', text)
+
     def test_a_full_upgrade_checks_the_scope_block_after_the_apply(self):
         # The apply that introduces spec.scope can write the CR through the
         # previous operator's webhook, which drops the field; the check runs
