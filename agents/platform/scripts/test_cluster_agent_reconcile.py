@@ -705,12 +705,15 @@ class ScopeTest(HomesMixin):
         path.write_text(json.dumps(scope), encoding="utf-8")
         os.environ[rec.SCOPE_FILE_ENV] = str(path)
 
-    def _write_previous(self, projects: list[dict], containers: list[dict] | None = None):
-        # No `containers` key stands for a snapshot from before folders, or one written with
-        # none declared: every container declared next run then reads as newly declared.
+    def _write_previous(self, projects: list[dict], containers: list[dict] | None = None, declared: dict | None = None):
+        # No `containers` key and no `declared` stands for a snapshot from before folders, or
+        # one written with none declared: every container declared next run then reads as
+        # newly declared. `declared` is what the last run read (or carried forward unread).
         snapshot = {"projects": projects}
         if containers is not None:
             snapshot["containers"] = containers
+        if declared is not None:
+            snapshot["declared"] = declared
         (Path(self._tmp.name) / rec.SNAPSHOT_FILE).write_text(json.dumps(snapshot), encoding="utf-8")
 
     def _snapshot(self) -> dict:
@@ -1185,6 +1188,26 @@ class ScopeTest(HomesMixin):
                                        searches={self.FOLDER: (members, rec.OUTCOME_OK)})
         self.assertEqual(created, [("team-a", "prod", "us-central1")])
         self.assertNotIn("team-scratch", {p["id"] for p in self._snapshot()["projects"]})
+
+    def test_an_unreadable_tick_does_not_make_the_folder_newly_declared_on_the_next(self):
+        # Tick N-1 could not read the declaration: it resolved no container (`containers: []`)
+        # and carried `declared` forward. Tick N reads a declaration that has dropped the
+        # explicit project p2. The folder is not new, so p2 is the declaration's to retire,
+        # not held for a day under the index's reason.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE},
+                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}],
+                             containers=[],
+                             declared={"projects": ["p2"], "folders": ["123456789012"], "organizations": [],
+                                       "exclude": {"projects": [], "clusters": []}})
+        ids = {"cluster-a": _identity("team-a", "prod"), "cluster-p2": _identity("p2", "x")}
+        report, _, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=["cluster-a", "cluster-p2"], identities=ids,
+                                       searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["retiring"], ["p2"])
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, rows["p2"])
 
     def test_a_folder_that_cannot_be_read_freezes_its_previous_members_and_the_prune(self):
         # Last run: the folder resolved team-a; an explicit project p2 was in scope too. The

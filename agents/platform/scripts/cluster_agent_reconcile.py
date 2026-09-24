@@ -643,8 +643,18 @@ def _previous_via(previous: dict | None, project: str) -> list[str]:
 
 
 def _previous_container_ids(previous: dict | None) -> set[str]:
-    """The containers the last snapshot declared, by id, or an empty set."""
-    return {c["id"] for c in (previous or {}).get("containers", []) if isinstance(c, dict) and isinstance(c.get("id"), str)}
+    """The containers the last run knew as declared, by id, or an empty set.
+
+    Read from the snapshot's `declared` first: a tick that could not read the declaration
+    resolves no container and writes `containers: []`, but carries `declared` forward on
+    purpose, and the next readable tick must not read every folder as newly declared (which
+    would hold a dropped explicit project for a day under the index's reason). The
+    `containers` array is added for a snapshot written before `declared` existed.
+    """
+    declaration = _previous_declaration(previous)
+    known = set(_container_ids(declaration)) if declaration else set()
+    known.update(c["id"] for c in (previous or {}).get("containers", []) if isinstance(c, dict) and isinstance(c.get("id"), str))
+    return known
 
 
 def _previous_absent_since(previous: dict | None, project: str) -> str | None:
