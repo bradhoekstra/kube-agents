@@ -740,7 +740,9 @@ class ScopeTest(HomesMixin):
                 shutil.rmtree(self.homes / name, ignore_errors=True)
 
         def create(pr, c, l):
-            if create_raises is not None:
+            if callable(create_raises):
+                create_raises(pr, c, l)  # raises for the clusters it wants to fail
+            elif create_raises is not None:
                 raise create_raises
             created.append((pr, c, l))
             return f"cluster-{c}"
@@ -1484,6 +1486,59 @@ class ScopeTest(HomesMixin):
                               {"id": "team-a", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids)
         self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
+
+    def test_a_retiring_project_is_not_rescued_by_a_newly_declared_folder_on_an_unclean_run(self):
+        # X was dropped from `projects` and is retiring. The operator declares a folder whose
+        # first search is denied (the grant not yet there), so the run is unclean and the
+        # folder is new: X stays retiring, and is neither stamped nor carried back in scope.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "x", "via": [], "state": rec.STATE_RETIRING}])
+        ids = {"cluster-x": _identity("x", "c")}
+        report, _, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=["cluster-x"], identities=ids,
+                                       searches={self.FOLDER: (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["retiring"], ["x"])
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual(rows["x"]["state"], rec.STATE_RETIRING)
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, rows["x"])
+        # The next clean run prunes it, as the declaration asked.
+        report, _, deleted = self._run({"projects": [], "folders": ["123456789012"]}, {self.MGMT: []},
+                                       profiles=["cluster-x"], identities=ids,
+                                       searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
+        self.assertEqual(deleted, ["cluster-x"])
+
+    def test_a_member_whose_get_credentials_is_refused_is_rolled_back_not_left_half_built(self):
+        # describe succeeds (the account holds clusters.get in the member project) but
+        # get-credentials answers 403: the profile was registered and its layout pushed
+        # before the failure, so the reconcile deletes it again rather than leave a home the
+        # next run reads as incomplete and scaffolds once more.
+        def refuse_credentials(pr, c, l):
+            if pr == "team-a":
+                raise SystemExit("ERROR: failed to fetch credentials for team-a/prod: code=403 PERMISSION_DENIED")
+        report, created, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                             searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)},
+                                             create_raises=refuse_credentials)
+        self.assertEqual(created, [])
+        self.assertEqual(report["create_failed"], ["prod/us-central1"])
+        self.assertEqual(deleted, [rec.profile_name("team-a", "prod", "us-central1")])
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
+
+    def test_an_over_cap_folder_does_not_close_the_cap_on_the_folders_after_it(self):
+        # F1 sorts first and crosses the cap; F2 is small. F1's members are carried over-cap
+        # without counting, so F2 still fits and its cluster is created (design §3: a
+        # container that does not fit is skipped and the next one is still tried).
+        f1, f2 = "folders/111111111111", "folders/222222222222"
+        big = {f"q-{i}": [(f"q-{i}", "c", "us-central1")] for i in range(5)}
+        small = {"small": [("small", "s", "us-central1")]}
+        with mock.patch.object(rec, "RESOLVED_SET_CAP", 3):
+            report, created, _ = self._run({"folders": [f1[8:], f2[8:]]}, {self.MGMT: []},
+                                           searches={f1: (big, rec.OUTCOME_OK), f2: (small, rec.OUTCOME_OK)})
+        self.assertEqual(created, [("small", "s", "us-central1")])
+        containers = {c["id"]: c for c in self._snapshot()["containers"]}
+        self.assertEqual((containers[f1]["outcome"], containers[f2]["outcome"]), (rec.OUTCOME_OVER_CAP, rec.OUTCOME_OK))
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["q-0"]["outcome"], rows["small"]["outcome"]), (rec.OUTCOME_OVER_CAP, rec.OUTCOME_OK))
 
     def test_an_over_cap_members_stamp_clears_because_the_index_placed_it(self):
         old = "2020-01-01T00:00:00Z"

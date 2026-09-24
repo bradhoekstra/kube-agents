@@ -68,6 +68,7 @@ from cluster_agent_profile import (
     RESERVED_PROFILES,  # noqa: F401 - re-exported for callers/tests; used indirectly via list_profiles
     create_profile,
     delete_profile,
+    profile_name,
     kubeconfig_landed,
     list_profiles,
     profile_home,
@@ -490,6 +491,14 @@ def _resolve_projects(management: str | None, scope: dict,
     """
     patterns = scope["exclude"]["projects"]
     entries: list[dict] = []
+
+    def listed_count() -> int:
+        # What the cap counts: the projects this run lists. A member carried over-cap is
+        # in the set but not listed, so it does not close the cap on the containers after
+        # its own (design §3: a container that does not fit is skipped and the next one is
+        # still tried).
+        return sum(1 for e in entries if e["outcome"] != OUTCOME_OVER_CAP)
+
     ignored: list[dict] = []
     seen: set[str] = set()
     if management:
@@ -513,7 +522,7 @@ def _resolve_projects(management: str | None, scope: dict,
         seen.add(project)
         if _excluded_by(project, patterns):
             continue
-        outcome = OUTCOME_OVER_CAP if len(entries) >= RESOLVED_SET_CAP else None
+        outcome = OUTCOME_OVER_CAP if listed_count() >= RESOLVED_SET_CAP else None
         if outcome:
             log(f"{project} is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
         entries.append({"id": project, "via": [VIA_EXPLICIT], "outcome": outcome})
@@ -537,7 +546,7 @@ def _resolve_projects(management: str | None, scope: dict,
         members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
         if members is not None:
             fresh = [p for p in sorted(members) if p not in seen and not _excluded_by(p, patterns)]
-            if len(entries) + len(fresh) > RESOLVED_SET_CAP:
+            if listed_count() + len(fresh) > RESOLVED_SET_CAP:
                 # The lookup succeeded and the run holds the full member list, but listing
                 # them would cross the cap: the members the run just resolved are carried
                 # reading over-cap and get no CREATE, and because the run knows they are
@@ -984,6 +993,16 @@ def reconcile(dry_run: bool = False) -> dict:
                 # and a local "Permission denied" is not an IAM answer, so neither counts here.
                 if member_only and any(m in str(e) for m in _CREATE_DENIED_MARKERS):
                     _denied_this_run.add(proj)
+                    # The 403 came from get-credentials, after the profile was registered
+                    # and its layout pushed: roll that back, or the next run finds a home it
+                    # reads as incomplete and scaffolds it again, every hour, for as long
+                    # as the grant is missing.
+                    half = profile_name(proj, cluster, location)
+                    try:
+                        delete_profile(half)
+                        log(f"rolled back the half-built profile {half}: the project answered 403 on get-credentials.")
+                    except (SystemExit, Exception) as rollback_error:  # noqa: BLE001 - best effort; the sweep goes on
+                        log(f"could not roll back the half-built profile {half}: {rollback_error}")
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
                 report["create_failed"].append(f"{cluster}/{location}")
     for entry in entries:
@@ -1062,6 +1081,11 @@ def reconcile(dry_run: bool = False) -> dict:
         marks that edit, and the same day's clock applies; a stamp already on the row keeps
         counting on the runs after, when the container is no longer new.
         """
+        # A project already retiring was dropped by the declaration; the index rule is for
+        # members the declaration still reaches, and an unclean run carries a retiring
+        # project as retiring (below), never back into scope.
+        if project in previously_retiring:
+            return False
         via = _previous_via(previous, project)
         container_vias = [v for v in via if v.split("/")[0] in CONTAINER_KINDS]
         if VIA_MANAGEMENT in via:
