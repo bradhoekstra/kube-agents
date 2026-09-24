@@ -7007,11 +7007,15 @@ class NoChatTerminalAccessTest(unittest.TestCase):
 class ScopeGuardModesTest(unittest.TestCase):
     """install.sh's dealings with the hand-declared-scope check."""
 
-    def test_a_dry_run_or_generate_only_run_lets_the_check_speak_without_refusing(self):
+    def test_only_a_dry_run_lets_the_check_speak_without_refusing(self):
+        # A generate-only run hands the operator `lifecycle.sh apply` on the file
+        # it writes, and that path has no scope check, so the check refuses
+        # there as on an apply; only a dry run, which applies nothing, warns.
         text = _INSTALL_SH.read_text()
-        export_at = text.index('if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n    export SCOPE_GUARD_REFUSES="false"')
+        export_at = text.index('if [ "$PARAM_DRY_RUN" = "true" ]; then\n    export SCOPE_GUARD_REFUSES="false"')
         generate_at = text.index('KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \\\n    write_tfvars_from_state "$tfvars_file" "$image_tag"', export_at)
         self.assertLess(export_at, generate_at)
+        self.assertNotIn('[ "$PARAM_GENERATE_ONLY" = "true" ]; then\n    export SCOPE_GUARD_REFUSES', text)
 
     def test_the_scope_block_is_checked_after_the_apply(self):
         # A declared scope written through a previous operator's webhook is

@@ -5032,9 +5032,12 @@ main() {
   # after the generator has tried the live Secret. upgrade.sh and uninstall.sh
   # leave this unset so an unfindable key stays an error for them.
   #
-  # A dry run or a generate-only run applies nothing, so the hand-declared
-  # scope check speaks without refusing, the way upgrade.sh --plan does.
-  if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+  # A dry run applies nothing, so the hand-declared-scope check speaks
+  # without refusing, the way upgrade.sh --plan does. A generate-only run is
+  # the first half of an apply: its handoff is `lifecycle.sh apply` on the
+  # file it writes, and that path has no check of its own, so here the check
+  # refuses as it would on the apply.
+  if [ "$PARAM_DRY_RUN" = "true" ]; then
     export SCOPE_GUARD_REFUSES="false"
   fi
   KUBE_AGENTS_GENERATE_API_SERVER_KEY=true \
@@ -5268,8 +5271,9 @@ main() {
   # Terraform, which never recorded it, plans a create. Whenever the cluster
   # is already there -- adopted, or created by this state on the attempt that
   # died -- and only for a release no revision of which ever served. The
-  # generator fetched credentials on the adoption path alone, so fetch them
-  # here for the other; the check itself refuses to look at any other context.
+  # generator fetches credentials for an adoption, and for its scope check on
+  # a run that can refuse; fetch them here for the rest, and the check itself
+  # refuses to look at any other context.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
     # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
     # a DNS-endpoint-only cluster, the context gate below does not match, and

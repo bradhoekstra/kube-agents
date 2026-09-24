@@ -488,8 +488,10 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         no_keys = {"SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
         # Keys that share no project with the CR are the one disagreement a full
         # upgrade refuses, so that notice names the override; a grow says "run full".
+        exclude_only = '{"projects": [], "exclude": {"projects": ["*-sandbox"], "clusters": []}}'
         for live, keys, expect in ((empty, no_keys, None), (declared, no_keys, "record"),
-                                   (declared, {**no_keys, "SCOPE_PROJECTS": "other-project"}, "disjoint"),
+                                   (declared, {**no_keys, "SCOPE_PROJECTS": "other-project"}, "refused"),
+                                   (exclude_only, {**no_keys, "SCOPE_PROJECTS": "payments-new"}, "refused"),
                                    (declared, {**no_keys, "SCOPE_PROJECTS": "payments-prod payments-new"}, "differ")):
             with self.subTest(live=live, keys=keys):
                 script = (
@@ -510,8 +512,8 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
                 if expect == "record":
                     self.assertIn("records no SCOPE_* key while the PlatformAgent carries a spec.scope", out)
                     self.assertIn('SCOPE_PROJECTS="payments-prod"', out)
-                elif expect == "disjoint":
-                    self.assertIn("shares no project with the scope the PlatformAgent carries", out)
+                elif expect == "refused":
+                    self.assertIn("in a way a full upgrade refuses", out)
                     self.assertIn("SCOPE_GUARD_ENABLED=false", out)
                 elif expect == "differ":
                     self.assertIn("keys differ from the scope the PlatformAgent carries", out)
@@ -540,7 +542,8 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
     def test_the_scope_guard_runs_only_for_a_full_apply(self):
         # A plan applies nothing and is what shows the destroys the guard
         # protects against, so it speaks without refusing; harness and
-        # operator render no scope block, so the guard does not run.
+        # operator pass the CR's scope back as it is and render nothing from
+        # the keys, so the guard does not run.
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         block = text[text.index('if [ "$PARAM_PLAN" = "true" ]; then\n    export SCOPE_GUARD_REFUSES="false"'):]
         block = block[: block.index("fi\n") + 3]

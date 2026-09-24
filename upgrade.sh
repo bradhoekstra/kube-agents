@@ -1037,11 +1037,13 @@ print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(exclude.get("projects") or []))
 print("SCOPE_EXCLUDE_CLUSTERS=\"%s\"" % " ".join("/".join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []))
 ' || true
       elif ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
-        if declare -F scope_json_projects_disjoint >/dev/null 2>&1 && scope_json_projects_disjoint "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
-          # The one disagreement a full upgrade refuses: the keys name none of
-          # the CR's projects, which is what a hand-declared list recorded
-          # wrongly and a deliberate replacement both look like.
-          print_warning "install.env's SCOPE_PROJECTS shares no project with the scope the PlatformAgent carries. A ${PARAM_UPGRADE_MODE} upgrade leaves the CR's scope as it is, and a full upgrade refuses a list that replaces the CR's outright (its hand-declared-scope check). If the CR's list is the one to keep, record it in install.env first; if the replacement is intended, run ./upgrade.sh --upgrade-mode=full with SCOPE_GUARD_ENABLED=false."
+        if declare -F scope_json_full_apply_refused >/dev/null 2>&1 && scope_json_full_apply_refused "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
+          # The disagreements a full upgrade refuses, by the guard's own rule
+          # on the two values in hand: the keys share no project with the CR
+          # and would drop its projects, or would drop its exclusions with no
+          # exclusion key recorded. A hand-declared scope recorded wrongly and
+          # a deliberate replacement look the same.
+          print_warning "install.env's SCOPE_* keys differ from the scope the PlatformAgent carries in a way a full upgrade refuses (its hand-declared-scope check: the keys share no project with the CR and would drop projects or exclusions it declares). A ${PARAM_UPGRADE_MODE} upgrade leaves the CR's scope as it is. If the CR's scope is the one to keep, record it in install.env first; if the replacement is intended, run ./upgrade.sh --upgrade-mode=full with SCOPE_GUARD_ENABLED=false."
         else
           print_warning "install.env's SCOPE_* keys differ from the scope the PlatformAgent carries. A ${PARAM_UPGRADE_MODE} upgrade re-tags images and leaves the CR's scope as it is; run ./upgrade.sh --upgrade-mode=full to apply the change, which binds the IAM and renders the CR together."
         fi

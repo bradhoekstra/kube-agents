@@ -45,29 +45,11 @@ ROLES_KEPT_HOST_ONLY = {
 }
 
 
-def _hcl_string_list(source: str, name: str) -> list[str]:
-    block = re.search(
-        rf"^\s*{re.escape(name)}\s*=\s*\[(.*?)^\s*\]",
-        source,
-        re.MULTILINE | re.DOTALL,
-    )
-    if block is None:
-        raise AssertionError(f"no list named {name} found; it moved or was renamed")
-    roles = re.findall(r'"([^"]+)"', block.group(1))
-    if not roles:
-        raise AssertionError(f"the list named {name} parsed as empty")
-    return roles
-
-
-def _hcl_variable_default_list(source: str, variable: str) -> list[str]:
-    block = re.search(
-        rf'^variable\s+"{re.escape(variable)}"\s*\{{(.*?)^\}}',
-        source,
-        re.MULTILINE | re.DOTALL,
-    )
-    if block is None:
-        raise AssertionError(f"no variable named {variable}; it moved or was renamed")
-    return _hcl_string_list(block.group(1), "default")
+# The two HCL readers are test_scoped_sa_pool_iam's; one copy, whichever way the suite is run.
+try:
+    from tests.test_scoped_sa_pool_iam import _hcl_string_list, _hcl_variable_default_list  # noqa: E402
+except ImportError:  # run from inside tests/
+    from test_scoped_sa_pool_iam import _hcl_string_list, _hcl_variable_default_list  # noqa: E402
 
 
 def _resource_block(source: str, kind: str, name: str) -> str:

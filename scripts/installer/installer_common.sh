@@ -1617,15 +1617,23 @@ print(json.dumps({"projects": scope.get("projects") or [],
 '
 }
 
-# Whether the live scope (first) names projects and the keys' scope (second)
-# shares none of them: the list the hand-declared-scope check refuses a full
-# apply for, so a retag can say so rather than send the operator to it.
-scope_json_projects_disjoint() {
+# Whether a full apply from the keys' scope (second) over the live scope
+# (first) is what guard_hand_declared_scope refuses: the same two rules, on the
+# JSON the retag already holds, so a retag can say so rather than send the
+# operator to a full upgrade that stops.
+scope_json_full_apply_refused() {
   python3 -c '
 import json, sys
-live = set((json.loads(sys.argv[1] or "{}") or {}).get("projects") or [])
-keys = set((json.loads(sys.argv[2] or "{}") or {}).get("projects") or [])
-sys.exit(0 if live and not (live & keys) else 1)
+live = json.loads(sys.argv[1] or "{}") or {}
+keys = json.loads(sys.argv[2] or "{}") or {}
+live_projects, key_projects = set(live.get("projects") or []), set(keys.get("projects") or [])
+live_exclude, key_exclude = live.get("exclude") or {}, keys.get("exclude") or {}
+live_exclusions = bool(live_exclude.get("projects") or live_exclude.get("clusters"))
+key_exclusions = bool(key_exclude.get("projects") or key_exclude.get("clusters"))
+shared = bool(live_projects & key_projects)
+drops_projects = bool(live_projects) and not shared
+drops_exclusions = live_exclusions and not key_exclusions and not shared
+sys.exit(0 if drops_projects or drops_exclusions else 1)
 ' "$1" "$2"
 }
 

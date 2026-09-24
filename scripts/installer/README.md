@@ -241,7 +241,8 @@ too, with the three lines that carry the whole live declaration printed: the CR 
 keys existed, or an `install.env` that recorded part of it (the project to add rather than the live list), and it is also what removing the last
 project, or replacing the whole list, looks like: the check cannot tell them apart, so it stops both. It does not protect an
 exclusion added to the CR by hand (the `manage-cluster` skill's route) on an install whose
-`SCOPE_PROJECTS` names the CR's projects: record the triple in `SCOPE_EXCLUDE_CLUSTERS` before the
+`SCOPE_PROJECTS` shares a project with the CR or that already records either `SCOPE_EXCLUDE_*` key:
+record the triple in `SCOPE_EXCLUDE_CLUSTERS` before the
 next full upgrade, or that upgrade drops it and the reconcile re-onboards the cluster. A key that shares a project with the CR was derived from it and is the declaration for every
 kind, so adding a project, removing a project (other than
 the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or any of these in one edit, and running
@@ -254,8 +255,9 @@ retag, hand edits included, since they run no Terraform: the retag reads the liv
 anything is applied and passes it as it is, renders no block for a CR that has none (the chart's
 `platformAgent.scope.omit`), refuses when it cannot read the CR, and says so when the keys differ,
 leaving the change for `full` mode, which binds the IAM and renders the CR together; in those modes
-the check does not run, and under `--plan`, `install.sh --dry-run` and `--generate-only` it warns
-rather than refuses. One more thing a full apply checks afterwards: the apply that introduces
+the check does not run, and under `--plan` and `install.sh --dry-run` it warns rather than refuses;
+`install.sh --generate-only` refuses as an apply would, because its handoff is `lifecycle.sh apply`
+on the file it writes and that path has no check of its own. One more thing a full apply checks afterwards: the apply that introduces
 `spec.scope` writes the CR in the same Helm pass that rolls the operator, so the write can pass the
 previous operator's webhook, which drops the field, and a plain re-apply renders the same block and
 sends no patch. When the keys declare a scope and the CR carries no block after the apply, the run

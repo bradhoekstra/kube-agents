@@ -1439,6 +1439,8 @@ class InstallerCommonTest(unittest.TestCase):
             'hcl_scope_block "" "" "Team/us-central1/x"': "'Team' is not a name",
             'hcl_scope_block "" "" "a/b/c a/b/c"': "names 'a/b/c' twice",
             'hcl_scope_block "$(seq -f project-%03g 1 101 | tr "\\n" " ")" "" ""': "carries 101 entries",
+            'hcl_scope_block "" "$(seq -f sandbox-%03g 1 101 | tr "\\n" " ")" ""': "carries 101 entries",
+            'hcl_scope_block "" "" "p/us-central1/$(printf %064d 0 | tr 0 a)"': "is not a name",
         }
         for script, message in cases.items():
             with self.subTest(script=script):
