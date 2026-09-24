@@ -981,12 +981,14 @@ class InstallerCommonTest(unittest.TestCase):
     def test_a_hand_added_project_missing_from_a_named_key_is_not_refused(self):
         # SCOPE_PROJECTS names payments-prod, the CR also carries a hand-added
         # payments-staging. The key is the declaration: the run proceeds and
-        # payments-staging retires, which is what the recorded key says.
+        # payments-staging retires, which is what the recorded key says. The
+        # exclusions are recorded too, since they are guarded per kind.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod"},
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
+                     "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
                 describe_stub="printf '\\n'; exit 0",
                 kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
@@ -1058,8 +1060,18 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=kubectl,
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("excludes test-project/us-central1/scratch and no SCOPE_* key is set", proc.stdout)
+            self.assertIn("excludes test-project/us-central1/scratch and neither SCOPE_EXCLUDE_* key is set", proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_CLUSTERS="test-project/us-central1/scratch"', proc.stdout)
+            # Recording the projects alone, the first step the docs send a
+            # pre-key install through, does not stand in for the exclusions.
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod"},
+                describe_stub="printf '\\n'; exit 0",
+                kubectl_script=kubectl,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("neither SCOPE_EXCLUDE_* key is set", proc.stdout)
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "test-project/us-central1/scratch"},
