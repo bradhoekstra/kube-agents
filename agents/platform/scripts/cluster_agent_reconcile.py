@@ -108,6 +108,8 @@ _ASSET_NAME = re.compile(r"^//container\.googleapis\.com/projects/(?P<project>[^
 # member's outcome starts as `ok` because Asset Inventory listed its clusters without a
 # per-project call, and these two calls are what revise it to `denied` (design §4).
 _denied_this_run: set[str] = set()
+# Same, for a member whose GKE API answered disabled on a per-cluster call (also a 403).
+_api_disabled_this_run: set[str] = set()
 # The listing phase is bounded: the management project lists first and alone, then the
 # containers resolve LIST_WORKERS at a time, then the explicit projects LIST_WORKERS at a
 # time, and a lookup still running when LIST_BUDGET_SECONDS is spent reads unreachable. The
@@ -465,6 +467,14 @@ def _search_container(container: str, timeout: float = LIST_TIMEOUT_SECONDS) -> 
     return members, OUTCOME_OK
 
 
+def _previous_outcome(previous: dict | None, project: str) -> str | None:
+    """The outcome the last snapshot recorded for the project, if any."""
+    for p in (previous or {}).get("projects", []):
+        if isinstance(p, dict) and p.get("id") == project:
+            return p.get("outcome") if isinstance(p.get("outcome"), str) else None
+    return None
+
+
 def _previous_container_members(previous: dict | None, container: str) -> list[str]:
     """Project IDs the last snapshot reached through this container, for the freeze rule."""
     if not previous:
@@ -493,11 +503,13 @@ def _resolve_projects(management: str | None, scope: dict,
     entries: list[dict] = []
 
     def listed_count() -> int:
-        # What the cap counts: the projects this run lists. A member carried over-cap is
-        # in the set but not listed, so it does not close the cap on the containers after
-        # its own (design §3: a container that does not fit is skipped and the next one is
-        # still tried).
-        return sum(1 for e in entries if e["outcome"] != OUTCOME_OVER_CAP)
+        # What the cap counts: the projects this run lists, and the ones a frozen container
+        # last listed. A member carried over-cap is in the set but not listed, so it does
+        # not close the cap on the containers after its own (design §3: a container that
+        # does not fit is skipped and the next one is still tried); a frozen member that was
+        # over-cap last run was not listed then either (`uncounted`), so one failed search
+        # of a large folder does not shut its small siblings out for the run.
+        return sum(1 for e in entries if e["outcome"] != OUTCOME_OVER_CAP and not e.get("uncounted"))
 
     ignored: list[dict] = []
     seen: set[str] = set()
@@ -550,7 +562,8 @@ def _resolve_projects(management: str | None, scope: dict,
             # this container would list it (the live listing wins below), so it counts here
             # like a fresh one, or a second, overlapping container would lift a whole
             # over-cap folder past the cap without a check.
-            lifted = [p for p in members if p in seen and (frozen_entry(p) or {}).get("outcome") == OUTCOME_OVER_CAP]
+            lifted = [p for p in members if p in seen and (frozen_entry(p) or {}).get("outcome") == OUTCOME_OVER_CAP
+                      or (frozen_entry(p) or {}).get("uncounted")]
             if listed_count() + len(fresh) + len(lifted) > RESOLVED_SET_CAP:
                 # The lookup succeeded and the run holds the full member list, but listing
                 # them would cross the cap: the members the run just resolved are carried
@@ -579,7 +592,9 @@ def _resolve_projects(management: str | None, scope: dict,
                 # `indexed`: an over-cap member was placed by the index this run (the lookup
                 # succeeded); a frozen one was not. The snapshot's index-lag stamp reads it.
                 entries.append({"id": project, "via": [container], "outcome": outcome, "frozen": True,
-                                "indexed": outcome == OUTCOME_OVER_CAP})
+                                "indexed": outcome == OUTCOME_OVER_CAP,
+                                "uncounted": outcome != OUTCOME_OVER_CAP
+                                and _previous_outcome(previous, project) == OUTCOME_OVER_CAP})
             containers.append({"id": container, "outcome": outcome, "projects": len(carried)})
             continue
         for project in sorted(members):
@@ -592,6 +607,7 @@ def _resolve_projects(management: str | None, scope: dict,
                 frozen = frozen_entry(project)
                 if frozen:
                     frozen.pop("frozen")
+                    frozen.pop("uncounted", None)
                     frozen["outcome"] = OUTCOME_OK
                     frozen["clusters"] = sorted(members[project])
                 continue
@@ -602,6 +618,7 @@ def _resolve_projects(management: str | None, scope: dict,
         containers.append({"id": container, "outcome": OUTCOME_OK, "projects": len(members)})
     for entry in entries:
         entry.pop("frozen", None)
+        entry.pop("uncounted", None)
     return entries, ignored, containers
 
 
@@ -739,8 +756,11 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
         stderr = e.stderr or ""
         if "NotFound" in stderr or "not found" in stderr.lower() or "404" in stderr:
             return False
-        if _classify_list_failure(stderr) == OUTCOME_DENIED:
+        classified = _classify_list_failure(stderr)
+        if classified == OUTCOME_DENIED:
             _denied_this_run.add(project)
+        elif classified == OUTCOME_API_DISABLED:
+            _api_disabled_this_run.add(project)
         log(f"describe {cluster} ({project}/{location}) failed (treating as unknown): {stderr.strip()}")
         return None
     except subprocess.TimeoutExpired:
@@ -854,6 +874,10 @@ def reconcile(dry_run: bool = False) -> dict:
     report["create_pass_ran"] = False
 
     profiles = list_profiles()
+    # The homes that predate this run, by name: a create-path rollback below removes only a
+    # home this run made, never one that was already here (an incomplete re-run, a profile
+    # whose identity cannot be read), which PRUNE deliberately keeps.
+    preexisting_homes = set(profiles)
     identities = {name: read_cluster_identity(profile_home(name)) for name in profiles}
     existing_keys = set()
     for name, identity in identities.items():
@@ -869,6 +893,7 @@ def reconcile(dry_run: bool = False) -> dict:
     # --- RESOLVE: the management project plus whatever spec.scope declares (design §3).
     management, management_authoritative = _project_source()
     _denied_this_run.clear()
+    _api_disabled_this_run.clear()
     scope, scope_readable, scope_present, containers_known = _load_scope()
     previous = _load_previous_snapshot()
     # An unreadable or absent declaration keeps the exclusions of the last one read. The
@@ -986,7 +1011,8 @@ def reconcile(dry_run: bool = False) -> dict:
                 # index still names may be gone, and the first cluster answering says nothing
                 # about the second. A 403 seen earlier in the project, or on this describe,
                 # skips the create.
-                exists = None if proj in _denied_this_run else _cluster_exists(proj, cluster, location)
+                revised = proj in _denied_this_run or proj in _api_disabled_this_run
+                exists = None if revised else _cluster_exists(proj, cluster, location)
                 if exists is False:
                     log(f"{cluster} ({proj}/{location}) is in the asset index but describe says it is gone "
                         "(deleted, or the index is behind); no profile made for it this run.")
@@ -994,6 +1020,10 @@ def reconcile(dry_run: bool = False) -> dict:
                 if proj in _denied_this_run:
                     log(f"{cluster} ({proj}/{location}) has no profile and the project answered 403; "
                         f"no CREATE under it this run ({OUTCOME_DENIED}).")
+                    continue
+                if proj in _api_disabled_this_run:
+                    log(f"{cluster} ({proj}/{location}) has no profile and the project's GKE API is disabled; "
+                        f"no CREATE under it this run ({OUTCOME_API_DISABLED}).")
                     continue
             if dry_run:
                 log(f"{cluster} ({proj}/{location}) has no profile — WOULD create (dry-run).")
@@ -1007,18 +1037,30 @@ def reconcile(dry_run: bool = False) -> dict:
                 # A container-only member's get-credentials 403 revises the project (design §4);
                 # an explicit or management project's own listing already decided its outcome,
                 # and a local "Permission denied" is not an IAM answer, so neither counts here.
-                if member_only and any(m in str(e) for m in _CREATE_DENIED_MARKERS):
-                    _denied_this_run.add(proj)
-                    # The 403 came from get-credentials, after the profile was registered
+                # The API-disabled answer is itself a 403, so it is classified first, as
+                # `_classify_list_failure` does, and reads `api-disabled` rather than `denied`.
+                revision = None
+                if member_only and any(m in str(e) for m in _API_DISABLED_MARKERS):
+                    revision, bucket = OUTCOME_API_DISABLED, _api_disabled_this_run
+                elif member_only and any(m in str(e) for m in _CREATE_DENIED_MARKERS):
+                    revision, bucket = OUTCOME_DENIED, _denied_this_run
+                if revision:
+                    bucket.add(proj)
+                    # The failure came from get-credentials, after the profile was registered
                     # and its layout pushed: roll that back, or the next run finds a home it
-                    # reads as incomplete and scaffolds it again, every hour, for as long
-                    # as the grant is missing.
+                    # reads as incomplete and scaffolds it again, every hour, for as long as
+                    # the grant is missing. Only a home this run made: one that was here
+                    # before (an incomplete re-run, an unreadable identity) is PRUNE's to
+                    # keep, whatever it holds, and stays.
                     half = profile_name(proj, cluster, location)
-                    try:
-                        delete_profile(half)
-                        log(f"rolled back the half-built profile {half}: the project answered 403 on get-credentials.")
-                    except (SystemExit, Exception) as rollback_error:  # noqa: BLE001 - best effort; the sweep goes on
-                        log(f"could not roll back the half-built profile {half}: {rollback_error}")
+                    if half in preexisting_homes:
+                        log(f"{half} predates this run and is left in place after its get-credentials failed ({revision}).")
+                    else:
+                        try:
+                            delete_profile(half)
+                            log(f"rolled back the half-built profile {half}: the project answered {revision} on get-credentials.")
+                        except (SystemExit, Exception) as rollback_error:  # noqa: BLE001 - best effort; the sweep goes on
+                            log(f"could not roll back the half-built profile {half}: {rollback_error}")
                 log(f"create for {cluster} ({proj}/{location}) failed (left unmanaged): {e}")
                 report["create_failed"].append(f"{cluster}/{location}")
     for entry in entries:
@@ -1090,12 +1132,14 @@ def reconcile(dry_run: bool = False) -> dict:
         that predates containers (a rollback to the previous release) declares nothing about
         them, and keeps their members without a clock.
 
-        A project that was explicit alone last run is the declaration's to decide, with one
-        exception: dropped from `projects` in the same edit that declares the folder it moved
-        into, the index may not place it under that folder yet, and its previous `via` names
-        no container to keep it by. A container the previous snapshot did not carry is what
-        marks that edit, and the same day's clock applies; a stamp already on the row keeps
-        counting on the runs after, when the container is no longer new.
+        A project that was explicit alone last run, or whose previous containers have all
+        left the CR, is the declaration's to decide, with one exception: dropped from
+        `projects`, or from a folder the same edit removes, in the edit that declares the
+        folder it moved into, the index may not place it under that folder yet, and its
+        previous `via` names no declared container to keep it by. A container the previous
+        snapshot did not carry is what marks that edit, and the same day's clock applies; a
+        stamp already on the row keeps counting on the runs after, when the container is no
+        longer new.
         """
         # A project already retiring was dropped by the declaration; the index rule is for
         # members the declaration still reaches, and an unclean run carries a retiring
@@ -1114,7 +1158,8 @@ def reconcile(dry_run: bool = False) -> dict:
         elif not containers_known:
             return True
         elif not any(v in declared_containers for v in container_vias):
-            return False
+            if not (newly_declared_containers or _previous_absent_since(previous, project)):
+                return False
         since = _previous_absent_since(previous, project) or now.strftime(SNAPSHOT_TIME_FORMAT)
         try:
             first_absent = datetime.strptime(since, SNAPSHOT_TIME_FORMAT).replace(tzinfo=timezone.utc)
@@ -1272,12 +1317,16 @@ def reconcile(dry_run: bool = False) -> dict:
     # an IAM deny on a member project blocks the inherited grant without hiding the
     # cluster from the asset index, and these calls are the only ones that see it.
     for entry in entries:
-        if (entry["outcome"] == OUTCOME_OK and entry["id"] in _denied_this_run
-                and not ({VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]))):
-            entry["outcome"] = OUTCOME_DENIED
-            report["projects"][entry["id"]] = OUTCOME_DENIED
-            log(f"{entry['id']} (via {', '.join(entry['via'])}) answered 403 on a per-cluster call; "
-                f"its outcome is {OUTCOME_DENIED} this run.")
+        if entry["outcome"] != OUTCOME_OK or {VIA_MANAGEMENT, VIA_EXPLICIT} & set(entry["via"]):
+            continue
+        for bucket, revised_to, why in ((_api_disabled_this_run, OUTCOME_API_DISABLED, "answered API disabled"),
+                                        (_denied_this_run, OUTCOME_DENIED, "answered 403")):
+            if entry["id"] in bucket:
+                entry["outcome"] = revised_to
+                report["projects"][entry["id"]] = revised_to
+                log(f"{entry['id']} (via {', '.join(entry['via'])}) {why} on a per-cluster call; "
+                    f"its outcome is {revised_to} this run.")
+                break
 
     # Fill order decided the cap above; the written order is sorted by ID so an
     # unchanged fleet writes an unchanged file (design §3, "Resolution is deterministic").

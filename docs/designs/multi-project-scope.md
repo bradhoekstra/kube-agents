@@ -450,9 +450,9 @@ the CR, retires it sooner, on the ordinary two runs. PRUNE's per-profile `descri
 meanwhile returns a 403, because the folder binding no longer covers it, which `_cluster_exists`
 classifies as unknown and keeps. Moved to a different declared folder: no change, because resolution
 is by project; the `via` field records the new path and any placement clears the stamp, including a
-placement during the lag by the folder the project left. Dropped from `projects` in the same edit that
+placement during the lag by the folder the project left. Dropped from `projects`, or from a folder the same edit removes, in the edit that
 declares the folder it moved into, a project is held the same day, since the index may not place it yet
-and its previous route names no container to keep it by.
+and its previous route names no declared container to keep it by.
 
 **Never on ambiguity.** The rule at `cluster_agent_reconcile.py:11-15` holds: auth, network, quota,
 and unclassified errors leave profiles untouched.
