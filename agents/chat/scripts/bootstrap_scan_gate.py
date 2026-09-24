@@ -118,6 +118,9 @@ RECONCILE_SCRIPT_NAME = "cluster_agent_reconcile.py"
 # projects the roster covers and which it could not list this run.
 SCOPE_SNAPSHOT_NAME = "fleet_scope.json"
 SCOPE_OUTCOME_OK = "ok"
+# The one non-ok container outcome whose lookup succeeded: its members would cross the
+# reconcile's listing cap, so they are carried unlisted. Named apart from a failed lookup.
+SCOPE_OUTCOME_OVER_CAP = "over-cap"
 SCOPE_OUTCOME_UNKNOWN = "unknown"
 # How many unlisted projects the sweep's task prompt names before it counts the rest; a
 # folder or organisation can carry thousands, and the prompt names the container instead.
@@ -258,11 +261,21 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
     if not containers and not (unlisted and _scope_has_other_projects(data_dir)):
         return ""
     container_note = ""
-    if containers:
-        container_note = (
+    failed = [c for c in containers if c[1] != SCOPE_OUTCOME_OVER_CAP]
+    over_cap = [c for c in containers if c[1] == SCOPE_OUTCOME_OVER_CAP]
+    if failed:
+        container_note += (
             "The last reconcile could not resolve "
-            + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in containers)
+            + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in failed)
             + ", so every project beneath it is unlisted and the container is what to name. "
+        )
+    if over_cap:
+        container_note += (
+            "It resolved "
+            + ", ".join(f"`{cid}` ({count} project(s))" for cid, _outcome, count in over_cap)
+            + " past its listing cap, so those members are carried `over-cap` and unlisted; name the "
+            "container as over the cap, which the declaration fixes (narrower excludes or sub-folders), "
+            "not as unreadable. "
         )
     if unlisted:
         named = ", ".join(f"`{project}` ({outcome})" for project, outcome in unlisted[:SCOPE_GAP_NAMED_LIMIT])

@@ -1848,8 +1848,14 @@ class ScopeTest(HomesMixin):
                   "projects": {f"proj-{i:04d}": rec.OUTCOME_OVER_CAP for i in range(30)} | {self.MGMT: rec.OUTCOME_OK},
                   "containers": [{"id": "organizations/111", "outcome": rec.OUTCOME_OVER_CAP, "projects": 30}]}
         text = rec._format_notification(report)
-        self.assertIn("1 folder(s)/organisation(s) could not be resolved", text)
-        self.assertIn("`organizations/111` (over-cap, 30 project(s))", text)
+        # An over-cap container resolved; it is not reported as one that could not.
+        self.assertNotIn("could not be resolved", text)
+        self.assertIn(f"1 folder(s)/organisation(s) resolved past the listing cap of {rec.RESOLVED_SET_CAP}", text)
+        self.assertIn("`organizations/111` (30 project(s))", text)
+        self.assertIn("exclude.projects", text)
+        report["containers"].append({"id": "folders/222", "outcome": rec.OUTCOME_DENIED, "projects": 2})
+        text = rec._format_notification(report)
+        self.assertIn("1 folder(s)/organisation(s) could not be resolved (members carried, profiles kept): `folders/222` (denied, 2 project(s)).", text)
         self.assertIn("30 project(s) in scope could not be listed", text)
         self.assertIn(f"and {30 - rec.NOTIFY_UNLISTED_LIMIT} more (see fleet_scope.json)", text)
         self.assertEqual(text.count("`proj-"), rec.NOTIFY_UNLISTED_LIMIT)

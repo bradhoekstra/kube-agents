@@ -1411,12 +1411,23 @@ def _format_notification(report: dict) -> str:
             f"(left untouched): {', '.join(f'`{n}`' for n in report['skipped_error'])}."
         )
     # Containers first, one line each: a container that failed or read over-cap stands
-    # for every member it carried, which is what keeps the next line short.
-    bad_containers = [c for c in (report.get("containers") or []) if c.get("outcome") != OUTCOME_OK]
-    if bad_containers:
+    # for every member it carried, which is what keeps the next line short. The two are
+    # said apart: a failed lookup points at IAM or the Asset API, an over-cap one (the
+    # lookup succeeded, the members would cross the cap) at the declaration.
+    containers = sorted((report.get("containers") or []), key=lambda c: c["id"])
+    failed_containers = [c for c in containers if c.get("outcome") not in (OUTCOME_OK, OUTCOME_OVER_CAP)]
+    over_cap_containers = [c for c in containers if c.get("outcome") == OUTCOME_OVER_CAP]
+    if failed_containers:
         lines.append(
-            f"  ⚠️ {len(bad_containers)} folder(s)/organisation(s) could not be resolved (members carried, profiles kept): "
-            + ", ".join(f"`{c['id']}` ({c['outcome']}, {c.get('projects', 0)} project(s))" for c in sorted(bad_containers, key=lambda c: c["id"])) + "."
+            f"  ⚠️ {len(failed_containers)} folder(s)/organisation(s) could not be resolved (members carried, profiles kept): "
+            + ", ".join(f"`{c['id']}` ({c['outcome']}, {c.get('projects', 0)} project(s))" for c in failed_containers) + "."
+        )
+    if over_cap_containers:
+        lines.append(
+            f"  ⚠️ {len(over_cap_containers)} folder(s)/organisation(s) resolved past the listing cap of {RESOLVED_SET_CAP} "
+            "(members carried over-cap, profiles kept, nothing created): "
+            + ", ".join(f"`{c['id']}` ({c.get('projects', 0)} project(s))" for c in over_cap_containers)
+            + ". Narrow it with exclude.projects or declare the sub-folders that hold the clusters."
         )
     unlisted = sorted((p, o) for p, o in (report.get("projects") or {}).items() if o != OUTCOME_OK)
     if unlisted:

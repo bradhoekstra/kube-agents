@@ -619,7 +619,10 @@ class ScopeGapParagraphTest(unittest.TestCase):
         rows = [{"id": "mgmt", "outcome": "ok"}] + [{"id": f"p-{i:03d}", "outcome": "over-cap", "via": ["folders/9"]} for i in range(25)]
         snap = _json.dumps({"projects": rows, "containers": [{"id": "folders/9", "outcome": "over-cap", "projects": 25}]})
         paragraph = bootstrap_scan_gate._scope_gap_paragraph(self._with_snapshot(snap))
-        self.assertIn("could not resolve `folders/9` (over-cap, 25 project(s) carried)", paragraph)
+        # Over-cap is a successful lookup past the cap, named as such, never as unresolved.
+        self.assertNotIn("could not resolve", paragraph)
+        self.assertIn("It resolved `folders/9` (25 project(s)) past its listing cap", paragraph)
+        self.assertIn("name the container as over the cap", paragraph)
         self.assertEqual(paragraph.count("`p-"), bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT)
         self.assertIn(f"and {25 - bootstrap_scan_gate.SCOPE_GAP_NAMED_LIMIT} more", paragraph)
         self.assertLess(len(paragraph), 2500)
