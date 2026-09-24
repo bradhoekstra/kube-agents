@@ -7,6 +7,7 @@ behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 """
 
 import datetime
+import itertools
 import json
 import pathlib
 import re
@@ -1198,15 +1199,21 @@ class InstallerCommonTest(unittest.TestCase):
             "esac\n"
             "exit 1\n"
         )
-        for fetched, expected_fetches in (({"KUBECONFIG_CONTEXT_FETCHED": "true"}, 0), ({}, 1)):
-            with self.subTest(fetched=fetched), tempfile.TemporaryDirectory() as out_dir:
+        # The marker spares the adoption fetch as well as the guard's: upgrade.sh
+        # over an adopted cluster fetched twice before, the second time without
+        # the DNS-endpoint entry it had just written.
+        for fetched, state, expected_fetches in (({"KUBECONFIG_CONTEXT_FETCHED": "true"}, MANAGED_CLUSTER_STATE, 0),
+                                                 ({}, MANAGED_CLUSTER_STATE, 1),
+                                                 ({"KUBECONFIG_CONTEXT_FETCHED": "true"}, DATA_MODE_STATE, 0),
+                                                 ({}, DATA_MODE_STATE, 1)):
+            with self.subTest(fetched=fetched, state=state[:40]), tempfile.TemporaryDirectory() as out_dir:
                 dest = pathlib.Path(out_dir) / "terraform.tfvars"
                 log = pathlib.Path(out_dir) / "gcloud.log"
                 proc = self._run(
                     f'write_tfvars_from_state "{dest}"; echo "rc=$? fetched=${{KUBECONFIG_CONTEXT_FETCHED:-}}"',
                     env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log), **fetched},
                     describe_stub="printf '\\n'; exit 0",
-                    gcloud_stdout=MANAGED_CLUSTER_STATE,
+                    gcloud_stdout=state,
                     kubectl_script=held,
                 )
                 # Either way the marker is set afterwards, so install.sh's own later fetch can skip.
@@ -1232,6 +1239,15 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("WARN: install.env's SCOPE_* keys carry an entry the CRD would refuse", proc.stdout)
             self.assertEqual(dest.read_text(), "# the previous run's file\n")
+            # And the caller is told, for its own comparison of the keys.
+            proc = self._run(
+                'print_warning() { :; }; '
+                f'write_tfvars_from_state "{dest}"; echo "invalid=${{SCOPE_KEYS_INVALID:-}}"',
+                env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "prod/us-central1/", "SCOPE_INVALID_STOPS": "false",
+                     "SCOPE_GUARD_ENABLED": "false"},
+                describe_stub="printf '\\n'; exit 0",
+            )
+            self.assertIn("invalid=true", proc.stdout, proc.stderr)
             proc = self._run(
                 f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
                 env={"API_SERVER_KEY": "k", "SCOPE_EXCLUDE_CLUSTERS": "prod/us-central1/", "SCOPE_GUARD_ENABLED": "false"},
@@ -1239,14 +1255,68 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
 
+    def test_the_hand_declared_scope_guard_case_table(self):
+        # The guard's whole rule, one cell per row, decided once. Inputs: whether the
+        # chart CR names projects, whether it carries exclusions, what SCOPE_PROJECTS
+        # names relative to the CR (nothing, a shared project, a disjoint one, a
+        # superset), and whether either SCOPE_EXCLUDE_* key is set. The rule: a key
+        # that shares a project with the CR was derived from it and is the declaration
+        # for every kind; otherwise the CR's projects are protected, and its exclusions
+        # are protected while no exclusion key is recorded.
+        cr_projects_options = {"none": [], "some": ["payments-prod", "payments-staging"]}
+        key_projects_options = {"none": "", "shared": "payments-prod", "disjoint": "other-project",
+                                "superset": "payments-prod payments-staging new-project"}
+        for cr_projects, cr_exclusions, key_projects, key_exclusions in itertools.product(
+                cr_projects_options, (False, True), key_projects_options, (False, True)):
+            if cr_projects == "none" and key_projects in ("shared", "superset"):
+                continue  # nothing to share with
+            shared = cr_projects == "some" and key_projects in ("shared", "superset")
+            drops_projects = cr_projects == "some" and not shared
+            drops_exclusions = cr_exclusions and not key_exclusions and not shared
+            expected = 1 if (drops_projects or drops_exclusions) else 0
+            with self.subTest(cr_projects=cr_projects, cr_exclusions=cr_exclusions,
+                              key_projects=key_projects, key_exclusions=key_exclusions), \
+                    tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": key_projects_options[key_projects]}
+                if key_exclusions:
+                    env["SCOPE_EXCLUDE_PROJECTS"] = "*-scratch"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=env, describe_stub="printf '\\n'; exit 0",
+                    kubectl_script=self._scoped_cr_kubectl(cr_projects_options[cr_projects], exclusions=cr_exclusions),
+                )
+                self.assertIn(f"rc={expected}", proc.stdout, proc.stderr + proc.stdout)
+                self.assertEqual(expected == 0, dest.exists())
+
+    def test_a_scope_from_the_environment_over_a_file_without_the_key_is_refused_on_any_front_door(self):
+        # upgrade.sh's door: the same refusal install.sh makes beside its flags,
+        # shared so the key cannot be set for one run from the shell either way.
+        with tempfile.TemporaryDirectory() as out_dir:
+            env_file = pathlib.Path(out_dir) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            proc = self._run('print_info() { echo "INFO: $*"; }; '
+                             f'rc=0; refuse_unrecorded_scope_env "{env_file}" || rc=$?; echo "rc=$rc"',
+                             env={"SCOPE_PROJECTS": "payments-prod"})
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("comes from the process environment and is not recorded", proc.stdout + proc.stderr)
+            self.assertIn('Set SCOPE_PROJECTS="payments-prod" in', proc.stdout + proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=payments-staging\n")
+            proc = self._run(f'rc=0; refuse_unrecorded_scope_env "{env_file}" || rc=$?; echo "rc=$rc"',
+                             env={"SCOPE_PROJECTS": "payments-prod"})
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            proc = self._run(f'rc=0; refuse_unrecorded_scope_env "{out_dir}/absent.env" || rc=$?; echo "rc=$rc"',
+                             env={"SCOPE_PROJECTS": "payments-prod"})
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+
     def test_a_plan_sees_the_hand_declared_scope_message_and_goes_on(self):
-        # upgrade.sh --plan applies nothing, and the plan is what shows the
-        # operator the destroys the refusal protects against, so the check
-        # speaks and the run continues.
+        # upgrade.sh --plan applies nothing, so the check speaks and the run
+        # continues, with the live declaration rendered in place of the keys so
+        # the file it leaves behind cannot be the one that empties the scope.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
-                'print_warning() { echo "WARN: $*"; }; '
+                'print_warning() { echo "WARN: $*"; }; print_info() { echo "INFO: $*"; }; '
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "SCOPE_GUARD_REFUSES": "false"},
                 describe_stub="printf '\\n'; exit 0",
@@ -1255,7 +1325,14 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("This run applies nothing", proc.stdout + proc.stderr)
             self.assertIn('SCOPE_PROJECTS="payments-prod"', proc.stdout)
-            self.assertIn("  projects = []", dest.read_text())
+            # The file a warn-only run leaves behind carries the live declaration,
+            # not the empty block the keys would render: an apply from it by hand
+            # (a plan's own advice) changes nothing, and the plan shows no scope change.
+            self.assertIn("INFO: This run renders that live declaration into terraform.tfvars", proc.stdout)
+            content = dest.read_text()
+            self.assertIn('  projects = ["payments-prod"]', content)
+            self.assertIn('    projects = ["*-sandbox"]', content)
+            self.assertIn('"payments-prod"', content.split("clusters = [")[1])
 
     def test_live_scope_json_reads_the_crs_own_scope_or_fails(self):
         # A retag carries the chart CR's scope exactly as it is, so the reader

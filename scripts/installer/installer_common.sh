@@ -1631,6 +1631,30 @@ print(json.dumps({"projects": scope.get("projects") or [],
 '
 }
 
+# A SCOPE_* value that reached the run from the process environment over an
+# install.env that does not record the key (every file written before the
+# keys existed lacks them, and sourcing the file does not clear an inherited
+# value it does not carry) would be rendered and bound this run and reversed
+# by the next run from a clean shell, which the hand-declared-scope check then
+# refuses for a scope no hand declared. install.sh refuses this door beside
+# its --scope-* flags; upgrade.sh calls this for the same door in every mode,
+# since a retag or plan would compare the value as if recorded and the full
+# run that follows would be refused for it. Returns 1, naming the key, after
+# printing the line to record.
+refuse_unrecorded_scope_env() {
+  local file="$1" key value refused=""
+  [ -f "$file" ] || return 0
+  for key in SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS; do
+    grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null && continue
+    value="${!key:-}"
+    [ -n "$value" ] || continue
+    print_error "${key}=\"${value}\" comes from the process environment and is not recorded in ${file}. A scope cannot be set for one run: a full run would render and bind it and the next run from a clean shell would regenerate without it, which its hand-declared-scope check then refuses; a retag or plan would compare it against the live scope as if the file recorded it."
+    print_info "Set ${key}=\"${value}\" in ${file}, or unset it in this shell, and re-run."
+    refused="true"
+  done
+  [ -z "$refused" ] || return 1
+}
+
 # Whether a full apply from the keys' scope (second) over the live scope
 # (first) is what guard_hand_declared_scope refuses: the same two rules, on the
 # JSON the retag already holds, so a retag can say so rather than send the
@@ -1686,7 +1710,7 @@ verify_scope_block_after_apply() {
   local context live
   context="$(gke_context_name)"
   if ! live="$(live_scope_json "$ns" 2>/dev/null)"; then
-    print_warning "Could not read the PlatformAgent in '${ns}' after the apply to confirm it carries the declared spec.scope. If the operator before this apply predated the field, its webhook may have dropped the block; check with: kubectl get platformagent -n ${ns} -o jsonpath='{.items[0].spec.scope}'"
+    print_warning "Could not read the PlatformAgent '${PLATFORM_AGENT_CR_NAME}' in '${ns}' after the apply to confirm it carries the declared spec.scope. If the operator before this apply predated the field, its webhook may have dropped the block; check with: kubectl get platformagent ${PLATFORM_AGENT_CR_NAME} -n ${ns} -o jsonpath='{.spec.scope}'"
     return 0
   fi
   [ -z "$live" ] || return 0
@@ -1763,9 +1787,10 @@ verify_scope_block_after_apply() {
 # destroy keeps nothing either way, and upgrade.sh's harness and operator
 # modes set it because they pass the CR's scope back as it is and render
 # nothing from the keys. SCOPE_GUARD_REFUSES=false
-# keeps the check and its message but lets the run go on: upgrade.sh --plan
-# sets it, because a plan applies nothing and is the artefact that shows what
-# the refusal protects.
+# keeps the check and its message but lets the run go on, rendering the live
+# declaration in place of the keys so the file left behind cannot empty the
+# scope: upgrade.sh --plan and install.sh --dry-run set it, because they
+# apply nothing.
 guard_hand_declared_scope() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local context
@@ -1868,6 +1893,20 @@ for item in items:
     print_warning "The PlatformAgent in '${ns}' declares a scope that install.env's SCOPE_* keys would empty. This run applies nothing; a full apply from these keys would rewrite the CR, retiring the Cluster Agent profiles of every project it drops and re-onboarding every cluster an exclusion kept out."
     print_info "If that scope was set by hand before the keys existed, record it in install.env before the apply; if emptying it is the intent, the apply needs SCOPE_GUARD_ENABLED=false:"
     printf '%s\n' "$missing"
+    # The file this run leaves behind must not be the one that empties the
+    # scope: a plan's own advice is `terraform apply`, and that path has no
+    # check. So the live declaration (the three lines just printed) is what
+    # the rest of the generator renders, in place of the keys; the plan then
+    # shows no scope change, and an apply from the file leaves it as it is.
+    local live_line
+    while IFS= read -r live_line; do
+      case "$live_line" in
+        SCOPE_PROJECTS=*|SCOPE_EXCLUDE_PROJECTS=*|SCOPE_EXCLUDE_CLUSTERS=*)
+          live_line="${live_line%\"}"
+          export "${live_line%%=*}=${live_line#*=\"}" ;;
+      esac
+    done <<<"$missing"
+    print_info "This run renders that live declaration into terraform.tfvars in place of the keys, so the plan shows no scope change and an apply from the file it leaves behind keeps the scope as it is."
     return 0
   fi
   print_error "The PlatformAgent in '${ns}' declares a scope that install.env's SCOPE_* keys would empty. Applying would rewrite the CR, retiring the Cluster Agent profiles of every project it drops and re-onboarding every cluster an exclusion kept out. The check cannot tell a scope set by hand before the keys existed from one the keys rendered and now empty, so it stops both."
@@ -2016,18 +2055,18 @@ write_tfvars_from_state() {
   # or speaking without refusing (install.sh --dry-run, upgrade.sh --plan),
   # the fetch stays what it was, an adoption's alone, and a caller that
   # fetched this run (upgrade.sh, which exports KUBECONFIG_CONTEXT_FETCHED
-  # after its own get-credentials) is not made to fetch twice; the same
-  # marker is exported after the fetch below, so install.sh's own later fetch
-  # can skip it too. A context the kubeconfig merely holds is not trusted as is:
+  # after its own get-credentials) is not made to fetch twice, an adoption
+  # included; the same marker is exported after the fetch below, so
+  # install.sh's own later fetch can skip it too. A context the kubeconfig merely holds is not trusted as is:
   # it may point at an earlier cluster of the same name (a first install that
   # died past the create and is re-run), and a fetch is what refreshes it. So
   # a teardown or a dry run over a cluster this state created neither
   # rewrites the operator's kubeconfig nor opens the Secret recovery below,
   # and a warn-only run says so when the machine holds no context.
   if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 &&
+    ! is_truthy "${KUBECONFIG_CONTEXT_FETCHED:-false}" &&
     { [ "$create_cluster" = "false" ] ||
-      { is_truthy "${SCOPE_GUARD_ENABLED:-true}" && is_truthy "${SCOPE_GUARD_REFUSES:-true}" &&
-        ! is_truthy "${KUBECONFIG_CONTEXT_FETCHED:-false}"; }; }; then
+      { is_truthy "${SCOPE_GUARD_ENABLED:-true}" && is_truthy "${SCOPE_GUARD_REFUSES:-true}"; }; }; then
     if type gke_dns_endpoint_flag >/dev/null 2>&1; then
       GKE_DNS_ENDPOINT_FLAG=""
       gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true
@@ -2278,6 +2317,9 @@ write_tfvars_from_state() {
   if ! scope_block="$(hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}")"; then
     is_truthy "${SCOPE_INVALID_STOPS:-true}" && return 1
     print_warning "install.env's SCOPE_* keys carry an entry the CRD would refuse (named above). This run applies none of them, so terraform.tfvars is not regenerated: it keeps the previous run's scope block and image tag, so until the line is fixed and a full upgrade regenerates it, do not apply the composition by hand from it."
+    # For the caller's own comparison of the keys against the live scope,
+    # which has nothing sound to compare.
+    export SCOPE_KEYS_INVALID="true"
     return 0
   fi
 

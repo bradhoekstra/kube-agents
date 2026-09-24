@@ -694,6 +694,11 @@ main() {
   if load_install_env "$install_env_file"; then
     state_loaded="true"
     print_success "Loaded install configuration from: ${install_env_file}"
+    # The same door install.sh refuses: a SCOPE_* value from the shell over a
+    # file that does not record the key.
+    if declare -F refuse_unrecorded_scope_env >/dev/null 2>&1; then
+      refuse_unrecorded_scope_env "$install_env_file" || exit 1
+    fi
   fi
   if [ "$state_loaded" != "true" ]; then
     print_warning "No install configuration (install.env) and no saved state (k8s-operator/scripts/vars.sh) was found in ${repo_dir}."
@@ -946,9 +951,11 @@ main() {
     fi
   fi
   # The hand-declared-scope check protects a full apply. A plan applies
-  # nothing and is the artefact that shows the destroys it protects
-  # against, so it speaks without refusing; harness and operator mode carry
-  # the CR's scope as it is (helm_retag), so it does not run.
+  # nothing, so it speaks without refusing, and renders the live declaration
+  # into the file it leaves behind rather than the keys, so the plan shows no
+  # scope change and an apply by hand from that file keeps the scope; harness
+  # and operator mode carry the CR's scope as it is (helm_retag), so it does
+  # not run.
   if [ "$PARAM_PLAN" = "true" ]; then
     export SCOPE_GUARD_REFUSES="false"
   elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then
@@ -1025,7 +1032,11 @@ main() {
       fi
     else
       local retag_keys_json
-      if ! retag_keys_json="$(scope_values_json 2>/dev/null)"; then
+      if [ "${SCOPE_KEYS_INVALID:-false}" = "true" ]; then
+        # The generator just refused an entry (named above) and rendered
+        # nothing from the keys; there is nothing sound to compare.
+        print_warning "install.env's SCOPE_* keys carry an entry the CRD refuses (named above), so this ${PARAM_UPGRADE_MODE} upgrade leaves the CR's scope as it is and compares nothing. Fix the line before a full upgrade."
+      elif ! retag_keys_json="$(scope_values_json 2>/dev/null)"; then
         # A key the reader cannot parse (a triple short of three parts): the
         # retag applies none of them, so it says so and leaves the CR alone;
         # full mode names the line.

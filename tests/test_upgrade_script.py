@@ -454,7 +454,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertIn('if [ "${RETAG_SCOPE_OMIT:-}" = "true" ]; then', retag)
         self.assertIn('set_args+=(--set "platformAgent.scope.omit=true")', retag)
         self.assertIn('set_args+=(--set "platformAgent.scope.omit=false" --set-json "platformAgent.scope=${RETAG_SCOPE_JSON}")', retag)
-        self.assertNotIn("scope_values_json)", retag, "the keys never travel through a retag")
+        self.assertNotIn("scope_values_json", retag, "the keys never travel through a retag")
         read_at = text.index('RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"')
         dispatch_at = text.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
         self.assertLess(read_at, dispatch_at)
@@ -490,6 +490,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         # upgrade refuses, so that notice names the override; a grow says "run full".
         exclude_only = '{"projects": [], "exclude": {"projects": ["*-sandbox"], "clusters": []}}'
         for live, keys, expect in ((empty, no_keys, None), (declared, no_keys, "record"), (None, no_keys, "no-cr"),
+                                   (declared, {**no_keys, "SCOPE_PROJECTS": "Team_A", "SCOPE_KEYS_INVALID": "true"}, "invalid"),
                                    (declared, {**no_keys, "SCOPE_PROJECTS": "other-project"}, "refused"),
                                    (exclude_only, {**no_keys, "SCOPE_PROJECTS": "payments-new"}, "refused"),
                                    (declared, {**no_keys, "SCOPE_PROJECTS": "payments-prod payments-new"}, "differ")):
@@ -511,7 +512,12 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
                 )
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
                 out = proc.stdout + proc.stderr
-                if expect == "no-cr":
+                if expect == "invalid":
+                    # The generator refused an entry this run: nothing sound to compare.
+                    self.assertIn("carry an entry the CRD refuses", out)
+                    self.assertNotIn("--upgrade-mode=full to apply the change", out)
+                    self.assertNotIn("SCOPE_GUARD_ENABLED=false", out)
+                elif expect == "no-cr":
                     # No chart CR: nothing to carry, neither omit nor a block, the release's values render it again.
                     self.assertIn("No PlatformAgent 'platform-agent'", out)
                     self.assertIn("RETAG_SCOPE_OMIT= RETAG_SCOPE_JSON=", out)
@@ -545,9 +551,19 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         # completed apply must not be reported as a failure for its absence.
         self.assertIn("if declare -F verify_scope_block_after_apply >/dev/null 2>&1; then", full[:check_at])
 
+    def test_a_scope_from_the_shell_over_a_file_without_the_key_is_refused_before_anything_runs(self):
+        # install.sh refuses this door beside its flags; upgrade.sh has the same
+        # door and refuses it the same way, right after loading the file and
+        # before any read or generation.
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        loaded_at = text.index('if load_install_env "$install_env_file"; then')
+        refuse_at = text.index('refuse_unrecorded_scope_env "$install_env_file" || exit 1', loaded_at)
+        self.assertLess(refuse_at, text.index('write_tfvars_from_state "'))
+        self.assertIn("if declare -F refuse_unrecorded_scope_env >/dev/null 2>&1; then", text[loaded_at:refuse_at])
+
     def test_the_scope_guard_runs_only_for_a_full_apply(self):
-        # A plan applies nothing and is what shows the destroys the guard
-        # protects against, so it speaks without refusing; harness and
+        # A plan applies nothing, so the guard speaks without refusing and the
+        # live declaration is rendered in place of the keys; harness and
         # operator pass the CR's scope back as it is and render nothing from
         # the keys, so the guard does not run.
         text = (_REPO_ROOT / "upgrade.sh").read_text()

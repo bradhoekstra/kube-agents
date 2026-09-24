@@ -248,14 +248,14 @@ kind, so adding a project, removing a project (other than
 the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or any of these in one edit, and running
 `upgrade.sh` is never refused; emptying the
 scope on purpose, the last project included, or replacing the list outright, is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
-destroy keeps nothing either way. The check reads the chart's own `PlatformAgent`, by name, through the install's own kubeconfig
+destroy keeps nothing either way. A `SCOPE_*` value that reaches either front door from the shell over an `install.env` that does not record the key is refused before anything runs, since the next run from a clean shell would reverse it. The check reads the chart's own `PlatformAgent`, by name, through the install's own kubeconfig
 context by name and fails closed: a read it cannot make refuses the run with the same override,
 because the apply that follows would not stop. `upgrade.sh`'s `harness` and `operator` modes leave the CR's scope exactly as it is on every Helm
 retag, hand edits included, since they run no Terraform: the retag reads the live scope back before
 anything is applied and passes it as it is, renders no block for a CR that has none (the chart's
 `platformAgent.scope.omit`), refuses when it cannot read the CR, and says so when the keys differ,
 leaving the change for `full` mode, which binds the IAM and renders the CR together; in those modes
-the check does not run, and under `--plan` and `install.sh --dry-run` it warns rather than refuses;
+the check does not run, and under `--plan` and `install.sh --dry-run` it warns rather than refuses and, when it could read the CR, renders the live declaration into `terraform.tfvars` in place of the keys, so the plan shows no scope change and an apply by hand from the file it leaves behind keeps the scope as it is (a run that could not read the CR says so, and its file carries the keys as loaded);
 `install.sh --generate-only` refuses as an apply would, because its handoff is `lifecycle.sh apply`
 on the file it writes and that path has no check of its own. One more thing a full apply checks afterwards: the apply that introduces
 `spec.scope` writes the CR in the same Helm pass that rolls the operator, so the write can pass the
