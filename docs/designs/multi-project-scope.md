@@ -314,7 +314,7 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
 the only value phase 1 writes, `asset-inventory` once a folder or organisation is, and a fallback resolver,
 if one is ever built, names itself here. It says nothing about the other selectors: each project's
 `via` carries its source, and the phase 3 selectors record theirs there (§10). The management project's `via` is `["management"]`; an explicit project's is `["explicit"]`;
-a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and in phase 3 each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` lists every `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
+a project a container produced names the container. `containers` lists every selector the run resolved at runtime, with its outcome and member count: the declared folders and organisations, and in phase 3 each `sharedVpcHosts/<host>` and `metricsScopes/<scope>` entry under its `via` name, so that a failed lookup of any of them is visible where the freeze rule (§4) and §7's second condition read it. `ignoredExcludes` records the first `exclude.projects` entry that matched the management project and was not applied (§3), with the project and the pattern, so an
 exclusion the run declined to honour is visible in the snapshot rather than only in a log line.
 `profiles` maps every profile on the volume to its project as the run read it, or as the last run
 that could read it did: a profile whose `cluster_identity` cannot be read this run is attributed
@@ -394,8 +394,8 @@ Prerequisites the design has to state and the installer has to preflight:
 - The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Today it needs only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
   than failing on the first.
-- A project in scope with `container.googleapis.com` disabled resolves to zero clusters (§4's
-  `api-disabled`); Terraform must not enable the API in other people's projects.
+- A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
+  profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
 - When a folder or organisation is declared, the identity running Terraform can enable
   `cloudasset.googleapis.com` in the host project, checked before the apply that then binds the
   agent's `roles/cloudasset.viewer` on each container. The preflight names an organisation policy
@@ -461,7 +461,7 @@ and unclassified errors leave profiles untouched.
 
 Discovery and IAM are the mechanism; these are the places that will read wrong once the mechanism
 works. Each is listed with whether it blocks the first phase or follows it: `1` is phase 1 of §10,
-`2` means after it, and `docs` means the documents step; the column is not §10's step numbering.
+`2` means after it, `docs` means the documents step, and `done` means `main` already carries the change; the column is not §10's step numbering.
 
 | Where                                                                                                                                                                            | What it assumes                                                                                                                                                                        | Phase |
 | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |

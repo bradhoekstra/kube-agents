@@ -123,7 +123,7 @@ LIST_GRACE_SECONDS = 5
 NOTIFY_UNLISTED_LIMIT = 8
 VIA_MANAGEMENT = "management"
 VIA_EXPLICIT = "explicit"
-# Two caps of 100 (the number is the open question in design §11): the CRD caps each declared list, and this caps the resolved
+# Two caps of 100 (design §3; a declared value replaces this one in a follow-up): the CRD caps each declared list, and this caps the resolved
 # set, the management project included. Explicit projects fill it in sorted order after the
 # management project; one past the cap reads over-cap, keeps its profiles, and gets no CREATE.
 RESOLVED_SET_CAP = 100
