@@ -460,6 +460,9 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertLess(read_at, dispatch_at)
         pre = text[read_at:dispatch_at]
         self.assertIn("exit 1", pre)
+        # A failed read is not sent to full mode, which makes the same read and refuses too.
+        self.assertIn("is refused the same way", pre)
+        self.assertNotIn("or run ./upgrade.sh --upgrade-mode=full, which renders the scope", pre)
         self.assertIn('RETAG_SCOPE_OMIT="true"', pre)
         # No block and keys recorded: the retag renders none and says so.
         self.assertIn("carries SCOPE_* keys but the PlatformAgent carries no spec.scope block", pre)

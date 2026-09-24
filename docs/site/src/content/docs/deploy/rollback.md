@@ -162,8 +162,9 @@ which has no sandbox, and the next forward upgrade renders the Secret again.
 
 Fields `N` added to the `PlatformAgent` schema. Once `N-1`'s CRD is applied, the API server prunes
 them from the stored object, and `N-1`'s chart does not render them. The Helm values that produced
-them stay in the release's recorded values: a later forward re-tag renders them again, the schema
-refusal below turns on them, and the full mode discards them.
+them stay in the release's recorded values: a later forward re-tag renders them again (`spec.scope`
+excepted: a re-tag passes the CR's live block back, so a full upgrade is what renders it from
+`install.env`), the schema refusal below turns on them, and the full mode discards them.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s

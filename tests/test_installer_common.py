@@ -879,15 +879,15 @@ class InstallerCommonTest(unittest.TestCase):
 
     # ── write_tfvars_from_state: the hand-declared scope guard ──────────────
 
-    def _scoped_cr_kubectl(self, projects, current_context="gke_test-project_us-central1_test-cluster"):
+    def _scoped_cr_kubectl(self, projects, current_context="gke_test-project_us-central1_test-cluster", exclusions=True):
         # `get platformagents` answers only through the install's own context by
         # name, the way the guard asks; the current context is whatever the
         # operator left it on.
-        cr = {"items": [{"spec": {"scope": {
-            "projects": projects,
-            "exclude": {"projects": ["*-sandbox"],
-                        "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]},
-        }}}]}
+        scope = {"projects": projects}
+        if exclusions:
+            scope["exclude"] = {"projects": ["*-sandbox"],
+                                "clusters": [{"projectId": "payments-prod", "location": "us-central1", "clusterName": "scratch"}]}
+        cr = {"items": [{"spec": {"scope": scope}}]}
         return (
             "#!/usr/bin/env bash\n"
             'case "$*" in\n'
@@ -912,7 +912,7 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("SCOPE_PROJECTS names nothing", proc.stdout)
+            self.assertIn("names payments-prod payments-staging and SCOPE_PROJECTS names nothing", proc.stdout)
             self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_PROJECTS="*-sandbox"', proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_CLUSTERS="payments-prod/us-central1/scratch"', proc.stdout)
@@ -948,6 +948,31 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("SCOPE_PROJECTS names nothing", proc.stdout)
             self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
             self.assertFalse(dest.exists())
+
+    def test_a_key_sharing_no_project_with_the_cr_is_refused_and_a_key_sharing_one_grows_it(self):
+        # A pre-key CR hand-edited to two projects and no exclusions. Recording the
+        # project the operator meant to add, alone, would render it over the two: refused,
+        # with the live declaration printed. A key that carries one of the CR's projects
+        # was derived from it and grows the list freely.
+        cr = self._scoped_cr_kubectl(["payments-prod", "payments-staging"], exclusions=False)
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "new-project"},
+                describe_stub="printf '\\n'; exit 0", kubectl_script=cr,
+            )
+            self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("names payments-prod payments-staging and SCOPE_PROJECTS names none of them", proc.stdout)
+            self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
+            self.assertFalse(dest.exists())
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod new-project"},
+                describe_stub="printf '\\n'; exit 0", kubectl_script=cr,
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn('projects = ["payments-prod", "new-project"]', dest.read_text())
 
     def test_a_hand_added_project_missing_from_a_named_key_is_not_refused(self):
         # The documented lifecycle, and the hand-added case, are one scenario:
@@ -1291,6 +1316,7 @@ class InstallerCommonTest(unittest.TestCase):
                 'case "$*" in\n'
                 '  *"get platformagents"*)\n'
                 '    if [ -f "$KUBECTL_STATE" ]; then echo \'' + second + '\'; else touch "$KUBECTL_STATE"; echo \'{"items":[{"spec":{}}]}\'; fi; exit 0 ;;\n'
+                '  *"get crd"*) printf "%s" "${CRD_SERVES_SCOPE-object}"; exit 0 ;;\n'
                 "esac\n"
                 "exit 1\n"
             )
@@ -1329,6 +1355,18 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=1", helm_fails.stdout, helm_fails.stderr)
             self.assertIn("failed at the Helm upgrade", helm_fails.stdout + helm_fails.stderr)
+            # A served CRD from before the field: the API server pruned the block and no
+            # Helm upgrade can get past that; the check says so, names the CRD apply
+            # upgrade.sh makes, and drives no Helm upgrade.
+            state.unlink(missing_ok=True); log.unlink(missing_ok=True)
+            stale_crd = self._run(
+                f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
+                env={**env, "CRD_SERVES_SCOPE": ""}, kubectl_script=kubectl_absent_then(absent), helm_script=helm_logging,
+            )
+            self.assertIn("rc=1", stale_crd.stdout, stale_crd.stderr)
+            self.assertIn("CRD this cluster serves has no spec.scope", stale_crd.stdout + stale_crd.stderr)
+            self.assertIn("--upgrade-mode=full", stale_crd.stdout + stale_crd.stderr)
+            self.assertFalse(log.exists(), "stale CRD: no Helm upgrade may run")
             for label, env2, script in (
                 ("no keys", {}, kubectl_absent_then(absent)),
                 ("block present", {"SCOPE_PROJECTS": "payments-prod"}, self._scoped_cr_kubectl(["payments-prod"])),
@@ -1339,7 +1377,7 @@ class InstallerCommonTest(unittest.TestCase):
                     proc = self._run(
                         'print_warning() { echo "WARN: $*"; }; '
                         f'verify_scope_block_after_apply kubeagents-system "{chart}"; echo "rc=$?"',
-                        env={**env2, "KUBECTL_STATE": str(state)}, kubectl_script=script, helm_script=helm_logging,
+                        env={**env2, "KUBECTL_STATE": str(state), "HELM_CALL_LOG": str(log)}, kubectl_script=script, helm_script=helm_logging,
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertFalse(log.exists(), f"{label}: no Helm upgrade may run")
@@ -1355,13 +1393,7 @@ class InstallerCommonTest(unittest.TestCase):
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k"},
                 describe_stub="printf '\\n'; exit 0",
-                kubectl_script=(
-                    "#!/usr/bin/env bash\n"
-                    'case "$*" in\n'
-                    '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
-                    "esac\n"
-                    "exit 1\n"
-                ),
+                # The harness's default kubectl answers "no such resource type".
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertNotIn("hand-declared-scope check", proc.stdout + proc.stderr)

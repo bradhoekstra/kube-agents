@@ -147,6 +147,9 @@ readonly SCOPE_LIST_MAX_ENTRIES=100
 # with no kube-agents CRD on it, which is every first adoption.
 readonly KUBECTL_NO_RESOURCE_TYPE_PATTERN="doesn't have a resource type|could not find the requested resource"
 # kubectl naming a --context the kubeconfig does not hold (two wordings across releases).
+# Where the served PlatformAgent CRD's schema carries spec.scope, for a served-CRD check.
+readonly CRD_SCOPE_FIELD_JSONPATH='{.spec.versions[*].schema.openAPIV3Schema.properties.spec.properties.scope.type}'
+readonly PLATFORMAGENT_CRD_NAME="platformagents.kubeagents.x-k8s.io"
 readonly KUBECTL_NO_CONTEXT_PATTERN="context was not found for specified context|context .* does not exist"
 
 # Memory mode (the input spelling, recorded in install.env as MEMORY) → the
@@ -1658,6 +1661,17 @@ verify_scope_block_after_apply() {
     return 0
   fi
   [ -z "$live" ] || return 0
+  # Two things drop the block on write: the previous operator's webhook, which
+  # the re-render below gets past, and a served CRD from before the field,
+  # which the API server prunes against and no Helm upgrade can get past.
+  # install.sh applies no CRD update (upgrade.sh does, before its apply), so a
+  # re-run of install.sh over a pre-field install lands here; say which it is.
+  local served_scope
+  served_scope="$(kubectl --context "$context" get crd "$PLATFORMAGENT_CRD_NAME" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o jsonpath="$CRD_SCOPE_FIELD_JSONPATH" 2>/dev/null || true)"
+  if [ -z "$served_scope" ]; then
+    print_error "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent CRD this cluster serves has no spec.scope, so the API server pruned the block on write. install.sh applies no CRD update: run ./upgrade.sh --upgrade-mode=full, which applies the chart's CRDs before its apply and re-renders the block, or apply charts/kube-agents/crds/ by hand and re-run. The IAM is bound; the reconcile lists the management project alone until the block is on the CR."
+    return 1
+  fi
   print_warning "The apply declared a scope (SCOPE_* in install.env) but the PlatformAgent in '${ns}' carries no spec.scope block: the CR was written through the previous operator's webhook, which dropped the field. Re-rendering it against the new operator (two Helm upgrades: one recording no block, one adding it back)..."
   if [ -z "$chart_dir" ] || [ ! -d "$chart_dir" ]; then
     print_error "Cannot re-render the block: no chart directory to upgrade from${chart_dir:+ (${chart_dir})}. The IAM is bound; the reconcile lists the management project alone until spec.scope is on the CR."
@@ -1688,14 +1702,15 @@ verify_scope_block_after_apply() {
 # from empty keys over such a CR would retire every Cluster Agent profile the
 # hand-set projects produced and re-onboard every cluster the hand-set
 # exclusions kept out. The rule: refuse when the CR names projects and
-# SCOPE_PROJECTS names none; and refuse when the CR carries exclusions,
-# neither SCOPE_EXCLUDE_* key is set, and the CR's projects disagree with
-# SCOPE_PROJECTS, since that is a scope the keys have not taken over (a hand
-# set, or the partial install.env that recorded the projects alone). Once the
-# projects agree the CR reads as rendered from these keys, and a key of each
-# kind changes its kind freely: removing a project retires its profiles,
-# clearing the exclusion keys re-onboards the excluded clusters, which is what
-# the operator asked for. Emptying the projects on purpose is
+# SCOPE_PROJECTS names none of them; and refuse when the CR carries
+# exclusions, neither SCOPE_EXCLUDE_* key is set, and SCOPE_PROJECTS names
+# nothing or a project the CR does not carry, since that is a scope the keys
+# have not taken over (a hand set, or the partial install.env that recorded
+# part of it). Keys that share a project with the CR were derived from it,
+# and keys naming the CR's projects or a subset are the declaration for every
+# kind: removing a project retires its profiles, clearing the exclusion keys
+# re-onboards the excluded clusters, which is what the operator asked for.
+# Emptying the projects on purpose, or replacing the whole list, is
 # SCOPE_GUARD_ENABLED=false for one run. Nothing is read from the Helm
 # release: what the chart last rendered is no guide to what the CR carries.
 #
@@ -1775,10 +1790,13 @@ for item in items:
     projects = scope.get("projects") or []
     excluded = exclude.get("projects") or []
     clusters = [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []]
-    # A CR that names projects against a key that names none is what a pre-key install
-    # and a partial install.env look like, and also what removing the last project looks
-    # like; the guard cannot tell them apart, so the last is SCOPE_GUARD_ENABLED=false.
-    drops_projects = bool(projects) and not key_projects
+    # A CR that names projects against a key that names none of them is what a pre-key
+    # install and a partial install.env look like (the operator recorded the project to
+    # add, not the live list), and also what removing the last project or replacing the
+    # whole list looks like; the guard cannot tell them apart, so the last two are
+    # SCOPE_GUARD_ENABLED=false. A key that shares a project with the CR was derived from
+    # it: it grows and shrinks the list freely.
+    drops_projects = bool(projects) and not (set(key_projects) & set(projects))
     # An exclusion is protected while no key names a project, or while SCOPE_PROJECTS
     # names a project the CR does not carry: either way the keys were not derived from
     # this CR (hand-set, or a partial install.env). Keys that name the projects the CR
@@ -1789,7 +1807,7 @@ for item in items:
         continue
     what = []
     if drops_projects:
-        what.append("names %s and SCOPE_PROJECTS names nothing" % " ".join(projects))
+        what.append("names %s and SCOPE_PROJECTS %s" % (" ".join(projects), "names nothing" if not key_projects else "names none of them"))
     if drops_exclusions:
         what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS %s" % (" ".join(excluded + clusters), "names nothing" if not key_projects else "names a project the CR does not carry"))
     print("# the PlatformAgent " + "; ".join(what))
@@ -2213,7 +2231,7 @@ write_tfvars_from_state() {
   local scope_block
   if ! scope_block="$(hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}")"; then
     is_truthy "${SCOPE_INVALID_STOPS:-true}" && return 1
-    print_warning "install.env's SCOPE_* keys carry an entry the CRD would refuse (named above). This run applies none of them, so terraform.tfvars is left as it was; fix the line before a full upgrade, which renders the keys."
+    print_warning "install.env's SCOPE_* keys carry an entry the CRD would refuse (named above). This run applies none of them, so terraform.tfvars is not regenerated: it keeps the previous run's scope block and image tag, so until the line is fixed and a full upgrade regenerates it, do not apply the composition by hand from it."
     return 0
   fi
 

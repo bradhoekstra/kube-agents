@@ -870,7 +870,9 @@ main() {
   # The chart-only fast path: a mode that moves no GCP resource re-tags the
   # images it owns on the live release and leaves the rest of the values as
   # they are. The regenerated tfvars carry the same new tag, so the next full
-  # `terraform apply` agrees with the release instead of reverting it.
+  # `terraform apply` agrees with the release instead of reverting it (unless
+  # the generator skipped the file over a SCOPE_* entry the CRD would refuse,
+  # which it says: the file then keeps the previous tag until a full upgrade).
   #
   # Takes every key it must move in one `helm upgrade`, not one call per key:
   # two sequential upgrades leave the release briefly holding a new agent
@@ -951,9 +953,10 @@ main() {
   fi
   # A retag never applies the SCOPE_* keys (helm_retag passes the CR's scope
   # back), so a malformed line in them must not stop it: the generator warns
-  # and leaves terraform.tfvars as it was, which keeps the file faithful to
-  # install.env for a hand-run apply. A plan renders what a full upgrade
-  # would, in every mode, so it keeps the keys and the refusal.
+  # and does not regenerate terraform.tfvars, so the file never carries a
+  # scope install.env does not declare (it does keep the previous image tag,
+  # which the warning says). A plan renders what a full upgrade would, in
+  # every mode, so it keeps the keys and the refusal.
   if [ "$PARAM_PLAN" != "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then
     export SCOPE_INVALID_STOPS="false"
   fi
@@ -998,7 +1001,7 @@ main() {
   RETAG_SCOPE_OMIT=""
   if [ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block >/dev/null 2>&1; then
     if ! RETAG_SCOPE_JSON="$(live_scope_json "$target_namespace")"; then
-      print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read, or run ./upgrade.sh --upgrade-mode=full, which renders the scope from install.env."
+      print_error "Could not read the PlatformAgent's spec.scope in '${target_namespace}' through this install's kubectl context; a ${PARAM_UPGRADE_MODE} upgrade has to carry it unchanged and would otherwise render the chart's empty default over it. Fix the read: a full upgrade reads the CR the same way for its hand-declared-scope check and is refused the same way (SCOPE_GUARD_ENABLED=false skips that check, and a run that skips it renders the scope from install.env over whatever the CR carries)."
       exit 1
     fi
     if [ -z "$RETAG_SCOPE_JSON" ]; then

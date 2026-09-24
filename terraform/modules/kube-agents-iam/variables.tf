@@ -35,9 +35,10 @@ variable "ksa_name" {
 
 variable "project_roles" {
   description = <<-EOT
-    Project-level IAM roles granted to the agent's service account, and the only
-    list the module binds -- `local.agent_project_roles` in main.tf reads this
-    and nothing else. The default below mirrors `read_only_roles` in
+    Project-level IAM roles granted to the agent's service account in the host
+    project, and the list the scope input's per-project bindings (scope.tf) are
+    drawn from -- `local.agent_project_roles` in main.tf reads this and nothing
+    else. The default below mirrors `read_only_roles` in
     terraform/examples/full-install/main.tf, and
     tests/test_scoped_sa_pool_iam.py compares the two, so the mirror is checked
     rather than merely intended. Set [] to grant nothing and manage roles

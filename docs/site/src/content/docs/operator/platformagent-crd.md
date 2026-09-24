@@ -463,11 +463,13 @@ included; the Terraform composition fills that value from its `scope` variable, 
 writes from `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`.
 A scope set by editing the CR by hand on an installer-managed install, an exclusion the `manage-cluster` skill adds included, is replaced by those keys on
 the next full `upgrade.sh` (the `harness` and `operator` modes re-tag images and pass the CR's scope back as it is), so record it in `install.env` first; a full run
-refuses while the CR declares what the keys would empty, and prints the lines to add. Keys that name
-the CR's projects, or a subset of them, are the declaration for every kind, in full mode: removing a
-project other than the last, clearing the exclusion keys, or both in one edit, is never refused.
-Removing the last project is, because a CR that names projects against a key that names none is also
-what a hand-set scope looks like; `SCOPE_GUARD_ENABLED=false` for that one run empties it on purpose.
+refuses while the CR declares what the keys would empty, and prints the lines to add. A key that shares
+a project with the CR grows and shrinks the list freely, and keys that name the CR's projects, or a
+subset of them, are the declaration for every kind, in full mode: adding a project, removing a project
+other than the last, clearing the exclusion keys, or both in one edit, is never refused. Removing the
+last project, or replacing the list with one that shares no project with the CR, is, because a CR that
+names projects against a key that names none of them is also what a hand-set scope looks like;
+`SCOPE_GUARD_ENABLED=false` for that one run does it on purpose.
 Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
 
 ```yaml
