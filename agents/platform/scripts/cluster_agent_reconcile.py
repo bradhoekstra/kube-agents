@@ -1006,11 +1006,12 @@ def reconcile(dry_run: bool = False) -> dict:
                 log(f"{cluster} ({proj}/{location}) is skipped by RECONCILE_EXCLUDE, a bare name; "
                     "move it to spec.scope.exclude.clusters, the variable retires next release.")
                 continue
-            if member_only and not dry_run:
+            if member_only:
                 # Per cluster: the index lags real state by minutes, so a member's cluster the
                 # index still names may be gone, and the first cluster answering says nothing
                 # about the second. A 403 seen earlier in the project, or on this describe,
-                # skips the create.
+                # skips the create. On a dry run too: the preview has to name the creates and
+                # outcomes the real run will produce, and PRUNE describes on a dry run already.
                 revised = proj in _denied_this_run or proj in _api_disabled_this_run
                 exists = None if revised else _cluster_exists(proj, cluster, location)
                 if exists is False:
@@ -1113,7 +1114,8 @@ def reconcile(dry_run: bool = False) -> dict:
     declared_containers = set(_container_ids(scope))
     # A container this run declares that the previous snapshot did not: the one-edit
     # migration from `projects` to a folder, whose members the index may not place yet.
-    newly_declared_containers = bool(declared_containers - _previous_container_ids(previous))
+    previous_known_containers = _previous_container_ids(previous)
+    newly_declared_containers = bool(declared_containers - previous_known_containers)
     exclude_patterns = scope["exclude"]["projects"]
 
     now = datetime.now(timezone.utc)
@@ -1139,7 +1141,8 @@ def reconcile(dry_run: bool = False) -> dict:
         previous `via` names no declared container to keep it by. A container the previous
         snapshot did not carry is what marks that edit, and the same day's clock applies; a
         stamp already on the row keeps counting on the runs after, when the container is no
-        longer new.
+        longer new. A container removed by this edit with nothing new declared is the
+        declaration speaking, stamp or no stamp: the row retires.
         """
         # A project already retiring was dropped by the declaration; the index rule is for
         # members the declaration still reaches, and an unclean run carries a retiring
@@ -1158,8 +1161,13 @@ def reconcile(dry_run: bool = False) -> dict:
         elif not containers_known:
             return True
         elif not any(v in declared_containers for v in container_vias):
-            if not (newly_declared_containers or _previous_absent_since(previous, project)):
+            if newly_declared_containers:
+                pass  # the one-edit move: held from this run, whatever the row carried
+            elif any(v in previous_known_containers for v in container_vias):
+                return False  # removed by this edit, nothing declared in its place: retires
+            elif not _previous_absent_since(previous, project):
                 return False
+            # else: a hold that began on an earlier run, still counting
         since = _previous_absent_since(previous, project) or now.strftime(SNAPSHOT_TIME_FORMAT)
         try:
             first_absent = datetime.strptime(since, SNAPSHOT_TIME_FORMAT).replace(tzinfo=timezone.utc)

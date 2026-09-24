@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+from datetime import datetime, timezone
 import os
 import shutil
 import subprocess
@@ -1458,8 +1459,17 @@ class ScopeTest(HomesMixin):
                                        searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
         self.assertEqual(deleted, ["cluster-a"])
         # The declaration speaks, two ways: the folder leaves the CR, or a glob names the project.
-        for scope in ({"projects": []}, {"folders": ["123456789012"], "exclude": {"projects": ["team-*"]}}):
-            self._write_previous(prev)
+        # On an unstamped row, and on a row already stamped (the operator reacting to
+        # `unmanaged` by dropping the folder): both retire at once.
+        stamped = [{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                   {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE,
+                    rec.ABSENT_SINCE_KEY: datetime.now(timezone.utc).strftime(rec.SNAPSHOT_TIME_FORMAT)}]
+        for scope, previous in (({"projects": []}, prev), ({"projects": []}, stamped),
+                                ({"folders": ["123456789012"], "exclude": {"projects": ["team-*"]}}, prev),
+                                ({"folders": ["123456789012"], "exclude": {"projects": ["team-*"]}}, stamped)):
+            self._write_previous(previous, containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1}],
+                                 declared={"projects": [], "folders": ["123456789012"], "organizations": [],
+                                           "exclude": {"projects": [], "clusters": []}})
             report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
                                            searches={self.FOLDER: ({}, rec.OUTCOME_OK)})
             self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]), scope)
@@ -1707,6 +1717,25 @@ class ScopeTest(HomesMixin):
                                  profiles=["cluster-a"], identities=ids,
                                  searches={new: ({}, rec.OUTCOME_OK)})
         self.assertEqual(report["retiring"], ["team-a"])
+
+    def test_a_dry_run_previews_the_creates_and_outcomes_the_real_run_makes(self):
+        # The per-cluster probe runs on a dry run too: a member the account cannot read
+        # previews as denied with no WOULD-create, and a cluster the index still names but
+        # describe says is gone is left out, the way the real run leaves them.
+        members = {"team-a": [("team-a", "prod", "us-central1")], "team-b": [("team-b", "old", "us-central1")],
+                   "team-c": [("team-c", "live", "us-central1")]}
+
+        def probe(project, cluster, location):
+            if project == "team-a":
+                rec._denied_this_run.add(project)
+                return None
+            return project != "team-b"
+        report, created, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, exists=probe, dry_run=True,
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(created, [])
+        self.assertEqual(report["created"], ["live/us-central1"])
+        self.assertEqual((report["projects"]["team-a"], report["projects"]["team-b"], report["projects"]["team-c"]),
+                         (rec.OUTCOME_DENIED, rec.OUTCOME_OK, rec.OUTCOME_OK))
 
     def test_an_over_cap_members_stamp_clears_because_the_index_placed_it(self):
         old = "2020-01-01T00:00:00Z"
