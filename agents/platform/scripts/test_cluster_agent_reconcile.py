@@ -1187,10 +1187,13 @@ class ScopeTest(HomesMixin):
         self.assertNotIn("team-scratch", {p["id"] for p in self._snapshot()["projects"]})
 
     def test_a_folder_that_cannot_be_read_freezes_its_previous_members_and_the_prune(self):
-        # Last run: the folder resolved team-a; an explicit project p2 was in scope too.
+        # Last run: the folder resolved team-a; an explicit project p2 was in scope too. The
+        # folder is in the previous snapshot, so p2's hold below is the freeze's and not the
+        # one-edit migration rule's (a container declared this run for the first time).
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "team-a", "via": [self.FOLDER], "state": rec.STATE_IN_SCOPE},
-                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+                              {"id": "p2", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}],
+                             containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1}])
         ids = {"cluster-a": _identity("team-a", "prod"), "cluster-p2": _identity("p2", "x")}
         # This run: the folder is denied and p2 was dropped from the declaration.
         report, created, deleted = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
@@ -1203,7 +1206,13 @@ class ScopeTest(HomesMixin):
         self.assertEqual((rows["team-a"]["outcome"], rows["team-a"]["state"], rows["team-a"]["via"]), (rec.OUTCOME_DENIED, rec.STATE_IN_SCOPE, [self.FOLDER]))
         # p2 is carried, not retired: the frozen container holds back the prune.
         self.assertEqual(rows["p2"]["state"], rec.STATE_IN_SCOPE)
+        self.assertNotIn(rec.ABSENT_SINCE_KEY, rows["p2"])
         self.assertIn("cluster-p2", report["unmanaged"])
+        # The same edit with the folder readable retires p2, so the hold above was the freeze's.
+        report, _, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []},
+                                 profiles=["cluster-a", "cluster-p2"], identities=ids,
+                                 searches={self.FOLDER: ({"team-a": [("team-a", "prod", "us-central1")]}, rec.OUTCOME_OK)})
+        self.assertEqual(report["retiring"], ["p2"])
 
     def test_an_over_cap_folder_carries_its_members_without_holding_back_the_prune(self):
         # The folder was declared before this run (the previous snapshot carries it), so the
