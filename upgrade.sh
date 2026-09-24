@@ -1004,10 +1004,12 @@ main() {
     else
       local retag_keys_json
       retag_keys_json="$(scope_values_json)" || exit 1
-      if [ -z "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ]; then
-        # No key recorded at all: the pre-key install whose scope was set by
-        # hand. Full mode would refuse it (the hand-declared-scope check), so
-        # the way forward is to record the live declaration, not to run full.
+      if [ -z "${SCOPE_PROJECTS:-}${SCOPE_EXCLUDE_PROJECTS:-}${SCOPE_EXCLUDE_CLUSTERS:-}" ] && ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then
+        # No key recorded and the CR declares something: the pre-key install
+        # whose scope was set by hand. Full mode would refuse it (the
+        # hand-declared-scope check), so the way forward is to record the live
+        # declaration, not to run full. A CR carrying the empty block every
+        # full apply renders declares nothing, and nothing needs recording.
         print_warning "install.env records no SCOPE_* key while the PlatformAgent carries a spec.scope. A ${PARAM_UPGRADE_MODE} upgrade leaves the CR's scope as it is; before a full upgrade, record the live declaration in install.env (a full upgrade with the keys empty is refused, since it would empty the scope):"
         printf '%s' "$RETAG_SCOPE_JSON" | python3 -c '
 import json, sys

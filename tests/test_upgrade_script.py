@@ -471,6 +471,40 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertLess(pre.index("records no SCOPE_* key"), pre.index("elif ! scope_json_equal"))
         self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block', text)
 
+    def test_the_retag_scope_notice_speaks_only_for_a_scope_the_keys_do_not_carry(self):
+        # The block runs, with the live read stubbed: every full apply renders
+        # an empty spec.scope, so a scope-less install must retag in silence,
+        # and only a CR that declares something with no key recorded gets the
+        # "record the live declaration" notice with its three lines.
+        text = _UPGRADE_SH.read_text()
+        start = text.index('  RETAG_SCOPE_OMIT=""\n')
+        end = text.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
+        block = text[start:end]
+        empty = '{"projects": [], "exclude": {"projects": [], "clusters": []}}'
+        declared = '{"projects": ["payments-prod"], "exclude": {"projects": [], "clusterst": []}}'.replace("clusterst", "clusters")
+        for live, expect_notice in ((empty, False), (declared, True)):
+            with self.subTest(live=live):
+                script = (
+                    f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                    # Source-only mode loads no engine; the block's readers live there.
+                    f'source "{_REPO_ROOT}/scripts/installer/installer_common.sh"\n'
+                    'print_warning() { echo "WARN: $*"; }; hcl_scope_block() { :; }\n'
+                    f"live_scope_json() {{ printf '%s' '{live}'; }}\n"
+                    'PARAM_UPGRADE_MODE=harness; target_namespace=kubeagents-system\n'
+                    f'retag_scope_check() {{\n{block}\n}}\nretag_scope_check; echo "rc=$?"\n'
+                )
+                proc = subprocess.run(
+                    ["bash", "-c", script], capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                    env=get_isolated_test_env(overrides={"SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                out = proc.stdout + proc.stderr
+                if expect_notice:
+                    self.assertIn("records no SCOPE_* key while the PlatformAgent carries a spec.scope", out)
+                    self.assertIn('SCOPE_PROJECTS="payments-prod"', out)
+                else:
+                    self.assertNotIn("WARN:", out)
+
     def test_jq_is_required_for_the_modes_that_read_with_it(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()
         self.assertIn('if [ "$PARAM_UPGRADE_MODE" != "operator" ]; then\n    required_tools+=(jq)', text)
