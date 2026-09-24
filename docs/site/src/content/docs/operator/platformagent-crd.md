@@ -463,8 +463,9 @@ included; the Terraform composition fills that value from its `scope` variable, 
 writes from `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`.
 A scope set by editing the CR by hand on an installer-managed install is replaced by those keys on
 the next full `upgrade.sh` (the `harness` and `operator` modes re-tag images and pass the CR's scope back as it is), so record it in `install.env` first; a full run
-refuses while the CR declares by hand what the keys would empty, and prints the lines to add. A key
-that names any project is the declaration and changes the scope freely, in full mode.
+refuses while the CR declares by hand what the keys would empty, and prints the lines to add. Once
+the projects agree the CR reads as rendered from the keys, and each key changes its own kind freely,
+in full mode: removing a project, or clearing the exclusion keys, is never refused.
 Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and retires nothing; an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.
 
 ```yaml

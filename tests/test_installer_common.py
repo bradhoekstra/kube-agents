@@ -193,10 +193,9 @@ class InstallerCommonTest(unittest.TestCase):
                 "exit 1\n"
             ))
             kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
-            # Hermetic helm too: the scope guard asks the release what the
-            # chart last rendered, and a developer's real release must never
-            # answer a unit test. No release by default, in helm's own words,
-            # since any other failure is a read the guard reports as not run.
+            # Hermetic helm too: the post-apply scope heal and the retag path
+            # drive helm, and a developer's real release must never answer a
+            # unit test. No release by default, in helm's own words.
             helm = bin_dir / "helm"
             helm.write_text(helm_script or '#!/usr/bin/env bash\necho "Error: release: not found" >&2\nexit 1\n')
             helm.chmod(helm.stat().st_mode | stat.S_IEXEC)
@@ -900,7 +899,10 @@ class InstallerCommonTest(unittest.TestCase):
 
     def test_tfvars_refuse_to_empty_a_hand_declared_scope(self):
         # The CR carries a scope, install.env carries none: the apply would
-        # render an empty block and the reconcile would retire payments-prod's profiles.
+        # render an empty block and the reconcile would retire payments-prod's
+        # profiles. This is the one shrink that is refused, since it is also what
+        # a pre-key install and a partial install.env look like;
+        # SCOPE_GUARD_ENABLED=false is the deliberate form.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -910,6 +912,7 @@ class InstallerCommonTest(unittest.TestCase):
                 kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
             )
             self.assertIn("rc=1", proc.stdout, proc.stderr)
+            self.assertIn("SCOPE_PROJECTS names nothing", proc.stdout)
             self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_PROJECTS="*-sandbox"', proc.stdout)
             self.assertIn('SCOPE_EXCLUDE_CLUSTERS="payments-prod/us-central1/scratch"', proc.stdout)
@@ -946,43 +949,13 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
             self.assertFalse(dest.exists())
 
-    def test_an_installer_rendered_scope_shrinks_through_the_keys(self):
-        # The documented lifecycle: remove payments-staging from SCOPE_PROJECTS, run
-        # upgrade.sh. SCOPE_PROJECTS still names a project, so the guard reads the
-        # edit as the shrink it is and the run proceeds with projects = ["payments-prod"].
-        with tempfile.TemporaryDirectory() as out_dir:
-            dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod", "SCOPE_EXCLUDE_PROJECTS": "*-sandbox",
-                     "SCOPE_EXCLUDE_CLUSTERS": "payments-prod/us-central1/scratch"},
-                describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
-            )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn('  projects = ["payments-prod"]', dest.read_text())
-
-    def test_emptying_every_project_needs_the_guard_turned_off(self):
-        # Every key removed while the CR names projects: the one shrink that
-        # is refused, since it is also what a pre-key install and a partial
-        # install.env look like; SCOPE_GUARD_ENABLED=false is the deliberate form.
-        with tempfile.TemporaryDirectory() as out_dir:
-            dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(
-                f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
-                env={"API_SERVER_KEY": "k"},
-                describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["payments-prod", "payments-staging"]),
-            )
-            self.assertIn("rc=1", proc.stdout, proc.stderr)
-            self.assertIn("SCOPE_PROJECTS names nothing", proc.stdout)
-            self.assertIn('SCOPE_PROJECTS="payments-prod payments-staging"', proc.stdout)
-
     def test_a_hand_added_project_missing_from_a_named_key_is_not_refused(self):
-        # SCOPE_PROJECTS names payments-prod, the CR also carries a hand-added
-        # payments-staging. The key is the declaration: the run proceeds and
-        # payments-staging retires, which is what the recorded key says. The
-        # exclusions are recorded too, since they are guarded per kind.
+        # The documented lifecycle, and the hand-added case, are one scenario:
+        # SCOPE_PROJECTS names payments-prod, the CR also carries payments-staging
+        # (removed from the key, or added by hand). The key is the declaration:
+        # the run proceeds and payments-staging retires, which is what the
+        # recorded key says. The exclusions are recorded too, since they are
+        # guarded per kind.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -1168,6 +1141,35 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=1", proc.stdout, proc.stderr)
             self.assertEqual(1, len([line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]))
             self.assertIn("could not run", proc.stdout + proc.stderr)
+
+    def test_a_context_the_kubeconfig_already_holds_is_not_fetched_again(self):
+        # upgrade.sh fetches credentials before it generates; the guard reads
+        # the CR through that context as it is rather than fetching a second
+        # time over it. A kubeconfig without the context still fetches.
+        def kubectl(holds):
+            listed = "gke_test-project_us-central1_test-cluster" if holds else "some-other-context"
+            return (
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"config get-contexts"*) echo "{listed}"; exit 0 ;;\n'
+                '  *"get platformagents"*) echo "error: the server doesn\x27t have a resource type \\"platformagents\\"" >&2; exit 1 ;;\n'
+                "esac\n"
+                "exit 1\n"
+            )
+        for holds, expected_fetches in ((True, 0), (False, 1)):
+            with self.subTest(holds=holds), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                log = pathlib.Path(out_dir) / "gcloud.log"
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env={"API_SERVER_KEY": "k", "GCLOUD_CALL_LOG": str(log)},
+                    describe_stub="printf '\\n'; exit 0",
+                    gcloud_stdout=MANAGED_CLUSTER_STATE,
+                    kubectl_script=kubectl(holds),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                fetches = [line for line in log.read_text().splitlines() if "get-credentials" in line and "--help" not in line]
+                self.assertEqual(expected_fetches, len(fetches), fetches)
 
     def test_a_plan_sees_the_hand_declared_scope_message_and_goes_on(self):
         # upgrade.sh --plan applies nothing, and the plan is what shows the

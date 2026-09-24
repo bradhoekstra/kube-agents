@@ -1585,10 +1585,15 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 # name and fails, with kubectl's message, when it cannot read the CR or finds
 # none. A CR with no scope block prints nothing and succeeds: the caller
 # renders no block (`platformAgent.scope.omit`) so absent stays absent.
+# Does the kubeconfig kubectl reads hold this context, by name? Read-only.
+kubeconfig_holds_context() {
+  kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$1"
+}
+
 live_scope_json() {
   local ns="$1" context
   context="$(gke_context_name)"
-  kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json | python3 -c '
+  kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json | python3 -c '
 import json, sys
 items = json.load(sys.stdin).get("items", [])
 if not items:
@@ -1718,7 +1723,7 @@ guard_hand_declared_scope() {
   local cr_json kubectl_err
   local err_file
   err_file="$(mktemp)"
-  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout=10s -o json 2>"$err_file")"; then
+  if ! cr_json="$(kubectl --context "$context" get platformagents.kubeagents.x-k8s.io -n "$ns" --request-timeout="${KUBECTL_PROBE_REQUEST_TIMEOUT}" -o json 2>"$err_file")"; then
     kubectl_err="$(cat "$err_file" 2>/dev/null)"; rm -f "$err_file"
     # No CRD means no kube-agents on the cluster yet (every first adoption):
     # there is no CR to protect, and a refusal here would block every adoption.
@@ -1934,16 +1939,20 @@ write_tfvars_from_state() {
   # flag is resolved here whenever the helper is sourced (both front doors
   # source it) and otherwise taken as the caller left it.
   #
-  # The widening is for the guard, and only for a run the guard can refuse:
-  # with the guard off (uninstall.sh) or speaking without refusing (install.sh
+  # The widening is for the guard, and only for a run the guard can refuse
+  # on a machine that does not already hold the install's context: with the
+  # guard off (uninstall.sh) or speaking without refusing (install.sh
   # --dry-run / --generate-only, upgrade.sh --plan), the fetch stays what it
-  # was, an adoption's alone. So a teardown or a dry run over a cluster this
-  # state created neither rewrites the operator's kubeconfig nor opens the
-  # Secret recovery below; a warn-only run reads the CR through a context the
-  # machine already holds, and says so when it holds none.
+  # was, an adoption's alone, and a context already in the kubeconfig
+  # (upgrade.sh fetches one before it generates) is read through as it is.
+  # So a teardown or a dry run over a cluster this state created neither
+  # rewrites the operator's kubeconfig nor opens the Secret recovery below,
+  # upgrade.sh does not fetch twice, and a warn-only run says so when the
+  # machine holds no context.
   if [ "$cluster_exists" = "true" ] && command -v kubectl >/dev/null 2>&1 &&
     { [ "$create_cluster" = "false" ] ||
-      { is_truthy "${SCOPE_GUARD_ENABLED:-true}" && is_truthy "${SCOPE_GUARD_REFUSES:-true}"; }; }; then
+      { is_truthy "${SCOPE_GUARD_ENABLED:-true}" && is_truthy "${SCOPE_GUARD_REFUSES:-true}" &&
+        ! kubeconfig_holds_context "$(gke_context_name)"; }; }; then
     if type gke_dns_endpoint_flag >/dev/null 2>&1; then
       GKE_DNS_ENDPOINT_FLAG=""
       gke_dns_endpoint_flag "${CLUSTER_NAME}" "${REGION}" "${PROJECT_ID}" || true

@@ -528,11 +528,14 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         # protects against, so it speaks without refusing; harness and
         # operator render no scope block, so the guard does not run.
         text = (_REPO_ROOT / "upgrade.sh").read_text()
-        block = text[text.index('if [ "$PARAM_PLAN" = "true" ]; then\n      export SCOPE_GUARD_REFUSES="false"'):]
+        block = text[text.index('if [ "$PARAM_PLAN" = "true" ]; then\n    export SCOPE_GUARD_REFUSES="false"'):]
         block = block[: block.index("fi\n") + 3]
-        self.assertIn('elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n      export SCOPE_GUARD_ENABLED="false"', block)
+        self.assertIn('elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then\n    export SCOPE_GUARD_ENABLED="false"', block)
         generate_at = text.find('write_tfvars_from_state "')
         self.assertLess(text.index('export SCOPE_GUARD_REFUSES="false"'), generate_at)
+        # The NAMESPACE prefix is joined to the generator call itself: a
+        # continuation onto a comment line would leave it a bare assignment.
+        self.assertIn('NAMESPACE="$target_namespace" \\\n    write_tfvars_from_state "', text)
 
     def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
         text = (_REPO_ROOT / "upgrade.sh").read_text()

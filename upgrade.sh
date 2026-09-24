@@ -940,18 +940,18 @@ main() {
       print_warning "Helm release '${KUBE_AGENTS_HELM_RELEASE}' is currently in '${current_helm_status}'. Note: rollback is skipped in plan mode."
     fi
   fi
+  # The hand-declared-scope check protects a full apply. A plan applies
+  # nothing and is the artefact that shows the destroys it protects
+  # against, so it speaks without refusing; harness and operator mode carry
+  # the CR's scope as it is (helm_retag), so it does not run.
+  if [ "$PARAM_PLAN" = "true" ]; then
+    export SCOPE_GUARD_REFUSES="false"
+  elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+    export SCOPE_GUARD_ENABLED="false"
+  fi
   # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
-    # The hand-declared-scope check protects a full apply. A plan applies
-    # nothing and is the artefact that shows the destroys it protects
-    # against, so it speaks without refusing; harness and operator mode carry
-    # the CR's scope as it is (helm_retag), so it does not run.
-    if [ "$PARAM_PLAN" = "true" ]; then
-      export SCOPE_GUARD_REFUSES="false"
-    elif [ "$PARAM_UPGRADE_MODE" != "full" ]; then
-      export SCOPE_GUARD_ENABLED="false"
-    fi
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
 
   if [ "$PARAM_PLAN" = "true" ]; then

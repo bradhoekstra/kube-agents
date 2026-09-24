@@ -4990,8 +4990,8 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
         """`write_env_var` serialises with `%q`, which spells the empty string
         as the two-character literal `''`.
 
-        `bootstrap_install_env_file` writes ten keys unconditionally, and on a
-        stock install — no Slack, no GitOps app — all seven are empty. Comparing
+        `bootstrap_install_env_file` writes its keys unconditionally, and on a
+        stock install — no Slack, no GitOps app — most of them are empty. Comparing
         the recorded `''` against an empty environment value found drift in
         every one of them, on every interactive run, and the line the banner
         printed for each (`KEY=`) changed nothing, so the next run said it
