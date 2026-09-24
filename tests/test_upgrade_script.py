@@ -481,7 +481,7 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         end = text.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
         block = text[start:end]
         empty = '{"projects": [], "exclude": {"projects": [], "clusters": []}}'
-        declared = '{"projects": ["payments-prod"], "exclude": {"projects": [], "clusterst": []}}'.replace("clusterst", "clusters")
+        declared = '{"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}'
         for live, expect_notice in ((empty, False), (declared, True)):
             with self.subTest(live=live):
                 script = (

@@ -144,7 +144,8 @@ composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
 and drops the custom roles; `SCOPE_PROJECTS` absent renders an empty scope, which revokes every
 scope binding and retires those projects' Cluster Agent profiles over the reconcile's next two clean
-runs.
+runs (a full upgrade refuses that emptying while the CR names projects, and applies it only with
+`SCOPE_GUARD_ENABLED=false`).
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -231,16 +232,16 @@ and the chart renders the CR. The block is always written, empty lists included,
 that drops a project makes the next full `upgrade.sh` (the default mode) revoke its grants and
 retire its profiles. An entry that is not what the CRD accepts (a project ID, an exclude ID or glob, a
 `project/location/cluster` triple of names up to 63 characters), a repeat, or a list past 100 entries
-fails the generator before any file is written, and so before a `harness` or `operator` retag could
-carry it to the API server. An install whose `PlatformAgent` declares a scope by hand that these keys would empty is refused
+fails the generator before any file is written, whichever front door runs it. An install whose `PlatformAgent` declares a scope that these keys would empty is refused
 too, with the three lines that carry the whole live declaration printed: the CR names projects and
-`SCOPE_PROJECTS` names none, or the CR carries exclusions while neither `SCOPE_EXCLUDE_*` key is set and its
-projects disagree with `SCOPE_PROJECTS`, which is the install whose scope was set by hand before the
-keys existed or an `install.env` that recorded the projects alone. Once the projects agree the CR
-reads as rendered from these keys, and a key of each kind changes its kind freely, so removing a
-project from `SCOPE_PROJECTS`, or clearing the exclusion keys, and running `upgrade.sh` is never
-refused; emptying the
-scope on purpose is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
+`SCOPE_PROJECTS` names none, or the CR carries exclusions while neither `SCOPE_EXCLUDE_*` key is set and
+`SCOPE_PROJECTS` names a project the CR does not carry. That is the install whose scope was set by hand before the
+keys existed, or an `install.env` that recorded part of it, and it is also what removing the last
+project looks like: the check cannot tell them apart, so it stops both. Keys that name the CR's
+projects, or a subset of them, are the declaration for every kind, so removing a project (other than
+the last) from `SCOPE_PROJECTS`, clearing the exclusion keys, or both in one edit, and running
+`upgrade.sh` is never refused; emptying the
+scope on purpose, the last project included, is `SCOPE_GUARD_ENABLED=false` for one run, which `uninstall.sh` sets because a
 destroy keeps nothing either way. The check reads the CR through the install's own kubeconfig
 context by name and fails closed: a read it cannot make refuses the run with the same override,
 because the apply that follows would not stop. `upgrade.sh`'s `harness` and `operator` modes leave the CR's scope exactly as it is on every Helm

@@ -969,19 +969,23 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('  projects = ["payments-prod"]', dest.read_text())
 
     def test_clearing_the_exclusions_of_an_installer_rendered_scope_is_not_refused(self):
-        # The CR carries the same projects the keys name, so it reads as
-        # rendered from them; clearing the exclusion keys is the ordinary way
-        # to stop excluding, and proceeds.
-        with tempfile.TemporaryDirectory() as out_dir:
-            dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            proc = self._run(
-                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "payments-prod"},
-                describe_stub="printf '\\n'; exit 0",
-                kubectl_script=self._scoped_cr_kubectl(["payments-prod"]),
-            )
-            self.assertIn("rc=0", proc.stdout, proc.stderr)
-            self.assertIn("    projects = []\n    clusters = []", dest.read_text())
+        # Keys that name the CR's projects, or a subset of them, are the
+        # declaration for every kind: clearing the exclusion keys is the
+        # ordinary way to stop excluding, alone or in the same edit that
+        # removes a project (the exclusion that belonged to it), and proceeds.
+        for cr_projects, keys in ((["payments-prod"], "payments-prod"),
+                                  (["payments-prod", "payments-staging"], "payments-prod")):
+            with self.subTest(cr=cr_projects), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                    env={"API_SERVER_KEY": "k", "SCOPE_PROJECTS": keys},
+                    describe_stub="printf '\\n'; exit 0",
+                    kubectl_script=self._scoped_cr_kubectl(cr_projects),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertIn('  projects = ["payments-prod"]', dest.read_text())
+                self.assertIn("    projects = []\n    clusters = []", dest.read_text())
 
     def test_the_scope_guard_reads_through_the_installs_context_not_the_current_one(self):
         # kubectl pointed at another cluster: the Secret recovery stands down,

@@ -1574,6 +1574,11 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 '
 }
 
+# Does the kubeconfig kubectl reads hold this context, by name? Read-only.
+kubeconfig_holds_context() {
+  kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$1"
+}
+
 # The live PlatformAgent's spec.scope, in JSON with every list present, for a
 # `helm upgrade --set-json` that must leave the CR's scope exactly as it is.
 # upgrade.sh's harness and operator modes run no Terraform, so no scope may
@@ -1585,11 +1590,6 @@ print(json.dumps({"projects": split("SCOPE_PROJECTS"),
 # name and fails, with kubectl's message, when it cannot read the CR or finds
 # none. A CR with no scope block prints nothing and succeeds: the caller
 # renders no block (`platformAgent.scope.omit`) so absent stays absent.
-# Does the kubeconfig kubectl reads hold this context, by name? Read-only.
-kubeconfig_holds_context() {
-  kubectl config get-contexts -o name 2>/dev/null | grep -qxF "$1"
-}
-
 live_scope_json() {
   local ns="$1" context
   context="$(gke_context_name)"
@@ -1700,7 +1700,8 @@ verify_scope_block_after_apply() {
 # it yet and nothing to protect, so that case passes silently.
 # SCOPE_GUARD_ENABLED=false turns the check off: uninstall.sh sets it, since a
 # destroy keeps nothing either way, and upgrade.sh's harness and operator
-# modes set it because they render no scope block. SCOPE_GUARD_REFUSES=false
+# modes set it because they pass the CR's scope back as it is and render
+# nothing from the keys. SCOPE_GUARD_REFUSES=false
 # keeps the check and its message but lets the run go on: upgrade.sh --plan
 # sets it, because a plan applies nothing and is the artefact that shows what
 # the refusal protects.
@@ -1766,20 +1767,23 @@ for item in items:
     projects = scope.get("projects") or []
     excluded = exclude.get("projects") or []
     clusters = [sep.join((c.get("projectId", ""), c.get("location", ""), c.get("clusterName", ""))) for c in exclude.get("clusters") or []]
+    # A CR that names projects against a key that names none is what a pre-key install
+    # and a partial install.env look like, and also what removing the last project looks
+    # like; the guard cannot tell them apart, so the last is SCOPE_GUARD_ENABLED=false.
     drops_projects = bool(projects) and not key_projects
-    # An exclusion is protected while no key names a project, or while the projects on the
-    # CR disagree with SCOPE_PROJECTS: either is a scope the keys have not taken over
-    # (hand-set, or a partial install.env). Once the projects agree the CR reads as
-    # rendered from these keys, and clearing the exclusion keys is the ordinary way to
-    # stop excluding.
-    drops_exclusions = bool(excluded or clusters) and not key_exclusions and (not key_projects or sorted(projects) != sorted(key_projects))
+    # An exclusion is protected while no key names a project, or while SCOPE_PROJECTS
+    # names a project the CR does not carry: either way the keys were not derived from
+    # this CR (hand-set, or a partial install.env). Keys that name the projects the CR
+    # carries, or a subset of them, are the declaration for every kind, so removing a project and
+    # clearing the exclusion keys, in one edit or two, is the ordinary way to stop.
+    drops_exclusions = bool(excluded or clusters) and not key_exclusions and (not key_projects or not set(key_projects) <= set(projects))
     if not (drops_projects or drops_exclusions):
         continue
     what = []
     if drops_projects:
         what.append("names %s and SCOPE_PROJECTS names nothing" % " ".join(projects))
     if drops_exclusions:
-        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and its projects differ from SCOPE_PROJECTS" % " ".join(excluded + clusters))
+        what.append("excludes %s while neither SCOPE_EXCLUDE_* key is set and SCOPE_PROJECTS names a project the CR does not carry" % " ".join(excluded + clusters))
     print("# the PlatformAgent " + "; ".join(what))
     print("SCOPE_PROJECTS=\"%s\"" % " ".join(projects))
     print("SCOPE_EXCLUDE_PROJECTS=\"%s\"" % " ".join(excluded))
@@ -1793,15 +1797,15 @@ for item in items:
   rm -f "$err_file"
   [ -n "$missing" ] || return 0
   if [ "$refuses" != "true" ]; then
-    print_warning "The PlatformAgent in '${ns}' declares a scope by hand that install.env's SCOPE_* keys would empty. This run applies nothing; a full apply from these keys would rewrite the CR, retiring the Cluster Agent profiles of every project it drops and re-onboarding every cluster an exclusion kept out."
-    print_info "Record the live declaration in install.env before the apply:"
+    print_warning "The PlatformAgent in '${ns}' declares a scope that install.env's SCOPE_* keys would empty. This run applies nothing; a full apply from these keys would rewrite the CR, retiring the Cluster Agent profiles of every project it drops and re-onboarding every cluster an exclusion kept out."
+    print_info "If that scope was set by hand before the keys existed, record it in install.env before the apply; if emptying it is the intent, the apply needs SCOPE_GUARD_ENABLED=false:"
     printf '%s\n' "$missing"
     return 0
   fi
-  print_error "The PlatformAgent in '${ns}' declares a scope by hand that install.env's SCOPE_* keys would empty. Applying would rewrite the CR, retiring the Cluster Agent profiles of every project it drops and re-onboarding every cluster an exclusion kept out."
-  print_info "The keys own the field from now on. Record the live declaration in install.env and re-run; a full upgrade is what applies it (a harness or operator retag leaves the CR's scope as it is):"
+  print_error "The PlatformAgent in '${ns}' declares a scope that install.env's SCOPE_* keys would empty. Applying would rewrite the CR, retiring the Cluster Agent profiles of every project it drops and re-onboarding every cluster an exclusion kept out. The check cannot tell a scope set by hand before the keys existed from one the keys rendered and now empty, so it stops both."
+  print_info "If the scope was set by hand, the keys own the field from now on: record the live declaration in install.env and re-run; a full upgrade is what applies it (a harness or operator retag leaves the CR's scope as it is):"
   printf '%s\n' "$missing"
-  print_info "To empty the scope on purpose instead, run once with SCOPE_GUARD_ENABLED=false."
+  print_info "To empty the scope on purpose (the last project removed, or an exclusion dropped with no project named), run once with SCOPE_GUARD_ENABLED=false."
   return 1
 }
 
