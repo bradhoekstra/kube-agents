@@ -417,9 +417,10 @@ owns them, which is the property #588 lost when its revocation lived in a bash f
 ## 7. The onboarding lifecycle
 
 **Adding a project.** Under a declared folder or organisation: nothing to do; it is discovered at
-the next tick. As an explicit project: add it to `scope.projects` in the tfvars and run
-`upgrade.sh`, which binds the IAM and renders the CR from the same value (a hand-applied CR is
-edited separately, and §11 says why that split is the weak point). The binding then exists before
+the next tick. As an explicit project: add it to `SCOPE_PROJECTS` in `install.env` and run
+`upgrade.sh` in its default full mode, which regenerates the tfvars, binds the IAM and renders the CR
+from the same value; a hand-driven composition sets `scope.projects` in its own tfvars (a hand-applied
+CR is edited separately, and §11 says why that split is the weak point). The binding then exists before
 the reconcile tries the list, and the project's
 outcome goes from `denied` to `ok` at the following tick. The order matters and the snapshot shows
 it: a project added to the CR before Terraform has run reads `denied`, which is correct and visible,

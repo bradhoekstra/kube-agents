@@ -463,8 +463,12 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         self.assertIn('RETAG_SCOPE_OMIT="true"', pre)
         # No block and keys recorded: the retag renders none and says so.
         self.assertIn("carries SCOPE_* keys but the PlatformAgent carries no spec.scope block", pre)
-        self.assertIn('if ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then', pre)
+        self.assertIn('elif ! scope_json_equal "$RETAG_SCOPE_JSON" "$retag_keys_json"; then', pre)
         self.assertIn("--upgrade-mode=full to apply the change", pre)
+        # No key recorded at all is the pre-key install: full mode would refuse
+        # it, so the advice is to record the live declaration, with the lines.
+        self.assertIn("records no SCOPE_* key while the PlatformAgent carries a spec.scope", pre)
+        self.assertLess(pre.index("records no SCOPE_* key"), pre.index("elif ! scope_json_equal"))
         self.assertIn('[ "$PARAM_UPGRADE_MODE" != "full" ] && declare -F hcl_scope_block', text)
 
     def test_jq_is_required_for_the_modes_that_read_with_it(self):
