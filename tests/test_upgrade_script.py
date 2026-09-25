@@ -717,9 +717,10 @@ class ScopeCheckWiringTest(unittest.TestCase):
     def setUp(self):
         self.text = _UPGRADE_SH.read_text()
 
-    def test_full_mode_refuses_before_it_changes_anything(self):
-        # Before the CRD apply as well as the Terraform apply: a refused run
-        # must leave the cluster as it found it.
+    def test_full_mode_refuses_before_the_crd_apply_and_the_terraform_apply(self):
+        # Before the CRD apply as well as the Terraform apply: a refusal leaves
+        # the served schema and the release as they were (the credentials
+        # fetch and the two Secret backfills above the arm have run).
         full = self.text[self.text.index("    full)\n"):]
         check = full.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1')
         crds = full.index('apply_crd_upgrades "$repo_dir"')
