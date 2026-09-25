@@ -4164,23 +4164,34 @@ class FailedInitialReleaseIsClearedBeforeTheApplyTest(unittest.TestCase):
         self.assertLess(cmek, clear)
         self.assertLess(clear, apply)
 
-    def test_it_is_gated_on_the_cluster_existing_and_fetches_its_credentials(self):
+    def test_it_is_gated_on_the_cluster_existing_and_runs_on_the_context_fetched_before_the_summary(self):
         # Existing, not adopted: a cluster this state created on the attempt
         # that died exists with create_cluster = true, and its retry hits the
         # same Helm refusal. The generator fetched credentials on the adoption
-        # path alone, so this branch fetches them itself.
+        # path alone, so main() fetches them itself for any existing cluster,
+        # once, before the step-11 summary (the scope check needs them there
+        # too), and step 12's gate reuses that context rather than fetching
+        # again.
         clear = self.source.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"')
-        gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
+        summary = self.source.index('print_step "11. Pre-Flight Configuration Summary"')
+        gate = self.source.rfind(
+            'if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && [ "$PARAM_GENERATE_ONLY" != "true" ]; then',
+            0, summary)
         self.assertGreater(gate, 0)
         credentials = self.source.index('gcloud container clusters get-credentials "$cluster_name"', gate)
-        self.assertLess(credentials, clear)
-        # Nothing else opens between the gate and the call.
-        self.assertNotIn("\n  fi\n", self.source[gate:clear])
+        self.assertLess(credentials, summary)
+        self.assertLess(summary, clear)
         # The fetch reaches a DNS-endpoint-only cluster the way step 13's does;
         # a plain one fails there, and the context gate then skips the check.
         flag = self.source.index('gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id"', gate)
         self.assertLess(flag, credentials)
-        self.assertIn("$GKE_DNS_ENDPOINT_FLAG", self.source[credentials:clear])
+        self.assertIn("$GKE_DNS_ENDPOINT_FLAG", self.source[credentials:summary])
+        # Step 12 still gates the clear on the cluster existing, opens nothing
+        # else before the call, and fetches nothing of its own.
+        step12_gate = self.source.rfind('if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then', 0, clear)
+        self.assertGreater(step12_gate, summary)
+        self.assertNotIn("\n  fi\n", self.source[step12_gate:clear])
+        self.assertNotIn("get-credentials", self.source[step12_gate:clear])
 
 
 class TheCloneDirectoryNeedsHomeOnlyWhenCloningTest(unittest.TestCase):
