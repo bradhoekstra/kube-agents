@@ -1,8 +1,10 @@
 """The chart renders `spec.scope` from `platformAgent.scope`, in three states.
 
-null, the chart default, renders no block: the CR declares nothing and a scope
-the CR already carries is left alone, because Helm patches a custom resource
-from the difference between its rendered manifests. A map renders the block as
+null, the chart default, renders no block: the CR declares nothing, and a scope
+the CR already carries is left alone while no earlier revision rendered the
+block, because Helm patches a custom resource from the difference between its
+rendered manifests (a render without the block after one with it removes the
+field, which the reconcile reads as no declaration). A map renders the block as
 it is, empty lists included, because the reconcile reads an emptied projects
 list as the declaration that drops projects and a missing block as no
 declaration (docs/designs/multi-project-scope.md §7); the composition always

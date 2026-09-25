@@ -489,9 +489,10 @@ has the variable: that apply renders the block for the first time and replaces t
 with `scope`'s, empty by default, after which the reconcile retires the dropped projects over two
 clean runs. `upgrade.sh --upgrade-mode=full` refuses that apply until `install.env` records the
 declaration; the composition run directly does not. A composition applied directly to an existing
-install also applies no CRDs: run `kubectl apply --server-side --force-conflicts -f
-charts/kube-agents/crds/` first, as `upgrade.sh` does, or a `spec.scope` the served schema does not
-know is pruned on write and, the release record then carrying it, never re-sent. The identity running the apply needs
+install also applies no CRDs: run `kubectl --context gke_<project>_<region>_<cluster> apply
+--server-side --force-conflicts -f charts/kube-agents/crds/` first, through the install's own context
+as `upgrade.sh` does, or a `spec.scope` the served schema does not know is pruned on write and, the
+release record then carrying it, never re-sent. The identity running the apply needs
 to set IAM policy in each project named. The release's dependency on the module orders creation,
 not IAM propagation: a first install's one-shot inventory sweep may name a scoped project as
 `denied`, and the hourly reconcile creates its profiles once the grant has propagated. Folders and

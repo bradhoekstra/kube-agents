@@ -2452,9 +2452,11 @@ print_generate_only_handoff() {
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""
   echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
-  echo -e "  # On an existing install, first apply the chart's CRDs, which neither Helm nor lifecycle.sh"
-  echo -e "  # upgrades; a field the served schema lacks is otherwise pruned from the PlatformAgent for good:"
-  echo -e "  kubectl apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
+  echo -e "  # On an existing install only: first apply the chart's CRDs through the install's own context,"
+  echo -e "  # never the current one. Neither Helm nor lifecycle.sh upgrades them, and a field the served"
+  echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
+  echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
+  echo -e "  kubectl --context gke_${project_id}_${region}_${cluster_name} apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
@@ -5302,17 +5304,11 @@ main() {
   # Terraform, which never recorded it, plans a create. Whenever the cluster
   # is already there -- adopted, or created by this state on the attempt that
   # died -- and only for a release no revision of which ever served. The
-  # generator fetched credentials on the adoption path alone, so fetch them
-  # here for the other; the check itself refuses to look at any other context.
+  # context is the one fetched before the step-11 summary for the scope check
+  # (with the DNS-endpoint flag step 13 passes, since without it the fetch
+  # fails on a DNS-endpoint-only cluster and the context gate below does not
+  # match); the check itself refuses to look at any other context.
   if [ "${TFVARS_CLUSTER_EXISTS:-false}" = "true" ]; then
-    # With the DNS-endpoint flag step 13 passes: without it the fetch fails on
-    # a DNS-endpoint-only cluster, the context gate below does not match, and
-    # the check skips exactly the retry it exists for.
-    GKE_DNS_ENDPOINT_FLAG=""
-    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
-    # shellcheck disable=SC2086
-    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
-      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
     clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
     # A re-run is how INSTALL.md says to change configuration, and Helm never
     # upgrades CRDs, so the schema is applied here as upgrade.sh applies it

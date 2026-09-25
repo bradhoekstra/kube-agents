@@ -466,7 +466,9 @@ hand until `install.env` records it (it prints the three lines that reproduce it
 back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because
 Helm sends only the difference between its rendered manifests. An empty scope is a present block
 with empty lists, rendered whenever the chart is given one; a chart that is given nothing (the
-value is `null`, its default) renders no block and leaves the field as it finds it. The
+value is `null`, its default) renders no block, which leaves the field as it finds it while no earlier
+release rendered the block and removes it once one has, a removal the reconcile reads as no
+declaration (the management project alone, nothing retired). The
 composition binds the read roles before it writes the CR, which orders creation and not IAM
 propagation: a first install's one-shot inventory sweep may still name a scoped project as
 `denied`, and the hourly reconcile creates its profiles once the grant has propagated. Absent, the reconcile lists the management project alone, every cluster there getting a Cluster Agent profile, keeps the last declaration's exclusions and marks nothing newly `retiring` (a project an earlier block already marked `retiring` is still pruned on a clean run); an empty `projects` list in a present block drops the projects an earlier block declared, over two clean runs. The management project is always in scope and cannot be excluded.

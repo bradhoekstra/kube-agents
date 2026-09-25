@@ -7154,18 +7154,22 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(fetch, check)
         self.assertLess(check, summary)
 
-    def test_the_crds_are_applied_at_step_12_after_the_fetch_and_before_the_apply(self):
+    def test_the_crds_are_applied_at_step_12_before_the_apply_on_the_one_fetched_context(self):
         # INSTALL.md names a re-run and the menu as the way to change
         # configuration; Helm never upgrades CRDs, so a field the served schema
-        # lacked would be pruned from the CR, and stay pruned.
+        # lacked would be pruned from the CR, and stay pruned. The context is
+        # the one fetched before the summary: main() fetches once for an
+        # existing cluster, not again at step 12.
         step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
-        fetch = self.text.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
+        clear = self.text.index('clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE" "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1')
         crds = self.text.index('apply_crd_upgrades "$repo_dir"\n  fi\n')
         apply = self.text.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"')
-        self.assertLess(step12, fetch)
-        self.assertLess(fetch, crds)
+        self.assertLess(step12, clear)
+        self.assertLess(clear, crds)
         self.assertLess(crds, apply)
         self.assertNotIn("refuse_apply_over_undeclared_scope", self.text[step12:apply])
+        main_fetch = 'gcloud container clusters get-credentials "$cluster_name" --location "$region" \\\n      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true'
+        self.assertEqual(self.text.count(main_fetch), 1)
 
     def test_the_menu_fetches_a_context_then_checks_then_applies_the_crds_before_its_apply(self):
         menu = self.text[self.text.index("run_menu_system()"):]
@@ -7196,9 +7200,13 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # lifecycle.sh applies no CRDs; on an existing install a field the
         # served schema lacks would be pruned from the CR and never re-sent.
         handoff = self.text[self.text.index('2. Apply via lifecycle.sh'):]
-        crds = handoff.index("kubectl apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
+        fetch = handoff.index("gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}")
+        crds = handoff.index("kubectl --context gke_${project_id}_${region}_${cluster_name} apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
         apply = handoff.index("./lifecycle.sh apply")
+        self.assertLess(fetch, crds)
         self.assertLess(crds, apply)
+        # Never the current context: every CRD apply this change ships names the install's own.
+        self.assertNotIn("\n  kubectl apply --server-side", handoff[:apply])
 
     def test_python3_is_a_required_tool(self):
         self.assertIn("for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do", self.text)

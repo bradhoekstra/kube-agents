@@ -14,6 +14,8 @@ import pathlib
 import re
 import unittest
 
+import yaml
+
 try:
     from tests.test_scoped_sa_pool_iam import _hcl_string_list, _hcl_variable_default_list
 except ImportError:  # run from inside tests/
@@ -22,6 +24,9 @@ except ImportError:  # run from inside tests/
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "terraform" / "modules" / "kube-agents-iam"
 _COMPOSITION = _REPO_ROOT / "terraform" / "examples" / "full-install"
+# The chart's copy of the CRD, which make chart-check holds byte-identical to
+# the operator's generated one; the constraints below are read from it.
+_CRD = _REPO_ROOT / "charts" / "kube-agents" / "crds" / "kubeagents.x-k8s.io_platformagents.yaml"
 
 # docs/designs/multi-project-scope.md §6, verbatim.
 DESIGN_ALLOWLIST = [
@@ -111,12 +116,26 @@ class ScopeAllowlistTest(unittest.TestCase):
                       self.scope_tf)
 
 
+def _crd_scope_schema():
+    crd = yaml.safe_load(_CRD.read_text())
+    spec = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+    return spec["properties"]["scope"]["properties"]
+
+
+def _hcl_regex(pattern):
+    """The CRD's pattern as it has to be spelled inside an HCL string."""
+    return pattern.replace("\\", "\\\\")
+
+
 class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
     """The module refuses at plan time what the CRD would refuse at admission,
-    after IAM had been applied."""
+    after IAM had been applied: every cap, pattern and list type is read from
+    the CRD here and looked for in the variable's validations, so a change to
+    the kubebuilder markers without a matching edit to variables.tf fails."""
 
     def setUp(self):
         self.variable = _block((_MODULE / "variables.tf").read_text(), "variable", "scope")
+        self.crd = _crd_scope_schema()
 
     def test_the_shape_and_defaults(self):
         for line in ("projects = optional(list(string), [])",
@@ -126,15 +145,42 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertIn(line, self.variable)
 
-    def test_the_crds_caps_patterns_and_uniqueness(self):
-        for rule in ("length(var.scope.projects) <= 100",
-                     "length(var.scope.exclude.projects) <= 100",
-                     "length(var.scope.exclude.clusters) <= 100",
-                     'regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", project)',
-                     'regex("^[a-z0-9][a-z0-9-]{0,62}$", cluster.cluster_name)',
-                     'regex("^[a-z0-9*?\\\\[\\\\]!-]{1,63}$", entry)',
-                     "length(distinct(var.scope.projects)) == length(var.scope.projects)"):
-            with self.subTest(rule=rule):
+    def test_each_list_carries_the_crds_cap(self):
+        lists = {
+            "var.scope.projects": self.crd["projects"],
+            "var.scope.exclude.projects": self.crd["exclude"]["properties"]["projects"],
+            "var.scope.exclude.clusters": self.crd["exclude"]["properties"]["clusters"],
+        }
+        for name, schema in lists.items():
+            with self.subTest(list=name):
+                self.assertIn(f"length({name}) <= {schema['maxItems']}", self.variable)
+
+    def test_the_project_and_glob_patterns_are_the_crds(self):
+        projects = self.crd["projects"]["items"]["pattern"]
+        globs = self.crd["exclude"]["properties"]["projects"]["items"]["pattern"]
+        self.assertIn(f'regex("{_hcl_regex(projects)}", project)', self.variable)
+        self.assertIn(f'regex("{_hcl_regex(globs)}", entry)', self.variable)
+
+    def test_the_cluster_triple_pattern_and_length_are_the_crds(self):
+        # The CRD states the triple's parts as a pattern plus maxLength; the
+        # module folds the length into the pattern's quantifier, which is only
+        # right while the CRD pattern is the unbounded form asserted here.
+        parts = self.crd["exclude"]["properties"]["clusters"]["items"]["properties"]
+        for crd_key, tf_key in (("projectId", "project_id"), ("location", "location"), ("clusterName", "cluster_name")):
+            with self.subTest(part=crd_key):
+                schema = parts[crd_key]
+                self.assertEqual(schema["pattern"], "^[a-z0-9][a-z0-9-]*$")
+                bounded = f"^[a-z0-9][a-z0-9-]{{0,{schema['maxLength'] - 1}}}$"
+                self.assertIn(f'regex("{bounded}", cluster.{tf_key})', self.variable)
+
+    def test_the_crds_set_and_map_lists_are_checked_for_repeats(self):
+        self.assertEqual(self.crd["projects"]["x-kubernetes-list-type"], "set")
+        self.assertEqual(self.crd["exclude"]["properties"]["projects"]["x-kubernetes-list-type"], "set")
+        self.assertEqual(self.crd["exclude"]["properties"]["clusters"]["x-kubernetes-list-type"], "map")
+        for rule in ("length(distinct(var.scope.projects)) == length(var.scope.projects)",
+                     "length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)",
+                     'length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)'):
+            with self.subTest(rule=rule[:50]):
                 self.assertIn(rule, self.variable)
 
 
