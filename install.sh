@@ -2467,7 +2467,7 @@ print_generate_only_handoff() {
   echo -e "  # never the current one. Neither Helm nor lifecycle.sh upgrades them, and a field the served"
   echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
   echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
-  echo -e "  kubectl --context gke_${project_id}_${region}_${cluster_name} apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
+  echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"

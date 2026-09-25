@@ -7153,10 +7153,14 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             out = proc.stdout + proc.stderr
-            self.assertIn("Set SCOPE_PROJECTS=payments-prod\\ payments-staging in", out)
-            # And the printed assignment round-trips through the loader.
+            # The value carries a backslash-escaped space, so the token is
+            # "anything but an unescaped space" up to the trailing " in ".
+            printed = re.search(r"Set (SCOPE_PROJECTS=(?:\\.|\S)+) in ", out)
+            self.assertIsNotNone(printed, out)
+            self.assertEqual(printed.group(1), "SCOPE_PROJECTS=payments-prod\\ payments-staging")
+            # And the assignment as printed round-trips through a sourcing shell.
             check = subprocess.run(
-                ["bash", "-c", 'set -eu; SCOPE_PROJECTS=payments-prod\\ payments-staging; printf "%s" "$SCOPE_PROJECTS"'],
+                ["bash", "-c", f'set -eu; {printed.group(1)}; printf "%s" "$SCOPE_PROJECTS"'],
                 capture_output=True, text=True,
             )
             self.assertEqual(check.stdout, "payments-prod payments-staging")
@@ -7273,7 +7277,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         # served schema lacks would be pruned from the CR and never re-sent.
         handoff = self.text[self.text.index('2. Apply via lifecycle.sh'):]
         fetch = handoff.index("gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}")
-        crds = handoff.index("kubectl --context gke_${project_id}_${region}_${cluster_name} apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
+        crds = handoff.index("kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
         apply = handoff.index("./lifecycle.sh apply")
         self.assertLess(fetch, crds)
         self.assertLess(crds, apply)
