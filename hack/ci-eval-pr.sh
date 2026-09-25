@@ -41,6 +41,24 @@ readonly EVAL_NIGHTLY_CASES_FILE="eval/nightly-cases.txt"
 readonly EVAL_SUITE_NOT_EVALUATED_STATUS=2
 readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 
+# EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
+# `spec.mode: next` under, in the same job environment. Under it the matrix
+# runs through the gateway's inject door (docs/designs/eval-next-transport.md,
+# stage 1): the harness's transport switch, and the door's bearer token read
+# from the Secret the operator renders beside the door -- <agent>-a2a-inject,
+# key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
+# already waited for it). Unset, the matrix runs over the agent API exactly
+# as before; section 4 below is the only site that reads the flag.
+readonly EVAL_INJECT_TRANSPORT="inject"
+readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
+readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The inject door's port-forward is per unit for the same reason the agent
+# API's is (run_one_unit): the harness reads AGENT_INJECT_LOCAL_PORT for it,
+# not AGENT_LOCAL_PORT, and its default (28099) would put every unit of the
+# fan-out on one listener that the first unit to finish tears down. The base
+# sits clear of the API range (28642 + seq) for any matrix this job runs.
+readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
+
 # ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
 # A push that changes only inert files re-runs this whole job and aborts the
 # run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
@@ -107,7 +125,15 @@ readonly EVAL_VERDICT_OUTCOME_NOT_EVALUATED="not_evaluated"
 readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
 # Where the job history lives and how a human opens a build from the log.
 readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
-readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"
+# The job whose history and status context step 0 reads: the running job's
+# own name, which Prow exports as JOB_NAME. Every presubmit that runs this
+# script has its own history path and its own status context, so keying the
+# reuse on a fixed name would let a second job (the next-mode lane runs this
+# same script under EVAL_MODE_NEXT=1) find the today job's green build at
+# the same head and run nothing. Outside Prow the default keeps the log
+# lines and the tests naming the job that exists.
+readonly REVALIDATION_DEFAULT_JOB_NAME="pull-kube-agents-smoke-test"
+readonly REVALIDATION_JOB_NAME="${JOB_NAME:-${REVALIDATION_DEFAULT_JOB_NAME}}"
 readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
 # The started.json repos key naming this repository's clone record, and the
 # base ref assumed when the decoration did not export PULL_BASE_REF.
@@ -817,8 +843,9 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # Clusters are found by label rather than by name, so this does not need to
 # know the leased project's cluster prefix or region.
 #
-# Non-fatal by design: an unreachable seeded cluster -- or a leased project the
-# fleet was never applied to -- leaves its roles' files absent, and
+# Non-fatal by design, with one exception (the read-only credential, below,
+# which a project the fleet was never applied to also lacks): an unreachable
+# seeded cluster leaves its roles' files absent, and
 # `fleet_resource_property` turns that into status=error naming the role and
 # the project: failing the checks that needed that cluster rather than the job,
 # and never silently reading platform-agent-host instead.
@@ -837,9 +864,10 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # one namespace read per probe -- seconds, against a job measured in tens
 # of minutes.
 #
-# The `||` catches a REPOSITORY bug only: a missing or malformed
-# bench/tf/fleet/fixtures.json, or an unusable output directory. Every
-# environmental failure -- no fleet in this project, a cluster that will not
+# The `||` catches two things. Exit 3 is the read-only credential unavailable
+# and ends the job (below). Any other non-zero is a REPOSITORY bug -- a missing
+# or malformed bench/tf/fleet/fixtures.json, an unusable output directory --
+# and warns. Every other environmental failure -- a cluster that will not
 # answer, a fixture that was never planted -- returns 0 with a warning of its
 # own and leaves the affected roles' files absent, which is the whole design.
 
@@ -854,22 +882,29 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # The other half is the token-creator grant -- `fleet_reader_token_creators`
 # in bench/tf/fleet/variables.tf, which defaults to both runners, the
 # presubmit's and the nightly's, and to the CI health bot, so an apply of that
-# stack grants each. In a project whose fleet was applied before that default
-# landed, `gcloud auth print-access-token
-# --impersonate-service-account` fails, fleet-kubeconfigs.sh warns per cluster,
-# and the role kubeconfigs keep the runner's own read-write credential. That is
-# a privilege gap on a fleet every open PR shares, not a functional one: the
-# files are still written, still point at the right seeded cluster, and every
-# check still grades the right object. `scripts/verify_ci_pool_project.py`
-# fails a project missing the binding. See bench/tf/fleet/README.md, "A
-# read-only credential for evaluations".
-export FLEET_READONLY_SA="${FLEET_READONLY_SA:-seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
+# stack grants each. A project without the binding stops the run here: the
+# runner refuses to write kubeconfigs carrying this job's own read-write
+# credential onto a fleet every open PR shares. A precondition, not a repair:
+# the grant is `fleet_reader_token_creators`, and
+# `scripts/verify_ci_pool_project.py` fails a project missing it. See
+# bench/tf/fleet/README.md, "A read-only credential for evaluations".
+# FLEET_ALLOW_RUNNER_CREDENTIAL=1 is a developer's opt-in for a fleet only they
+# use, and a Prow job refuses it: set there it would restore the fallback.
+# shellcheck source=hack/fleet-kubeconfigs.sh
+source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
+_fleet_refuse_opt_in_under_prow || exit 1
+FLEET_READONLY_SA="$(_fleet_reader_for_run "${PROJECT_ID}")"
 
 profile_begin "fleet-kubeconfigs: seeded-fleet credentials"
 STEP_START=$SECONDS
-# shellcheck source=hack/fleet-kubeconfigs.sh
-source "${SCRIPT_DIR}/fleet-kubeconfigs.sh"
-write_fleet_kubeconfigs || echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+write_fleet_kubeconfigs || {
+  fleet_rc=$?
+  if [ "$fleet_rc" -eq "$_FLEET_EXIT_READONLY_UNAVAILABLE" ]; then
+    echo "FATAL: stopping at the fleet step: the seeded fleet cannot be read as its reader, and it is not graded with the runner's write credential." >&2
+    exit 1
+  fi
+  echo "WARNING: the seeded-fleet catalog or output directory is unusable, so no fleet kubeconfigs were written at all; every fleet fixture check will report status=error" >&2
+}
 echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 
 # Section 2c resized slot a's default pool to two nodes here (#1278). The incident's
@@ -1394,6 +1429,23 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
+# Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the
+# inject door and declared the bridge; the matrix goes through the door. The
+# agent token above is still fetched: the transport switch changes how a
+# prompt reaches the agent, not what else the run reads from the install.
+# Everything about the door the harness needs beyond these two it derives
+# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
+if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
+  EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
+  if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+    echo "ERROR: EVAL_MODE_NEXT=1 but the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
+    echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does under the same flag." >&2
+    exit 1
+  fi
+  export AGENT_INJECT_TOKEN
+  export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+  echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
+fi
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 # The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
@@ -1516,8 +1568,8 @@ PRESUBMIT_CASE_NAMES="$(for ENTRY in "${TASKS[@]}"; do basename "$(dirname "${EN
 # seat on that record; measured cost, presubmit redundancy or grading
 # something outside the core journeys keep a case there for good. The file's
 # header carries the budget arithmetic against the periodic's 480m deadline
-# at EVAL_TASK_PARALLELISM=6 (#1491; oss-test-infra#2707, open, moves it to
-# 8), and that is the copy to keep current. Since 2026-09-22 (#1023) the
+# at EVAL_TASK_PARALLELISM=8 (6 from #1491 until oss-test-infra#2707, merged
+# 2026-09-25), and that is the copy to keep current. Since 2026-09-22 (#1023) the
 # presubmit file is the blocking roster and nothing else, so this file is
 # also where every held-out case lives, with its hold-out reason.
 NIGHTLY_ENTRIES="$(roster_entries "${NIGHTLY_CASES_FILE}")"
@@ -1963,6 +2015,10 @@ unit_cost_hint() {
     # the tofu cases; the hint stays at the presubmit measurement until the
     # presubmit record says otherwise.
     incident-triage-oom-event-probe) echo 700 ;;
+    # Nightly-only since #1840. Median of four clean dev-install repetitions
+    # (710/710/735/1325s, 2026-09-23): the platform worker fans out to every
+    # Cluster Agent profile in the fleet before the payments-api one reports.
+    cluster-agent-delegation-profile-lookup) echo 720 ;;
     *) echo 200 ;;
   esac
 }
@@ -2224,6 +2280,8 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # listener under every sibling mid-conversation. On its own port, each
   # unit owns its own tunnel and keeps the harness's stale-tunnel recycling.
   export AGENT_LOCAL_PORT=$((28642 + seq))
+  # The inject door's tunnel, the same way; inert on the api transport.
+  export AGENT_INJECT_LOCAL_PORT=$((EVAL_INJECT_LOCAL_PORT_BASE + seq))
   # Which case and which repetition this unit is, for any transport that can
   # carry an id into the agent's own records. The inject transport sends the
   # pair as the backend message id, which the gateway's ingress log joins to

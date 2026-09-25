@@ -50,6 +50,18 @@ import (
 var manifestsLog = logf.Log.WithName("platformagent-manifests")
 
 const (
+	// kindLocation is the spec.harness.location a kind install sets (with
+	// "kind" for projectId and clusterName as well). No GKE location looks like
+	// this. It means: there is no GKE cluster to fetch credentials for, use the
+	// cluster the pod runs in.
+	kindLocation = "kind"
+	// inClusterContextName is the kubectl context the credential proxy and the
+	// agent use on kind.
+	inClusterContextName = "in-cluster"
+	// inClusterAPIServer is the in-cluster API server address; its certificate
+	// carries this name, so no IP has to be read at render time.
+	inClusterAPIServer = "https://kubernetes.default.svc"
+
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
 	defaultAgentHome            = "/opt/data"
@@ -265,11 +277,13 @@ type scopeDeclaration struct {
 	// and retires nothing, because the ordinary way a block goes missing is a write
 	// through an older operator's webhook, not an operator dropping every project. An
 	// empty `projects` list in a present block is the declaration that drops projects.
-	Present       bool                    `json:"present"`
-	Projects      []string                `json:"projects"`
-	Folders       []string                `json:"folders"`
-	Organizations []string                `json:"organizations"`
-	Exclude       scopeExcludeDeclaration `json:"exclude"`
+	Present        bool                    `json:"present"`
+	Projects       []string                `json:"projects"`
+	Folders        []string                `json:"folders"`
+	Organizations  []string                `json:"organizations"`
+	SharedVpcHosts []string                `json:"sharedVpcHosts"`
+	MetricsScopes  []string                `json:"metricsScopes"`
+	Exclude        scopeExcludeDeclaration `json:"exclude"`
 }
 
 type scopeExcludeDeclaration struct {
@@ -291,10 +305,12 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 		scope = &agentv1alpha1.ScopeSpec{}
 	}
 	decl := scopeDeclaration{
-		Present:       agent.Spec.Scope != nil,
-		Projects:      append([]string{}, scope.Projects...),
-		Folders:       append([]string{}, scope.Folders...),
-		Organizations: append([]string{}, scope.Organizations...),
+		Present:        agent.Spec.Scope != nil,
+		Projects:       append([]string{}, scope.Projects...),
+		Folders:        append([]string{}, scope.Folders...),
+		Organizations:  append([]string{}, scope.Organizations...),
+		SharedVpcHosts: append([]string{}, scope.SharedVpcHosts...),
+		MetricsScopes:  append([]string{}, scope.MetricsScopes...),
 		Exclude: scopeExcludeDeclaration{
 			Projects: []string{},
 			Clusters: []agentv1alpha1.ScopeClusterRef{},
@@ -307,6 +323,8 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 	sort.Strings(decl.Projects)
 	sort.Strings(decl.Folders)
 	sort.Strings(decl.Organizations)
+	sort.Strings(decl.SharedVpcHosts)
+	sort.Strings(decl.MetricsScopes)
 	sort.Strings(decl.Exclude.Projects)
 	sort.Slice(decl.Exclude.Clusters, func(i, j int) bool {
 		a, b := decl.Exclude.Clusters[i], decl.Exclude.Clusters[j]
@@ -320,9 +338,9 @@ func renderScopeJSON(agent *agentv1alpha1.PlatformAgent) string {
 	})
 	out, err := json.MarshalIndent(decl, "", "  ")
 	if err != nil {
-		// Three string slices cannot fail to marshal; if they ever do, an empty
-		// scope is the safe render: the reconcile falls back to today's behaviour
-		// rather than acting on a partial declaration.
+		// String slices and a struct of them cannot fail to marshal; if they ever
+		// do, an empty scope is the safe render: the reconcile falls back to today's
+		// behaviour rather than acting on a partial declaration.
 		manifestsLog.Error(err, "rendering spec.scope failed; rendering no scope")
 		return ""
 	}
@@ -2447,7 +2465,17 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		})
 	}
 
-	if agent.Spec.Harness != nil {
+	if agent.Spec.Harness != nil && harnessOnKind(agent.Spec.Harness) {
+		// The context the credential proxy's bootstrap writes on kind.
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_CONTEXT_NAME",
+			Value: inClusterContextName,
+		})
+		envVars = append(envVars, corev1.EnvVar{
+			Name:  "KUBE_DEFAULT_NAMESPACE",
+			Value: agent.Namespace,
+		})
+	} else if agent.Spec.Harness != nil {
 		if agent.Spec.Harness.ProjectID != "" {
 			envVars = append(envVars, corev1.EnvVar{
 				Name:  "GKE_PROJECT_ID",
@@ -3625,6 +3653,12 @@ func sessionKVSaltSecretRef(agent *agentv1alpha1.PlatformAgent) *corev1.SecretKe
 	return defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
 }
 
+// harnessOnKind reports whether the harness describes a kind install rather
+// than a GKE cluster; see kindLocation.
+func harnessOnKind(harness *agentv1alpha1.HarnessSpec) bool {
+	return harness != nil && harness.Location == kindLocation
+}
+
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
@@ -3735,7 +3769,19 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 		corev1.EnvVar{Name: "CREDENTIAL_PROXY_CONTENT_WORKSPACE", Value: "1"},
 	)
-	if harness := agent.Spec.Harness; harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
+	if harness := agent.Spec.Harness; harnessOnKind(harness) {
+		// kind: the proxy serves the cluster it runs in. Write its kubeconfig from the pod's service account mount --
+		// `tokenFile` rather than `--token`, since the kubelet rotates the
+		// projected token. Paths are literal because the bootstrap shell only
+		// receives GKE_* and KUBE_* variables (credential_proxy.py, bootstrap).
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: inClusterContextName}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", Value: fmt.Sprintf(`kubectl config set-cluster "$KUBE_CONTEXT_NAME" --server=%q --certificate-authority=%q >/dev/null &&
+kubectl config set "users.${KUBE_CONTEXT_NAME}.tokenFile" %q >/dev/null &&
+kubectl config set-context "$KUBE_CONTEXT_NAME" --cluster="$KUBE_CONTEXT_NAME" --user="$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMESPACE" >/dev/null &&
+kubectl config use-context "$KUBE_CONTEXT_NAME" >/dev/null`, inClusterAPIServer, kubeAPIAccessMountPath+"/ca.crt", kubeAPIAccessMountPath+"/token")},
+		)
+	} else if harness != nil && harness.ProjectID != "" && harness.Location != "" && harness.ClusterName != "" {
 		envVars = append(envVars,
 			corev1.EnvVar{Name: "GKE_PROJECT_ID", Value: harness.ProjectID}, corev1.EnvVar{Name: "GKE_CLUSTER_NAME", Value: harness.ClusterName}, corev1.EnvVar{Name: "GKE_LOCATION", Value: harness.Location},
 			corev1.EnvVar{Name: "KUBE_CONTEXT_NAME", Value: fmt.Sprintf("gke_%s_%s_%s", harness.ProjectID, harness.Location, harness.ClusterName)}, corev1.EnvVar{Name: "KUBE_DEFAULT_NAMESPACE", Value: agent.Namespace},
@@ -5282,8 +5328,9 @@ func peersNotAlreadyPresent(present, candidates []networkingv1.NetworkPolicyPeer
 	return kept
 }
 
-// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent.
-// Note: This is the operator-generated version; Kustomize static deployments use deploy/kustomize/platform/.
+// buildNetworkPolicy generates the restrictive NetworkPolicy manifest for PlatformAgent:
+// the gateway policy, the one policy an install places on the agent Pod. No static
+// copy of it ships anywhere in the repository.
 //
 // otlpDisabled carries the same meaning as renderOptions.otlpDisabled: discovery found no
 // collector, so there is no export to allow and the collector egress rule is left out.
@@ -5364,7 +5411,7 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 	// it under, so a grep for that constant finds both places the resolver is
 	// permitted. The grant is IPv4-only on purpose: fd20:ce::254 is documented as
 	// a metadata endpoint rather than as a resolver, and no static copy in
-	// charts/ or deploy/kustomize names it in a DNS rule, so it stays out until a
+	// charts/ names it in a DNS rule, so it stays out until a
 	// dual-stack Cloud DNS cluster is observed naming it in a Pod's resolv.conf.
 	peers = append(peers, formatCIDRPeers([]string{metadataResolverCIDR}, true)...)
 
