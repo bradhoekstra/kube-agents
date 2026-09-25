@@ -2283,6 +2283,78 @@ class ScopeTest(HomesMixin):
         self.assertEqual(created, [])
         self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
 
+    def test_a_retiring_row_keeps_its_number_so_a_relinked_project_the_run_cannot_name_is_kept(self):
+        # Run N named 111 as team-a. Run N+1: unlinked, retiring. Run N+2: linked again while
+        # the naming call is refused. Without the number on the retiring row the member would be
+        # reported as the bare number and team-a, still retiring and absent, would be pruned.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        report, _, deleted = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                       profiles=["cluster-a"], identities=ids,
+                                       selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["retiring"]), ([], ["team-a"]))
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-a")
+        self.assertEqual((row["state"], row[rec.NUMBER_KEY]), (rec.STATE_RETIRING, "111"))
+        report, _, deleted = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                       profiles=["cluster-a"], identities=ids,
+                                       selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)}, numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((deleted, report["retiring"], report["projects"]["team-a"]), ([], [], rec.OUTCOME_DENIED))
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-a")
+        self.assertEqual((row["state"], row["via"], row[rec.NUMBER_KEY]), (rec.STATE_IN_SCOPE, [self.SCOPE], "111"))
+        self.assertIn("cluster-a", report["kept"])
+
+    def test_a_project_that_is_also_explicit_or_the_management_project_keeps_the_number_it_was_named_by(self):
+        # Declared in `projects` and named by the scope: the row carries the number, so the
+        # documented migration (drop the explicit entry) survives a refused naming call.
+        report, _, _ = self._run({"projects": ["team-b"], "metricsScopes": ["mon-proj"]},
+                                 {self.MGMT: [], "team-b": [("team-b", "prod", "us-central1")]},
+                                 selectors={self.SCOPE: (["222", "999"], rec.OUTCOME_OK)},
+                                 numbers={"222": ("team-b", rec.OUTCOME_OK), "999": (self.MGMT, rec.OUTCOME_OK)})
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["team-b"]["via"], rows["team-b"][rec.NUMBER_KEY]), ([rec.VIA_EXPLICIT, self.SCOPE], "222"))
+        self.assertEqual(rows[self.MGMT][rec.NUMBER_KEY], "999")
+        ids = {"cluster-b": _identity("team-b", "prod")}
+        report, _, deleted = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                       profiles=["cluster-b"], identities=ids,
+                                       selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)}, numbers={"222": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((deleted, report["retiring"], report["projects"]["team-b"]), ([], [], rec.OUTCOME_DENIED))
+        self.assertIn("cluster-b", report["kept"])
+
+    def test_a_container_that_places_a_project_whose_naming_call_failed_lists_it(self):
+        # The scope named 222 last run as team-a; this run the naming call is cut, but the folder
+        # places team-a with its clusters: the folder's listing wins, as it does over a frozen row.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        report, created, _ = self._run({"metricsScopes": ["mon-proj"], "folders": ["123456789012"]}, {self.MGMT: []},
+                                       selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)}, numbers={"222": (None, rec.OUTCOME_UNREACHABLE)},
+                                       searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(created, [("team-a", "prod", "us-central1")])
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-a")
+        self.assertEqual((row["outcome"], row["via"], row["clusters"], row[rec.NUMBER_KEY]),
+                         (rec.OUTCOME_OK, [self.FOLDER, self.SCOPE], 1, "222"))
+        # The naming failure was unreachable, and it did not hold the prune: a clean run.
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_OK)
+
+    def test_a_project_id_the_scope_cannot_carry_reads_denied_and_does_not_hold_the_prune(self):
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="example.com:legacy\n")), \
+             mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._project_id_of("333"), (None, rec.OUTCOME_DENIED))
+        self.assertIn("cannot carry", " ".join(str(c) for c in logged.call_args_list))
+        # End to end: the member is reported by number, and a project the declaration dropped
+        # still retires this run, because a denied member does not hold the scope prune.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "p-old", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-old": _identity("p-old", "c")}
+        report, _, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                 profiles=["cluster-old"], identities=ids,
+                                 selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(report["projects"]["333"], rec.OUTCOME_DENIED)
+        self.assertEqual(report["retiring"], ["p-old"])
+
     def test_a_row_written_under_the_bare_number_is_no_mapping(self):
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "222", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}])

@@ -587,9 +587,12 @@ into a second project the tester controls.
    install over one misdeclared host. The selectors' projects read `over-cap` one by one past
    the cap, like explicit projects, and there is no index-lag hold behind either lookup, since
    neither has an index: a project detached or unlinked retires under §7's ordinary rule. And a
-   fourth, from review: a monitored project whose naming call failed but that a Shared VPC host, an
-   explicit entry or the management project names by ID is listed on that route, its own listing
-   decides its outcome, and the row carries every `via` and the number.
+   fourth, from review: a monitored project whose naming call failed but that a Shared VPC host, a
+   folder, an explicit entry or the management project names by ID is listed on that route, its own
+   listing decides its outcome, and every row a scope named by number keeps the number, `retiring`
+   rows included. A fifth: a monitored project whose ID the scope model cannot carry (a legacy
+   domain-scoped ID) reads `denied` by number, a stable fact reported and never a lookup failure
+   that would hold the prune; `exclude.projects` by number drops it.
 4. **Downstream consumers.** The rows §8 marks 2: the drift detector's cross-project join,
    audit-log sinks per project or an aggregated sink, and the fleet-audit SOPs and cost skills
    iterating the snapshot.

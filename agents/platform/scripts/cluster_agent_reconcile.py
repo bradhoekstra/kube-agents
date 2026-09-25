@@ -611,14 +611,23 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
     `projects describe` needs `resourcemanager.projects.get`, which every read role the scope
     binds carries, so a monitored project the account cannot name is one it holds no role in:
-    the same `denied` its listing would have read.
+    the same `denied` its listing would have read. An answer the scope model cannot carry (a
+    legacy domain-scoped `example.com:name` ID, outside the CRD's project-ID pattern that every
+    exclusion, profile name and declared value is written in) reads `denied` too: a stable fact
+    about the estate, reported by number and dropped by naming the number in `exclude.projects`,
+    never `unreachable`, which would hold the scope prune for the whole install on every tick.
     """
     cmd = ["gcloud", "projects", "describe", number, f"--format={PROJECT_ID_FORMAT}"]
     try:
         result = sandbox_exec.run(cmd, check=True, timeout=timeout)
         project = (result.stdout or "").strip()
+        if not project:
+            raise ValueError("projects describe returned no project ID")
         if not _PROJECT_ID.match(project):
-            raise ValueError(f"projects describe returned {project!r}, not a project ID")
+            log(f"naming project {number} returned {project!r}, a project ID the scope cannot carry "
+                f"(a legacy domain-scoped ID); reported by number as {OUTCOME_DENIED}, so the prune is not held. "
+                "Name the number in spec.scope.exclude.projects to drop it from the set.")
+            return None, OUTCOME_DENIED
         return project, OUTCOME_OK
     except subprocess.CalledProcessError as e:
         outcome = _classify_list_failure(e.stderr or "")
@@ -803,13 +812,24 @@ def _resolve_projects(management: str | None, scope: dict,
                 merged["outcome"] = merged["outcome"] or info["outcome"]
             merged[NUMBER_KEY] = merged[NUMBER_KEY] or info.get(NUMBER_KEY)
         containers.append({"id": selector, "outcome": OUTCOME_OK, "projects": len(members)})
+    def keep_number(project: str, number: str | None) -> None:
+        # Every row a Metrics Scope named by number carries the number, whichever route
+        # listed the project: it is what lets a later run whose naming call is refused still
+        # report the project under its ID rather than retire it.
+        if not number:
+            return
+        for entry in entries:
+            if entry["id"] == project and not entry.get(NUMBER_KEY):
+                entry[NUMBER_KEY] = number
+
     for project in sorted(selected):
         info = selected[project]
         if project in seen:
             # Declared explicitly, or the management project, as well as reached through a
-            # selector: both vias, and the listing it already has.
+            # selector: both vias, the listing it already has, and the number.
             for via in info["via"]:
                 add_via(project, via)
+            keep_number(project, info[NUMBER_KEY])
             continue
         seen.add(project)
         if _excluded_by(project, patterns):
@@ -818,11 +838,17 @@ def _resolve_projects(management: str | None, scope: dict,
         if outcome is None and listed_count() >= RESOLVED_SET_CAP:
             outcome = OUTCOME_OVER_CAP
             log(f"{project} (via {', '.join(sorted(info['via']))}) is past the resolved-set cap of {RESOLVED_SET_CAP}; over-cap, no CREATE.")
+        # A member whose naming call failed is carried under that outcome the way a frozen
+        # member is, and marked so: a container that places it live below lifts it into the
+        # listing, as it lifts a frozen one, rather than losing the folder's clusters to a
+        # naming call that was cut or refused.
         entries.append({"id": project, "via": sorted(info["via"]), "outcome": outcome,
+                        **({"frozen": True} if info["outcome"] else {}),
                         **({NUMBER_KEY: info[NUMBER_KEY]} if info[NUMBER_KEY] else {})})
     for selector, project, outcome in sorted(frozen_selected):
         if project in seen:
             add_via(project, selector)
+            keep_number(project, _previous_number(previous, project))
             continue
         if _excluded_by(project, patterns):
             continue
@@ -1671,8 +1697,12 @@ def reconcile(dry_run: bool = False) -> dict:
          **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
+        # With the number it was named by, so a run that relinks it while the naming call is
+        # refused reports it under its ID, `denied` and in scope, rather than pruning it as a
+        # retiring project the run did not see.
         {"id": pid, "via": [], "outcome": OUTCOME_OK, "state": STATE_RETIRING,
-         "clusters": remaining(pid)}
+         "clusters": remaining(pid),
+         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
         for pid in sorted(still_retiring - carried_in_scope)
     ], key=lambda p: p["id"])
     if not dry_run:
