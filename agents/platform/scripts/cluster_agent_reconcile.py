@@ -612,8 +612,8 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
     `projects describe` needs `resourcemanager.projects.get`, which every read role the scope
     binds carries, so a monitored project the account cannot name is one it holds no role in:
     the same `denied` its listing would have read. An answer the scope model cannot carry (a
-    legacy domain-scoped `example.com:name` ID, outside the CRD's project-ID pattern that every
-    exclusion, profile name and declared value is written in) reads `denied` too: a stable fact
+    legacy domain-scoped `example.com:name` ID, with a `:` no exclusion, profile name or declared
+    value can carry) reads `denied` too: a stable fact
     about the estate, reported by number and dropped by naming the number in `exclude.projects`,
     never `unreachable`, which would hold the scope prune for the whole install on every tick.
     """
@@ -660,7 +660,8 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     be listed, or the outcome of the naming call for a monitored project whose number could
     not be named this run. Such a member is reported under the ID the last snapshot recorded
     for its number, and under the bare number when no run has named it yet (no outcome is
-    silent, design §4); either way it is not listed and nothing is created under it. None
+    silent, design §4); either way it is not listed and nothing is created under it, unless a
+    declared container places it, which lists it as it lifts a frozen member. None
     members means the selector's own lookup failed.
     """
     numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
@@ -789,7 +790,8 @@ def _resolve_projects(management: str | None, scope: dict,
     # frozen, after the live ones, so a project one selector froze and another named live is
     # listed. A monitored project that could not be named (`outcome` set), and that no other
     # selector named live, is in the set,
-    # reported, and not listed: nothing is created under a project the run cannot read.
+    # reported, and not listed, unless a declared container places it below: nothing is
+    # created under a project the run cannot read.
     selected: dict[str, dict] = {}
     frozen_selected: list[tuple[str, str, str]] = []
     for selector in _selector_ids(scope):
@@ -1679,9 +1681,13 @@ def reconcile(dry_run: bool = False) -> dict:
          "clusters": cluster_counts.get(e["id"]),
          **({ABSENT_SINCE_KEY: _previous_absent_since(previous, e["id"])}
             if e.get("indexed") is False and _previous_absent_since(previous, e["id"]) else {}),
-         # The number a Metrics Scope named the project by, kept so a later run that cannot
-         # name it (the grant revoked) still reports it under its ID rather than its number.
-         **({NUMBER_KEY: e[NUMBER_KEY]} if e.get(NUMBER_KEY) else {})}
+         # The number a Metrics Scope named the project by, this run or any earlier one, kept
+         # on every later row for the project whatever route built it (explicit, management, a
+         # container, a frozen carry), so a later run that cannot name the number (the grant
+         # revoked) still reports the project under its ID rather than retiring it. A number
+         # and an ID are immutable and unique per project, so a recorded pair never goes stale.
+         **({NUMBER_KEY: e.get(NUMBER_KEY) or _previous_number(previous, e["id"])}
+            if (e.get(NUMBER_KEY) or _previous_number(previous, e["id"])) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the

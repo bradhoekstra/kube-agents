@@ -2355,6 +2355,47 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["projects"]["333"], rec.OUTCOME_DENIED)
         self.assertEqual(report["retiring"], ["p-old"])
 
+    def test_every_later_row_for_a_project_keeps_the_number_whatever_route_built_it(self):
+        # Named by the scope once (222 -> team-b), then reached by other routes on later runs
+        # while the scope no longer names it: the explicit route, a frozen folder's carry, and a
+        # frozen scope's carry beside the explicit entry. Each row keeps the number, so a relink
+        # with the naming call refused still resolves under the ID.
+        previous_row = {"id": "team-b", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}
+        mgmt_row = {"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}
+        # Explicit only: the scope resolved live and dropped it.
+        self._write_previous([mgmt_row, previous_row], containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        self._run({"projects": ["team-b"], "metricsScopes": ["mon-proj"]}, {self.MGMT: [], "team-b": []},
+                  selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-b")
+        self.assertEqual((row["via"], row[rec.NUMBER_KEY]), ([rec.VIA_EXPLICIT], "222"))
+        # A frozen folder carrying it, the scope live and not naming it.
+        self._write_previous([mgmt_row, {**previous_row, "via": [self.FOLDER, self.SCOPE]}],
+                             containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1},
+                                         {"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        self._run({"folders": ["123456789012"], "metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                  selectors={self.SCOPE: ([], rec.OUTCOME_OK)}, searches={self.FOLDER: (None, rec.OUTCOME_UNREACHABLE)})
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-b")
+        self.assertEqual((row["via"], row["outcome"], row[rec.NUMBER_KEY]), ([self.FOLDER], rec.OUTCOME_UNREACHABLE, "222"))
+        # A frozen scope's carry beside the explicit entry.
+        self._write_previous([mgmt_row, previous_row], containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        self._run({"projects": ["team-b"], "metricsScopes": ["mon-proj"]}, {self.MGMT: [], "team-b": []},
+                  selectors={self.SCOPE: (None, rec.OUTCOME_UNREACHABLE)})
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-b")
+        self.assertEqual((row["via"], row[rec.NUMBER_KEY]), ([rec.VIA_EXPLICIT, self.SCOPE], "222"))
+        # And the relink with naming refused, from the explicit-only row: one row, under the ID.
+        report, _, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                 selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)}, numbers={"222": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(report["projects"].get("team-b"), rec.OUTCOME_DENIED)
+        self.assertNotIn("222", report["projects"])
+
+    def test_excluding_the_bare_number_drops_a_member_the_run_could_not_name(self):
+        report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
+                                       {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                       selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
+        self.assertEqual(sorted(report["projects"]), [self.MGMT])
+        self.assertNotIn("333", {p["id"] for p in self._snapshot()["projects"]})
+
     def test_a_row_written_under_the_bare_number_is_no_mapping(self):
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "222", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}])

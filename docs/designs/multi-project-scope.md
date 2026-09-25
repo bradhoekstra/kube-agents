@@ -323,7 +323,7 @@ that could read it did: a profile whose `cluster_identity` cannot be read this r
 through this map, so a `retiring` project whose remaining profile is unreadable stays `retiring`
 rather than leaving the snapshot and reading as never in scope once the identity is readable again.
 
-A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, so a later run whose naming call is refused can still report the project under its ID (§10 step 3).
+A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, and every later row for the project keeps it, explicit, management, container and `retiring` rows included, so a later run whose naming call is refused can still report the project under its ID (§10 step 3).
 
 A project entry carries two fields that answer different questions. `outcome` (§4) says whether
 the run could read the project this tick. `state` says what the declaration wants: `in-scope` for
