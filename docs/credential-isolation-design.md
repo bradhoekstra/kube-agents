@@ -782,17 +782,19 @@ Consequences:
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
   and a half-closed one look alike, runs its commands unwatched.
-- Envoy's stream idle timeout in front of the runtime is twenty minutes. The
-  broker writes nothing to a stream until the request is answered, and one
-  request can run more than one command back to back: a vcs publish fetches
-  and then pushes, each with the full five-minute deadline, and a kubectl
-  naming a cluster whose kubeconfig is not cached fetches credentials first,
-  on the shorter kubectl deadline. Twenty minutes covers two deadlines plus
-  the slot wait, the kill grace and the drain, so a silent request that
-  reaches its deadline is still answered with its partial output and the
-  timed-out notice rather than reset by Envoy first. An operator raising
-  `CREDENTIAL_PROXY_TIMEOUT_SECONDS` raises the Envoy timeout with it, keeping
-  it above twice the deadline plus the minute.
+- All the commands one request runs share one deadline,
+  `CREDENTIAL_PROXY_TIMEOUT_SECONDS` (five minutes) counted from admission: a
+  vcs publish's several network git commands, and a first kubectl's
+  credential fetch (itself on the shorter kubectl deadline) followed by the
+  kubectl, are each capped to what is left of it. A vcs body must also arrive
+  within 60 seconds of admission. Envoy's stream idle timeout in front of the
+  runtime is twenty minutes: the broker writes nothing to a stream until the
+  request is answered, so the silent worst case is that deadline plus the
+  slot wait, the kill grace and the drain, a little over six minutes at the
+  defaults, and a silent request that reaches its deadline is still answered
+  with its partial output and the timed-out notice rather than reset by Envoy
+  first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` keeps the
+  Envoy timeout above it plus the minute.
 
 ### Cloud API reads
 

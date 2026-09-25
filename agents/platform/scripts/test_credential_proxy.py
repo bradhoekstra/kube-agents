@@ -2171,6 +2171,126 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual([("verb", 1), ("write", 1)], seen)
         self.assert_slot_released(executor)
 
+    def raw_request(self, target, body, content_length=None):
+        """Send one HTTP request on a raw socket and return the socket unread.
+
+        For the callers the route tests cannot make with urllib: one that never
+        reads its response, one that never finishes sending its body.
+        """
+        sock = socket.create_connection(("127.0.0.1", self.server.server_port))
+        self.addCleanup(sock.close)
+        length = len(body) if content_length is None else content_length
+        sock.sendall(
+            f"POST {target} HTTP/1.0\r\nContent-Type: application/json\r\n"
+            f"Content-Length: {length}\r\n\r\n".encode("ascii")
+            + body
+        )
+        return sock
+
+    def test_a_caller_that_stops_reading_is_given_up_on_and_its_slot_freed(self):
+        # The slot is held through the write, so a caller that never reads a
+        # body larger than the socket buffers would otherwise keep it forever.
+        executor = CredentialProxyHandler.executor
+        stub = Path(executor.executables["kubectl"])
+        stub.write_text("#!/bin/bash\nhead -c 16777216 /dev/zero | tr '\\0' a\n", encoding="utf-8")
+        with (
+            mock.patch.object(executor, "max_output_bytes", 16 << 20),
+            mock.patch.object(credential_proxy, "RESPONSE_WRITE_TIMEOUT_SECONDS", 1),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.raw_request("/v1/exec", json.dumps({"argv": ["kubectl", "get", "pods"]}).encode())
+            deadline = time.monotonic() + 10
+            while not any("response not delivered" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the write to a caller that never reads was not given up on")
+                time.sleep(0.1)
+
+        self.assert_slot_released(executor)
+
+    def test_a_caller_that_stalls_mid_body_on_the_vcs_route_frees_its_slot(self):
+        # The vcs body is read inside the slot, so a caller that announces a
+        # body and stops sending would keep a slot with nothing running in it;
+        # a stalled peer is no hang-up, so a deadline is what ends it.
+        executor = CredentialProxyHandler.executor
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"probe": lambda payload: {"ok": True}},
+            ),
+            mock.patch.object(credential_proxy, "REQUEST_READ_TIMEOUT_SECONDS", 1),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            self.raw_request("/v1/vcs/probe", b'{"partial": ', content_length=1000)
+            deadline = time.monotonic() + 10
+            while not any("request body not received" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the stalled body was not given up on")
+                time.sleep(0.1)
+
+        self.assert_slot_released(executor)
+
+    def test_a_caller_that_hangs_up_while_queued_is_logged_by_the_route(self):
+        # The executor-level test proves the refusal; this one proves the exec
+        # route turns it into its log line and starts nothing. Over a Unix
+        # socket, as in production: on the TCP listener the other tests use, a
+        # closed peer reports no POLLHUP, and the route runs unwatched there
+        # by design.
+        executor = CredentialProxyHandler.executor
+        single = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "single"),
+            scoped_pool=None,
+            max_concurrent_commands=1,
+        )
+        single.executables["kubectl"] = executor.executables["kubectl"]
+        socket_path = Path(self.temp_dir.name) / "broker.sock"
+        unix_server = credential_proxy.ThreadingUnixHTTPServer(
+            str(socket_path), CredentialProxyHandler
+        )
+        threading.Thread(target=unix_server.serve_forever, daemon=True).start()
+        self.addCleanup(unix_server.server_close)
+        self.addCleanup(unix_server.shutdown)
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold():
+            with single.request_slot():
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        with (
+            mock.patch.object(CredentialProxyHandler, "executor", single),
+            self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs,
+        ):
+            body = json.dumps({"argv": ["kubectl", "get", "pods"]}).encode()
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.connect(str(socket_path))
+            sock.sendall(
+                b"POST /v1/exec HTTP/1.0\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii")
+                + body
+            )
+            time.sleep(0.3)
+            sock.close()
+            deadline = time.monotonic() + 10
+            while not any("while queued for a slot" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the route never logged the queued hang-up")
+                time.sleep(0.1)
+        release.set()
+        holder.join()
+
+        self.assertEqual(0, single.queued_requests)
+        self.assertEqual(0, single.slots_in_use)
+
     def test_a_broker_at_its_cap_answers_503_with_a_reason_the_shim_prints(self):
         # `error` is the key the shim prints for a non-policy failure, so the
         # agent reads why rather than a bare exit 1 -- and `code` lets a caller
@@ -3230,6 +3350,27 @@ class CommandExecutorTest(unittest.TestCase):
 
         self.assertTrue(seen, "no gcloud ran for the cache fill")
         self.assertEqual({7}, set(seen))
+
+    def test_a_request_s_commands_share_one_deadline(self):
+        # Several commands in one request -- a vcs publish's git, a first
+        # kubectl's credential fetch -- must not each get the whole broker
+        # deadline, or the request's silent worst case is that many deadlines
+        # end to end. The first command here spends most of a 2 s budget; the
+        # second gets only what is left.
+        executor = self.executor(timeout_seconds=2)
+
+        started = time.monotonic()
+        with executor.request_slot():
+            first = executor.execute_internal(["/bin/sleep", "1.2"])
+            second = executor.execute_internal(["/bin/sleep", "5"])
+        elapsed = time.monotonic() - started
+
+        self.assertFalse(first.timed_out)
+        self.assertTrue(second.timed_out)
+        self.assertEqual(124, second.exit_code)
+        self.assertLess(elapsed, 5)
+        # Outside a request, a command gets the deadline it asked for.
+        self.assertFalse(executor.execute_internal(["/bin/sleep", "0.1"]).timed_out)
 
     def test_commands_take_no_slot_of_their_own(self):
         # A slot is a request's, held by the route around the command and the

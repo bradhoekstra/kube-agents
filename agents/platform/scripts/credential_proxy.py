@@ -156,6 +156,11 @@ COMMAND_SLOT_POLL_SECONDS = 0.5
 # that stops reading would otherwise keep the slot for as long as it liked; a
 # 16 MiB body crosses the Pod network in well under a second.
 RESPONSE_WRITE_TIMEOUT_SECONDS = 60
+# The same bound from the other end, for the one route that reads its body
+# after admission: a vcs body, bundle included, has this long to arrive once
+# the request holds a slot, or a caller that stalls mid-send would keep the
+# slot with nothing running in it.
+REQUEST_READ_TIMEOUT_SECONDS = 60
 # What a socket reports once its peer has closed for good. POLLHUP and not
 # EOF, because a peer that has only shut its writing half -- legal after an
 # HTTP request, and still waiting for the response -- reads as EOF too.
@@ -3575,6 +3580,9 @@ class CommandExecutor:
         self._slot_condition = threading.Condition()
         self._slots_in_use = 0
         self._slot_queue: collections.deque[object] = collections.deque()
+        # The deadline the commands of the request on this thread share; set by
+        # `request_slot` for as long as the slot is held, read by `_execute`.
+        self._request_budget = threading.local()
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -3834,6 +3842,15 @@ class CommandExecutor:
         COMMAND_SLOT_WAIT_SECONDS raises `CommandSlotUnavailable`; with the
         queue ordered, that is the request that has waited longest, not
         whichever one a semaphore happened to pass over.
+
+        While the slot is held, every command run on this thread shares one
+        deadline, the broker-wide `timeout_seconds` counted from admission:
+        `_execute` caps each command to what is left of it. A vcs verb runs
+        several network git commands back to back and a first kubectl on an
+        uncached cluster fetches credentials first, and without the shared
+        deadline a request's silent worst case would be that many deadlines
+        end to end -- longer than the idle time Envoy allows the stream in
+        front of the broker, which is sized against this one.
         """
         queued_at = time.monotonic()
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
@@ -3866,6 +3883,7 @@ class CommandExecutor:
                 # line is woken to look again.
                 self._slot_queue.remove(ticket)
                 self._slot_condition.notify_all()
+        self._request_budget.deadline = time.monotonic() + self.timeout_seconds
         try:
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
@@ -3876,6 +3894,7 @@ class CommandExecutor:
                 )
             yield
         finally:
+            self._request_budget.deadline = None
             with self._slot_condition:
                 self._slots_in_use -= 1
                 self._slot_condition.notify_all()
@@ -4785,9 +4804,16 @@ class CommandExecutor:
             )
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
-        effective_timeout = (
+        effective_timeout: float = (
             timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         )
+        request_deadline = getattr(self._request_budget, "deadline", None)
+        if request_deadline is not None:
+            # The commands of one request share its deadline (`request_slot`);
+            # a command that starts with nothing left gets nothing, and comes
+            # back timed out rather than running past what the request was
+            # allowed.
+            effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
         started = time.monotonic()
         process = subprocess.Popen(
             argv,
@@ -6068,10 +6094,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # CommandExecutor.request_slot for why the response is inside it;
             # the body is inside it for the same reason, from the other end.
             with self._request_slot():
+                # Read under a deadline: the slot is held from here on, and a
+                # caller that stalls mid-send would otherwise keep it with
+                # nothing running in it. A stalled peer is not a hang-up --
+                # its socket reports no POLLHUP -- so the watch that ends an
+                # abandoned wait does not cover this. (A handler the route
+                # tests build by hand has no connection; see _request_slot.)
+                connection = getattr(self, "connection", None)
+                if connection is not None:
+                    connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
                 try:
                     payload = self._read_json_body(max_bytes=body_limit)
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except OSError as exc:
+                    LOGGER.warning(
+                        "request body not received verb=%s type=%s", verb, type(exc).__name__
+                    )
                     return
                 # The managed-repository control, on the same footing as
                 # `require_managed_workspace` on the content routes: the broker
@@ -6341,7 +6381,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         rather than a fault, and a handler without a connection an unwatched
         wait.
         """
-        executor = self.executor
+        executor = getattr(self, "executor", None)
         if hasattr(executor, "request_slot"):
             return executor.request_slot(caller=getattr(self, "connection", None))
         return contextlib.nullcontext()
