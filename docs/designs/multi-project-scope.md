@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 to 3's IAM bindings and installer paths (for step 3, the plan-time resolution of the two selectors), step 1's chart rendering of `spec.scope` and `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Step 1's IAM bindings, installer path and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input, the composition's `scope` variable feeding the module and the chart from one value, and the installer's `SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys. Steps 2 and 3's IAM bindings and installer paths (for step 3, the plan-time resolution of the two selectors), step 1's `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -83,7 +83,7 @@ Cluster Agent is named, stored, or driven:
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project
   (`:2496`). It does not pin a project. Only IAM stops a cross-project call.
 - The scoped service account pool is already keyed on a per-row project. `scoped_clusters`
-  (`terraform/modules/kube-agents-iam/variables.tf:71` onward) is a list of
+  (`variable "scoped_clusters"` in `terraform/modules/kube-agents-iam/variables.tf`) is a list of
   `{project_id, location, cluster_name}` objects, with the comment that "a cluster in another
   project is a row in this list rather than a second module"; the CRD mirror is
   `spec.security.scopedServiceAccounts[]` (`k8s-operator/api/v1alpha1/common_types.go:498-540`),
@@ -368,14 +368,18 @@ follow the selector type:
 project was named or reached through a container. The allowlist is `container.clusterViewer`,
 `container.viewer`, `compute.viewer`, `monitoring.viewer`, `logging.viewer`, and
 `iam.securityReviewer`: the read roles in the list the composition binds, `local.read_only_roles`
-in `terraform/examples/full-install/main.tf`, which the module default
-(`terraform/modules/kube-agents-iam/variables.tf:59-68`) mirrors. The intersection matters on the
+in `terraform/examples/full-install/main.tf`, which the module default (`variable "project_roles"`
+in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection matters on the
 `custom` permission set, where the operator names `project_roles` outright: a list that carries
 `roles/container.admin` for the host project must not carry it to another project, where
 `container.clusters.impersonate` would apply to every cluster, and a
 quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
 projects the agent only reads. Widening `project_roles` widens the host project alone; widening
-what the scope carries is an edit to the allowlist, in one file, on purpose.
+what the scope carries is an edit to the allowlist, in one file, on purpose. The module refuses the
+plan when `scope.projects` is non-empty and the intersection carries neither
+`roles/container.clusterViewer` nor `roles/container.viewer`, the two allowlist roles that carry
+`container.clusters.get` as well as `container.clusters.list`: `roles/iam.securityReviewer` lists
+but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
 
 The default roles outside the allowlist are outside it by design, and so is any role a later
 change adds to the default list that is not a read role. `roles/iam.serviceAccountUser` is
@@ -418,8 +422,9 @@ owns them, which is the property #588 lost when its revocation lived in a bash f
 ## 7. The onboarding lifecycle
 
 **Adding a project.** Under a declared folder or organisation: nothing to do; it is discovered at
-the next tick. As an explicit project: add it to `scope.projects` in the tfvars and run
-`upgrade.sh`, which binds the IAM and renders the CR from the same value (a hand-applied CR is
+the next tick. As an explicit project: add it to `SCOPE_PROJECTS` in `install.env` (a hand-driven
+composition edits `scope.projects` in its tfvars) and run `upgrade.sh --upgrade-mode=full`, which
+binds the IAM and renders the CR from the same value (a hand-applied CR is
 edited separately, and §11 says why that split is the weak point). The binding then exists before
 the reconcile tries the list, and the project's
 outcome goes from `denied` to `ok` at the following tick. The order matters and the snapshot shows

@@ -813,6 +813,38 @@ platformAgent:
       # roles. The federated principal needs only roles/iam.workloadIdentityUser
       # on it.
       serviceAccountEmail: ""
+  # The GCP projects, beyond the one the agent runs in, whose GKE clusters the
+  # hourly Cluster Agent reconcile enumerates, and what it leaves unmanaged:
+  # rendered as spec.scope on the PlatformAgent (the CRD reference on the site
+  # documents the field). The agent's service account needs the read roles in
+  # each project named; the Terraform composition binds them from the same
+  # value it passes here, and a chart installed on its own needs them granted
+  # by hand.
+  #
+  # A map renders the block as it is, empty lists included: an empty scope is a
+  # present block with empty lists, which the reconcile reads as the
+  # declaration that drops projects (their Cluster Agent profiles retire over
+  # its next two clean runs), so the composition always passes a map and a
+  # project leaves the scope by being removed from projects. null, the default,
+  # is not an empty scope: it is the chart being told nothing, renders no block,
+  # and leaves a scope the CR already carries alone, because Helm sends only
+  # the difference between its rendered manifests. The block is never dropped
+  # for being empty; null is not how a scope is cleared, emptying projects is.
+  # Once a release has rendered the block the value is the declaration: the
+  # installer refuses the next full upgrade over a spec.scope edited by hand
+  # until install.env records it or the CR is put back, and a retag, or a
+  # hand-driven composition apply whose rendered scope is unchanged, leaves the
+  # edit in place.
+  #
+  #   scope:
+  #     projects: [payments-prod, payments-staging]
+  #     exclude:
+  #       projects: ["*-sandbox"]     # project IDs or shell-style globs
+  #       clusters:                   # one cluster, by the full triple
+  #         - projectId: payments-staging
+  #           location: us-central1
+  #           clusterName: scratch-cluster
+  scope: null
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /

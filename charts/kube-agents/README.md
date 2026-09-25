@@ -553,6 +553,19 @@ before any GKE call. The
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
+### Projects in scope
+
+`platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
+beyond the one the agent runs in, whose GKE clusters get a Cluster Agent, and the projects and
+clusters it leaves unmanaged (the
+[CRD reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/operator/platformagent-crd.md#specscope)
+documents the field). An empty scope is a present block with empty lists, and the chart renders it whenever it is given one, `{}` included, because the reconcile reads an emptied `projects` list as the declaration that drops projects. `null`, the chart's default, is not an empty scope: it is the chart being told nothing, and the composition never tells it nothing. The block is never dropped for being empty; `null` is not how a scope is cleared, emptying `projects` is. A `null` leaves a scope the CR already carries alone,
+because Helm patches a custom resource from the difference between its rendered manifests. The
+`terraform/examples/full-install` composition always passes a map, so on that path a project
+leaves the scope by being removed from `projects` and applied. Once a release has rendered the block the value is the declaration: the installer refuses the next full upgrade over a `spec.scope` edited by hand until `install.env` records it or the CR is put back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because Helm sends only the difference between its rendered manifests.
+The agent's service account needs the read roles in each project named; the composition binds
+them from the same value, and a chart installed on its own needs them granted by hand.
+
 ### ServiceAccount ownership
 
 Exactly one owner creates the agent's KSA, depending on

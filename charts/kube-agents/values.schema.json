@@ -671,6 +671,49 @@
             }
           }
         },
+        "scope": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "projects": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exclude": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "projects": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "clusters": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["projectId", "location", "clusterName"],
+                    "properties": {
+                      "projectId": {
+                        "type": "string"
+                      },
+                      "location": {
+                        "type": "string"
+                      },
+                      "clusterName": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
         "credentials": {
           "type": "object",
           "additionalProperties": false,

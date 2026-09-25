@@ -58,10 +58,11 @@ type PlatformAgentSpec struct {
 type ScopeSpec struct {
 	// Projects lists GCP project IDs whose GKE clusters get Cluster Agent
 	// profiles, in addition to the management project. The agent's service
-	// account needs the read roles in each, granted by hand until the install's
-	// Terraform gains a scope input; a project it cannot list is reported with
-	// the reason (denied, api-disabled, unreachable) and its existing profiles
-	// are kept.
+	// account needs the read roles in each: the install's Terraform binds them
+	// from the same scope input that renders this block, and a CR edited by
+	// hand needs the same grants made by hand; a project it cannot list is
+	// reported with the reason (denied, api-disabled, unreachable) and its
+	// existing profiles are kept.
 	// +kubebuilder:validation:MaxItems=100
 	// +kubebuilder:validation:items:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]$`
 	// +listType=set
