@@ -1,6 +1,6 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
-> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Steps 1 and 2's IAM bindings and installer paths, step 1's chart rendering of `spec.scope` and `platform_mcp_server.py` change, and steps 3 to 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
+> **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 to 3's IAM bindings and installer paths (for step 3, the plan-time resolution of the two selectors), step 1's chart rendering of `spec.scope` and `platform_mcp_server.py` change, and steps 4 and 5, do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
 > architecture documents define it as one agent per project. This document proposes replacing that
 > single project with a declared scope, and gives the order the change has to land in. Each section
 > says what is true on `main` now and what the design changes.
@@ -574,7 +574,15 @@ into a second project the tester controls.
    selectors at runtime so the snapshot names the project and its `denied` outcome rather than
    omitting it: each such project's `via` names its source (`sharedVpcHosts/<host>` or
    `metricsScopes/<scope>`), the projects fill the set after explicit projects and before containers (§3), a failed lookup freezes the selector's members and the prune exactly as a failed container lookup does (§4, §7), and the two read verbs join the broker allowlist the way §4 adds `asset`. Moved ahead of the consumers and the documents on 2026-09-21 because the first
-   enterprise request named both.
+   enterprise request named both. The runtime half shipped with three rulings. The Monitoring
+   API names monitored projects by project number, so the reconcile names each with
+   `projects describe` and reports one it cannot name by number as `denied`, or under the ID an
+   earlier snapshot recorded for that number (the row keeps the number). A project that is not a Shared
+   VPC host resolves to no members rather than to a failed lookup, because a host whose service
+   projects were all detached is exactly that, and a failure would hold the prune for the whole
+   install over one misdeclared host. The selectors' projects read `over-cap` one by one past
+   the cap, like explicit projects, and there is no index-lag hold behind either lookup, since
+   neither has an index: a project detached or unlinked retires under §7's ordinary rule.
 4. **Downstream consumers.** The rows §8 marks 2: the drift detector's cross-project join,
    audit-log sinks per project or an aggregated sink, and the fleet-audit SOPs and cost skills
    iterating the snapshot.

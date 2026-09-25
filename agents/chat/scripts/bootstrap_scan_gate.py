@@ -246,9 +246,10 @@ def _scope_has_other_projects(data_dir: Path) -> bool:
 
 
 def _scope_gap_paragraph(data_dir: Path) -> str:
-    """The sweep's note on projects and containers the reconcile could not resolve.
+    """The sweep's note on projects, containers and selectors the reconcile could not resolve.
 
-    Rendered when a declared folder or organisation could not be resolved, or when the
+    Rendered when a declared folder, organisation, Shared VPC host or Metrics Scope could not
+    be resolved (each has a row in the snapshot's `containers` array), or when the
     snapshot names more than one project (or any container) and one project was not listed. An install with
     no scope renders the prompt it rendered before scopes existed, whatever its one
     project's outcome: that prompt already tells the worker what to do when the project
@@ -267,7 +268,7 @@ def _scope_gap_paragraph(data_dir: Path) -> str:
         container_note += (
             "The last reconcile could not resolve "
             + ", ".join(f"`{cid}` ({outcome}, {count} project(s) carried)" for cid, outcome, count in failed)
-            + ", so every project beneath it is unlisted and the container is what to name. "
+            + ", so every project it reaches is unlisted and the container or selector is what to name. "
         )
     if over_cap:
         container_note += (
