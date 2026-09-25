@@ -994,9 +994,10 @@ main() {
 
     full)
       print_step "4. Executing Full Atomic Upgrade (Terraform + Helm)"
-      # First in this arm, so a refusal leaves the cluster's schema and
-      # release as they were (the credentials fetch and the Secret backfills
-      # above have run): the apply renders spec.scope from install.env over
+      # First in this arm, so a refusal applies nothing and leaves the served
+      # schema as it was (the credentials fetch, the Secret backfills and a
+      # pending release's rollback above have run): the apply renders
+      # spec.scope from install.env over
       # the live CR, and a scope the CR carries that neither the release
       # record nor the keys account for is refused here rather than replaced.
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1

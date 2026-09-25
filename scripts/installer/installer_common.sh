@@ -971,9 +971,10 @@ print(max(served) if served else "")
       served_json="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null || echo '{}')"
     fi
   fi
-  rm -f "$err_file"
   # Normalises L, R and K to sorted lists and rules. Values arrive as argv and
-  # on stdin, never interpolated into the program text.
+  # on stdin, never interpolated into the program text. stderr goes to the
+  # file, not into the verdict: an interpreter that warns at startup and exits
+  # 0 would otherwise put its warning where the first line is read.
   if ! verdict="$(trap - ERR; printf '%s\n\x1e\n%s\n\x1e\n%s\n' "$cr_json" "$record_json" "$served_json" | python3 -c '
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
@@ -1038,10 +1039,13 @@ print(items[0]["metadata"]["name"])
 print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>&1)"; then
-    _scope_check_failed "$mode" "the live and recorded scope could not be compared: ${verdict}"
-    return $?
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+    _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
+    local rc=$?
+    rm -f "$err_file"
+    return $rc
   fi
+  rm -f "$err_file"
   first_line="${verdict%%$'\n'*}"
   local containers lines cr_name
   lines="${verdict#*$'\n'}"

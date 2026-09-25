@@ -10,6 +10,7 @@ import datetime
 import json
 import pathlib
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -2305,7 +2306,8 @@ class PreApplyScopeCheckTest(unittest.TestCase):
     "warn", where a plan applies nothing.
     """
 
-    def _run(self, cr, record, keys=None, mode="", context_present=True, served=None, latest_failed=True):
+    def _run(self, cr, record, keys=None, mode="", context_present=True, served=None, latest_failed=True,
+             python_noise=False):
         """cr / record: a JSON string the stub prints, or one of the failure
         spellings: 'notype', 'norelease', 'err'. served: the values of the
         previous revision; with latest_failed the history reads deployed then
@@ -2345,7 +2347,16 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 f"  *\"history\"*) printf '%s\\n' '{history}'; exit 0 ;;\n"
                 "esac\nexit 1\n"
             )
-            for stub in ("kubectl", "helm"):
+            if python_noise:
+                # An interpreter that writes to stderr and exits 0: PYTHONWARNINGS,
+                # -X dev, a half-installed prefix. The verdict must not read it.
+                real = shutil.which("python3")
+                (bin_dir / "python3").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'echo "warning: stderr noise from the interpreter" >&2\n'
+                    f'exec "{real}" "$@"\n'
+                )
+            for stub in ("kubectl", "helm") + (("python3",) if python_noise else ()):
                 path = bin_dir / stub
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
@@ -2484,6 +2495,18 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         proc = self._run(_LIVE_SCOPE_CR, "norelease", mode="warn", context_present=False)
         self._assert_rc(proc, 0)
         self.assertIn("WARN: The scope check did not run: the kubeconfig has no context", proc.stdout)
+
+    def test_interpreter_noise_on_stderr_does_not_become_a_refusal(self):
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, record, python_noise=True)
+        self._assert_rc(proc, 0)
+        self.assertNotIn("declares a scope", proc.stdout)
+        # And a genuine failure still carries the interpreter's message.
+        two = '{"items":[{"metadata":{"name":"a"},"spec":{"scope":{"projects":["p2-project"]}}},{"metadata":{"name":"b"},"spec":{}}]}'
+        proc = self._run(two, "norelease", python_noise=True)
+        self._assert_rc(proc, 1)
+        self.assertIn("more than one PlatformAgent is served", proc.stdout)
 
     def test_a_read_that_cannot_decide_fails_closed_unless_warning(self):
         for label, cr, record in (
