@@ -2592,11 +2592,12 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_timeout_handles_process_group_exit_race(self):
         # The group can be gone by the time the deadline fires -- the command
-        # exited between the timeout and the kill -- and a kill that fails must
-        # not turn a timeout into an exception. The fallback kills the child
-        # itself, which is what ends the sleep here.
+        # exits between the timeout and the kill -- and a kill that finds
+        # nothing must not turn a timeout into an exception. The sleep here
+        # outlives the deadline by a fifth of a second and ends on its own;
+        # every signal to its group is made to answer as though it had already.
         with mock.patch("credential_proxy.os.killpg", side_effect=ProcessLookupError):
-            result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])
+            result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "1.2"])
         self.assertTrue(result.timed_out)
         self.assertEqual(124, result.exit_code)
 
@@ -2660,6 +2661,25 @@ class CommandExecutorTest(unittest.TestCase):
 
         self.assertEqual(0, result.exit_code)
         self.assertEqual(payload, result.stdout)
+
+    def test_stdin_is_fed_after_the_outputs_close(self):
+        # A child that closes stdout and stderr first and then reads its input
+        # is still owed the input: the read loop has to keep going for stdin
+        # alone, or the child blocks on a half-written pipe until the deadline.
+        # `wc` reads all of stdin and reports the count into a file, since its
+        # stdout is gone.
+        count_file = Path(self.temp_dir.name) / "count"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=2),
+            body=f'exec >&- 2>&-; wc -c > "{count_file}"',
+        )
+        payload = "y" * (1 << 20)
+
+        result = executor.execute(["kubectl", "get", "pods"], stdin=payload)
+
+        self.assertFalse(result.timed_out)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(str(len(payload)), count_file.read_text().strip())
 
     def test_a_timed_out_command_still_returns_what_it_wrote(self):
         executor = self.fake_kubectl(

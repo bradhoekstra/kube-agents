@@ -3289,8 +3289,7 @@ def _kill_process_group(process: subprocess.Popen) -> None:
     SIGTERM would otherwise outlive the kill, holding the pipes and running on
     outside the slot it was counted under. Signalling the group after the
     child was reaped is safe: Linux keeps a pid allocated while it is a live
-    group's id, an empty group answers ESRCH, which is swallowed, and the
-    fallback to the child itself is a no-op once it has been reaped. The grace
+    group's id, and an empty group answers ESRCH, which is swallowed. The grace
     is the group's, not the child's -- the loop waits for the group to empty,
     so a helper cleaning up after its parent exited gets the same two seconds.
     """
@@ -3299,10 +3298,9 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         try:
             os.killpg(process.pid, signum)
         except OSError:
-            try:
-                process.send_signal(signum)
-            except OSError:
-                pass
+            # ESRCH: nothing left to signal. The child is in that group, so
+            # there is no per-process fallback that could reach anything.
+            pass
 
     def group_is_empty() -> bool:
         try:
@@ -3375,7 +3373,12 @@ def _capture_output(
         if not watch_caller and caller is not None:
             with contextlib.suppress(KeyError, ValueError):
                 selector.unregister(caller)
-        while any(not stream.closed for stream in outputs):
+        # Until every pipe is done, stdin included: a child that closes its
+        # outputs and goes on reading its input still has to be fed, or it
+        # blocks on a pipe nobody writes to until the deadline kills it.
+        while any(not stream.closed for stream in outputs) or (
+            process.stdin is not None and not process.stdin.closed
+        ):
             remaining = None if until is None else until - time.monotonic()
             if remaining is not None and remaining <= 0:
                 return True, False
