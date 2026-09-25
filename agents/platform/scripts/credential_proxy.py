@@ -741,11 +741,13 @@ class AuthenticationError(Exception):
 
 
 class CommandSlotUnavailable(RuntimeError):
-    """Every command slot stayed busy for COMMAND_SLOT_WAIT_SECONDS.
+    """A request waited COMMAND_SLOT_WAIT_SECONDS without reaching a free slot.
 
-    Answered 503 rather than run anyway: a command past the cap is the one that
+    Slots go in arrival order, so this is the request that has waited longest,
+    whether the slots never freed or freed only for the requests ahead of it.
+    Answered 503 rather than run anyway: a request past the cap is the one that
     would take the container over its memory limit, and an OOM kill fails every
-    command in flight for every caller, not just this one.
+    request in flight for every caller, not just this one.
     """
 
 
@@ -4842,7 +4844,7 @@ class CommandExecutor:
             # Appended after the bound, so a stream already at the cap does
             # not push the one line that explains the exit code off the end.
             stderr_text += (
-                f"\n[credential-proxy] kubectl command timed out after {effective_timeout}s "
+                f"\n[credential-proxy] kubectl command timed out after {effective_timeout:.0f}s "
                 f"({target_str})\n"
             )
 
@@ -6094,17 +6096,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # CommandExecutor.request_slot for why the response is inside it;
             # the body is inside it for the same reason, from the other end.
             with self._request_slot():
-                # Read under a deadline: the slot is held from here on, and a
-                # caller that stalls mid-send would otherwise keep it with
-                # nothing running in it. A stalled peer is not a hang-up --
-                # its socket reports no POLLHUP -- so the watch that ends an
-                # abandoned wait does not cover this. (A handler the route
-                # tests build by hand has no connection; see _request_slot.)
-                connection = getattr(self, "connection", None)
-                if connection is not None:
-                    connection.settimeout(REQUEST_READ_TIMEOUT_SECONDS)
+                # Read under one deadline for the whole body: the slot is held
+                # from here on, and a caller that stalls or trickles mid-send
+                # would otherwise keep it with nothing running in it. A stalled
+                # peer is not a hang-up -- its socket reports no POLLHUP -- so
+                # the watch that ends an abandoned wait does not cover this.
+                # (A handler the route tests build by hand has no connection;
+                # see _request_slot.)
                 try:
-                    payload = self._read_json_body(max_bytes=body_limit)
+                    if getattr(self, "connection", None) is None:
+                        payload = self._read_json_body(max_bytes=body_limit)
+                    else:
+                        payload = self._read_json_body_within(
+                            body_limit, REQUEST_READ_TIMEOUT_SECONDS
+                        )
                 except (json.JSONDecodeError, TypeError, ValueError) as exc:
                     self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
                     return
@@ -6196,6 +6201,37 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         ):
             raise ValueError("request exceeds configured size limit")
         payload = json.loads(self.rfile.read(content_length))
+        if not isinstance(payload, dict):
+            raise ValueError("request body must be an object")
+        return payload
+
+    def _read_json_body_within(self, max_bytes: int, seconds: float) -> dict[str, Any]:
+        """`_read_json_body` for a body read while a slot is held.
+
+        The whole body has `seconds` to arrive, not each piece of it. A socket
+        timeout bounds one `recv`, so a body that trickles a byte at a time
+        inside that window would never time out; here one deadline is fixed
+        up front and the timeout re-armed with what is left of it before every
+        read, and `read1` takes at most one `recv` per call, so no single call
+        can outlast the deadline either. Raises `TimeoutError` when it passes.
+        """
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0 or content_length > max_bytes:
+            raise ValueError("request exceeds configured size limit")
+        deadline = time.monotonic() + seconds
+        chunks: list[bytes] = []
+        remaining = content_length
+        while remaining:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("the request body did not arrive in time")
+            self.connection.settimeout(left)
+            chunk = self.rfile.read1(min(remaining, OUTPUT_READ_CHUNK_BYTES))
+            if not chunk:
+                raise ConnectionError("the connection closed before the request body was complete")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = json.loads(b"".join(chunks))
         if not isinstance(payload, dict):
             raise ValueError("request body must be an object")
         return payload

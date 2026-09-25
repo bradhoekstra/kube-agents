@@ -2231,6 +2231,49 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
         self.assert_slot_released(executor)
 
+    def test_a_body_that_trickles_in_is_given_up_on_at_the_deadline(self):
+        # A socket timeout bounds one recv, so a byte every so often would
+        # keep a full stall from ever showing; the whole body has to arrive
+        # within one deadline, however it is paced.
+        executor = CredentialProxyHandler.executor
+        stop = threading.Event()
+        self.addCleanup(stop.set)
+
+        def trickle(sock):
+            # A byte well inside the per-recv window, for as long as the test
+            # runs; the deadline, not the gaps, has to end the read.
+            while not stop.is_set():
+                try:
+                    sock.sendall(b" ")
+                except OSError:
+                    return
+                stop.wait(0.3)
+
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"probe": lambda payload: {"ok": True}},
+            ),
+            mock.patch.object(credential_proxy, "REQUEST_READ_TIMEOUT_SECONDS", 1),
+            self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs,
+        ):
+            sock = self.raw_request("/v1/vcs/probe", b"{", content_length=1000)
+            threading.Thread(target=trickle, args=(sock,), daemon=True).start()
+            started = time.monotonic()
+            deadline = time.monotonic() + 10
+            while not any("request body not received" in line for line in logs.output):
+                if time.monotonic() > deadline:
+                    self.fail("the trickling body was never given up on")
+                time.sleep(0.1)
+            elapsed = time.monotonic() - started
+        stop.set()
+
+        # Given up on at about the deadline, not after the whole body's worth of gaps.
+        self.assertLess(elapsed, 4)
+        self.assert_slot_released(executor)
+
     def test_a_caller_that_hangs_up_while_queued_is_logged_by_the_route(self):
         # The executor-level test proves the refusal; this one proves the exec
         # route turns it into its log line and starts nothing. Over a Unix
@@ -3300,17 +3343,23 @@ class CommandExecutorTest(unittest.TestCase):
         # own duration does not include the wait, since `_execute` starts its
         # clock after admission.
         executor = self.executor(max_concurrent_commands=1)
-        self.hold_a_slot(executor, seconds=0.5)
+        self.hold_a_slot(executor, seconds=2)
 
+        queued_at = time.monotonic()
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_LOG_MS", 100):
             with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
                 with executor.request_slot():
+                    waited_ms = (time.monotonic() - queued_at) * 1000
                     result = executor.execute_internal(["/bin/echo", "after the wait"])
 
         self.assertTrue(
             any("request waited" in line and "for a slot" in line for line in logs.output)
         )
-        self.assertLess(result.duration_ms, 400)
+        # Measured against the wait rather than a fixed bound: a loaded runner
+        # can take half a second to fork an echo, but never the two seconds the
+        # command would report if its clock had started in the queue.
+        self.assertGreater(waited_ms, 1000)
+        self.assertLess(result.duration_ms, waited_ms / 2)
 
     def test_an_emptied_group_gets_no_sigkill(self):
         # Once the group is seen empty its id is free for reuse, so the second
