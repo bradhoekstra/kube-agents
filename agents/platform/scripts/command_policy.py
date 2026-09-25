@@ -312,17 +312,15 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # Metrics Scope read: how the Cluster Agent reconcile resolves a
         # spec.scope.metricsScopes entry to the projects that scope monitors, one
         # call per scope (docs/designs/multi-project-scope.md §10 step 3). The
-        # verb exists only on the beta and alpha tracks -- GA gcloud rejects
-        # `monitoring metrics-scopes` outright (568.0.0 and 586.0.0; the
-        # credential-proxy image installs an unpinned google-cloud-cli, so a GA
-        # promotion is a later entry here, not a change to this one). The track
-        # word is matched as typed: _gcloud_words_and_flag keeps `beta` as the
-        # first word and _gcloud_is_read_only compares the prefix exactly, and
-        # only the --help escape looks past it through _gcloud_surface. So this
-        # entry admits the beta spelling the reconcile uses and neither the GA
-        # nor the alpha one. A pure read; `beta monitoring metrics-scopes
-        # create` and `delete`, which link and unlink a monitored project, stay
-        # refused, and the tests hold that door.
+        # verb exists only on the beta and alpha tracks (GA gcloud rejects
+        # `monitoring metrics-scopes` outright as of 586.0.0, the version the
+        # credential-proxy image ships), so it is spelled with the track word
+        # like the `beta compute advice` entries above, and for the same reason:
+        # the allowlist matches the words as typed, so this admits the beta
+        # spelling the reconcile uses and neither the GA nor the alpha one. A
+        # pure read; `beta monitoring metrics-scopes create` and `delete`, which
+        # link and unlink a monitored project, stay refused, and the tests hold
+        # that door.
         ("beta", "monitoring", "metrics-scopes", "describe"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
