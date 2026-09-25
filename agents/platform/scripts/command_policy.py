@@ -313,8 +313,10 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         # spec.scope.metricsScopes entry to the projects that scope monitors, one
         # call per scope (docs/designs/multi-project-scope.md §10 step 3). The
         # verb exists only on the beta and alpha tracks (GA gcloud rejects
-        # `monitoring metrics-scopes` outright as of 586.0.0, the version the
-        # credential-proxy image ships), so it is spelled with the track word
+        # `monitoring metrics-scopes` outright as of 586.0.0, which the image's
+        # unpinned google-cloud-cli resolved to when this was written; a GA
+        # promotion is a later entry here, not a change to this one, because
+        # the reconcile spells the call with `beta`), so it is spelled with the track word
         # like the `beta compute advice` entries above, and for the same reason:
         # the allowlist matches the words as typed, so this admits the beta
         # spelling the reconcile uses and neither the GA nor the alpha one. A

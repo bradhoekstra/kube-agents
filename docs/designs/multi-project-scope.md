@@ -586,7 +586,10 @@ into a second project the tester controls.
    projects were all detached is exactly that, and a failure would hold the prune for the whole
    install over one misdeclared host. The selectors' projects read `over-cap` one by one past
    the cap, like explicit projects, and there is no index-lag hold behind either lookup, since
-   neither has an index: a project detached or unlinked retires under §7's ordinary rule.
+   neither has an index: a project detached or unlinked retires under §7's ordinary rule. And a
+   fourth, from review: a monitored project whose naming call failed but that a Shared VPC host, an
+   explicit entry or the management project names by ID is listed on that route, its own listing
+   decides its outcome, and the row carries every `via` and the number.
 4. **Downstream consumers.** The rows §8 marks 2: the drift detector's cross-project join,
    audit-log sinks per project or an aggregated sink, and the fleet-audit SOPs and cost skills
    iterating the snapshot.

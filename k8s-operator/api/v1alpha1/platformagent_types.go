@@ -117,9 +117,11 @@ type ScopeSpec struct {
 	// Nothing is inherited through a Metrics Scope, so the agent's service account
 	// needs the read roles in each resolved project, granted by hand until the
 	// install's Terraform resolves the selectors at plan time (the design's §10
-	// step 3); the lookup itself needs resourcemanager.projects.get in the scoping
-	// project, which every read role above carries (roles/monitoring.metricsScopesViewer
-	// is that permission alone), with the Monitoring API enabled there. A lookup that fails freezes the selector's
+	// step 3); the lookup itself needs to read the scope in the scoping project:
+	// roles/monitoring.metricsScopesViewer (resourcemanager.projects.get and
+	// resourcemanager.projects.list) is the narrowest role that grants it, and the
+	// read roles the scope binds carry both between them. The Monitoring API has to
+	// be enabled in the scoping project. A lookup that fails freezes the selector's
 	// previous members and holds the scope prune, and is reported in the
 	// snapshot's containers array under metricsScopes/<scope>.
 	// +kubebuilder:validation:MaxItems=100
