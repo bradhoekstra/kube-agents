@@ -321,8 +321,12 @@ including:
 - interactive TTY programs and password prompts;
 - arbitrary binary or unbounded streaming input/output;
 - file paths that refer to sandbox-only files;
-- background processes or commands that outlive the request; and
-- commands exceeding request, output, or timeout limits.
+- background processes or commands that outlive the request;
+- commands exceeding request, output, or timeout limits; and
+- more commands at once than the broker's concurrency cap admits
+  (`CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS`, 8 by default): a request waits
+  up to 60 seconds for a slot and is then refused with `503
+CREDENTIAL_PROXY_BUSY`.
 
 Standard input and full-duplex streaming require a future bounded protocol; the
 wrapper does not silently consume an inherited protocol stream.
@@ -636,8 +640,9 @@ per-invocation timeout. A shallow clone plus the ceiling would bound both and is
 the right follow-up; neither alone does.
 
 Separately, the content routes raise the request-body cap to twice the
-total-payload limit, and the listener is threaded with no connection cap, so peak
-heap is roughly concurrency times that figure. None of this is reachable from
+total-payload limit. The listener is threaded with no connection cap, but
+commands are capped at `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` in flight, so
+peak heap is roughly that cap times the figure. None of this is reachable from
 outside the Pod, but it is worth knowing before the flag is armed anywhere it
 matters.
 
@@ -740,6 +745,22 @@ Consequences:
   interactive verbs (`exec`, `attach`, `debug`, `port-forward`, `proxy`),
   `logs --follow`, anything watching with `-w`, and any command whose caller
   supplied its own `--timeout` or `--request-timeout`.
+- The broker reads a command's output as it streams and keeps at most
+  `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` of each stream (8 MiB as the operator
+  deploys it); the rest is drained and dropped, so what a command prints past
+  the cap costs the broker nothing. At most
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` commands run at once (8 by default;
+  `spec.deployment.env` tunes it). Each in-flight command is a child process
+  plus about six times the output cap of transient copies in the broker, so
+  the two caps together are what the broker container's memory limit is sized
+  against. A request that waits more than 60 seconds for a slot is answered
+  `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
+  `the credential proxy is already running 8 commands and none finished within 60s; retry shortly`.
+  A long-running command holds its slot for as long as it runs.
+- A command whose caller disconnects while it runs is ended rather than left to
+  run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two seconds later,
+  to the whole process group it started. The same two-step end applies at the
+  deadline.
 
 ### Cloud API reads
 

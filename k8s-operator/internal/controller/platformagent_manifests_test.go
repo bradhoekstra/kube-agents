@@ -1458,44 +1458,62 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The other half of the argument, which the floor above cannot make: a cap
 	// this side of the fleet's needs is still wrong if the container cannot
-	// hold it. Five live copies of a capped output exist per in-flight command
-	// -- subprocess bytes, slice, decoded str, JSON-escaped str, encoded
-	// response -- and the commands in flight are one per kanban worker plus
-	// the front-door session. Nothing bounds that concurrency inside the
-	// proxy; it is a ThreadingHTTPServer. So the burst has to fit under the
-	// memory limit alongside what the container holds at rest, or an OOMKill
-	// takes gcloud, kubectl, gh and git away from every agent the proxy serves.
+	// hold it. credential_proxy.py reads a command's output as it streams and
+	// keeps at most the cap per stream, so what the broker holds per in-flight
+	// command is about six times the cap, transiently: the two capped stream
+	// buffers, their decoded strings, and the JSON body and its encoding
+	// (measured at 24 MiB per command against a 4 MiB cap). Concurrency is
+	// bounded inside the broker by DEFAULT_MAX_CONCURRENT_COMMANDS, read here
+	// from the broker's source so the two cannot drift apart silently: the
+	// operator does not set the variable, so that spec.deployment.env can, and
+	// a Go constant would be a second copy of the default. The burst has to
+	// fit under the memory limit alongside what the container holds at rest,
+	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
+	// the proxy serves.
 	//
-	// Five workers rather than defaultKanbanMaxInProgress, because that
-	// default is overridable and resolveResources sizes the agent container
-	// for the five-way fan-out it has actually observed. The proxy is sized
-	// for the same install.
-	//
-	// And two capped streams per command, not one. `_execute` truncates stdout
-	// and stderr in two independent calls -- see the pair of `self._truncate`
-	// lines in credential_proxy.py -- so the cap is a per-stream ceiling and a
-	// single command can hold 2x it. Modelling one stream understates the
-	// burst by half, which is the direction that lets a too-large cap pass.
+	// The children -- one kubectl or gcloud per in-flight command -- are
+	// outside this arithmetic. A kubectl listing thousands of objects runs to
+	// hundreds of MiB on its own, and the rest of the limit is what holds it.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 5
-	const streamsPerCommand = 2
-	const observedFanOut = 5
-	inFlight := int64(observedFanOut + 1)
-	burst := int64(capBytes) * copiesPerCommand * streamsPerCommand * inFlight
+	const copiesPerCommand = 6
+	inFlight := brokerDefaultConcurrentCommands(t)
+	burst := int64(capBytes) * copiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
 	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
-		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands, which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit or lower the cap",
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (the broker's DEFAULT_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower the cap or the concurrency default",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
 	}
+}
+
+// brokerDefaultConcurrentCommands reads DEFAULT_MAX_CONCURRENT_COMMANDS out of
+// credential_proxy.py. The broker owns the default -- the operator deliberately
+// does not set CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS, so spec.deployment.env
+// can tune it -- and the cap test has to model the number the broker actually
+// admits rather than a copy of it that could drift.
+func brokerDefaultConcurrentCommands(t *testing.T) int64 {
+	t.Helper()
+	source, err := os.ReadFile(filepath.Join("..", "..", "..", "agents", "platform", "scripts", "credential_proxy.py"))
+	if err != nil {
+		t.Fatalf("reading the broker's source for its concurrency default: %v", err)
+	}
+	match := regexp.MustCompile(`(?m)^DEFAULT_MAX_CONCURRENT_COMMANDS = (\d+)$`).FindSubmatch(source)
+	if match == nil {
+		t.Fatal("credential_proxy.py no longer declares DEFAULT_MAX_CONCURRENT_COMMANDS as a bare integer, so the cap test cannot model the broker's concurrency")
+	}
+	value, err := strconv.ParseInt(string(match[1]), 10, 64)
+	if err != nil || value < 1 {
+		t.Fatalf("DEFAULT_MAX_CONCURRENT_COMMANDS in credential_proxy.py is %q, not a positive integer", match[1])
+	}
+	return value
 }
 
 // TestBuildPodTemplateSpecHoldsNoCredentialRuntime covers the Pod-level half of

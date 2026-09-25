@@ -253,6 +253,8 @@ kubectl logs -n kubeagents-system platform-agent-shell-0
 
 **A `401` from every proxied command** is the other half of the same path, and it is authentication rather than availability. The broker verifies an audience-bound projected token with a `TokenReview`, so a `401` means the token was absent, expired, minted for another audience, or presented by a ServiceAccount that is not in `CREDENTIAL_PROXY_ALLOWED_CALLERS`. The broker's log names the reason; the caller never gets it.
 
+**A proxied command fails with `the credential proxy is already running 8 commands and none finished within 60s; retry shortly`.** The broker runs a bounded number of commands at once (`CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS`, 8 by default), because each one is a child process the container's memory limit has to hold. A request that cannot get a slot within a minute is refused with a `503` rather than run. The broker's log shows the queueing (`command waited … for a slot`) and the refusal (`command queued too long`). Retry, or raise the cap through `spec.deployment.env` together with the container's memory limit if the install routinely runs that many commands at the same time; long-running commands such as `kubectl logs --follow` or `kubectl wait` hold a slot for as long as they run.
+
 **Diagnostics run inside the sandbox are misleading while the broker is down.** Those wrappers are the only `gcloud` and `kubectl` the sandbox has, so the commands you would normally reach for return the same connection error. Test the broker's cloud identity from a throwaway Pod using the same ServiceAccount:
 
 ```bash

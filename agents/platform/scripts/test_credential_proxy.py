@@ -2065,6 +2065,100 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         self.assertEqual(["git", "status", "--porcelain"], executed_argvs[0])
 
 
+class ExecRouteCapacityTest(unittest.TestCase):
+    """The concurrency cap and the caller watch as the agent meets them: over /v1/exec."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(
+            json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8"
+        )
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=5,
+            max_output_bytes=4096,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
+        )
+        stub_dir = Path(self.temp_dir.name) / "bin"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/bash\necho pods\n", encoding="utf-8")
+        stub.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(stub)
+        CredentialProxyHandler.max_request_bytes = 65536
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+    def post(self, payload, path="/v1/exec"):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_port}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_a_vcs_verb_at_the_cap_answers_the_same_503(self):
+        # The slot is taken in `_execute`, under every route, so each route has
+        # to map the refusal -- or a broker at its cap reads as a fault there.
+        def busy(payload):
+            raise credential_proxy.CommandSlotUnavailable("already running 8 commands")
+
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker, "route_table", return_value={"probe": busy}
+            ),
+        ):
+            status, body = self.post({}, path="/v1/vcs/probe")
+
+        self.assertEqual(503, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertIn("already running 8 commands", body["error"])
+
+    def test_a_broker_at_its_cap_answers_503_with_a_reason_the_shim_prints(self):
+        # `error` is the key the shim prints for a non-policy failure, so the
+        # agent reads why rather than a bare exit 1 -- and `code` lets a caller
+        # tell "busy, retry" from a fault.
+        with mock.patch.object(
+            CredentialProxyHandler.executor,
+            "execute",
+            side_effect=credential_proxy.CommandSlotUnavailable("already running 8 commands"),
+        ):
+            status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(503, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
+        self.assertIn("already running 8 commands", body["error"])
+
+    def test_the_exec_route_hands_its_connection_to_the_executor(self):
+        # The watch that ends an abandoned command needs the socket the request
+        # arrived on; the route is where it is known.
+        seen = []
+        original = CredentialProxyHandler.executor.execute
+
+        def recording(argv, **kwargs):
+            seen.append(kwargs.get("caller"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", recording):
+            status, body = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(200, status)
+        self.assertEqual("pods\n", body["stdout"])
+        self.assertEqual(1, len(seen))
+        self.assertIsInstance(seen[0], socket.socket)
+
+
 class CommandExecutorTest(unittest.TestCase):
     CONTEXT = "gke_demo-project_us-central1_cluster-a"
 
@@ -2085,6 +2179,7 @@ class CommandExecutorTest(unittest.TestCase):
         timeout_seconds=5,
         max_output_bytes=1024,
         kubectl_timeout_seconds=credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        max_concurrent_commands=None,
     ):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
@@ -2092,6 +2187,7 @@ class CommandExecutorTest(unittest.TestCase):
             state_dir=self.temp_dir.name,
             scoped_pool=None,
             kubectl_timeout_seconds=kubectl_timeout_seconds,
+            max_concurrent_commands=max_concurrent_commands,
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
@@ -2495,18 +2591,337 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(124, result.exit_code)
 
     def test_timeout_handles_process_group_exit_race(self):
-        process = mock.Mock(pid=123, returncode=0)
-        process.communicate.side_effect = [
-            subprocess.TimeoutExpired(["command"], 1),
-            (b"", b""),
-        ]
-        with (
-            mock.patch("credential_proxy.subprocess.Popen", return_value=process),
-            mock.patch("credential_proxy.os.killpg", side_effect=ProcessLookupError),
-        ):
-            result = self.executor(timeout_seconds=1).execute_internal(["command"])
+        # The group can be gone by the time the deadline fires -- the command
+        # exited between the timeout and the kill -- and a kill that fails must
+        # not turn a timeout into an exception. The fallback kills the child
+        # itself, which is what ends the sleep here.
+        with mock.patch("credential_proxy.os.killpg", side_effect=ProcessLookupError):
+            result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])
         self.assertTrue(result.timed_out)
         self.assertEqual(124, result.exit_code)
+
+    # ---- What a command's output costs this process --------------------------
+    #
+    # Output is read as it streams and only `max_output_bytes` of each stream is
+    # kept. Before this, `communicate()` held every byte a command printed until
+    # it exited, so the broker's memory tracked the size of what commands
+    # printed times how many ran at once -- the OOM loop in #2018.
+
+    def test_output_past_the_cap_is_dropped_as_it_streams(self):
+        # 3 MiB printed, 4 KiB kept: the command still runs to completion (a
+        # child blocked on a full pipe would time out instead) and the caller
+        # gets exactly the cap, marked truncated.
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=4096),
+            body="head -c 3145728 /dev/zero | tr '\\0' a",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertFalse(result.timed_out)
+        self.assertTrue(result.truncated)
+        self.assertEqual(4096, len(result.stdout))
+        self.assertEqual("a" * 4096, result.stdout)
+
+    def test_each_stream_is_capped_on_its_own(self):
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=4096),
+            body="printf ok; head -c 100000 /dev/zero | tr '\\0' e >&2",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertEqual("ok", result.stdout)
+        self.assertEqual("e" * 4096, result.stderr)
+        self.assertTrue(result.truncated)
+
+    def test_output_within_the_cap_is_complete_and_not_marked_truncated(self):
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=1 << 20),
+            body="head -c 200000 /dev/zero | tr '\\0' b; printf err >&2; exit 3",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertEqual(3, result.exit_code)
+        self.assertFalse(result.truncated)
+        self.assertEqual(200000, len(result.stdout))
+        self.assertEqual("err", result.stderr)
+
+    def test_a_large_stdin_is_delivered_in_full(self):
+        # Larger than a pipe buffer, so the write has to interleave with the
+        # reads: a command that echoes its input back would otherwise deadlock
+        # against a writer that waits for it to be read.
+        executor = self.fake_kubectl(self.executor(max_output_bytes=1 << 24), body="cat")
+        payload = "x" * (1 << 20)
+
+        result = executor.execute(["kubectl", "get", "pods"], stdin=payload)
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual(payload, result.stdout)
+
+    def test_a_timed_out_command_still_returns_what_it_wrote(self):
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="printf partial; sleep 10",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.exit_code)
+        self.assertEqual("partial", result.stdout)
+        self.assertIn("kubectl command timed out after 1s", result.stderr)
+
+    def test_output_past_the_cap_never_lands_in_this_process(self):
+        # The claim the streaming read exists for, checked against the process
+        # rather than against the result: 16 MiB printed against a 64 KiB cap
+        # must not cost 16 MiB here. Reading the whole output first and
+        # truncating afterwards passes every other test in this group and
+        # fails this one.
+        import tracemalloc
+
+        printed = 16 << 20
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=64 << 10),
+            body=f"head -c {printed} /dev/zero | tr '\\0' a",
+        )
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            result = executor.execute(["kubectl", "get", "pods"])
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        self.assertTrue(result.truncated)
+        self.assertLess(
+            peak, printed // 4, f"{peak} bytes peaked in this process for {printed} printed"
+        )
+
+    def test_an_ended_command_gets_sigterm_before_sigkill(self):
+        # git removes its lock files on SIGTERM and cannot on SIGKILL, so the
+        # end a command gets -- at its deadline or when its caller leaves -- is
+        # TERM, a grace period, then KILL. The stub proves the order by writing
+        # a marker from its TERM handler.
+        marker = Path(self.temp_dir.name) / "terminated"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body=f"trap 'touch \"{marker}\"; exit 143' TERM; sleep 10 & wait $!",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertTrue(
+            marker.exists(), "the command was not given SIGTERM before it was killed"
+        )
+
+    def test_a_command_that_ignores_sigterm_is_killed_after_the_grace(self):
+        # `trap '' TERM` is inherited by the sleep, so nothing in the group
+        # exits on the first signal; the second one is what ends it, after the
+        # grace and well before the sleep would have.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="trap '' TERM; sleep 10 & wait $!",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        grace_ms = credential_proxy.KILL_GRACE_SECONDS * 1000
+        self.assertGreaterEqual(result.duration_ms, 1000 + grace_ms - 100)
+        self.assertLess(result.duration_ms, 9000)
+
+    # ---- The caller's connection ---------------------------------------------
+
+    @staticmethod
+    def process_is_live(pid):
+        """Is `pid` still running? A zombie or a missing entry both mean no."""
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("State:"):
+                        return line.split()[1] not in {"Z", "X"}
+        except OSError:
+            return False
+        return False
+
+    def test_an_abandoned_caller_ends_the_command_and_everything_it_started(self):
+        # A triage session torn down mid-command used to leave its kubectl
+        # running to the deadline, holding a slot and buffering output for
+        # nobody. `wait` is a long-running verb, so the deadline here is the
+        # broker-wide 30s; the result has to come back well before that.
+        pid_file = Path(self.temp_dir.name) / "sleeper.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30),
+            body=f'sleep 30 & echo $! > "{pid_file}"; wait',
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.5)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        result = executor.execute(
+            ["kubectl", "wait", "--for=condition=Ready", "pod/api"], caller=ours
+        )
+
+        self.assertTrue(result.abandoned)
+        self.assertFalse(result.timed_out)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "the sleep the command started outlived the command",
+        )
+
+    def test_a_caller_that_stays_connected_does_not_end_the_command(self):
+        executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("done\n", result.stdout)
+
+    def test_unexpected_bytes_from_the_caller_are_not_taken_for_a_hang_up(self):
+        # After the request body nothing more is expected, but a peer that
+        # sends something is still there: the command runs on, unwatched.
+        executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        theirs.sendall(b"not part of this protocol")
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertEqual("done\n", result.stdout)
+
+    def test_the_deadline_still_applies_while_a_caller_is_watched(self):
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1), body="sleep 10"
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(result.abandoned)
+        self.assertEqual(124, result.exit_code)
+
+    def test_a_closed_caller_socket_runs_the_command_unwatched(self):
+        # Registering a dead descriptor must not fail the command; internal
+        # callers pass nothing and this is the same path.
+        executor = self.fake_kubectl(self.executor(), body="echo done")
+        ours, theirs = socket.socketpair()
+        theirs.close()
+        ours.close()
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("done\n", result.stdout)
+
+    # ---- How many commands run at once ---------------------------------------
+
+    def test_the_concurrency_cap_is_read_from_the_environment(self):
+        with mock.patch.dict(
+            os.environ, {credential_proxy.ENV_MAX_CONCURRENT_COMMANDS: "3"}
+        ):
+            self.assertEqual(3, self.executor().max_concurrent_commands)
+        with mock.patch.dict(
+            os.environ, {credential_proxy.ENV_MAX_CONCURRENT_COMMANDS: "0"}
+        ):
+            with self.assertRaises(ValueError):
+                self.executor()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(credential_proxy.ENV_MAX_CONCURRENT_COMMANDS, None)
+            self.assertEqual(
+                credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
+                self.executor().max_concurrent_commands,
+            )
+
+    def hold_a_slot(self, executor, seconds):
+        """Run a command that holds a slot for `seconds`; return once it holds it.
+
+        The command touches a marker as its first act, and the slot is taken
+        before the command starts, so the marker's existence is the proof --
+        rather than a sleep that a loaded runner can outrun.
+        """
+        marker = Path(self.temp_dir.name) / f"holder-{time.monotonic_ns()}"
+        thread = threading.Thread(
+            target=executor.execute_internal,
+            args=(["/bin/sh", "-c", f'touch "{marker}"; sleep {seconds}'],),
+        )
+        thread.start()
+        self.addCleanup(thread.join)
+        deadline = time.monotonic() + 5
+        while not marker.exists():
+            if time.monotonic() > deadline:
+                self.fail("the slot-holding command never started")
+            time.sleep(0.02)
+        return thread
+
+    def test_a_command_past_the_cap_waits_for_a_slot(self):
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=1)
+
+        started = time.monotonic()
+        result = executor.execute_internal(["/bin/echo", "second"])
+
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("second\n", result.stdout)
+        # It ran after the first finished, not beside it.
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+
+    def test_a_command_that_waits_too_long_for_a_slot_is_refused(self):
+        executor = self.executor(max_concurrent_commands=1)
+        holder = self.hold_a_slot(executor, seconds=2)
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                executor.execute_internal(["/bin/echo", "second"])
+
+        self.assertIn("already running 1 commands", str(raised.exception))
+        # The refusal released nothing it did not hold: the slot is still the
+        # first command's, and comes back when it ends.
+        holder.join()
+        self.assertEqual(0, executor.execute_internal(["/bin/echo", "after"]).exit_code)
+
+    def test_the_duration_reported_is_the_command_s_not_the_wait_for_a_slot(self):
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=1)
+
+        result = executor.execute_internal(["/bin/echo", "second"])
+
+        # It waited about a second for the slot; the command itself was instant.
+        self.assertLess(result.duration_ms, 500)
+
+    def test_the_kubeconfig_cache_fill_does_not_need_a_slot(self):
+        # `_ensure_managed_kubeconfig` runs gcloud while holding
+        # `_kubeconfig_lock`. Queueing for a slot there would hold the lock --
+        # and every context-carrying kubectl behind it -- for the whole wait,
+        # and the lock already serialises those calls, so they skip the count.
+        executor = self.fake_gcloud(self.executor(max_concurrent_commands=1))
+        self.hold_a_slot(executor, seconds=2)
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            started = time.monotonic()
+            managed = executor._ensure_managed_kubeconfig(target)
+
+        self.assertTrue(managed.is_file())
+        self.assertLess(time.monotonic() - started, 1.0)
 
     # ---- Bounding a kubectl that cannot reach its control plane -------------
 
@@ -4001,7 +4416,13 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
                 return None
 
             def execute(
-                self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+                self,
+                argv,
+                stdin=None,
+                cwd=None,
+                kubeconfig_context=None,
+                wants_kubeconfig=False,
+                caller=None,
             ):
                 owner.executed.append(argv)
                 return credential_proxy.ExecutionResult(
@@ -5184,7 +5605,13 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
             return "no lease" if argv and argv[0] == "git" else None
 
         def execute(
-            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            self,
+            argv,
+            stdin=None,
+            cwd=None,
+            kubeconfig_context=None,
+            wants_kubeconfig=False,
+            caller=None,
         ):
             return credential_proxy.ExecutionResult(
                 exit_code=0, stdout="", stderr="",
@@ -5303,7 +5730,13 @@ class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
             return None
 
         def execute(
-            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            self,
+            argv,
+            stdin=None,
+            cwd=None,
+            kubeconfig_context=None,
+            wants_kubeconfig=False,
+            caller=None,
         ):
             self.executed.append(argv)
             return credential_proxy.ExecutionResult(
@@ -6197,7 +6630,13 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             return None
 
         def execute(
-            self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False
+            self,
+            argv,
+            stdin=None,
+            cwd=None,
+            kubeconfig_context=None,
+            wants_kubeconfig=False,
+            caller=None,
         ):
             self.executed.append(argv)
             return credential_proxy.ExecutionResult(

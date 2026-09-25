@@ -15,9 +15,12 @@ import logging
 import os
 import queue
 import re
+import select
+import selectors
 import shlex
 import signal
 import shutil
+import socket
 import socketserver
 import ssl
 import subprocess
@@ -93,6 +96,52 @@ KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
 # A caller who named their own bound has already answered the question; honour
 # it rather than overriding it with a shorter one.
 KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
+
+# Bounds on what a command's output costs this process while the command runs.
+# Output is read as it streams and only the first `--max-output-bytes` of each
+# stream is kept; the rest is drained and discarded, because the caller was
+# never going to receive it. `Popen.communicate()` would buffer all of it first
+# and truncate afterwards, so one `kubectl get pods -A -o yaml` on a large
+# cluster cost tens of MiB in this process per in-flight command, and a burst
+# of concurrent triage sessions took the broker past its memory limit.
+OUTPUT_READ_CHUNK_BYTES = 64 * 1024
+# The stdin pipe is written in pieces this size, interleaved with the reads, so
+# a request body larger than the pipe buffer cannot deadlock against a child
+# that is already writing. PIPE_BUF because a write no larger than it does not
+# block once `select` has reported the pipe writable; a bigger write to a
+# blocking pipe can, with this process then unable to read the child's output
+# while the child waits for its input to be read -- the same reason
+# `Popen.communicate()` uses this size.
+STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
+# After a command is killed, how long its pipes are given to close before what
+# it had already written is given up on.
+KILLED_COMMAND_DRAIN_SECONDS = 5
+# How many commands may run at once. Each in-flight command is one child
+# process -- a kubectl listing a large cluster runs to hundreds of MiB on its
+# own -- plus, in this process, about six times `--max-output-bytes` at peak:
+# the two capped stream buffers, their decoded strings, and the JSON body and
+# its encoding (measured at 24 MiB per command against a 4 MiB cap). The
+# operator's cap test sizes the container's memory limit against this default
+# and its output cap, so raising either means re-checking the other. A
+# long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
+# long as it runs. Read from the environment so an operator can tune it through
+# spec.deployment.env. The gcloud calls made while `_kubeconfig_lock` is held
+# are the one exception to the count; `_execute` says why.
+DEFAULT_MAX_CONCURRENT_COMMANDS = 8
+ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# How long a request waits for a slot before it is refused with 503. Long
+# enough to ride out a burst of one-shot reads, short enough that a queue held
+# up by long-running commands answers its callers rather than parking them.
+COMMAND_SLOT_WAIT_SECONDS = 60
+# A wait for a slot this long is worth a log line: it says the broker is
+# queueing, which is what an operator sizing the cap needs to see.
+COMMAND_SLOT_WAIT_LOG_MS = 1000
+# A command that has to be ended -- its deadline passed, or its caller went
+# away -- gets SIGTERM and this long to exit before SIGKILL. git removes its
+# lock files on SIGTERM and cannot on SIGKILL, and a lock left behind in a
+# leased workspace fails every later git there until the pod restarts.
+KILL_GRACE_SECONDS = 2
+KILL_POLL_SECONDS = 0.05
 
 # Bounds on the pre-authentication body drain in AgentAPIProxyHandler. The body has
 # to be read in full for the 401 to survive the close, so these bound what reading it
@@ -659,6 +708,15 @@ class AuthenticationError(Exception):
     The message is for this process's log. It is deliberately never returned
     to the client, which gets an undifferentiated 401 — telling an unidentified
     caller *why* it failed tells it how to succeed.
+    """
+
+
+class CommandSlotUnavailable(RuntimeError):
+    """Every command slot stayed busy for COMMAND_SLOT_WAIT_SECONDS.
+
+    Answered 503 rather than run anyway: a command past the cap is the one that
+    would take the container over its memory limit, and an OOM kill fails every
+    command in flight for every caller, not just this one.
     """
 
 
@@ -1940,6 +1998,9 @@ class ExecutionResult:
     # ran in this one. Empty for every other command. See
     # `_execute_get_credentials`.
     kubeconfig: str = ""
+    # The caller's connection closed while the command ran, and the command was
+    # killed for it. There is nobody to answer; the handler logs and returns.
+    abandoned: bool = False
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
@@ -3190,6 +3251,188 @@ def broker_executables() -> tuple[str, ...]:
     return ("gcloud", "kubectl", "git", *providers.Registry().executables)
 
 
+@dataclass
+class _CapturedOutput:
+    stdout: bytes
+    stderr: bytes
+    truncated: bool
+    timed_out: bool
+    abandoned: bool
+
+
+def _caller_has_gone(caller: Any) -> bool:
+    """Has the connection a command runs for closed?
+
+    Asked only once `select` reports the socket readable. After the request
+    body nothing more is expected from the caller, so readability means either
+    EOF -- the peer closed, which is the case this exists for -- or bytes that
+    are not this protocol's, which the caller of this function stops watching
+    for rather than spinning on.
+    """
+    try:
+        return caller.recv(1, socket.MSG_PEEK) == b""
+    except (BlockingIOError, InterruptedError):
+        return False
+    except OSError:
+        return True
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    """End a command and everything it started. Never raises.
+
+    SIGTERM first, so a program that cleans up on it -- git and its lock files
+    above all -- gets KILL_GRACE_SECONDS to do so, then SIGKILL for whatever is
+    left. Each signal goes to the process group `_execute` started, falling
+    back to the child itself when the group is already gone. The SIGKILL is
+    sent only while the child is still alive: `poll` reaps it once it exits,
+    and a signal to a reaped group id could reach whoever inherits the number.
+    """
+
+    def signal_group(signum: int) -> None:
+        try:
+            os.killpg(process.pid, signum)
+        except OSError:
+            try:
+                process.send_signal(signum)
+            except OSError:
+                pass
+
+    signal_group(signal.SIGTERM)
+    grace_ends = time.monotonic() + KILL_GRACE_SECONDS
+    while process.poll() is None and time.monotonic() < grace_ends:
+        time.sleep(KILL_POLL_SECONDS)
+    if process.poll() is None:
+        signal_group(signal.SIGKILL)
+
+
+def _capture_output(
+    process: subprocess.Popen,
+    stdin: bytes | None,
+    limit: int,
+    timeout: float | None,
+    caller: Any = None,
+) -> _CapturedOutput:
+    """Run a started command to completion holding at most `limit` bytes per stream.
+
+    What `Popen.communicate()` does, with three differences that are the point:
+    output past `limit` is read and dropped as it arrives instead of being kept
+    until the end, so the memory a command costs this process does not depend
+    on how much it prints; `caller`, when given, is the socket the command is
+    being run for, and its closing kills the command rather than leaving it to
+    run to its deadline for nobody; and a command that is killed -- for either
+    reason -- still has what it managed to write collected, briefly, so a
+    timed-out kubectl's partial output and stderr reach the caller.
+
+    Returns once the command has exited. `process.returncode` is set.
+    """
+    deadline = None if timeout is None else time.monotonic() + timeout
+    outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
+    truncated = False
+    pending = memoryview(stdin) if stdin else None
+    written = 0
+    selector = selectors.DefaultSelector()
+    for stream in outputs:
+        selector.register(stream, selectors.EVENT_READ)
+    if process.stdin is not None:
+        if pending is not None:
+            selector.register(process.stdin, selectors.EVENT_WRITE)
+        else:
+            process.stdin.close()
+    if caller is not None:
+        try:
+            selector.register(caller, selectors.EVENT_READ)
+        except (ValueError, OSError):
+            # Already closed, or not a file descriptor at all: run unwatched,
+            # as every internal caller does.
+            caller = None
+
+    def pump(until: float | None, watch_caller: bool) -> tuple[bool, bool]:
+        """Read until every output closes, `until` passes, or the caller leaves.
+
+        Returns (timed_out, abandoned).
+        """
+        nonlocal truncated, written
+        if not watch_caller and caller is not None:
+            with contextlib.suppress(KeyError, ValueError):
+                selector.unregister(caller)
+        while any(not stream.closed for stream in outputs):
+            remaining = None if until is None else until - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return True, False
+            for key, _ in selector.select(remaining):
+                stream = key.fileobj
+                if stream is caller:
+                    if _caller_has_gone(caller):
+                        return False, True
+                    selector.unregister(caller)
+                    continue
+                if stream is process.stdin:
+                    try:
+                        written += os.write(
+                            stream.fileno(),
+                            pending[written : written + STDIN_WRITE_CHUNK_BYTES],
+                        )
+                    except BrokenPipeError:
+                        # The child stopped reading; what it did not take is
+                        # its business, exactly as it is for communicate().
+                        written = len(pending)
+                    if written >= len(pending):
+                        selector.unregister(stream)
+                        stream.close()
+                    continue
+                data = os.read(stream.fileno(), OUTPUT_READ_CHUNK_BYTES)
+                if not data:
+                    selector.unregister(stream)
+                    stream.close()
+                    continue
+                buffer = outputs[stream]
+                room = limit - len(buffer)
+                if room > 0:
+                    buffer += data[:room]
+                if len(data) > room:
+                    truncated = True
+        return False, False
+
+    try:
+        timed_out, abandoned = pump(deadline, watch_caller=True)
+        if timed_out or abandoned:
+            _kill_process_group(process)
+            # What the command wrote before it died is still in the pipes.
+            pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
+        try:
+            process.wait(
+                timeout=None
+                if deadline is None
+                else max(deadline - time.monotonic(), KILLED_COMMAND_DRAIN_SECONDS)
+            )
+        except subprocess.TimeoutExpired:
+            # Both pipes closed but the command is still running -- it handed
+            # them to a child, or ignored the deadline. It gets the same end a
+            # command that kept writing does.
+            timed_out = True
+            _kill_process_group(process)
+            process.wait()
+    except BaseException:
+        # Whatever went wrong in here -- a read or write that raised, the
+        # thread being torn down -- the child does not get to outlive the
+        # capture: it would run on outside the cap, unwatched and unreaped.
+        _kill_process_group(process)
+        process.wait()
+        raise
+    finally:
+        selector.close()
+        for stream in (process.stdin, *outputs):
+            if stream is not None and not stream.closed:
+                stream.close()
+    return _CapturedOutput(
+        stdout=bytes(outputs[process.stdout]),
+        stderr=bytes(outputs[process.stderr]),
+        truncated=truncated,
+        timed_out=timed_out,
+        abandoned=abandoned,
+    )
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = broker_executables()
 
@@ -3200,10 +3443,22 @@ class CommandExecutor:
         state_dir: str,
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
+        max_concurrent_commands: int | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
         self.max_output_bytes = max_output_bytes
+        # See DEFAULT_MAX_CONCURRENT_COMMANDS. Taken from the environment when
+        # the constructor is not told, so the operator's env passthrough is the
+        # way to tune it and the tests can pin it.
+        if max_concurrent_commands is None:
+            max_concurrent_commands = int(
+                os.getenv(ENV_MAX_CONCURRENT_COMMANDS, str(DEFAULT_MAX_CONCURRENT_COMMANDS))
+            )
+        if max_concurrent_commands < 1:
+            raise ValueError(f"{ENV_MAX_CONCURRENT_COMMANDS} must be at least 1")
+        self.max_concurrent_commands = max_concurrent_commands
+        self._command_slots = threading.BoundedSemaphore(max_concurrent_commands)
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -3478,7 +3733,15 @@ class CommandExecutor:
         cwd: str | None = None,
         kubeconfig_context: str | None = None,
         wants_kubeconfig: bool = False,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
+        """Run an agent-selected command.
+
+        `caller` is the connection the command is being run for. While the
+        command runs it is watched, and its closing kills the command: a triage
+        session torn down mid-command otherwise leaves its kubectl running to
+        the deadline, holding a slot and buffering output for nobody.
+        """
         if (
             not isinstance(argv, list)
             or not argv
@@ -3497,7 +3760,9 @@ class CommandExecutor:
         # kubeconfig, so it is handled separately: it writes, everything else
         # reads.
         if _is_get_credentials(argv):
-            return self._execute_get_credentials(command, stdin, cwd, wants_kubeconfig)
+            return self._execute_get_credentials(
+                command, stdin, cwd, wants_kubeconfig, caller=caller
+            )
 
         # Two ways in, and both have to be covered or the other is a bypass.
         # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
@@ -3575,6 +3840,7 @@ class CommandExecutor:
             cwd=cwd,
             kubeconfig_path=kubeconfig_path,
             timeout_seconds=kubectl_deadline,
+            caller=caller,
         )
 
     def execute_internal(
@@ -4133,7 +4399,8 @@ class CommandExecutor:
             return []
 
         def run(argv: list[str]) -> tuple[int, str]:
-            result = self._execute([gcloud, *argv[1:]])
+            # Under `_kubeconfig_lock`, hence no slot; see `_execute`.
+            result = self._execute([gcloud, *argv[1:]], take_slot=False)
             return result.exit_code, result.stdout
 
         return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
@@ -4169,6 +4436,8 @@ class CommandExecutor:
                         *self._dns_endpoint_args(gcloud, target),
                     ],
                     kubeconfig_path=scratch,
+                    # Serialised by the lock this runs under; see `_execute`.
+                    take_slot=False,
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
@@ -4186,6 +4455,7 @@ class CommandExecutor:
         stdin: str | None,
         cwd: str | None,
         wants_kubeconfig: bool,
+        caller: socket.socket | None = None,
     ) -> ExecutionResult:
         """Run the one command that is allowed to author a kubeconfig.
 
@@ -4207,7 +4477,9 @@ class CommandExecutor:
         # kubectl resolves against.
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
-            result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
+            result = self._execute(
+                command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch, caller=caller
+            )
             if result.exit_code == 0 and scratch.is_file():
                 generated = scratch.read_text(encoding="utf-8")
                 context = read_current_context(generated)
@@ -4234,6 +4506,8 @@ class CommandExecutor:
         containment_root: Path | None = None,
         extra_config: tuple[tuple[str, str], ...] = (),
         timeout_seconds: int | None = None,
+        caller: socket.socket | None = None,
+        take_slot: bool = True,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -4249,9 +4523,21 @@ class CommandExecutor:
 
         `timeout_seconds` overrides the broker-wide deadline for this one
         command; `execute` passes the shorter kubectl bound through it.
+
+        `caller` is the connection the command answers, if it answers one; see
+        `_capture_output`. Internal callers leave it unset.
+
+        Every command takes one of the concurrency slots for as long as it
+        runs, and raises `CommandSlotUnavailable` when none frees within
+        COMMAND_SLOT_WAIT_SECONDS. The slot is the innermost thing this method
+        takes -- `_kubeconfig_lock` is held by callers, never the other way
+        round -- which is what keeps the cap from deadlocking against it.
+        `take_slot=False` is for the two gcloud calls `_ensure_managed_kubeconfig`
+        makes while holding that lock: the lock already serialises them, so
+        they cannot multiply, and waiting for a slot there would hold the lock
+        -- and every context-carrying kubectl queued behind it -- for the whole
+        of the wait. The bound is therefore the cap plus one.
         """
-        started = time.monotonic()
-        timed_out = False
         root = containment_root or self.workspace_dir
         command_cwd = root
         if cwd:
@@ -4289,49 +4575,66 @@ class CommandExecutor:
             )
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
-        process = subprocess.Popen(
-            argv,
-            cwd=command_cwd,
-            env=command_environment,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
         effective_timeout = (
             timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         )
-        try:
-            stdout_bytes, stderr_bytes = process.communicate(
-                input=stdin.encode("utf-8") if stdin is not None else None,
-                timeout=effective_timeout,
-            )
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except OSError:
-                pass
-            stdout_bytes, stderr_bytes = process.communicate()
-            if argv and Path(argv[0]).name == "kubectl":
-                target_str = (
-                    f"target kubeconfig {kubeconfig_path}"
-                    if kubeconfig_path
-                    else "ambient cluster target"
+        if take_slot:
+            queued_at = time.monotonic()
+            if not self._command_slots.acquire(timeout=COMMAND_SLOT_WAIT_SECONDS):
+                raise CommandSlotUnavailable(
+                    f"the credential proxy is already running "
+                    f"{self.max_concurrent_commands} commands and none finished within "
+                    f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
                 )
-                msg = f"\n[credential-proxy] kubectl command timed out after {effective_timeout}s ({target_str})\n"
-                stderr_bytes = (stderr_bytes or b"") + msg.encode("utf-8")
+            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
+            if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
+                LOGGER.info(
+                    "command waited %dms for a slot (all %d slots were busy)",
+                    waited_ms,
+                    self.max_concurrent_commands,
+                )
+        # Timed from here rather than from entry: `duration_ms` is how long the
+        # command ran, and a wait for a slot is the broker's time, logged above.
+        started = time.monotonic()
+        try:
+            process = subprocess.Popen(
+                argv,
+                cwd=command_cwd,
+                env=command_environment,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            captured = _capture_output(
+                process,
+                stdin=stdin.encode("utf-8") if stdin is not None else None,
+                limit=self.max_output_bytes,
+                timeout=effective_timeout,
+                caller=caller,
+            )
+        finally:
+            if take_slot:
+                self._command_slots.release()
+        stderr_bytes = captured.stderr
+        if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
+            target_str = (
+                f"target kubeconfig {kubeconfig_path}"
+                if kubeconfig_path
+                else "ambient cluster target"
+            )
+            msg = f"\n[credential-proxy] kubectl command timed out after {effective_timeout}s ({target_str})\n"
+            stderr_bytes = stderr_bytes + msg.encode("utf-8")
 
-        stdout_bytes, stdout_truncated = self._truncate(stdout_bytes)
-        stderr_bytes, stderr_truncated = self._truncate(stderr_bytes)
         duration_ms = int((time.monotonic() - started) * 1000)
         return ExecutionResult(
-            exit_code=124 if timed_out else process.returncode,
-            stdout=stdout_bytes.decode("utf-8", errors="replace"),
+            exit_code=124 if captured.timed_out else process.returncode,
+            stdout=captured.stdout.decode("utf-8", errors="replace"),
             stderr=stderr_bytes.decode("utf-8", errors="replace"),
             duration_ms=duration_ms,
-            truncated=stdout_truncated or stderr_truncated,
-            timed_out=timed_out,
+            truncated=captured.truncated,
+            timed_out=captured.timed_out,
+            abandoned=captured.abandoned,
         )
 
     def _truncate(self, value: bytes) -> tuple[bytes, bool]:
@@ -4982,7 +5285,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 cwd=cwd,
                 kubeconfig_context=kubeconfig_context,
                 wants_kubeconfig=wants_kubeconfig,
+                # The connection this command answers. Its closing mid-command
+                # kills the command; see CommandExecutor.execute.
+                caller=self.connection,
             )
+        except CommandSlotUnavailable as exc:
+            LOGGER.warning("command queued too long request_id=%s", request_id)
+            self._busy(exc)
+            return
         except scoped_sa_pool.PoolRefusal as exc:
             # A refusal, not a fault and not a caller error: the request was
             # well formed and the deployment holds no credential narrow enough
@@ -5031,6 +5341,16 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "credential proxy command execution failed"},
+            )
+            return
+        if result.abandoned:
+            # The connection is gone, so there is no response to write; the
+            # log line is the record that the command was ended for it.
+            LOGGER.info(
+                "command abandoned request_id=%s duration_ms=%d: the caller disconnected "
+                "and the command was killed",
+                request_id,
+                result.duration_ms,
             )
             return
         LOGGER.info(
@@ -5342,6 +5662,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
+        except CommandSlotUnavailable as exc:
+            LOGGER.warning("workspace request queued too long route=%s", route)
+            self._busy(exc)
+            return
         except Exception as exc:
             LOGGER.exception("workspace request failed route=%s type=%s", route, type(exc).__name__)
             self._json(
@@ -5491,6 +5815,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             return
+        except CommandSlotUnavailable as exc:
+            LOGGER.warning("%s credential refresh queued too long", forge.name)
+            self._busy(exc)
+            return
         except Exception as exc:
             # The helper's own stderr is the only place the refusal exists, and
             # `refresh_forge_credential` has already logged it redacted. It must
@@ -5595,6 +5923,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_GATEWAY,
                 {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
             )
+            return
+        except CommandSlotUnavailable as exc:
+            # A verb is several git commands; the refusal can land between
+            # two of them, and the scratch tree is then whatever the earlier
+            # ones left, exactly as after any other mid-verb failure.
+            LOGGER.warning("vcs %s queued too long", verb)
+            self._busy(exc)
             return
         except Exception as exc:
             LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
@@ -5766,6 +6101,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _busy(self, exc: CommandSlotUnavailable) -> None:
+        """Answer a broker at its concurrency cap, on whichever route asked.
+
+        Not a refusal of what was asked and not a fault: the command past the
+        cap is the one that would take the container over its memory limit.
+        `error` is the key the shim prints, so the agent reads why rather than
+        a bare exit 1, and `code` lets a caller tell "busy, retry" from a
+        failure.
+        """
+        self._json(
+            HTTPStatus.SERVICE_UNAVAILABLE,
+            {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
+        )
 
 
 def start_agent_api_proxy() -> ThreadingHTTPServer:
