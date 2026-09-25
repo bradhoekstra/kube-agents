@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import codecs
 import contextlib
 import hashlib
 import hmac
@@ -34,7 +35,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterator, Mapping
 
 import api_policy
 import command_policy
@@ -116,19 +117,22 @@ STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
 # After a command is killed, how long its pipes are given to close before what
 # it had already written is given up on.
 KILLED_COMMAND_DRAIN_SECONDS = 5
-# How many commands may run at once. Each in-flight command is one child
-# process -- a kubectl listing a large cluster runs to hundreds of MiB on its
-# own -- plus, in this process, about six times `--max-output-bytes` at peak:
-# the two capped stream buffers, their decoded strings, and the JSON body and
-# its encoding (measured at 24 MiB per command against a 4 MiB cap). A
-# long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
+# How many requests that run commands may be in flight at once. A slot is held
+# from the moment a request is admitted until its response is on the wire,
+# because everything the request costs lives that long: one child process -- a
+# kubectl listing a large cluster runs to hundreds of MiB on its own -- and,
+# in this process, the two capped stream buffers, their decoded strings, and
+# the JSON body and its encoding. For text output that is about six times
+# `--max-output-bytes` at peak, measured at 24 MiB per request against a 4 MiB
+# cap; for output that is not UTF-8 it is more, because every such byte becomes
+# a replacement character (`_bounded_text` says how much more, and bounds it).
+# A long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
 # long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
 # from a constant of its own beside the output cap and reserves the name, and
 # its cap test sizes the container's memory limit against the two, so the
 # value an install runs moves with that limit rather than through the CR; this
-# default is for a broker run outside the operator. The calls `_execute`
-# exempts from the count are the ones a lock already serialises, plus the
-# forge refresh helper; it says why.
+# default is for a broker run outside the operator. `CommandExecutor.request_slot`
+# says which routes hold a slot and why the others take none.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # How long a request waits for a slot before it is refused with 503. Long
@@ -142,9 +146,11 @@ COMMAND_SLOT_WAIT_LOG_MS = 1000
 # while queued is noticed between attempts and dropped without starting its
 # command -- a fork made only to be killed would cost a live request the slot.
 COMMAND_SLOT_POLL_SECONDS = 0.5
-# The exit code of a command that was never started because its caller hung
-# up while it was queued. Negative like a signal exit, but no signal's number.
-ABANDONED_BEFORE_START_EXIT_CODE = -1
+# How long the write of a response may take before its caller is given up on.
+# A response is written while its request's slot is still held, so a caller
+# that stops reading would otherwise keep the slot for as long as it liked; a
+# 16 MiB body crosses the Pod network in well under a second.
+RESPONSE_WRITE_TIMEOUT_SECONDS = 60
 # What a socket reports once its peer has closed for good. POLLHUP and not
 # EOF, because a peer that has only shut its writing half -- legal after an
 # HTTP request, and still waiting for the response -- reads as EOF too.
@@ -730,6 +736,14 @@ class CommandSlotUnavailable(RuntimeError):
     Answered 503 rather than run anyway: a command past the cap is the one that
     would take the container over its memory limit, and an OOM kill fails every
     command in flight for every caller, not just this one.
+    """
+
+
+class CallerHungUp(Exception):
+    """The caller closed its connection while its request waited for a slot.
+
+    Nothing to run and nobody to answer: the route logs it and returns, and the
+    slot goes to a caller that is still there.
     """
 
 
@@ -3343,6 +3357,39 @@ def _kill_process_group(process: subprocess.Popen) -> None:
     signal_group(signal.SIGKILL)
 
 
+def _bounded_text(raw: bytes, limit: int) -> tuple[str, bool]:
+    """Decode a captured stream so that its UTF-8 form stays within `limit`.
+
+    Decoding with replacement can only grow the text: every byte that is not
+    UTF-8 becomes U+FFFD, three bytes when encoded again and four in memory,
+    so a stream of such bytes at the cap -- a container that logs binary --
+    would cost this process, and then the response, several times the cap
+    the capture was bounded to. Text that decodes cleanly is returned whole;
+    anything else is measured once encoded and cut at the limit on a character
+    boundary, and the cut is reported as truncation.
+    """
+    try:
+        return raw.decode("utf-8"), False
+    except UnicodeDecodeError:
+        pass
+    # Piece by piece, so the measuring never holds a second full copy: a
+    # whole-stream decode and re-encode of 8 MiB of such bytes cost 40 MiB of
+    # transients on top of the result.
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pieces: list[str] = []
+    budget = limit
+    for offset in range(0, len(raw), OUTPUT_READ_CHUNK_BYTES):
+        end = offset + OUTPUT_READ_CHUNK_BYTES
+        piece = decoder.decode(raw[offset:end], final=end >= len(raw))
+        encoded = piece.encode("utf-8")
+        if len(encoded) > budget:
+            pieces.append(encoded[:budget].decode("utf-8", errors="ignore"))
+            return "".join(pieces), True
+        pieces.append(piece)
+        budget -= len(encoded)
+    return "".join(pieces), False
+
+
 def _capture_output(
     process: subprocess.Popen,
     stdin: bytes | None,
@@ -3734,6 +3781,51 @@ class CommandExecutor:
                 "scoped service account pool armed scopes=%d", len(self.scoped_pool.scopes)
             )
 
+    @contextlib.contextmanager
+    def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
+        """Hold one concurrency slot for the whole of a request.
+
+        Taken by the routes that run agent-selected commands -- `/v1/exec` and
+        `/v1/vcs/*` -- around the command and the response together, because
+        the memory a request costs lives until its response is written: the
+        child, the captured output, the decoded strings, the JSON body and its
+        encoding. Released when the command exited, the slot would let a caller
+        that reads slowly keep its body alive while the next command holds the
+        slot, and the number of bodies in memory would be the number of
+        callers rather than the cap. The other routes take no slot: the forge
+        refresh is a short call to the minter, the content workspace's git is
+        serialised by the store's own lock, and the Cloud API relay answers
+        from a bounded read of its own.
+
+        The wait is taken in COMMAND_SLOT_POLL_SECONDS pieces and `caller`, when
+        given, is checked between them: one that has hung up while queued raises
+        `CallerHungUp` before anything is started, rather than taking the slot
+        a live request is waiting for. Every slot busy for
+        COMMAND_SLOT_WAIT_SECONDS raises `CommandSlotUnavailable`.
+        """
+        queued_at = time.monotonic()
+        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        while not self._command_slots.acquire(timeout=COMMAND_SLOT_POLL_SECONDS):
+            if caller is not None and _caller_has_gone(caller):
+                raise CallerHungUp("the caller disconnected while queued for a slot")
+            if time.monotonic() >= deadline:
+                raise CommandSlotUnavailable(
+                    f"the credential proxy is already running "
+                    f"{self.max_concurrent_commands} commands and none finished within "
+                    f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
+                )
+        try:
+            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
+            if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
+                LOGGER.info(
+                    "request waited %dms for a slot (all %d slots were busy)",
+                    waited_ms,
+                    self.max_concurrent_commands,
+                )
+            yield
+        finally:
+            self._command_slots.release()
+
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
         if not command.strip():
@@ -3790,11 +3882,12 @@ class CommandExecutor:
         """Run an agent-selected command.
 
         `caller` is the connection the command is being run for. While the
-        command waits for a slot and while it runs, the connection is watched,
-        and its closing ends the command -- or, while queued, drops it without
-        starting: a triage session torn down mid-command otherwise leaves its
+        command runs the connection is watched, and its closing ends the
+        command: a triage session torn down mid-command otherwise leaves its
         kubectl running to the deadline, holding a slot and buffering output
-        for nobody. See `_caller_has_gone` for what counts as closing.
+        for nobody. The route holds the request's slot around this call and
+        the response (`request_slot`), and watches the same connection while
+        queued. See `_caller_has_gone` for what counts as closing.
         """
         if (
             not isinstance(argv, list)
@@ -3902,15 +3995,13 @@ class CommandExecutor:
     ) -> ExecutionResult:
         """Run a trusted, operator-defined helper that is not agent selectable.
 
-        Outside the concurrency count. The helpers that come through here are
-        short calls -- the forge credential refresh is a request to the minter,
-        not a listing -- and the caller whose credential is being refreshed
-        takes the slot for its own git. Queueing here would spend that caller's
-        minute twice, once in the helper and once in the verb, and the
-        credential strategies swallow the helper's failures, so the wait would
-        not even surface as the busy answer.
+        Slots are a request's, not a command's (`request_slot`), so a helper
+        takes none of its own: it runs inside whichever request needed it -- a
+        vcs verb refreshing its credential -- or, from the refresh route and
+        the cron behind it, inside none. It is a short call to the minter
+        either way, not a listing.
         """
-        return self._execute(argv, cwd=cwd, take_slot=False)
+        return self._execute(argv, cwd=cwd)
 
     def execute_workspace_git(
         self,
@@ -3968,10 +4059,6 @@ class CommandExecutor:
             cwd=str(cwd),
             containment_root=self.content_workspace_root,
             extra_config=tuple(config),
-            # Run under the content store's lock, which already serialises
-            # it; a wait for a slot while holding that lock would stall every
-            # workspace verb behind it. See `_execute`.
-            take_slot=False,
         )
 
     def execute_vcs_git(
@@ -4466,8 +4553,7 @@ class CommandExecutor:
             return []
 
         def run(argv: list[str]) -> tuple[int, str]:
-            # Under `_kubeconfig_lock`, hence no slot; see `_execute`.
-            result = self._execute([gcloud, *argv[1:]], take_slot=False)
+            result = self._execute([gcloud, *argv[1:]])
             return result.exit_code, result.stdout
 
         return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
@@ -4503,8 +4589,6 @@ class CommandExecutor:
                         *self._dns_endpoint_args(gcloud, target),
                     ],
                     kubeconfig_path=scratch,
-                    # Serialised by the lock this runs under; see `_execute`.
-                    take_slot=False,
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
@@ -4574,7 +4658,6 @@ class CommandExecutor:
         extra_config: tuple[tuple[str, str], ...] = (),
         timeout_seconds: int | None = None,
         caller: socket.socket | None = None,
-        take_slot: bool = True,
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -4594,19 +4677,11 @@ class CommandExecutor:
         `caller` is the connection the command answers, if it answers one; see
         `_capture_output`. Internal callers leave it unset.
 
-        Every command takes one of the concurrency slots for as long as it
-        runs, and raises `CommandSlotUnavailable` when none frees within
-        COMMAND_SLOT_WAIT_SECONDS. The slot is the innermost thing this method
-        takes -- `_kubeconfig_lock` is held by callers, never the other way
-        round -- which is what keeps the cap from deadlocking against it.
-        `take_slot=False` is for three callers. The two gcloud calls
-        `_ensure_managed_kubeconfig` makes while holding that lock, and the git
-        `execute_workspace_git` runs under the content store's lock: each lock
-        already serialises its commands, so they cannot multiply, and waiting
-        for a slot while holding the lock would stall everything queued behind
-        it for the whole of the wait. And `execute_internal`'s trusted helpers,
-        short calls whose caller takes the slot for its own git. The bound is
-        therefore the cap plus those calls.
+        No concurrency slot is taken here. A slot is a request's, held by the
+        route from admission until the response is written (`request_slot`),
+        so every command a request runs -- the kubeconfig cache-fill made under
+        `_kubeconfig_lock` included -- is covered by the one its request holds,
+        and no lock is ever held while waiting for a slot.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root
@@ -4648,76 +4723,45 @@ class CommandExecutor:
         effective_timeout = (
             timeout_seconds if timeout_seconds is not None else self.timeout_seconds
         )
-        if take_slot:
-            queued_at = time.monotonic()
-            slot_deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-            while not self._command_slots.acquire(timeout=COMMAND_SLOT_POLL_SECONDS):
-                if caller is not None and _caller_has_gone(caller):
-                    # Hung up while queued: nothing to run and nobody to
-                    # answer. Taking the slot anyway would fork a child only to
-                    # kill it, in the slot a live request was waiting for.
-                    return ExecutionResult(
-                        exit_code=ABANDONED_BEFORE_START_EXIT_CODE,
-                        stdout="",
-                        stderr="",
-                        duration_ms=0,
-                        truncated=False,
-                        timed_out=False,
-                        abandoned=True,
-                    )
-                if time.monotonic() >= slot_deadline:
-                    raise CommandSlotUnavailable(
-                        f"the credential proxy is already running "
-                        f"{self.max_concurrent_commands} commands and none finished within "
-                        f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
-                    )
-            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
-            if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                LOGGER.info(
-                    "command waited %dms for a slot (all %d slots were busy)",
-                    waited_ms,
-                    self.max_concurrent_commands,
-                )
-        # Timed from here rather than from entry: `duration_ms` is how long the
-        # command ran, and a wait for a slot is the broker's time, logged above.
         started = time.monotonic()
-        try:
-            process = subprocess.Popen(
-                argv,
-                cwd=command_cwd,
-                env=command_environment,
-                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            )
-            captured = _capture_output(
-                process,
-                stdin=stdin.encode("utf-8") if stdin is not None else None,
-                limit=self.max_output_bytes,
-                timeout=effective_timeout,
-                caller=caller,
-            )
-        finally:
-            if take_slot:
-                self._command_slots.release()
-        stderr_bytes = captured.stderr
+        process = subprocess.Popen(
+            argv,
+            cwd=command_cwd,
+            env=command_environment,
+            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        captured = _capture_output(
+            process,
+            stdin=stdin.encode("utf-8") if stdin is not None else None,
+            limit=self.max_output_bytes,
+            timeout=effective_timeout,
+            caller=caller,
+        )
+        stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
+        stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
             target_str = (
                 f"target kubeconfig {kubeconfig_path}"
                 if kubeconfig_path
                 else "ambient cluster target"
             )
-            msg = f"\n[credential-proxy] kubectl command timed out after {effective_timeout}s ({target_str})\n"
-            stderr_bytes = stderr_bytes + msg.encode("utf-8")
+            # Appended after the bound, so a stream already at the cap does
+            # not push the one line that explains the exit code off the end.
+            stderr_text += (
+                f"\n[credential-proxy] kubectl command timed out after {effective_timeout}s "
+                f"({target_str})\n"
+            )
 
         duration_ms = int((time.monotonic() - started) * 1000)
         return ExecutionResult(
             exit_code=124 if captured.timed_out else process.returncode,
-            stdout=captured.stdout.decode("utf-8", errors="replace"),
-            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+            stdout=stdout_text,
+            stderr=stderr_text,
             duration_ms=duration_ms,
-            truncated=captured.truncated,
+            truncated=captured.truncated or stdout_cut or stderr_cut,
             timed_out=captured.timed_out,
             abandoned=captured.abandoned,
         )
@@ -5364,16 +5408,58 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute(
-                exec_argv,
-                stdin=stdin,
-                cwd=cwd,
-                kubeconfig_context=kubeconfig_context,
-                wants_kubeconfig=wants_kubeconfig,
-                # The connection this command answers. Its closing mid-command
-                # kills the command; see CommandExecutor.execute.
-                caller=self.connection,
+            # One slot for the command and its response together; see
+            # CommandExecutor.request_slot for why the response is inside it.
+            with self._request_slot():
+                result = self.executor.execute(
+                    exec_argv,
+                    stdin=stdin,
+                    cwd=cwd,
+                    kubeconfig_context=kubeconfig_context,
+                    wants_kubeconfig=wants_kubeconfig,
+                    # The connection this command answers. Its closing
+                    # mid-command kills the command; see CommandExecutor.execute.
+                    caller=self.connection,
+                )
+                if result.abandoned:
+                    # The connection is gone, so there is no response to write;
+                    # the log line is the record that the command was ended.
+                    LOGGER.info(
+                        "command abandoned request_id=%s duration_ms=%d: the caller "
+                        "disconnected and the command was killed",
+                        request_id,
+                        result.duration_ms,
+                    )
+                    return
+                LOGGER.info(
+                    "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
+                    request_id,
+                    result.exit_code,
+                    result.duration_ms,
+                    result.truncated,
+                )
+                response = {
+                    "status": "completed",
+                    "exitCode": result.exit_code,
+                    "stdout": result.stdout,
+                    "stderr": result.stderr,
+                    "durationMs": result.duration_ms,
+                    "truncated": result.truncated,
+                    "timedOut": result.timed_out,
+                }
+                # Only `get-credentials` fills this, and only when the caller
+                # asked for the file. It is gcloud's own output, not anything
+                # the agent wrote.
+                if result.kubeconfig:
+                    response["kubeconfig"] = result.kubeconfig
+                self._json(HTTPStatus.OK, response)
+        except CallerHungUp:
+            LOGGER.info(
+                "command abandoned request_id=%s: the caller disconnected while queued "
+                "for a slot; the command was not started",
+                request_id,
             )
+            return
         except CommandSlotUnavailable as exc:
             LOGGER.warning("command queued too long request_id=%s", request_id)
             self._busy(exc)
@@ -5428,39 +5514,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 {"error": "credential proxy command execution failed"},
             )
             return
-        if result.abandoned:
-            # The connection is gone, so there is no response to write; the
-            # log line is the record of what became of the command.
-            LOGGER.info(
-                "command abandoned request_id=%s duration_ms=%d: the caller disconnected %s",
-                request_id,
-                result.duration_ms,
-                "while queued for a slot; the command was not started"
-                if result.exit_code == ABANDONED_BEFORE_START_EXIT_CODE
-                else "and the command was killed",
-            )
-            return
-        LOGGER.info(
-            "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
-            request_id,
-            result.exit_code,
-            result.duration_ms,
-            result.truncated,
-        )
-        response = {
-            "status": "completed",
-            "exitCode": result.exit_code,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "durationMs": result.duration_ms,
-            "truncated": result.truncated,
-            "timedOut": result.timed_out,
-        }
-        # Only `get-credentials` fills this, and only when the caller asked for
-        # the file. It is gcloud's own output, not anything the agent wrote.
-        if result.kubeconfig:
-            response["kubeconfig"] = result.kubeconfig
-        self._json(HTTPStatus.OK, response)
 
     def _handle_api_relay(self) -> None:
         """`GET /v1/gcp/<host>/<path>?<query>`: one permitted Google API read.
@@ -5969,7 +6022,16 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             if not self._repository_is_permitted(repository):
                 return
         try:
-            result = route(payload)
+            # One slot for the verb's git commands and the response together;
+            # see CommandExecutor.request_slot.
+            with self._request_slot():
+                result = route(payload)
+                self._json(HTTPStatus.OK, result)
+        except CallerHungUp:
+            LOGGER.info(
+                "vcs %s abandoned: the caller disconnected while queued for a slot", verb
+            )
+            return
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and
             # `refresh_forge_credential` raises it: the credential strategy asks
@@ -6004,9 +6066,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except CommandSlotUnavailable as exc:
-            # A verb is several git commands; the refusal can land between
-            # two of them, and the scratch tree is then whatever the earlier
-            # ones left, exactly as after any other mid-verb failure.
+            # Raised before the verb starts, so nothing is left half-done.
             LOGGER.warning("vcs %s queued too long", verb)
             self._busy(exc)
             return
@@ -6016,7 +6076,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
             )
             return
-        self._json(HTTPStatus.OK, result)
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -6174,12 +6233,46 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
-        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        # Not ASCII-escaped: a replacement character standing in for a byte
+        # that was not UTF-8 is three bytes on the wire this way and six as
+        # `�`, and `_bounded_text` sized the text for the former. JSON is
+        # UTF-8 and every caller reads it as such.
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8", errors="replace"
+        )
+        # Written under a deadline: a request's slot is held until its response
+        # is on the wire, and a caller that stops reading must not keep it. A
+        # write that fails is logged rather than raised -- the caller is the
+        # one party that cannot be told.
+        self.connection.settimeout(RESPONSE_WRITE_TIMEOUT_SECONDS)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as exc:
+            LOGGER.warning(
+                "response not delivered status=%d bytes=%d type=%s",
+                int(status),
+                len(body),
+                type(exc).__name__,
+            )
+
+    def _request_slot(self) -> contextlib.AbstractContextManager:
+        """This request's concurrency slot, watched on this connection.
+
+        `serve` always installs a `CommandExecutor`, which has one, and every
+        handler the server builds has a connection. The stand-ins the route
+        tests put in their place predate the slot, as they predate
+        `resolve_git_command` above: an executor without one gets no slot
+        rather than a fault, and a handler without a connection an unwatched
+        wait.
+        """
+        executor = self.executor
+        if hasattr(executor, "request_slot"):
+            return executor.request_slot(caller=getattr(self, "connection", None))
+        return contextlib.nullcontext()
 
     def _busy(self, exc: CommandSlotUnavailable) -> None:
         """Answer a broker at its concurrency cap, on whichever route asked.

@@ -749,19 +749,26 @@ Consequences:
 - The broker reads a command's output as it streams and keeps at most
   `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` of each stream (8 MiB as the operator
   deploys it); the rest is drained and dropped, so what a command prints past
-  the cap costs the broker nothing. At most
-  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` commands run at once (8; the
-  operator sets it, as it sets the output cap, and reserves the name). Each
-  in-flight command is a child process plus about six times the output cap of
-  transient copies in the broker, so the two caps together are what the broker
-  container's memory limit is sized against, and they move with that limit in
-  the operator rather than through the CR. The calls a lock already serialises
-  (the kubeconfig cache-fill, the content workspace's git) and the forge
-  refresh helper run outside the count. A request that waits more than 60
-  seconds for a slot is answered
-  `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
+  the cap costs the broker nothing. The same bound applies to the decoded
+  text's UTF-8 size, so output that is not UTF-8, whose every byte becomes a
+  three-byte replacement character, cannot cost more than text does. At most
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` requests that run commands are in
+  flight at once (8; the operator sets it, as it sets the output cap, and
+  reserves the name). A slot is held from admission until the response is on
+  the wire, because everything a request costs lives that long: a child
+  process plus about six times the output cap of transient copies in the
+  broker (the captured streams, their decoded text, the JSON body and its
+  encoding). The two caps together are therefore what the broker container's
+  memory limit is sized against, and they move with that limit in the
+  operator rather than through the CR. The exec and vcs routes hold a slot;
+  the forge refresh (a short call to the minter), the content workspace's git
+  (serialised by the store's own lock) and the Cloud API relay (a bounded read
+  of its own) take none. A request that waits more than 60 seconds for a slot
+  is answered `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
   `the credential proxy is already running 8 commands and none finished within 60s; retry shortly`.
-  A long-running command holds its slot for as long as it runs.
+  A long-running command holds its slot for as long as it runs, and a caller
+  that stops reading its response is given up on after 60 seconds so that it
+  cannot keep one.
 - A command whose caller disconnects while it runs is ended rather than left to
   run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two seconds later,
   to the whole process group it started. The same two-step end applies at the
@@ -770,6 +777,12 @@ Consequences:
   good (`POLLHUP` on the broker's Unix socket); a peer that only shut its
   writing half is still answered, and a broker spoken to over TCP, where a
   closed peer and a half-closed one look alike, runs its commands unwatched.
+- Envoy's stream idle timeout in front of the runtime is ten minutes, above
+  the broker's five-minute deadline plus the slot wait, the kill grace and the
+  drain, so a silent long-running command that reaches its deadline is still
+  answered with its partial output and the timed-out notice rather than reset
+  by Envoy first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` past
+  about nine minutes raises the Envoy timeout with it.
 
 ### Cloud API reads
 

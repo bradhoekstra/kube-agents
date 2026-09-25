@@ -1466,12 +1466,14 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 
 	// The other half of the argument, which the floor above cannot make: a cap
 	// this side of the fleet's needs is still wrong if the container cannot
-	// hold it. credential_proxy.py reads a command's output as it streams and
-	// keeps at most the cap per stream, so what the broker holds per in-flight
-	// command is about six times the cap, transiently: the two capped stream
-	// buffers, their decoded strings, and the JSON body and its encoding
-	// (measured at 24 MiB per command against a 4 MiB cap). Concurrency is
-	// bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+	// hold it. credential_proxy.py reads a command's output as it streams,
+	// keeps at most the cap per stream and bounds the decoded text to the
+	// same size, so what the broker holds per in-flight request is about six
+	// times the cap, transiently: the two capped stream buffers, their decoded
+	// text, and the JSON body and its encoding (measured at 48 MiB per request
+	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
+	// A request holds its slot until its response is written, and concurrency
+	// is bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
 	// read here off the rendered env like the output cap, so the test models
 	// what the operator deploys rather than a copy of it. The burst has to
 	// fit under the memory limit alongside what the container holds at rest,

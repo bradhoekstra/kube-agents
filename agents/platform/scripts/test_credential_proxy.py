@@ -2140,6 +2140,47 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
         self.assertIn("already running 8 commands", body["error"])
 
+    def test_the_exec_route_holds_its_slot_until_the_response_is_written(self):
+        # The slot covers the response as well as the command: released when
+        # the command exits, a slow reader keeps its body alive while the next
+        # command holds the slot, and the bodies in memory number the callers
+        # rather than the cap.
+        seen = []
+        original = CredentialProxyHandler._json
+
+        def recording(handler, status, payload):
+            seen.append(CredentialProxyHandler.executor._command_slots._value)
+            return original(handler, status, payload)
+
+        with mock.patch.object(CredentialProxyHandler, "_json", recording):
+            status, _ = self.post({"argv": ["kubectl", "get", "pods"]})
+
+        self.assertEqual(200, status)
+        cap = CredentialProxyHandler.executor.max_concurrent_commands
+        self.assertEqual([cap - 1], seen)
+
+    def test_a_replacement_character_is_three_bytes_on_the_wire(self):
+        # ASCII-escaped JSON writes `\ufffd`, six bytes for one byte that was
+        # not UTF-8; the bound on the decoded text was sized for the three
+        # bytes of the character itself.
+        stub = Path(CredentialProxyHandler.executor.executables["kubectl"])
+        stub.write_text("#!/bin/bash\nprintf '\\377'\n", encoding="utf-8")
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+        connection.request(
+            "POST",
+            "/v1/exec",
+            body=json.dumps({"argv": ["kubectl", "get", "pods"]}),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read()
+        connection.close()
+
+        self.assertEqual(200, response.status)
+        self.assertIn("\ufffd".encode("utf-8"), body)
+        self.assertNotIn(b"\\ufffd", body)
+        self.assertEqual("\ufffd", json.loads(body)["stdout"])
+
     def test_the_exec_route_hands_its_connection_to_the_executor(self):
         # The watch that ends an abandoned command needs the socket the request
         # arrived on; the route is where it is known.
@@ -2650,6 +2691,30 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(200000, len(result.stdout))
         self.assertEqual("err", result.stderr)
 
+    def test_output_that_is_not_utf8_is_bounded_once_decoded(self):
+        # Every byte that is not UTF-8 decodes to a three-byte replacement
+        # character, so a stream of them at the cap would leave the process,
+        # and then the response, three times the cap. The bound is on the
+        # decoded text's UTF-8 size, not only on the bytes captured.
+        executor = self.fake_kubectl(
+            self.executor(max_output_bytes=64 << 10),
+            body="head -c 200000 /dev/zero | tr '\\0' '\\377'",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.truncated)
+        self.assertLessEqual(len(result.stdout.encode("utf-8")), 64 << 10)
+        self.assertEqual({"�"}, set(result.stdout))
+
+    def test_valid_utf8_output_is_returned_as_written(self):
+        executor = self.fake_kubectl(self.executor(), body="printf 'h\\303\\251llo'")
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertFalse(result.truncated)
+        self.assertEqual("héllo", result.stdout)
+
     def test_a_large_stdin_is_delivered_in_full(self):
         # Larger than a pipe buffer, so the write has to interleave with the
         # reads: a command that echoes its input back would otherwise deadlock
@@ -2861,13 +2926,10 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertEqual("done\n", result.stdout)
 
-    def test_a_caller_that_hangs_up_while_queued_never_gets_the_command_started(self):
+    def test_a_caller_that_hangs_up_while_queued_is_dropped_before_anything_starts(self):
         # With every slot busy, a caller that leaves during the wait must not
         # take the slot a live request is waiting for only to fork and kill.
-        ran = Path(self.temp_dir.name) / "ran"
-        executor = self.fake_kubectl(
-            self.executor(max_concurrent_commands=1), body=f'touch "{ran}"'
-        )
+        executor = self.executor(max_concurrent_commands=1)
         self.hold_a_slot(executor, seconds=3)
         ours, theirs = socket.socketpair()
         self.addCleanup(ours.close)
@@ -2878,13 +2940,12 @@ class CommandExecutorTest(unittest.TestCase):
 
         threading.Thread(target=hang_up, daemon=True).start()
         started = time.monotonic()
-        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+        with self.assertRaises(credential_proxy.CallerHungUp):
+            with executor.request_slot(caller=ours):
+                self.fail("a slot was granted to a caller that had gone")
 
-        self.assertTrue(result.abandoned)
-        self.assertEqual(credential_proxy.ABANDONED_BEFORE_START_EXIT_CODE, result.exit_code)
-        # Back before the slot would have freed, and the command never ran.
+        # Back before the slot would have freed.
         self.assertLess(time.monotonic() - started, 2.5)
-        self.assertFalse(ran.exists(), "the command was started for a caller that had gone")
 
     def test_unexpected_bytes_from_the_caller_are_not_taken_for_a_hang_up(self):
         # After the request body nothing more is expected, but a peer that
@@ -2947,123 +3008,64 @@ class CommandExecutorTest(unittest.TestCase):
             )
 
     def hold_a_slot(self, executor, seconds):
-        """Run a command that holds a slot for `seconds`; return once it holds it.
+        """Hold a request slot for `seconds` on another thread; return once held.
 
-        The command touches a marker as its first act, and the slot is taken
-        before the command starts, so the marker's existence is the proof --
-        rather than a sleep that a loaded runner can outrun. Through `_execute`
-        directly: `execute_internal` is the slot-free path for trusted helpers.
+        The holder sets an event once it has the slot, so the caller waits on
+        the fact rather than on a sleep that a loaded runner can outrun.
         """
-        marker = Path(self.temp_dir.name) / f"holder-{time.monotonic_ns()}"
-        thread = threading.Thread(
-            target=executor._execute,
-            args=(["/bin/sh", "-c", f'touch "{marker}"; sleep {seconds}'],),
-        )
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                time.sleep(seconds)
+
+        thread = threading.Thread(target=hold)
         thread.start()
         self.addCleanup(thread.join)
-        deadline = time.monotonic() + 5
-        while not marker.exists():
-            if time.monotonic() > deadline:
-                self.fail("the slot-holding command never started")
-            time.sleep(0.02)
+        self.assertTrue(held.wait(5), "the slot holder never got its slot")
         return thread
 
-    def test_a_command_past_the_cap_waits_for_a_slot(self):
+    def test_a_request_past_the_cap_waits_for_a_slot(self):
         executor = self.executor(max_concurrent_commands=1)
         self.hold_a_slot(executor, seconds=1)
 
         started = time.monotonic()
-        result = executor._execute(["/bin/echo", "second"])
+        with executor.request_slot():
+            waited = time.monotonic() - started
 
-        self.assertEqual(0, result.exit_code)
-        self.assertEqual("second\n", result.stdout)
-        # It ran after the first finished, not beside it.
-        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        # It was admitted after the holder finished, not beside it.
+        self.assertGreaterEqual(waited, 0.5)
 
-    def test_a_command_that_waits_too_long_for_a_slot_is_refused(self):
+    def test_a_request_that_waits_too_long_for_a_slot_is_refused(self):
         executor = self.executor(max_concurrent_commands=1)
         holder = self.hold_a_slot(executor, seconds=2)
 
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
             with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
-                executor._execute(["/bin/echo", "second"])
+                with executor.request_slot():
+                    self.fail("a slot was granted while the holder still had it")
 
         self.assertIn("already running 1 commands", str(raised.exception))
         # The refusal released nothing it did not hold: the slot is still the
-        # first command's, and comes back when it ends.
+        # holder's, and comes back when it ends.
         holder.join()
-        self.assertEqual(0, executor._execute(["/bin/echo", "after"]).exit_code)
+        with executor.request_slot():
+            pass
 
-    def test_the_duration_reported_is_the_command_s_not_the_wait_for_a_slot(self):
+    def test_commands_take_no_slot_of_their_own(self):
+        # A slot is a request's, held by the route around the command and the
+        # response; a command never queues on its own. So the kubeconfig
+        # cache-fill under `_kubeconfig_lock`, a trusted helper and the
+        # workspace's git all run inside whatever slot their request holds,
+        # and none of them can hold a lock while waiting for one.
         executor = self.executor(max_concurrent_commands=1)
-        self.hold_a_slot(executor, seconds=1)
-
-        result = executor._execute(["/bin/echo", "second"])
-
-        # It waited about a second for the slot; the command itself was instant.
-        self.assertLess(result.duration_ms, 500)
-
-    def slot_taking(self, executor, call):
-        """The `take_slot` values `_execute` saw while `call(executor)` ran."""
-        seen = []
-        original = executor._execute
-
-        def record(argv, **kwargs):
-            seen.append(kwargs.get("take_slot", True))
-            return original(argv, **kwargs)
-
-        with mock.patch.object(executor, "_execute", record):
-            call(executor)
-        return seen
-
-    def test_the_forge_refresh_helper_takes_no_slot(self):
-        # The helper is a short call to the minter and its caller takes the
-        # slot for its own git; a wait here would spend the caller's minute
-        # twice, and the credential strategies swallow the helper's failures,
-        # so the refusal would not even surface as the busy answer. It runs
-        # through `execute_internal`, the slot-free path for trusted helpers.
-        helper = Path(self.temp_dir.name) / "helper.sh"
-        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        helper.chmod(0o755)
-
-        seen = self.slot_taking(
-            self.executor(),
-            lambda executor: executor._run_forge_helper("github", helper, [], "refresh"),
-        )
-
-        self.assertEqual([False], seen)
-
-    def test_workspace_git_takes_no_slot(self):
-        # Run under the content store's lock, which already serialises it; a
-        # wait for a slot there would stall every workspace verb behind it.
-        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
-            executor = self.executor()
-        tree = executor.content_workspace_root / "tree"
-        tree.mkdir(parents=True)
-
-        seen = self.slot_taking(
-            executor,
-            lambda executor: executor.execute_workspace_git(
-                ["git", "rev-parse", "--git-dir"], tree
-            ),
-        )
-
-        self.assertEqual([False], seen)
-
-    def test_the_kubeconfig_cache_fill_does_not_need_a_slot(self):
-        # `_ensure_managed_kubeconfig` runs gcloud while holding
-        # `_kubeconfig_lock`. Queueing for a slot there would hold the lock --
-        # and every context-carrying kubectl behind it -- for the whole wait,
-        # and the lock already serialises those calls, so they skip the count.
-        executor = self.fake_gcloud(self.executor(max_concurrent_commands=1))
         self.hold_a_slot(executor, seconds=2)
-        target = credential_proxy.parse_gke_context(self.CONTEXT)
 
-        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
-            started = time.monotonic()
-            managed = executor._ensure_managed_kubeconfig(target)
+        started = time.monotonic()
+        result = executor.execute_internal(["/bin/echo", "now"])
 
-        self.assertTrue(managed.is_file())
+        self.assertEqual("now\n", result.stdout)
         self.assertLess(time.monotonic() - started, 1.0)
 
     # ---- Bounding a kubectl that cannot reach its control plane -------------

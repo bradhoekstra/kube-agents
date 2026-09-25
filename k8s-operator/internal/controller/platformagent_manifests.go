@@ -3642,23 +3642,27 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		//
 		// The cap bounds the read as well as the response: credential_proxy.py
 		// reads a command's output as it streams and drops everything past
-		// the cap, so what a command prints beyond it costs the broker
-		// nothing. (It used to hold the whole output until the command exited
-		// and truncate afterwards, which is what took the container past its
-		// limit under concurrent triage sessions.) What the broker does hold,
-		// per in-flight command and transiently, is about six times the cap:
-		// the two capped stream buffers, their decoded strings, and the JSON
-		// body and its encoding -- measured at 24 MiB per command against a
-		// 4 MiB cap.
+		// the cap, and bounds the decoded text to the same size, so what a
+		// command prints beyond it costs the broker nothing and output that is
+		// not UTF-8 (every byte a three-byte replacement character) cannot
+		// cost more than text. (It used to hold the whole output until the
+		// command exited and truncate afterwards, which is what took the
+		// container past its limit under concurrent triage sessions.) What the
+		// broker does hold, per in-flight request and transiently, is about
+		// six times the cap: the two capped stream buffers, their decoded
+		// text, and the JSON body and its encoding -- measured at 48 MiB per
+		// request against this 8 MiB cap for text, 37 MiB for bytes that are
+		// not UTF-8.
 		//
 		// Which is what ties this figure to the proxy container's own memory
 		// limit (buildCredentialProxyContainer) rather than to anything about
 		// the fleet. Concurrency is bounded inside the broker at the value set
-		// just below, so the burst is six times the cap times that: at 8 MiB
-		// and eight slots, 384 MiB on top of the 256Mi the container requests
-		// at rest, which its 1Gi limit absorbs. The limit must also hold the
+		// just below, and a request holds its slot until its response is
+		// written, so the burst is six times the cap times that: at 8 MiB and
+		// eight slots, 384 MiB on top of the 256Mi the container requests at
+		// rest, which its 1Gi limit absorbs. The limit must also hold the
 		// child processes themselves, one kubectl or gcloud per in-flight
-		// command, and a kubectl listing thousands of objects runs to hundreds
+		// request, and a kubectl listing thousands of objects runs to hundreds
 		// of MiB on its own; that term is outside this arithmetic and is what
 		// the rest of the limit is for. Raising either cap means raising the
 		// limit with it, which is why both are set here and so reserved rather
