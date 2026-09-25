@@ -592,7 +592,10 @@ into a second project the tester controls.
    listing decides its outcome, and every row a scope named by number keeps the number, `retiring`
    rows included. A fifth: a monitored project whose ID the scope model cannot carry (a legacy
    domain-scoped ID) reads `denied` by number, a stable fact reported and never a lookup failure
-   that would hold the prune; `exclude.projects` by number drops it.
+   that would hold the prune; `exclude.projects` by number drops it. A sixth: a member the run
+   could not name and no run has named holds the scope prune like a frozen container, because
+   the bare number could be any project, the one the same edit dropped from `projects` included,
+   and §7's prune never runs on a guess; naming it once, or excluding the number, releases it.
 4. **Downstream consumers.** The rows §8 marks 2: the drift detector's cross-project join,
    audit-log sinks per project or an aggregated sink, and the fleet-audit SOPs and cost skills
    iterating the snapshot.

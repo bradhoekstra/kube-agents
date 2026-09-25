@@ -2229,8 +2229,9 @@ class ScopeTest(HomesMixin):
         self.assertEqual((rows["222"]["via"], rows["222"]["outcome"], rows["222"]["clusters"], rows["222"][rec.NUMBER_KEY]),
                          ([self.SCOPE], rec.OUTCOME_DENIED, None, "222"))
         self.assertEqual(report["projects"]["222"], rec.OUTCOME_DENIED)
-        # A denied member does not hold the scope prune: a project the declaration dropped
-        # still retires. (p-old was in scope last run and is named by nothing now.)
+        # A member no run has named holds the scope prune (its number could be any project);
+        # one an earlier run named does not: reported under its ID, and a project the
+        # declaration dropped still retires. (p-old was in scope last run and is named by nothing now.)
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"},
                               {"id": "p-old", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}],
@@ -2240,7 +2241,7 @@ class ScopeTest(HomesMixin):
         # snapshot recorded its number, so it is reported under its ID and its profile kept.
         report, created, deleted = self._run({"metricsScopes": ["mon-proj"]}, lister,
                                              profiles=["cluster-old", "cluster-a"], identities=ids,
-                                             selectors={self.SCOPE: (["111", "222"], rec.OUTCOME_OK)})
+                                             selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)})
         self.assertEqual((created, deleted), ([(self.MGMT, "c", "us-central1")], []))
         rows = {p["id"]: p for p in self._snapshot()["projects"]}
         self.assertEqual((rows["team-a"]["outcome"], rows["team-a"][rec.NUMBER_KEY], rows["team-a"]["state"]),
@@ -2342,7 +2343,7 @@ class ScopeTest(HomesMixin):
     def test_a_project_id_the_scope_cannot_carry_reads_denied_and_does_not_hold_the_prune(self):
         with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="example.com:legacy\n")), \
              mock.patch.object(rec, "log") as logged:
-            self.assertEqual(rec._project_id_of("333"), (None, rec.OUTCOME_DENIED))
+            self.assertEqual(rec._project_id_of("333"), ("example.com:legacy", rec.OUTCOME_DENIED))
         self.assertIn("cannot carry", " ".join(str(c) for c in logged.call_args_list))
         # End to end: the member is reported by number, and a project the declaration dropped
         # still retires this run, because a denied member does not hold the scope prune.
@@ -2351,9 +2352,48 @@ class ScopeTest(HomesMixin):
         ids = {"cluster-old": _identity("p-old", "c")}
         report, _, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
                                  profiles=["cluster-old"], identities=ids,
-                                 selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+                                 selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": ("example.com:legacy", rec.OUTCOME_DENIED)})
         self.assertEqual(report["projects"]["333"], rec.OUTCOME_DENIED)
         self.assertEqual(report["retiring"], ["p-old"])
+        self.assertNotIn("unnamed", next(p for p in self._snapshot()["projects"] if p["id"] == "333"))
+
+    def test_a_member_no_run_has_named_holds_the_scope_prune_so_a_one_edit_migration_is_safe(self):
+        # team-b was explicit last run and was never named by number. This edit drops it from
+        # `projects` and declares the scope that reaches it, and the naming call for its number
+        # answers 403 (a custom role set without resourcemanager.projects.get, or a deny). The
+        # run cannot tell 222 from team-b, so nothing retires; team-b is carried in scope.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-b", "via": ["explicit"], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-b": _identity("team-b", "prod")}
+        with mock.patch.object(rec, "log") as logged:
+            report, created, deleted = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                                 profiles=["cluster-b"], identities=ids,
+                                                 selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)}, numbers={"222": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((created, deleted, report["retiring"]), ([], [], []))
+        self.assertIn("scope prune skipped this run: a Metrics Scope member could not be named and no run has named it (222)",
+                      " ".join(str(c) for c in logged.call_args_list))
+        rows = {p["id"]: p for p in self._snapshot()["projects"]}
+        self.assertEqual((rows["222"]["outcome"], rows["222"][rec.NUMBER_KEY]), (rec.OUTCOME_DENIED, "222"))
+        self.assertNotIn("unnamed", rows["222"])
+        self.assertEqual(rows["team-b"]["state"], rec.STATE_IN_SCOPE)
+        self.assertIn("cluster-b", report["kept"])
+        # The same run, once the grant lets the number be named: team-b is the member, listed.
+        report, _, deleted = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: [], "team-b": [("team-b", "prod", "us-central1")]},
+                                       profiles=["cluster-b"], identities=ids,
+                                       selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)}, numbers={"222": ("team-b", rec.OUTCOME_OK)})
+        self.assertEqual((deleted, report["retiring"], report["projects"]["team-b"]), ([], [], rec.OUTCOME_OK))
+
+    def test_a_selector_member_held_on_an_unreadable_tick_carries_the_unreadable_reason(self):
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "svc-a", "via": [self.HOST], "state": rec.STATE_IN_SCOPE}])
+        ids = {"cluster-a": _identity("svc-a", "prod")}
+        path = Path(self._tmp.name) / "scope.json"
+        path.write_text("{not json", encoding="utf-8")
+        os.environ[rec.SCOPE_FILE_ENV] = str(path)
+        report, _, deleted = self._run(None, {self.MGMT: []}, profiles=["cluster-a"], identities=ids)
+        self.assertEqual((deleted, report["retiring"]), ([], []))
+        self.assertEqual([u["reason"] for u in self._snapshot()["unmanaged"]],
+                         ["not judged this run: the declaration could not be read; carried forward"])
 
     def test_every_later_row_for_a_project_keeps_the_number_whatever_route_built_it(self):
         # Named by the scope once (222 -> team-b), then reached by other routes on later runs

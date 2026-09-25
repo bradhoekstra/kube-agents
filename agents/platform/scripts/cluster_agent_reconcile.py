@@ -610,12 +610,14 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
     """The project ID behind a project number, through the broker, and the outcome.
 
     `projects describe` needs `resourcemanager.projects.get`, which every read role the scope
-    binds carries, so a monitored project the account cannot name is one it holds no role in:
-    the same `denied` its listing would have read. An answer the scope model cannot carry (a
-    legacy domain-scoped `example.com:name` ID, with a `:` no exclusion, profile name or declared
-    value can carry) reads `denied` too: a stable fact
-    about the estate, reported by number and dropped by naming the number in `exclude.projects`,
-    never `unreachable`, which would hold the scope prune for the whole install on every tick.
+    binds carries, so under the default set a monitored project the account cannot name is one
+    it holds no role in: the same `denied` its listing would have read. An answer the scope
+    model cannot carry (a legacy domain-scoped `example.com:name` ID, with a `:` no exclusion,
+    profile name or declared value can carry) is returned as it came, with `denied`: the caller
+    reads it as a known identity the set cannot hold, a stable fact reported by number and
+    dropped by naming the number in `exclude.projects`, never `unreachable`, which would hold
+    the scope prune for the whole install on every tick. (None, outcome) is an identity the run
+    does not know at all.
     """
     cmd = ["gcloud", "projects", "describe", number, f"--format={PROJECT_ID_FORMAT}"]
     try:
@@ -627,7 +629,7 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
             log(f"naming project {number} returned {project!r}, a project ID the scope cannot carry "
                 f"(a legacy domain-scoped ID); reported by number as {OUTCOME_DENIED}, so the prune is not held. "
                 "Name the number in spec.scope.exclude.projects to drop it from the set.")
-            return None, OUTCOME_DENIED
+            return project, OUTCOME_DENIED
         return project, OUTCOME_OK
     except subprocess.CalledProcessError as e:
         outcome = _classify_list_failure(e.stderr or "")
@@ -661,7 +663,11 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     not be named this run. Such a member is reported under the ID the last snapshot recorded
     for its number, and under the bare number when no run has named it yet (no outcome is
     silent, design §4); either way it is not listed and nothing is created under it, unless a
-    declared container places it, which lists it as it lifts a frozen member. None
+    declared container places it, which lists it as it lifts a frozen member. A member reported
+    by number whose identity no run knows is `unnamed`: the caller holds the scope prune for the
+    run, because that number could be any project, including one the same edit dropped from
+    `projects`, and a project pruned on that guess is the deletion this script never makes. A
+    number named to an ID the scope cannot carry is a known identity and holds nothing. None
     members means the selector's own lookup failed.
     """
     numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
@@ -678,15 +684,21 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
                 resolved.setdefault(member, {"outcome": None, NUMBER_KEY: None})
                 continue
             project, naming = named.get(member, (None, OUTCOME_UNREACHABLE))
-            if project:
+            if project and naming == OUTCOME_OK:
                 resolved.setdefault(project, {"outcome": None, NUMBER_KEY: member})
+            elif project:
+                # Named, to an ID the set cannot carry: a known identity, reported by number.
+                resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member})
             elif member in known:
                 log(f"{selector}: project {member} ({known[member]}) could not be named this run ({naming}); "
                     "reported under the ID the last snapshot recorded, not listed.")
                 resolved.setdefault(known[member], {"outcome": naming, NUMBER_KEY: member})
             else:
-                log(f"{selector}: project {member} could not be named ({naming}); reported by number, not listed.")
-                resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member})
+                log(f"{selector}: project {member} could not be named ({naming}) and no run has named it; "
+                    "reported by number, not listed, and the scope prune is held this run: the number could "
+                    "be a project this declaration just dropped. Grant resourcemanager.projects.get there, "
+                    "or name the number in spec.scope.exclude.projects.")
+                resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member, "unnamed": True})
         out[selector] = (resolved, outcome)
     return out
 
@@ -802,8 +814,9 @@ def _resolve_projects(management: str | None, scope: dict,
             containers.append({"id": selector, "outcome": outcome, "projects": len(carried)})
             continue
         for project, info in members.items():
-            merged = selected.setdefault(project, {"via": [], "outcome": None, NUMBER_KEY: None, "live": False})
+            merged = selected.setdefault(project, {"via": [], "outcome": None, NUMBER_KEY: None, "live": False, "unnamed": False})
             merged["via"].append(selector)
+            merged["unnamed"] = merged["unnamed"] or bool(info.get("unnamed"))
             # A selector that named the project live (outcome None: still to be listed) wins
             # over one whose naming call failed for it: that failure says the number could
             # not be named this run, not that the project cannot be listed, and the live
@@ -846,6 +859,7 @@ def _resolve_projects(management: str | None, scope: dict,
         # naming call that was cut or refused.
         entries.append({"id": project, "via": sorted(info["via"]), "outcome": outcome,
                         **({"frozen": True} if info["outcome"] else {}),
+                        **({"unnamed": True} if info["unnamed"] and not info["live"] else {}),
                         **({NUMBER_KEY: info[NUMBER_KEY]} if info[NUMBER_KEY] else {})})
     for selector, project, outcome in sorted(frozen_selected):
         if project in seen:
@@ -1427,12 +1441,19 @@ def reconcile(dry_run: bool = False) -> dict:
     elif management_changed:
         log(f"management project changed from {previous_management} to {management}, which did not "
             "list its clusters; the old project is carried forward and nothing is judged this run.")
+    # A Metrics Scope member the run could not name and no run has named is an identity the
+    # run does not know: the bare number could be the project this very declaration dropped
+    # from `projects` (the one-edit migration), and a project retired on that guess is the
+    # deletion this script never makes. It holds the scope prune the way a frozen container
+    # does, until the account can name it or the operator excludes the number.
+    unnamed = sorted(e["id"] for e in entries if e.get("unnamed"))
     lookups_clean = (management is not None and management_listed and scope_readable
-                     and not management_changed
+                     and not management_changed and not unnamed
                      and all(e["outcome"] != OUTCOME_UNREACHABLE for e in entries)
                      and all(c["outcome"] in (OUTCOME_OK, OUTCOME_OVER_CAP) for c in containers))
     if not lookups_clean and not management_changed:
         why = ("the management project did not list its own clusters" if management and not management_listed
+               else f"a Metrics Scope member could not be named and no run has named it ({', '.join(unnamed)})" if unnamed
                else "a lookup or the declaration could not be trusted")
         log(f"scope prune skipped this run: {why}.")
     declared_containers = set(_container_ids(scope))
@@ -1488,7 +1509,8 @@ def reconcile(dry_run: bool = False) -> dict:
             # one hold is a render that predates the selectors (a rollback), which declares
             # nothing about them and keeps their members without a clock, as for containers.
             if any(_is_selector(v) for v in via) and not selectors_known:
-                held_reason[project] = "reached through a selector the running render does not know; kept"
+                held_reason[project] = ("reached through a selector the running render does not know; kept" if scope_readable
+                                        else "not judged this run: the declaration could not be read; carried forward")
                 return True
             if not (containers_known and (newly_declared_containers or _previous_absent_since(previous, project))):
                 return False
