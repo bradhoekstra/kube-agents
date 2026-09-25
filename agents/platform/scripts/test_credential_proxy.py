@@ -3175,6 +3175,62 @@ class CommandExecutorTest(unittest.TestCase):
         with executor.request_slot():
             pass
 
+    def test_a_wait_for_a_slot_is_logged(self):
+        # The log line is what an operator sizing the cap reads; the command's
+        # own duration does not include the wait, since `_execute` starts its
+        # clock after admission.
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=0.5)
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_LOG_MS", 100):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                with executor.request_slot():
+                    result = executor.execute_internal(["/bin/echo", "after the wait"])
+
+        self.assertTrue(
+            any("request waited" in line and "for a slot" in line for line in logs.output)
+        )
+        self.assertLess(result.duration_ms, 400)
+
+    def test_an_emptied_group_gets_no_sigkill(self):
+        # Once the group is seen empty its id is free for reuse, so the second
+        # signal goes only to a group the grace ran out on.
+        sent = []
+        real_killpg = os.killpg
+
+        def recording(pgid, signum):
+            sent.append(signum)
+            return real_killpg(pgid, signum)
+
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1), body="sleep 10"
+        )
+        with mock.patch("credential_proxy.os.killpg", recording):
+            result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertIn(credential_proxy.signal.SIGTERM, sent)
+        self.assertNotIn(credential_proxy.signal.SIGKILL, sent)
+
+    def test_the_kubeconfig_cache_fill_runs_on_the_short_deadline(self):
+        # Two silent gcloud calls ahead of the kubectl, inside one request:
+        # on the broker-wide deadline they alone could outlast the idle time
+        # Envoy allows the stream.
+        executor = self.fake_gcloud(self.executor(kubectl_timeout_seconds=7))
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(kwargs.get("timeout_seconds"))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            executor._ensure_managed_kubeconfig(target)
+
+        self.assertTrue(seen, "no gcloud ran for the cache fill")
+        self.assertEqual({7}, set(seen))
+
     def test_commands_take_no_slot_of_their_own(self):
         # A slot is a request's, held by the route around the command and the
         # response; a command never queues on its own. So the kubeconfig

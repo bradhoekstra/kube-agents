@@ -3323,14 +3323,15 @@ def _kill_process_group(process: subprocess.Popen) -> None:
 
     SIGTERM first, so a program that cleans up on it -- git and its lock files
     above all -- gets KILL_GRACE_SECONDS to do so, then SIGKILL to the whole
-    group `_execute` started, whether or not the direct child is still there.
-    `poll` reports the child alone, and a helper it started that ignores
-    SIGTERM would otherwise outlive the kill, holding the pipes and running on
-    outside the slot it was counted under. Signalling the group after the
-    child was reaped is safe: Linux keeps a pid allocated while it is a live
-    group's id, and an empty group answers ESRCH, which is swallowed. The grace
-    is the group's, not the child's -- the loop waits for the group to empty,
-    so a helper cleaning up after its parent exited gets the same two seconds.
+    group `_execute` started if anything in it is still there. `poll` reports
+    the child alone, and a helper it started that ignores SIGTERM would
+    otherwise outlive the kill, holding the pipes and running on outside the
+    slot it was counted under. The grace is the group's, not the child's: the
+    loop waits for the group to empty, so a helper cleaning up after its
+    parent exited gets the same two seconds, and Linux keeps the group's id
+    allocated for as long as any member lives. A group seen empty gets no
+    SIGKILL at all -- with the child reaped its id is free for reuse, and the
+    next new session in this container is the likeliest taker.
     """
 
     def signal_group(signum: int) -> None:
@@ -3357,7 +3358,10 @@ def _kill_process_group(process: subprocess.Popen) -> None:
         # group looking occupied for the whole grace.
         process.poll()
         if group_is_empty():
-            break
+            # Nothing left to kill, and once the child is reaped the group's
+            # id is free for reuse -- by another command's new session, most
+            # likely -- so an emptied group is left alone.
+            return
         time.sleep(KILL_POLL_SECONDS)
     signal_group(signal.SIGKILL)
 
@@ -4603,7 +4607,12 @@ class CommandExecutor:
             return []
 
         def run(argv: list[str]) -> tuple[int, str]:
-            result = self._execute([gcloud, *argv[1:]])
+            # The short deadline: this is a control-plane lookup made on the
+            # way to a kubectl, not a command the caller chose, and it runs
+            # silently under the kubeconfig lock. See _ensure_managed_kubeconfig.
+            result = self._execute(
+                [gcloud, *argv[1:]], timeout_seconds=self.kubectl_timeout_seconds
+            )
             return result.exit_code, result.stdout
 
         return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
@@ -4639,6 +4648,12 @@ class CommandExecutor:
                         *self._dns_endpoint_args(gcloud, target),
                     ],
                     kubeconfig_path=scratch,
+                    # The short deadline, as for the describe above. A
+                    # credential fetch takes seconds when the API answers, and
+                    # when it does not, five minutes of silence here -- ahead of
+                    # the kubectl's own deadline, inside the same request --
+                    # would outlast the idle timeout Envoy allows the stream.
+                    timeout_seconds=self.kubectl_timeout_seconds,
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
@@ -6045,36 +6060,39 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if route is None:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
+        body_limit = max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
         try:
-            payload = self._read_json_body(
-                max_bytes=max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
-            )
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
-            return
-        # The managed-repository control, on the same footing as
-        # `require_managed_workspace` on the content routes: the broker holds
-        # the forge credential, so "is this a repository we write to" can only
-        # be answered here. Nothing downstream answers it -- a forge is handed a
-        # repository and spends the token on it -- so this is the whole of the
-        # check for these routes.
-        #
-        # Resolved rather than compared as given, because the managed list holds
-        # slugs and a caller may name a repository by URL. Resolving here also
-        # rejects a host this install serves no credential for before the write
-        # verb is entered, which is the same order `/v1/forge/refresh` uses.
-        if verb in vcs_broker.WRITE_VERBS:
-            try:
-                _, repository = self.vcs.registry.resolve(payload.get("repository"))
-            except providers.WorkspaceError as exc:
-                self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                return
-            if not self._repository_is_permitted(repository):
-                return
-        try:
-            # One slot for the verb's git commands and the response together;
-            # see CommandExecutor.request_slot.
+            # One slot for the whole request: the body, which may carry a
+            # bundle of tens of MiB and is not read until the request is
+            # admitted, the verb's git commands, and the response. See
+            # CommandExecutor.request_slot for why the response is inside it;
+            # the body is inside it for the same reason, from the other end.
             with self._request_slot():
+                try:
+                    payload = self._read_json_body(max_bytes=body_limit)
+                except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                # The managed-repository control, on the same footing as
+                # `require_managed_workspace` on the content routes: the broker
+                # holds the forge credential, so "is this a repository we write
+                # to" can only be answered here. Nothing downstream answers it
+                # -- a forge is handed a repository and spends the token on it
+                # -- so this is the whole of the check for these routes.
+                #
+                # Resolved rather than compared as given, because the managed
+                # list holds slugs and a caller may name a repository by URL.
+                # Resolving here also rejects a host this install serves no
+                # credential for before the write verb is entered, which is the
+                # same order `/v1/forge/refresh` uses.
+                if verb in vcs_broker.WRITE_VERBS:
+                    try:
+                        _, repository = self.vcs.registry.resolve(payload.get("repository"))
+                    except providers.WorkspaceError as exc:
+                        self._json(HTTPStatus(exc.status), _redacted_fields(exc))
+                        return
+                    if not self._repository_is_permitted(repository):
+                        return
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
         except CallerHungUp:
@@ -6116,8 +6134,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except CommandSlotUnavailable as exc:
-            # Raised before the verb starts, so nothing is left half-done.
-            LOGGER.warning("vcs %s queued too long", verb)
+            # Raised before the body was read, so nothing is left half-done --
+            # and the body is drained before the answer, or a caller still
+            # sending a large one would see the connection reset in place of
+            # the 503.
+            LOGGER.warning("command queued too long verb=%s", verb)
+            drain_request_body(self, body_limit)
             self._busy(exc)
             return
         except Exception as exc:

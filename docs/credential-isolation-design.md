@@ -761,7 +761,9 @@ Consequences:
   encoding). The two caps together are therefore what the broker container's
   memory limit is sized against, and they move with that limit in the
   operator rather than through the CR. The exec and vcs routes hold a slot;
-  the forge refresh (a short call to the minter), the content workspace's git
+  the vcs route reads its body, which may carry a bundle of tens of MiB, only
+  once admitted, while the exec route's body (at most 1 MiB) is read before.
+  The forge refresh (a short call to the minter), the content workspace's git
   (serialised by the store's own lock) and the Cloud API relay (a bounded read
   of its own) take none. A request that waits more than 60 seconds for a slot
   is answered `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
@@ -780,12 +782,17 @@ Consequences:
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
   and a half-closed one look alike, runs its commands unwatched.
-- Envoy's stream idle timeout in front of the runtime is ten minutes, above
-  the broker's five-minute deadline plus the slot wait, the kill grace and the
-  drain, so a silent long-running command that reaches its deadline is still
-  answered with its partial output and the timed-out notice rather than reset
-  by Envoy first. An operator raising `CREDENTIAL_PROXY_TIMEOUT_SECONDS` past
-  about nine minutes raises the Envoy timeout with it.
+- Envoy's stream idle timeout in front of the runtime is twenty minutes. The
+  broker writes nothing to a stream until the request is answered, and one
+  request can run more than one command back to back: a vcs publish fetches
+  and then pushes, each with the full five-minute deadline, and a kubectl
+  naming a cluster whose kubeconfig is not cached fetches credentials first,
+  on the shorter kubectl deadline. Twenty minutes covers two deadlines plus
+  the slot wait, the kill grace and the drain, so a silent request that
+  reaches its deadline is still answered with its partial output and the
+  timed-out notice rather than reset by Envoy first. An operator raising
+  `CREDENTIAL_PROXY_TIMEOUT_SECONDS` raises the Envoy timeout with it, keeping
+  it above twice the deadline plus the minute.
 
 ### Cloud API reads
 
