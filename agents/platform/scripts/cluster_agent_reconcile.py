@@ -633,9 +633,14 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 
 def _previous_numbers(previous: dict | None) -> dict[str, str]:
-    """project number -> ID, from every snapshot row a past run named by number."""
+    """project number -> ID, from every snapshot row a past run named by number.
+
+    A row written under the bare number (never named) is not a mapping and is left out, so
+    the log says "reported by number" for it rather than naming an ID that is the number.
+    """
     return {p[NUMBER_KEY]: p["id"] for p in (previous or {}).get("projects", [])
-            if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)}
+            if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)
+            and p["id"] != p[NUMBER_KEY]}
 
 
 def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: dict | None,
@@ -773,7 +778,8 @@ def _resolve_projects(management: str | None, scope: dict,
     # over-cap on its own past the cap, the way an explicit project does. A selector's own
     # row in `containers` records the lookup; a failed lookup carries its previous members
     # frozen, after the live ones, so a project one selector froze and another named live is
-    # listed. A monitored project that could not be named (`outcome` set) is in the set,
+    # listed. A monitored project that could not be named (`outcome` set), and that no other
+    # selector named live, is in the set,
     # reported, and not listed: nothing is created under a project the run cannot read.
     selected: dict[str, dict] = {}
     frozen_selected: list[tuple[str, str, str]] = []
@@ -785,9 +791,16 @@ def _resolve_projects(management: str | None, scope: dict,
             containers.append({"id": selector, "outcome": outcome, "projects": len(carried)})
             continue
         for project, info in members.items():
-            merged = selected.setdefault(project, {"via": [], "outcome": None, NUMBER_KEY: None})
+            merged = selected.setdefault(project, {"via": [], "outcome": None, NUMBER_KEY: None, "live": False})
             merged["via"].append(selector)
-            merged["outcome"] = merged["outcome"] or info.get("outcome")
+            # A selector that named the project live (outcome None: still to be listed) wins
+            # over one whose naming call failed for it: that failure says the number could
+            # not be named this run, not that the project cannot be listed, and the live
+            # selector shows it can.
+            if info.get("outcome") is None:
+                merged["live"], merged["outcome"] = True, None
+            elif not merged["live"]:
+                merged["outcome"] = merged["outcome"] or info["outcome"]
             merged[NUMBER_KEY] = merged[NUMBER_KEY] or info.get(NUMBER_KEY)
         containers.append({"id": selector, "outcome": OUTCOME_OK, "projects": len(members)})
     for project in sorted(selected):

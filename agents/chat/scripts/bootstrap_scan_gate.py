@@ -212,7 +212,10 @@ def _unlisted_projects(data_dir: Path) -> list[tuple[str, str]]:
 
 
 def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
-    """Folders and organisations the last reconcile could not resolve, as (id, outcome, projects)."""
+    """Every row of the snapshot's `containers` array the last reconcile could not resolve, as (id, outcome, projects).
+
+    A row is a folder, an organisation, a Shared VPC host or a Metrics Scope; the kind is not read here.
+    """
     try:
         snapshot = json.loads((data_dir / SCOPE_SNAPSHOT_NAME).read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 - absent or unreadable: nothing to name
@@ -229,8 +232,8 @@ def _unresolved_containers(data_dir: Path) -> list[tuple[str, str, int]]:
 def _scope_has_other_projects(data_dir: Path) -> bool:
     """Whether the last reconcile's scope reaches beyond one project.
 
-    True when the snapshot names more than one project, or any declared folder or
-    organisation. The task body speaks of "the project" on an install with no scope,
+    True when the snapshot names more than one project, or any declared folder,
+    organisation, Shared VPC host or Metrics Scope. The task body speaks of "the project" on an install with no scope,
     exactly as it did before scopes existed, and of "the projects in scope" only then,
     so a single-project install renders the same prompt as before.
     """

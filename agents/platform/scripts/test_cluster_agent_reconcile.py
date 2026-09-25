@@ -2259,6 +2259,40 @@ class ScopeTest(HomesMixin):
         self.assertEqual(len(rows), 1)
         self.assertEqual((rows[0]["via"], rows[0][rec.NUMBER_KEY]), ([self.SCOPE, self.HOST], "111"))
 
+    def test_a_project_one_selector_names_live_is_listed_when_anothers_naming_call_fails(self):
+        # Last run named 111 as team-a. This run the naming call fails (a slow pool, a revoked
+        # grant on the resourcemanager read) while the Shared VPC host still names team-a by
+        # ID: the live selector wins, the project lists, and the row carries both vias.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        for naming in (rec.OUTCOME_UNREACHABLE, rec.OUTCOME_DENIED):
+            report, created, _ = self._run({"sharedVpcHosts": ["host-proj"], "metricsScopes": ["mon-proj"]},
+                                           {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")]},
+                                           selectors={self.HOST: (["team-a"], rec.OUTCOME_OK), self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                           numbers={"111": (None, naming)})
+            self.assertEqual(created, [("team-a", "prod", "us-central1")], naming)
+            rows = [p for p in self._snapshot()["projects"] if p["id"] == "team-a"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual((rows[0]["outcome"], rows[0]["via"], rows[0][rec.NUMBER_KEY]),
+                             (rec.OUTCOME_OK, [self.SCOPE, self.HOST], "111"), naming)
+            self.assertEqual(report["retiring"], [])
+        # Without the live selector the same failure is reported under the recorded ID, not listed.
+        report, created, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")]},
+                                       selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)}, numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(created, [])
+        self.assertEqual(report["projects"]["team-a"], rec.OUTCOME_DENIED)
+
+    def test_a_row_written_under_the_bare_number_is_no_mapping(self):
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "222", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}])
+        self.assertEqual(rec._previous_numbers(self._snapshot()), {})
+        with mock.patch.object(rec, "log") as logged:
+            report, _, _ = self._run({"metricsScopes": ["mon-proj"]}, {self.MGMT: []},
+                                     selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)})
+        self.assertIn("reported by number, not listed", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(report["projects"]["222"], rec.OUTCOME_DENIED)
+
     def test_an_excluded_selector_member_is_dropped_and_the_management_project_keeps_both_vias(self):
         report, created, _ = self._run({"sharedVpcHosts": ["host-proj"], "exclude": {"projects": ["*-scratch"]}},
                                        {self.MGMT: [(self.MGMT, "m", "us-central1")], "team-a": [("team-a", "prod", "us-central1")],

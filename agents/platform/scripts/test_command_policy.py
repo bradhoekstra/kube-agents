@@ -740,7 +740,7 @@ class GcloudReadOnlyTest(unittest.TestCase):
         # (docs/designs/multi-project-scope.md §10 step 3). Both pass --format and
         # nothing else, and --format is already in the flag table.
         self.assertTrue(evaluate(["gcloud", "compute", "shared-vpc", "list-associated-resources",
-                                  "bhoekstra-gkedemos", "--format=json(id,type)"]).allowed)
+                                  "host-proj", "--format=json(id,type)"]).allowed)
         self.assertTrue(evaluate(["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
                                   "locations/global/metricsScopes/my-proj", "--format=json"]).allowed)
         # The writes one word away attach and detach a service project, or link and
