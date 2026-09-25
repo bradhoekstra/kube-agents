@@ -2107,6 +2107,15 @@ class ExecRouteCapacityTest(unittest.TestCase):
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
+    def assert_slot_released(self, executor):
+        """The slot goes once the response is written, and the client can read
+        that response a moment before the handler thread leaves the `with`;
+        wait for the release rather than race it."""
+        deadline = time.monotonic() + 5
+        while executor.slots_in_use and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(0, executor.slots_in_use)
+
     @staticmethod
     @contextlib.contextmanager
     def no_slot_free(caller=None):
@@ -2160,7 +2169,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual({"ok": True}, body)
         self.assertEqual([("verb", 1), ("write", 1)], seen)
-        self.assertEqual(0, executor.slots_in_use)
+        self.assert_slot_released(executor)
 
     def test_a_broker_at_its_cap_answers_503_with_a_reason_the_shim_prints(self):
         # `error` is the key the shim prints for a non-policy failure, so the
@@ -2192,7 +2201,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
         self.assertEqual(200, status)
         self.assertEqual([1], seen)
-        self.assertEqual(0, CredentialProxyHandler.executor.slots_in_use)
+        self.assert_slot_released(CredentialProxyHandler.executor)
 
     def test_a_replacement_character_is_three_bytes_on_the_wire(self):
         # ASCII-escaped JSON writes `\ufffd`, six bytes for one byte that was
