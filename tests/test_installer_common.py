@@ -2430,6 +2430,23 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
 
+    def test_containers_on_the_live_cr_are_reported_and_never_weighed(self):
+        # folders and organizations (phase 2) have no installer key and the
+        # chart renders neither, so an apply leaves them alone: a CR carrying
+        # only containers passes with a note, and a refused mixed edit still
+        # prints the three lines it can reproduce plus the note.
+        only_containers = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"folders":["123456789012"],'
+                           '"organizations":["987654321098"]}}}]}')
+        proc = self._run(only_containers, "norelease")
+        self._assert_rc(proc, 0)
+        self.assertIn("also declares folders: 123456789012 organizations: 987654321098, which the installer has no key for yet", proc.stdout)
+        mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
+                 '"folders":["123456789012"]}}}]}')
+        proc = self._run(mixed, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
+        self.assertIn("also declares folders: 123456789012, which the installer has no key for yet", proc.stdout)
+
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.
         record = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'

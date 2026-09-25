@@ -908,6 +908,9 @@ require_scope_cluster_triples() {
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
+# L, R and K are the projects and exclusions; the folders and organizations
+# lists phase 2 added are reported when the CR carries them and never weighed,
+# because the chart renders neither and an apply leaves them as they are.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1002,8 +1005,16 @@ if live_raw is None:
     print(ok)
     sys.exit(0)
 live = normalise(live_raw)
+# The container lists phase 2 added to the CR. The chart renders neither and
+# the installer has no key for them, so an apply leaves them as they are; they
+# are reported on the second output line, never weighed in the verdict.
+containers = " ".join(
+    k + ": " + " ".join(sorted(set(live_raw.get(k) or [])))
+    for k in ("folders", "organizations") if live_raw.get(k)
+)
 if is_empty(live):
     print(ok)
+    print(containers)
     sys.exit(0)
 def recorded(text):
     raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
@@ -1019,8 +1030,10 @@ declared = normalise({
 })
 if live in records or live == declared:
     print(ok)
+    print(containers)
     sys.exit(0)
 print(refuse)
+print(containers)
 print(items[0]["metadata"]["name"])
 print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
@@ -1030,9 +1043,15 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
     return $?
   fi
   first_line="${verdict%%$'\n'*}"
-  [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
-  local cr_name lines
+  local containers lines cr_name
   lines="${verdict#*$'\n'}"
+  [ "$lines" != "$verdict" ] || lines=""
+  containers="${lines%%$'\n'*}"
+  if [ -n "$containers" ]; then
+    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders no container list and leaves them as they are."
+  fi
+  [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
+  lines="${lines#*$'\n'}"
   cr_name="${lines%%$'\n'*}"
   lines="${lines#*$'\n'}"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
@@ -2143,9 +2162,9 @@ write_tfvars_from_state() {
     echo ""
     echo "# The projects beyond project_id whose GKE clusters get a Cluster Agent, and"
     echo "# what to leave unmanaged (SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
-    echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written: an emptied projects"
-    echo "# list is the declaration that drops projects; a missing block would declare"
-    echo "# nothing."
+    echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
+    echo "# the declaration the composition renders either way, empty lists included;"
+    echo "# an emptied projects list is the declaration that drops projects."
     hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
