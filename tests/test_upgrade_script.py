@@ -708,10 +708,6 @@ class HarnessRetagKeysTest(_StubHelm, unittest.TestCase):
         self.assertIn("Could not read the values of Helm release", proc.stdout)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ScopeCheckWiringTest(unittest.TestCase):
     """The pre-apply scope check sits where the apply is, and only there: the
     full arm refuses before `run_lifecycle ... apply`, a plan warns, and the
@@ -755,3 +751,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         common = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
         self.assertIn("apply_crd_upgrades() {", common)
         self.assertIn('kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts', common)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -994,10 +994,11 @@ main() {
 
     full)
       print_step "4. Executing Full Atomic Upgrade (Terraform + Helm)"
-      # First, so a refused run has changed nothing: the apply renders
-      # spec.scope from install.env over the live CR, and a scope the CR
-      # carries that neither the release record nor the keys account for is
-      # refused here rather than replaced.
+      # First in this arm, so a refusal leaves the cluster's schema and
+      # release as they were (the credentials fetch and the Secret backfills
+      # above have run): the apply renders spec.scope from install.env over
+      # the live CR, and a scope the CR carries that neither the release
+      # record nor the keys account for is refused here rather than replaced.
       refuse_apply_over_undeclared_scope "$target_namespace" || exit 1
       apply_crd_upgrades "$repo_dir"
       # install.sh's post-generation minter guard, without its import step:

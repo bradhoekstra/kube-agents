@@ -948,16 +948,20 @@ refuse_apply_over_undeclared_scope() {
       return $rc
     fi
   else
-    # The last revision that served, when the latest did not (a failed
-    # upgrade): its values are what the CR still holds. A history that cannot
-    # be read leaves only the latest revision to compare against.
+    # The last revision that served, and only when the latest did not (a
+    # failed or pending upgrade): its values are what the CR still holds. On a
+    # healthy release the latest revision is the one record, so a hand edit
+    # that happens to restore an earlier scope is still a hand edit. A history
+    # that cannot be read leaves only the latest revision to compare against.
     served_rev="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>/dev/null \
       | python3 -c '
 import json, sys
 statuses = sys.argv[1].split()
 revisions = json.load(sys.stdin) or []
-latest = max((r["revision"] for r in revisions), default=0)
-served = [r["revision"] for r in revisions if r.get("status") in statuses and r["revision"] != latest]
+latest = max(revisions, key=lambda r: r["revision"], default=None)
+served = [] if latest is None or latest.get("status") in statuses else [
+    r["revision"] for r in revisions if r.get("status") in statuses
+]
 print(max(served) if served else "")
 ' "$HELM_SERVED_REVISION_STATUSES" 2>/dev/null || true)"
     if [ -n "$served_rev" ]; then

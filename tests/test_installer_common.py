@@ -2201,7 +2201,7 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
                 self.assertNotIn(unguarded, source, f"{path.name}: a probe lost its `trap - ERR`")
 
 
-class ScopeKeysReachTheTfvarsTest(InstallerCommonTest):
+class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
     """The three SCOPE_* keys become the composition's `scope` object.
 
     Always a full block, empty lists included: the reconcile reads an emptied
@@ -2210,6 +2210,11 @@ class ScopeKeysReachTheTfvarsTest(InstallerCommonTest):
     never omits it. Only the shape of an excluded cluster is checked here; the
     CRD's patterns, caps and repeats are the module variable's validations.
     """
+
+    # The generator harness, borrowed rather than inherited: subclassing the
+    # concrete test class would run its whole suite a second time.
+    _run = InstallerCommonTest._run
+    _tfvars = InstallerCommonTest._tfvars
 
     EMPTY_BLOCK = (
         "scope = {\n"
@@ -2300,10 +2305,11 @@ class PreApplyScopeCheckTest(unittest.TestCase):
     "warn", where a plan applies nothing.
     """
 
-    def _run(self, cr, record, keys=None, mode="", context_present=True, served=None):
+    def _run(self, cr, record, keys=None, mode="", context_present=True, served=None, latest_failed=True):
         """cr / record: a JSON string the stub prints, or one of the failure
         spellings: 'notype', 'norelease', 'err'. served: the values of the
-        last revision that served when the latest revision failed."""
+        previous revision; with latest_failed the history reads deployed then
+        failed, otherwise superseded then deployed."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -2327,7 +2333,9 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 history = '[{"revision": 3, "status": "deployed"}]'
                 served_case = "exit 1"
             else:
-                history = '[{"revision": 3, "status": "deployed"}, {"revision": 4, "status": "failed"}]'
+                history = ('[{"revision": 3, "status": "deployed"}, {"revision": 4, "status": "failed"}]'
+                           if latest_failed else
+                           '[{"revision": 3, "status": "superseded"}, {"revision": 4, "status": "deployed"}]')
                 served_case = f"printf '%s\\n' '{served}'; exit 0"
             (bin_dir / "helm").write_text(
                 "#!/usr/bin/env bash\n"
@@ -2408,6 +2416,19 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         # And without a served revision that matches, the same shape is refused.
         proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"}, served=latest)
         self._assert_rc(proc, 1)
+
+    def test_a_previous_revisions_scope_is_not_a_record_once_the_latest_served(self):
+        # Revision 3 (superseded) rendered [p2, p3]; revision 4 (deployed)
+        # rendered [p2] and the CR held it, until a hand edit put p3 back. The
+        # latest revision served, so it is the one record: the hand edit is
+        # refused, not read as the installer's own earlier declaration.
+        latest = '{"platformAgent":{"scope":{"projects":["p2-project"],"exclude":{"projects":[],"clusters":[]}}}}'
+        previous = ('{"platformAgent":{"scope":{"projects":["p3-project","p2-project"],"exclude":{"projects":[],'
+                    '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        proc = self._run(_LIVE_SCOPE_CR, latest, keys={"SCOPE_PROJECTS": "p2-project"},
+                         served=previous, latest_failed=False)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
 
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.

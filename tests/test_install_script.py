@@ -7029,11 +7029,6 @@ class BannerColourVariablesAreDefinedTest(unittest.TestCase):
         )
 
 
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
     """The scope flags follow the install.env contract every other key does.
 
@@ -7110,7 +7105,9 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
         # Applied, an empty flag would drop every scoped project for one run
         # while install.env still named them; the file is where a scope is
         # emptied on purpose.
-        for flag in ("--scope-projects", "--scope-exclude-projects", "--scope-exclude-clusters"):
+        for flag, key in (("--scope-projects", "SCOPE_PROJECTS"),
+                          ("--scope-exclude-projects", "SCOPE_EXCLUDE_PROJECTS"),
+                          ("--scope-exclude-clusters", "SCOPE_EXCLUDE_CLUSTERS")):
             for value in ("", ",", " ", " , "):
                 with self.subTest(flag=flag, value=value):
                     proc = subprocess.run(
@@ -7120,7 +7117,9 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
                     self.assertNotIn("REACHED", proc.stdout)
                     out = proc.stdout + proc.stderr
                     self.assertIn(f"{flag}= was given an empty value", out)
-                    self.assertIn("set SCOPE_PROJECTS= (empty) in install.env", out)
+                    # The remedy names the flag's own key: an operator clearing an
+                    # exclusion must not be told to empty the project list.
+                    self.assertIn(f"set {key}= (empty) in install.env", out)
 
     def test_the_flags_are_in_the_help_text(self):
         proc = subprocess.run(
@@ -7193,5 +7192,17 @@ class ScopeCheckWiringTest(unittest.TestCase):
     def test_the_generate_only_handoff_says_the_check_does_not_run_there(self):
         self.assertIn("The live-scope check does not run here", self.text)
 
+    def test_the_generate_only_handoff_applies_the_crds_before_the_apply(self):
+        # lifecycle.sh applies no CRDs; on an existing install a field the
+        # served schema lacks would be pruned from the CR and never re-sent.
+        handoff = self.text[self.text.index('2. Apply via lifecycle.sh'):]
+        crds = handoff.index("kubectl apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/")
+        apply = handoff.index("./lifecycle.sh apply")
+        self.assertLess(crds, apply)
+
     def test_python3_is_a_required_tool(self):
         self.assertIn("for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do", self.text)
+
+
+if __name__ == "__main__":
+    unittest.main()

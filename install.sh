@@ -730,12 +730,17 @@ flag_bool_value() {
 # named them, and the next upgrade would add them back. Refused, like an empty
 # toggle; the file is where a scope is emptied on purpose.
 require_scope_flag_value() {
-  local flag="$1" value="${2:-}"
+  local flag="$1" value="${2:-}" key
   # A value that is nothing but separators (`,`, a space) renders the same
   # empty list an empty value does, so it is refused the same way.
   [[ "$value" == *[![:space:],]* ]] && return 0
+  case "$flag" in
+    --scope-projects) key="SCOPE_PROJECTS" ;;
+    --scope-exclude-projects) key="SCOPE_EXCLUDE_PROJECTS" ;;
+    *) key="SCOPE_EXCLUDE_CLUSTERS" ;;
+  esac
   print_error "${flag}= was given an empty value."
-  print_info "To drop every project from the scope, set SCOPE_PROJECTS= (empty) in install.env and re-run; to keep the recorded scope, omit the flag."
+  print_info "To clear it, set ${key}= (empty) in install.env and re-run; to keep the recorded value, omit the flag."
   exit 1
 }
 
@@ -2447,6 +2452,9 @@ print_generate_only_handoff() {
   echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
   echo ""
   echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  # On an existing install, first apply the chart's CRDs, which neither Helm nor lifecycle.sh"
+  echo -e "  # upgrades; a field the served schema lacks is otherwise pruned from the PlatformAgent for good:"
+  echo -e "  kubectl apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
