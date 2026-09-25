@@ -2389,9 +2389,13 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         self.assertIn("edit the PlatformAgent", proc.stdout)
 
     def test_keys_that_carry_the_live_scope_pass_whatever_their_spelling(self):
+        # Order, separators and repeats are spelling: every list is compared
+        # as a set, the cluster triples included (the CR's list is a map keyed
+        # on the triple, so it never repeats; a repeated triple in install.env
+        # is Terraform's distinct validation to refuse, with its own message).
         proc = self._run(_LIVE_SCOPE_CR, "norelease", keys={
-            "SCOPE_PROJECTS": "p2-project,p3-project",
-            "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1",
+            "SCOPE_PROJECTS": "p3-project,p2-project p2-project",
+            "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1, p2-project/us-central1/c1",
         })
         self._assert_rc(proc, 0)
 

@@ -987,7 +987,7 @@ def normalise(scope):
     scope = scope or {}
     exclude = scope.get("exclude") or {}
     clusters = sorted(
-        (c["projectId"], c["location"], c["clusterName"]) for c in exclude.get("clusters") or []
+        {(c["projectId"], c["location"], c["clusterName"]) for c in exclude.get("clusters") or []}
     )
     return {
         "projects": sorted(set(scope.get("projects") or [])),
