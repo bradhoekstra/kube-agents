@@ -309,6 +309,21 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("beta", "compute", "advice", "calendar-mode"),
         ("beta", "compute", "advice", "capacity"),
         ("beta", "compute", "advice", "capacity-history"),
+        # Metrics Scope read: how the Cluster Agent reconcile resolves a
+        # spec.scope.metricsScopes entry to the projects that scope monitors, one
+        # call per scope (docs/designs/multi-project-scope.md §10 step 3). The
+        # verb exists only on the beta and alpha tracks -- GA gcloud rejects
+        # `monitoring metrics-scopes` outright (568.0.0 and 586.0.0; the
+        # credential-proxy image installs an unpinned google-cloud-cli, so a GA
+        # promotion is a later entry here, not a change to this one). The track
+        # word is matched as typed: _gcloud_words_and_flag keeps `beta` as the
+        # first word and _gcloud_is_read_only compares the prefix exactly, and
+        # only the --help escape looks past it through _gcloud_surface. So this
+        # entry admits the beta spelling the reconcile uses and neither the GA
+        # nor the alpha one. A pure read; `beta monitoring metrics-scopes
+        # create` and `delete`, which link and unlink a monitored project, stay
+        # refused, and the tests hold that door.
+        ("beta", "monitoring", "metrics-scopes", "describe"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
         # the skills take the account id from configuration, not discovery.
@@ -401,6 +416,14 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "routers", "get-status"),
         ("compute", "routers", "list"),
         ("compute", "security-policies", "list"),
+        # Shared VPC association read: how the Cluster Agent reconcile resolves a
+        # spec.scope.sharedVpcHosts entry to the service projects attached to the
+        # host, one call per host (docs/designs/multi-project-scope.md §10 step
+        # 3). Compute API projects.getXpnResources, a pure read; `shared-vpc
+        # enable` and `disable`, and `associated-projects add` and `remove` --
+        # the writes that attach and detach a service project -- stay refused,
+        # and the tests hold that door.
+        ("compute", "shared-vpc", "list-associated-resources"),
         # The daily `stockout-prevention` cron reads these three and nothing
         # else can stand in for them: reservations list is the committed
         # capacity, regions describe is the quota headroom, machine-types
