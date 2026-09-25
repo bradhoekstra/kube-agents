@@ -732,6 +732,19 @@ flag_bool_value() {
 #
 # Lives beside flag_bool_value for the same reason that one is not in
 # scripts/installer/installer_common.sh.
+validate_bool_flag_value() {
+  local flag="$1" value="${2:-}"
+  if [ -z "$value" ]; then
+    print_error "${flag}= was given an empty value."
+    print_info "Pass ${flag} on its own, or ${flag}=true, or ${flag}=false."
+    exit 1
+  fi
+  if [[ ! "$value" =~ ^(true|false)$ ]]; then
+    print_error "${flag} must be either true or false."
+    exit 1
+  fi
+}
+
 # A scope flag given nothing cannot mean "leave the recorded scope alone" (the
 # flag is what overrides the file for one run) and must not mean "drop every
 # project" in silence: applied, an empty --scope-projects= would revoke the
@@ -751,19 +764,6 @@ require_scope_flag_value() {
   print_error "${flag}= was given an empty value."
   print_info "To clear it, set ${key}= (empty) in install.env and re-run; to keep the recorded value, omit the flag."
   exit 1
-}
-
-validate_bool_flag_value() {
-  local flag="$1" value="${2:-}"
-  if [ -z "$value" ]; then
-    print_error "${flag}= was given an empty value."
-    print_info "Pass ${flag} on its own, or ${flag}=true, or ${flag}=false."
-    exit 1
-  fi
-  if [[ ! "$value" =~ ^(true|false)$ ]]; then
-    print_error "${flag} must be either true or false."
-    exit 1
-  fi
 }
 
 parse_args() {
@@ -1427,7 +1427,9 @@ warn_flag_beats_unrecorded_file_value() {
     print_warning "${flag}=${value} applies to this run only: ${file} records no ${key}."
   fi
   print_info "$consequence"
-  print_info "Set ${key}=${value} in ${file}, or repeat ${flag} on ${repeat_on}."
+  # %q, because the scope keys are the first list-valued values through here and
+  # a space-separated one printed bare would not paste back as one assignment.
+  print_info "Set ${key}=$(printf '%q' "$value") in ${file}, or repeat ${flag} on ${repeat_on}."
 }
 
 bootstrap_install_env_file() {

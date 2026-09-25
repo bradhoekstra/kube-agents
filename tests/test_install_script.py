@@ -7134,8 +7134,32 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             self.assertIn("--scope-projects=payments-prod,payments-staging applies to this run only", out)
             self.assertIn("records SCOPE_PROJECTS=payments-prod", out)
             self.assertIn("retired over the reconcile's next two clean runs", out)
-            self.assertIn("Set SCOPE_PROJECTS=payments-prod,payments-staging in", out)
+            # Spelled as install.env records it (%q), so the line pastes back as is.
+            self.assertIn("Set SCOPE_PROJECTS=payments-prod\\,payments-staging in", out)
             self.assertEqual(existing.read_text(), "SCOPE_PROJECTS=payments-prod\n")
+
+    def test_the_remedy_for_a_space_separated_flag_pastes_back_as_one_assignment(self):
+        # The scope keys are the first list-valued values through the warning;
+        # printed bare, `Set SCOPE_PROJECTS=a b in ...` would source as the
+        # command `b` with SCOPE_PROJECTS=a in its environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            existing = pathlib.Path(tmp) / "install.env"
+            existing.write_text("SCOPE_PROJECTS=payments-prod\n")
+            existing.chmod(0o600)
+            proc = self._run(
+                'PARAM_SCOPE_PROJECTS="payments-prod payments-staging"\n'
+                f'bootstrap_install_env_file "{existing}" some-tag',
+                env={"KUBE_AGENTS_INSTALL_ENV": str(existing)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = proc.stdout + proc.stderr
+            self.assertIn("Set SCOPE_PROJECTS=payments-prod\\ payments-staging in", out)
+            # And the printed assignment round-trips through the loader.
+            check = subprocess.run(
+                ["bash", "-c", 'set -eu; SCOPE_PROJECTS=payments-prod\\ payments-staging; printf "%s" "$SCOPE_PROJECTS"'],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(check.stdout, "payments-prod payments-staging")
 
     def test_a_run_without_a_scope_flag_over_a_recorded_file_is_silent(self):
         with tempfile.TemporaryDirectory() as tmp:
