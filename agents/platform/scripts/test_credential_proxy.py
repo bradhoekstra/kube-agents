@@ -2111,7 +2111,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
     @contextlib.contextmanager
     def no_slot_free(caller=None):
         """What `request_slot` does when every slot stays busy for the wait."""
-        raise credential_proxy.CommandSlotUnavailable("already running 8 commands")
+        raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands and this request waited 60s without reaching a free slot")
         yield  # pragma: no cover -- makes this a generator, as a context manager needs
 
     def test_a_vcs_verb_at_the_cap_answers_the_same_503(self):
@@ -2130,7 +2130,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
         self.assertEqual(503, status)
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
-        self.assertIn("already running 8 commands", body["error"])
+        self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
 
     def test_the_vcs_route_holds_its_slot_until_the_response_is_written(self):
         # The route that runs the largest children the broker forks -- git
@@ -2173,7 +2173,7 @@ class ExecRouteCapacityTest(unittest.TestCase):
 
         self.assertEqual(503, status)
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
-        self.assertIn("already running 8 commands", body["error"])
+        self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
 
     def test_the_exec_route_holds_its_slot_until_the_response_is_written(self):
         # The slot covers the response as well as the command: released when
@@ -2873,6 +2873,36 @@ class CommandExecutorTest(unittest.TestCase):
             "a descendant that ignored SIGTERM outlived the command",
         )
 
+    def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
+        # With both pipes closed the read loop has nothing to watch, so the
+        # wait that follows has to look at the caller itself, or a hang-up in
+        # that window leaves the command running to the deadline for nobody.
+        pid_file = Path(self.temp_dir.name) / "detached.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30),
+            body=f'exec >&- 2>&-; sleep 30 & echo $! > "{pid_file}"; wait',
+        )
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.7)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        result = executor.execute(
+            ["kubectl", "wait", "--for=condition=Ready", "pod/api"], caller=ours
+        )
+
+        self.assertTrue(result.abandoned)
+        self.assertFalse(result.timed_out)
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "the sleep the command started outlived the hang-up",
+        )
+
     def test_a_command_that_closes_its_pipes_and_runs_on_still_meets_the_deadline(self):
         # With both pipes closed there is nothing left to read, so the
         # deadline is enforced by the wait that follows -- at the deadline,
@@ -3047,9 +3077,22 @@ class CommandExecutorTest(unittest.TestCase):
         # Under sustained saturation the request that has waited longest must
         # be the next served, and the one refused after the wait must be the
         # one that waited it: a semaphore's lapsing timed acquire rejoins at
-        # the back and does neither.
+        # the back and does neither. The holder keeps its slot until told to
+        # let go, so the four are queued before any can be admitted, however
+        # slowly the runner starts threads.
         executor = self.executor(max_concurrent_commands=1)
-        self.hold_a_slot(executor, seconds=1)
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(10)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.assertTrue(held.wait(5), "the slot holder never got its slot")
         admitted = []
         lock = threading.Lock()
 
@@ -3057,7 +3100,6 @@ class CommandExecutorTest(unittest.TestCase):
             with executor.request_slot():
                 with lock:
                     admitted.append(label)
-                time.sleep(0.1)
 
         threads = []
         for index, label in enumerate(("first", "second", "third", "fourth")):
@@ -3071,6 +3113,7 @@ class CommandExecutorTest(unittest.TestCase):
                 if time.monotonic() > deadline:
                     self.fail(f"{label} never joined the queue")
                 time.sleep(0.01)
+        release.set()
         for thread in threads:
             thread.join()
 
@@ -3115,7 +3158,8 @@ class CommandExecutorTest(unittest.TestCase):
                 with executor.request_slot():
                     self.fail("a slot was granted while the holder still had it")
 
-        self.assertIn("already running 1 commands", str(raised.exception))
+        self.assertIn("limit of 1 concurrent commands", str(raised.exception))
+        self.assertIn("without reaching a free slot", str(raised.exception))
         # The refusal released nothing it did not hold: the slot is still the
         # holder's, and comes back when it ends.
         holder.join()

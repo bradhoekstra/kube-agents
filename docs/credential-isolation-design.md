@@ -765,7 +765,7 @@ Consequences:
   (serialised by the store's own lock) and the Cloud API relay (a bounded read
   of its own) take none. A request that waits more than 60 seconds for a slot
   is answered `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
-  `the credential proxy is already running 8 commands and none finished within 60s; retry shortly`.
+  `the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly`.
   A long-running command holds its slot for as long as it runs, and a caller
   that stops reading its response is given up on after 60 seconds so that it
   cannot keep one.

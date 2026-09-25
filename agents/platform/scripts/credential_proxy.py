@@ -118,6 +118,10 @@ STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
 # After a command is killed, how long its pipes are given to close before what
 # it had already written is given up on.
 KILLED_COMMAND_DRAIN_SECONDS = 5
+# How often a command that has closed both its pipes but is still running is
+# looked at: nothing can wake that wait, so the deadline and the caller's
+# hang-up are checked in steps this long.
+PIPES_CLOSED_POLL_SECONDS = 0.5
 # How many requests that run commands may be in flight at once. A slot is held
 # from the moment a request is admitted until its response is on the wire,
 # because everything the request costs lives that long: one child process -- a
@@ -3492,24 +3496,31 @@ def _capture_output(
         timed_out, abandoned = pump(deadline, watch_caller=True)
         if timed_out or abandoned:
             _kill_process_group(process)
-            # What the command wrote before it died is still in the pipes.
+            # What the command wrote before it died is still in the pipes, and
+            # what is left to wait for after that is the reaping.
             pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
-        if timed_out or abandoned:
-            # Killed: what is left to wait for is the reaping.
-            grace = float(KILLED_COMMAND_DRAIN_SECONDS)
+            try:
+                process.wait(timeout=KILLED_COMMAND_DRAIN_SECONDS)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(process)
+                process.wait()
         else:
             # Every pipe closed but the command is still running -- it handed
-            # them to a child, or closed them itself. It gets what is left of
-            # its deadline and not a second more.
-            grace = max(deadline - time.monotonic(), 0)
-        try:
-            process.wait(timeout=grace)
-        except subprocess.TimeoutExpired:
-            # Still running at the deadline with nothing to read: the same end
-            # a command that kept writing gets.
-            timed_out = True
-            _kill_process_group(process)
-            process.wait()
+            # them to a child, or closed them itself. Nothing can wake a wait
+            # now, so it is taken in steps: the deadline still applies, and so
+            # does the caller's hang-up, and either gets the command the same
+            # end a command that kept writing gets.
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                elif caller is not None and _caller_has_gone(caller):
+                    abandoned = True
+                else:
+                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
+                    continue
+                _kill_process_group(process)
+                process.wait()
     except BaseException:
         # Whatever went wrong in here -- a read or write that raised, the
         # thread being torn down -- the child does not get to outlive the
@@ -3832,10 +3843,15 @@ class CommandExecutor:
                 ):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        # Worded for the queue: slots may well have freed in
+                        # the meantime and gone to earlier arrivals, so "none
+                        # finished" would be false for a request that was
+                        # overtaken rather than starved.
                         raise CommandSlotUnavailable(
-                            f"the credential proxy is already running "
-                            f"{self.max_concurrent_commands} commands and none finished "
-                            f"within {COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
+                            f"the credential proxy is at its limit of "
+                            f"{self.max_concurrent_commands} concurrent commands and this "
+                            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                            f"free slot; retry shortly"
                         )
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
