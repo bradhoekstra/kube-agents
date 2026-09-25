@@ -92,7 +92,9 @@ type ScopeSpec struct {
 	// attached to the host contributes its GKE clusters, resolved on each run from
 	// the Compute API (gcloud compute shared-vpc list-associated-resources). The
 	// host project itself is not included: name it in projects if its clusters are
-	// wanted. A project that is not a Shared VPC host resolves to no members.
+	// wanted. A project that is not a Shared VPC host resolves to no members: the
+	// API answers HTTP 400 for it, which the reconcile reads as an empty membership
+	// rather than a failed lookup, so a misdeclared host cannot hold the scope prune.
 	// Nothing is inherited through a Shared VPC, so the agent's service account
 	// needs the read roles in each resolved project, granted by hand until the
 	// install's Terraform gains a scope input, and compute.projects.get in the
@@ -113,8 +115,9 @@ type ScopeSpec struct {
 	// reported by number as denied. Nothing is inherited through a Metrics Scope,
 	// so the agent's service account needs the read roles in each resolved
 	// project, granted by hand until the install's Terraform gains a scope input;
-	// the lookup itself needs the metrics scope to be readable by the agent's
-	// identity in the scoping project. A lookup that fails freezes the selector's
+	// the lookup itself needs resourcemanager.projects.get in the scoping project,
+	// which every read role above carries (roles/monitoring.metricsScopesViewer is
+	// that permission alone). A lookup that fails freezes the selector's
 	// previous members and holds the scope prune, and is reported in the
 	// snapshot's containers array under metricsScopes/<scope>.
 	// +kubebuilder:validation:MaxItems=100
