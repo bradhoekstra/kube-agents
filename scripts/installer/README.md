@@ -203,9 +203,9 @@ leaves the scope. A file that lacks the keys declares an empty scope, like every
 (the list above). Only full mode applies the keys; `harness` and `operator` retags re-render
 the release's recorded values and change nothing about the scope. `upgrade.sh`, `uninstall.sh`
 and the Day-2 menu read the keys from `install.env` alone (`load_install_env` drops a value
-inherited from the shell, as it does `NAMESPACE`); `install.sh` also takes the three `--scope-*`
-flags and the environment on a first install and records them, and an empty `--scope-*=` is
-refused. A malformed `SCOPE_EXCLUDE_CLUSTERS` entry stops every front door but `uninstall.sh`,
+inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
+`install.env` exists); `install.sh` also takes the three `--scope-*` flags, and on a first install
+the environment, and records them, and an empty `--scope-*=` is refused. A malformed `SCOPE_EXCLUDE_CLUSTERS` entry stops every front door but `uninstall.sh`,
 retags included, until the line is fixed; there is no bypass.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own

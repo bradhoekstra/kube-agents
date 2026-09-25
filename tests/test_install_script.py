@@ -7071,16 +7071,53 @@ class ScopeKeysAreRecordedAndWarnedTest(unittest.TestCase):
             loaded = pathlib.Path(tmp) / "loaded.install.env"
             loaded.write_text("")
             loaded.chmod(0o600)
+            # Exported after the load, as main() exports the flags' values: the
+            # loader drops an inherited key once an install.env exists.
             proc = self._run(
+                'export SCOPE_PROJECTS="payments-prod payments-staging" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""\n'
                 f'bootstrap_install_env_file "{dest}" some-tag >/dev/null\ncat "{dest}"',
-                env={"KUBE_AGENTS_INSTALL_ENV": str(loaded),
-                     "SCOPE_PROJECTS": "payments-prod payments-staging",
-                     "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""},
+                env={"KUBE_AGENTS_INSTALL_ENV": str(loaded)},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_PROJECTS=payments-prod\\ payments-staging$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_PROJECTS=''$", re.MULTILINE))
             self.assertRegex(proc.stdout, re.compile(r"^SCOPE_EXCLUDE_CLUSTERS=''$", re.MULTILINE))
+
+    def test_an_inherited_scope_key_is_dropped_once_install_env_exists(self):
+        # The hazard load_install_env closes for the other front doors: a
+        # shell-exported value applied for one run over a file that does not
+        # record it is dropped again by the next run. A file that carries the
+        # key sets it; a first install (no file) keeps the environment.
+        probe = 'echo "P=${PARAM_SCOPE_PROJECTS:-unset} X=${PARAM_SCOPE_EXCLUDE_PROJECTS:-unset} C=${PARAM_SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+        stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
+                 "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            env_file.chmod(0o600)
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
+            )
+            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n{probe}'],
+                capture_output=True, text=True, cwd=str(_REPO_ROOT),
+                env=get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(env_file), **stray}),
+            )
+            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
+        # No file: a first install seeds from the environment and records it.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_copy = pathlib.Path(tmp) / "install.sh"
+            script_copy.write_text(_INSTALL_SH.read_text())
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{script_copy}"\n{probe}'],
+                capture_output=True, text=True, cwd=tmp,
+                env=get_isolated_test_env(overrides={"HOME": tmp, **stray}),
+            )
+            self.assertIn("P=stray-project X=*-stray C=s/l/c", proc.stdout, proc.stderr)
 
     def test_a_flag_that_disagrees_with_the_recorded_file_warns_and_names_the_line(self):
         with tempfile.TemporaryDirectory() as tmp:

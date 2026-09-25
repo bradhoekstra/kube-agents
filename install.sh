@@ -316,6 +316,15 @@ bootstrap_install_env() {
     fi
     return 0
   fi
+  # The scope keys render into the PlatformAgent and are recorded only by a
+  # first install, so once this file exists it is the only way in for them,
+  # as load_install_env makes it for upgrade.sh, uninstall.sh and the menu: a
+  # value inherited from the shell would declare a project the file does not
+  # record, applied for this run and dropped again, with its profiles, by the
+  # next run from a clean shell. A first install, which has no file yet, keeps
+  # the environment and records it; a typed --scope-* flag still overrides
+  # for one run and is warned about.
+  unset SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then
@@ -3796,7 +3805,8 @@ run_menu_system() {
         # The menu edits no scope key, so the keys are the recorded ones; this
         # still refuses a re-apply over a scope the CR gained by hand since.
         # The menu establishes no kubeconfig context of its own, so fetch one
-        # first, as step 12 does; the check refuses if the fetch did not land.
+        # first, as main() does before its summary; the check refuses if the
+        # fetch did not land.
         GKE_DNS_ENDPOINT_FLAG=""
         gke_dns_endpoint_flag "$cluster_name" "$REGION" "$PROJECT_ID" || true
         # shellcheck disable=SC2086
