@@ -2845,6 +2845,47 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(0, result.exit_code)
         self.assertEqual("done\n", result.stdout)
 
+    def test_a_half_closed_caller_is_not_taken_for_a_hang_up(self):
+        # A peer that shut its writing half after the request is still there,
+        # waiting for the response; it reads as EOF, and EOF alone must not
+        # end its command. Only a peer that closed for good reports POLLHUP.
+        executor = self.fake_kubectl(self.executor(), body="sleep 0.5; echo done")
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        self.addCleanup(theirs.close)
+        theirs.shutdown(socket.SHUT_WR)
+
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertFalse(result.abandoned)
+        self.assertEqual(0, result.exit_code)
+        self.assertEqual("done\n", result.stdout)
+
+    def test_a_caller_that_hangs_up_while_queued_never_gets_the_command_started(self):
+        # With every slot busy, a caller that leaves during the wait must not
+        # take the slot a live request is waiting for only to fork and kill.
+        ran = Path(self.temp_dir.name) / "ran"
+        executor = self.fake_kubectl(
+            self.executor(max_concurrent_commands=1), body=f'touch "{ran}"'
+        )
+        self.hold_a_slot(executor, seconds=3)
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.3)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        result = executor.execute(["kubectl", "get", "pods"], caller=ours)
+
+        self.assertTrue(result.abandoned)
+        self.assertEqual(credential_proxy.ABANDONED_BEFORE_START_EXIT_CODE, result.exit_code)
+        # Back before the slot would have freed, and the command never ran.
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertFalse(ran.exists(), "the command was started for a caller that had gone")
+
     def test_unexpected_bytes_from_the_caller_are_not_taken_for_a_hang_up(self):
         # After the request body nothing more is expected, but a peer that
         # sends something is still there: the command runs on, unwatched.

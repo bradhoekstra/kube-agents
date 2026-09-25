@@ -138,6 +138,17 @@ COMMAND_SLOT_WAIT_SECONDS = 60
 # A wait for a slot this long is worth a log line: it says the broker is
 # queueing, which is what an operator sizing the cap needs to see.
 COMMAND_SLOT_WAIT_LOG_MS = 1000
+# The slot wait is taken in pieces this long so that a caller that hangs up
+# while queued is noticed between attempts and dropped without starting its
+# command -- a fork made only to be killed would cost a live request the slot.
+COMMAND_SLOT_POLL_SECONDS = 0.5
+# The exit code of a command that was never started because its caller hung
+# up while it was queued. Negative like a signal exit, but no signal's number.
+ABANDONED_BEFORE_START_EXIT_CODE = -1
+# What a socket reports once its peer has closed for good. POLLHUP and not
+# EOF, because a peer that has only shut its writing half -- legal after an
+# HTTP request, and still waiting for the response -- reads as EOF too.
+CALLER_GONE_EVENTS = select.POLLHUP | select.POLLERR | select.POLLNVAL
 # A command that has to be ended -- its deadline passed, or its caller went
 # away -- gets SIGTERM and this long to exit before SIGKILL. git removes its
 # lock files on SIGTERM and cannot on SIGKILL, and a lock left behind in a
@@ -3263,20 +3274,29 @@ class _CapturedOutput:
 
 
 def _caller_has_gone(caller: Any) -> bool:
-    """Has the connection a command runs for closed?
+    """Has the connection a command runs for closed for good?
 
-    Asked only once `select` reports the socket readable. After the request
-    body nothing more is expected from the caller, so readability means either
-    EOF -- the peer closed, which is the case this exists for -- or bytes that
-    are not this protocol's, which the caller of this function stops watching
-    for rather than spinning on.
+    Decided from the socket's hang-up state, never from EOF: a peer that has
+    only shut its writing half -- legal after an HTTP request, and still
+    waiting for the response -- reads as EOF too, and ending its command would
+    refuse a valid request. On the Unix socket every shipped topology fronts
+    with Envoy, a peer that closed reports POLLHUP and a half-closed one does
+    not. A TCP peer reports neither until a write fails, so a broker spoken to
+    over TCP runs its commands unwatched, the way internal callers do.
+
+    Non-blocking, so it can be asked at any time -- while the command runs,
+    once `select` has reported the socket, and between attempts to take a slot.
     """
     try:
-        return caller.recv(1, socket.MSG_PEEK) == b""
-    except (BlockingIOError, InterruptedError):
-        return False
-    except OSError:
+        descriptor = caller.fileno()
+    except (OSError, ValueError):
         return True
+    if descriptor < 0:
+        return True
+    poller = select.poll()
+    poller.register(descriptor, select.POLLIN)
+    flags = dict(poller.poll(0)).get(descriptor, 0)
+    return bool(flags & CALLER_GONE_EVENTS)
 
 
 def _kill_process_group(process: subprocess.Popen) -> None:
@@ -3387,6 +3407,10 @@ def _capture_output(
                 if stream is caller:
                     if _caller_has_gone(caller):
                         return False, True
+                    # Readable but not hung up: bytes that are not this
+                    # protocol's, or a peer that shut its writing half and is
+                    # waiting for the answer. Either way it is still there;
+                    # stop watching rather than spin, and let the command run.
                     selector.unregister(caller)
                     continue
                 if stream is process.stdin:
@@ -3766,9 +3790,11 @@ class CommandExecutor:
         """Run an agent-selected command.
 
         `caller` is the connection the command is being run for. While the
-        command runs it is watched, and its closing kills the command: a triage
-        session torn down mid-command otherwise leaves its kubectl running to
-        the deadline, holding a slot and buffering output for nobody.
+        command waits for a slot and while it runs, the connection is watched,
+        and its closing ends the command -- or, while queued, drops it without
+        starting: a triage session torn down mid-command otherwise leaves its
+        kubectl running to the deadline, holding a slot and buffering output
+        for nobody. See `_caller_has_gone` for what counts as closing.
         """
         if (
             not isinstance(argv, list)
@@ -4624,12 +4650,27 @@ class CommandExecutor:
         )
         if take_slot:
             queued_at = time.monotonic()
-            if not self._command_slots.acquire(timeout=COMMAND_SLOT_WAIT_SECONDS):
-                raise CommandSlotUnavailable(
-                    f"the credential proxy is already running "
-                    f"{self.max_concurrent_commands} commands and none finished within "
-                    f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
-                )
+            slot_deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+            while not self._command_slots.acquire(timeout=COMMAND_SLOT_POLL_SECONDS):
+                if caller is not None and _caller_has_gone(caller):
+                    # Hung up while queued: nothing to run and nobody to
+                    # answer. Taking the slot anyway would fork a child only to
+                    # kill it, in the slot a live request was waiting for.
+                    return ExecutionResult(
+                        exit_code=ABANDONED_BEFORE_START_EXIT_CODE,
+                        stdout="",
+                        stderr="",
+                        duration_ms=0,
+                        truncated=False,
+                        timed_out=False,
+                        abandoned=True,
+                    )
+                if time.monotonic() >= slot_deadline:
+                    raise CommandSlotUnavailable(
+                        f"the credential proxy is already running "
+                        f"{self.max_concurrent_commands} commands and none finished within "
+                        f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
+                    )
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
                 LOGGER.info(
@@ -5389,12 +5430,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         if result.abandoned:
             # The connection is gone, so there is no response to write; the
-            # log line is the record that the command was ended for it.
+            # log line is the record of what became of the command.
             LOGGER.info(
-                "command abandoned request_id=%s duration_ms=%d: the caller disconnected "
-                "and the command was killed",
+                "command abandoned request_id=%s duration_ms=%d: the caller disconnected %s",
                 request_id,
                 result.duration_ms,
+                "while queued for a slot; the command was not started"
+                if result.exit_code == ABANDONED_BEFORE_START_EXIT_CODE
+                else "and the command was killed",
             )
             return
         LOGGER.info(

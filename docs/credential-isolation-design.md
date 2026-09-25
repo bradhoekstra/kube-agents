@@ -765,7 +765,11 @@ Consequences:
 - A command whose caller disconnects while it runs is ended rather than left to
   run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two seconds later,
   to the whole process group it started. The same two-step end applies at the
-  deadline.
+  deadline. A caller that disconnects while queued for a slot is dropped
+  without the command being started. Disconnecting means the peer closed for
+  good (`POLLHUP` on the broker's Unix socket); a peer that only shut its
+  writing half is still answered, and a broker spoken to over TCP, where a
+  closed peer and a half-closed one look alike, runs its commands unwatched.
 
 ### Cloud API reads
 
