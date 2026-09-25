@@ -640,11 +640,12 @@ per-invocation timeout. A shallow clone plus the ceiling would bound both and is
 the right follow-up; neither alone does.
 
 Separately, the content routes raise the request-body cap to twice the
-total-payload limit. The listener is threaded with no connection cap, but
-commands are capped at `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` in flight, so
-peak heap is roughly that cap times the figure. None of this is reachable from
-outside the Pod, but it is worth knowing before the flag is armed anywhere it
-matters.
+total-payload limit, and the listener is threaded with no connection cap, so
+peak heap on those routes is roughly concurrency times that figure: the bodies
+are read before any command runs, so the broker's command cap does not bound
+them, and the git these verbs run is serialised by the store's lock rather than
+counted against that cap. None of this is reachable from outside the Pod, but
+it is worth knowing before the flag is armed anywhere it matters.
 
 Every verb takes a lock for its whole duration. The handler is threaded, so two
 requests naming one handle genuinely interleave, and each verb is a read-then-act
@@ -749,11 +750,15 @@ Consequences:
   `CREDENTIAL_PROXY_MAX_OUTPUT_BYTES` of each stream (8 MiB as the operator
   deploys it); the rest is drained and dropped, so what a command prints past
   the cap costs the broker nothing. At most
-  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` commands run at once (8 by default;
-  `spec.deployment.env` tunes it). Each in-flight command is a child process
-  plus about six times the output cap of transient copies in the broker, so
-  the two caps together are what the broker container's memory limit is sized
-  against. A request that waits more than 60 seconds for a slot is answered
+  `CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS` commands run at once (8; the
+  operator sets it, as it sets the output cap, and reserves the name). Each
+  in-flight command is a child process plus about six times the output cap of
+  transient copies in the broker, so the two caps together are what the broker
+  container's memory limit is sized against, and they move with that limit in
+  the operator rather than through the CR. The calls a lock already serialises
+  (the kubeconfig cache-fill, the content workspace's git) and the forge
+  refresh helper run outside the count. A request that waits more than 60
+  seconds for a slot is answered
   `503 CREDENTIAL_PROXY_BUSY`, which the sandbox CLIs print as
   `the credential proxy is already running 8 commands and none finished within 60s; retry shortly`.
   A long-running command holds its slot for as long as it runs.

@@ -662,6 +662,13 @@ class ContentWorkspaceStore:
         # gone. Note that `max_workspaces` advertises a concurrency this
         # forbids: eight may be open, one may be doing anything.
         #
+        # The git those verbs run takes none of the executor's concurrency
+        # slots, for the reason the kubeconfig cache-fill takes none: this lock
+        # already serialises it, so it cannot multiply, and a wait for a slot
+        # while holding the lock would stall every verb behind it -- reads that
+        # need no subprocess included -- for the whole of the wait. So the
+        # timeout above really is the bound.
+        #
         # Still the right trade for a single agent Pod publishing one pull
         # request at a time, and a per-workspace lock would still need this one
         # to guard the dict it lives in. Worth revisiting the day a caller has

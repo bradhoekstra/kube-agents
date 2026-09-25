@@ -55,10 +55,14 @@ const (
 	defaultAgentHome            = "/opt/data"
 	defaultStorageSize          = "5Gi"
 	// credentialProxyMaxOutputBytes caps each stream a brokered command returns,
-	// and what the broker keeps of it while the command runs; the paragraph
-	// above its use ties the figure and the broker's concurrency default to the
-	// proxy container's memory limit, and the cap test asserts the three.
-	credentialProxyMaxOutputBytes = "8388608"
+	// and what the broker keeps of it while the command runs;
+	// credentialProxyMaxConcurrentCommands caps how many commands run at once.
+	// The paragraph above their use ties the two to the proxy container's
+	// memory limit, and the cap test asserts the three from the rendered env.
+	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
+	// move neither, because the limit they are sized against is not a CR field.
+	credentialProxyMaxOutputBytes        = "8388608"
+	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
 	// Hermes against the agent PVC. Octal, and read by Hermes as such. See the comment
 	// on the HERMES_HOME_MODE env var for why 0700 does not work here and why a chmod
@@ -3649,19 +3653,24 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		//
 		// Which is what ties this figure to the proxy container's own memory
 		// limit (buildCredentialProxyContainer) rather than to anything about
-		// the fleet. Concurrency is bounded inside the broker at
-		// CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS, whose default lives in
-		// credential_proxy.py, so the burst is six times the cap times that
-		// default: at 8 MiB and eight slots, 384 MiB on top of the 256Mi the
-		// container requests at rest, which its 1Gi limit absorbs. The limit
-		// must also hold the child processes themselves, one kubectl or gcloud
-		// per in-flight command, and a kubectl listing thousands of objects
-		// runs to hundreds of MiB on its own; that term is outside this
-		// arithmetic and is what the rest of the limit is for. Raising this
-		// cap or the concurrency default means raising the limit with them.
-		// The cap test asserts the pair from the source constants, so believe
-		// it over this paragraph if they ever disagree.
+		// the fleet. Concurrency is bounded inside the broker at the value set
+		// just below, so the burst is six times the cap times that: at 8 MiB
+		// and eight slots, 384 MiB on top of the 256Mi the container requests
+		// at rest, which its 1Gi limit absorbs. The limit must also hold the
+		// child processes themselves, one kubectl or gcloud per in-flight
+		// command, and a kubectl listing thousands of objects runs to hundreds
+		// of MiB on its own; that term is outside this arithmetic and is what
+		// the rest of the limit is for. Raising either cap means raising the
+		// limit with it, which is why both are set here and so reserved rather
+		// than left to spec.deployment.env: the limit is not a CR field, and a
+		// CR that could raise a cap could not raise what holds it. The cap
+		// test asserts the three from the rendered env, so believe it over
+		// this paragraph if they ever disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
+		// How many brokered commands run at once. The broker's own default is
+		// the same figure; setting it here is what makes it the operator's to
+		// move, together with the limit above.
+		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},

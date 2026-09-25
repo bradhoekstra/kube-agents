@@ -301,8 +301,9 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			// cap test in platformagent_manifests_test.go asserts against this
 			// limit. The term that varies is the children: kubectl 1.35 listing
 			// 4,000 pods measured 432Mi resident for -o json and 1,281Mi for
-			// -o yaml. An install whose clusters make that routine lowers the
-			// concurrency cap through spec.deployment.env or raises this limit.
+			// -o yaml. An install whose clusters make that routine moves
+			// credentialProxyMaxConcurrentCommands and this limit together;
+			// neither is a CR field today.
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("100m"), corev1.ResourceMemory: resource.MustParse("256Mi")},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),

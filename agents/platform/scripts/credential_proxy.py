@@ -120,13 +120,15 @@ KILLED_COMMAND_DRAIN_SECONDS = 5
 # process -- a kubectl listing a large cluster runs to hundreds of MiB on its
 # own -- plus, in this process, about six times `--max-output-bytes` at peak:
 # the two capped stream buffers, their decoded strings, and the JSON body and
-# its encoding (measured at 24 MiB per command against a 4 MiB cap). The
-# operator's cap test sizes the container's memory limit against this default
-# and its output cap, so raising either means re-checking the other. A
+# its encoding (measured at 24 MiB per command against a 4 MiB cap). A
 # long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
-# long as it runs. Read from the environment so an operator can tune it through
-# spec.deployment.env. The gcloud calls made while `_kubeconfig_lock` is held
-# are the one exception to the count; `_execute` says why.
+# long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
+# from a constant of its own beside the output cap and reserves the name, and
+# its cap test sizes the container's memory limit against the two, so the
+# value an install runs moves with that limit rather than through the CR; this
+# default is for a broker run outside the operator. The calls `_execute`
+# exempts from the count are the ones a lock already serialises, plus the
+# forge refresh helper; it says why.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # How long a request waits for a slot before it is refused with 503. Long
@@ -3281,11 +3283,16 @@ def _kill_process_group(process: subprocess.Popen) -> None:
     """End a command and everything it started. Never raises.
 
     SIGTERM first, so a program that cleans up on it -- git and its lock files
-    above all -- gets KILL_GRACE_SECONDS to do so, then SIGKILL for whatever is
-    left. Each signal goes to the process group `_execute` started, falling
-    back to the child itself when the group is already gone. The SIGKILL is
-    sent only while the child is still alive: `poll` reaps it once it exits,
-    and a signal to a reaped group id could reach whoever inherits the number.
+    above all -- gets KILL_GRACE_SECONDS to do so, then SIGKILL to the whole
+    group `_execute` started, whether or not the direct child is still there.
+    `poll` reports the child alone, and a helper it started that ignores
+    SIGTERM would otherwise outlive the kill, holding the pipes and running on
+    outside the slot it was counted under. Signalling the group after the
+    child was reaped is safe: Linux keeps a pid allocated while it is a live
+    group's id, an empty group answers ESRCH, which is swallowed, and the
+    fallback to the child itself is a no-op once it has been reaped. The grace
+    is the group's, not the child's -- the loop waits for the group to empty,
+    so a helper cleaning up after its parent exited gets the same two seconds.
     """
 
     def signal_group(signum: int) -> None:
@@ -3297,12 +3304,25 @@ def _kill_process_group(process: subprocess.Popen) -> None:
             except OSError:
                 pass
 
+    def group_is_empty() -> bool:
+        try:
+            os.killpg(process.pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
     signal_group(signal.SIGTERM)
     grace_ends = time.monotonic() + KILL_GRACE_SECONDS
-    while process.poll() is None and time.monotonic() < grace_ends:
+    while time.monotonic() < grace_ends:
+        # Reap the child if it has exited; a zombie would otherwise keep the
+        # group looking occupied for the whole grace.
+        process.poll()
+        if group_is_empty():
+            break
         time.sleep(KILL_POLL_SECONDS)
-    if process.poll() is None:
-        signal_group(signal.SIGKILL)
+    signal_group(signal.SIGKILL)
 
 
 def _capture_output(
@@ -3399,16 +3419,21 @@ def _capture_output(
             _kill_process_group(process)
             # What the command wrote before it died is still in the pipes.
             pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
-        try:
-            process.wait(
-                timeout=None
-                if deadline is None
-                else max(deadline - time.monotonic(), KILLED_COMMAND_DRAIN_SECONDS)
-            )
-        except subprocess.TimeoutExpired:
+        if timed_out or abandoned:
+            # Killed: what is left to wait for is the reaping.
+            grace: float | None = KILLED_COMMAND_DRAIN_SECONDS
+        elif deadline is None:
+            grace = None
+        else:
             # Both pipes closed but the command is still running -- it handed
-            # them to a child, or ignored the deadline. It gets the same end a
-            # command that kept writing does.
+            # them to a child, or closed them itself. It gets what is left of
+            # its deadline and not a second more.
+            grace = max(deadline - time.monotonic(), 0)
+        try:
+            process.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            # Still running at the deadline with nothing to read: the same end
+            # a command that kept writing gets.
             timed_out = True
             _kill_process_group(process)
             process.wait()
@@ -3846,8 +3871,17 @@ class CommandExecutor:
     def execute_internal(
         self, argv: list[str], cwd: str | None = None
     ) -> ExecutionResult:
-        """Run a trusted, operator-defined helper that is not agent selectable."""
-        return self._execute(argv, cwd=cwd)
+        """Run a trusted, operator-defined helper that is not agent selectable.
+
+        Outside the concurrency count. The helpers that come through here are
+        short calls -- the forge credential refresh is a request to the minter,
+        not a listing -- and the caller whose credential is being refreshed
+        takes the slot for its own git. Queueing here would spend that caller's
+        minute twice, once in the helper and once in the verb, and the
+        credential strategies swallow the helper's failures, so the wait would
+        not even surface as the busy answer.
+        """
+        return self._execute(argv, cwd=cwd, take_slot=False)
 
     def execute_workspace_git(
         self,
@@ -3905,6 +3939,10 @@ class CommandExecutor:
             cwd=str(cwd),
             containment_root=self.content_workspace_root,
             extra_config=tuple(config),
+            # Run under the content store's lock, which already serialises
+            # it; a wait for a slot while holding that lock would stall every
+            # workspace verb behind it. See `_execute`.
+            take_slot=False,
         )
 
     def execute_vcs_git(
@@ -4532,11 +4570,14 @@ class CommandExecutor:
         COMMAND_SLOT_WAIT_SECONDS. The slot is the innermost thing this method
         takes -- `_kubeconfig_lock` is held by callers, never the other way
         round -- which is what keeps the cap from deadlocking against it.
-        `take_slot=False` is for the two gcloud calls `_ensure_managed_kubeconfig`
-        makes while holding that lock: the lock already serialises them, so
-        they cannot multiply, and waiting for a slot there would hold the lock
-        -- and every context-carrying kubectl queued behind it -- for the whole
-        of the wait. The bound is therefore the cap plus one.
+        `take_slot=False` is for three callers. The two gcloud calls
+        `_ensure_managed_kubeconfig` makes while holding that lock, and the git
+        `execute_workspace_git` runs under the content store's lock: each lock
+        already serialises its commands, so they cannot multiply, and waiting
+        for a slot while holding the lock would stall everything queued behind
+        it for the whole of the wait. And `execute_internal`'s trusted helpers,
+        short calls whose caller takes the slot for its own git. The bound is
+        therefore the cap plus those calls.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root
@@ -5662,10 +5703,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
-        except CommandSlotUnavailable as exc:
-            LOGGER.warning("workspace request queued too long route=%s", route)
-            self._busy(exc)
-            return
         except Exception as exc:
             LOGGER.exception("workspace request failed route=%s type=%s", route, type(exc).__name__)
             self._json(
@@ -5814,10 +5851,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "code": "REPOSITORY_NOT_MANAGED",
                 },
             )
-            return
-        except CommandSlotUnavailable as exc:
-            LOGGER.warning("%s credential refresh queued too long", forge.name)
-            self._busy(exc)
             return
         except Exception as exc:
             # The helper's own stderr is the only place the refusal exists, and

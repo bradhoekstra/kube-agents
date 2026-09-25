@@ -1422,6 +1422,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 				Deployment: &agentv1alpha1.DeploymentSpec{
 					Env: []corev1.EnvVar{
 						{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: "1024"},
+						{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: "64"},
 						{Name: "UNRESERVED_PASSENGER", Value: "arrived"},
 					},
 				},
@@ -1445,6 +1446,13 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	if got := env["CREDENTIAL_PROXY_MAX_OUTPUT_BYTES"]; got != want {
 		t.Errorf("expected the proxy output cap %s, got %q — a CR override must not reach it", want, got)
 	}
+	// The concurrency cap is the other half of what the limit is sized
+	// against, so it is the operator's in the same way: set here, and not a
+	// CR's to raise past what the limit below can hold.
+	const wantConcurrent = "8"
+	if got := env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"]; got != wantConcurrent {
+		t.Errorf("expected the proxy concurrency cap %s, got %q — a CR override must not reach it", wantConcurrent, got)
+	}
 	// The measured worst case, so a future reduction of the cap has to argue
 	// with the number rather than pass silently.
 	const largestObservedDump = 3866719
@@ -1463,10 +1471,9 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// command is about six times the cap, transiently: the two capped stream
 	// buffers, their decoded strings, and the JSON body and its encoding
 	// (measured at 24 MiB per command against a 4 MiB cap). Concurrency is
-	// bounded inside the broker by DEFAULT_MAX_CONCURRENT_COMMANDS, read here
-	// from the broker's source so the two cannot drift apart silently: the
-	// operator does not set the variable, so that spec.deployment.env can, and
-	// a Go constant would be a second copy of the default. The burst has to
+	// bounded inside the broker by CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS,
+	// read here off the rendered env like the output cap, so the test models
+	// what the operator deploys rather than a copy of it. The burst has to
 	// fit under the memory limit alongside what the container holds at rest,
 	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
 	// the proxy serves.
@@ -1481,7 +1488,10 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
 	const copiesPerCommand = 6
-	inFlight := brokerDefaultConcurrentCommands(t)
+	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
+	if err != nil || inFlight < 1 {
+		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
+	}
 	burst := int64(capBytes) * copiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
@@ -1489,31 +1499,9 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	}
 	limit := proxy.Resources.Limits.Memory().Value()
 	if burst+steadyStateBytes > limit {
-		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (the broker's DEFAULT_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower the cap or the concurrency default",
+		t.Errorf("proxy output cap %d bursts to %d bytes across %d in-flight commands (CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS), which does not fit under the proxy container's %d-byte memory limit with %d bytes of steady state — raise the limit, or lower one of the two caps",
 			capBytes, burst, inFlight, limit, steadyStateBytes)
 	}
-}
-
-// brokerDefaultConcurrentCommands reads DEFAULT_MAX_CONCURRENT_COMMANDS out of
-// credential_proxy.py. The broker owns the default -- the operator deliberately
-// does not set CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS, so spec.deployment.env
-// can tune it -- and the cap test has to model the number the broker actually
-// admits rather than a copy of it that could drift.
-func brokerDefaultConcurrentCommands(t *testing.T) int64 {
-	t.Helper()
-	source, err := os.ReadFile(filepath.Join("..", "..", "..", "agents", "platform", "scripts", "credential_proxy.py"))
-	if err != nil {
-		t.Fatalf("reading the broker's source for its concurrency default: %v", err)
-	}
-	match := regexp.MustCompile(`(?m)^DEFAULT_MAX_CONCURRENT_COMMANDS = (\d+)$`).FindSubmatch(source)
-	if match == nil {
-		t.Fatal("credential_proxy.py no longer declares DEFAULT_MAX_CONCURRENT_COMMANDS as a bare integer, so the cap test cannot model the broker's concurrency")
-	}
-	value, err := strconv.ParseInt(string(match[1]), 10, 64)
-	if err != nil || value < 1 {
-		t.Fatalf("DEFAULT_MAX_CONCURRENT_COMMANDS in credential_proxy.py is %q, not a positive integer", match[1])
-	}
-	return value
 }
 
 // TestBuildPodTemplateSpecHoldsNoCredentialRuntime covers the Pod-level half of

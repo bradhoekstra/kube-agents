@@ -2734,6 +2734,40 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertGreaterEqual(result.duration_ms, 1000 + grace_ms - 100)
         self.assertLess(result.duration_ms, 9000)
 
+    def test_a_descendant_that_ignores_sigterm_is_killed_with_the_group(self):
+        # The leader (bash) dies on SIGTERM; the shell it started ignores it,
+        # and so does that shell's sleep. The second signal has to reach the
+        # group whether or not the leader is still there, or the survivors
+        # keep the pipes and run on outside the slot they were counted under.
+        pid_file = Path(self.temp_dir.name) / "stubborn.pid"
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body=f'sh -c \'trap "" TERM; echo $$ > "{pid_file}"; sleep 30\' & wait',
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertFalse(
+            self.process_is_live(int(pid_file.read_text().strip())),
+            "a descendant that ignored SIGTERM outlived the command",
+        )
+
+    def test_a_command_that_closes_its_pipes_and_runs_on_still_meets_the_deadline(self):
+        # With both pipes closed there is nothing left to read, so the
+        # deadline is enforced by the wait that follows -- at the deadline,
+        # not at the end of the drain grace a killed command gets.
+        executor = self.fake_kubectl(
+            self.executor(timeout_seconds=30, kubectl_timeout_seconds=1),
+            body="exec >&- 2>&-; sleep 10",
+        )
+
+        result = executor.execute(["kubectl", "get", "pods"])
+
+        self.assertTrue(result.timed_out)
+        self.assertEqual(124, result.exit_code)
+        self.assertLess(result.duration_ms, 4000)
+
     # ---- The caller's connection ---------------------------------------------
 
     @staticmethod
@@ -2856,11 +2890,12 @@ class CommandExecutorTest(unittest.TestCase):
 
         The command touches a marker as its first act, and the slot is taken
         before the command starts, so the marker's existence is the proof --
-        rather than a sleep that a loaded runner can outrun.
+        rather than a sleep that a loaded runner can outrun. Through `_execute`
+        directly: `execute_internal` is the slot-free path for trusted helpers.
         """
         marker = Path(self.temp_dir.name) / f"holder-{time.monotonic_ns()}"
         thread = threading.Thread(
-            target=executor.execute_internal,
+            target=executor._execute,
             args=(["/bin/sh", "-c", f'touch "{marker}"; sleep {seconds}'],),
         )
         thread.start()
@@ -2877,7 +2912,7 @@ class CommandExecutorTest(unittest.TestCase):
         self.hold_a_slot(executor, seconds=1)
 
         started = time.monotonic()
-        result = executor.execute_internal(["/bin/echo", "second"])
+        result = executor._execute(["/bin/echo", "second"])
 
         self.assertEqual(0, result.exit_code)
         self.assertEqual("second\n", result.stdout)
@@ -2890,22 +2925,69 @@ class CommandExecutorTest(unittest.TestCase):
 
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
             with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
-                executor.execute_internal(["/bin/echo", "second"])
+                executor._execute(["/bin/echo", "second"])
 
         self.assertIn("already running 1 commands", str(raised.exception))
         # The refusal released nothing it did not hold: the slot is still the
         # first command's, and comes back when it ends.
         holder.join()
-        self.assertEqual(0, executor.execute_internal(["/bin/echo", "after"]).exit_code)
+        self.assertEqual(0, executor._execute(["/bin/echo", "after"]).exit_code)
 
     def test_the_duration_reported_is_the_command_s_not_the_wait_for_a_slot(self):
         executor = self.executor(max_concurrent_commands=1)
         self.hold_a_slot(executor, seconds=1)
 
-        result = executor.execute_internal(["/bin/echo", "second"])
+        result = executor._execute(["/bin/echo", "second"])
 
         # It waited about a second for the slot; the command itself was instant.
         self.assertLess(result.duration_ms, 500)
+
+    def slot_taking(self, executor, call):
+        """The `take_slot` values `_execute` saw while `call(executor)` ran."""
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(kwargs.get("take_slot", True))
+            return original(argv, **kwargs)
+
+        with mock.patch.object(executor, "_execute", record):
+            call(executor)
+        return seen
+
+    def test_the_forge_refresh_helper_takes_no_slot(self):
+        # The helper is a short call to the minter and its caller takes the
+        # slot for its own git; a wait here would spend the caller's minute
+        # twice, and the credential strategies swallow the helper's failures,
+        # so the refusal would not even surface as the busy answer. It runs
+        # through `execute_internal`, the slot-free path for trusted helpers.
+        helper = Path(self.temp_dir.name) / "helper.sh"
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o755)
+
+        seen = self.slot_taking(
+            self.executor(),
+            lambda executor: executor._run_forge_helper("github", helper, [], "refresh"),
+        )
+
+        self.assertEqual([False], seen)
+
+    def test_workspace_git_takes_no_slot(self):
+        # Run under the content store's lock, which already serialises it; a
+        # wait for a slot there would stall every workspace verb behind it.
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+            executor = self.executor()
+        tree = executor.content_workspace_root / "tree"
+        tree.mkdir(parents=True)
+
+        seen = self.slot_taking(
+            executor,
+            lambda executor: executor.execute_workspace_git(
+                ["git", "rev-parse", "--git-dir"], tree
+            ),
+        )
+
+        self.assertEqual([False], seen)
 
     def test_the_kubeconfig_cache_fill_does_not_need_a_slot(self):
         # `_ensure_managed_kubeconfig` runs gcloud while holding
