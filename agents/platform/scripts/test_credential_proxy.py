@@ -2107,17 +2107,24 @@ class ExecRouteCapacityTest(unittest.TestCase):
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
-    def test_a_vcs_verb_at_the_cap_answers_the_same_503(self):
-        # The slot is taken in `_execute`, under every route, so each route has
-        # to map the refusal -- or a broker at its cap reads as a fault there.
-        def busy(payload):
-            raise credential_proxy.CommandSlotUnavailable("already running 8 commands")
+    @staticmethod
+    @contextlib.contextmanager
+    def no_slot_free(caller=None):
+        """What `request_slot` does when every slot stays busy for the wait."""
+        raise credential_proxy.CommandSlotUnavailable("already running 8 commands")
+        yield  # pragma: no cover -- makes this a generator, as a context manager needs
 
+    def test_a_vcs_verb_at_the_cap_answers_the_same_503(self):
+        # The slot is the request's, taken by the route before the verb runs,
+        # so a broker at its cap has to read as busy there too, not as a fault.
         with (
             mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
             mock.patch.object(
-                credential_proxy.vcs_broker, "route_table", return_value={"probe": busy}
+                credential_proxy.vcs_broker,
+                "route_table",
+                return_value={"probe": lambda payload: {"ok": True}},
             ),
+            mock.patch.object(CredentialProxyHandler.executor, "request_slot", self.no_slot_free),
         ):
             status, body = self.post({}, path="/v1/vcs/probe")
 
@@ -2125,14 +2132,42 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
         self.assertIn("already running 8 commands", body["error"])
 
+    def test_the_vcs_route_holds_its_slot_until_the_response_is_written(self):
+        # The route that runs the largest children the broker forks -- git
+        # clone and fetch -- is bounded the same way the exec route is: the
+        # slot is held through the verb and through the write of its answer.
+        seen = []
+        executor = CredentialProxyHandler.executor
+        original = CredentialProxyHandler._json
+
+        def verb(payload):
+            seen.append(("verb", executor.slots_in_use))
+            return {"ok": True}
+
+        def recording(handler, status, payload):
+            seen.append(("write", executor.slots_in_use))
+            return original(handler, status, payload)
+
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", object(), create=True),
+            mock.patch.object(
+                credential_proxy.vcs_broker, "route_table", return_value={"probe": verb}
+            ),
+            mock.patch.object(CredentialProxyHandler, "_json", recording),
+        ):
+            status, body = self.post({}, path="/v1/vcs/probe")
+
+        self.assertEqual(200, status)
+        self.assertEqual({"ok": True}, body)
+        self.assertEqual([("verb", 1), ("write", 1)], seen)
+        self.assertEqual(0, executor.slots_in_use)
+
     def test_a_broker_at_its_cap_answers_503_with_a_reason_the_shim_prints(self):
         # `error` is the key the shim prints for a non-policy failure, so the
         # agent reads why rather than a bare exit 1 -- and `code` lets a caller
         # tell "busy, retry" from a fault.
         with mock.patch.object(
-            CredentialProxyHandler.executor,
-            "execute",
-            side_effect=credential_proxy.CommandSlotUnavailable("already running 8 commands"),
+            CredentialProxyHandler.executor, "request_slot", self.no_slot_free
         ):
             status, body = self.post({"argv": ["kubectl", "get", "pods"]})
 
@@ -2149,15 +2184,15 @@ class ExecRouteCapacityTest(unittest.TestCase):
         original = CredentialProxyHandler._json
 
         def recording(handler, status, payload):
-            seen.append(CredentialProxyHandler.executor._command_slots._value)
+            seen.append(CredentialProxyHandler.executor.slots_in_use)
             return original(handler, status, payload)
 
         with mock.patch.object(CredentialProxyHandler, "_json", recording):
             status, _ = self.post({"argv": ["kubectl", "get", "pods"]})
 
         self.assertEqual(200, status)
-        cap = CredentialProxyHandler.executor.max_concurrent_commands
-        self.assertEqual([cap - 1], seen)
+        self.assertEqual([1], seen)
+        self.assertEqual(0, CredentialProxyHandler.executor.slots_in_use)
 
     def test_a_replacement_character_is_three_bytes_on_the_wire(self):
         # ASCII-escaped JSON writes `\ufffd`, six bytes for one byte that was
@@ -2220,7 +2255,7 @@ class CommandExecutorTest(unittest.TestCase):
         timeout_seconds=5,
         max_output_bytes=1024,
         kubectl_timeout_seconds=credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS,
-        max_concurrent_commands=None,
+        max_concurrent_commands=credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
     ):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
@@ -2991,21 +3026,55 @@ class CommandExecutorTest(unittest.TestCase):
     # ---- How many commands run at once ---------------------------------------
 
     def test_the_concurrency_cap_is_read_from_the_environment(self):
+        # Through the argument parser, like the other bounds, so the operator's
+        # env entry reaches the executor the way the output cap does.
         with mock.patch.dict(
             os.environ, {credential_proxy.ENV_MAX_CONCURRENT_COMMANDS: "3"}
+        ), mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+            self.assertEqual(3, credential_proxy.parse_args().max_concurrent_commands)
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(
+            sys, "argv", ["credential_proxy.py"]
         ):
-            self.assertEqual(3, self.executor().max_concurrent_commands)
-        with mock.patch.dict(
-            os.environ, {credential_proxy.ENV_MAX_CONCURRENT_COMMANDS: "0"}
-        ):
-            with self.assertRaises(ValueError):
-                self.executor()
-        with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop(credential_proxy.ENV_MAX_CONCURRENT_COMMANDS, None)
             self.assertEqual(
                 credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
-                self.executor().max_concurrent_commands,
+                credential_proxy.parse_args().max_concurrent_commands,
             )
+        with self.assertRaises(ValueError):
+            self.executor(max_concurrent_commands=0)
+
+    def test_slots_are_granted_in_arrival_order(self):
+        # Under sustained saturation the request that has waited longest must
+        # be the next served, and the one refused after the wait must be the
+        # one that waited it: a semaphore's lapsing timed acquire rejoins at
+        # the back and does neither.
+        executor = self.executor(max_concurrent_commands=1)
+        self.hold_a_slot(executor, seconds=1)
+        admitted = []
+        lock = threading.Lock()
+
+        def wait_in_line(label):
+            with executor.request_slot():
+                with lock:
+                    admitted.append(label)
+                time.sleep(0.1)
+
+        threads = []
+        for index, label in enumerate(("first", "second", "third", "fourth")):
+            thread = threading.Thread(target=wait_in_line, args=(label,))
+            thread.start()
+            threads.append(thread)
+            # Each joins the queue before the next is started, so arrival
+            # order is known rather than raced.
+            deadline = time.monotonic() + 5
+            while executor.queued_requests < index + 1:
+                if time.monotonic() > deadline:
+                    self.fail(f"{label} never joined the queue")
+                time.sleep(0.01)
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(["first", "second", "third", "fourth"], admitted)
 
     def hold_a_slot(self, executor, seconds):
         """Hold a request slot for `seconds` on another thread; return once held.

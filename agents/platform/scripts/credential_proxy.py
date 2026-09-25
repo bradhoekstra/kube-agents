@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import codecs
+import collections
 import contextlib
 import hashlib
 import hmac
@@ -3394,7 +3395,7 @@ def _capture_output(
     process: subprocess.Popen,
     stdin: bytes | None,
     limit: int,
-    timeout: float | None,
+    timeout: float,
     caller: Any = None,
 ) -> _CapturedOutput:
     """Run a started command to completion holding at most `limit` bytes per stream.
@@ -3410,7 +3411,7 @@ def _capture_output(
 
     Returns once the command has exited. `process.returncode` is set.
     """
-    deadline = None if timeout is None else time.monotonic() + timeout
+    deadline = time.monotonic() + timeout
     outputs: dict[Any, bytearray] = {process.stdout: bytearray(), process.stderr: bytearray()}
     truncated = False
     pending = memoryview(stdin) if stdin else None
@@ -3431,8 +3432,8 @@ def _capture_output(
             # as every internal caller does.
             caller = None
 
-    def pump(until: float | None, watch_caller: bool) -> tuple[bool, bool]:
-        """Read until every output closes, `until` passes, or the caller leaves.
+    def pump(until: float, watch_caller: bool) -> tuple[bool, bool]:
+        """Read until every pipe closes, `until` passes, or the caller leaves.
 
         Returns (timed_out, abandoned).
         """
@@ -3446,8 +3447,8 @@ def _capture_output(
         while any(not stream.closed for stream in outputs) or (
             process.stdin is not None and not process.stdin.closed
         ):
-            remaining = None if until is None else until - time.monotonic()
-            if remaining is not None and remaining <= 0:
+            remaining = until - time.monotonic()
+            if remaining <= 0:
                 return True, False
             for key, _ in selector.select(remaining):
                 stream = key.fileobj
@@ -3495,11 +3496,9 @@ def _capture_output(
             pump(time.monotonic() + KILLED_COMMAND_DRAIN_SECONDS, watch_caller=False)
         if timed_out or abandoned:
             # Killed: what is left to wait for is the reaping.
-            grace: float | None = KILLED_COMMAND_DRAIN_SECONDS
-        elif deadline is None:
-            grace = None
+            grace = float(KILLED_COMMAND_DRAIN_SECONDS)
         else:
-            # Both pipes closed but the command is still running -- it handed
+            # Every pipe closed but the command is still running -- it handed
             # them to a child, or closed them itself. It gets what is left of
             # its deadline and not a second more.
             grace = max(deadline - time.monotonic(), 0)
@@ -3542,22 +3541,25 @@ class CommandExecutor:
         state_dir: str,
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
-        max_concurrent_commands: int | None = None,
+        max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
         self.max_output_bytes = max_output_bytes
-        # See DEFAULT_MAX_CONCURRENT_COMMANDS. Taken from the environment when
-        # the constructor is not told, so the operator's env passthrough is the
-        # way to tune it and the tests can pin it.
-        if max_concurrent_commands is None:
-            max_concurrent_commands = int(
-                os.getenv(ENV_MAX_CONCURRENT_COMMANDS, str(DEFAULT_MAX_CONCURRENT_COMMANDS))
-            )
+        # See DEFAULT_MAX_CONCURRENT_COMMANDS; `parse_args` reads the operator's
+        # value from the environment, the way it does the other bounds.
         if max_concurrent_commands < 1:
             raise ValueError(f"{ENV_MAX_CONCURRENT_COMMANDS} must be at least 1")
         self.max_concurrent_commands = max_concurrent_commands
-        self._command_slots = threading.BoundedSemaphore(max_concurrent_commands)
+        # The slots are handed out in arrival order: a request holds a ticket
+        # in this queue while it waits, and only the ticket at the head may
+        # take a free slot. A semaphore would not do -- a waiter whose timed
+        # acquire lapses rejoins the wait at the back, so under sustained
+        # saturation the caller that had waited longest was as likely to be
+        # refused as one that had just arrived.
+        self._slot_condition = threading.Condition()
+        self._slots_in_use = 0
+        self._slot_queue: collections.deque[object] = collections.deque()
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -3781,6 +3783,18 @@ class CommandExecutor:
                 "scoped service account pool armed scopes=%d", len(self.scoped_pool.scopes)
             )
 
+    @property
+    def slots_in_use(self) -> int:
+        """How many requests hold a slot right now."""
+        with self._slot_condition:
+            return self._slots_in_use
+
+    @property
+    def queued_requests(self) -> int:
+        """How many requests are waiting for a slot right now."""
+        with self._slot_condition:
+            return len(self._slot_queue)
+
     @contextlib.contextmanager
     def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
         """Hold one concurrency slot for the whole of a request.
@@ -3797,23 +3811,41 @@ class CommandExecutor:
         serialised by the store's own lock, and the Cloud API relay answers
         from a bounded read of its own.
 
-        The wait is taken in COMMAND_SLOT_POLL_SECONDS pieces and `caller`, when
-        given, is checked between them: one that has hung up while queued raises
+        Slots go in arrival order. The wait is woken every
+        COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
+        checked each time: one that has hung up while queued raises
         `CallerHungUp` before anything is started, rather than taking the slot
-        a live request is waiting for. Every slot busy for
-        COMMAND_SLOT_WAIT_SECONDS raises `CommandSlotUnavailable`.
+        a live request is waiting for. A request still queued after
+        COMMAND_SLOT_WAIT_SECONDS raises `CommandSlotUnavailable`; with the
+        queue ordered, that is the request that has waited longest, not
+        whichever one a semaphore happened to pass over.
         """
         queued_at = time.monotonic()
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        while not self._command_slots.acquire(timeout=COMMAND_SLOT_POLL_SECONDS):
-            if caller is not None and _caller_has_gone(caller):
-                raise CallerHungUp("the caller disconnected while queued for a slot")
-            if time.monotonic() >= deadline:
-                raise CommandSlotUnavailable(
-                    f"the credential proxy is already running "
-                    f"{self.max_concurrent_commands} commands and none finished within "
-                    f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
-                )
+        ticket = object()
+        with self._slot_condition:
+            self._slot_queue.append(ticket)
+            try:
+                while not (
+                    self._slot_queue[0] is ticket
+                    and self._slots_in_use < self.max_concurrent_commands
+                ):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise CommandSlotUnavailable(
+                            f"the credential proxy is already running "
+                            f"{self.max_concurrent_commands} commands and none finished "
+                            f"within {COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
+                        )
+                    self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
+                    if caller is not None and _caller_has_gone(caller):
+                        raise CallerHungUp("the caller disconnected while queued for a slot")
+                self._slots_in_use += 1
+            finally:
+                # Admitted or leaving, the ticket comes out and the next in
+                # line is woken to look again.
+                self._slot_queue.remove(ticket)
+                self._slot_condition.notify_all()
         try:
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
@@ -3824,7 +3856,9 @@ class CommandExecutor:
                 )
             yield
         finally:
-            self._command_slots.release()
+            with self._slot_condition:
+                self._slots_in_use -= 1
+                self._slot_condition.notify_all()
 
     def bootstrap(self, command: str) -> None:
         """Prepare the trusted shell profile without interpreting later commands."""
@@ -6403,6 +6437,9 @@ def serve(args: argparse.Namespace) -> None:
         kubectl_timeout_seconds=getattr(
             args, "kubectl_timeout_seconds", DEFAULT_KUBECTL_TIMEOUT_SECONDS
         ),
+        max_concurrent_commands=getattr(
+            args, "max_concurrent_commands", DEFAULT_MAX_CONCURRENT_COMMANDS
+        ),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
@@ -6536,6 +6573,14 @@ def parse_args() -> argparse.Namespace:
         "--max-output-bytes",
         type=int,
         default=int(os.getenv("CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", "4194304")),
+    )
+    parser.add_argument(
+        "--max-concurrent-commands",
+        type=int,
+        default=int(
+            os.getenv(ENV_MAX_CONCURRENT_COMMANDS, str(DEFAULT_MAX_CONCURRENT_COMMANDS))
+        ),
+        help="How many requests that run commands may be in flight at once",
     )
     parser.add_argument(
         "--state-dir",
