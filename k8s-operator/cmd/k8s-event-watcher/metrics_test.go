@@ -165,3 +165,21 @@ func TestRun_AnEventReachingTheInformerIsCountedAsSeen(t *testing.T) {
 		t.Fatal("Run did not return within 5s of cancellation")
 	}
 }
+
+// The address the process opened is in its log, so a scrape target that is
+// down can be read against it: the entrypoint forwards whatever port it was
+// given, and a port other than the declared one binds fine.
+func TestRealMain_LogsTheMetricsAddressItOpened(t *testing.T) {
+	logs := captureLog(t)
+	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := realMain([]string{"--dry-run", "--kubeconfig", badKubeconfig, "--cluster-name", "x", "--metrics-addr", "127.0.0.1:0"})
+	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
+		t.Fatalf("want realMain to stop on the kubeconfig after opening the listener, got err=%v", err)
+	}
+	if got := logs.String(); !strings.Contains(got, "/metrics listening on 127.0.0.1:") {
+		t.Errorf("log does not name the address the listener opened:\n%s", got)
+	}
+}

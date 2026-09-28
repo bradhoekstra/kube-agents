@@ -721,6 +721,12 @@ func realMain(argv []string) error {
 	if err != nil {
 		log.Printf("k8s-event-watcher: ALERT %v — running without a /metrics listener; cluster events are still watched", err)
 	}
+	if metricsSrv != nil {
+		// The bound address, so a scrape target that is down can be read
+		// against what the process opened: the entrypoint forwards whatever
+		// port it was given, and a port other than the declared one binds fine.
+		log.Printf("k8s-event-watcher: /metrics listening on %s", metricsSrv.ln.Addr())
+	}
 
 	// Set up context cancellation on SIGINT/SIGTERM for clean shutdown.
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

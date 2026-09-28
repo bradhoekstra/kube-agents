@@ -483,10 +483,30 @@ start_event_watcher() {
   # reachable. The operator reserves the name, so spec.deployment.env cannot
   # move it either. Unset means no listener: an older operator that declares no
   # port gets the watcher it had, not one bound to a port nothing can reach.
+  #
+  # Checked to be a port and said out loud, for the same two writers the
+  # EVENT_WATCHER_ENABLED gate above names: a hand-edited Deployment, and an
+  # image paired with an operator that spells the value differently. A value
+  # that is not a port opens nothing and says so; a port other than the one
+  # the operator declares would bind fine while the container port, the policy
+  # and the PodMonitoring still point at the declared one, so the address is
+  # logged here and by the watcher, and a scrape target that is down has a line
+  # to be read against.
   metrics_addr=""
-  if [ -n "${EVENT_WATCHER_METRICS_PORT:-}" ]; then
-    metrics_addr=":${EVENT_WATCHER_METRICS_PORT}"
-  fi
+  case "${EVENT_WATCHER_METRICS_PORT:-}" in
+    "") ;;
+    *[!0-9]*)
+      echo "start-services: EVENT_WATCHER_METRICS_PORT=${EVENT_WATCHER_METRICS_PORT} is not a port number; the k8s-event-watcher opens no /metrics listener" >&2
+      ;;
+    *)
+      if [ "${EVENT_WATCHER_METRICS_PORT}" -ge 1 ] && [ "${EVENT_WATCHER_METRICS_PORT}" -le 65535 ]; then
+        metrics_addr=":${EVENT_WATCHER_METRICS_PORT}"
+        echo "start-services: k8s-event-watcher /metrics listener on ${metrics_addr}" >&2
+      else
+        echo "start-services: EVENT_WATCHER_METRICS_PORT=${EVENT_WATCHER_METRICS_PORT} is outside 1-65535; the k8s-event-watcher opens no /metrics listener" >&2
+      fi
+      ;;
+  esac
 
   (
     # Leave the loop on SIGTERM instead of going round it again. bash runs a trap

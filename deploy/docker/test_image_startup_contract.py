@@ -330,7 +330,12 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
     documented disabled state, so the port stays declared, the policy stays
     open and the PodMonitoring's target is simply down, with nothing in any
     log. The derivation is extracted from the real script and run, as the
-    emergency-stop gate above is.
+    emergency-stop gate above is. Two writers can put a value here without the
+    operator: a hand-edited Deployment and an image paired with an operator
+    that spells the value differently. So the script checks the value is a
+    port, refuses and says so when it is not, and says which address it opens,
+    since a port other than the declared one would bind fine while the
+    container port and the policy still point at the declared one.
     """
 
     def setUp(self):
@@ -344,8 +349,8 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
         self.launcher = launcher.group(0)
         derivation = re.search(
             r'^  metrics_addr=""\n'
-            r'  if \[ -n "\$\{([A-Za-z_][A-Za-z0-9_]*):-\}" \]; then\n'
-            r".*?\n  fi$",
+            r'  case "\$\{([A-Za-z_][A-Za-z0-9_]*):-\}" in\n'
+            r".*?\n  esac$",
             self.launcher,
             flags=re.M | re.S,
         )
@@ -359,7 +364,7 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
         self.derivation = derivation.group(0)
 
     def derive(self, value):
-        """Run the real derivation for `value` (None = unset); return metrics_addr."""
+        """Run the real derivation for `value` (None = unset); return (metrics_addr, stderr)."""
         env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
         if value is not None:
             env[self.env_var] = value
@@ -375,17 +380,34 @@ class EventWatcherMetricsPortContractTest(unittest.TestCase):
             text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        return result.stdout
+        return result.stdout, result.stderr
 
-    def test_the_operators_port_becomes_the_listener_address(self):
-        self.assertEqual(self.derive("9095"), ":9095")
+    def test_the_operators_port_becomes_the_listener_address_and_is_said(self):
+        address, log = self.derive("9095")
+        self.assertEqual(address, ":9095")
+        self.assertIn("listener on :9095", log)
 
     def test_unset_means_no_listener(self):
         # An older operator that declares no port gets the watcher it had. An
         # empty --metrics-addr is the flag's disabled state, which the watcher's
         # own TestStartMetrics_EmptyAddressOpensNothing pins.
-        self.assertEqual(self.derive(None), "")
-        self.assertEqual(self.derive(""), "")
+        self.assertEqual(self.derive(None)[0], "")
+        self.assertEqual(self.derive("")[0], "")
+
+    def test_a_value_that_is_not_a_port_opens_nothing_and_says_so(self):
+        for value in ("abc", "9095x", "-1", "0", "65536", "70000"):
+            with self.subTest(value=value):
+                address, log = self.derive(value)
+                self.assertEqual(address, "", log)
+                self.assertIn(value, log, "the refusal must name the value it refused")
+                self.assertIn("no /metrics listener", log)
+
+    def test_another_valid_port_is_forwarded_but_named(self):
+        # Nothing here knows the operator's constant, so a different port binds;
+        # the line naming it is what a reader of a down scrape target has.
+        address, log = self.derive("9096")
+        self.assertEqual(address, ":9096")
+        self.assertIn("listener on :9096", log)
 
     def test_the_launcher_passes_the_derived_address(self):
         launched = self.launcher.index("/usr/local/bin/k8s-event-watcher")
