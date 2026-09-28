@@ -482,7 +482,8 @@ drops projects (their read roles are revoked and their Cluster Agent profiles re
 reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
 `cluster_name` triple; neither changes IAM. Through the installer the value comes from
-`SCOPE_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
+`SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
 forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
 declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that
@@ -509,8 +510,7 @@ the apply needs `resourcemanager.folders.setIamPolicy` on each folder or
 check before the apply and the composition run directly does not. An organisation binding reaches
 every project in the organisation; the design recommends folders until the scoped service account
 pool grants authority ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
-§9). Through the installer the two lists are `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS` in
-`install.env`.
+§9).
 
 ### Backups
 

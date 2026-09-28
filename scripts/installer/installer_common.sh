@@ -165,6 +165,9 @@ readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.se
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
+# How the preflight names the identity it probed: Terraform's, not gcloud's
+# active account, which can be a different principal.
+readonly SCOPE_ADC_LABEL="the Application Default Credentials (the identity Terraform applies with)"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -1160,9 +1163,11 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   return 1
 }
 
-# Preflight for a declared folder or organisation, run with the identity the
-# front doors hand to Terraform (gcloud's active account), before the apply
-# that would bind the agent's roles on the container: (1) the Cloud Asset API
+# Preflight for a declared folder or organisation, run with the identity
+# Terraform applies with -- the Application Default Credentials, which the
+# google provider reads (providers.tf sets no access token), and which need
+# not be gcloud's active account -- before the apply that would bind the
+# agent's roles on the container: (1) the Cloud Asset API
 # the reconcile's container search calls can be enabled in the host project,
 # meaning it is enabled already or no effective organisation policy forbids
 # it, and (2) this identity can set IAM policy on every container named, so
@@ -1197,12 +1202,11 @@ check_scope_container_access() {
     fi
   fi
   if ! command -v curl >/dev/null 2>&1; then
-    undecided+=("whether this identity can set IAM policy on the declared containers (curl is not installed)")
-  elif ! token="$(trap - ERR; gcloud auth print-access-token 2>/dev/null)" || [ -z "$token" ]; then
-    undecided+=("whether this identity can set IAM policy on the declared containers (gcloud could not mint an access token)")
+    undecided+=("whether ${SCOPE_ADC_LABEL} can set IAM policy on the declared containers (curl is not installed)")
+  elif ! token="$(trap - ERR; gcloud auth application-default print-access-token 2>/dev/null)" || [ -z "$token" ]; then
+    undecided+=("whether the Application Default Credentials can set IAM policy on the declared containers (gcloud could not mint an access token for them; run: gcloud auth application-default login)")
   else
-    local IFS=$', \t\n' account
-    account="$(trap - ERR; gcloud config get-value account 2>/dev/null || true)"
+    local IFS=$', \t\n'
     case "$-" in *f*) had_noglob=true ;; esac
     set -f
     for entry in $folders; do
@@ -1210,9 +1214,9 @@ check_scope_container_access() {
       rc=0
       _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("this identity (${account}) cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder, or drop it from SCOPE_FOLDERS.")
+        failures+=("${SCOPE_ADC_LABEL} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
-        undecided+=("whether this identity can set IAM policy on folders/${entry}")
+        undecided+=("whether ${SCOPE_ADC_LABEL} can set IAM policy on folders/${entry}")
       fi
     done
     for entry in $organizations; do
@@ -1220,9 +1224,9 @@ check_scope_container_access() {
       rc=0
       _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("this identity (${account}) cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin, or drop it from SCOPE_ORGANIZATIONS.")
+        failures+=("${SCOPE_ADC_LABEL} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
-        undecided+=("whether this identity can set IAM policy on organizations/${entry}")
+        undecided+=("whether ${SCOPE_ADC_LABEL} can set IAM policy on organizations/${entry}")
       fi
     done
     $had_noglob || set +f
@@ -1254,7 +1258,9 @@ _scope_asset_api_enabled() {
 # nothing printed when no read policy denies it, SCOPE_PROBE_UNDECIDED when
 # every constraint's policy was unreadable (a constraint that has no policy
 # set reads as not denying). Both service-usage constraints are read, because
-# an organisation may still carry the legacy one.
+# an organisation may still carry the legacy one. Only the enforced `spec` is
+# read: a `dryRunSpec` enforces nothing, and an organisation trialling a
+# constraint in dry run must not be refused for it.
 _scope_policy_denying_asset_api() {
   local project="$1" constraint policy readable=false
   for constraint in $SCOPE_SERVICE_USAGE_CONSTRAINTS; do
@@ -1269,7 +1275,7 @@ try:
     doc = json.load(sys.stdin) or {}
 except Exception:
     sys.exit(1)
-rules = ((doc.get("spec") or doc.get("dryRunSpec") or {}).get("rules")) or []
+rules = ((doc.get("spec") or {}).get("rules")) or []
 for rule in rules:
     if rule.get("denyAll"):
         sys.exit(0)

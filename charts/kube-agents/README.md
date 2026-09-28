@@ -559,7 +559,7 @@ before any GKE call. The
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 
-### Projects in scope
+### Projects, folders and organisations in scope
 
 `platformAgent.scope` is rendered as `spec.scope` on the `PlatformAgent`: the GCP projects,
 folders and organisations, beyond the project the agent runs in, whose GKE clusters get a Cluster
@@ -770,6 +770,7 @@ helm uninstall kube-agents -n kubeagents-system
   `terraform/examples/full-install` does both in one apply.
 
   Two behaviours worth knowing before you enable them:
+
   - **`failurePolicy` defaults to `Ignore`, where the kustomize path uses
     `Fail`.** Helm applies the webhook configurations before both the
     `Certificate` and the `PlatformAgent` CR, so under `Fail` the API server

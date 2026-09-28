@@ -3061,8 +3061,11 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 f'  *"services list"*) printf "%s\\n" "{services}"; exit 0 ;;\n'
                 + ('  *"org-policies describe"*) echo "ERROR: PERMISSION_DENIED" >&2; exit 1 ;;\n' if policy_error else
                    f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
-                + ('  *"print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
-                   '  *"print-access-token"*) exit 1 ;;\n')
+                # Terraform's credentials, not gcloud's active account: the stub
+                # answers the ADC form and refuses the plain one.
+                + ('  *"application-default print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
+                   '  *"application-default print-access-token"*) exit 1 ;;\n')
+                + '  *"auth print-access-token"*) echo "wrong-identity"; exit 0 ;;\n'
                 + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
                 "esac\nexit 1\n"
             )
@@ -3128,7 +3131,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                          probe={"folders/111111111111": "denied", "folders/222222222222": "granted",
                                 "organizations/333333333333": "missing"})
         self._assert_rc(proc, 1)
-        self.assertIn("ERROR: Refusing to apply: this identity (tester@example.com) cannot set IAM policy on folders/111111111111 (resourcemanager.folders.setIamPolicy)", proc.stdout)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111 (resourcemanager.folders.setIamPolicy)", proc.stdout)
         self.assertIn("cannot set IAM policy on organizations/333333333333 (resourcemanager.organizations.setIamPolicy)", proc.stdout)
         self.assertNotIn("folders/222222222222 (", proc.stdout)
         self.assertIn("INFO: Nothing was changed.", proc.stdout)
@@ -3141,8 +3144,8 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                                 "folders/333333333333": "garbage"})
         self._assert_rc(proc, 1)
         self.assertIn("cannot set IAM policy on folders/111111111111", proc.stdout)
-        self.assertIn("WARN: The scope container preflight could not decide whether this identity can set IAM policy on folders/222222222222", proc.stdout)
-        self.assertIn("could not decide whether this identity can set IAM policy on folders/333333333333", proc.stdout)
+        self.assertIn("WARN: The scope container preflight could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/222222222222", proc.stdout)
+        self.assertIn("can set IAM policy on folders/333333333333", proc.stdout)
 
     def test_a_policy_that_denies_the_api_is_named_when_the_api_is_off(self):
         for label, policy in (
@@ -3164,6 +3167,13 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                          policy={"spec": {"rules": [{"values": {"allowedValues": ["cloudasset.googleapis.com"]}}]}},
                          probe={"folders/123456789012": "granted"})
         self._assert_rc(proc, 0)
+        # A dry-run policy enforces nothing: an organisation trialling the
+        # constraint must not be refused for it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                         policy={"dryRunSpec": {"rules": [{"denyAll": True}]}},
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("denies it", proc.stdout)
 
     def test_an_unreadable_policy_warns_and_lets_the_apply_speak(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False, policy_error=True,
@@ -3174,7 +3184,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     def test_no_token_or_no_curl_warns_about_the_containers_and_passes(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, token=False)
         self._assert_rc(proc, 0)
-        self.assertIn("gcloud could not mint an access token", proc.stdout)
+        self.assertIn("gcloud could not mint an access token for them; run: gcloud auth application-default login", proc.stdout)
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, curl_present=False)
         self._assert_rc(proc, 0)
         self.assertIn("curl is not installed", proc.stdout)
@@ -3189,8 +3199,8 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self._assert_rc(proc, 0)
         self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
         self.assertIn("WARN: A full upgrade would be refused: cloudasset.googleapis.com cannot be enabled", proc.stdout)
-        self.assertIn("WARN: A full upgrade would be refused: this identity (tester@example.com) cannot set IAM policy on folders/111111111111", proc.stdout)
-        self.assertIn("could not decide whether this identity can set IAM policy on folders/222222222222", proc.stdout)
+        self.assertIn("WARN: A full upgrade would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("can set IAM policy on folders/222222222222", proc.stdout)
         # And a clean run under the same options is silent.
         proc = self._run(keys={"SCOPE_FOLDERS": "111111111111"}, strict=True, probe={"folders/111111111111": "granted"})
         self._assert_rc(proc, 0)
@@ -3199,7 +3209,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     def test_warn_mode_names_the_failures_and_passes(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, mode="warn", probe={"folders/123456789012": "denied"})
         self._assert_rc(proc, 0)
-        self.assertIn("WARN: A full upgrade would be refused: this identity (tester@example.com) cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertIn("WARN: A full upgrade would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
         self.assertNotIn("ERROR", proc.stdout)
 
 

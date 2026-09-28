@@ -376,7 +376,7 @@ in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection m
 quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
 projects the agent only reads. Widening `project_roles` widens the host project alone; widening
 what the scope carries is an edit to the allowlist, in one file, on purpose. The module refuses the
-plan when `scope.projects` is non-empty and the intersection carries neither
+plan when `scope.projects`, `scope.folders` or `scope.organizations` is non-empty and the intersection carries neither
 `roles/container.clusterViewer` nor `roles/container.viewer`, the two allowlist roles that carry
 `container.clusters.get` as well as `container.clusters.list`: `roles/iam.securityReviewer` lists
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
@@ -399,9 +399,10 @@ which §9 takes up.
 
 Prerequisites the design has to state and the installer has to preflight:
 
-- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Today it needs only
+- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Before phase 2 it needed only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
-  than failing on the first.
+  than failing on the first, and probes the Application Default Credentials Terraform applies with
+  rather than gcloud's active account.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
 - When a folder or organisation is declared, the identity running Terraform can enable

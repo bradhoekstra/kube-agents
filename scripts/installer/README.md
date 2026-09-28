@@ -262,16 +262,28 @@ and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so
 every front door rather than being pruned by a served schema that predates the field.
 
 When a folder or organisation is declared, a second check runs before every apply, first install
-included, with the identity the front doors hand to Terraform (`check_scope_container_access`):
-that `cloudasset.googleapis.com` is enabled in the host project or no effective organisation
-policy (`constraints/gcp.restrictServiceUsage`, the legacy `constraints/serviceuser.services`)
-denies it, and that this identity holds `resourcemanager.folders.setIamPolicy` on each folder and
+included, with the identity Terraform applies with, the Application Default Credentials, which
+need not be gcloud's active account (`check_scope_container_access`): that
+`cloudasset.googleapis.com` is enabled in the host project or no enforced organisation policy
+(`constraints/gcp.restrictServiceUsage`, the legacy `constraints/serviceuser.services`; a policy
+in dry run enforces nothing and is not read) denies it, and that those credentials hold
+`resourcemanager.folders.setIamPolicy` on each folder and
 `resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
 Manager's `testIamPermissions`. Every container is probed and every failure named before the run
 refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
 apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
-first check guards against. `upgrade.sh --plan` warns instead of refusing. Declaring an
-organisation prints a warning on every run: the binding reaches every project in it.
+first check guards against. `upgrade.sh --plan` warns instead of refusing; the retag modes and
+`install.sh --dry-run` do not run it. Declaring an organisation prints a warning on every run
+that plans or applies: the binding reaches every project in it.
+
+An install that declared a folder or organisation on the `PlatformAgent` by hand before the
+installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade
+like any hand edit, and the lines it prints include `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS`.
+Recording them hands the container's bindings to Terraform, which creates them with the applying
+credentials, so those credentials need `setIamPolicy` on the container even where an
+administrator made the hand grant; the alternatives are to obtain it for the identity that
+applies, or to take the container off the `PlatformAgent`, which retires its members over the
+reconcile's next two clean runs, and manage those projects through `SCOPE_PROJECTS` instead.
 
 The bindings live in projects, folders and organisations the applying identity has to be able to
 set IAM policy in. A scoped project or container that is deleted, or whose owner revokes that
