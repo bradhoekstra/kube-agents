@@ -776,3 +776,47 @@ func TestTheBrokerPodIsNotDeletedByTheLegacyCleanup(t *testing.T) {
 		}
 	}
 }
+
+// The broker's metrics-only listener: the port the runtime binds, the port the
+// container declares and the port the policy admits are one constant, and this
+// pins the two the container carries. The policy's is
+// TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape.
+func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
+	agent := brokerPodAgent()
+	container := buildCredentialProxyContainer(agent)
+
+	var ports []corev1.ContainerPort
+	for _, p := range container.Ports {
+		if p.Name == "cred-metrics" {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) != 1 || ports[0].ContainerPort != 8766 {
+		t.Fatalf("want exactly one cred-metrics container port on 8766, got %#v", container.Ports)
+	}
+	var found []corev1.EnvVar
+	for _, e := range container.Env {
+		if e.Name == "CREDENTIAL_PROXY_METRICS_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 || found[0].Value != "8766" {
+		t.Fatalf("want exactly one CREDENTIAL_PROXY_METRICS_PORT=8766, got %#v", found)
+	}
+
+	// Reserved, so a CR cannot move the listener off the declared port, and
+	// server-side apply never sees the duplicate key that would freeze the
+	// Deployment.
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_METRICS_PORT", Value: "1"}},
+	}
+	found = nil
+	for _, e := range buildCredentialProxyContainer(agent).Env {
+		if e.Name == "CREDENTIAL_PROXY_METRICS_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 || found[0].Value != "8766" {
+		t.Errorf("spec.deployment.env moved the metrics listener: %#v", found)
+	}
+}

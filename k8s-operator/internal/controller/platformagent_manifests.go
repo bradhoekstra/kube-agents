@@ -91,6 +91,17 @@ const (
 	// any install whose working directories were larger than the guess.
 	agentDataStorageSize = "10Gi"
 	credentialProxyPort  = 8765
+	// credentialProxyMetricsPort is the broker's metrics-only listener, beside
+	// Envoy's credentialProxyPort. Its own port so that the managed-Prometheus
+	// collector is admitted to a listener that serves counters and nothing
+	// else, and the credentialed port keeps admitting only the sandbox and the
+	// gateway. One constant for the container port, the value of
+	// CREDENTIAL_PROXY_METRICS_PORT the runtime binds, and the collector's
+	// ingress rule; the chart's PodMonitoring scrapes it by number, held to
+	// this one by tests/test_chart_platform_agent_monitoring.py.
+	credentialProxyMetricsPort     int32 = 8766
+	credentialProxyMetricsPortName       = "cred-metrics"
+	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT"
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -3880,6 +3891,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		// The metrics-only listener's port (see credentialProxyMetricsPort). In
+		// the managed set, so a spec.deployment.env entry cannot move the
+		// listener off the port the container declares and the policy admits.
+		{Name: credentialProxyMetricsPortEnv, Value: strconv.Itoa(int(credentialProxyMetricsPort))},
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
