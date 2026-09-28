@@ -615,11 +615,3 @@ func resolveActiveInterfaces(agent *agentv1alpha1.PlatformAgent) []string {
 	slices.Sort(interfaces)
 	return interfaces
 }
-
-// activeInterfacesEqual is the status gate's term for the list. nil and empty
-// compare equal, so a CR whose status has never carried the key does not read as
-// changed against a spec that enables nothing — which would otherwise be one
-// status write per reconcile, forever, on exactly that CR.
-func activeInterfacesEqual(current, resolved []string) bool {
-	return slices.Equal(current, resolved)
-}

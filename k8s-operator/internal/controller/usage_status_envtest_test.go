@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -150,13 +151,13 @@ func TestAPrunedUsageStatusOnAServedCRDEnvtest(t *testing.T) {
 	// field, once the API server serves the new schema.
 	key := client.ObjectKeyFromObject(agent)
 	deadline := time.Now().Add(crdSettleTimeout)
-	for !activeInterfacesEqual(agent.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
+	for !slices.Equal(agent.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
 		if time.Now().After(deadline) {
 			t.Fatalf("status.usage.activeInterfaces never landed after the CRD was applied: %v", agent.Status.Usage.ActiveInterfaces)
 		}
 		r.prunedUsageStatus.Store(key, time.Now().Add(-2*usageStatusReprobeInterval))
 		settle("after the CRD")
-		if !activeInterfacesEqual(agent.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
+		if !slices.Equal(agent.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
 			time.Sleep(crdSettlePoll)
 		}
 	}
@@ -167,7 +168,7 @@ func TestAPrunedUsageStatusOnAServedCRDEnvtest(t *testing.T) {
 	if err := cl.Get(ctx, key, stored); err != nil {
 		t.Fatal(err)
 	}
-	if !activeInterfacesEqual(stored.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
+	if !slices.Equal(stored.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
 		t.Errorf("a fresh read shows activeInterfaces=%v, want [dashboard]", stored.Status.Usage.ActiveInterfaces)
 	}
 	before := writes

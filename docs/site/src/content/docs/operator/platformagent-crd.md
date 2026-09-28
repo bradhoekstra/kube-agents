@@ -689,11 +689,12 @@ The operator writes observed state to the `status` subresource:
 from the spec on every reconcile and written by the Ready status update when it changes; a pass that
 parks the CR `Degraded` before that update leaves the previous value, so read it alongside the Ready
 condition. On an install whose served CRD predates the field, the API server drops it from every
-write; the operator notices from the write's echo, stops treating the missing field as a change for five
-minutes at a time, and lands it once this release's CRD is applied: within five minutes on a quiet
-install, at once if anything else in the status moves. The counters and
-`usage.lastActiveTime` are declared in the schema and absent from every status until something writes
-them.
+write; the operator notices from the write's echo, stops treating the missing field as a change for
+five minutes at a time, and lands it once this release's CRD is applied: within five minutes on a
+quiet install, at once when the Ready status update next writes for any other reason. The other
+status writers carry the field through as they read it, so a pass that ends `Degraded` lands
+nothing new. The counters and `usage.lastActiveTime` are declared in the schema and absent from
+every status until something writes them.
 
 These condition types appear in `conditions`; only `Ready` is always present:
 

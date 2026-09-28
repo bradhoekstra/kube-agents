@@ -269,8 +269,10 @@ type PlatformAgentReconciler struct {
 	// usageStatusReprobeInterval the record expires and the next pass writes
 	// once: that lands the field if the CRD has been applied since, and records
 	// the pruning again if not. So an applied CRD shows up within one interval
-	// on a quiet install, at once if anything else in the status moves, and a
-	// skewed install costs one status write per interval. The steady-state
+	// on a quiet install, at once when the Ready writer next writes for any
+	// other reason (the other status writers carry the field through as read,
+	// so a Degraded pass lands nothing new), and a skewed install costs one
+	// status write and one log line per interval. The steady-state
 	// requeue is capped at the interval while a record is held
 	// (usageStatusRequeue), so the probe is scheduled rather than left to the
 	// next event. Keyed by ObjectKey, value time.Time; cleared by any write
@@ -3067,7 +3069,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		agent.Status.Telemetry.OTLPEndpoint == otlpEndpoint &&
 		agent.Status.Telemetry.OTLPEndpointSource == otlpSource &&
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
-		(r.usageStatusPruned(agent) || activeInterfacesEqual(agent.Status.Usage.ActiveInterfaces, newActiveInterfaces)) &&
+		(r.usageStatusPruned(agent) || slices.Equal(agent.Status.Usage.ActiveInterfaces, newActiveInterfaces)) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		hostPathDroppedUnchanged &&

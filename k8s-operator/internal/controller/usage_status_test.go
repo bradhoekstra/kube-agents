@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -67,23 +68,10 @@ func TestResolveActiveInterfaces(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := resolveActiveInterfaces(tc.agent)
-			if !activeInterfacesEqual(got, tc.want) {
+			if !slices.Equal(got, tc.want) {
 				t.Errorf("resolveActiveInterfaces() = %v, want %v", got, tc.want)
 			}
 		})
-	}
-}
-
-func TestActiveInterfacesEqual(t *testing.T) {
-	if !activeInterfacesEqual(nil, []string{}) || !activeInterfacesEqual([]string{}, nil) {
-		t.Error("nil and empty must compare equal, or a CR enabling nothing writes status every pass")
-	}
-	if !activeInterfacesEqual([]string{"dashboard", "slack"}, []string{"dashboard", "slack"}) {
-		t.Error("equal lists must compare equal")
-	}
-	if activeInterfacesEqual([]string{"dashboard"}, []string{"dashboard", "slack"}) ||
-		activeInterfacesEqual([]string{"slack"}, []string{"teams"}) {
-		t.Error("different lists must not compare equal")
 	}
 }
 
@@ -144,7 +132,7 @@ func TestUpdateStatusReadyWritesActiveInterfacesOnlyWhenTheyChange(t *testing.T)
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
 		t.Fatal(err)
 	}
-	if !activeInterfacesEqual(stored.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
+	if !slices.Equal(stored.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
 		t.Errorf("status.usage.activeInterfaces = %v, want [dashboard]", stored.Status.Usage.ActiveInterfaces)
 	}
 	if stored.Status.Usage.SessionsTotal != 42 {
@@ -171,7 +159,7 @@ func TestUpdateStatusReadyWritesActiveInterfacesOnlyWhenTheyChange(t *testing.T)
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
 		t.Fatal(err)
 	}
-	if !activeInterfacesEqual(stored.Status.Usage.ActiveInterfaces, []string{"dashboard", "slack"}) {
+	if !slices.Equal(stored.Status.Usage.ActiveInterfaces, []string{"dashboard", "slack"}) {
 		t.Errorf("status.usage.activeInterfaces = %v, want [dashboard slack]", stored.Status.Usage.ActiveInterfaces)
 	}
 
@@ -238,7 +226,7 @@ func TestAPrunedUsageStatusDoesNotWriteEveryPass(t *testing.T) {
 	}
 	r.prunedUsageStatus.Store(key, time.Now().Add(-2*usageStatusReprobeInterval))
 	settleReady(t, r, agent)
-	if counter.writes != 3 || !activeInterfacesEqual(agent.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
+	if counter.writes != 3 || !slices.Equal(agent.Status.Usage.ActiveInterfaces, []string{"dashboard"}) {
 		t.Fatalf("after the record expired under the applied CRD: %d writes, activeInterfaces=%v; want 3 and [dashboard]", counter.writes, agent.Status.Usage.ActiveInterfaces)
 	}
 	if r.usageStatusPruned(agent) {
@@ -255,7 +243,7 @@ func TestAPrunedUsageStatusDoesNotWriteEveryPass(t *testing.T) {
 	}
 	settleReady(t, r, agent)
 	settleReady(t, r, agent)
-	if counter.writes != 4 || !activeInterfacesEqual(agent.Status.Usage.ActiveInterfaces, []string{"dashboard", "slack"}) {
+	if counter.writes != 4 || !slices.Equal(agent.Status.Usage.ActiveInterfaces, []string{"dashboard", "slack"}) {
 		t.Errorf("after enabling slack: %d writes, activeInterfaces=%v; want 4 and [dashboard slack]", counter.writes, agent.Status.Usage.ActiveInterfaces)
 	}
 }
