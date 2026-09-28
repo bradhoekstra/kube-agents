@@ -165,13 +165,16 @@ readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.se
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
-# gcloud's own credential overrides, cleared for every mint the preflight
-# makes because the google provider does not read them.
-readonly SCOPE_GCLOUD_AUTH_OVERRIDES="CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"
+# gcloud's own credential overrides, cleared for every gcloud call the
+# preflight makes, the property read included, because the google provider
+# does not read them.
+readonly SCOPE_GCLOUD_AUTH_OVERRIDES="CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_ACCESS_TOKEN_FILE CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"
 # The same overrides as gcloud configuration properties, which live in the
 # active configuration file where env -u cannot reach them; a mint under
 # either would answer for an identity Terraform never uses, so a set one
-# makes the probe undecided rather than wrong.
+# makes the probe undecided rather than wrong. Read with the variables above
+# cleared, so only the configuration file's value is reported and the remedy
+# (unset the property) is one that works.
 readonly SCOPE_GCLOUD_AUTH_PROPERTIES="auth/impersonate_service_account auth/access_token_file"
 # The reasons in a 403 from Resource Manager that are not a permission answer:
 # the API not enabled in the credential's quota project, or no quota project
@@ -1341,18 +1344,33 @@ _scope_terraform_token_remedy() {
 # impersonation). A property gcloud cannot report reads as unset.
 _scope_gcloud_auth_properties_in_the_way() {
   local property value out=""
+  local -a clear=()
   if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ] && [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
     return 0
   fi
+  # shellcheck disable=SC2207
+  clear=($(_scope_gcloud_env_clear_args))
   for property in $SCOPE_GCLOUD_AUTH_PROPERTIES; do
     if [ "$property" = "auth/impersonate_service_account" ] && [ -n "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
       continue
     fi
-    value="$(trap - ERR; gcloud config get-value "$property" 2>/dev/null || true)"
+    # Under the same cleared environment as the mint: `config get-value`
+    # reports the effective value, and a CLOUDSDK_AUTH_* variable would
+    # otherwise read as a property the operator never set.
+    value="$(trap - ERR; env "${clear[@]}" gcloud config get-value "$property" 2>/dev/null || true)"
     case "$value" in ""|"(unset)") continue ;; esac
     out="${out:+$out }${property}"
   done
   printf '%s' "$out"
+}
+
+# Prints the `-u VAR` pairs that clear gcloud's own credential overrides for
+# one `env` call. Word-split by the caller into an array (the values are
+# variable names, so splitting is safe); no nameref, because the front doors
+# run on bash 3.2 as well.
+_scope_gcloud_env_clear_args() {
+  local var
+  for var in $SCOPE_GCLOUD_AUTH_OVERRIDES; do printf -- '-u %s ' "$var"; done
 }
 
 # Prints the access token for those credentials; fails when none can be
@@ -1363,7 +1381,8 @@ _scope_terraform_access_token() {
   local var creds
   local -a impersonate=() clear=()
   [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ] || impersonate=("--impersonate-service-account=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}")
-  for var in $SCOPE_GCLOUD_AUTH_OVERRIDES; do clear+=("-u" "$var"); done
+  # shellcheck disable=SC2207
+  clear=($(_scope_gcloud_env_clear_args))
   var="$(_scope_terraform_credentials_var)"
   case "$var" in
     GOOGLE_OAUTH_ACCESS_TOKEN)

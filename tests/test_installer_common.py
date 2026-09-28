@@ -3042,8 +3042,8 @@ class PreApplyScopeCheckTest(unittest.TestCase):
 _GOOGLE_CREDENTIAL_VARIABLES = (
     "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_OAUTH_ACCESS_TOKEN", "GOOGLE_CREDENTIALS",
     "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON", "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
-    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
-    "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE", "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
 )
 
 
@@ -3077,17 +3077,19 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                    f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
                 # Terraform's credentials, not gcloud's active account: the stub
                 # answers the ADC form and refuses the plain one.
-                + ('  *"application-default print-access-token"*) [ -z "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}${CLOUDSDK_AUTH_ACCESS_TOKEN:-}" ] || echo "CLOUDSDK-LEAKED" >>"$SCOPE_PROBE_LOG"; [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] || echo "KEYFILE-BYTES:$(head -c 12 "$GOOGLE_APPLICATION_CREDENTIALS" | tr -d "\\n")" >>"$SCOPE_PROBE_LOG"; echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
+                + ('  *"application-default print-access-token"*) [ -z "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}${CLOUDSDK_AUTH_ACCESS_TOKEN:-}${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-}${CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE:-}" ] || echo "CLOUDSDK-LEAKED" >>"$SCOPE_PROBE_LOG"; [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] || echo "KEYFILE-BYTES:$(head -c 12 "$GOOGLE_APPLICATION_CREDENTIALS" | tr -d "\\n")" >>"$SCOPE_PROBE_LOG"; echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
                    '  *"application-default print-access-token"*) exit 1 ;;\n')
                 # The raw-token form: only right with a source token in
                 # CLOUDSDK_AUTH_ACCESS_TOKEN and the impersonation flag.
                 + '  *"auth print-access-token"*"--impersonate-service-account="*) echo "imp-from-${CLOUDSDK_AUTH_ACCESS_TOKEN:-none}"; echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG"; exit 0 ;;\n'
                 + '  *"auth print-access-token"*) echo "wrong-identity"; exit 0 ;;\n'
                 + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
-                # gcloud configuration properties: set per case through the
-                # environment the stub reads, unset otherwise.
-                + '  *"config get-value auth/impersonate_service_account"*) echo "${STUB_PROPERTY_IMPERSONATE:-}"; exit 0 ;;\n'
-                + '  *"config get-value auth/access_token_file"*) echo "${STUB_PROPERTY_TOKEN_FILE:-}"; exit 0 ;;\n'
+                # gcloud configuration properties: `config get-value` reports the
+                # effective value, so a CLOUDSDK_AUTH_* variable wins over the
+                # configuration file, as in the real binary; the file's value is
+                # set per case through STUB_PROPERTY_*.
+                + '  *"config get-value auth/impersonate_service_account"*) echo "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-${STUB_PROPERTY_IMPERSONATE:-}}"; exit 0 ;;\n'
+                + '  *"config get-value auth/access_token_file"*) echo "${CLOUDSDK_AUTH_ACCESS_TOKEN_FILE:-${STUB_PROPERTY_TOKEN_FILE:-}}"; exit 0 ;;\n'
                 "esac\nexit 1\n"
             )
             if curl_present:
@@ -3194,11 +3196,18 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
         self.assertRegex(proc.stderr, r"IMPERSONATED:.*tf@p\.iam\.gserviceaccount\.com")
         self.assertIn("BEARER:tok\n", proc.stderr)
-        # gcloud's own overrides in the operator's shell do not reach the mint:
-        # the provider does not read them.
-        proc = self._run(keys=base, probe=probe, env_extra={"CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT": "other@p.iam.gserviceaccount.com"})
-        self.assertIn("BEARER:tok\n", proc.stderr)
-        self.assertNotIn("CLOUDSDK-LEAKED", proc.stderr)
+        # gcloud's own overrides in the operator's shell reach neither the mint
+        # nor the property read that guards it: the provider does not read
+        # them, and `config get-value` would otherwise report them as a
+        # property the operator never set.
+        for var in ("CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE",
+                    "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"):
+            with self.subTest(var=var):
+                proc = self._run(keys=base, probe=probe, env_extra={var: "other@p.iam.gserviceaccount.com"})
+                self._assert_rc(proc, 0)
+                self.assertIn("BEARER:tok\n", proc.stderr)
+                self.assertNotIn("CLOUDSDK-LEAKED", proc.stderr)
+                self.assertNotIn("active configuration sets", proc.stdout)
         # A raw token plus impersonation: the token is the source credential
         # and the probe is made as the impersonated account, as the provider
         # does, never as the raw token's identity.
