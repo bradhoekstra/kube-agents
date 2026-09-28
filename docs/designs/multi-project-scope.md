@@ -405,11 +405,13 @@ Prerequisites the design has to state and the installer has to preflight:
   rather than gcloud's active account.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
-- When a folder or organisation is declared, the identity running Terraform can enable
-  `cloudasset.googleapis.com` in the host project, checked before the apply that then binds the
-  agent's `roles/cloudasset.viewer` on each container. The preflight names an organisation policy
-  that forbids the API rather than failing inside `google_project_service`; an install that
-  declares only explicit projects skips this check and never enables the API (§4).
+- When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
+  the host project. The preflight checks, before the apply that then binds the agent's
+  `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced
+  organisation policy forbids it, and names the policy rather than failing inside
+  `google_project_service`; whether the applying identity holds `serviceusage.services.enable` is
+  left to the apply. An install that declares only explicit projects skips this check and never
+  enables the API (§4).
 - `project_roles` stays the list bound in the host project, and the mirror between it and
   `read_only_roles` that `tests/test_scoped_sa_pool_iam.py` checks is unchanged. The `scope_roles`
   allowlist lives beside it with a test that every entry is also in the default `project_roles`,

@@ -168,6 +168,11 @@ readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
 # How the preflight names the identity it probed: Terraform's, not gcloud's
 # active account, which can be a different principal.
 readonly SCOPE_ADC_LABEL="the Application Default Credentials (the identity Terraform applies with)"
+# The reasons in a 403 from Resource Manager that are not a permission answer:
+# the API not enabled in the credential's quota project, or no quota project
+# at all. The apply enables cloudresourcemanager.googleapis.com before its
+# own binding call, so these read as undecided, not denied.
+readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not been used in project|quota project|USER_PROJECT_DENIED"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -1204,7 +1209,7 @@ check_scope_container_access() {
   fi
   if ! command -v curl >/dev/null 2>&1; then
     undecided+=("whether ${SCOPE_ADC_LABEL} can set IAM policy on the declared containers (curl is not installed)")
-  elif ! token="$(trap - ERR; gcloud auth application-default print-access-token 2>/dev/null)" || [ -z "$token" ]; then
+  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether the Application Default Credentials can set IAM policy on the declared containers (gcloud could not mint an access token for them; run: gcloud auth application-default login)")
   else
     local IFS=$', \t\n'
@@ -1243,6 +1248,38 @@ check_scope_container_access() {
   for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
   print_info "Nothing was changed. Fix what is named above, or edit SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
   return 1
+}
+
+# An access token for the identity the google provider will apply with, read
+# the way the provider reads it: GOOGLE_OAUTH_ACCESS_TOKEN as is; otherwise
+# the credentials file or JSON in GOOGLE_CREDENTIALS or
+# GOOGLE_CLOUD_KEYFILE_JSON, else the Application Default Credentials, minted
+# through gcloud, impersonating GOOGLE_IMPERSONATE_SERVICE_ACCOUNT when the
+# operator set it. Prints the token; fails when none can be minted.
+_scope_terraform_access_token() {
+  if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ]; then
+    printf '%s' "$GOOGLE_OAUTH_ACCESS_TOKEN"
+    return 0
+  fi
+  local creds="${GOOGLE_CREDENTIALS:-${GOOGLE_CLOUD_KEYFILE_JSON:-}}" key_file="" rc=0 token
+  local -a impersonate=()
+  [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ] || impersonate=("--impersonate-service-account=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}")
+  if [ -n "$creds" ]; then
+    if [ -f "$creds" ]; then
+      key_file="$creds"
+    else
+      # The provider accepts the key's JSON inline; gcloud wants a file.
+      key_file="$(mktemp)"
+      (umask 077; printf '%s' "$creds" >"$key_file")
+    fi
+    token="$(trap - ERR; GOOGLE_APPLICATION_CREDENTIALS="$key_file" gcloud auth application-default print-access-token \
+      ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)" || rc=$?
+    [ "$key_file" = "$creds" ] || rm -f "$key_file"
+  else
+    token="$(trap - ERR; gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)" || rc=$?
+  fi
+  [ "$rc" -eq 0 ] && [ -n "$token" ] || return 1
+  printf '%s' "$token"
 }
 
 # True when the Asset API is already enabled in the host project. A listing
@@ -1300,16 +1337,25 @@ sys.exit(1)
 # container, through testIamPermissions, which never mutates and answers for
 # the caller alone. $1 folders/<id> or organizations/<id>; $2 the permission;
 # $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
-# permission, or a 403/404: a container the caller cannot see cannot be bound)
-# or _UNDECIDED (transport failure, any other status, an unreadable body).
+# permission, a 404, or a 403 that is a permission answer: a container the
+# caller cannot see cannot be bound) or _UNDECIDED (transport failure, a 403
+# for the API being off in the quota project, any other status, an
+# unreadable body).
 _scope_container_can_set_iam() {
-  local resource="$1" permission="$2" token="$3" response status body rc=0
+  local resource="$1" permission="$2" token="$3" response status body rc=0 header_file
+  # The bearer token goes to curl through a mode-600 file, never argv, where
+  # any local user could read it from the process table for the request's
+  # duration.
+  header_file="$(mktemp)"
+  (umask 077; printf 'Authorization: Bearer %s\n' "$token" >"$header_file")
   if ! response="$(trap - ERR; curl -sS --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
-    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -H "@${header_file}" -H "Content-Type: application/json" \
     -d "{\"permissions\":[\"${permission}\"]}" \
     -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
+    rm -f "$header_file"
     return "$SCOPE_PROBE_UNDECIDED"
   fi
+  rm -f "$header_file"
   status="${response##*$'\n'}"
   body="${response%$'\n'*}"
   case "$status" in
@@ -1326,7 +1372,15 @@ except Exception:
 sys.exit(granted if sys.argv[1] in held else denied)
 ' "$permission" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
       return "$rc" ;;
-    403|404) return "$SCOPE_PROBE_DENIED" ;;
+    403)
+      # A 403 whose reason is the Resource Manager API being off in the
+      # credential's quota project is not a permission answer; the apply
+      # enables that API before it binds.
+      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
+        return "$SCOPE_PROBE_UNDECIDED"
+      fi
+      return "$SCOPE_PROBE_DENIED" ;;
+    404) return "$SCOPE_PROBE_DENIED" ;;
     *) return "$SCOPE_PROBE_UNDECIDED" ;;
   esac
 }

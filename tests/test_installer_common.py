@@ -3046,9 +3046,12 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
-             probe=None, token=True, curl_present=True, strict=False):
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None):
         """probe: a dict from resource ("folders/1") to what curl answers:
-        "granted", "denied", "forbidden", "missing", "garbage", "down"."""
+        "granted", "denied", "forbidden", "service-disabled", "missing",
+        "garbage", "down". The curl stub also records the bearer it was handed
+        (read from the -H @file, never argv) and the impersonation flag gcloud
+        saw, on stdout, so a test can assert which identity was probed."""
         probe = probe or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -3063,7 +3066,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                    f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
                 # Terraform's credentials, not gcloud's active account: the stub
                 # answers the ADC form and refuses the plain one.
-                + ('  *"application-default print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
+                + ('  *"application-default print-access-token"*) echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
                    '  *"application-default print-access-token"*) exit 1 ;;\n')
                 + '  *"auth print-access-token"*) echo "wrong-identity"; exit 0 ;;\n'
                 + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
@@ -3075,7 +3078,8 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                     body, status = {
                         "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
                         "denied": ("{}", 200),
-                        "forbidden": ('{"error":{"code":403}}', 403),
+                        "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
+                        "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
                         "missing": ('{"error":{"code":404}}', 404),
                         "garbage": ("<html>", 200),
                         "down": ("", None),
@@ -3084,12 +3088,24 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                         cases.append(f'  *"/{resource}:testIamPermissions"*) exit 7 ;;')
                     else:
                         cases.append(f"  *\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
-                (bin_dir / "curl").write_text("#!/usr/bin/env bash\ncase \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
+                # Records the bearer read from the header file, and refuses a
+                # token on argv, before answering.
+                (bin_dir / "curl").write_text(
+                    "#!/usr/bin/env bash\n"
+                    'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
+                    'for a in "$@"; do case "$a" in @*) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\' "${a#@}")" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
             for stub in ("gcloud",) + (("curl",) if curl_present else ()):
                 path = bin_dir / stub
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
-            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": ""}
+            # The library discards the stubs' stderr, so what they saw is
+            # recorded in a file the test reads back into proc.stderr.
+            probe_log = pathlib.Path(tmp) / "probe.log"
+            probe_log.write_text("")
+            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_PROBE_LOG": str(probe_log)}
             env.update(keys or {})
+            env.update(env_extra or {})
             # strict: the front doors' shell options and ERR trap, under which
             # upgrade.sh --plan calls the check bare (no `|| exit 1`), so a probe
             # answering "denied" must not read as an error.
@@ -3109,8 +3125,10 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 tools = create_minimal_tools_bin(pathlib.Path(tmp) / "tools")
                 (tools / "python3").symlink_to(shutil.which("python3"))
                 isolated["PATH"] = f"{bin_dir}:{tools}"
-            return subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
                                   env=isolated, cwd=str(_REPO_ROOT))
+            proc.stderr += probe_log.read_text()
+            return proc
 
     def _assert_rc(self, proc, rc):
         self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
@@ -3137,6 +3155,39 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertIn("INFO: Nothing was changed.", proc.stdout)
         # An organisation is always warned about, bindable or not.
         self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_the_probe_uses_the_credentials_the_provider_would(self):
+        # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
+        # through gcloud's flag; a key file or inline key JSON in
+        # GOOGLE_CREDENTIALS through GOOGLE_APPLICATION_CREDENTIALS; and the
+        # token reaches curl through a file, never argv.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        probe = {"folders/123456789012": "granted"}
+        proc = self._run(keys=base, probe=probe)
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self.assertRegex(proc.stderr, r"IMPERSONATED:.*tf@p\.iam\.gserviceaccount\.com")
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+            key.write("{}")
+        self.addCleanup(pathlib.Path(key.name).unlink)
+        for creds in (key.name, '{"type":"service_account"}'):
+            with self.subTest(creds=creds[:12]):
+                proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_CREDENTIALS": creds})
+                self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
+                self._assert_rc(proc, 0)
+
+    def test_a_403_for_a_disabled_api_is_undecided_not_denied(self):
+        # Resource Manager answers 403 with reason SERVICE_DISABLED when its
+        # API is off in the credential's quota project; the apply enables it
+        # before binding, so this is not a permission answer.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "service-disabled"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/123456789012", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
 
     def test_a_403_is_a_refusal_and_a_transport_failure_is_a_warning(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222 333333333333"},
