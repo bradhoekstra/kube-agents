@@ -3037,6 +3037,15 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 self.assertIn("WARN: The scope check did not run:", proc.stdout)
 
 
+# Every variable the preflight's token minting, or the gcloud that does it,
+# reads from the environment; blanked in the test environment and set per case.
+_GOOGLE_CREDENTIAL_VARIABLES = (
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_OAUTH_ACCESS_TOKEN", "GOOGLE_CREDENTIALS",
+    "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON", "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+)
+
+
 class ScopeContainerPreflightTest(unittest.TestCase):
     """check_scope_container_access: silent with no container; with one, the
     Asset API must be enabled in the host project or no effective policy may
@@ -3049,9 +3058,10 @@ class ScopeContainerPreflightTest(unittest.TestCase):
              probe=None, token=True, curl_present=True, strict=False, env_extra=None):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "service-disabled", "missing",
-        "garbage", "down". The curl stub also records the bearer it was handed
-        (read from the -H @file, never argv) and the impersonation flag gcloud
-        saw, on stdout, so a test can assert which identity was probed."""
+        "garbage", "down". The stubs record what they saw in a log the test
+        folds into proc.stderr: the bearer curl read from its stdin (-H @-),
+        the impersonation flag gcloud saw, the first bytes of a key file it
+        was pointed at, and any CLOUDSDK_AUTH_* override that reached it."""
         probe = probe or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -3066,7 +3076,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                    f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
                 # Terraform's credentials, not gcloud's active account: the stub
                 # answers the ADC form and refuses the plain one.
-                + ('  *"application-default print-access-token"*) echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
+                + ('  *"application-default print-access-token"*) [ -z "${CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT:-}${CLOUDSDK_AUTH_ACCESS_TOKEN:-}" ] || echo "CLOUDSDK-LEAKED" >>"$SCOPE_PROBE_LOG"; [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] || echo "KEYFILE-BYTES:$(head -c 12 "$GOOGLE_APPLICATION_CREDENTIALS" | tr -d "\\n")" >>"$SCOPE_PROBE_LOG"; echo "tok${GOOGLE_APPLICATION_CREDENTIALS:+-from-keyfile}"; case "$*" in *--impersonate-service-account=*) echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG" ;; esac; exit 0 ;;\n' if token else
                    '  *"application-default print-access-token"*) exit 1 ;;\n')
                 # The raw-token form: only right with a source token in
                 # CLOUDSDK_AUTH_ACCESS_TOKEN and the impersonation flag.
@@ -3105,8 +3115,12 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             # recorded in a file the test reads back into proc.stderr.
             probe_log = pathlib.Path(tmp) / "probe.log"
             probe_log.write_text("")
+            # Hermetic: the library and the gcloud stub read the provider's and
+            # gcloud's credential variables straight from the environment, so a
+            # developer's shell must not reach them; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
                    "SCOPE_PROBE_LOG": str(probe_log)}
+            env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
             env.update(keys or {})
             env.update(env_extra or {})
             # strict: the front doors' shell options and ERR trap, under which
@@ -3175,6 +3189,11 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         proc = self._run(keys=base, probe=probe, env_extra={"GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
         self.assertRegex(proc.stderr, r"IMPERSONATED:.*tf@p\.iam\.gserviceaccount\.com")
         self.assertIn("BEARER:tok\n", proc.stderr)
+        # gcloud's own overrides in the operator's shell do not reach the mint:
+        # the provider does not read them.
+        proc = self._run(keys=base, probe=probe, env_extra={"CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT": "other@p.iam.gserviceaccount.com"})
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("CLOUDSDK-LEAKED", proc.stderr)
         # A raw token plus impersonation: the token is the source credential
         # and the probe is made as the impersonated account, as the provider
         # does, never as the raw token's identity.
@@ -3186,12 +3205,19 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             key.write("{}")
         self.addCleanup(pathlib.Path(key.name).unlink)
         for var in ("GOOGLE_CREDENTIALS", "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON"):
-            for creds in (key.name, '{"type":"service_account"}'):
+            for creds in (key.name, '{"type":"service_account"}', '\n  {"type":"service_account"}', "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50In0="):
                 with self.subTest(var=var, creds=creds[:12]):
                     proc = self._run(keys=base, probe=probe, env_extra={var: creds})
                     self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
                     self._assert_rc(proc, 0)
+                    # An inline value reaches gcloud byte for byte, whatever it
+                    # starts with: the provider's rule is "an existing path,
+                    # else JSON", never the first byte.
+                    if creds != key.name:
+                        self.assertIn("KEYFILE-BYTES:" + creds[:12].replace("\n", ""), proc.stderr)
+        # The bearer reaches curl on stdin, never through a file or argv.
         self.assertNotIn("BEARER-FROM-FILE", proc.stderr)
+        self.assertNotIn("TOKEN-ON-ARGV", proc.stderr)
 
     def test_a_refusal_names_the_identity_it_probed(self):
         # A denied probe under a key file sends the operator to that key's
@@ -3199,23 +3225,45 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         # could not be minted names the source that failed.
         base = {"SCOPE_FOLDERS": "123456789012"}
         denied = {"folders/123456789012": "denied"}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
+            key.write("{}")
+        self.addCleanup(pathlib.Path(key.name).unlink)
         proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_CREDENTIALS": '{"type":"service_account"}'})
         self._assert_rc(proc, 1)
         self.assertIn("the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
         proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "t",
                                                               "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
         self.assertIn("the identity behind GOOGLE_OAUTH_ACCESS_TOKEN impersonating tf@p.iam.gserviceaccount.com (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
-        # A path that does not exist: no token, and the remedy names the variable and the path.
-        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_CREDENTIALS": "/nonexistent/key.json"})
+        # A path that does not exist: gcloud is handed it as key JSON (the
+        # provider's rule), mints nothing, and the remedy names the variable
+        # and says the file is missing, without printing the value.
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CREDENTIALS": "/nonexistent/key.json"})
         self._assert_rc(proc, 0)
-        self.assertIn("WARN: The scope container preflight could not decide whether the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_CREDENTIALS names /nonexistent/key.json, which does not exist; the apply would fail the same way)", proc.stdout)
+        self.assertIn("WARN: The scope container preflight could not decide whether the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_CREDENTIALS is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+        self.assertNotIn("/nonexistent/key.json", proc.stdout)
         self.assertNotIn("application-default login", proc.stdout)
-        # A key that gcloud refuses: the remedy names the key, not ADC.
-        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CLOUD_KEYFILE_JSON": '{"type":"service_account"}'})
-        self.assertIn("(the key JSON in GOOGLE_CLOUD_KEYFILE_JSON could not mint a token; check it is a valid service-account key)", proc.stdout)
-        # ADC, no token: the ADC remedy.
+        # A key that gcloud refuses: the remedy names the key, not ADC, and
+        # never prints it, whatever byte the key starts with.
+        for creds in ('{"type":"service_account"}', '\n{"type":"service_account","private_key":"SECRET-BYTES"}', "eyJ0eXBlIjoic2VydmljZV9hY2NvdW50In0="):
+            with self.subTest(creds=creds[:10]):
+                proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CLOUD_KEYFILE_JSON": creds})
+                self.assertIn("(GOOGLE_CLOUD_KEYFILE_JSON is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+                self.assertNotIn("SECRET-BYTES", proc.stdout + proc.stderr)
+                self.assertNotIn("eyJ0eXBl", proc.stdout)
+        # ADC, no token: the ADC remedy; with GOOGLE_APPLICATION_CREDENTIALS
+        # set, the remedy and the label name that variable instead, because
+        # the login the plain remedy suggests writes a file the variable
+        # overrides.
         proc = self._run(keys=base, probe=denied, token=False)
         self.assertIn("run: gcloud auth application-default login", proc.stdout)
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": "/nonexistent/adc.json"})
+        self.assertIn("whether the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way)", proc.stdout)
+        self.assertNotIn("application-default login", proc.stdout)
+        proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
+        self.assertIn("(the key file GOOGLE_APPLICATION_CREDENTIALS names could not mint a token; check it is a valid service-account key, or unset the variable to use the login credentials)", proc.stdout)
+        proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
+        self._assert_rc(proc, 1)
+        self.assertIn("the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
 
     def test_a_403_for_a_disabled_api_is_undecided_not_denied(self):
         # Resource Manager answers 403 with reason SERVICE_DISABLED when its

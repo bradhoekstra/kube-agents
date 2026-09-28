@@ -270,12 +270,15 @@ holds `resourcemanager.folders.setIamPolicy` on each folder and
 `resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
 Manager's `testIamPermissions` with a token minted for the credentials the google provider will
 read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
-`GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (a key file or inline key JSON), else the
-Application Default Credentials, each impersonating `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` when it
-is set. The messages name that identity, so a refusal points at the principal that will apply
-rather than at whatever ADC the workstation holds. The token reaches `curl` on its stdin and an
-inline key reaches `gcloud` through a file that exists only for the mint and is removed on any
-exit of it, a signal included. Every container is probed and every failure named before the run
+`GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything
+else is the key's JSON, the provider's own rule), else the Application Default Credentials, which
+read `GOOGLE_APPLICATION_CREDENTIALS` first, each impersonating `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`
+when it is set; gcloud's own `CLOUDSDK_AUTH_*` overrides are cleared for the mint because the
+provider does not read them. The messages name that identity, so a refusal points at the
+principal that will apply rather than at whatever ADC the workstation holds, and a credential
+variable's value is never printed. The token reaches `curl` on its stdin and an inline key
+reaches `gcloud` through a file that exists only for the mint and is removed on any exit of it,
+a signal included. Every container is probed and every failure named before the run
 refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
 apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
 first check guards against. `upgrade.sh --plan` and `install.sh --generate-only` warn instead of

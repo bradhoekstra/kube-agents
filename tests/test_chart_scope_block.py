@@ -44,6 +44,9 @@ POPULATED = {
     },
 }
 EMPTY = {"projects": [], "folders": [], "organizations": [], "exclude": {"projects": [], "clusters": []}}
+# What a record written before the chart knew the container lists renders: the
+# two keys stay out of the manifest, so a retag's patch leaves the CR's lists alone.
+EMPTY_WITHOUT_CONTAINERS = {"projects": [], "exclude": {"projects": [], "clusters": []}}
 
 
 class ScopeBlockShapeTest(unittest.TestCase):
@@ -62,6 +65,17 @@ class ScopeBlockShapeTest(unittest.TestCase):
         self.assertIn('{{- if kindIs "map" $scope }}', body)
         self.assertNotIn("compactFields", body)
         self.assertNotIn("{{- with", body)
+
+    def test_the_container_lists_render_only_when_the_value_carries_the_key(self):
+        # A release record from before the chart knew the keys must re-render
+        # without them: Helm patches the CR from the difference between
+        # manifests, and `folders: []` over a hand-declared folder retires its
+        # members on the next reconcile. `hasKey`, not `with`: an empty list the
+        # value carries still renders.
+        for key in ("folders", "organizations"):
+            with self.subTest(key=key):
+                self.assertIn(f'{{{{- if hasKey $scope "{key}" }}}}\n    {key}: {{{{ $scope.{key} | default list | toJson }}}}\n    {{{{- end }}}}',
+                              self.template)
 
     def test_every_list_renders_even_when_empty(self):
         for key in ("projects: {{ $scope.projects | default list | toJson }}",
@@ -108,9 +122,20 @@ class ScopeBlockRenderTest(unittest.TestCase):
     def test_an_empty_map_renders_a_present_block_with_empty_lists(self):
         for args in (["--set-json", "platformAgent.scope={}"],
                      ["-f", self._values_file({})],
-                     ["-f", self._values_file(EMPTY)]):
+                     ["-f", self._values_file(EMPTY_WITHOUT_CONTAINERS)]):
             with self.subTest(args=args):
-                self.assertEqual(self._scope_of(self._render(*args)), EMPTY)
+                self.assertEqual(self._scope_of(self._render(*args)), EMPTY_WITHOUT_CONTAINERS)
+        self.assertEqual(self._scope_of(self._render("-f", self._values_file(EMPTY))), EMPTY)
+
+    def test_a_record_without_the_container_keys_renders_no_container_list(self):
+        # The pre-2078 release record: a scope map with projects and exclude
+        # only. The manifest must not carry the two keys, so the retag's patch
+        # cannot clear a folder the CR holds.
+        older = {"projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}
+        rendered = self._scope_of(self._render("-f", self._values_file(older)))
+        self.assertEqual(rendered, older)
+        self.assertNotIn("folders", rendered)
+        self.assertNotIn("organizations", rendered)
 
     def test_a_populated_value_reaches_the_block_verbatim(self):
         self.assertEqual(self._scope_of(self._render("-f", self._values_file(POPULATED))), POPULATED)
@@ -128,6 +153,6 @@ class ScopeBlockRenderTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("scope", proc.stderr)
 
-    def test_a_folder_without_the_other_lists_renders_every_list(self):
+    def test_a_folder_without_the_other_lists_renders_it_and_the_project_lists(self):
         rendered = self._scope_of(self._render("-f", self._values_file({"folders": ["123456789012"]})))
-        self.assertEqual(rendered, {**EMPTY, "folders": ["123456789012"]})
+        self.assertEqual(rendered, {**EMPTY_WITHOUT_CONTAINERS, "folders": ["123456789012"]})

@@ -165,6 +165,9 @@ readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.se
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
+# gcloud's own credential overrides, cleared for every mint the preflight
+# makes because the google provider does not read them.
+readonly SCOPE_GCLOUD_AUTH_OVERRIDES="CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"
 # The reasons in a 403 from Resource Manager that are not a permission answer:
 # the API not enabled in the credential's quota project, or no quota project
 # at all. The apply enables cloudresourcemanager.googleapis.com before its
@@ -1256,12 +1259,18 @@ check_scope_container_access() {
 
 # The credentials the google provider will apply with, read in its own order
 # of precedence: GOOGLE_OAUTH_ACCESS_TOKEN; else the key file or inline key
-# JSON in GOOGLE_CREDENTIALS, GOOGLE_CLOUD_KEYFILE_JSON or GCLOUD_KEYFILE_JSON;
-# else the Application Default Credentials; each impersonating
+# JSON in GOOGLE_CREDENTIALS, GOOGLE_CLOUD_KEYFILE_JSON or GCLOUD_KEYFILE_JSON
+# (an existing path is a file, anything else is the key's JSON, the provider's
+# own rule); else the Application Default Credentials, which read
+# GOOGLE_APPLICATION_CREDENTIALS first; each impersonating
 # GOOGLE_IMPERSONATE_SERVICE_ACCOUNT when the operator set it, the token
-# serving only as the source credential then. Three readers of that one
-# rule: the variable that holds the credentials, a label for messages, and
-# the token itself.
+# serving only as the source credential then. gcloud's own CLOUDSDK_AUTH_*
+# variables are cleared for every mint, because the provider does not read
+# them and a gcloud impersonation the operator configured for other work
+# would otherwise answer for an identity Terraform never uses. The value of a
+# credential variable is never printed: the variable's name is enough, and an
+# inline key is a private key. Three readers of that one rule: the variable
+# that holds the credentials, a label for messages, and the token itself.
 _scope_terraform_credentials_var() {
   if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ]; then printf 'GOOGLE_OAUTH_ACCESS_TOKEN'
   elif [ -n "${GOOGLE_CREDENTIALS:-}" ]; then printf 'GOOGLE_CREDENTIALS'
@@ -1278,7 +1287,7 @@ _scope_terraform_identity_label() {
   var="$(_scope_terraform_credentials_var)"
   case "$var" in
     GOOGLE_OAUTH_ACCESS_TOKEN) base="the identity behind GOOGLE_OAUTH_ACCESS_TOKEN" ;;
-    "") base="the Application Default Credentials" ;;
+    "") base="the Application Default Credentials${GOOGLE_APPLICATION_CREDENTIALS:+ in GOOGLE_APPLICATION_CREDENTIALS}" ;;
     *) base="the credentials in ${var}" ;;
   esac
   if [ -n "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
@@ -1295,17 +1304,24 @@ _scope_terraform_token_remedy() {
   case "$var" in
     GOOGLE_OAUTH_ACCESS_TOKEN)
       printf 'gcloud could not mint an impersonated token from GOOGLE_OAUTH_ACCESS_TOKEN; check the token is current and may impersonate %s' "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ;;
-    "") printf 'gcloud could not mint an access token for them; run: gcloud auth application-default login' ;;
+    "")
+      if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+        printf 'gcloud could not mint an access token for them; run: gcloud auth application-default login'
+      elif [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+        printf 'the key file GOOGLE_APPLICATION_CREDENTIALS names could not mint a token; check it is a valid service-account key%s, or unset the variable to use the login credentials' "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
+      else
+        printf 'GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way'
+      fi ;;
     *)
       creds="${!var}"
-      case "$creds" in
-        \{*) printf 'the key JSON in %s could not mint a token; check it is a valid service-account key%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}" ;;
-        *) if [ -f "$creds" ]; then
-             printf 'the key file %s names could not mint a token; check it is a valid service-account key%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
-           else
-             printf '%s names %s, which does not exist; the apply would fail the same way' "$var" "$creds"
-           fi ;;
-      esac ;;
+      if [ -f "$creds" ]; then
+        printf 'the key file %s names could not mint a token; check it is a valid service-account key%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
+      else
+        # Not an existing file, and gcloud refused it as key JSON. Which of
+        # the two the operator meant is not decidable here and the value is
+        # never printed, so the remedy names both readings.
+        printf '%s is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key'"'"'s JSON itself (not base64)%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+, and that it may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
+      fi ;;
   esac
 }
 
@@ -1315,8 +1331,9 @@ _scope_terraform_token_remedy() {
 # a signal included, so an interrupted run leaves no private key at rest.
 _scope_terraform_access_token() {
   local var creds
-  local -a impersonate=()
+  local -a impersonate=() clear=()
   [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ] || impersonate=("--impersonate-service-account=${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}")
+  for var in $SCOPE_GCLOUD_AUTH_OVERRIDES; do clear+=("-u" "$var"); done
   var="$(_scope_terraform_credentials_var)"
   case "$var" in
     GOOGLE_OAUTH_ACCESS_TOKEN)
@@ -1326,29 +1343,29 @@ _scope_terraform_access_token() {
       fi
       # gcloud takes a raw token as its credential through this variable and
       # impersonates on top of it, as the provider does with access_token.
-      (trap - ERR; CLOUDSDK_AUTH_ACCESS_TOKEN="$GOOGLE_OAUTH_ACCESS_TOKEN" gcloud auth print-access-token "${impersonate[@]}" 2>/dev/null)
+      (trap - ERR; env "${clear[@]}" CLOUDSDK_AUTH_ACCESS_TOKEN="$GOOGLE_OAUTH_ACCESS_TOKEN" gcloud auth print-access-token "${impersonate[@]}" 2>/dev/null)
       return ;;
     "")
-      (trap - ERR; gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
+      (trap - ERR; env "${clear[@]}" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
       return ;;
   esac
   creds="${!var}"
-  case "$creds" in
-    \{*)
-      (
-        trap - ERR
-        key_file="$(mktemp)"
-        trap 'rm -f "$key_file"' EXIT
-        trap 'rm -f "$key_file"; exit 130' INT TERM HUP
-        (umask 077; printf '%s' "$creds" >"$key_file")
-        GOOGLE_APPLICATION_CREDENTIALS="$key_file" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null
-      )
-      return ;;
-    *)
-      [ -f "$creds" ] || return 1
-      (trap - ERR; GOOGLE_APPLICATION_CREDENTIALS="$creds" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
-      return ;;
-  esac
+  if [ -f "$creds" ]; then
+    (trap - ERR; env "${clear[@]}" GOOGLE_APPLICATION_CREDENTIALS="$creds" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
+    return
+  fi
+  # Not an existing file, so the key's JSON, whatever byte it starts with
+  # (a leading newline or space from a heredoc or a secret store is JSON to
+  # the provider too). gcloud validates it; the preflight never parses or
+  # prints it.
+  (
+    trap - ERR
+    key_file="$(mktemp)"
+    trap 'rm -f "$key_file"' EXIT
+    trap 'rm -f "$key_file"; exit 130' INT TERM HUP
+    (umask 077; printf '%s' "$creds" >"$key_file")
+    env "${clear[@]}" GOOGLE_APPLICATION_CREDENTIALS="$key_file" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null
+  )
 }
 
 # True when the Asset API is already enabled in the host project. A listing
