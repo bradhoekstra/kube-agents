@@ -293,6 +293,11 @@ TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 TOOL_STATUS_SUCCESS = "success"
 TOOL_STATUS_ERROR = "error"
 TOOL_STATUS_BLOCKED = "blocked"
+# A command the broker ran and killed because its caller hung up mid-command.
+# Its own outcome rather than `error`: the command's exit is unknown, and the
+# repeated abandon is the pattern the abandon path exists for, so it has to be
+# visible as itself.
+TOOL_STATUS_ABANDONED = "abandoned"
 # What a label reads when the request named nothing in its vocabulary: an
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
@@ -5689,6 +5694,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 request_id,
                 _sanitize_for_logging(argv[0]),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -5698,13 +5704,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": "Executable is not supported by the credential proxy.",
                 },
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             return
         rule = self.policy.blocked_by(argv)
         if rule is not None:
             LOGGER.warning(
                 "command blocked request_id=%s rule=%s", request_id, rule.rule_id
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -5714,7 +5720,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": rule.message,
                 },
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             return
 
         # Backup check only. The boundary for the `ext::` transport is
@@ -5725,6 +5730,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         violation = git_argument_violation(argv)
         if violation is not None:
             LOGGER.warning("git argument refused request_id=%s", request_id)
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -5734,7 +5740,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": violation,
                 },
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             return
 
         # Not a policy rule: the policy matches on argv alone, and this refusal
@@ -5750,6 +5755,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 request_id,
                 _sanitize_for_logging(cwd or "", max_length=256),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -5759,7 +5765,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": violation,
                 },
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             return
 
         # Runs after the credential denylist above, so rules like
@@ -5777,8 +5782,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             LOGGER.warning(
                 "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint
             )
-            self._json(HTTPStatus.FORBIDDEN, refusal)
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+            self._json(HTTPStatus.FORBIDDEN, refusal)
             return
 
         try:
@@ -5804,6 +5809,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         request_id,
                         result.duration_ms,
                     )
+                    # No response is written, so log_request never counts this
+                    # request; the invocation and its duration are counted here
+                    # or nowhere.
+                    self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
+                    self.metrics.observe_duration(tool_label, result.duration_ms / MILLISECONDS_PER_SECOND)
                     return
                 LOGGER.info(
                     "command complete request_id=%s exit_code=%d duration_ms=%d truncated=%s",
@@ -5864,6 +5874,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             self._json(
                 HTTPStatus.FORBIDDEN,
                 {
@@ -5873,7 +5884,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "message": str(exc),
                 },
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
             return
         except ValueError as exc:
             # Containment rejections (cwd or kubeconfig outside the workspace)
@@ -5886,8 +5896,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 request_id,
                 _sanitize_for_logging(str(exc), max_length=256),
             )
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
         except Exception as exc:
             LOGGER.exception(
@@ -5895,11 +5905,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 request_id,
                 type(exc).__name__,
             )
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"error": "credential proxy command execution failed"},
             )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ERROR)
             return
 
     def _handle_api_relay(self) -> None:

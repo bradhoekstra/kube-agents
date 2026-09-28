@@ -147,7 +147,9 @@ in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. Se
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
-every caller with a `TokenReview` over an audience-bound projected token, and
+every caller of its credentialed listener with a `TokenReview` over an audience-bound
+projected token (the metrics-only listener, [Architecture](#architecture), serves counters
+and authenticates nobody), and
 `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
 which one presented it; what does vary the policy is the audience the token was minted for
 and the route table it feeds

@@ -206,8 +206,56 @@ class ToolInvocationCountingTest(_BrokerFixture):
             for key, value in labels:
                 self.assertRegex(value, _WORD_LABEL, f"{key}={value!r} is not vocabulary")
         self.assertGreaterEqual(
-            _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="other", status="blocked"), 2
+            _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="other", status="blocked"),
+            2,
+            exposition,
         )
+
+
+class AbandonedCommandTest(unittest.TestCase):
+    """A command the caller hung up on ran and was killed: counted and timed under
+    its own outcome, since no response is written for log_request to count."""
+
+    def test_an_abandoned_command_is_counted_and_timed(self):
+        class _Abandoning:
+            ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+            def git_lease_violation(self, argv, cwd):
+                return None
+
+            def execute(self, argv, stdin=None, cwd=None, kubeconfig_context=None, wants_kubeconfig=False, caller=None):
+                return credential_proxy.ExecutionResult(
+                    exit_code=-9, stdout="", stderr="", duration_ms=1500, truncated=False, timed_out=False, abandoned=True,
+                )
+
+        previous = {name: CredentialProxyHandler.__dict__.get(name) for name in ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator")}
+        for name, value in previous.items():
+            self.addCleanup(setattr, CredentialProxyHandler, name, value)
+        CredentialProxyHandler.executor = _Abandoning()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.metrics = ProxyMetrics()
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/v1/exec",
+            data=json.dumps({"requestId": "req-a", "argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # The handler returns without writing, so the client sees the connection
+        # close with no status line.
+        with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+            urllib.request.urlopen(request, timeout=5)
+        families = _parse(CredentialProxyHandler.metrics.render())
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="abandoned"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="200"))
 
 
 class RequestCountingTest(_BrokerFixture):
@@ -313,6 +361,23 @@ class ListenerStartTest(unittest.TestCase):
                 self.assertEqual(8766, credential_proxy.parse_args().metrics_port)
             os.environ.pop(credential_proxy.METRICS_PORT_ENV, None)
             self.assertEqual(0, credential_proxy.parse_args().metrics_port)
+
+
+class OperatorContractTest(unittest.TestCase):
+    """The operator sets the variable the runtime reads: one name, pinned from
+    the runtime's side. The operator's own test pins its literal; without this
+    a rename on either side keeps both suites green while the broker logs
+    `metrics listener disabled` under a declared port and an open policy."""
+
+    def test_the_operator_names_the_variable_the_runtime_reads(self):
+        manifests = (
+            Path(__file__).resolve().parents[3] / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+        ).read_text()
+        self.assertRegex(
+            manifests,
+            r'credentialProxyMetricsPortEnv\s*=\s*"' + re.escape(credential_proxy.METRICS_PORT_ENV) + '"',
+            f"the operator does not set {credential_proxy.METRICS_PORT_ENV}; the listener is never switched on",
+        )
 
 
 class LabelDerivationTest(unittest.TestCase):
