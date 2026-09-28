@@ -246,14 +246,14 @@ leaves the scope. A file that lacks the keys declares an empty scope, like every
 the release's recorded values and change nothing about the scope. `upgrade.sh`, `uninstall.sh`
 and the Day-2 menu read the keys from `install.env` alone (`load_install_env` drops a value
 inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
-`install.env` exists); `install.sh` also takes the five `--scope-*` flags, and on a first install
+`install.env` exists); `install.sh` also takes the `--scope-*` flags, and on a first install
 the environment, and records them, and an empty `--scope-*=` is refused. A malformed
 `SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` entry stops every front door but
 `uninstall.sh`, retags included, until the line is fixed; there is no bypass.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
-keys account for, printing the five lines that reproduce it; a read that cannot decide (no
+keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
 `installer_common.sh`; `upgrade.sh --plan` warns instead). The `sharedVpcHosts` and
@@ -262,19 +262,19 @@ and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so
 every front door rather than being pruned by a served schema that predates the field.
 
 When a folder or organisation is declared, a second check runs before every apply, first install
-included, with the identity Terraform applies with, the Application Default Credentials, which
-need not be gcloud's active account (`check_scope_container_access`): that
-`cloudasset.googleapis.com` is enabled in the host project or no enforced organisation policy
-(`constraints/gcp.restrictServiceUsage`, the legacy `constraints/serviceuser.services`; a policy
-in dry run enforces nothing and is not read) denies it, and that those credentials hold
+included (`check_scope_container_access`): that `cloudasset.googleapis.com` is enabled in the
+host project or no enforced organisation policy (`constraints/gcp.restrictServiceUsage`, the
+legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
+denies it, read through gcloud's active account, and that the identity Terraform applies with,
+the Application Default Credentials, which need not be that account, holds
 `resourcemanager.folders.setIamPolicy` on each folder and
 `resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
-Manager's `testIamPermissions`. Every container is probed and every failure named before the run
+Manager's `testIamPermissions` with a token minted for those credentials. Every container is probed and every failure named before the run
 refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
 apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
 first check guards against. `upgrade.sh --plan` warns instead of refusing; the retag modes and
-`install.sh --dry-run` do not run it. Declaring an organisation prints a warning on every run
-that plans or applies: the binding reaches every project in it.
+`install.sh --dry-run` do not run it. Declaring an organisation prints a warning on every run but
+those: the binding reaches every project in it.
 
 An install that declared a folder or organisation on the `PlatformAgent` by hand before the
 installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade
@@ -290,9 +290,9 @@ set IAM policy in. A scoped project or container that is deleted, or whose owner
 permission, fails the refresh or destroy of its bindings on every later plan, full upgrade and
 uninstall. Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` and forget
 its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
-against the install's backend (the address is `google_project_iam_member.scope_roles`,
-`google_folder_iam_member.scope_roles` or `google_organization_iam_member.scope_roles`, keyed
-`<id>/<role>`):
+against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
+`module.kube_agents_iam.google_folder_iam_member.scope_roles` or
+`module.kube_agents_iam.google_organization_iam_member.scope_roles`, keyed `<id>/<role>`):
 
 ```bash
 cd terraform/examples/full-install

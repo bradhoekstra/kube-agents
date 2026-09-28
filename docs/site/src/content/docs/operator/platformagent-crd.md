@@ -520,8 +520,8 @@ it from `platformAgent.scope`, and the Terraform composition sets that value fro
 tfvars, which the installer generates from `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`,
 `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`, so on those paths the field
 is declared there and never by editing the `PlatformAgent`: the installer refuses a full upgrade
-over a `spec.scope` edited by hand until `install.env` records it (it prints the five lines that
-reproduce it) or the CR is put
+over a `spec.scope` edited by hand until `install.env` records it (it prints the `SCOPE_*` lines
+that reproduce it) or the CR is put
 back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because
 Helm sends only the difference between its rendered manifests. An empty scope is a present block
 with empty lists, rendered whenever the chart is given one; a chart that is given nothing (the

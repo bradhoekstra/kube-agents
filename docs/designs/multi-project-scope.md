@@ -401,7 +401,7 @@ Prerequisites the design has to state and the installer has to preflight:
 
 - The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable and `roles/cloudasset.viewer` on the container for that identity too. Before phase 2 it needed only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
-  than failing on the first, and probes the Application Default Credentials Terraform applies with
+  than failing on the first, and makes the IAM probe as the Application Default Credentials Terraform applies with
   rather than gcloud's active account.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.

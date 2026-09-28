@@ -1163,11 +1163,12 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   return 1
 }
 
-# Preflight for a declared folder or organisation, run with the identity
-# Terraform applies with -- the Application Default Credentials, which the
-# google provider reads (providers.tf sets no access token), and which need
-# not be gcloud's active account -- before the apply that would bind the
-# agent's roles on the container: (1) the Cloud Asset API
+# Preflight for a declared folder or organisation, before the apply that
+# would bind the agent's roles on the container. The IAM probe is made as the
+# identity Terraform applies with -- the Application Default Credentials,
+# which the google provider reads (providers.tf sets no access token), and
+# which need not be gcloud's active account; the API and policy reads go
+# through gcloud's active account, whose answer does not depend on who asks: (1) the Cloud Asset API
 # the reconcile's container search calls can be enabled in the host project,
 # meaning it is enabled already or no effective organisation policy forbids
 # it, and (2) this identity can set IAM policy on every container named, so
