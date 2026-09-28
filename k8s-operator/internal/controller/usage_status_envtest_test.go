@@ -14,7 +14,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
-	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -71,25 +70,12 @@ func platformAgentCRDWithoutUsage(t *testing.T) (pruned []byte, full map[string]
 // times and see one write; then apply the full CRD, let the record expire, and
 // see the field land on the next pass and the writer go quiet again.
 func TestAPrunedUsageStatusOnAServedCRDEnvtest(t *testing.T) {
-	if os.Getenv(envtestAssetsEnvVar) == "" {
-		t.Skipf("%s is unset: run through `make -C k8s-operator test`, or export it from `bin/setup-envtest use -p path`", envtestAssetsEnvVar)
-	}
 	pruned, full := platformAgentCRDWithoutUsage(t)
 	crdDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(crdDir, platformAgentCRDFile), pruned, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	env := &envtest.Environment{CRDDirectoryPaths: []string{crdDir}, ErrorIfCRDPathMissing: true}
-	cfg, err := env.Start()
-	if err != nil {
-		t.Fatalf("envtest start: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := env.Stop(); err != nil {
-			t.Errorf("envtest stop: %v", err)
-		}
-	})
-	scheme := setupScheme()
+	cfg, scheme := startEnvtestConfigWithCRDs(t, crdDir)
 	direct, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
 	if err != nil {
 		t.Fatalf("envtest client: %v", err)

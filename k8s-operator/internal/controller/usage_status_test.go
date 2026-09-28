@@ -16,6 +16,8 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"k8s.io/apimachinery/pkg/types"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
 
 func TestResolveActiveInterfaces(t *testing.T) {
@@ -337,5 +339,58 @@ func TestAPrunedUsageStatusIsLoggedOncePerRecord(t *testing.T) {
 	settle()
 	if said() != 2 || counter.writes != 3 {
 		t.Errorf("after the probe: %d log lines, %d writes; want 2 and 3", said(), counter.writes)
+	}
+}
+
+// The cap at Reconcile's tail is what turns the record's expiry into a probe:
+// a held record has to shorten the steady-state requeue to the interval, and
+// no record has to leave the caller's ceiling alone. Read off Reconcile itself,
+// the way the RBAC self-check's cap is, because the helper passing on its own
+// says nothing about whether the tail still consults it.
+func TestReconcileRequeuesAtTheIntervalWhileAUsageRecordIsHeld(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		// The sandbox keys Secret keeps the agent out of Degraded, whose 30s
+		// requeue would mask the interval under test.
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	// The finalizer, then the workload and the status, then a settled pass.
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", pass, err)
+		}
+	}
+	settled, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("settled Reconcile: %v", err)
+	}
+	if settled.RequeueAfter != secretEnvReprobeInterval {
+		t.Fatalf("settled RequeueAfter = %v, want the ceiling %v before any record is held", settled.RequeueAfter, secretEnvReprobeInterval)
+	}
+
+	r.prunedUsageStatus.Store(client.ObjectKeyFromObject(agent), time.Now())
+	held, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile with a record held: %v", err)
+	}
+	if held.RequeueAfter != usageStatusReprobeInterval {
+		t.Errorf("RequeueAfter = %v while a pruning record is held, want %v: nothing else schedules the probe", held.RequeueAfter, usageStatusReprobeInterval)
+	}
+
+	r.forgetUsageStatus(agent)
+	released, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile with the record dropped: %v", err)
+	}
+	if released.RequeueAfter != secretEnvReprobeInterval {
+		t.Errorf("RequeueAfter = %v with no record, want the ceiling %v", released.RequeueAfter, secretEnvReprobeInterval)
 	}
 }
