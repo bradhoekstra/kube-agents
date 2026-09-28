@@ -839,8 +839,11 @@ platformAgent:
   # Terraform composition binds them from the same value it passes here, and
   # a chart installed on its own needs them granted by hand.
   #
-  # A map renders the block as it is, empty lists included: an empty scope is a
-  # present block with empty lists, which the reconcile reads as the
+  # A map renders the block as it is, empty lists included (folders and
+  # organizations only when the map carries the key, so a release record from
+  # before the chart knew them re-renders without them and a retag's patch
+  # leaves the CR's lists alone; the composition always passes both): an
+  # empty scope is a present block with empty lists, which the reconcile reads as the
   # declaration that drops projects (their Cluster Agent profiles retire over
   # its next two clean runs), so the composition always passes a map and a
   # project leaves the scope by being removed from projects. null, the default,

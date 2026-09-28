@@ -524,7 +524,9 @@ over a `spec.scope` edited by hand until `install.env` records it (it prints the
 that reproduce it) or the CR is put
 back, and a retag, or a hand-driven composition apply whose rendered scope is unchanged, leaves the edit in place because
 Helm sends only the difference between its rendered manifests. An empty scope is a present block
-with empty lists, rendered whenever the chart is given one; a chart that is given nothing (the
+with empty lists, rendered whenever the chart is given one (`folders` and `organizations` only when
+the value carries the key, so a release record from before the chart knew them leaves the CR's
+lists alone on a retag; the composition always passes both); a chart that is given nothing (the
 value is `null`, its default) renders no block, which leaves the field as it finds it while no earlier
 release rendered the block and removes it once one has, a removal the reconcile reads as no
 declaration (the management project alone, nothing retired). The

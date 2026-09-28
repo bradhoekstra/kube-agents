@@ -1379,42 +1379,56 @@ _scope_asset_api_enabled() {
 
 # Prints the constraint whose effective policy on the host project denies the
 # Asset API and returns SCOPE_PROBE_DENIED; returns SCOPE_PROBE_GRANTED with
-# nothing printed when no read policy denies it, SCOPE_PROBE_UNDECIDED when
-# every constraint's policy was unreadable (a constraint that has no policy
-# set reads as not denying). Both service-usage constraints are read, because
-# an organisation may still carry the legacy one. Only the enforced `spec` is
+# nothing printed when every policy that could be read says it is not denied,
+# SCOPE_PROBE_UNDECIDED when a constraint's policy could not be fetched or,
+# fetched, could not be parsed (a constraint that has no policy set reads as
+# not denying). Both service-usage constraints are read, because an
+# organisation may still carry the legacy one. Only the enforced `spec` is
 # read: a `dryRunSpec` enforces nothing, and an organisation trialling a
-# constraint in dry run must not be refused for it.
+# constraint in dry run must not be refused for it. A parse failure is its
+# own answer, never "not denied": the reader exits with the probe's three
+# statuses, as the IAM probe's does.
 _scope_policy_denying_asset_api() {
-  local project="$1" constraint policy readable=false
+  local project="$1" constraint policy readable=false unread=false rc
   for constraint in $SCOPE_SERVICE_USAGE_CONSTRAINTS; do
     if ! policy="$(trap - ERR; gcloud org-policies describe "$constraint" --project="$project" --effective --format=json 2>/dev/null)"; then
+      unread=true
       continue
     fi
-    readable=true
-    if printf '%s' "$policy" | python3 -c '
+    rc=0
+    (trap - ERR; printf '%s' "$policy" | python3 -c '
 import json, sys
 api = sys.argv[1]
+denied, not_denied, undecided = (int(a) for a in sys.argv[2:5])
 try:
     doc = json.load(sys.stdin) or {}
 except Exception:
-    sys.exit(1)
+    sys.exit(undecided)
+if not isinstance(doc, dict):
+    sys.exit(undecided)
 rules = ((doc.get("spec") or {}).get("rules")) or []
 for rule in rules:
     if rule.get("denyAll"):
-        sys.exit(0)
+        sys.exit(denied)
     values = rule.get("values") or {}
     if api in (values.get("deniedValues") or []):
-        sys.exit(0)
+        sys.exit(denied)
     allowed = values.get("allowedValues") or []
     if allowed and api not in allowed:
-        sys.exit(0)
-sys.exit(1)
-' "$SCOPE_ASSET_API" 2>/dev/null; then
-      printf '%s' "constraints/${constraint}"
-      return "$SCOPE_PROBE_DENIED"
-    fi
+        sys.exit(denied)
+sys.exit(not_denied)
+' "$SCOPE_ASSET_API" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
+    case "$rc" in
+      "$SCOPE_PROBE_DENIED")
+        printf '%s' "constraints/${constraint}"
+        return "$SCOPE_PROBE_DENIED" ;;
+      "$SCOPE_PROBE_GRANTED") readable=true ;;
+      *) unread=true ;;
+    esac
   done
+  # A constraint that could not be read may still deny: only a full read
+  # that found no denial passes.
+  $unread && return "$SCOPE_PROBE_UNDECIDED"
   $readable && return "$SCOPE_PROBE_GRANTED"
   return "$SCOPE_PROBE_UNDECIDED"
 }

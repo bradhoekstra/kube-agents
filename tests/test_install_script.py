@@ -7640,7 +7640,16 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(refusal, run)
 
     def test_the_generate_only_handoff_says_the_check_does_not_run_there(self):
+        # The one applying route with no live-scope check: the sentence is the
+        # only guard, so it names every key the apply renders, not just the
+        # projects, and says what to do.
         self.assertIn("The live-scope check does not run here", self.text)
+        handoff = self.text[self.text.index("The live-scope check does not run here"):]
+        handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
+        for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS and the two exclusions",
+                       "the reconcile", "retires what it drops", "record it first", "preflight above only warned"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, handoff)
 
     def test_the_generate_only_handoff_applies_the_crds_before_the_apply(self):
         # lifecycle.sh applies no CRDs; on an existing install a field the

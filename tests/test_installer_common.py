@@ -3055,7 +3055,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
-             probe=None, token=True, curl_present=True, strict=False, env_extra=None):
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "service-disabled", "missing",
         "garbage", "down". The stubs record what they saw in a log the test
@@ -3066,7 +3066,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
-            policy_json = json.dumps(policy or {"spec": {"rules": []}})
+            policy_json = "<not json>" if policy_garbage else json.dumps(policy or {"spec": {"rules": []}})
             services = "cloudasset.googleapis.com" if api_enabled else ""
             (bin_dir / "gcloud").write_text(
                 "#!/usr/bin/env bash\n"
@@ -3178,7 +3178,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT
         # through gcloud's flag; a key file or inline key JSON in
         # GOOGLE_CREDENTIALS through GOOGLE_APPLICATION_CREDENTIALS; and the
-        # token reaches curl through a file, never argv.
+        # token reaches curl on its stdin, never argv and never a file.
         base = {"SCOPE_FOLDERS": "123456789012"}
         probe = {"folders/123456789012": "granted"}
         proc = self._run(keys=base, probe=probe)
@@ -3312,10 +3312,16 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertNotIn("denies it", proc.stdout)
 
     def test_an_unreadable_policy_warns_and_lets_the_apply_speak(self):
-        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False, policy_error=True,
-                         probe={"folders/123456789012": "granted"})
-        self._assert_rc(proc, 0)
-        self.assertIn("WARN: The scope container preflight could not decide whether cloudasset.googleapis.com can be enabled in project 'test-project'", proc.stdout)
+        # Unreadable two ways: gcloud fails, or gcloud exits 0 with a body the
+        # reader cannot parse. Neither is "not denied"; both warn, like the
+        # IAM probe's undocumented body does.
+        for kwargs in ({"policy_error": True}, {"policy_garbage": True}):
+            with self.subTest(**kwargs):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                                 probe={"folders/123456789012": "granted"}, **kwargs)
+                self._assert_rc(proc, 0)
+                self.assertIn("WARN: The scope container preflight could not decide whether cloudasset.googleapis.com can be enabled in project 'test-project'", proc.stdout)
+                self.assertNotIn("ERROR", proc.stdout)
 
     def test_no_token_or_no_curl_warns_about_the_containers_and_passes(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, token=False)
