@@ -7582,14 +7582,21 @@ class ScopeCheckWiringTest(unittest.TestCase):
     def test_the_container_preflight_runs_for_every_non_dry_run_before_the_summary(self):
         # A first install has no cluster to read a CR from, but it does bind a
         # declared folder with this identity, so the container preflight is
-        # outside the existing-cluster gate and skipped only by --dry-run
-        # (read-only, so --generate-only makes the same check a real run does).
+        # outside the existing-cluster gate and skipped only by --dry-run.
+        # --generate-only makes the same check but warns: the apply it hands
+        # to lifecycle.sh may run as another identity.
         gate_end = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
-        preflight = self.text.index('if [ "$PARAM_DRY_RUN" != "true" ]; then\n    check_scope_container_access || exit 1\n  fi\n')
+        preflight = self.text.index(
+            'if [ "$PARAM_DRY_RUN" != "true" ]; then\n'
+            '    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n'
+            '      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n'
+            '    else\n'
+            '      check_scope_container_access || exit 1\n'
+            '    fi\n'
+            '  fi\n')
         summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
         self.assertLess(gate_end, preflight)
         self.assertLess(preflight, summary)
-        self.assertNotIn("PARAM_GENERATE_ONLY", self.text[preflight - 200:preflight])
 
     def test_the_crds_are_applied_at_step_12_before_the_apply_on_the_one_fetched_context(self):
         # INSTALL.md names a re-run and the menu as the way to change

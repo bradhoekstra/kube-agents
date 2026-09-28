@@ -265,16 +265,24 @@ When a folder or organisation is declared, a second check runs before every appl
 included (`check_scope_container_access`): that `cloudasset.googleapis.com` is enabled in the
 host project or no enforced organisation policy (`constraints/gcp.restrictServiceUsage`, the
 legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
-denies it, read through gcloud's active account, and that the identity Terraform applies with,
-the Application Default Credentials, which need not be that account, holds
-`resourcemanager.folders.setIamPolicy` on each folder and
+denies it, read through gcloud's active account, and that the identity Terraform applies with
+holds `resourcemanager.folders.setIamPolicy` on each folder and
 `resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
-Manager's `testIamPermissions` with a token minted for those credentials. Every container is probed and every failure named before the run
+Manager's `testIamPermissions` with a token minted for the credentials the google provider will
+read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
+`GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (a key file or inline key JSON), else the
+Application Default Credentials, each impersonating `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` when it
+is set. The messages name that identity, so a refusal points at the principal that will apply
+rather than at whatever ADC the workstation holds. The token reaches `curl` on its stdin and an
+inline key reaches `gcloud` through a file that exists only for the mint and is removed on any
+exit of it, a signal included. Every container is probed and every failure named before the run
 refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
 apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
-first check guards against. `upgrade.sh --plan` warns instead of refusing; the retag modes and
+first check guards against. `upgrade.sh --plan` and `install.sh --generate-only` warn instead of
+refusing, the first because it applies nothing and the second because the apply it hands to
+`lifecycle.sh` may run as an identity other than the one at the keyboard; the retag modes and
 `install.sh --dry-run` do not run it. Declaring an organisation prints a warning on every run but
-those: the binding reaches every project in it.
+those two: the binding reaches every project in it.
 
 An install that declared a folder or organisation on the `PlatformAgent` by hand before the
 installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade

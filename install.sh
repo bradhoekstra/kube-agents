@@ -5152,9 +5152,15 @@ main() {
   # project; both are checked here, first install included, so a container
   # this identity cannot bind or an organisation policy that forbids the API
   # stops the run before anything is applied rather than partway through.
-  # Read-only, so a generate-only run makes the same check a real one does.
+  # A generate-only run makes the same check but only warns: it hands the
+  # apply to lifecycle.sh, often run later by a CI or platform identity, and
+  # the credentials probed here are the ones at the keyboard.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
-    check_scope_container_access || exit 1
+    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
+    else
+      check_scope_container_access || exit 1
+    fi
   fi
 
   # Prompt for opt-ins on existing cluster mutations before the summary
