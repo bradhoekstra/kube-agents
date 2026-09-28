@@ -3046,7 +3046,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
-             probe=None, token=True, curl_present=True):
+             probe=None, token=True, curl_present=True, strict=False):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "missing", "garbage", "down"."""
         probe = probe or {}
@@ -3087,12 +3087,17 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": ""}
             env.update(keys or {})
+            # strict: the front doors' shell options and ERR trap, under which
+            # upgrade.sh --plan calls the check bare (no `|| exit 1`), so a probe
+            # answering "denied" must not read as an error.
+            call = (f'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; check_scope_container_access {mode}; echo "rc=$?"\n'
+                    if strict else f'check_scope_container_access {mode}; echo "rc=$?"\n')
             body = (
                 "set -u\n"
                 'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
                 'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
                 f'source "{_INSTALLER_COMMON}"\n'
-                f'check_scope_container_access {mode}; echo "rc=$?"\n'
+                + call
             )
             # For a curl-absent run PATH is the stubs plus a minimal toolbox
             # (bash, coreutils, python3), so the real curl is not found behind it.
@@ -3173,6 +3178,23 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, curl_present=False)
         self._assert_rc(proc, 0)
         self.assertIn("curl is not installed", proc.stdout)
+
+    def test_a_denied_probe_is_an_answer_under_the_front_doors_strict_shell(self):
+        # upgrade.sh --plan calls the check bare under set -eE with an ERR
+        # trap; a probe that answers denied, or a policy read that says the
+        # API is forbidden, must reach the warning rather than abort the run.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222"}, mode="warn", strict=True,
+                         api_enabled=False, policy={"spec": {"rules": [{"denyAll": True}]}},
+                         probe={"folders/111111111111": "denied", "folders/222222222222": "down"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
+        self.assertIn("WARN: A full upgrade would be refused: cloudasset.googleapis.com cannot be enabled", proc.stdout)
+        self.assertIn("WARN: A full upgrade would be refused: this identity (tester@example.com) cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("could not decide whether this identity can set IAM policy on folders/222222222222", proc.stdout)
+        # And a clean run under the same options is silent.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111"}, strict=True, probe={"folders/111111111111": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
 
     def test_warn_mode_names_the_failures_and_passes(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, mode="warn", probe={"folders/123456789012": "denied"})

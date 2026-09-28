@@ -1183,8 +1183,13 @@ check_scope_container_access() {
   if [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
   fi
+  # Every probe below is called in a `||` list: the front doors run under
+  # `set -eE` with an ERR trap, and a probe answering "denied" is an answer,
+  # not an error, on the bare call upgrade.sh --plan makes as well as on the
+  # `|| exit 1` call the applying modes make.
   if ! _scope_asset_api_enabled "$project"; then
-    constraint="$(_scope_policy_denying_asset_api "$project")"; rc=$?
+    rc=0
+    constraint="$(_scope_policy_denying_asset_api "$project")" || rc=$?
     if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
       failures+=("${SCOPE_ASSET_API} cannot be enabled in project '${project}': the effective organisation policy ${constraint} denies it, and the reconcile resolves a folder or organisation through that API. Ask the organisation's administrator for an exception, or declare explicit SCOPE_PROJECTS instead.")
     elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
@@ -1196,23 +1201,26 @@ check_scope_container_access() {
   elif ! token="$(trap - ERR; gcloud auth print-access-token 2>/dev/null)" || [ -z "$token" ]; then
     undecided+=("whether this identity can set IAM policy on the declared containers (gcloud could not mint an access token)")
   else
-    local IFS=$', \t\n'
+    local IFS=$', \t\n' account
+    account="$(trap - ERR; gcloud config get-value account 2>/dev/null || true)"
     case "$-" in *f*) had_noglob=true ;; esac
     set -f
     for entry in $folders; do
       [ -n "$entry" ] || continue
-      _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token"; rc=$?
+      rc=0
+      _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("this identity ($(gcloud config get-value account 2>/dev/null)) cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder, or drop it from SCOPE_FOLDERS.")
+        failures+=("this identity (${account}) cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
         undecided+=("whether this identity can set IAM policy on folders/${entry}")
       fi
     done
     for entry in $organizations; do
       [ -n "$entry" ] || continue
-      _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token"; rc=$?
+      rc=0
+      _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
-        failures+=("this identity ($(gcloud config get-value account 2>/dev/null)) cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin, or drop it from SCOPE_ORGANIZATIONS.")
+        failures+=("this identity (${account}) cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
         undecided+=("whether this identity can set IAM policy on organizations/${entry}")
       fi
