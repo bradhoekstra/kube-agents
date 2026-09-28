@@ -3423,8 +3423,8 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                          probe={"folders/111111111111": "denied", "folders/222222222222": "down"})
         self._assert_rc(proc, 0)
         self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
-        self.assertIn("WARN: A full upgrade would be refused: cloudasset.googleapis.com cannot be enabled", proc.stdout)
-        self.assertIn("WARN: A full upgrade would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused: cloudasset.googleapis.com cannot be enabled", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/111111111111", proc.stdout)
         self.assertIn("can set IAM policy on folders/222222222222", proc.stdout)
         # And a clean run under the same options is silent.
         proc = self._run(keys={"SCOPE_FOLDERS": "111111111111"}, strict=True, probe={"folders/111111111111": "granted"})
@@ -3434,7 +3434,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     def test_warn_mode_names_the_failures_and_passes(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, mode="warn", probe={"folders/123456789012": "denied"})
         self._assert_rc(proc, 0)
-        self.assertIn("WARN: A full upgrade would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot set IAM policy on folders/123456789012", proc.stdout)
         self.assertNotIn("ERROR", proc.stdout)
 
 

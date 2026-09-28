@@ -1263,7 +1263,10 @@ check_scope_container_access() {
   done
   [ "${#failures[@]}" -eq 0 ] && return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-    for entry in "${failures[@]}"; do print_warning "A full upgrade would be refused: ${entry}"; done
+    # Route-neutral: the warn mode serves upgrade.sh --plan, install.sh
+    # --generate-only and the interactive g answer alike, and only the last
+    # two hand the apply to lifecycle.sh under credentials this run cannot see.
+    for entry in "${failures[@]}"; do print_warning "An applying run would be refused: ${entry}"; done
     return 0
   fi
   for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done

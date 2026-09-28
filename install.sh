@@ -2470,8 +2470,9 @@ print_generate_only_handoff() {
   echo -e "  # SCOPE_ORGANIZATIONS and the two exclusions) is replaced by this apply, and the reconcile"
   echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
   if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
-    echo -e "  # The scope container preflight above only warned: this apply binds the declared folder or"
-    echo -e "  # organisation with whatever credentials run it, which need setIamPolicy on the container."
+    echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
+    echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
+    echo -e "  # on the container, and a warning above, if any, says what this identity could not."
   fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"

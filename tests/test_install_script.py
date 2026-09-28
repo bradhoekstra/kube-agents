@@ -7660,7 +7660,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
         handoff = self.text[self.text.index("The live-scope check does not run here"):]
         handoff = handoff[:handoff.index("3. Out-of-Terraform post-apply steps")]
         for phrase in ("SCOPE_PROJECTS, SCOPE_FOLDERS,", "SCOPE_ORGANIZATIONS and the two exclusions",
-                       "the reconcile", "retires what it drops", "record it first", "preflight above only warned"):
+                       "the reconcile", "retires what it drops", "record it first", "preflight above does not refuse on this route"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, handoff)
 
