@@ -6323,7 +6323,9 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
     """One request must produce one audit record, whatever the caller sends.
 
     The exec line is the only thing that binds a command to a verified
-    identity, and the root formatter is line-oriented plain text. A newline in
+    identity, and under a line-oriented text formatter (the one a local run or an
+    older image installs; the deployed one is JSON, covered by
+    test_credential_proxy_audit_json) a newline in
     any caller-supplied field ends the record and starts another, so an
     unsanitized `requestId` or `argv[0]` lets the caller write a complete,
     well-formed second entry naming a ServiceAccount that made no request.

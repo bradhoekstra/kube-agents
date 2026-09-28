@@ -754,8 +754,9 @@ override identity or correlation fields.
   initial reads, refreshes, and incremental source pages. Logging and Trace
   retain opaque continuation cursors only inside the Streamlit session, append
   two bounded pages per load, and preserve successful earlier pages when a
-  later page fails. Logging uses two non-overlapping queries with 500-record
-  pages and a 60-second request timeout; Trace and each Logging query stop
+  later page fails. Logging uses two queries (the wrapped text form and the
+  lifted-field form of a record, merged by `insertId` where both match) with
+  500-record pages and a 60-second request timeout; Trace and each Logging query stop
   after ten pages, and both sources share a 90-second load deadline. Source
   pagination and ledger pagination remain separate concerns.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,
