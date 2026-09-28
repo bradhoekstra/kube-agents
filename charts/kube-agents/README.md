@@ -392,6 +392,14 @@ of applying the port-443 check. The site's telemetry page is canonical for this
 rule as well as for the full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 
+`platformAgent.podMonitoring` (default `true`) renders a `PodMonitoring` for the
+gateway pod, so GKE Managed Prometheus scrapes the event watcher's
+`k8s_event_watcher_*` metrics from the `agent-api-auth` sidecar's port 9095. The
+operator's gateway NetworkPolicy admits the collector on that port either way;
+the value only decides whether a scrape is configured. Set it `false` off-GKE,
+where the `PodMonitoring` CRD does not exist — the same caveat as
+`litellm.podMonitoring`.
+
 ### Turning telemetry off
 
 A cluster with no collector needs nothing done: when discovery completes and

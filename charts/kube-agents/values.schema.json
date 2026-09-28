@@ -489,6 +489,9 @@
         "annotations": {
           "type": "object"
         },
+        "podMonitoring": {
+          "type": "boolean"
+        },
         "harness": {
           "type": "object",
           "additionalProperties": false,

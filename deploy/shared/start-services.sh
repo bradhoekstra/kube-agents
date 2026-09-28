@@ -473,6 +473,21 @@ start_event_watcher() {
     echo "start-services: cannot create ${WATCHER_DEDUP_DIR}; the dedup cache will not survive a watcher restart, so recent incidents may be reported twice" >&2
   fi
 
+  # Where the watcher serves Prometheus metrics, passed as --metrics-addr. The
+  # port arrives from the operator in EVENT_WATCHER_METRICS_PORT rather than
+  # being a constant here like KV_DAEMON_PORT, because unlike the daemon address
+  # it is reachable from outside the pod: the operator declares the container
+  # port, the NetworkPolicy rule that admits the managed-Prometheus collector,
+  # and the port the chart's PodMonitoring scrapes, so the number has one home
+  # and the listener cannot drift from the declarations that make it
+  # reachable. The operator reserves the name, so spec.deployment.env cannot
+  # move it either. Unset means no listener: an older operator that declares no
+  # port gets the watcher it had, not one bound to a port nothing can reach.
+  metrics_addr=""
+  if [ -n "${EVENT_WATCHER_METRICS_PORT:-}" ]; then
+    metrics_addr=":${EVENT_WATCHER_METRICS_PORT}"
+  fi
+
   (
     # Leave the loop on SIGTERM instead of going round it again. bash runs a trap
     # between commands, so this one is deferred until the foreground watcher below
@@ -490,6 +505,7 @@ start_event_watcher() {
         --profiles-dir="${CREDENTIAL_PROXY_WORKSPACE_ROOT:-/opt/data}/profiles" \
         --dedup-persist="${dedup_persist}" \
         --dedup-window="${WATCHER_DEDUP_WINDOW}" \
+        --metrics-addr="${metrics_addr}" \
         --in-cluster \
         --daemon-url="${KV_DAEMON_URL}" \
         --token-env=SESSION_KV_API_KEY \

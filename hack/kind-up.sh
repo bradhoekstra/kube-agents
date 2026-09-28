@@ -119,7 +119,7 @@ helm --kube-context "${CONTEXT}" upgrade --install kube-agents "${REPO_ROOT}/cha
   --set-string "agentSandbox.image.repository=kind.local/agent-sandbox" --set-string "agentSandbox.image.tag=${SANDBOX_TAG}" \
   --set-string "platformAgent.harness.projectId=kind" --set-string "platformAgent.harness.location=kind" --set-string "platformAgent.harness.clusterName=kind" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
-  --set "platformAgent.harness.hermes.dashboardEnabled=false" \
+  --set "platformAgent.harness.hermes.dashboardEnabled=false" --set "platformAgent.podMonitoring=false" \
   --set "platformAgent.credentials.create=true" \
   --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
   --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}" \

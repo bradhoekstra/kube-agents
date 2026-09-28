@@ -590,6 +590,14 @@ platformAgent:
   # entry that is not a namespace name (a lowercase RFC 1123 label) fails the
   # render too.
   annotations: {}
+  # GKE managed-Prometheus PodMonitoring for the gateway pod, where the
+  # k8s-event-watcher serves its metrics on the agent-api-auth sidecar's
+  # event-metrics port (9095). The operator's gateway NetworkPolicy admits the
+  # collector on that port whatever this is set to; this decides only whether a
+  # scrape is configured. Disable off-GKE — the PodMonitoring CRD is
+  # GKE-managed, and helm template/lint cannot catch its absence: a non-GKE
+  # install fails at apply time, the same caveat as litellm.podMonitoring.
+  podMonitoring: true
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
