@@ -34,6 +34,8 @@ _REQUIRED = [
 
 POPULATED = {
     "projects": ["payments-prod", "payments-staging"],
+    "folders": ["123456789012"],
+    "organizations": [],
     "exclude": {
         "projects": ["*-sandbox"],
         "clusters": [
@@ -41,7 +43,7 @@ POPULATED = {
         ],
     },
 }
-EMPTY = {"projects": [], "exclude": {"projects": [], "clusters": []}}
+EMPTY = {"projects": [], "folders": [], "organizations": [], "exclude": {"projects": [], "clusters": []}}
 
 
 class ScopeBlockShapeTest(unittest.TestCase):
@@ -63,6 +65,8 @@ class ScopeBlockShapeTest(unittest.TestCase):
 
     def test_every_list_renders_even_when_empty(self):
         for key in ("projects: {{ $scope.projects | default list | toJson }}",
+                    "folders: {{ $scope.folders | default list | toJson }}",
+                    "organizations: {{ $scope.organizations | default list | toJson }}",
                     "projects: {{ $scopeExclude.projects | default list | toJson }}",
                     "clusters: {{ $scopeExclude.clusters | default list | toJson }}"):
             with self.subTest(line=key):
@@ -118,6 +122,12 @@ class ScopeBlockRenderTest(unittest.TestCase):
         self.assertEqual(self._scope_of(proc), "ABSENT")
 
     def test_an_unknown_key_under_scope_is_refused_by_the_schema(self):
-        proc = self._render("--set", "platformAgent.scope.folders={123}")
+        # The two phase 3 selectors are not rendered by the chart yet, so a
+        # value for them is a mistake the schema names rather than drops.
+        proc = self._render("--set", "platformAgent.scope.sharedVpcHosts={shared-net-host}")
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("scope", proc.stderr)
+
+    def test_a_folder_without_the_other_lists_renders_every_list(self):
+        rendered = self._scope_of(self._render("-f", self._values_file({"folders": ["123456789012"]})))
+        self.assertEqual(rendered, {**EMPTY, "folders": ["123456789012"]})

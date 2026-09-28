@@ -16,7 +16,7 @@ import subprocess
 import tempfile
 import unittest
 
-from tests.testing.common import get_isolated_test_env
+from tests.testing.common import create_minimal_tools_bin, get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
@@ -2667,7 +2667,7 @@ class ToleratedProbesClearErrTrapTest(unittest.TestCase):
 
 
 class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
-    """The three SCOPE_* keys become the composition's `scope` object.
+    """The five SCOPE_* keys become the composition's `scope` object.
 
     Always a full block, empty lists included: the reconcile reads an emptied
     projects list as the declaration that drops projects and a missing block as
@@ -2683,7 +2683,9 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     EMPTY_BLOCK = (
         "scope = {\n"
-        "  projects = []\n"
+        "  projects      = []\n"
+        "  folders       = []\n"
+        "  organizations = []\n"
         "  exclude = {\n"
         "    projects = []\n"
         "    clusters = []\n"
@@ -2692,8 +2694,8 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
     )
 
     def _scope_env(self, **keys):
-        env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "",
-               "SCOPE_EXCLUDE_CLUSTERS": ""}
+        env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+               "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
         env.update(keys)
         return env
 
@@ -2704,12 +2706,16 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
     def test_the_keys_are_carried_verbatim_into_the_block(self):
         content = self._tfvars(self._scope_env(
             SCOPE_PROJECTS="payments-prod, payments-staging",
+            SCOPE_FOLDERS="123456789012 210987654321",
+            SCOPE_ORGANIZATIONS="987654321098",
             SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
             SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
         ))
         self.assertIn(
             "scope = {\n"
-            '  projects = ["payments-prod", "payments-staging"]\n'
+            '  projects      = ["payments-prod", "payments-staging"]\n'
+            '  folders       = ["123456789012", "210987654321"]\n'
+            '  organizations = ["987654321098"]\n'
             "  exclude = {\n"
             '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
             '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
@@ -2751,6 +2757,21 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
                 self.assertFalse(dest.exists(), "no tfvars is written for an entry the block cannot render")
                 self.assertFalse((pathlib.Path(out_dir) / "terraform.tfvars.tmp").exists())
 
+    def test_a_container_id_that_is_not_a_bare_number_is_refused_before_the_file_is_written(self):
+        # A folders/<id> spelling would otherwise reach terraform's variable
+        # validation with a message naming neither the key nor the entry.
+        for key, bad in (("SCOPE_FOLDERS", "folders/123456789012"), ("SCOPE_ORGANIZATIONS", "organizations/1"),
+                         ("SCOPE_FOLDERS", "my-folder"), ("SCOPE_ORGANIZATIONS", "123456789012345678901")):
+            with self.subTest(key=key, entry=bad), tempfile.TemporaryDirectory() as out_dir:
+                dest = pathlib.Path(out_dir) / "terraform.tfvars"
+                proc = self._run(
+                    f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                    env=self._scope_env(**{key: f"123456789012, {bad}"}),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stderr)
+                self.assertIn(f"{key} entry '{bad}' is not a numeric Resource Manager ID", proc.stderr + proc.stdout)
+                self.assertFalse(dest.exists())
+
 
 _LIVE_SCOPE_CR = (
     '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p3-project","p2-project"],'
@@ -2758,6 +2779,8 @@ _LIVE_SCOPE_CR = (
 )
 _LIVE_SCOPE_LINES = (
     'SCOPE_PROJECTS="p2-project p3-project"',
+    'SCOPE_FOLDERS=""',
+    'SCOPE_ORGANIZATIONS=""',
     'SCOPE_EXCLUDE_PROJECTS=""',
     'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
 )
@@ -2824,7 +2847,8 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 path = bin_dir / stub
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
-                   "SCOPE_PROJECTS": "", "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+                   "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
             env.update(keys or {})
             body = (
                 "set -u\n"
@@ -2909,22 +2933,46 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project p3-project"', proc.stdout)
 
-    def test_containers_on_the_live_cr_are_reported_and_never_weighed(self):
-        # folders and organizations (phase 2) have no installer key and the
-        # chart renders neither, so an apply leaves them alone: a CR carrying
-        # only containers passes with a note, and a refused mixed edit still
-        # prints the three lines it can reproduce plus the note.
+    def test_a_hand_declared_container_is_protected_like_a_project(self):
+        # The chart renders folders and organizations now, so an apply over a
+        # CR that carries one the record and the keys do not is the same
+        # silent replace as for a project: refused, with the two lines that
+        # reproduce it, and passed once the keys carry it.
         only_containers = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"folders":["123456789012"],'
                            '"organizations":["987654321098"]}}}]}')
         proc = self._run(only_containers, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_FOLDERS="123456789012"', proc.stdout)
+        self.assertIn('INFO:   SCOPE_ORGANIZATIONS="987654321098"', proc.stdout)
+        proc = self._run(only_containers, "norelease",
+                         keys={"SCOPE_FOLDERS": "123456789012", "SCOPE_ORGANIZATIONS": "987654321098"})
         self._assert_rc(proc, 0)
-        self.assertIn("also declares folders: 123456789012 organizations: 987654321098, which the installer has no key for yet", proc.stdout)
+        # A record that carries the folder makes the keys the new declaration,
+        # dropping it included.
+        record = ('{"platformAgent":{"scope":{"projects":[],"folders":["123456789012"],"organizations":["987654321098"],'
+                  '"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_containers, record), 0)
+        # And a record from before the chart rendered the lists (no folders
+        # key) does not account for a folder the CR carries.
+        older = '{"platformAgent":{"scope":{"projects":[],"exclude":{"projects":[],"clusters":[]}}}}'
+        self._assert_rc(self._run(only_containers, older), 1)
+
+    def test_selectors_on_the_live_cr_are_reported_and_never_weighed(self):
+        # sharedVpcHosts and metricsScopes (phase 3) have no installer key and
+        # the chart renders neither, so an apply leaves them alone: a CR
+        # carrying only selectors passes with a note, and a refused mixed edit
+        # still prints the lines it can reproduce plus the note.
+        only_selectors = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"sharedVpcHosts":["shared-net-host"],'
+                          '"metricsScopes":["observability-hub"]}}}]}')
+        proc = self._run(only_selectors, "norelease")
+        self._assert_rc(proc, 0)
+        self.assertIn("also declares sharedVpcHosts: shared-net-host metricsScopes: observability-hub, which the installer has no key for yet", proc.stdout)
         mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
-                 '"folders":["123456789012"]}}}]}')
+                 '"sharedVpcHosts":["shared-net-host"]}}}]}')
         proc = self._run(mixed, "norelease")
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
-        self.assertIn("also declares folders: 123456789012, which the installer has no key for yet", proc.stdout)
+        self.assertIn("also declares sharedVpcHosts: shared-net-host, which the installer has no key for yet", proc.stdout)
 
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.
@@ -2987,6 +3035,150 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 proc = self._run(cr, record, mode="warn")
                 self._assert_rc(proc, 0)
                 self.assertIn("WARN: The scope check did not run:", proc.stdout)
+
+
+class ScopeContainerPreflightTest(unittest.TestCase):
+    """check_scope_container_access: silent with no container; with one, the
+    Asset API must be enabled in the host project or no effective policy may
+    deny it, and the applying identity must hold setIamPolicy on every
+    container, asked through testIamPermissions. Every failure is named
+    before the refusal; a probe that cannot decide warns and lets the apply
+    speak; "warn" turns the refusal into a warning."""
+
+    def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
+             probe=None, token=True, curl_present=True):
+        """probe: a dict from resource ("folders/1") to what curl answers:
+        "granted", "denied", "forbidden", "missing", "garbage", "down"."""
+        probe = probe or {}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            policy_json = json.dumps(policy or {"spec": {"rules": []}})
+            services = "cloudasset.googleapis.com" if api_enabled else ""
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"services list"*) printf "%s\\n" "{services}"; exit 0 ;;\n'
+                + ('  *"org-policies describe"*) echo "ERROR: PERMISSION_DENIED" >&2; exit 1 ;;\n' if policy_error else
+                   f"  *\"org-policies describe\"*) printf '%s\\n' '{policy_json}'; exit 0 ;;\n")
+                + ('  *"print-access-token"*) echo "tok"; exit 0 ;;\n' if token else
+                   '  *"print-access-token"*) exit 1 ;;\n')
+                + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
+                "esac\nexit 1\n"
+            )
+            if curl_present:
+                cases = []
+                for resource, answer in probe.items():
+                    body, status = {
+                        "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
+                        "denied": ("{}", 200),
+                        "forbidden": ('{"error":{"code":403}}', 403),
+                        "missing": ('{"error":{"code":404}}', 404),
+                        "garbage": ("<html>", 200),
+                        "down": ("", None),
+                    }[answer]
+                    if status is None:
+                        cases.append(f'  *"/{resource}:testIamPermissions"*) exit 7 ;;')
+                    else:
+                        cases.append(f"  *\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
+                (bin_dir / "curl").write_text("#!/usr/bin/env bash\ncase \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
+            for stub in ("gcloud",) + (("curl",) if curl_present else ()):
+                path = bin_dir / stub
+                path.chmod(path.stat().st_mode | stat.S_IEXEC)
+            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": ""}
+            env.update(keys or {})
+            body = (
+                "set -u\n"
+                'print_error() { echo "ERROR: $*"; }; print_info() { echo "INFO: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                f'check_scope_container_access {mode}; echo "rc=$?"\n'
+            )
+            # For a curl-absent run PATH is the stubs plus a minimal toolbox
+            # (bash, coreutils, python3), so the real curl is not found behind it.
+            isolated = get_isolated_test_env(overrides=env, bin_dir=str(bin_dir))
+            if not curl_present:
+                tools = create_minimal_tools_bin(pathlib.Path(tmp) / "tools")
+                (tools / "python3").symlink_to(shutil.which("python3"))
+                isolated["PATH"] = f"{bin_dir}:{tools}"
+            return subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=isolated, cwd=str(_REPO_ROOT))
+
+    def _assert_rc(self, proc, rc):
+        self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_no_container_is_silent_and_touches_nothing(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, api_enabled=False, policy_error=True, token=False)
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+
+    def test_a_bindable_folder_with_the_api_enabled_passes_silently(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+
+    def test_every_unbindable_container_is_named_before_the_refusal(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111, 222222222222", "SCOPE_ORGANIZATIONS": "333333333333"},
+                         probe={"folders/111111111111": "denied", "folders/222222222222": "granted",
+                                "organizations/333333333333": "missing"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: this identity (tester@example.com) cannot set IAM policy on folders/111111111111 (resourcemanager.folders.setIamPolicy)", proc.stdout)
+        self.assertIn("cannot set IAM policy on organizations/333333333333 (resourcemanager.organizations.setIamPolicy)", proc.stdout)
+        self.assertNotIn("folders/222222222222 (", proc.stdout)
+        self.assertIn("INFO: Nothing was changed.", proc.stdout)
+        # An organisation is always warned about, bindable or not.
+        self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_a_403_is_a_refusal_and_a_transport_failure_is_a_warning(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222 333333333333"},
+                         probe={"folders/111111111111": "forbidden", "folders/222222222222": "down",
+                                "folders/333333333333": "garbage"})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot set IAM policy on folders/111111111111", proc.stdout)
+        self.assertIn("WARN: The scope container preflight could not decide whether this identity can set IAM policy on folders/222222222222", proc.stdout)
+        self.assertIn("could not decide whether this identity can set IAM policy on folders/333333333333", proc.stdout)
+
+    def test_a_policy_that_denies_the_api_is_named_when_the_api_is_off(self):
+        for label, policy in (
+            ("deniedValues", {"spec": {"rules": [{"values": {"deniedValues": ["cloudasset.googleapis.com"]}}]}}),
+            ("allowedValues without it", {"spec": {"rules": [{"values": {"allowedValues": ["container.googleapis.com"]}}]}}),
+            ("denyAll", {"spec": {"rules": [{"denyAll": True}]}}),
+        ):
+            with self.subTest(policy=label):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False, policy=policy,
+                                 probe={"folders/123456789012": "granted"})
+                self._assert_rc(proc, 1)
+                self.assertIn("ERROR: Refusing to apply: cloudasset.googleapis.com cannot be enabled in project 'test-project': the effective organisation policy constraints/gcp.restrictServiceUsage denies it", proc.stdout)
+        # The API already on: the policy is never consulted.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=True,
+                         policy={"spec": {"rules": [{"denyAll": True}]}}, probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        # The API off and no policy denying it: fine, the apply enables it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False,
+                         policy={"spec": {"rules": [{"values": {"allowedValues": ["cloudasset.googleapis.com"]}}]}},
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+
+    def test_an_unreadable_policy_warns_and_lets_the_apply_speak(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, api_enabled=False, policy_error=True,
+                         probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: The scope container preflight could not decide whether cloudasset.googleapis.com can be enabled in project 'test-project'", proc.stdout)
+
+    def test_no_token_or_no_curl_warns_about_the_containers_and_passes(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, token=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("gcloud could not mint an access token", proc.stdout)
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, curl_present=False)
+        self._assert_rc(proc, 0)
+        self.assertIn("curl is not installed", proc.stdout)
+
+    def test_warn_mode_names_the_failures_and_passes(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, mode="warn", probe={"folders/123456789012": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: A full upgrade would be refused: this identity (tester@example.com) cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -214,6 +214,8 @@ spec:
   {{- $scopeExclude := $scope.exclude | default dict }}
   scope:
     projects: {{ $scope.projects | default list | toJson }}
+    folders: {{ $scope.folders | default list | toJson }}
+    organizations: {{ $scope.organizations | default list | toJson }}
     exclude:
       projects: {{ $scopeExclude.projects | default list | toJson }}
       clusters: {{ $scopeExclude.clusters | default list | toJson }}

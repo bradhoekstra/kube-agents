@@ -834,9 +834,10 @@ platformAgent:
   # hourly Cluster Agent reconcile enumerates, and what it leaves unmanaged:
   # rendered as spec.scope on the PlatformAgent (the CRD reference on the site
   # documents the field). The agent's service account needs the read roles in
-  # each project named; the Terraform composition binds them from the same
-  # value it passes here, and a chart installed on its own needs them granted
-  # by hand.
+  # each project named, and the read roles plus roles/cloudasset.viewer on
+  # each folder and organisation; the Terraform composition binds them from
+  # the same value it passes here, and a chart installed on its own needs them
+  # granted by hand.
   #
   # A map renders the block as it is, empty lists included: an empty scope is a
   # present block with empty lists, which the reconcile reads as the
@@ -859,6 +860,8 @@ platformAgent:
   #
   #   scope:
   #     projects: [payments-prod, payments-staging]
+  #     folders: ["123456789012"]   # numeric IDs; every project beneath, at any depth
+  #     organizations: []           # numeric IDs; wide, prefer folders
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple

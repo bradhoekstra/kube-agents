@@ -151,6 +151,24 @@ readonly IMAGE_TAG_FALLBACK="latest"
 # the separator, and the shape an entry has to have to be rendered at all.
 readonly SCOPE_CLUSTER_TRIPLE_SEPARATOR="/"
 readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
+# A SCOPE_FOLDERS or SCOPE_ORGANIZATIONS entry is the bare numeric Resource
+# Manager ID, the pattern the CRD accepts for the same fields.
+readonly SCOPE_CONTAINER_ID_PATTERN='^[0-9]{1,20}$'
+# What check_scope_container_access verifies before an apply that binds a
+# container: the API the reconcile's container search calls, the permission
+# the applying identity needs on each container kind, the constraints an
+# organisation policy forbids an API through, and where the permission probe
+# is asked.
+readonly SCOPE_ASSET_API="cloudasset.googleapis.com"
+readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
+readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
+readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
+readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
+readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
+# The three answers a container permission probe gives.
+readonly SCOPE_PROBE_GRANTED=0
+readonly SCOPE_PROBE_DENIED=1
+readonly SCOPE_PROBE_UNDECIDED=2
 # kubectl's answers for a cluster that serves no PlatformAgent type at all, and
 # helm's for a release that does not exist: on a first adoption both mean there
 # is nothing live to protect, not that the read failed.
@@ -461,7 +479,7 @@ load_install_env() {
   # and the Day-2 menu the file is the only way in. A value inherited from the
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
-  unset SCOPE_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -872,17 +890,19 @@ hcl_csv_list() {
   printf '%s]' "$out"
 }
 
-# The three SCOPE_* keys as the composition's `scope` object: `projects` and
-# `exclude.projects` are lists like every other list key, `exclude.clusters`
-# is one project/location/cluster triple per entry. Always a full block, empty
-# lists included -- the reconcile reads an emptied projects list as the
-# declaration that drops projects and a missing block as no declaration
-# (docs/designs/multi-project-scope.md §7). Shape only: the caller has already
-# run require_scope_cluster_triples, and the patterns, caps and repeats the
-# CRD enforces are the module variable's validations, which fail the plan
-# before any binding.
+# The five SCOPE_* keys as the composition's `scope` object: `projects`,
+# `folders`, `organizations` and `exclude.projects` are lists like every other
+# list key, `exclude.clusters` is one project/location/cluster triple per
+# entry. Always a full block, empty lists included -- the reconcile reads an
+# emptied projects list as the declaration that drops projects, a container
+# leaving the list as the declaration that retires its members, and a missing
+# block as no declaration (docs/designs/multi-project-scope.md §7). Shape
+# only: the caller has already run require_scope_cluster_triples and
+# require_scope_container_ids, and the patterns, caps and repeats the CRD
+# enforces are the module variable's validations, which fail the plan before
+# any binding.
 hcl_scope_block() {
-  local projects="${1:-}" exclude_projects="${2:-}" exclude_clusters="${3:-}"
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" exclude_projects="${4:-}" exclude_clusters="${5:-}"
   local clusters="[" first=true entry project location cluster had_noglob=false
   local IFS=$', \t\n'
   case "$-" in *f*) had_noglob=true ;; esac
@@ -896,8 +916,33 @@ hcl_scope_block() {
   done
   $had_noglob || set +f
   clusters+="]"
-  printf 'scope = {\n  projects = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
-    "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$exclude_projects")" "$clusters"
+  printf 'scope = {\n  projects      = %s\n  folders       = %s\n  organizations = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+    "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
+    "$(hcl_csv_list "$exclude_projects")" "$clusters"
+}
+
+# Every SCOPE_FOLDERS and SCOPE_ORGANIZATIONS entry is a bare numeric ID, or
+# the run stops before a file is written and names the entry and its key: a
+# folders/<id> spelling would otherwise reach terraform's variable validation
+# with a message naming neither. $1 the folders, $2 the organisations. Caller
+# defines print_error.
+require_scope_container_ids() {
+  local folders="${1:-}" organizations="${2:-}" key entries entry had_noglob=false
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for key in SCOPE_FOLDERS SCOPE_ORGANIZATIONS; do
+    [ "$key" = SCOPE_FOLDERS ] && entries="$folders" || entries="$organizations"
+    for entry in $entries; do
+      [ -n "$entry" ] || continue
+      if ! [[ "$entry" =~ $SCOPE_CONTAINER_ID_PATTERN ]]; then
+        $had_noglob || set +f
+        print_error "${key} entry '${entry}' is not a numeric Resource Manager ID. Name each folder or organisation by its bare number in install.env (123456789012, not folders/123456789012)."
+        return 1
+      fi
+    done
+  done
+  $had_noglob || set +f
 }
 
 # Every SCOPE_EXCLUDE_CLUSTERS entry is project/location/cluster, or the run
@@ -943,9 +988,10 @@ require_scope_cluster_triples() {
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
-# L, R and K are the projects and exclusions; the folders and organizations
-# lists phase 2 added are reported when the CR carries them and never weighed,
-# because the chart renders neither and an apply leaves them as they are.
+# L, R and K are the projects, folders, organisations and exclusions; the
+# sharedVpcHosts and metricsScopes selectors phase 3 added are reported when
+# the CR carries them and never weighed, because the chart renders neither
+# and an apply leaves them as they are.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1014,7 +1060,7 @@ print(max(served) if served else "")
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
-keys = sys.argv[3:6]
+keys = sys.argv[3:8]
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
@@ -1027,11 +1073,14 @@ def normalise(scope):
     )
     return {
         "projects": sorted(set(scope.get("projects") or [])),
+        "folders": sorted(set(scope.get("folders") or [])),
+        "organizations": sorted(set(scope.get("organizations") or [])),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
     }
 
 def is_empty(scope):
-    return not (scope["projects"] or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+    return not (scope["projects"] or scope["folders"] or scope["organizations"]
+                or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
 
 items = json.loads(cr_text).get("items") or []
 if len(items) > 1:
@@ -1041,12 +1090,12 @@ if live_raw is None:
     print(ok)
     sys.exit(0)
 live = normalise(live_raw)
-# The container lists phase 2 added to the CR. The chart renders neither and
+# The two selectors phase 3 added to the CR. The chart renders neither and
 # the installer has no key for them, so an apply leaves them as they are; they
 # are reported on the second output line, never weighed in the verdict.
 containers = " ".join(
     k + ": " + " ".join(sorted(set(live_raw.get(k) or [])))
-    for k in ("folders", "organizations") if live_raw.get(k)
+    for k in ("sharedVpcHosts", "metricsScopes") if live_raw.get(k)
 )
 if is_empty(live):
     print(ok)
@@ -1059,9 +1108,11 @@ def recorded(text):
 records = [r for r in (recorded(record_text), recorded(served_text)) if r is not None]
 declared = normalise({
     "projects": split(keys[0]),
+    "folders": split(keys[1]),
+    "organizations": split(keys[2]),
     "exclude": {
-        "projects": split(keys[1]),
-        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[2])],
+        "projects": split(keys[3]),
+        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[4])],
     },
 })
 if live in records or live == declared:
@@ -1072,9 +1123,11 @@ print(refuse)
 print(containers)
 print(items[0]["metadata"]["name"])
 print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
+print("SCOPE_FOLDERS=" + json.dumps(" ".join(live["folders"])))
+print("SCOPE_ORGANIZATIONS=" + json.dumps(" ".join(live["organizations"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -1087,7 +1140,7 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   [ "$lines" != "$verdict" ] || lines=""
   containers="${lines%%$'\n'*}"
   if [ -n "$containers" ]; then
-    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders no container list and leaves them as they are."
+    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders neither selector and leaves them as they are."
   fi
   [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
   lines="${lines#*$'\n'}"
@@ -1105,6 +1158,162 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
   print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope to what install.env declares and re-run; the apply then renders the same value it already holds."
   return 1
+}
+
+# Preflight for a declared folder or organisation, run with the identity the
+# front doors hand to Terraform (gcloud's active account), before the apply
+# that would bind the agent's roles on the container: (1) the Cloud Asset API
+# the reconcile's container search calls can be enabled in the host project,
+# meaning it is enabled already or no effective organisation policy forbids
+# it, and (2) this identity can set IAM policy on every container named, so
+# the apply does not stop partway with the API enabled and some containers
+# bound. Every container is probed and every failure named before the run
+# stops (docs/designs/multi-project-scope.md §6); a probe that cannot decide
+# (no curl, no token, a transport error) warns and lets the apply speak,
+# because an apply that fails to bind fails loudly, unlike the scope replace
+# refuse_apply_over_undeclared_scope guards against. An install that declares
+# no container returns silently and never touches the Asset API. $1 "warn"
+# turns the refusal into a warning (upgrade.sh --plan applies nothing).
+# Caller defines print_error / print_info / print_warning.
+check_scope_container_access() {
+  local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
+  local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
+  [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false
+  if [[ "$organizations" == *[![:space:],]* ]]; then
+    print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
+  fi
+  if ! _scope_asset_api_enabled "$project"; then
+    constraint="$(_scope_policy_denying_asset_api "$project")"; rc=$?
+    if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+      failures+=("${SCOPE_ASSET_API} cannot be enabled in project '${project}': the effective organisation policy ${constraint} denies it, and the reconcile resolves a folder or organisation through that API. Ask the organisation's administrator for an exception, or declare explicit SCOPE_PROJECTS instead.")
+    elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
+      undecided+=("whether ${SCOPE_ASSET_API} can be enabled in project '${project}' (the organisation policy could not be read)")
+    fi
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    undecided+=("whether this identity can set IAM policy on the declared containers (curl is not installed)")
+  elif ! token="$(trap - ERR; gcloud auth print-access-token 2>/dev/null)" || [ -z "$token" ]; then
+    undecided+=("whether this identity can set IAM policy on the declared containers (gcloud could not mint an access token)")
+  else
+    local IFS=$', \t\n'
+    case "$-" in *f*) had_noglob=true ;; esac
+    set -f
+    for entry in $folders; do
+      [ -n "$entry" ] || continue
+      _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token"; rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("this identity ($(gcloud config get-value account 2>/dev/null)) cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder, or drop it from SCOPE_FOLDERS.")
+      elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
+        undecided+=("whether this identity can set IAM policy on folders/${entry}")
+      fi
+    done
+    for entry in $organizations; do
+      [ -n "$entry" ] || continue
+      _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token"; rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("this identity ($(gcloud config get-value account 2>/dev/null)) cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin, or drop it from SCOPE_ORGANIZATIONS.")
+      elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
+        undecided+=("whether this identity can set IAM policy on organizations/${entry}")
+      fi
+    done
+    $had_noglob || set +f
+  fi
+  for entry in ${undecided[@]+"${undecided[@]}"}; do
+    print_warning "The scope container preflight could not decide ${entry}; the apply will report it if it fails."
+  done
+  [ "${#failures[@]}" -eq 0 ] && return 0
+  if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
+    for entry in "${failures[@]}"; do print_warning "A full upgrade would be refused: ${entry}"; done
+    return 0
+  fi
+  for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
+  print_info "Nothing was changed. Fix what is named above, or edit SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
+  return 1
+}
+
+# True when the Asset API is already enabled in the host project. A listing
+# that fails reads as not enabled, which sends the caller to the policy read.
+_scope_asset_api_enabled() {
+  local project="$1" enabled
+  enabled="$(trap - ERR; gcloud services list --enabled --project "$project" \
+    --filter="config.name=${SCOPE_ASSET_API}" --format="value(config.name)" 2>/dev/null)" || return 1
+  [ "$enabled" = "$SCOPE_ASSET_API" ]
+}
+
+# Prints the constraint whose effective policy on the host project denies the
+# Asset API and returns SCOPE_PROBE_DENIED; returns SCOPE_PROBE_GRANTED with
+# nothing printed when no read policy denies it, SCOPE_PROBE_UNDECIDED when
+# every constraint's policy was unreadable (a constraint that has no policy
+# set reads as not denying). Both service-usage constraints are read, because
+# an organisation may still carry the legacy one.
+_scope_policy_denying_asset_api() {
+  local project="$1" constraint policy readable=false
+  for constraint in $SCOPE_SERVICE_USAGE_CONSTRAINTS; do
+    if ! policy="$(trap - ERR; gcloud org-policies describe "$constraint" --project="$project" --effective --format=json 2>/dev/null)"; then
+      continue
+    fi
+    readable=true
+    if printf '%s' "$policy" | python3 -c '
+import json, sys
+api = sys.argv[1]
+try:
+    doc = json.load(sys.stdin) or {}
+except Exception:
+    sys.exit(1)
+rules = ((doc.get("spec") or doc.get("dryRunSpec") or {}).get("rules")) or []
+for rule in rules:
+    if rule.get("denyAll"):
+        sys.exit(0)
+    values = rule.get("values") or {}
+    if api in (values.get("deniedValues") or []):
+        sys.exit(0)
+    allowed = values.get("allowedValues") or []
+    if allowed and api not in allowed:
+        sys.exit(0)
+sys.exit(1)
+' "$SCOPE_ASSET_API" 2>/dev/null; then
+      printf '%s' "constraints/${constraint}"
+      return "$SCOPE_PROBE_DENIED"
+    fi
+  done
+  $readable && return "$SCOPE_PROBE_GRANTED"
+  return "$SCOPE_PROBE_UNDECIDED"
+}
+
+# Asks Resource Manager whether the token's identity holds one permission on a
+# container, through testIamPermissions, which never mutates and answers for
+# the caller alone. $1 folders/<id> or organizations/<id>; $2 the permission;
+# $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
+# permission, or a 403/404: a container the caller cannot see cannot be bound)
+# or _UNDECIDED (transport failure, any other status, an unreadable body).
+_scope_container_can_set_iam() {
+  local resource="$1" permission="$2" token="$3" response status body rc=0
+  if ! response="$(trap - ERR; curl -sS --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
+    -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \
+    -d "{\"permissions\":[\"${permission}\"]}" \
+    -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
+    return "$SCOPE_PROBE_UNDECIDED"
+  fi
+  status="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+  case "$status" in
+    200)
+      # The parser exits with the probe's own answer: granted, denied, or
+      # undecided for a body that is not the JSON the API documents.
+      (trap - ERR; printf '%s' "$body" | python3 -c '
+import json, sys
+granted, denied, undecided = (int(a) for a in sys.argv[2:5])
+try:
+    held = (json.load(sys.stdin) or {}).get("permissions") or []
+except Exception:
+    sys.exit(undecided)
+sys.exit(granted if sys.argv[1] in held else denied)
+' "$permission" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
+      return "$rc" ;;
+    403|404) return "$SCOPE_PROBE_DENIED" ;;
+    *) return "$SCOPE_PROBE_UNDECIDED" ;;
+  esac
 }
 
 # The check above could not decide. A refusal, except under "warn" (a plan
@@ -2287,10 +2496,11 @@ write_tfvars_from_state() {
     print_error "MODEL_MAX_TOKENS='${model_max_tokens}' is not a whole number of tokens. Set a non-negative integer, or leave it empty, in install.env."
     return 1
   fi
-  # A triple the block cannot render stops the run here, with the file
-  # untouched, rather than at terraform's parser with a message naming
-  # neither the key nor the entry.
+  # A triple the block cannot render, or a container ID that is not a bare
+  # number, stops the run here, with the file untouched, rather than at
+  # terraform with a message naming neither the key nor the entry.
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
+  require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
 
   local old_umask
   old_umask="$(umask)"
@@ -2366,12 +2576,14 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
-    echo "# The projects beyond project_id whose GKE clusters get a Cluster Agent, and"
-    echo "# what to leave unmanaged (SCOPE_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
-    echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
-    echo "# the declaration the composition renders either way, empty lists included;"
-    echo "# an emptied projects list is the declaration that drops projects."
-    hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
+    echo "# The projects, folders and organisations beyond project_id whose GKE clusters"
+    echo "# get a Cluster Agent, and what to leave unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS,"
+    echo "# SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS in"
+    echo "# install.env). Always written, so this file states the declaration the"
+    echo "# composition renders either way, empty lists included; an emptied list is the"
+    echo "# declaration that drops what it named."
+    hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
+      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
