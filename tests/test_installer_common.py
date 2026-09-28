@@ -3100,6 +3100,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                         "denied": ("{}", 200),
                         "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
                         "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
+                        "scope-insufficient": ('{"error":{"code":403,"message":"Request had insufficient authentication scopes.","status":"PERMISSION_DENIED","details":[{"reason":"ACCESS_TOKEN_SCOPE_INSUFFICIENT"}]}}', 403),
                         "missing": ('{"error":{"code":404}}', 404),
                         "garbage": ("<html>", 200),
                         "down": ("", None),
@@ -3115,7 +3116,14 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                     'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
                     'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
                     "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
-            for stub in ("gcloud",) + (("curl",) if curl_present else ()):
+            # env is an external binary whose argv any local user can read: the
+            # stub records what it was handed, then hands over to the real one.
+            (bin_dir / "env").write_text(
+                "#!/usr/bin/env bash\n"
+                'echo "ENV-ARGV:$*" >>"$SCOPE_PROBE_LOG"\n'
+                'exec /usr/bin/env "$@"\n'
+            )
+            for stub in ("gcloud", "env") + (("curl",) if curl_present else ()):
                 path = bin_dir / stub
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             # The library discards the stubs' stderr, so what they saw is
@@ -3215,6 +3223,21 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                                                             "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
         self.assertIn("BEARER:imp-from-from-env\n", proc.stderr)
         self.assertNotIn("BEARER:from-env\n", proc.stderr)
+        # The source token reaches gcloud through the environment, never on
+        # env's argv, which any local user can read.
+        self.assertIn("ENV-ARGV:", proc.stderr)
+        for line in proc.stderr.splitlines():
+            if line.startswith("ENV-ARGV:"):
+                self.assertNotIn("from-env", line)
+                self.assertNotIn("CLOUDSDK_AUTH_ACCESS_TOKEN=", line)
+        # A tilde path is a key file to the provider (its pathOrContents
+        # expands the home directory), so it is one here too.
+        with tempfile.TemporaryDirectory() as home:
+            (pathlib.Path(home) / "sa.json").write_text("{}")
+            proc = self._run(keys=base, probe=probe, env_extra={"HOME": home, "GOOGLE_CREDENTIALS": "~/sa.json"})
+            self._assert_rc(proc, 0)
+            self.assertIn("BEARER:tok-from-keyfile\n", proc.stderr)
+            self.assertIn("KEYFILE-BYTES:{}", proc.stderr)
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as key:
             key.write("{}")
         self.addCleanup(pathlib.Path(key.name).unlink)
@@ -3311,11 +3334,28 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     def test_a_403_for_a_disabled_api_is_undecided_not_denied(self):
         # Resource Manager answers 403 with reason SERVICE_DISABLED when its
         # API is off in the credential's quota project; the apply enables it
-        # before binding, so this is not a permission answer.
+        # before binding, so this is not a permission answer, and the warning
+        # says why.
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "service-disabled"})
         self._assert_rc(proc, 0)
-        self.assertIn("could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/123456789012", proc.stdout)
+        self.assertIn("could not decide whether the Application Default Credentials (the identity Terraform applies with) can set IAM policy on folders/123456789012 (Resource Manager answered 403 for its API being off in the credentials' quota project, which the apply enables before it binds)", proc.stdout)
         self.assertNotIn("ERROR", proc.stdout)
+
+    def test_a_403_for_an_insufficiently_scoped_token_names_the_scope_not_a_grant(self):
+        # A raw token minted without cloud-platform gets 403
+        # ACCESS_TOKEN_SCOPE_INSUFFICIENT; the role may be held, so the
+        # remedy is the token's scope, never "ask for folderIamAdmin".
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "scope-insufficient"},
+                         env_extra={"GOOGLE_OAUTH_ACCESS_TOKEN": "narrow"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether the identity behind GOOGLE_OAUTH_ACCESS_TOKEN (the identity Terraform applies with) can set IAM policy on folders/123456789012 (the token lacks the cloud-platform scope; mint it with that scope, as gcloud does)", proc.stdout)
+        self.assertNotIn("folderIamAdmin", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        # The other undecided answers carry their reason too.
+        proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222"},
+                         probe={"folders/111111111111": "down", "folders/222222222222": "garbage"})
+        self.assertIn("folders/111111111111 (the request to Resource Manager did not complete)", proc.stdout)
+        self.assertIn("folders/222222222222 (Resource Manager answered 200 with a body that is not the JSON it documents)", proc.stdout)
 
     def test_a_403_is_a_refusal_and_a_transport_failure_is_a_warning(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "111111111111 222222222222 333333333333"},

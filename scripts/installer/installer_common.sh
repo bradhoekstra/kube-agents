@@ -181,6 +181,10 @@ readonly SCOPE_GCLOUD_AUTH_PROPERTIES="auth/impersonate_service_account auth/acc
 # at all. The apply enables cloudresourcemanager.googleapis.com before its
 # own binding call, so these read as undecided, not denied.
 readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not been used in project|quota project|USER_PROJECT_DENIED"
+# And the 403 a token minted without the cloud-platform scope gets: the role
+# may well be held, so it is not a permission answer either, and the remedy
+# is the token's scope, not a grant.
+readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -1200,7 +1204,7 @@ check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
   local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
   [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
-  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason
   identity="$(_scope_terraform_identity_label)"
   if [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
@@ -1231,25 +1235,25 @@ check_scope_container_access() {
     for entry in $folders; do
       [ -n "$entry" ] || continue
       rc=0
-      _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token" || rc=$?
+      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
         # Undecided, and any status the probe does not define: nothing but a
         # granted answer passes silently.
-        undecided+=("whether ${identity} can set IAM policy on folders/${entry}")
+        undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
       fi
     done
     for entry in $organizations; do
       [ -n "$entry" ] || continue
       rc=0
-      _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token" || rc=$?
+      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
         # Undecided, and any status the probe does not define: nothing but a
         # granted answer passes silently.
-        undecided+=("whether ${identity} can set IAM policy on organizations/${entry}")
+        undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
       fi
     done
     $had_noglob || set +f
@@ -1323,7 +1327,7 @@ _scope_terraform_token_remedy() {
         printf 'GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way'
       fi ;;
     *)
-      creds="${!var}"
+      creds="$(_scope_expand_home "${!var}")"
       if [ -f "$creds" ]; then
         printf 'the key file %s names could not mint a token; check it is a valid service-account key%s' "$var" "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:+ that may impersonate $GOOGLE_IMPERSONATE_SERVICE_ACCOUNT}"
       else
@@ -1369,8 +1373,23 @@ _scope_gcloud_auth_properties_in_the_way() {
 # variable names, so splitting is safe); no nameref, because the front doors
 # run on bash 3.2 as well.
 _scope_gcloud_env_clear_args() {
-  local var
-  for var in $SCOPE_GCLOUD_AUTH_OVERRIDES; do printf -- '-u %s ' "$var"; done
+  local keep="${1:-}" var
+  for var in $SCOPE_GCLOUD_AUTH_OVERRIDES; do
+    [ "$var" = "$keep" ] || printf -- '-u %s ' "$var"
+  done
+}
+
+# A credential path as the google provider reads it: a leading ~ is the
+# home directory (its pathOrContents expands it), which a quoted install.env
+# line or a CI environment block hands over unexpanded.
+_scope_expand_home() {
+  # The literal tilde is the point: shellcheck reads the pattern as a path.
+  # shellcheck disable=SC2088
+  case "$1" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s%s' "$HOME" "${1#\~}" ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
 
 # Prints the access token for those credentials; fails when none can be
@@ -1391,14 +1410,19 @@ _scope_terraform_access_token() {
         return 0
       fi
       # gcloud takes a raw token as its credential through this variable and
-      # impersonates on top of it, as the provider does with access_token.
-      (trap - ERR; env "${clear[@]}" CLOUDSDK_AUTH_ACCESS_TOKEN="$GOOGLE_OAUTH_ACCESS_TOKEN" gcloud auth print-access-token "${impersonate[@]}" 2>/dev/null)
+      # impersonates on top of it, as the provider does with access_token. The
+      # variable is set in the shell's environment for the call, never as an
+      # argument to env, whose argv any local user can read; env therefore
+      # clears every override but this one.
+      # shellcheck disable=SC2207
+      clear=($(_scope_gcloud_env_clear_args CLOUDSDK_AUTH_ACCESS_TOKEN))
+      (trap - ERR; CLOUDSDK_AUTH_ACCESS_TOKEN="$GOOGLE_OAUTH_ACCESS_TOKEN" env "${clear[@]}" gcloud auth print-access-token "${impersonate[@]}" 2>/dev/null)
       return ;;
     "")
       (trap - ERR; env "${clear[@]}" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
       return ;;
   esac
-  creds="${!var}"
+  creds="$(_scope_expand_home "${!var}")"
   if [ -f "$creds" ]; then
     (trap - ERR; env "${clear[@]}" GOOGLE_APPLICATION_CREDENTIALS="$creds" gcloud auth application-default print-access-token ${impersonate[@]+"${impersonate[@]}"} 2>/dev/null)
     return
@@ -1486,8 +1510,10 @@ sys.exit(not_denied)
 # $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
 # permission, a 404, or a 403 that is a permission answer: a container the
 # caller cannot see cannot be bound) or _UNDECIDED (transport failure, a 403
-# for the API being off in the quota project, any other status, an
-# unreadable body).
+# for the API being off in the quota project or for a token minted without
+# the cloud-platform scope, any other status, an unreadable body), printing
+# for an undecided answer the reason, which the caller's warning carries so
+# the remedy names the cause rather than a grant.
 _scope_container_can_set_iam() {
   local resource="$1" permission="$2" token="$3" response status body rc=0
   # The bearer token goes to curl on its stdin (-H @-), never argv, where any
@@ -1497,6 +1523,7 @@ _scope_container_can_set_iam() {
     -H @- -H "Content-Type: application/json" \
     -d "{\"permissions\":[\"${permission}\"]}" \
     -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
+    printf 'the request to Resource Manager did not complete'
     return "$SCOPE_PROBE_UNDECIDED"
   fi
   status="${response##*$'\n'}"
@@ -1514,17 +1541,26 @@ except Exception:
     sys.exit(undecided)
 sys.exit(granted if sys.argv[1] in held else denied)
 ' "$permission" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
+      [ "$rc" -ne "$SCOPE_PROBE_UNDECIDED" ] || printf 'Resource Manager answered 200 with a body that is not the JSON it documents'
       return "$rc" ;;
     403)
-      # A 403 whose reason is the Resource Manager API being off in the
-      # credential's quota project is not a permission answer; the apply
-      # enables that API before it binds.
+      # Two 403s are not permission answers: a token minted without the
+      # cloud-platform scope (the remedy is the token's scope, not a grant),
+      # and the Resource Manager API being off in the credential's quota
+      # project (the apply enables that API before it binds).
+      if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_TOKEN_SCOPE_PATTERN"; then
+        printf 'the token lacks the cloud-platform scope; mint it with that scope, as gcloud does'
+        return "$SCOPE_PROBE_UNDECIDED"
+      fi
       if printf '%s' "$body" | grep -qE "$SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN"; then
+        printf 'Resource Manager answered 403 for its API being off in the credentials'"'"' quota project, which the apply enables before it binds'
         return "$SCOPE_PROBE_UNDECIDED"
       fi
       return "$SCOPE_PROBE_DENIED" ;;
     404) return "$SCOPE_PROBE_DENIED" ;;
-    *) return "$SCOPE_PROBE_UNDECIDED" ;;
+    *)
+      printf 'Resource Manager answered HTTP %s' "$status"
+      return "$SCOPE_PROBE_UNDECIDED" ;;
   esac
 }
 

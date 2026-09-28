@@ -218,10 +218,11 @@ host-project API enablement (`google_project_service.required` in
 `terraform/examples/full-install/main.tf`), and `cloudasset.googleapis.com` joins that list when a
 folder or organisation is declared and not otherwise: an install that names explicit projects only
 never calls the Asset API, and must not fail under an organisation policy that forbids it. Where a
-container is declared, the installer preflights, before the apply and with the identity running
-Terraform, that the API can be enabled in the host project and that this identity can set IAM
-policy on the container; the agent's own `roles/cloudasset.viewer` is bound by the apply that
-follows. A policy that forbids the API is reported by name (§6, §10). A Resource Manager walk (`projects list` per folder, recursing into every
+container is declared, the installer preflights before the apply that the API is enabled in the
+host project or that no enforced organisation policy forbids it (read through gcloud's active
+account, whose answer does not depend on who asks) and that the identity Terraform applies with,
+read the way the google provider reads its credentials, can set IAM policy on the container; the
+agent's own `roles/cloudasset.viewer` is bound by the apply that follows. A policy that forbids the API is reported by name (§6, §10). A Resource Manager walk (`projects list` per folder, recursing into every
 sub-folder) was considered and dropped from this design: it is one call per folder plus one per
 project, needs `resourcemanager.folders.list` and `resourcemanager.projects.list` at the
 container on top of the viewer roles, and `parent.id` matches the immediate parent only, so a
