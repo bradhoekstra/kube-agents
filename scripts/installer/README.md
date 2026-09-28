@@ -273,19 +273,24 @@ read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
 `GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything
 else is the key's JSON, the provider's own rule), else the Application Default Credentials, which
 read `GOOGLE_APPLICATION_CREDENTIALS` first, each impersonating `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`
-when it is set; gcloud's own `CLOUDSDK_AUTH_*` overrides are cleared for the mint because the
-provider does not read them. The messages name that identity, so a refusal points at the
+when it is set. The messages name that identity, so a refusal points at the
 principal that will apply rather than at whatever ADC the workstation holds, and a credential
 variable's value is never printed. The token reaches `curl` on its stdin and an inline key
 reaches `gcloud` through a file that exists only for the mint and is removed on any exit of it,
 a signal included. Every container is probed and every failure named before the run
 refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
 apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
-first check guards against. `upgrade.sh --plan` and `install.sh --generate-only` warn instead of
-refusing, the first because it applies nothing and the second because the apply it hands to
-`lifecycle.sh` may run as an identity other than the one at the keyboard; the retag modes and
-`install.sh --dry-run` do not run it. Declaring an organisation prints a warning on every run but
-those two: the binding reaches every project in it.
+first check guards against. `upgrade.sh --plan`, `install.sh --generate-only` and the interactive
+`g` answer warn instead of refusing, the first because it applies nothing and the other two
+because the apply they hand to `lifecycle.sh` may run as an identity other than the one at the
+keyboard; an interactive run is checked at the `(Y/n/g)` prompt, where its route is known, so a
+`Y` refuses before anything is applied. The retag modes and `install.sh --dry-run` do not run it.
+Declaring an organisation prints a warning on every run that reaches the check: the binding
+reaches every project in it. gcloud's own credential overrides are kept out of the mint:
+the `CLOUDSDK_AUTH_*` variables are cleared, and a set `auth/impersonate_service_account` or
+`auth/access_token_file` property in the active configuration, which the provider does not read,
+makes the probe undecided with the property named, unless `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT`
+overrides the first explicitly.
 
 An install that declared a folder or organisation on the `PlatformAgent` by hand before the
 installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade

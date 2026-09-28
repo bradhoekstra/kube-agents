@@ -3042,7 +3042,8 @@ class PreApplyScopeCheckTest(unittest.TestCase):
 _GOOGLE_CREDENTIAL_VARIABLES = (
     "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_OAUTH_ACCESS_TOKEN", "GOOGLE_CREDENTIALS",
     "GOOGLE_CLOUD_KEYFILE_JSON", "GCLOUD_KEYFILE_JSON", "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT",
-    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT",
+    "CLOUDSDK_AUTH_ACCESS_TOKEN", "CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE",
+    "STUB_PROPERTY_IMPERSONATE", "STUB_PROPERTY_TOKEN_FILE",
 )
 
 
@@ -3083,6 +3084,10 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 + '  *"auth print-access-token"*"--impersonate-service-account="*) echo "imp-from-${CLOUDSDK_AUTH_ACCESS_TOKEN:-none}"; echo "IMPERSONATED:${*##*--impersonate-service-account=}" >>"$SCOPE_PROBE_LOG"; exit 0 ;;\n'
                 + '  *"auth print-access-token"*) echo "wrong-identity"; exit 0 ;;\n'
                 + '  *"config get-value account"*) echo "tester@example.com"; exit 0 ;;\n'
+                # gcloud configuration properties: set per case through the
+                # environment the stub reads, unset otherwise.
+                + '  *"config get-value auth/impersonate_service_account"*) echo "${STUB_PROPERTY_IMPERSONATE:-}"; exit 0 ;;\n'
+                + '  *"config get-value auth/access_token_file"*) echo "${STUB_PROPERTY_TOKEN_FILE:-}"; exit 0 ;;\n'
                 "esac\nexit 1\n"
             )
             if curl_present:
@@ -3264,6 +3269,35 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         proc = self._run(keys=base, probe=denied, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
         self._assert_rc(proc, 1)
         self.assertIn("the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) cannot set IAM policy", proc.stdout)
+
+    def test_a_gcloud_impersonation_property_makes_the_probe_undecided(self):
+        # gcloud config set auth/impersonate_service_account lives in the
+        # active configuration, out of env -u's reach, and a mint under it
+        # answers for an identity Terraform never uses: undecided, naming the
+        # property, unless GOOGLE_IMPERSONATE_SERVICE_ACCOUNT overrides it
+        # explicitly or no gcloud mint is made at all.
+        base = {"SCOPE_FOLDERS": "123456789012"}
+        probe = {"folders/123456789012": "granted"}
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com"})
+        self._assert_rc(proc, 0)
+        self.assertIn("gcloud's active configuration sets auth/impersonate_service_account, which its token mint honours and Terraform does not", proc.stdout)
+        self.assertNotIn("BEARER:", proc.stderr)
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_TOKEN_FILE": "/tmp/t"})
+        self.assertIn("sets auth/access_token_file,", proc.stdout)
+        # Both set: both named.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "x@p.iam.gserviceaccount.com", "STUB_PROPERTY_TOKEN_FILE": "/tmp/t"})
+        self.assertIn("sets auth/impersonate_service_account auth/access_token_file,", proc.stdout)
+        # An explicit GOOGLE_IMPERSONATE_SERVICE_ACCOUNT overrides the impersonation property: the probe runs.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com",
+                                                            "GOOGLE_IMPERSONATE_SERVICE_ACCOUNT": "tf@p.iam.gserviceaccount.com"})
+        self._assert_rc(proc, 0)
+        self.assertIn("BEARER:tok\n", proc.stderr)
+        self.assertNotIn("active configuration sets", proc.stdout)
+        # A raw token with no impersonation makes no gcloud mint: the property is irrelevant.
+        proc = self._run(keys=base, probe=probe, env_extra={"STUB_PROPERTY_IMPERSONATE": "other@p.iam.gserviceaccount.com",
+                                                            "GOOGLE_OAUTH_ACCESS_TOKEN": "from-env"})
+        self.assertIn("BEARER:from-env\n", proc.stderr)
+        self.assertNotIn("active configuration sets", proc.stdout)
 
     def test_a_403_for_a_disabled_api_is_undecided_not_denied(self):
         # Resource Manager answers 403 with reason SERVICE_DISABLED when its

@@ -2468,9 +2468,11 @@ print_generate_only_handoff() {
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
   echo -e "  # carries that the SCOPE_* keys in install.env do not declare (SCOPE_PROJECTS, SCOPE_FOLDERS,"
   echo -e "  # SCOPE_ORGANIZATIONS and the two exclusions) is replaced by this apply, and the reconcile"
-  echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first. The scope"
-  echo -e "  # container preflight above only warned: this apply binds a declared folder or organisation"
-  echo -e "  # with whatever credentials run it, which need setIamPolicy on the container."
+  echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
+  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
+    echo -e "  # The scope container preflight above only warned: this apply binds the declared folder or"
+    echo -e "  # organisation with whatever credentials run it, which need setIamPolicy on the container."
+  fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
@@ -5153,16 +5155,19 @@ main() {
   fi
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
-  # project; both are checked here, first install included, so a container
-  # this identity cannot bind or an organisation policy that forbids the API
-  # stops the run before anything is applied rather than partway through.
-  # A generate-only run makes the same check but only warns: it hands the
-  # apply to lifecycle.sh, often run later by a CI or platform identity, and
-  # the credentials probed here are the ones at the keyboard.
+  # project; both are checked before anything is applied, first install
+  # included, so a container this identity cannot bind or an organisation
+  # policy that forbids the API stops the run rather than failing it partway.
+  # The mode follows the route: a run that will apply is refused, a run that
+  # hands the apply to lifecycle.sh only warns, because that apply often runs
+  # later as a CI or platform identity and the credentials probed here are the
+  # ones at the keyboard. Here the route is known for --generate-only and -y;
+  # an interactive run learns it at the (Y/n/g) prompt below and is checked
+  # there, so the g answer is the same choice as the flag.
   if [ "$PARAM_DRY_RUN" != "true" ]; then
     if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
       check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
-    else
+    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       check_scope_container_access || exit 1
     fi
   fi
@@ -5317,9 +5322,14 @@ main() {
     prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
     case "$confirm_choice" in
       [Yy])
+        # The apply is chosen: the container preflight refuses here, before
+        # step 12 writes anything, as it does above the summary for -y.
+        check_scope_container_access || exit 1
         ;;
       [Gg])
+        # The handoff is chosen: the same check only warns, as for the flag.
         PARAM_GENERATE_ONLY="true"
+        check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
         ;;
       *)
         print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"

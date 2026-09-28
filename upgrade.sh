@@ -1645,7 +1645,7 @@ main() {
       # new fixed-name GSA on an install that has been running without one, so
       # the 409 check install.sh runs before its apply runs here too.
       check_service_account_ownership || exit 1
-      # All three guards above are refusals, and apply_crd_upgrades is the first
+      # Every guard above is a refusal, and apply_crd_upgrades is the first
       # write this arm makes, so the gate belongs between them.
       UPGRADE_APPLY_STARTED="true"
       apply_crd_upgrades "$repo_dir"

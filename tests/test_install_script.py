@@ -7579,24 +7579,37 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(fetch, check)
         self.assertLess(check, summary)
 
-    def test_the_container_preflight_runs_for_every_non_dry_run_before_the_summary(self):
+    def test_the_container_preflight_mode_follows_the_route(self):
         # A first install has no cluster to read a CR from, but it does bind a
         # declared folder with this identity, so the container preflight is
-        # outside the existing-cluster gate and skipped only by --dry-run.
-        # --generate-only makes the same check but warns: the apply it hands
-        # to lifecycle.sh may run as another identity.
+        # outside the existing-cluster gate and skipped only by --dry-run. A
+        # run that will apply is refused, a run that hands the apply to
+        # lifecycle.sh only warns, and the interactive run is checked at the
+        # (Y/n/g) prompt, where its route is known, so the g answer is the same
+        # choice as the flag and a Y still refuses before step 12.
         gate_end = self.text.index('refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1\n  fi\n')
         preflight = self.text.index(
             'if [ "$PARAM_DRY_RUN" != "true" ]; then\n'
             '    if [ "$PARAM_GENERATE_ONLY" = "true" ]; then\n'
             '      check_scope_container_access "$SCOPE_CHECK_MODE_WARN"\n'
-            '    else\n'
+            '    elif [ "$PARAM_NON_INTERACTIVE" = "true" ]; then\n'
             '      check_scope_container_access || exit 1\n'
             '    fi\n'
             '  fi\n')
         summary = self.text.index('print_step "11. Pre-Flight Configuration Summary"')
         self.assertLess(gate_end, preflight)
         self.assertLess(preflight, summary)
+        prompt = self.text.index('prompt_read "\\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)"')
+        yes = self.text.index('      [Yy])\n', prompt)
+        yes_check = self.text.index('check_scope_container_access || exit 1', yes)
+        g = self.text.index('      [Gg])\n', prompt)
+        g_check = self.text.index('check_scope_container_access "$SCOPE_CHECK_MODE_WARN"', g)
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        self.assertLess(summary, prompt)
+        self.assertLess(yes, yes_check)
+        self.assertLess(yes_check, g)
+        self.assertLess(g, g_check)
+        self.assertLess(g_check, step12)
 
     def test_the_crds_are_applied_at_step_12_before_the_apply_on_the_one_fetched_context(self):
         # INSTALL.md names a re-run and the menu as the way to change

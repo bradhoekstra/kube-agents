@@ -167,7 +167,12 @@ readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
 # gcloud's own credential overrides, cleared for every mint the preflight
 # makes because the google provider does not read them.
-readonly SCOPE_GCLOUD_AUTH_OVERRIDES="CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT"
+readonly SCOPE_GCLOUD_AUTH_OVERRIDES="CLOUDSDK_AUTH_ACCESS_TOKEN CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"
+# The same overrides as gcloud configuration properties, which live in the
+# active configuration file where env -u cannot reach them; a mint under
+# either would answer for an identity Terraform never uses, so a set one
+# makes the probe undecided rather than wrong.
+readonly SCOPE_GCLOUD_AUTH_PROPERTIES="auth/impersonate_service_account auth/access_token_file"
 # The reasons in a 403 from Resource Manager that are not a permission answer:
 # the API not enabled in the credential's quota project, or no quota project
 # at all. The apply enables cloudresourcemanager.googleapis.com before its
@@ -1192,7 +1197,7 @@ check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
   local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
   [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
-  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties
   identity="$(_scope_terraform_identity_label)"
   if [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
@@ -1212,6 +1217,8 @@ check_scope_container_access() {
   fi
   if ! command -v curl >/dev/null 2>&1; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
+  elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
+    undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
   elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
   else
@@ -1325,6 +1332,29 @@ _scope_terraform_token_remedy() {
   esac
 }
 
+# Prints, space-separated, the gcloud auth properties set in the active
+# configuration that a gcloud mint would honour and the google provider would
+# not: auth/access_token_file always, auth/impersonate_service_account unless
+# GOOGLE_IMPERSONATE_SERVICE_ACCOUNT names the account explicitly (the flag
+# the mint passes then overrides the property). Empty when none is in the
+# way, and when no gcloud mint will be made at all (a raw token with no
+# impersonation). A property gcloud cannot report reads as unset.
+_scope_gcloud_auth_properties_in_the_way() {
+  local property value out=""
+  if [ -n "${GOOGLE_OAUTH_ACCESS_TOKEN:-}" ] && [ -z "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
+    return 0
+  fi
+  for property in $SCOPE_GCLOUD_AUTH_PROPERTIES; do
+    if [ "$property" = "auth/impersonate_service_account" ] && [ -n "${GOOGLE_IMPERSONATE_SERVICE_ACCOUNT:-}" ]; then
+      continue
+    fi
+    value="$(trap - ERR; gcloud config get-value "$property" 2>/dev/null || true)"
+    case "$value" in ""|"(unset)") continue ;; esac
+    out="${out:+$out }${property}"
+  done
+  printf '%s' "$out"
+}
+
 # Prints the access token for those credentials; fails when none can be
 # minted. Inline key JSON reaches gcloud through a file that lives only inside
 # the subshell that mints the token and is removed on that subshell's exit,
@@ -1379,17 +1409,16 @@ _scope_asset_api_enabled() {
 
 # Prints the constraint whose effective policy on the host project denies the
 # Asset API and returns SCOPE_PROBE_DENIED; returns SCOPE_PROBE_GRANTED with
-# nothing printed when every policy that could be read says it is not denied,
-# SCOPE_PROBE_UNDECIDED when a constraint's policy could not be fetched or,
-# fetched, could not be parsed (a constraint that has no policy set reads as
-# not denying). Both service-usage constraints are read, because an
+# nothing printed when both policies were read and neither denies it,
+# SCOPE_PROBE_UNDECIDED when either could not be fetched or, fetched, could
+# not be parsed (a constraint that has no policy set reads as not denying). Both service-usage constraints are read, because an
 # organisation may still carry the legacy one. Only the enforced `spec` is
 # read: a `dryRunSpec` enforces nothing, and an organisation trialling a
 # constraint in dry run must not be refused for it. A parse failure is its
 # own answer, never "not denied": the reader exits with the probe's three
 # statuses, as the IAM probe's does.
 _scope_policy_denying_asset_api() {
-  local project="$1" constraint policy readable=false unread=false rc
+  local project="$1" constraint policy unread=false rc
   for constraint in $SCOPE_SERVICE_USAGE_CONSTRAINTS; do
     if ! policy="$(trap - ERR; gcloud org-policies describe "$constraint" --project="$project" --effective --format=json 2>/dev/null)"; then
       unread=true
@@ -1422,15 +1451,14 @@ sys.exit(not_denied)
       "$SCOPE_PROBE_DENIED")
         printf '%s' "constraints/${constraint}"
         return "$SCOPE_PROBE_DENIED" ;;
-      "$SCOPE_PROBE_GRANTED") readable=true ;;
+      "$SCOPE_PROBE_GRANTED") ;;
       *) unread=true ;;
     esac
   done
   # A constraint that could not be read may still deny: only a full read
   # that found no denial passes.
   $unread && return "$SCOPE_PROBE_UNDECIDED"
-  $readable && return "$SCOPE_PROBE_GRANTED"
-  return "$SCOPE_PROBE_UNDECIDED"
+  return "$SCOPE_PROBE_GRANTED"
 }
 
 # Asks Resource Manager whether the token's identity holds one permission on a
