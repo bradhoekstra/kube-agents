@@ -2429,12 +2429,20 @@ class ScopeTest(HomesMixin):
         self.assertNotIn("222", report["projects"])
 
     def test_excluding_the_bare_number_drops_a_member_the_run_could_not_name(self):
-        report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
-                                       {self.MGMT: [(self.MGMT, "m", "us-central1")]},
-                                       selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        # An excluded number is not named at all (the install path withholds the grant on
+        # that entry, so the call would only be refused), and it is neither reported as
+        # unnamed nor a hold on the prune: the number is the declaration speaking.
+        def never_named(number, timeout=None):
+            raise AssertionError(f"named the excluded number {number}")
+        with mock.patch.object(rec, "log") as logged:
+            report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
+                                           {self.MGMT: [(self.MGMT, "m", "us-central1")]},
+                                           selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers=never_named)
         self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
         self.assertEqual(sorted(report["projects"]), [self.MGMT])
         self.assertNotIn("333", {p["id"] for p in self._snapshot()["projects"]})
+        self.assertNotIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(self._snapshot()["containers"], [{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
 
     def test_excluding_the_number_drops_a_member_a_past_run_named_once_its_grant_is_gone(self):
         # Run N named 111 as team-a and listed it. The operator then names 111 in

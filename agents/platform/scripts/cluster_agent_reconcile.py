@@ -655,7 +655,7 @@ def _previous_numbers(previous: dict | None) -> dict[str, str]:
 
 
 def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: dict | None,
-                      deadline: float) -> dict[str, tuple[dict[str, dict] | None, str]]:
+                      deadline: float, patterns: list[str] | None = None) -> dict[str, tuple[dict[str, dict] | None, str]]:
     """Name each selector's members: selector -> (members, outcome).
 
     `members` maps a project ID to {"outcome", "number"}: outcome None for a project still to
@@ -668,9 +668,14 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     run, because that number could be any project, including one the same edit dropped from
     `projects`, and a project pruned on that guess is the deletion this script never makes. A
     number named to an ID the scope cannot carry is a known identity and holds nothing. None
-    members means the selector's own lookup failed.
+    members means the selector's own lookup failed. A number an `exclude.projects` entry
+    (`patterns`) names is not named at all: the install path withholds the grant on that entry,
+    so the call would be refused, and `_resolve_projects` drops the member on the number
+    whatever ID a past run knew it by, so it is neither unnamed nor a hold on the prune.
     """
-    numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
+    patterns = patterns or []
+    numbers = sorted({m for members, _ in raw.values() if members for m in members
+                      if m.isdigit() and not _excluded_by(m, patterns)})
     named = _bounded_map(_project_id_of, numbers, deadline, "naming project") if numbers else {}
     known = _previous_numbers(previous)
     out: dict[str, tuple[dict[str, dict] | None, str]] = {}
@@ -682,6 +687,9 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
         for member in members:
             if not member.isdigit():
                 resolved.setdefault(member, {"outcome": None, NUMBER_KEY: None})
+                continue
+            if _excluded_by(member, patterns):
+                resolved.setdefault(member, {"outcome": None, NUMBER_KEY: member})
                 continue
             project, naming = named.get(member, (None, OUTCOME_UNREACHABLE))
             if project and naming == OUTCOME_OK:
@@ -1287,7 +1295,8 @@ def reconcile(dry_run: bool = False) -> dict:
         listings[management] = _list_project(management)
     groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline)
     searches = {g: r for g, r in groups.items() if _is_container(g)}
-    selections = _selector_members({g: r for g, r in groups.items() if _is_selector(g)}, previous, listing_deadline)
+    selections = _selector_members({g: r for g, r in groups.items() if _is_selector(g)}, previous, listing_deadline,
+                                   scope["exclude"]["projects"])
     entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections)
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
