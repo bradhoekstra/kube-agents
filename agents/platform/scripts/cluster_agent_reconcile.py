@@ -760,6 +760,18 @@ def _resolve_projects(management: str | None, scope: dict,
         # snapshot remembers then, and on the ID alone it would read denied on every tick.
         return bool(_excluded_by(project, patterns) or (number and _excluded_by(number, patterns)))
 
+    # The number a Metrics Scope named a project by, from this run's naming pass or from the
+    # row the last snapshot kept, so a number entry matches the project on every route it is
+    # reached through -- explicit, container or selector -- as an ID entry does (design §3:
+    # an excluded project is dropped whichever route reached it). A number no run has tied
+    # to an ID matches only its bare-number row, which is all there is to match.
+    numbers_named = {project: info[NUMBER_KEY]
+                     for members, _ in (selections or {}).values() if members
+                     for project, info in members.items() if info.get(NUMBER_KEY) and project != info[NUMBER_KEY]}
+
+    def number_of(project: str) -> str | None:
+        return numbers_named.get(project) or _previous_number(previous, project)
+
     def listed_count() -> int:
         # What the cap counts: the projects this run lists, and the ones a frozen container
         # last listed. A member carried over-cap is in the set but not listed, so it does
@@ -790,7 +802,7 @@ def _resolve_projects(management: str | None, scope: dict,
             add_via(project, VIA_EXPLICIT)
             continue
         seen.add(project)
-        if _excluded_by(project, patterns):
+        if excluded(project, number_of(project)):
             continue
         outcome = OUTCOME_OVER_CAP if listed_count() >= RESOLVED_SET_CAP else None
         if outcome:
@@ -864,7 +876,7 @@ def _resolve_projects(management: str | None, scope: dict,
             keep_number(project, info[NUMBER_KEY])
             continue
         seen.add(project)
-        if excluded(project, info[NUMBER_KEY]):
+        if excluded(project, info[NUMBER_KEY] or number_of(project)):
             continue
         outcome = info["outcome"]
         if outcome is None and listed_count() >= RESOLVED_SET_CAP:
@@ -897,7 +909,7 @@ def _resolve_projects(management: str | None, scope: dict,
     for container in _container_ids(scope):
         members, outcome = (searches or {}).get(container, (None, OUTCOME_UNREACHABLE))
         if members is not None:
-            fresh = [p for p in sorted(members) if p not in seen and not _excluded_by(p, patterns)]
+            fresh = [p for p in sorted(members) if p not in seen and not excluded(p, number_of(p))]
             # A member an earlier container carried over-cap is in the set but not listed;
             # this container would list it (the live listing wins below), so it counts here
             # like a fresh one, or a second, overlapping container would lift a whole
@@ -926,7 +938,7 @@ def _resolve_projects(management: str | None, scope: dict,
                     if outcome == OUTCOME_OVER_CAP:
                         mark_indexed(project)
                     continue
-                if _excluded_by(project, patterns):
+                if excluded(project, number_of(project)):
                     continue
                 seen.add(project)
                 # `indexed`: an over-cap member was placed by the index this run (the lookup
@@ -951,7 +963,7 @@ def _resolve_projects(management: str | None, scope: dict,
                     frozen["outcome"] = OUTCOME_OK
                     frozen["clusters"] = sorted(members[project])
                 continue
-            if _excluded_by(project, patterns):
+            if excluded(project, number_of(project)):
                 continue
             seen.add(project)
             entries.append({"id": project, "via": [container], "outcome": OUTCOME_OK, "clusters": sorted(members[project])})

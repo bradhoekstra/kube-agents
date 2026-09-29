@@ -228,6 +228,17 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # nothing, so the two must not share a remedy.
         self.assertIn('"x-goog-user-project" = var.quota_project', self.resolver_tf)
         self.assertIn('variable "quota_project"', (_RESOLVER / "variables.tf").read_text())
+        # The management project is whatever the install has, a legacy
+        # domain-scoped ID included (install.sh's is_valid_project_id admits
+        # one), and the module is in every plan whether or not a selector is
+        # declared, so its rule is the installer's two-sided one, not the CRD's.
+        quota = re.search(r'variable "quota_project" \{.*?regex\("([^"]+)", var\.quota_project\)', (_RESOLVER / "variables.tf").read_text(), re.DOTALL)
+        self.assertIsNotNone(quota, "quota_project has no regex validation")
+        pattern = re.compile(quota.group(1))
+        for accepted in ("my-project", "example.com:my-project", "sub.example.com:my-project"):
+            self.assertRegex(accepted, pattern)
+        for refused in ("My_Project", "abc", ":my-project", "example.com:"):
+            self.assertNotRegex(refused, pattern)
         self.assertIn('scope_api_off_markers              = ["SERVICE_DISABLED", "has not been used in project"]', self.resolver_tf)
         self.assertIn('scope_consumer_denied_markers      = ["USER_PROJECT_DENIED", "quota project"]', self.resolver_tf)
         self.assertIn('scope_consumer_role                = "roles/serviceusage.serviceUsageConsumer"', self.resolver_tf)
@@ -504,7 +515,15 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn("exclude_projects = var.scope.exclude.projects", body)
         self.assertIn("quota_project = var.project_id", body)
         self.assertNotIn("depends_on", body)
-        self.assertNotRegex(body, r"(google_|module\.gke)")
+        # Every input is a var. reference and nothing else: a managed value, a
+        # module output or a local derived from either makes an input unknown
+        # on a first install, and the for_each keyed on it fails the plan.
+        inputs = re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.MULTILINE)
+        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project"})
+        for key, value in inputs:
+            if key != "source":
+                with self.subTest(input=key):
+                    self.assertRegex(value, r"^var\.[A-Za-z0-9_.]+$", f"{key} is fed {value}, not a variable")
         iam = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', self.main_tf, re.DOTALL).group(1)
         self.assertIn("scope_selector_members = module.scope_resolver.members", iam)
         self.assertIn("depends_on = [google_project_service.required, module.gke_cluster]", iam)

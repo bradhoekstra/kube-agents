@@ -51,9 +51,13 @@ variable "quota_project" {
   type        = string
   nullable    = false
 
+  # The installer's rule (is_valid_project_id), not the CRD's: a legacy
+  # domain-scoped management project (example.com:name) is a project this
+  # module is in the plan of whether or not a selector is declared, so the
+  # CRD's pattern here would refuse every plan and destroy of such an install.
   validation {
-    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.quota_project))
-    error_message = "quota_project is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$)."
+    condition     = can(regex("^([a-z0-9][a-z0-9.-]*[a-z0-9]:)?[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.quota_project))
+    error_message = "quota_project is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$, or a legacy domain-scoped domain:name)."
   }
 }
 

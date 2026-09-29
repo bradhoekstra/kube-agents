@@ -2472,6 +2472,36 @@ class ScopeTest(HomesMixin):
                                  selectors={self.SCOPE: (None, rec.OUTCOME_DENIED)})
         self.assertNotIn("team-a", report["projects"])
 
+    def test_excluding_the_number_drops_the_project_on_the_explicit_and_container_routes_too(self):
+        # Run N named 111 as team-a, which is also declared in `projects` and sits under a
+        # declared folder. The number is then excluded: the selector never names it, and the
+        # explicit and folder routes have to match the entry on the number the row keeps,
+        # or the project stays fully managed with nothing saying the entry matched nothing.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.FOLDER, self.SCOPE], "state": rec.STATE_IN_SCOPE,
+                               rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1},
+                                         {"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "folders": ["123456789012"], "metricsScopes": ["mon-proj"],
+                       "exclude": {"projects": ["111"]}}
+        members = {"team-a": [("team-a", "prod", "us-central1")]}
+        report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                             profiles=["cluster-a"], identities=ids,
+                                             searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                             selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted), ([], []))
+        self.assertNotIn("team-a", report["projects"])
+        self.assertEqual(report["retiring"], ["team-a"])
+        # An ID no run has tied to the number is beyond the entry's reach on those routes:
+        # the number matches the bare-number row a selector keys it under, and that only.
+        declaration["exclude"]["projects"].append("222")
+        report, created, _ = self._run(declaration, {self.MGMT: [], "team-b": [("team-b", "x", "us-central1")]},
+                                       searches={self.FOLDER: ({"team-b": [("team-b", "x", "us-central1")]}, rec.OUTCOME_OK)},
+                                       selectors={self.SCOPE: (["222"], rec.OUTCOME_OK)})
+        self.assertIn("team-b", report["projects"])
+        self.assertNotIn("222", report["projects"])
+
     def test_a_row_written_under_the_bare_number_is_no_mapping(self):
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "222", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}])
