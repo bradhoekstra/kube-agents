@@ -100,8 +100,8 @@ const (
 	// ingress rule; the chart's PodMonitoring scrapes it by number, held to
 	// this one by tests/test_chart_platform_agent_monitoring.py.
 	credentialProxyMetricsPort     int32 = 8766
-	credentialProxyMetricsPortName       = "cred-metrics"
-	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT"
+	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
+	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
