@@ -5554,7 +5554,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return False
 
     def do_GET(self) -> None:  # noqa: N802
-        if self.path != "/healthz" and self._authenticated() is None:
+        if self.path != HEALTHZ_PATH and self._authenticated() is None:
             return
         if self.path.startswith(API_RELAY_PREFIX):
             self._handle_api_relay()
@@ -5595,7 +5595,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 LOGGER.warning("chat event pull failed: %s", type(exc).__name__)
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat event pull failed"})
             return
-        if self.path != "/healthz":
+        if self.path != HEALTHZ_PATH:
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
             return
         self._json(HTTPStatus.OK, {"status": "ok"})
@@ -7006,6 +7006,27 @@ def serve(args: argparse.Namespace) -> None:
     server.serve_forever()
 
 
+def _metrics_port_default() -> int:
+    """METRICS_PORT_ENV as an integer, or 0 with an ALERT when it is not one.
+
+    Read eagerly as the flag's default, so this is the one integer variable a
+    hand-edited value must not take the broker down with: the listener is
+    never fatal, and a value it could not have bound costs the metrics alone.
+    """
+    raw = os.getenv(METRICS_PORT_ENV, "").strip()
+    if not raw:
+        return 0
+    try:
+        return int(raw)
+    except ValueError:
+        LOGGER.error(
+            "ALERT %s=%r is not an integer; the broker serves no /metrics until it "
+            "restarts with a port, and commands are unaffected",
+            METRICS_PORT_ENV, raw,
+        )
+        return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -7024,7 +7045,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--metrics-port",
         type=int,
-        default=int(os.getenv(METRICS_PORT_ENV, "") or "0"),
+        default=_metrics_port_default(),
         help="Port of the metrics-only listener (GET /metrics); 0 or unset opens none",
     )
     parser.add_argument(

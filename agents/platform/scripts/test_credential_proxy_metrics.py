@@ -362,6 +362,13 @@ class ListenerStartTest(unittest.TestCase):
         with urllib.request.urlopen(f"http://127.0.0.1:{server.server_port}/metrics") as response:
             self.assertEqual(200, response.status)
 
+    def test_a_value_that_is_not_an_integer_disables_the_listener_and_says_so(self):
+        with mock.patch.object(sys, "argv", ["credential_proxy.py"]):
+            with mock.patch.dict(os.environ, {credential_proxy.METRICS_PORT_ENV: "8766a"}):
+                with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+                    self.assertEqual(0, credential_proxy.parse_args().metrics_port)
+        self.assertTrue(any("ALERT" in line and "8766a" in line for line in logs.output), logs.output)
+
     def test_the_port_comes_from_the_operators_variable_and_defaults_off(self):
         with mock.patch.object(sys, "argv", ["credential_proxy.py"]):
             with mock.patch.dict(os.environ, {credential_proxy.METRICS_PORT_ENV: ""}):

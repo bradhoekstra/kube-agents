@@ -5,7 +5,7 @@ sidebar:
   order: 9
 ---
 
-The Platform Agent (Hermes) Deployment exports OpenTelemetry traces and, from its `agent-api-auth` sidecar, the event watcher's Prometheus metrics, and the credential-proxy Pod exports the broker's; LiteLLM and vLLM export both OpenTelemetry traces and Prometheus metrics, and the Hindsight memory API Prometheus metrics, to GKE Managed telemetry. Container logs go to Cloud Logging. The Platform Agent's persona also generates Cloud Console links inline in Chat replies whenever it's discussing telemetry.
+The Platform Agent (Hermes) Deployment exports OpenTelemetry traces and, from its `agent-api-auth` sidecar, the event watcher's Prometheus metrics, and the credential-proxy Pod exports the broker's; LiteLLM and vLLM export both OpenTelemetry traces and Prometheus metrics to GKE Managed telemetry, and the Hindsight memory API exports Prometheus metrics. Container logs go to Cloud Logging. The Platform Agent's persona also generates Cloud Console links inline in Chat replies whenever it's discussing telemetry.
 
 ## What gets exported
 
