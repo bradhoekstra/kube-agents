@@ -43,22 +43,25 @@ class TagGAReleaseScriptTest(unittest.TestCase):
 
     _FAKE_RELEASE_REPO = {"GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"}
 
-    def _bare_origin_for(self, git, repo_dir):
-        """A bare `origin`, with common.sh's https URL for the release repository sent nowhere.
+    def _bare_origin_for(self, git, repo_dir, checkout=None):
+        """A bare `origin` that is also the release repository, as in the CI job.
 
         The scripts compose `https://github.com/<GH_ORG>/<GH_REPO>.git` for their
-        remote lookups and their push fallback. Rewriting it onto a path that does
-        not exist keeps the tests off the network and away from the developer's
-        credential helper, and leaves `origin` as the only remote that answers.
+        remote lookups and their push fallback. Rewriting it onto the same bare
+        path keeps the tests off the network and away from the developer's
+        credential helper, and matches the publish job, whose `origin` is the
+        release repository. `checkout` is another working copy of the same bare
+        repository that needs the same rewrite.
         """
         bare_dir = pathlib.Path(repo_dir).parent / "origin.git"
-        git("init", "--bare", str(bare_dir))
-        git("remote", "add", "origin", str(bare_dir))
-        unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+        if checkout is None:
+            git("init", "--bare", str(bare_dir))
+            git("remote", "add", "origin", str(bare_dir))
         git(
             "config",
-            f"url.{unreachable}.insteadOf",
+            f"url.{bare_dir}.insteadOf",
             f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+            cwd=checkout or repo_dir,
         )
         return bare_dir
 
@@ -493,13 +496,54 @@ class TagGAReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_a_failed_branch_push_leaves_the_tag_and_a_fresh_checkout_re_run_finishes(self):
-        """The tag is pushed first, so a branch failure is recoverable by re-running.
+    def test_a_release_branch_at_another_commit_is_refused_before_the_tag_is_pushed(self):
+        """The branch check runs before the tag, so a collision leaves nothing behind.
 
-        The tag is what a re-run keys on: create_stamped_release_commit reuses the
-        tagged commit, so the second run pushes the same commit to the branch it
-        did not get to. Pushed the other way round, the re-run would stamp a fresh
-        commit and refuse the branch its first attempt pushed.
+        The tag is the one artefact a failed run cannot take back; finding the
+        stray branch only after pushing it would leave the operator holding a GA
+        tag for a release that did not finish.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            self._populate_valid_release_files(repo_dir)
+            git("add", ".")
+            git("commit", "-m", "feat: populate release files")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            bare_dir = self._bare_origin_for(git, repo_dir)
+            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+
+            # The remote already holds this release's branch at a commit that
+            # diverged from the one about to be stamped.
+            git("switch", "-c", "elsewhere")
+            (pathlib.Path(repo_dir) / "elsewhere.txt").write_text("elsewhere\n")
+            git("add", "elsewhere.txt")
+            git("commit", "-m", "feat: elsewhere")
+            stray = git("rev-parse", "HEAD").stdout.strip()
+            git("push", "origin", f"HEAD:refs/heads/{branch}")
+            git("switch", "main")
+
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG, main_commit],
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(f"Release branch '{branch}' already exists on", proc.stderr)
+            self.assertNotIn("CREATING AND PUSHING GA RELEASE GIT TAG", proc.stdout)
+            self.assertEqual(git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
+            self.assertEqual(git("--git-dir", str(bare_dir), "tag", "-l").stdout.strip(), "")
+            remote_branch = git("--git-dir", str(bare_dir), "rev-parse", f"refs/heads/{branch}").stdout.strip()
+            self.assertEqual(remote_branch, stray)
+        finally:
+            temp_dir.cleanup()
+
+    def test_a_run_that_pushed_the_tag_but_not_the_branch_finishes_on_re_run_from_a_fresh_checkout(self):
+        """The tag is what a re-run keys on, so a run that died before the branch is repeatable.
+
+        create_stamped_release_commit reuses the tagged commit, so the second run,
+        from a fresh checkout with no local release branch, pushes the same commit
+        to the branch it did not get to. Pushed the other way round, the re-run
+        would stamp a fresh commit and refuse the branch its first attempt pushed.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
@@ -513,42 +557,24 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             def remote(ref):
                 return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
 
-            # The remote already holds this release's branch at a commit that
-            # diverged from the one about to be stamped, so the branch push fails.
-            git("switch", "-c", "elsewhere")
-            (pathlib.Path(repo_dir) / "elsewhere.txt").write_text("elsewhere\n")
-            git("add", "elsewhere.txt")
-            git("commit", "-m", "feat: elsewhere")
-            git("push", "origin", f"HEAD:refs/heads/{branch}")
-            git("switch", "main")
-
-            proc = self._run_script(
+            first = self._run_script(
                 [MOCK_TARGET_RELEASE_TAG, main_commit],
                 env={"CI": "true", **self._FAKE_RELEASE_REPO},
                 cwd=repo_dir,
             )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn(f"Could not push Release branch '{branch}'", proc.stderr)
+            self.assertEqual(first.returncode, 0, first.stderr)
             tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
-            self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), tag_commit)
-            self.assertNotEqual(remote(f"refs/heads/{branch}"), tag_commit)
+            self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
 
-            # The operator removes the branch that was in the way and re-runs the
-            # job, which is a fresh checkout: no local branch, no local tag beyond
-            # what the clone fetched.
+            # Stage the failure: the tag is on the remote and the branch is not.
             git("--git-dir", str(bare_dir), "branch", "-D", branch)
             rerun_dir = pathlib.Path(repo_dir).parent / "rerun"
             git("clone", "--quiet", str(bare_dir), str(rerun_dir))
             git("config", "user.name", "Test User", cwd=rerun_dir)
             git("config", "user.email", "test@example.com", cwd=rerun_dir)
             git("config", "commit.gpgsign", "false", cwd=rerun_dir)
-            unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
-            git(
-                "config",
-                f"url.{unreachable}.insteadOf",
-                f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
-                cwd=rerun_dir,
-            )
+            self._bare_origin_for(git, repo_dir, checkout=rerun_dir)
+            self.assertEqual(git("branch", "--list", branch, cwd=rerun_dir).stdout.strip(), "")
 
             rerun = self._run_script(
                 [MOCK_TARGET_RELEASE_TAG, main_commit],

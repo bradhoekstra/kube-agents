@@ -1061,6 +1061,82 @@ release_branch_for_version() {
   echo "${RELEASE_BRANCH_PREFIX}${version}"
 }
 
+# The commit the release repository's copy of a branch points at, or nothing
+# when it has none. The match is exact: ls-remote's own pattern is tail-matched,
+# so `refs/heads/release/0.7.0` alone would also answer for a stray
+# `x/refs/heads/release/0.7.0`. A remote that cannot be read is an error rather
+# than an empty answer: in CI the remote is the truth about the branch, and a
+# guess of "absent" would let a plain push fast-forward a branch that exists.
+# Arguments: $1 = branch ref (refs/heads/...)
+release_branch_remote_commit() {
+  local branch_ref="${1:-}"
+
+  if [ -z "${branch_ref}" ]; then
+    echo "❌ ERROR: a branch ref is required for release_branch_remote_commit." >&2
+    return 1
+  fi
+
+  local remote_url
+  remote_url="$(release_repo_url)"
+
+  local listing
+  if ! listing="$(git ls-remote --heads "${remote_url}" "${branch_ref}" 2>&1)"; then
+    echo "❌ ERROR: Could not read branches of ${remote_url}: ${listing}" >&2
+    return 1
+  fi
+  awk -v ref="${branch_ref}" '$2 == ref { print $1 }' <<<"${listing}"
+}
+
+# Where the release branch for a version is, relative to the release commit:
+# prints `remote` (on the release repository, at the commit), `local` (in this
+# checkout only, at the commit) or `absent`. A branch anywhere else is an error
+# naming both commits, and so is a remote that cannot be read. Read-only, so
+# tag_ga_release.sh runs it before the tag goes out and ensure_release_branch
+# runs it again before pushing.
+# Arguments: $1 = version, $2 = commit_sha
+release_branch_placement() {
+  local version="${1:-}"
+  local commit_sha="${2:-}"
+
+  if [ -z "${version}" ] || [ -z "${commit_sha}" ]; then
+    echo "❌ ERROR: version and commit SHA are required for release_branch_placement." >&2
+    return 1
+  fi
+
+  local branch
+  branch="$(release_branch_for_version "${version}")"
+  local branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+
+  local target_full_sha
+  target_full_sha="$(git rev-parse --verify "${commit_sha}^{commit}" 2>/dev/null || echo "${commit_sha}")"
+
+  if is_ci_pipeline; then
+    local target_repo
+    target_repo="$(get_target_repo)"
+    local remote_sha
+    remote_sha="$(release_branch_remote_commit "${branch_ref}")" || return 1
+    if [ "${remote_sha}" = "${target_full_sha}" ]; then
+      echo "remote"
+      return 0
+    elif [ -n "${remote_sha}" ]; then
+      echo "❌ ERROR: Release branch '${branch}' already exists on ${target_repo} but points to commit ${remote_sha}, not target SHA ${target_full_sha}!" >&2
+      return 1
+    fi
+  fi
+
+  local local_sha
+  local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+  if [ -n "${local_sha}" ] && [ "${local_sha}" != "${target_full_sha}" ]; then
+    echo "❌ ERROR: Release branch '${branch}' already exists locally but points to commit ${local_sha}, not target SHA ${target_full_sha}!" >&2
+    return 1
+  fi
+  if [ -n "${local_sha}" ]; then
+    echo "local"
+  else
+    echo "absent"
+  fi
+}
+
 # Ensures the release branch for a version exists at the release commit and, in
 # CI, is on the remote. The contract is ensure_git_tag's: a branch already at the
 # commit is an idempotent skip, one anywhere else is an error, and nothing is ever
@@ -1075,41 +1151,26 @@ ensure_release_branch() {
     return 1
   fi
 
+  local placement
+  placement="$(release_branch_placement "${version}" "${commit_sha}")" || return 1
+
   local branch
   branch="$(release_branch_for_version "${version}")"
   local branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
 
-  local target_repo
-  target_repo="$(get_target_repo)"
-
   local target_full_sha
   target_full_sha="$(git rev-parse --verify "${commit_sha}^{commit}" 2>/dev/null || echo "${commit_sha}")"
 
-  # In CI the remote is the truth: the checkout is fresh, and a re-run of the
-  # release job has to find the branch its first attempt pushed. An unreachable
-  # remote reads as "no branch" here, and the non-force push below is what then
-  # refuses a branch that turns out to exist elsewhere.
-  if is_ci_pipeline; then
-    local remote_sha
-    remote_sha="$(git ls-remote --heads "$(release_repo_url)" "${branch_ref}" 2>/dev/null | cut -f1 || true)"
-    if [ "${remote_sha}" = "${target_full_sha}" ]; then
-      echo "✅ Release branch '${branch}' already exists on ${target_repo} at target commit ${target_full_sha}. Idempotent skip."
+  case "${placement}" in
+    remote)
+      echo "✅ Release branch '${branch}' already exists on $(get_target_repo) at target commit ${target_full_sha}. Idempotent skip."
       return 0
-    elif [ -n "${remote_sha}" ]; then
-      echo "❌ ERROR: Release branch '${branch}' already exists on ${target_repo} but points to commit ${remote_sha}, not target SHA ${target_full_sha}!" >&2
-      return 1
-    fi
-  fi
-
-  local local_sha
-  local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
-  if [ -n "${local_sha}" ] && [ "${local_sha}" != "${target_full_sha}" ]; then
-    echo "❌ ERROR: Release branch '${branch}' already exists locally but points to commit ${local_sha}, not target SHA ${target_full_sha}!" >&2
-    return 1
-  fi
-  if [ -z "${local_sha}" ]; then
-    git branch "${branch}" "${target_full_sha}"
-  fi
+      ;;
+    absent)
+      git branch "${branch}" "${target_full_sha}"
+      ;;
+    local) ;;
+  esac
 
   # Safety Guard: Remote push executes exclusively inside CI
   if ! is_ci_pipeline; then
@@ -1117,6 +1178,9 @@ ensure_release_branch() {
     return 0
   fi
 
+  # A plain push: it refuses a non-fast-forward, and the placement check above
+  # has already read the remote, so the only way to reach it with the branch
+  # elsewhere is a push that landed between the two.
   release_push_ref "${branch_ref}:${branch_ref}" "Release branch '${branch}'"
 }
 
