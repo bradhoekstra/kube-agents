@@ -41,6 +41,27 @@ class TagGAReleaseScriptTest(unittest.TestCase):
     def _populate_valid_release_files(self, repo_dir):
         populate_mock_release_files(repo_dir)
 
+    _FAKE_RELEASE_REPO = {"GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"}
+
+    def _bare_origin_for(self, git, repo_dir):
+        """A bare `origin`, with common.sh's https URL for the release repository sent nowhere.
+
+        The scripts compose `https://github.com/<GH_ORG>/<GH_REPO>.git` for their
+        remote lookups and their push fallback. Rewriting it onto a path that does
+        not exist keeps the tests off the network and away from the developer's
+        credential helper, and leaves `origin` as the only remote that answers.
+        """
+        bare_dir = pathlib.Path(repo_dir).parent / "origin.git"
+        git("init", "--bare", str(bare_dir))
+        git("remote", "add", "origin", str(bare_dir))
+        unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+        git(
+            "config",
+            f"url.{unreachable}.insteadOf",
+            f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+        )
+        return bare_dir
+
     def test_missing_arguments(self):
         proc = self._run_script([])
         self.assertNotEqual(proc.returncode, 0)
@@ -413,6 +434,134 @@ class TagGAReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+
+    # ─── the release branch ──────────────────────────────────────────────────
+    # The stamped commit is pushed to `release/<X.Y.Z>` as well as tagged, so a
+    # release commit belongs to a branch on the repository rather than to its tag
+    # alone. tests/test_release_common.py owns ensure_release_branch's own
+    # contract; these pin that the GA tagger calls it, and in which order.
+
+    def test_creates_the_release_branch_at_the_stamped_commit(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            self._populate_valid_release_files(repo_dir)
+            git("add", ".")
+            git("commit", "-m", "feat: populate release files")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+
+            proc = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"Release Branch:      {branch}", proc.stdout)
+
+            tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
+            self.assertEqual(git("rev-parse", branch).stdout.strip(), tag_commit)
+            self.assertNotEqual(tag_commit, main_commit)
+            self.assertEqual(git("rev-parse", "main").stdout.strip(), main_commit)
+            self.assertEqual(git("symbolic-ref", "--short", "HEAD").stdout.strip(), "main")
+
+            # Re-running finds both the branch and the tag where it left them.
+            proc2 = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], cwd=repo_dir)
+            self.assertEqual(proc2.returncode, 0, proc2.stderr)
+            self.assertEqual(git("rev-parse", branch).stdout.strip(), tag_commit)
+        finally:
+            temp_dir.cleanup()
+
+    def test_in_ci_pushes_the_branch_and_the_tag(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            self._populate_valid_release_files(repo_dir)
+            git("add", ".")
+            git("commit", "-m", "feat: populate release files")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            bare_dir = self._bare_origin_for(git, repo_dir)
+            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG, main_commit],
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            def remote(ref):
+                return git("--git-dir", str(bare_dir), "rev-parse", "--verify", f"{ref}^{{commit}}").stdout.strip()
+
+            tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
+            self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
+            self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), tag_commit)
+        finally:
+            temp_dir.cleanup()
+
+    def test_a_failed_branch_push_leaves_the_tag_and_a_fresh_checkout_re_run_finishes(self):
+        """The tag is pushed first, so a branch failure is recoverable by re-running.
+
+        The tag is what a re-run keys on: create_stamped_release_commit reuses the
+        tagged commit, so the second run pushes the same commit to the branch it
+        did not get to. Pushed the other way round, the re-run would stamp a fresh
+        commit and refuse the branch its first attempt pushed.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            self._populate_valid_release_files(repo_dir)
+            git("add", ".")
+            git("commit", "-m", "feat: populate release files")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            bare_dir = self._bare_origin_for(git, repo_dir)
+            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+
+            def remote(ref):
+                return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+
+            # The remote already holds this release's branch at a commit that
+            # diverged from the one about to be stamped, so the branch push fails.
+            git("switch", "-c", "elsewhere")
+            (pathlib.Path(repo_dir) / "elsewhere.txt").write_text("elsewhere\n")
+            git("add", "elsewhere.txt")
+            git("commit", "-m", "feat: elsewhere")
+            git("push", "origin", f"HEAD:refs/heads/{branch}")
+            git("switch", "main")
+
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG, main_commit],
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(f"Could not push Release branch '{branch}'", proc.stderr)
+            tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
+            self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), tag_commit)
+            self.assertNotEqual(remote(f"refs/heads/{branch}"), tag_commit)
+
+            # The operator removes the branch that was in the way and re-runs the
+            # job, which is a fresh checkout: no local branch, no local tag beyond
+            # what the clone fetched.
+            git("--git-dir", str(bare_dir), "branch", "-D", branch)
+            rerun_dir = pathlib.Path(repo_dir).parent / "rerun"
+            git("clone", "--quiet", str(bare_dir), str(rerun_dir))
+            git("config", "user.name", "Test User", cwd=rerun_dir)
+            git("config", "user.email", "test@example.com", cwd=rerun_dir)
+            git("config", "commit.gpgsign", "false", cwd=rerun_dir)
+            unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+            git(
+                "config",
+                f"url.{unreachable}.insteadOf",
+                f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+                cwd=rerun_dir,
+            )
+
+            rerun = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG, main_commit],
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=str(rerun_dir),
+            )
+            self.assertEqual(rerun.returncode, 0, rerun.stderr)
+            self.assertIn("Reusing existing release commit", rerun.stderr)
+            self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' already exists", rerun.stdout)
+            self.assertIn(f"Release branch '{branch}' successfully pushed", rerun.stdout)
+            self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
+        finally:
+            temp_dir.cleanup()
 
 if __name__ == "__main__":
     unittest.main()

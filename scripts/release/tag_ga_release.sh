@@ -37,8 +37,19 @@ GA_TAG_DETAILS+=(--detail "RC Candidate Commit: ${RC_CANDIDATE_COMMIT_SHA:0:7}")
 if [ "${RELEASE_COMMIT}" != "${RC_CANDIDATE_COMMIT_SHA}" ]; then
   GA_TAG_DETAILS+=(--detail "Release Commit:      ${RELEASE_COMMIT:0:7}")
 fi
+GA_TAG_DETAILS+=(--detail "Release Branch:      $(release_branch_for_version "${RELEASE_VERSION}")")
 
-exec "${SCRIPT_DIR}/tag_commit.sh" \
+"${SCRIPT_DIR}/tag_commit.sh" \
   --title "CREATING AND PUSHING GA RELEASE GIT TAG" \
   "${GA_TAG_DETAILS[@]}" \
   "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "Release ${RELEASE_VERSION}"
+
+# The branch comes after the tag, and the order is load-bearing. The tag is what
+# a re-run keys on: create_stamped_release_commit reuses the tagged commit and
+# verify_release_eligibility.sh reads the tag, so a run that fails here re-runs
+# the way one that fails at image promotion does, and pushes the branch it did
+# not get to. The other way round is not re-runnable: with the branch pushed and
+# no tag, the re-run stamps a fresh commit and refuses the branch it pushed
+# itself. Without the branch the stamped commit is reachable from the tag alone,
+# which GitHub shows as belonging to no branch on the repository.
+ensure_release_branch "${RELEASE_VERSION}" "${RELEASE_COMMIT}"
