@@ -1,8 +1,9 @@
 """Unit tests for scripts/release/decide_image_publish.sh.
 
 The `decide` job of docker-publish-ghcr.yml runs it: `main` always builds, and
-a release branch builds only for a merge Tide pushed, never the GA tagger's
-stamped commit, and never a commit whose images already exist. The last rule is
+a release branch builds only for a merge Tide pushed and never for a commit
+whose images already exist. The pusher rule is also what keeps the GA tagger's
+stamped commit out, since the tagger pushes as the release App. The second rule is
 the one with teeth: image tags are mutable, so a line opened at a commit `main`
 already built would otherwise replace the manifests its validation was earned
 against. The registry probe is common.sh's docker-free GHCR path, answered by
@@ -24,6 +25,7 @@ _MAIN_REF = "refs/heads/main"
 _LINE_REF = "refs/heads/release/0.8"
 _SHA = "0123456789abcdef0123456789abcdef01234567"
 _MERGER = "google-oss-prow[bot]"
+_RELEASE_APP = "kube-agents-release-bot[bot]"
 _MOCK_CURL_MISSING_IMAGE_EXIT = 1
 
 
@@ -49,7 +51,6 @@ class DecideImagePublishTest(unittest.TestCase):
                 "GITHUB_REF": ref,
                 "GITHUB_SHA": _SHA,
                 "GITHUB_ACTOR": actor,
-                "HEAD_COMMIT_MESSAGE": subject + "\n\nbody",
                 "GITHUB_OUTPUT": str(self.output),
             }
         )
@@ -73,15 +74,17 @@ class DecideImagePublishTest(unittest.TestCase):
         self.assertEqual(outputs["build"], "false")
         self.assertIn("only merges pushed by", outputs["reason"])
 
-    def test_the_stamped_release_commit_does_not_build(self):
-        proc, outputs = self.run_script(_LINE_REF, subject="chore(release): stamp release version 0.8.1")
+    def test_the_ga_taggers_stamp_push_is_refused_by_the_pusher_rule(self):
+        """The tagger pushes the stamped release commit as the release App, not as Tide,
+        so it never builds; no subject test is needed, and none is made."""
+        proc, outputs = self.run_script(_LINE_REF, actor=_RELEASE_APP, subject="chore(release): stamp release version 0.8.1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(outputs["build"], "false")
-        self.assertIn("stamped release commit", outputs["reason"])
+        self.assertIn("only merges pushed by", outputs["reason"])
 
-    def test_a_backport_whose_title_merely_starts_like_a_stamp_still_builds(self):
-        """Only the tagger's exact subject is a stamp; a title with those words and more is a backport."""
-        for subject in ("chore(release): stamp release version helper", "chore(release): stamp release version 0.8.1 again"):
+    def test_a_tide_merge_builds_whatever_its_subject_says(self):
+        """A Tide squash subject is a backport by definition, stamp words or not."""
+        for subject in ("chore(release): stamp release version 0.8.1 (#2200)", "fix: a backport (#2201)"):
             with self.subTest(subject=subject):
                 proc, outputs = self.run_script(_LINE_REF, subject=subject)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -117,7 +120,6 @@ class DecideImagePublishTest(unittest.TestCase):
                 "GITHUB_REF": _LINE_REF,
                 "GITHUB_SHA": _SHA,
                 "GITHUB_ACTOR": "a-collaborator",
-                "HEAD_COMMIT_MESSAGE": "fix: pushed by hand",
                 "GITHUB_STEP_SUMMARY": str(summary),
             }
         )

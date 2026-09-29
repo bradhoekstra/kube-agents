@@ -31,15 +31,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # `main` always builds. A release branch builds only for a merge Tide
-      # pushed, never for the GA tagger's stamped commit, and never for a commit
-      # whose images already exist: image tags are mutable, and rebuilding a
-      # commit `main` already published would replace the manifests its
-      # validation was earned against. The rules and their reasons are the
-      # script's.
+      # pushed (which also keeps out the GA tagger's stamped commit, pushed as
+      # the release App), and never for a commit whose images already exist:
+      # image tags are mutable, and rebuilding a commit `main` already
+      # published would replace the manifests its validation was earned
+      # against. The rules and their reasons are the script's.
       - name: Decide
         id: decide
-        env:
-          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: ./scripts/release/decide_image_publish.sh
 
   publish-operator:

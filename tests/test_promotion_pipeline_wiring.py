@@ -750,7 +750,8 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         release lines. Only for those: the pattern is the line shape, so neither
         the per-release `release/<X.Y.Z>` branches nor an arbitrary
         `release/anything` a collaborator pushes can mint signed images, and both
-        jobs skip the stamped release commit the GA tagger pushes to a line.
+        jobs build nothing the GA tagger pushes to a line, since it pushes as the
+        release App rather than as Tide.
         `:latest` is what autopush and the presubmit cache follow and must keep
         tracking `main` alone: each `:latest` line is guarded by the ref, and
         `docker/build-push-action` drops the empty line the guard leaves behind.

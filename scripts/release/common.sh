@@ -19,14 +19,8 @@ export DEFAULT_INITIAL_VERSION="0.1.0"
 # definition, so the validator and the two tag lookups below cannot drift apart.
 readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
 # The subject the GA tagger gives the stamped release commit; the version
-# follows. What is_valid_stamped_or_direct_release_commit recognises, and what
-# the image publish skips on a release branch.
+# follows. What is_valid_stamped_or_direct_release_commit recognises.
 readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
-# The whole subject as a regular expression: the prefix (its parentheses
-# escaped, since in a pattern they would group rather than match), a space, and
-# a pure numeric X.Y.Z, nothing after. Read by decide_image_publish.sh.
-# shellcheck disable=SC2034
-readonly RELEASE_STAMP_SUBJECT_REGEX='^chore\(release\): stamp release version [0-9]+\.[0-9]+\.[0-9]+$'
 
 # The branch each GA release commit is pushed to, alongside its tag:
 # `release/<X.Y.Z>`. One branch per release rather than per line, because every

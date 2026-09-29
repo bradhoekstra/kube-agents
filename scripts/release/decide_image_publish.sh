@@ -3,17 +3,19 @@
 # docker-publish-ghcr.yml. Writes `build` (true|false) and `reason` to
 # GITHUB_OUTPUT and prints them.
 #
-# `main` always builds, as it always has. A release branch builds only when all
-# of these hold, each one closing a way the publish could do harm:
+# `main` always builds, as it always has. A release branch builds only when
+# both of these hold, each one closing a way the publish could do harm:
 #
 #   - the push came from the merger (Tide), so a mistaken or hand-made push
 #     under a release-branch name publishes nothing. This is a guard against
 #     accident, not a security boundary: the workflow and this script run from
 #     the pushed commit, so a collaborator who edits them in the same push is
 #     not stopped here. What bounds that is who may push at all, a repository
-#     rule, and it holds for any branch name, not only these;
-#   - the head commit is not the GA tagger's stamped release commit, whose
-#     images nothing deploys;
+#     rule, and it holds for any branch name, not only these. It is also what
+#     keeps the GA tagger's stamped release commit, whose images nothing
+#     deploys, from building: the tagger pushes it as the release App, not as
+#     Tide, and a stamp is never a pull request, so no subject test is needed
+#     (Tide's squash subjects end in "(#<number>)" in any case);
 #   - the commit has no published images yet. Image tags are mutable, and a
 #     line opened at, or fast-forwarded to, a commit `main` already built would
 #     otherwise rebuild it under the same `:<sha>` tags, replacing the manifests
@@ -24,7 +26,7 @@
 # A push that builds nothing is a green run: the reason is printed, written to
 # the step summary and raised as a workflow notice, so it is not only in the log.
 #
-# Inputs (environment): GITHUB_REF, GITHUB_SHA, GITHUB_ACTOR, HEAD_COMMIT_MESSAGE.
+# Inputs (environment): GITHUB_REF, GITHUB_SHA, GITHUB_ACTOR.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,8 +40,6 @@ readonly MAIN_REF="${GIT_BRANCH_REF_PREFIX}${RELEASE_MAIN_BRANCH}"
 REF="${GITHUB_REF:-}"
 SHA="${GITHUB_SHA:-}"
 ACTOR="${GITHUB_ACTOR:-}"
-HEAD_SUBJECT="${HEAD_COMMIT_MESSAGE:-}"
-HEAD_SUBJECT="${HEAD_SUBJECT%%$'\n'*}"
 
 if [ -z "${REF}" ] || [ -z "${SHA}" ]; then
   echo "❌ ERROR: GITHUB_REF and GITHUB_SHA are required." >&2
@@ -53,12 +53,6 @@ decide() {
   fi
   if [ "${ACTOR}" != "${RELEASE_MERGE_ACTOR}" ]; then
     echo "false" "only merges pushed by ${RELEASE_MERGE_ACTOR} build on a release branch; this push is by '${ACTOR}'"
-    return
-  fi
-  # The whole subject the tagger writes, not the prefix alone: a backport titled
-  # with those words and more is a backport, and needs its images.
-  if [[ "${HEAD_SUBJECT}" =~ ${RELEASE_STAMP_SUBJECT_REGEX} ]]; then
-    echo "false" "the head commit is the GA tagger's stamped release commit, whose images nothing deploys"
     return
   fi
   local registry_prefix img status present=0
