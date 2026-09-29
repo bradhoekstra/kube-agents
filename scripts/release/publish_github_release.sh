@@ -43,7 +43,7 @@ if [ -n "${PREVIOUS_VERSION}" ]; then
     exit 1
   fi
 else
-  PREVIOUS_VERSION="$(get_previous_ga_tag "${RELEASE_VERSION}")"
+  PREVIOUS_VERSION="$(get_base_ga_tag_for_commit "${RELEASE_COMMIT}" "${RELEASE_VERSION}")"
   if [ -z "${PREVIOUS_VERSION}" ]; then
     echo "⚠️ WARNING: No GA tag below '${RELEASE_VERSION}' in this checkout; GitHub will pick where the release notes start. Expected only for the first release. Otherwise the checkout is missing tags (fetch-depth: 0) or set PREVIOUS_VERSION." >&2
   fi

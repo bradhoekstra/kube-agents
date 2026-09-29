@@ -19,6 +19,8 @@ from tests.testing.common import (
 )
 from tests.testing.release import (
     MOCK_EXPLICIT_RELEASE_VERSION_NEXT,
+    MOCK_LINE_PATCH_RELEASE_TAG,
+    MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
     populate_mock_release_files,
 )
@@ -451,11 +453,11 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             git("add", ".")
             git("commit", "-m", "feat: populate release files")
             main_commit = git("rev-parse", "HEAD").stdout.strip()
-            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+            branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
 
             proc = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], cwd=repo_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertIn(f"Release Branch:      {branch}", proc.stdout)
+            self.assertIn(f"Release Line:        {branch}", proc.stdout)
 
             tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
             self.assertEqual(git("rev-parse", branch).stdout.strip(), tag_commit)
@@ -478,7 +480,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             git("commit", "-m", "feat: populate release files")
             main_commit = git("rev-parse", "HEAD").stdout.strip()
             bare_dir = self._bare_origin_for(git, repo_dir)
-            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+            branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
 
             proc = self._run_script(
                 [MOCK_TARGET_RELEASE_TAG, main_commit],
@@ -496,7 +498,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             # Tag first, then branch: the order the recovery test below depends on.
             self.assertLess(
                 proc.stdout.index(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' successfully pushed"),
-                proc.stdout.index(f"Release branch '{branch}' successfully pushed"),
+                proc.stdout.index(f"Release line '{branch}' successfully pushed"),
             )
         finally:
             temp_dir.cleanup()
@@ -515,7 +517,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             git("commit", "-m", "feat: populate release files")
             main_commit = git("rev-parse", "HEAD").stdout.strip()
             bare_dir = self._bare_origin_for(git, repo_dir)
-            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+            branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
 
             # The remote already holds this release's branch at a commit that
             # diverged from the one about to be stamped.
@@ -533,12 +535,72 @@ class TagGAReleaseScriptTest(unittest.TestCase):
                 cwd=repo_dir,
             )
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn(f"Release branch '{branch}' already exists on", proc.stderr)
+            self.assertIn(f"Release line '{branch}' already exists on", proc.stderr)
             self.assertNotIn("CREATING AND PUSHING GA RELEASE GIT TAG", proc.stdout)
             self.assertEqual(git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
             self.assertEqual(git("--git-dir", str(bare_dir), "tag", "-l").stdout.strip(), "")
             remote_branch = git("--git-dir", str(bare_dir), "rev-parse", f"refs/heads/{branch}").stdout.strip()
             self.assertEqual(remote_branch, stray)
+        finally:
+            temp_dir.cleanup()
+
+    def test_a_patch_fast_forwards_the_release_line(self):
+        """A minor creates `release/X.Y` at its stamp; a patch stamped from the line head moves it.
+
+        Run in CI mode against a bare origin: the tag is pushed before the line
+        each time, the minor's stamp stays tagged and reachable, and the patch
+        stamp's single parent is the backport that was the line head.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            self._populate_valid_release_files(repo_dir)
+            git("add", ".")
+            git("commit", "-m", "feat: populate release files")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            bare_dir = self._bare_origin_for(git, repo_dir)
+            branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+
+            def remote(ref):
+                return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+
+            minor = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG, main_commit],
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
+            self.assertEqual(minor.returncode, 0, minor.stderr)
+            s0 = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
+            self.assertEqual(remote(f"refs/heads/{branch}"), s0)
+
+            # A backport lands on the line (as Tide would push it).
+            git("switch", branch)
+            (pathlib.Path(repo_dir) / "backport.txt").write_text("fix\n")
+            git("add", "backport.txt")
+            git("commit", "-m", "fix: backport")
+            l1 = git("rev-parse", "HEAD").stdout.strip()
+            git("push", "--quiet", "origin", branch)
+            git("switch", "main")
+
+            patch = self._run_script(
+                [MOCK_LINE_PATCH_RELEASE_TAG, l1],
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
+            self.assertEqual(patch.returncode, 0, patch.stderr)
+            self.assertIn("fast-forwards", patch.stdout)
+            s1 = git("rev-parse", f"{MOCK_LINE_PATCH_RELEASE_TAG}^{{commit}}").stdout.strip()
+            self.assertEqual(git("rev-parse", f"{s1}^1").stdout.strip(), l1)
+            self.assertEqual(remote(f"refs/heads/{branch}"), s1)
+            self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), s0)
+            self.assertTrue(git("merge-base", "--is-ancestor", s0, s1))
+            self.assertLess(
+                patch.stdout.index(f"Git tag '{MOCK_LINE_PATCH_RELEASE_TAG}' successfully pushed"),
+                patch.stdout.index(f"Release line '{branch}' successfully pushed"),
+            )
+            install = git("show", f"{MOCK_LINE_PATCH_RELEASE_TAG}:install.sh").stdout
+            self.assertIn(f'BAKED_RELEASE_VERSION="{MOCK_LINE_PATCH_RELEASE_TAG}"', install)
+            # No per-release branch is created any more.
+            self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", f"release/{MOCK_TARGET_RELEASE_TAG}").stdout.strip(), "")
         finally:
             temp_dir.cleanup()
 
@@ -591,7 +653,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             git("commit", "-m", "feat: populate release files")
             main_commit = git("rev-parse", "HEAD").stdout.strip()
             bare_dir = self._bare_origin_for(git, repo_dir)
-            branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+            branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
             reject_marker = self._install_release_branch_rejecting_hook(git, bare_dir)
 
             def remote(ref):
@@ -604,7 +666,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
                 cwd=repo_dir,
             )
             self.assertNotEqual(first.returncode, 0)
-            self.assertIn(f"Could not push Release branch '{branch}'", first.stderr)
+            self.assertIn(f"Could not push Release line '{branch}'", first.stderr)
             self.assertIn("rejected by the test hook", first.stderr)
             tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
             # What the failed run left behind: the tag, and no branch.
@@ -630,7 +692,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             self.assertEqual(rerun.returncode, 0, rerun.stderr)
             self.assertIn("Reusing existing release commit", rerun.stderr)
             self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' already exists", rerun.stdout)
-            self.assertIn(f"Release branch '{branch}' successfully pushed", rerun.stdout)
+            self.assertIn(f"Release line '{branch}' successfully pushed", rerun.stdout)
             self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
         finally:
             temp_dir.cleanup()

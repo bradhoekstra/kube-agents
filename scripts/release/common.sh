@@ -22,13 +22,15 @@ readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
 # follows. What is_valid_stamped_or_direct_release_commit recognises.
 readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
 
-# The branch each GA release commit is pushed to, alongside its tag:
-# `release/<X.Y.Z>`. One branch per release rather than per line, because every
-# release stamps a fresh child of a `main` commit, so a per-line `release-0.7`
-# could take 0.7.1 only by force-push, which would orphan 0.7.0's commit again.
-# Without any branch the stamped commit is reachable from its tag alone, and
-# GitHub labels it as belonging to no branch on the repository.
+# The branch each GA release commit is pushed to, alongside its tag: the
+# release line `release/<X.Y>`. A minor GA creates the line at its stamped
+# commit; each patch GA is stamped as a child of the line's head and
+# fast-forwards it, so nothing is ever force-pushed and every release commit on
+# the line stays reachable from a branch. (Releases 0.1.0 to 0.7.0 predate the
+# lines and sit on per-release `release/<X.Y.Z>` branches, left as they are.)
 readonly RELEASE_BRANCH_PREFIX="release/"
+# The shape of a release line: `X.Y`, the version with its patch component off.
+readonly RELEASE_LINE_SHAPE_REGEX='^[0-9]+\.[0-9]+$'
 # The full ref a branch lives under, for the lookups and refspecs that must not
 # be satisfied by a tag of the same name.
 readonly GIT_BRANCH_REF_PREFIX="refs/heads/"
@@ -273,37 +275,63 @@ get_latest_ga_tag() {
   fi
 }
 
-# Finds the highest pure numeric GA tag strictly below a version (e.g. 0.4.0 for
-# 0.5.0). Prints nothing when no lower GA tag exists, as for the first release.
-#
-# Separate from get_latest_ga_tag because the two answer different questions at
-# different moments: by the time publish_github_release.sh runs, tag_ga_release.sh
-# has already created the new tag, so the latest GA tag *is* the release being
-# published, and what the release notes need is the one before it. Order comes
-# from compare_semver rather than from `--sort`, so 0.10.0 ranks above 0.9.0.
-#
-# Arguments: $1 = the version to look below (pure numeric X.Y.Z). Returns
-# non-zero without one, or with one that is not a GA version.
-get_previous_ga_tag() {
-  local version="${1:-}"
-  if [ -z "${version}" ]; then
-    echo "❌ ERROR: version is required for get_previous_ga_tag." >&2
+# Whether a GA tag sits on the stamped child the tagger creates (single parent,
+# subject `chore(release): stamp release version <tag>`), as 0.3.0 onward do.
+# 0.1.0 and 0.2.0 predate stamping and sit directly on main.
+# Arguments: $1 = tag, $2 = the tag's commit
+ga_tag_is_stamped() {
+  local tag="${1:-}" tag_commit="${2:-}" parent
+  parent="$(git rev-parse --verify --quiet "${tag_commit}^1" 2>/dev/null)" || return 1
+  is_valid_stamped_or_direct_release_commit "${parent}" "${tag_commit}" "${tag}" 2>/dev/null
+}
+
+# A GA tag is a base for a candidate when the candidate descends from, or is,
+# the tag's commit — a release line's head, or a pre-stamp tag on main — or, for
+# a stamped tag, from the commit the stamp was cut from, which is where main's
+# history meets it. `--is-ancestor` holds for equality, which is what lets a
+# re-run whose tag already exists (parent == candidate) find its own release.
+# Arguments: $1 = tag, $2 = candidate commit
+ga_tag_is_base_of() {
+  local tag="${1:-}" candidate="${2:-}" tag_commit
+  tag_commit="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" || return 1
+  git merge-base --is-ancestor "${tag_commit}" "${candidate}" 2>/dev/null && return 0
+  ga_tag_is_stamped "${tag}" "${tag_commit}" || return 1
+  git merge-base --is-ancestor "${tag_commit}^1" "${candidate}" 2>/dev/null
+}
+
+# The highest GA tag in a candidate's own history: the base the version bump,
+# the scheduled-release range and the release notes all start from. Found by
+# ancestry, not by number, so main's base stays 0.7.0 once 0.7.1 exists on
+# release/0.7, and 0.7.1's base is 0.7.0. Optional $2 looks strictly below a
+# version: the notes step passes the release being published, whose own tag is
+# by then in its history. Prints nothing when no GA tag is in the history.
+# Arguments: $1 = candidate commit-ish, $2 = ceiling version (exclusive), optional
+get_base_ga_tag_for_commit() {
+  local candidate="${1:-}" below="${2:-}" candidate_sha best="" tag
+
+  if [ -z "${candidate}" ]; then
+    echo "❌ ERROR: a candidate commit is required for get_base_ga_tag_for_commit." >&2
     return 1
   fi
-  validate_pure_numeric_semver "${version}" "Version" || return 1
+  if ! candidate_sha="$(git rev-parse --verify "${candidate}^{commit}" 2>/dev/null)"; then
+    echo "❌ ERROR: '${candidate}' does not resolve to a commit." >&2
+    return 1
+  fi
+  if [ -n "${below}" ]; then
+    validate_pure_numeric_semver "${below}" "Ceiling version" || return 1
+  fi
 
-  local previous="" tag
   while IFS= read -r tag; do
     [ -n "${tag}" ] || continue
-    if [ "$(compare_semver "${tag}" "${version}")" != "-1" ]; then
+    if [ -n "${below}" ] && [ "$(compare_semver "${tag}" "${below}")" != "-1" ]; then
       continue
     fi
-    if [ -z "${previous}" ] || [ "$(compare_semver "${tag}" "${previous}")" = "1" ]; then
-      previous="${tag}"
+    ga_tag_is_base_of "${tag}" "${candidate_sha}" || continue
+    if [ -z "${best}" ] || [ "$(compare_semver "${tag}" "${best}")" = "1" ]; then
+      best="${tag}"
     fi
   done < <(git tag -l '[0-9]*' 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" || true)
-
-  echo "${previous}"
+  echo "${best}"
 }
 
 # The ref that stands for `main` in this checkout. In CI it is the release
@@ -1214,22 +1242,27 @@ release_push_ref() {
   fi
 }
 
-# The branch a GA release is pushed to: RELEASE_BRANCH_PREFIX plus the version.
-release_branch_for_version() {
+# The release line a version belongs to: `X.Y.Z` -> `X.Y`.
+release_line_for_version() {
   local version="${1:-}"
+  validate_pure_numeric_semver "${version}" "Version" || return 1
+  echo "${version%.*}"
+}
 
-  if [ -z "${version}" ]; then
-    echo "❌ ERROR: version is required for release_branch_for_version." >&2
+# The branch of a release line: `X.Y` -> `release/X.Y`.
+release_branch_for_line() {
+  local line="${1:-}"
+  if ! [[ "${line}" =~ ${RELEASE_LINE_SHAPE_REGEX} ]]; then
+    echo "❌ ERROR: '${line}' is not a release line; expected X.Y." >&2
     return 1
   fi
-
-  echo "${RELEASE_BRANCH_PREFIX}${version}"
+  echo "${RELEASE_BRANCH_PREFIX}${line}"
 }
 
 # The commit the release repository's copy of a branch points at, or nothing
 # when it has none. The match is exact: ls-remote's own pattern is tail-matched,
-# so `refs/heads/release/0.7.0` alone would also answer for a stray
-# `x/refs/heads/release/0.7.0`. A remote that cannot be read is an error rather
+# so `refs/heads/release/0.7` alone would also answer for a stray
+# `x/refs/heads/release/0.7`. A remote that cannot be read is an error rather
 # than an empty answer: in CI the remote is the truth about the branch, and a
 # guess of "absent" would let a plain push fast-forward a branch that exists.
 # Arguments: $1 = branch ref (refs/heads/...)
@@ -1252,101 +1285,205 @@ release_branch_remote_commit() {
   awk -v ref="${branch_ref}" '$2 == ref { print $1 }' <<<"${listing}"
 }
 
-# Where the release branch for a version is, relative to the release commit:
-# prints `remote` (on the release repository, at the commit), `local` (in this
-# checkout only, at the commit) or `absent`. A branch anywhere else is an error
-# naming both commits, and so is a remote that cannot be read. Read-only, so
-# tag_ga_release.sh runs it before the tag goes out and ensure_release_branch
-# runs it again before pushing.
-# Arguments: $1 = version, $2 = commit_sha
+# The head of a release line: on the release repository in CI (fetched into
+# this checkout if it is not already here), the local branch off CI. An
+# unreadable remote or a line that does not exist is an error.
+# Arguments: $1 = line (X.Y)
+release_line_head() {
+  local line="${1:-}" branch branch_ref head
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+
+  if is_ci_pipeline; then
+    head="$(release_branch_remote_commit "${branch_ref}")" || return 1
+    if [ -z "${head}" ]; then
+      echo "❌ ERROR: No release line '${branch}' on $(get_target_repo)." >&2
+      return 1
+    fi
+    if ! git rev-parse --verify --quiet "${head}^{commit}" >/dev/null 2>&1; then
+      git fetch "$(release_repo_url)" "${branch_ref}" >/dev/null 2>&1 || true
+    fi
+    if ! git rev-parse --verify --quiet "${head}^{commit}" >/dev/null 2>&1; then
+      echo "❌ ERROR: The head of '${branch}' (${head}) is not in this checkout and could not be fetched." >&2
+      return 1
+    fi
+    echo "${head}"
+    return 0
+  fi
+
+  if ! head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null)"; then
+    echo "❌ ERROR: No local release line '${branch}'." >&2
+    return 1
+  fi
+  echo "${head}"
+}
+
+# Whether a release line exists: on the release repository in CI, locally off
+# CI. Returns 2 when the remote cannot be read, so a caller fails closed rather
+# than treat "unknown" as "no".
+# Arguments: $1 = line (X.Y)
+release_line_branch_exists() {
+  local line="${1:-}" branch branch_ref head
+  branch="$(release_branch_for_line "${line}")" || return 2
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+  if is_ci_pipeline; then
+    head="$(release_branch_remote_commit "${branch_ref}")" || return 2
+  else
+    head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+  fi
+  [ -n "${head}" ]
+}
+
+# The commit a release line's next patch is cut from: the head, unless the head
+# is a GA release's stamped commit, in which case the commit that stamp was cut
+# from. That is what makes an idle line, or a re-run after its tag was pushed,
+# resolve to the same candidate as the run that released it, and so land in the
+# eligibility check's idempotent path rather than as a new release of nothing.
+# Arguments: $1 = line (X.Y)
+release_line_candidate() {
+  local line="${1:-}" head tag
+  head="$(release_line_head "${line}")" || return 1
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    if ga_tag_is_stamped "${tag}" "${head}"; then
+      git rev-parse --verify "${head}^1"
+      return 0
+    fi
+  done < <(git tag --points-at "${head}" 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" || true)
+  echo "${head}"
+}
+
+# The rc_*_validated tags on a commit, one per line: a release line's gate.
+validated_rc_tags_at_commit() {
+  local sha="${1:-}"
+  git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || true
+}
+
+# Where a version's release line is, relative to the release commit and the
+# candidate it was stamped from: prints `remote` or `local` (at the release
+# commit, on the release repository or in this checkout only), `remote-candidate`
+# or `local-candidate` (at the candidate, which is the stamped commit's parent,
+# so the branch has a fast-forward ahead of it), or `absent`. A branch anywhere
+# else is an error naming both commits, and so is a remote that cannot be read.
+# Read-only, so tag_ga_release.sh runs it before the tag goes out and
+# ensure_release_branch runs it again before pushing.
+# Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
 release_branch_placement() {
   local version="${1:-}"
-  local commit_sha="${2:-}"
+  local release_commit="${2:-}"
+  local candidate="${3:-}"
 
-  if [ -z "${version}" ] || [ -z "${commit_sha}" ]; then
-    echo "❌ ERROR: version and commit SHA are required for release_branch_placement." >&2
+  if [ -z "${version}" ] || [ -z "${release_commit}" ]; then
+    echo "❌ ERROR: version and release commit are required for release_branch_placement." >&2
     return 1
   fi
 
-  local branch
-  branch="$(release_branch_for_version "${version}")"
-  local branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+  local line branch branch_ref
+  line="$(release_line_for_version "${version}")" || return 1
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
 
-  local target_full_sha
-  target_full_sha="$(git rev-parse --verify "${commit_sha}^{commit}" 2>/dev/null || echo "${commit_sha}")"
+  local target_full_sha candidate_full_sha=""
+  target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
+  if [ -n "${candidate}" ]; then
+    candidate_full_sha="$(git rev-parse --verify "${candidate}^{commit}" 2>/dev/null || echo "${candidate}")"
+  fi
+
+  # Names what a branch at `sha` is, or fails naming where it is instead.
+  classify() {
+    local sha="$1" where="$2" whose="$3"
+    if [ "${sha}" = "${target_full_sha}" ]; then
+      echo "${where}"
+    elif [ -n "${candidate_full_sha}" ] && [ "${sha}" = "${candidate_full_sha}" ]; then
+      echo "${where}-candidate"
+    else
+      echo "❌ ERROR: Release line '${branch}' already exists ${whose} but points to commit ${sha}, not the release commit ${target_full_sha}${candidate_full_sha:+ or its candidate ${candidate_full_sha}}!" >&2
+      return 1
+    fi
+  }
 
   if is_ci_pipeline; then
-    local target_repo
-    target_repo="$(get_target_repo)"
     local remote_sha
     remote_sha="$(release_branch_remote_commit "${branch_ref}")" || return 1
-    if [ "${remote_sha}" = "${target_full_sha}" ]; then
-      echo "remote"
-      return 0
-    elif [ -n "${remote_sha}" ]; then
-      echo "❌ ERROR: Release branch '${branch}' already exists on ${target_repo} but points to commit ${remote_sha}, not target SHA ${target_full_sha}!" >&2
-      return 1
+    if [ -n "${remote_sha}" ]; then
+      classify "${remote_sha}" "remote" "on $(get_target_repo)"
+      return
     fi
   fi
 
   local local_sha
   local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
-  if [ -n "${local_sha}" ] && [ "${local_sha}" != "${target_full_sha}" ]; then
-    echo "❌ ERROR: Release branch '${branch}' already exists locally but points to commit ${local_sha}, not target SHA ${target_full_sha}!" >&2
-    return 1
-  fi
   if [ -n "${local_sha}" ]; then
-    echo "local"
-  else
-    echo "absent"
+    classify "${local_sha}" "local" "locally"
+    return
   fi
+  echo "absent"
 }
 
-# Ensures the release branch for a version exists at the release commit and, in
-# CI, is on the remote. The contract is ensure_git_tag's: a branch already at the
-# commit is an idempotent skip, one anywhere else is an error, and nothing is ever
-# force-pushed. Off CI the branch is created locally and the push is skipped.
-# Arguments: $1 = version, $2 = commit_sha
+# Ensures a version's release line exists at the release commit and, in CI, is
+# on the remote. A line already at the commit is an idempotent skip; one at the
+# candidate — the stamped commit's parent — is fast-forwarded; anywhere else is
+# an error; nothing is ever force-pushed. Off CI the branch is created or moved
+# locally and the push is skipped.
+# Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
 ensure_release_branch() {
   local version="${1:-}"
-  local commit_sha="${2:-}"
+  local release_commit="${2:-}"
+  local candidate="${3:-}"
 
-  if [ -z "${version}" ] || [ -z "${commit_sha}" ]; then
-    echo "❌ ERROR: version and commit SHA are required for ensure_release_branch." >&2
+  if [ -z "${version}" ] || [ -z "${release_commit}" ]; then
+    echo "❌ ERROR: version and release commit are required for ensure_release_branch." >&2
     return 1
   fi
 
   local placement
-  placement="$(release_branch_placement "${version}" "${commit_sha}")" || return 1
+  placement="$(release_branch_placement "${version}" "${release_commit}" "${candidate}")" || return 1
 
-  local branch
-  branch="$(release_branch_for_version "${version}")"
-  local branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+  local line branch branch_ref
+  line="$(release_line_for_version "${version}")" || return 1
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
 
   local target_full_sha
-  target_full_sha="$(git rev-parse --verify "${commit_sha}^{commit}" 2>/dev/null || echo "${commit_sha}")"
+  target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
 
   case "${placement}" in
     remote)
-      echo "✅ Release branch '${branch}' already exists on $(get_target_repo) at target commit ${target_full_sha}. Idempotent skip."
+      echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
       return 0
       ;;
     absent)
       git branch "${branch}" "${target_full_sha}"
       ;;
     local) ;;
+    remote-candidate | local-candidate)
+      # Move the local branch to the release commit, compare-and-swap against
+      # the candidate it is at, or create it when the checkout has no copy.
+      local local_sha
+      local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+      if [ -n "${local_sha}" ]; then
+        git update-ref "${branch_ref}" "${target_full_sha}" "${local_sha}"
+      else
+        git branch "${branch}" "${target_full_sha}"
+      fi
+      echo "➡️ Release line '${branch}' fast-forwards to release commit ${target_full_sha:0:7}."
+      ;;
+    *)
+      echo "❌ ERROR: Unexpected release line placement '${placement}'." >&2
+      return 1
+      ;;
   esac
 
   # Safety Guard: Remote push executes exclusively inside CI
   if ! is_ci_pipeline; then
-    echo "⚠️ [Local Execution] Dry-run: Release branch '${branch}' created locally. Remote push skipped (runs only in CI)."
+    echo "⚠️ [Local Execution] Dry-run: Release line '${branch}' set locally. Remote push skipped (runs only in CI)."
     return 0
   fi
 
-  # A plain push: it refuses a non-fast-forward, and the placement check above
-  # has already read the remote, so the only way to reach it with the branch
-  # elsewhere is a push that landed between the two.
-  release_push_ref "${branch_ref}:${branch_ref}" "Release branch '${branch}'"
+  # A plain push: a fast-forward is accepted, a non-fast-forward refused, and
+  # the placement check above has already read the remote, so the only way to
+  # reach it with the branch elsewhere is a push that landed between the two.
+  release_push_ref "${branch_ref}:${branch_ref}" "Release line '${branch}'"
 }
 
 # Stamps BAKED_RELEASE_VERSION into root installer scripts (install.sh, uninstall.sh, upgrade.sh)
