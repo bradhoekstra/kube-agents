@@ -116,7 +116,7 @@ Maintainers do, on the Friday schedule above or by hand. An emergency hotfix can
 
 The release publish workflow enforces byte-for-byte fidelity with tested candidate binaries across seven layers:
 
-1. Container images are compiled once, when a commit is pushed to `main` or to a `release/<X.Y>` branch (`:latest` moves only for `main`; a push to a `release/X.Y.Z` branch builds nothing). The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
+1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to a `release/X.Y.Z` branch builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
 2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens.
 3. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed via Cosign.
 4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit, which is then pushed to the branch `release/X.Y.Z`.

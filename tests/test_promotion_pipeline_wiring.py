@@ -731,10 +731,9 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
 
     _RELEASE_LINE_PUSH_PATTERN = "release/[0-9]+.[0-9]+"
-    _STAMP_SUBJECT_GUARD = (
-        "(github.ref == 'refs/heads/main' || "
-        "!startsWith(github.event.head_commit.message, 'chore(release): stamp release version'))"
-    )
+    _DECIDE_JOB = "decide"
+    _DECIDE_SCRIPT = "./scripts/release/decide_image_publish.sh"
+    _DECIDE_GUARD = "needs.decide.outputs.build == 'true'"
 
     def test_a_release_line_push_builds_sha_tags_but_never_moves_latest(self):
         """A backport merged onto `release/<X.Y>` needs `:<sha>` images, and only those.
@@ -751,9 +750,14 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         """
         on = self.doc.get("on", self.doc.get(True))
         self.assertEqual(on["push"]["branches"], ["main", self._RELEASE_LINE_PUSH_PATTERN])
+        decide = self.jobs[self._DECIDE_JOB]
+        self.assertTrue(any(step.get("run") == self._DECIDE_SCRIPT for step in decide["steps"]))
         for name, job in self.jobs.items():
+            if name == self._DECIDE_JOB:
+                continue
             with self.subTest(job=name):
-                self.assertIn(self._STAMP_SUBJECT_GUARD, str(job.get("if", "")))
+                self.assertEqual(job.get("needs"), self._DECIDE_JOB)
+                self.assertIn(self._DECIDE_GUARD, str(job.get("if", "")))
         build_steps = [
             step
             for job in self.jobs.values()

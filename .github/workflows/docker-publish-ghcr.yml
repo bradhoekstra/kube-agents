@@ -6,9 +6,9 @@ on:
     # SHA-tagged images every rung of the release ladder checks for, and this is
     # the only workflow that publishes them. The pattern admits the line shape
     # alone: not the per-release `release/<X.Y.Z>` branches the GA tagger pushes,
-    # whose stamped commits nothing deploys, and not a misnamed `release/x`. Who
-    # may create or push a `release/<X.Y>` is the repository's branch rules, not
-    # this pattern. `:latest` still follows `main` alone; see the `tags:` below.
+    # and not a misnamed `release/x`. Which release-branch pushes actually build
+    # is the `decide` job's question. `:latest` still follows `main` alone; see
+    # the `tags:` blocks below.
     branches: [main, "release/[0-9]+.[0-9]+"]
 
 # Queue rather than cancel: every publish should complete, but not interleave.
@@ -20,14 +20,33 @@ permissions:
   contents: read
 
 jobs:
+  decide:
+    name: Decide whether this push builds
+    runs-on: ubuntu-latest
+    if: github.repository == 'gke-labs/kube-agents'
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `main` always builds. A release branch builds only for a merge Tide
+      # pushed, never for the GA tagger's stamped commit, and never for a commit
+      # whose images already exist: image tags are mutable, and rebuilding a
+      # commit `main` already published would replace the manifests its
+      # validation was earned against. The rules and their reasons are the
+      # script's.
+      - name: Decide
+        id: decide
+        env:
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: ./scripts/release/decide_image_publish.sh
+
   publish-operator:
     name: Publish Controller to GHCR
     runs-on: ubuntu-latest
-    # On a release branch the GA tagger's stamped commit is skipped: nothing
-    # deploys its images, the release is promoted from the candidate's, and
-    # building it would cost a full publish per release. `main` is exempt from
-    # the subject test, so a commit that merely starts that way still builds.
-    if: "github.repository == 'gke-labs/kube-agents' && (github.ref == 'refs/heads/main' || !startsWith(github.event.head_commit.message, 'chore(release): stamp release version'))"
+    needs: decide
+    if: github.repository == 'gke-labs/kube-agents' && needs.decide.outputs.build == 'true'
     permissions:
       contents: read
       packages: write
@@ -82,11 +101,8 @@ jobs:
   publish-agents:
     name: Publish Agent Images to GHCR
     runs-on: ubuntu-latest
-    # On a release branch the GA tagger's stamped commit is skipped: nothing
-    # deploys its images, the release is promoted from the candidate's, and
-    # building it would cost a full publish per release. `main` is exempt from
-    # the subject test, so a commit that merely starts that way still builds.
-    if: "github.repository == 'gke-labs/kube-agents' && (github.ref == 'refs/heads/main' || !startsWith(github.event.head_commit.message, 'chore(release): stamp release version'))"
+    needs: decide
+    if: github.repository == 'gke-labs/kube-agents' && needs.decide.outputs.build == 'true'
     permissions:
       contents: read
       packages: write

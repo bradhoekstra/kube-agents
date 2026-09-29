@@ -1,0 +1,95 @@
+"""Unit tests for scripts/release/decide_image_publish.sh.
+
+The `decide` job of docker-publish-ghcr.yml runs it: `main` always builds, and
+a release branch builds only for a merge Tide pushed, never the GA tagger's
+stamped commit, and never a commit whose images already exist. The last rule is
+the one with teeth: image tags are mutable, so a line opened at a commit `main`
+already built would otherwise replace the manifests its validation was earned
+against. The registry probe is common.sh's docker-free GHCR path, answered by
+the mock curl.
+"""
+
+import pathlib
+import subprocess
+import tempfile
+import unittest
+
+from tests.testing.common import MOCK_DEFAULT_REGISTRY_PREFIX, create_minimal_tools_bin, get_isolated_test_env
+from tests.testing.release import create_mock_ghcr_curl_binary
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_SCRIPT = _REPO_ROOT / "scripts" / "release" / "decide_image_publish.sh"
+
+_MAIN_REF = "refs/heads/main"
+_LINE_REF = "refs/heads/release/0.8"
+_SHA = "0123456789abcdef0123456789abcdef01234567"
+_MERGER = "google-oss-prow[bot]"
+_MOCK_CURL_MISSING_IMAGE_EXIT = 1
+
+
+class DecideImagePublishTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = pathlib.Path(self._tmp.name)
+        self.bin_dir = create_minimal_tools_bin(root)
+        self.output = root / "github_output.txt"
+
+    def run_script(self, ref, actor=_MERGER, subject="fix: a backport", images_exist=False):
+        create_mock_ghcr_curl_binary(
+            self.bin_dir,
+            manifest_status=0 if images_exist else _MOCK_CURL_MISSING_IMAGE_EXIT,
+        )
+        self.output.write_text("")
+        env = get_isolated_test_env(
+            overrides={
+                "PATH": str(self.bin_dir),
+                "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                "GITHUB_REF": ref,
+                "GITHUB_SHA": _SHA,
+                "GITHUB_ACTOR": actor,
+                "HEAD_COMMIT_MESSAGE": subject + "\n\nbody",
+                "GITHUB_OUTPUT": str(self.output),
+            }
+        )
+        proc = subprocess.run(["bash", str(_SCRIPT)], capture_output=True, text=True, env=env, cwd=_REPO_ROOT)
+        outputs = dict(line.split("=", 1) for line in self.output.read_text().splitlines() if "=" in line)
+        return proc, outputs
+
+    def test_main_always_builds_even_when_images_exist(self):
+        proc, outputs = self.run_script(_MAIN_REF, actor="someone", images_exist=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(outputs["build"], "true")
+
+    def test_a_merge_onto_a_release_branch_with_no_images_builds(self):
+        proc, outputs = self.run_script(_LINE_REF)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(outputs["build"], "true")
+
+    def test_a_push_by_anyone_but_the_merger_does_not_build_on_a_release_branch(self):
+        proc, outputs = self.run_script(_LINE_REF, actor="a-collaborator")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(outputs["build"], "false")
+        self.assertIn("only merges pushed by", outputs["reason"])
+
+    def test_the_stamped_release_commit_does_not_build(self):
+        proc, outputs = self.run_script(_LINE_REF, subject="chore(release): stamp release version 0.8.1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(outputs["build"], "false")
+        self.assertIn("stamped release commit", outputs["reason"])
+
+    def test_a_commit_whose_images_exist_is_never_rebuilt_on_a_release_branch(self):
+        proc, outputs = self.run_script(_LINE_REF, images_exist=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(outputs["build"], "false")
+        self.assertIn("already exist", outputs["reason"])
+
+    def test_missing_ref_or_sha_is_an_error(self):
+        env = get_isolated_test_env(overrides={"PATH": str(self.bin_dir), "GITHUB_REF": _LINE_REF})
+        proc = subprocess.run(["bash", str(_SCRIPT)], capture_output=True, text=True, env=env, cwd=_REPO_ROOT)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("GITHUB_REF and GITHUB_SHA are required", proc.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

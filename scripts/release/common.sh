@@ -18,6 +18,10 @@ export DEFAULT_INITIAL_VERSION="0.1.0"
 # The shape of a GA release tag: pure numeric X.Y.Z, no 'v' prefix. One
 # definition, so the validator and the two tag lookups below cannot drift apart.
 readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
+# The subject the GA tagger gives the stamped release commit; the version
+# follows. What is_valid_stamped_or_direct_release_commit recognises, and what
+# the image publish skips on a release branch.
+readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
 
 # The branch each GA release commit is pushed to, alongside its tag:
 # `release/<X.Y.Z>`. One branch per release rather than per line, because every
@@ -1428,7 +1432,7 @@ is_valid_stamped_or_direct_release_commit() {
 
   local commit_subject
   commit_subject="$(git log -1 --format=%s "${tag_commit}" 2>/dev/null || echo "")"
-  local expected_subject="chore(release): stamp release version ${version}"
+  local expected_subject="${RELEASE_STAMP_SUBJECT_PREFIX} ${version}"
   if [ "${commit_subject}" != "${expected_subject}" ]; then
     echo "⚠️ Tag commit ${tag_commit:0:7} subject '${commit_subject}' does not match expected stamped subject '${expected_subject}'." >&2
     return 1
@@ -1511,7 +1515,7 @@ create_stamped_release_commit() {
     echo "📝 Stamping release version '${version}' in release tag commit..." >&2
     setup_git_bot_user
     git -C "${repo_dir}" add "${modified_files[@]}"
-    git -C "${repo_dir}" commit -m "chore(release): stamp release version ${version}" >/dev/null
+    git -C "${repo_dir}" commit -m "${RELEASE_STAMP_SUBJECT_PREFIX} ${version}" >/dev/null
     git -C "${repo_dir}" rev-parse HEAD
   else
     echo "${target_sha}"
