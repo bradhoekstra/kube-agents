@@ -145,8 +145,8 @@ variable "scope" {
     them: each is resolved to its projects at plan time by the
     kube-agents-scope-resolver module, handed in through
     scope_selector_members, and this module binds the same allowlist in every
-    one, the Shared VPC host and the scoping project included because the
-    reconcile's lookups read them. A project attached or linked after the
+    one, the scoping project included and roles/compute.viewer alone in a host
+    not otherwise in scope, because the reconcile's lookups read them. A project attached or linked after the
     last apply reads `denied` until the next one. An exclude entry that names
     a resolved member exactly, by ID or by the project number the Monitoring
     API returns, keeps it out of the bindings; a glob is evaluated by the

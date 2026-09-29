@@ -79,13 +79,21 @@ locals {
 
   # Every project bound with scope_roles: the explicit ones and the ones the
   # two selectors resolved to (below), once each, so a project both an entry
-  # and a selector name is one binding with one state address.
+  # and a selector name is one binding with one state address. A Shared VPC
+  # host that is not otherwise in scope is bound too, with the lookup role
+  # alone (below), in the same resource.
   scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)
 
-  scope_bindings = {
-    for pair in setproduct(sort(tolist(local.scope_bound_projects)), local.scope_roles) :
-    "${pair[0]}/${pair[1]}" => { project = pair[0], role = pair[1] }
-  }
+  scope_bindings = merge(
+    {
+      for pair in setproduct(sort(tolist(local.scope_bound_projects)), local.scope_roles) :
+      "${pair[0]}/${pair[1]}" => { project = pair[0], role = pair[1] }
+    },
+    {
+      for host in sort(tolist(local.scope_lookup_only_hosts)) :
+      "${host}/${local.scope_shared_vpc_lookup_role}" => { project = host, role = local.scope_shared_vpc_lookup_role }
+    },
+  )
 
   # The one role a container carries beyond the allowlist: the reconcile's
   # `asset search-all-resources --scope=<container>` needs it on the container
@@ -148,14 +156,13 @@ locals {
   # the host project; the precondition in main.tf refuses a host without it.
   scope_shared_vpc_lookup_role = "roles/compute.viewer"
 
-  # What the selectors add to the bound set: their members, less an exact
-  # exclude entry and the host project (which carries project_roles already),
-  # plus each Shared VPC host and each Metrics Scope's scoping project, which
-  # the reconcile's lookups have to read (compute.projects.get in the host;
-  # the scope itself in the scoping project) whether or not their own clusters
-  # are wanted -- the host is not among its service projects, and is named in
-  # scope.projects when they are. Both are bound even when an exclude entry
-  # names them: the exclusion drops their clusters from the set, not the
+  # What the selectors add to the set that carries the allowlist: their
+  # members, less an exact exclude entry and the host project (which carries
+  # project_roles already), plus each Metrics Scope's scoping project, which
+  # the reconcile's lookup has to read (resourcemanager.projects.get and
+  # .list there, which both managing roles carry, so the manageability
+  # precondition in main.tf covers the lookup too) whether or not an exclude
+  # entry names it: the exclusion drops its clusters from the set, not the
   # lookup that resolves the selector, which would otherwise read `denied`
   # every tick and freeze the selector. Only the declared selectors' entries
   # are read, so a stale key in the input binds nothing.
@@ -164,9 +171,19 @@ locals {
       for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project
       if project != var.project_id && !contains(var.scope.exclude.projects, project)
     ],
-    [for host in local.scope_shared_vpc_hosts : host if host != var.project_id],
     [for scope in local.scope_metrics_scopes : scope if scope != var.project_id],
   ))
+
+  # A Shared VPC host the reconcile's lookup has to read (compute.projects.get)
+  # but that is not otherwise in scope: it is not among its own service
+  # projects, and is named in scope.projects when its clusters are wanted, so
+  # the rest of the allowlist would have no consumer there. It gets the lookup
+  # role alone, whether or not an exclude entry names it, for the reason the
+  # scoping project is bound: an unreadable host freezes its selector.
+  scope_lookup_only_hosts = toset([
+    for host in local.scope_shared_vpc_hosts : host
+    if host != var.project_id && !contains(local.scope_bound_projects, host)
+  ])
 }
 
 resource "google_project_iam_member" "scope_roles" {

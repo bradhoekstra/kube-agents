@@ -64,10 +64,13 @@ output is this module's `scope_selector_members` input; the plan is refused when
 selector has no entry there, so a caller that skips the resolver is told so rather than getting
 the host bound and its members not. Not resolved here because the composition calls this module
 with a module-level `depends_on`, which would defer a data source inside it to apply time and fail
-the bindings' `for_each` as unknown on a first install. Each host, and each scoping project, is
-bound too, because the reconcile's lookups read them (`compute.projects.get` in the host; the
-scope in the scoping project), even when an exclude entry names them, and the plan is refused
-when `project_roles` carries no `roles/compute.viewer` beside a host. An `exclude.projects` entry
+the bindings' `for_each` as unknown on a first install. Each scoping project is bound too, and a host
+not otherwise in scope gets `roles/compute.viewer` alone, because the reconcile's lookups read them
+(`compute.projects.get` in the host; the two Resource Manager reads in the scoping project, which
+both managing roles carry), even when an exclude entry names them, and the plan is refused when
+`project_roles` carries no `roles/compute.viewer` beside a host. Binding a resolved project needs
+`setIamPolicy` there for the applying identity, as for an explicit project; a failure lands inside
+the apply, not in the plan. An `exclude.projects` entry
 that names a member exactly, by ID or by project number, keeps it out of the bindings, the one
 place `exclude` reaches IAM. Removing an entry revokes its bindings on the next apply, and
 `terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,

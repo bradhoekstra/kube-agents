@@ -554,8 +554,8 @@ same three reads the reconcile makes each run (the Compute API for a host's serv
 Monitoring API for a scope's monitored projects, Resource Manager to name each of those, which the
 Monitoring API returns by number), made with the google provider's own token so they are answered
 for the identity that applies, and hands the members to the IAM module, which binds the allowlist
-in every project resolved, and in each host and scoping project, which the reconcile's lookups
-have to read. The resolver is a module of its own, called without a `depends_on`, because the IAM
+in every project resolved and in each scoping project, and `roles/compute.viewer` alone in a host
+not otherwise in scope, which is all the reconcile's lookup of its service projects reads. The resolver is a module of its own, called without a `depends_on`, because the IAM
 module's module-level `depends_on` would defer a read inside it to apply time and fail the plan on
 a first install. A read that identity cannot make fails the plan before anything is applied,
 naming the selector and the API's answer: it needs
@@ -758,7 +758,7 @@ module "gke_cluster" {
 }
 ```
 
-(and likewise for `kube-agents-iam`, `chat-pubsub`, `github-minter`,
+(and likewise for `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`,
 `gke-backup-plan`, and `drift-pubsub`), and
 would install the chart from the OCI registry rather than a local path — see
 the [chart README](../../../charts/kube-agents/README.md).

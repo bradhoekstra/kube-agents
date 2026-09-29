@@ -253,11 +253,15 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # Only the declared selectors' entries are read from the input.
         self.assertIn("lookup(var.scope_selector_members, name, [])", selector)
         self.assertIn("if project != var.project_id && !contains(var.scope.exclude.projects, project)", selector)
-        # The host and the scoping project are bound whatever exclude says:
+        # The scoping project is bound with the allowlist whatever exclude
+        # says, and a host not otherwise in scope with the lookup role alone:
         # the reconcile's lookups read them, and an unbound one freezes the
-        # selector every tick.
-        self.assertIn("[for host in local.scope_shared_vpc_hosts : host if host != var.project_id]", selector)
+        # selector every tick, while the rest of the allowlist has no consumer
+        # in a host whose clusters are never listed.
         self.assertIn("[for scope in local.scope_metrics_scopes : scope if scope != var.project_id]", selector)
+        self.assertNotIn("local.scope_shared_vpc_hosts", selector)
+        self.assertIn("if host != var.project_id && !contains(local.scope_bound_projects, host)", self.scope_tf)
+        self.assertIn('"${host}/${local.scope_shared_vpc_lookup_role}" => { project = host, role = local.scope_shared_vpc_lookup_role }', self.scope_tf)
         # An excluded number is neither named nor bound, in the resolver.
         self.assertIn("if can(regex(local.scope_project_number_pattern, member)) && !contains(var.exclude_projects, member)", self.resolver_tf)
         # The snapshot's names, so the output reads beside fleet_scope.json.
@@ -278,6 +282,7 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("value       = sort(tolist(local.scope_shared_vpc_hosts))", outputs)
         self.assertIn("value       = sort(tolist(local.scope_metrics_scopes))", outputs)
         self.assertIn("value       = sort(tolist(local.scope_bound_projects))", outputs)
+        self.assertIn("value       = sort(tolist(local.scope_lookup_only_hosts))", outputs)
 
 
 def _crd_scope_schema():
@@ -442,7 +447,7 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
     def test_the_outputs_are_surfaced(self):
         outputs = (_COMPOSITION / "outputs.tf").read_text()
         for name in ("scope_projects", "scope_roles", "scope_folders", "scope_organizations", "scope_container_roles",
-                     "scope_shared_vpc_hosts", "scope_metrics_scopes", "scope_bound_projects"):
+                     "scope_shared_vpc_hosts", "scope_metrics_scopes", "scope_bound_projects", "scope_lookup_only_hosts"):
             with self.subTest(output=name):
                 self.assertIn(f"value       = module.kube_agents_iam.{name}", outputs)
         self.assertIn("value       = module.scope_resolver.members", outputs)

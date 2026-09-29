@@ -177,7 +177,10 @@ variable "scope" {
     runs. `exclude.projects` takes project IDs or shell-style globs;
     `exclude.clusters` names single clusters by the full triple, because a
     cluster name is unique only within a project and location. Neither
-    exclusion changes IAM. `folders` and `organizations` are numeric Resource
+    exclusion changes IAM, except that an `exclude.projects` entry naming a
+    selector's member exactly (by ID, or by project number for a monitored
+    project) withholds its grant; a glob is the reconcile's alone. `folders`
+    and `organizations` are numeric Resource
     Manager IDs: each is bound on the container itself with the same allowlist
     plus roles/cloudasset.viewer, so every project beneath it inherits the
     grant and a project created under a declared folder later is discovered
@@ -189,8 +192,8 @@ variable "scope" {
     are project IDs, of a Shared VPC host and of a Metrics Scope's scoping
     project: the module resolves each to the projects it reaches at plan
     time, as the identity Terraform plans with, and binds the allowlist in
-    every one (and in the host and scoping project themselves, which the
-    reconcile's lookups read),
+    every one (and in each scoping project, and roles/compute.viewer alone in
+    a host not otherwise in scope, for the reconcile's lookups),
     because nothing is inherited through either; a project attached or
     linked after the apply reads denied until the next one. A lookup the
     planning identity cannot make fails the plan with the selector named,

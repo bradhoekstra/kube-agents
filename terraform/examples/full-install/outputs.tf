@@ -141,7 +141,7 @@ output "scope_container_roles" {
 }
 
 output "scope_shared_vpc_hosts" {
-  description = "The Shared VPC host projects scope.shared_vpc_hosts named; each was resolved at plan time to its service projects (scope_selector_members) and is bound with scope_roles itself for the reconcile's lookup."
+  description = "The Shared VPC host projects scope.shared_vpc_hosts named; each was resolved at plan time to its service projects (scope_selector_members) and, unless otherwise in scope, is bound with roles/compute.viewer alone for the reconcile's lookup (scope_lookup_only_hosts)."
   value       = module.kube_agents_iam.scope_shared_vpc_hosts
 }
 
@@ -156,6 +156,11 @@ output "scope_selector_members" {
 }
 
 output "scope_bound_projects" {
-  description = "Every project beyond project_id the IAM module bound scope_roles in: the explicit projects, the selectors' members less an exact exclude entry, and each Shared VPC host and Metrics Scope scoping project."
+  description = "Every project beyond project_id the IAM module bound scope_roles in: the explicit projects, the selectors' members less an exact exclude entry, and each Metrics Scope scoping project."
   value       = module.kube_agents_iam.scope_bound_projects
+}
+
+output "scope_lookup_only_hosts" {
+  description = "The Shared VPC hosts bound with roles/compute.viewer alone, for the reconcile's lookup of their service projects: every declared host that is neither project_id nor otherwise in scope."
+  value       = module.kube_agents_iam.scope_lookup_only_hosts
 }

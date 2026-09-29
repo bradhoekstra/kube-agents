@@ -607,7 +607,7 @@ leaves the scope by being removed from `projects` and applied. Once a release ha
 The agent's service account needs the read roles in each project named, the read roles plus
 `roles/cloudasset.viewer` on each folder and organisation (numeric IDs, every project beneath
 inherits the grant), and the read roles in every project a Shared VPC host or Metrics Scope
-(project IDs) resolves to, and in the host itself; the composition binds them from the same
+(project IDs) resolves to, in each scoping project, and `roles/compute.viewer` alone in a host not otherwise in scope; the composition binds them from the same
 value, resolving the two selectors at plan time, and a chart installed on its own needs them
 granted by hand.
 

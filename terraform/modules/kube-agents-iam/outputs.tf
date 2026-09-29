@@ -69,9 +69,10 @@ output "scope_container_roles" {
 
 output "scope_shared_vpc_hosts" {
   description = <<-EOT
-    The Shared VPC host projects scope.shared_vpc_hosts named. Each is bound
-    with scope_roles itself, so the reconcile's lookup can read it, beside
-    the service projects scope_selector_members resolved it to.
+    The Shared VPC host projects scope.shared_vpc_hosts named. One that is
+    not otherwise in scope is bound with roles/compute.viewer alone, so the
+    reconcile's lookup can read it (scope_lookup_only_hosts); one that is
+    carries scope_roles like any other member.
   EOT
   value       = sort(tolist(local.scope_shared_vpc_hosts))
 }
@@ -90,7 +91,18 @@ output "scope_bound_projects" {
   description = <<-EOT
     Every project beyond project_id bound with scope_roles: the explicit
     scope.projects, the selectors' members less an exact exclude entry, and
-    each Shared VPC host and Metrics Scope scoping project, once each.
+    each Metrics Scope scoping project, once each. A Shared VPC host that is
+    not among them is in scope_lookup_only_hosts instead.
   EOT
   value       = sort(tolist(local.scope_bound_projects))
+}
+
+output "scope_lookup_only_hosts" {
+  description = <<-EOT
+    The Shared VPC hosts bound with roles/compute.viewer alone, for the
+    reconcile's lookup of their service projects: every host in
+    scope.shared_vpc_hosts that is neither project_id nor in
+    scope_bound_projects.
+  EOT
+  value       = sort(tolist(local.scope_lookup_only_hosts))
 }

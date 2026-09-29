@@ -245,16 +245,19 @@ A Shared VPC host or a Metrics Scope inherits nothing, so the composition resolv
 when Terraform plans (the `kube-agents-scope-resolver` module), with the same reads the reconcile
 makes each run (the Compute API for a host's service projects, the Monitoring API for a scope's
 monitored projects, Resource Manager to name each of those by ID) made with the google provider's
-own token, and the IAM module binds the read roles in each, and in the host and scoping project
-themselves, which the reconcile's lookups read. A read that identity cannot make fails
+own token, and the IAM module binds the read roles in each and in the scoping project, and
+`roles/compute.viewer` alone in a host not otherwise in scope, which the reconcile's lookups read. A
+read that identity cannot make fails
 the plan, before anything is applied, naming the selector, the status and the API's message: it
 needs `compute.projects.get` on a host, to read the Metrics Scope in its scoping project with the
 Monitoring API enabled there, and `resourcemanager.projects.get` on every monitored project; a
 monitored project it cannot name is left out by naming its project number in
-`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors as
+`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors' reads as
 `check_scope_container_access` probes a container: a container's failure lands inside the apply,
-after the Asset API is enabled and some containers are bound, while a selector's lands in the plan
-with nothing changed, `upgrade.sh --plan` included. What the selectors do not have is a container's
+after the Asset API is enabled and some containers are bound, while a failed read lands in the plan
+with nothing changed, `upgrade.sh --plan` included. The bindings themselves are the explicit
+projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
+apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
 full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
 entry that names a selector's member exactly, by ID or by number, keeps it out of the bindings, the
@@ -332,7 +335,8 @@ uninstall (a Shared VPC host or Metrics Scope this identity can no longer read f
 same way, since the lookup runs on every plan except `uninstall.sh`'s destroy, which blanks the
 selector keys). Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`,
 `SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES`, or, for a project a selector resolved to, name
-it exactly in `SCOPE_EXCLUDE_PROJECTS` (its ID, or its project number for a monitored project), and forget
+it exactly in `SCOPE_EXCLUDE_PROJECTS` (a monitored project the identity can no longer name only by
+its project number, since the ID is what the plan could not read; a service project by its ID), and forget
 its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
 against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
 `module.kube_agents_iam.google_folder_iam_member.scope_roles` or

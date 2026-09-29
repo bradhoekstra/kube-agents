@@ -854,7 +854,8 @@ platformAgent:
   # the field). The agent's service account needs the read roles in each
   # project named, the read roles plus roles/cloudasset.viewer on each folder
   # and organisation, and the read roles in every project a Shared VPC host or
-  # Metrics Scope resolves to, and in the host and scoping project themselves;
+  # Metrics Scope resolves to, in each scoping project, and roles/compute.viewer
+  # alone in a host not otherwise in scope;
   # the Terraform composition binds them from the same value it passes here,
   # resolving the two selectors at plan time, and a chart installed on its own
   # needs them granted by hand.
