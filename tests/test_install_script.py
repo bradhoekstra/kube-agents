@@ -7648,6 +7648,45 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertLess(preflight, crds)
         self.assertLess(crds, apply)
 
+    def test_the_selector_apis_are_enabled_where_the_apply_is_about_to_run(self):
+        # The plan-time resolution of a Shared VPC host or Metrics Scope reads
+        # three APIs the apply is what enables, so a first install enables
+        # them first: after the generate-only route has left, before the
+        # apply; and in the menu's re-apply, after the checks, before the CRDs.
+        handoff = self.text.index('print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"')
+        step12 = self.text.index('print_step "12. Applying the Install (Terraform + Helm)"')
+        enable = self.text.index('enable_scope_selector_apis "$project_id"')
+        apply = self.text.index('run_lifecycle_apply "$repo_dir" "$provisioning_log"')
+        self.assertLess(handoff, step12)
+        self.assertLess(step12, enable)
+        self.assertLess(enable, apply)
+        menu_check = self.text.index('        check_scope_container_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
+        self.assertLess(menu_check, handoff)
+
+    def test_the_generate_only_handoff_names_the_selector_apis_only_when_a_selector_is_declared(self):
+        cmd_template = """
+{source}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+export SCOPE_METRICS_SCOPES="{scope}"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        line = "gcloud services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com --project=test-proj"
+        with tempfile.TemporaryDirectory() as tmp:
+            empty = pathlib.Path(tmp) / "install.env"
+            empty.write_text("")
+            def run(scope):
+                setup = f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n' + cmd_template.format(source=_SOURCE_INSTALLER_COMMON, scope=scope)
+                return _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(empty)}), cwd=_REPO_ROOT)
+            proc = run("observability-hub")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(line, proc.stdout)
+            self.assertIn("enable them first, or the plan is refused", proc.stdout)
+            proc = run("")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn(line, proc.stdout)
+
     def test_the_menu_refuses_a_scope_flag(self):
         proc = subprocess.run(
             ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],

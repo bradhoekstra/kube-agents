@@ -64,6 +64,11 @@ locals {
   scope_lookup_retry_attempts = 2
   # How much of an API's error body an error message carries.
   scope_lookup_error_excerpt_chars = 300
+  # What a 403 says when the cause is the API being off in, or no quota set
+  # for, the consumer project rather than a missing grant: the same reasons
+  # the installer's container preflight reads as not a permission answer.
+  # Here the consumer project is quota_project, so the remedy is one place.
+  scope_api_off_markers = ["SERVICE_DISABLED", "has not been used in project", "quota project", "USER_PROJECT_DENIED"]
 }
 
 # The identity the google provider plans and applies with, so every read
@@ -74,8 +79,11 @@ data "google_client_config" "scope_resolver" {
 }
 
 locals {
+  # The bearer, and the consumer project every read is billed to, so the
+  # answer is the same whichever credential type the provider holds.
   scope_resolver_headers = local.scope_resolves_selectors ? {
-    Authorization = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"
+    Authorization         = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"
+    "x-goog-user-project" = var.quota_project
   } : {}
 
   scope_resolver_identity = "the identity the google provider plans with (its configured credentials, impersonation included)"
@@ -95,7 +103,7 @@ data "http" "scope_shared_vpc_host" {
   lifecycle {
     postcondition {
       condition     = self.status_code == 200 || (self.status_code == 400 && strcontains(self.response_body, local.scope_not_xpn_host_marker))
-      error_message = "shared_vpc_hosts: the service projects of ${each.key} could not be listed by ${local.scope_resolver_identity}; the Compute API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs compute.projects.get on the host project (roles/compute.viewer carries it), and the Compute API enabled there; or drop the host from shared_vpc_hosts. Nothing was applied."
+      error_message = "shared_vpc_hosts: the service projects of ${each.key} could not be listed by ${local.scope_resolver_identity}; the Compute API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs compute.projects.get on the host project (roles/compute.viewer carries it), and the Compute API enabled there; or drop the host from shared_vpc_hosts.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: compute.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable compute.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
     }
     postcondition {
       # A 200 whose body does not decode, or whose resources lack an id or a
@@ -126,7 +134,7 @@ data "http" "scope_metrics_scope" {
   lifecycle {
     postcondition {
       condition     = self.status_code == 200
-      error_message = "metrics_scopes: the Metrics Scope of ${each.key} could not be read by ${local.scope_resolver_identity}; the Monitoring API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs to read the scope in its scoping project (roles/monitoring.metricsScopesViewer is the narrowest role), and monitoring.googleapis.com enabled there; or drop it from metrics_scopes. Nothing was applied."
+      error_message = "metrics_scopes: the Metrics Scope of ${each.key} could not be read by ${local.scope_resolver_identity}; the Monitoring API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs to read the scope in its scoping project (roles/monitoring.metricsScopesViewer is the narrowest role), and monitoring.googleapis.com enabled there; or drop it from metrics_scopes.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: monitoring.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable monitoring.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
     }
     postcondition {
       # A scope always monitors its own scoping project, so a 200 that
@@ -198,7 +206,7 @@ data "http" "scope_monitored_project" {
   lifecycle {
     postcondition {
       condition     = self.status_code == 200
-      error_message = "metrics_scopes: monitored project ${each.key} could not be named by ${local.scope_resolver_identity}; Resource Manager answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. A project this identity cannot name it cannot bind, and the agent would read it denied. Ask for resourcemanager.projects.get on projects/${each.key} for that identity, or name the number in exclude_projects (the scope's exclude.projects) to leave it out. Nothing was applied."
+      error_message = "metrics_scopes: monitored project ${each.key} could not be named by ${local.scope_resolver_identity}; Resource Manager answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. A project this identity cannot name it cannot bind, and the agent would read it denied. Ask for resourcemanager.projects.get on projects/${each.key} for that identity, or name the number in exclude_projects (the scope's exclude.projects) to leave it out.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: cloudresourcemanager.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable cloudresourcemanager.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
     }
     postcondition {
       condition     = self.status_code != 200 || can(regex(local.scope_project_id_pattern, jsondecode(self.response_body).projectId))

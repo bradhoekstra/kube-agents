@@ -148,9 +148,11 @@ variable "scope" {
     one, the scoping project included and roles/compute.viewer alone in a host
     not otherwise in scope, because the reconcile's lookups read them. A project attached or linked after the
     last apply reads `denied` until the next one. An exclude entry that names
-    a resolved member exactly, by ID or by the project number the Monitoring
-    API returns, keeps it out of the bindings; a glob is evaluated by the
-    reconcile alone.
+    a Shared VPC service project by ID, or a monitored project by the project
+    number the Monitoring API returns, keeps it out of the bindings; a
+    monitored project excluded by ID keeps its grant, which the reconcile's
+    naming call needs before the exclusion can match; a glob is evaluated by
+    the reconcile alone.
 
     Empty, the default, binds nothing and the reconcile lists project_id alone.
   EOT

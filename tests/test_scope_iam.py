@@ -212,7 +212,15 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # google_client_config is the provider's configured identity, impersonation
         # included: the lookup passes or fails for the principal that applies.
         self.assertIn('data "google_client_config" "scope_resolver"', self.resolver_tf)
-        self.assertIn('Authorization = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"', self.resolver_tf)
+        self.assertIn('Authorization         = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"', self.resolver_tf)
+        # And the management project as the consumer project, so the APIs the
+        # reads use are the ones the composition enables there, whichever
+        # credential type the provider holds; a 403 that names a disabled API
+        # is reported with that remedy rather than as a missing grant.
+        self.assertIn('"x-goog-user-project" = var.quota_project', self.resolver_tf)
+        self.assertIn('variable "quota_project"', (_RESOLVER / "variables.tf").read_text())
+        self.assertIn('scope_api_off_markers = ["SERVICE_DISABLED", "has not been used in project", "quota project", "USER_PROJECT_DENIED"]', self.resolver_tf)
+        self.assertEqual(self.resolver_tf.count("is off in ${var.quota_project}, the project these reads are billed to"), 3)
         for name in ("scope_shared_vpc_host", "scope_metrics_scope", "scope_monitored_project"):
             with self.subTest(read=name):
                 self.assertIn("request_headers    = local.scope_resolver_headers", self._data("http", name))
@@ -258,7 +266,11 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         selector = re.search(r"scope_selector_projects = toset\(concat\((.*?)\n  \)\)", self.scope_tf, re.DOTALL).group(1)
         # Only the declared selectors' entries are read from the input.
         self.assertIn("lookup(var.scope_selector_members, name, [])", selector)
-        self.assertIn("if project != var.project_id && !contains(var.scope.exclude.projects, project)", selector)
+        # An ID exclusion withholds a Shared VPC service project's grant only:
+        # a monitored project excluded by ID still needs the grant for the
+        # reconcile's naming call, or it is reported unnamed and holds the
+        # scope prune every tick; one excluded by number never arrives here.
+        self.assertIn('if pair.project != var.project_id && !(startswith(pair.name, "sharedVpcHosts/") && contains(var.scope.exclude.projects, pair.project))', selector)
         # The scoping project is bound with the allowlist whatever exclude
         # says, and a host not otherwise in scope with the lookup role alone:
         # the reconcile's lookups read them, and an unbound one freezes the
@@ -426,6 +438,7 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn("shared_vpc_hosts = var.scope.shared_vpc_hosts", body)
         self.assertIn("metrics_scopes   = var.scope.metrics_scopes", body)
         self.assertIn("exclude_projects = var.scope.exclude.projects", body)
+        self.assertIn("quota_project = var.project_id", body)
         self.assertNotIn("depends_on", body)
         self.assertNotRegex(body, r"(google_|module\.gke)")
         iam = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', self.main_tf, re.DOTALL).group(1)

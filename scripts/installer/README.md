@@ -260,8 +260,14 @@ projects' case: a resolved project the applying identity cannot set IAM policy i
 apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
 full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
-entry that names a selector's member exactly, by ID or by number, keeps it out of the bindings, the
-one place an exclusion reaches IAM, because the member has no list to be dropped from.
+entry that names a Shared VPC service project by ID, or a monitored project by its project number,
+keeps it out of the bindings, the one place an exclusion reaches IAM, because the member has no list
+to be dropped from; a monitored project excluded by ID keeps its grant, which the reconcile's naming
+call needs before the exclusion can match. The reads are billed to the management project and use
+its `cloudresourcemanager`, `monitoring` and `compute` APIs, which the composition enables in the
+apply that follows the plan, so `install.sh` enables them before a first install's apply
+(`enable_scope_selector_apis`) and the generate-only handoff names the command; `upgrade.sh` does
+not, because an existing install has them on.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a

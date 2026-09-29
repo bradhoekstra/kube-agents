@@ -185,6 +185,13 @@ readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not b
 # may well be held, so it is not a permission answer either, and the remedy
 # is the token's scope, not a grant.
 readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
+# The APIs the plan-time resolution of a Shared VPC host or Metrics Scope
+# reads (terraform/modules/kube-agents-scope-resolver), billed to the
+# management project, which the resolver sends as the quota project: enabled
+# before a first install's apply by enable_scope_selector_apis, because the
+# reads run in the plan and the composition enables them only in the apply
+# that follows.
+readonly SCOPE_SELECTOR_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -1264,6 +1271,24 @@ check_scope_container_access() {
   for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
   print_info "Nothing was changed. Fix what is named above, or edit SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
   return 1
+}
+
+# Enables, in the management project, the APIs the plan-time resolution of a
+# declared Shared VPC host or Metrics Scope reads (SCOPE_SELECTOR_APIS). The
+# reads run in the plan and are billed to that project, and the composition
+# enables the APIs only in the apply that follows, so a first install that
+# declared a selector would otherwise be refused at plan with the API
+# reported disabled. Idempotent, and an existing install has them on already;
+# silent when no selector is declared, so an install without one never calls
+# gcloud here. Runs where the apply is about to happen, never on a plan or a
+# generate-only run, whose handoff names the command instead. $1 the project
+# (PROJECT_ID by default). Caller defines print_info.
+enable_scope_selector_apis() {
+  [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] || return 0
+  local project="${1:-${PROJECT_ID:-}}"
+  print_info "Enabling the APIs the scope's Shared VPC host and Metrics Scope lookups read in project '${project}' (${SCOPE_SELECTOR_APIS// /, }), which the plan makes before the apply enables them..."
+  # shellcheck disable=SC2086
+  gcloud services enable $SCOPE_SELECTOR_APIS --project="$project"
 }
 
 # The credentials the google provider will apply with, read in its own order

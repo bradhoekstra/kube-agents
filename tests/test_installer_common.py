@@ -3073,6 +3073,48 @@ _GOOGLE_CREDENTIAL_VARIABLES = (
 )
 
 
+class ScopeSelectorApisTest(unittest.TestCase):
+    """enable_scope_selector_apis: silent with no selector declared; with one,
+    enables the three APIs the plan-time resolution reads, in the management
+    project, since the reads run in the plan and the composition enables the
+    APIs only in the apply that follows."""
+
+    def _run(self, keys):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            log = pathlib.Path(tmp) / "gcloud.log"
+            log.write_text("")
+            (bin_dir / "gcloud").write_text('#!/usr/bin/env bash\necho "$*" >>"$GCLOUD_LOG"\nexit 0\n')
+            (bin_dir / "gcloud").chmod(0o755)
+            env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
+                   "GCLOUD_LOG": str(log)}
+            env.update(keys)
+            body = (
+                "set -u\n"
+                'print_info() { echo "INFO: $*"; }; print_error() { echo "ERROR: $*"; }; print_warning() { :; }; print_success() { :; }\n'
+                f'source "{_INSTALLER_COMMON}"\n'
+                'enable_scope_selector_apis; echo "rc=$?"\n'
+            )
+            proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
+                                  env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)), cwd=str(_REPO_ROOT))
+            return proc, log.read_text()
+
+    def test_no_selector_calls_nothing(self):
+        proc, calls = self._run({"SCOPE_PROJECTS": "p2-project", "SCOPE_FOLDERS": "123456789012"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_selector_enables_the_three_apis_in_the_management_project(self):
+        for keys in ({"SCOPE_METRICS_SCOPES": "observability-hub"}, {"SCOPE_SHARED_VPC_HOSTS": "shared-net-host, other-host"}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com --project=test-project\n")
+                self.assertIn("INFO: Enabling the APIs the scope's Shared VPC host and Metrics Scope lookups read in project 'test-project'", proc.stdout)
+
+
 class ScopeContainerPreflightTest(unittest.TestCase):
     """check_scope_container_access: silent with no container; with one, the
     Asset API must be enabled in the host project or no effective policy may

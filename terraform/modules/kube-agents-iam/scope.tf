@@ -16,9 +16,14 @@
 # `projects` is bound even when an exclude entry removes it from the resolved
 # set -- drop it from `projects` instead. The one exception is a project a
 # selector resolved to, which has no list to be dropped from: an exclude entry
-# that names it exactly, by ID or by the project number the Monitoring API
-# returns, keeps it out of the plan-time set below, so the operator's only
-# lever over a selector's members also withholds the grant.
+# that names a Shared VPC service project by ID, or a monitored project by the
+# number the Monitoring API returns (applied in the resolver, before naming),
+# keeps it out of the bindings, so the operator's only lever over a selector's
+# members also withholds the grant. A monitored project excluded by ID keeps
+# its grant: the reconcile names every monitored project with the agent's own
+# credentials before it can match an ID entry, and without a grant the naming
+# fails, the member is reported by number as unnamed, and the scope prune is
+# held on every tick.
 #
 # What a scoped project gets is `local.scope_roles`, never `var.project_roles`
 # (design §6). The allowlist below is the read subset of the default project
@@ -166,10 +171,18 @@ locals {
   # lookup that resolves the selector, which would otherwise read `denied`
   # every tick and freeze the selector. Only the declared selectors' entries
   # are read, so a stale key in the input binds nothing.
+  # An exact exclude entry withholds a Shared VPC service project's grant
+  # only: a monitored project excluded by ID still needs the grant for the
+  # reconcile's naming call (the header comment says why), and one excluded
+  # by number never reached this input.
   scope_selector_projects = toset(concat(
     [
-      for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project
-      if project != var.project_id && !contains(var.scope.exclude.projects, project)
+      for pair in flatten([
+        for name in local.scope_selector_names : [
+          for project in lookup(var.scope_selector_members, name, []) : { name = name, project = project }
+        ]
+      ]) : pair.project
+      if pair.project != var.project_id && !(startswith(pair.name, "sharedVpcHosts/") && contains(var.scope.exclude.projects, pair.project))
     ],
     [for scope in local.scope_metrics_scopes : scope if scope != var.project_id],
   ))

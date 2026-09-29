@@ -34,6 +34,27 @@ variable "metrics_scopes" {
   }
 }
 
+variable "quota_project" {
+  description = <<-EOT
+    The project the three reads are billed to and whose enabled APIs they
+    use, sent as the x-goog-user-project header: the management project. With
+    it the answer does not depend on the credential's type (a user credential
+    has no consumer project of its own; a service account's is its own
+    project, which need not be the management project), and the APIs the
+    reads need (cloudresourcemanager, monitoring, compute) are the ones the
+    composition enables there, and install.sh enables before a first apply.
+    The identity needs serviceusage.services.use on it, which an identity
+    that applies the composition holds.
+  EOT
+  type        = string
+  nullable    = false
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", var.quota_project))
+    error_message = "quota_project is a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$)."
+  }
+}
+
 variable "exclude_projects" {
   description = <<-EOT
     The scope's `exclude.projects` entries. Only an entry that is a bare

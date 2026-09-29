@@ -516,8 +516,8 @@ rendered on every apply, empty lists included: an emptied `projects` list is the
 drops projects (their read roles are revoked and their Cluster Agent profiles retire over the
 reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
-`cluster_name` triple; neither changes IAM, except that an entry naming a selector's member exactly
-withholds its grant (below). Through the installer the value comes from
+`cluster_name` triple; neither changes IAM, except that an entry naming a Shared VPC service project
+by ID, or a monitored project by number, withholds its grant (below). Through the installer the value comes from
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
 `SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
@@ -566,10 +566,14 @@ naming the selector and the API's answer: it needs
 (`roles/monitoring.metricsScopesViewer` is the narrowest role) with `monitoring.googleapis.com`
 enabled there, and `resourcemanager.projects.get` on each monitored project; a monitored project
 it cannot name, or one whose ID the scope cannot carry, is left out by naming its project number
-in `exclude.projects`. A project that is not a Shared VPC host resolves to no members, as it does
-at runtime. An exclude entry that names a resolved member exactly (by ID, or by number for a
-monitored project) keeps it out of the bindings, the one place `exclude` reaches IAM, because a
-selector's member has no list to be dropped from; a glob is the reconcile's alone. What the
+in `exclude.projects`. The reads are billed to `project_id`, whose `cloudresourcemanager`,
+`monitoring` and `compute` APIs they use; the composition enables them in the apply, so `install.sh`
+enables them before a first install's apply, and a 403 that names a disabled API is reported with
+that remedy. A project that is not a Shared VPC host resolves to no members, as it does
+at runtime. An exclude entry that names a Shared VPC service project by ID, or a monitored project
+by number, keeps it out of the bindings, the one place `exclude` reaches IAM, because a selector's
+member has no list to be dropped from; a monitored project excluded by ID keeps its grant, which the
+reconcile's naming call needs before the exclusion can match; a glob is the reconcile's alone. What the
 selectors do not have is a container's zero-touch onboarding: a service project attached, or a
 project added to the scope, after the last apply reads `denied` in the reconcile's snapshot until
 the next apply binds it. `scope_selector_members` outputs what each resolved to, under the name

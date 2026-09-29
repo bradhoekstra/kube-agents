@@ -178,8 +178,9 @@ variable "scope" {
     `exclude.clusters` names single clusters by the full triple, because a
     cluster name is unique only within a project and location. Neither
     exclusion changes IAM, except that an `exclude.projects` entry naming a
-    selector's member exactly (by ID, or by project number for a monitored
-    project) withholds its grant; a glob is the reconcile's alone. `folders`
+    Shared VPC service project by ID, or a monitored project by its project
+    number, withholds its grant (a monitored project excluded by ID keeps
+    it, for the reconcile's naming call); a glob is the reconcile's alone. `folders`
     and `organizations` are numeric Resource
     Manager IDs: each is bound on the container itself with the same allowlist
     plus roles/cloudasset.viewer, so every project beneath it inherits the

@@ -386,9 +386,12 @@ follow the selector type:
   lands inside the apply, a failed read in the plan with nothing changed. The bindings are the
   explicit projects' case, a project the applying identity cannot set IAM policy in failing inside
   the apply, and a `testIamPermissions` probe over the resolved set is a follow-up for both. An `exclude.projects` entry that names a resolved member exactly (by
-  ID, or by the number the Monitoring API returned) keeps it out of the bindings, the one place an
-  exclusion reaches IAM, because a selector's member has no list to be dropped from; a project
-  that is not a Shared VPC host resolves to no members, as at runtime.
+  ID for a Shared VPC service project, or by the number the Monitoring API returned for a
+  monitored project) keeps it out of the bindings, the one place an exclusion reaches IAM, because
+  a selector's member has no list to be dropped from; a monitored project excluded by ID keeps its
+  grant, because the reconcile names every monitored project with the agent's credentials before it
+  can match the entry and an unnamed member holds the scope prune; a project that is not a Shared
+  VPC host resolves to no members, as at runtime.
 
 `scope_roles` is a fixed allowlist of read roles intersected with `project_roles`, never
 `project_roles` itself, and it is what every grant outside the host project carries, whether the
@@ -438,7 +441,11 @@ Prerequisites the design has to state and the installer has to preflight:
   project, and `setIamPolicy` in every project resolved. No shell preflight probes them: a read
   the identity cannot make fails the plan itself, before anything is applied, and a binding it
   cannot make fails inside the apply exactly as an explicit project's does (the phase 3 bullet
-  above says why).
+  above says why). The reads name the management project as their consumer project, so they use
+  its `cloudresourcemanager`, `monitoring` and `compute` APIs whichever credential type applies;
+  the composition enables those in the apply, so `install.sh` enables them before a first
+  install's apply, the one out-of-Terraform step the selectors add, and the resolver's refusal
+  names that project when the API's answer says the API is off.
 - When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
   the host project. The preflight checks, before the apply that then binds the agent's
   `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced

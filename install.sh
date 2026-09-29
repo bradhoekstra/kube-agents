@@ -2494,6 +2494,11 @@ print_generate_only_handoff() {
     echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
     echo -e "  # on the container, and a warning above, if any, says what this identity could not."
   fi
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading three APIs"
+    echo -e "  # this apply is what enables, so on a first install enable them first, or the plan is refused:"
+    echo -e "  gcloud services enable ${SCOPE_SELECTOR_APIS} --project=${project_id}"
+  fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
   echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
@@ -3836,6 +3841,7 @@ run_menu_system() {
           --project "$PROJECT_ID" $GKE_DNS_ENDPOINT_FLAG >/dev/null 2>&1 || true
         refuse_apply_over_undeclared_scope "${NAMESPACE:-$DEFAULT_NAMESPACE}" || exit 1
         check_scope_container_access || exit 1
+        enable_scope_selector_apis "$PROJECT_ID"
         apply_crd_upgrades "$repo_dir"
         print_info "Re-applying the install to GKE cluster '$cluster_name' (terraform apply)..."
         run_lifecycle_apply "$repo_dir" "/tmp/kube-agents-apply-$(date -u +%Y%m%dT%H%M%SZ).log"
@@ -5382,6 +5388,10 @@ main() {
   # and the non-interactive flag path. Warns-only when GitHub is unreachable;
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
   check_github_org_is_organization "${GITOPS_ORG:-}"
+  # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
+  # reads three APIs the apply below is what enables; on a first install they
+  # have to be on before the plan, or it is refused with the API disabled.
+  enable_scope_selector_apis "$project_id"
 
   # The three script behaviours a data source cannot express: CMEK, the
   # Workload Identity pool, and NetworkPolicy enforcement on a cluster that

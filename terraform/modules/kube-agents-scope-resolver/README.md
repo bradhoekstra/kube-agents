@@ -15,7 +15,12 @@ resolves to no members, as it does at runtime); the Monitoring API's `metricsSco
 scope's monitored projects, which it names by project number; and Resource Manager v3 to name each
 number. Every read carries the google provider's own access token (`data "google_client_config"`),
 so it is answered for the identity that applies, impersonation included, and not for gcloud's
-active account. A read that fails fails the plan, before anything is applied, with the selector,
+active account, and names `quota_project` (the management project) as the consumer project, so the
+APIs it uses and the quota it draws are that project's whichever credential type the provider
+holds. Those APIs (`cloudresourcemanager`, `monitoring`, `compute`) are ones the composition
+enables in the apply that follows the plan, so `install.sh` enables them before a first install's
+apply; a 403 that names a disabled API or the consumer project is reported with that remedy rather
+than as a missing grant. A read that fails fails the plan, before anything is applied, with the selector,
 the HTTP status and the API's message in the error: the identity needs `compute.projects.get` on a
 host, to read the Metrics Scope in its scoping project (`roles/monitoring.metricsScopesViewer` is
 the narrowest role) with `monitoring.googleapis.com` enabled there, and
@@ -24,10 +29,12 @@ module reads is refused rather than read as an empty selector, since an empty se
 apply is every member's bindings revoked. A monitored project the identity cannot name, or whose ID
 the scope cannot carry (a legacy domain-scoped ID), is left out by naming its project number in
 `exclude_projects`, the scope's `exclude.projects`; that is the only entry of that list this module
-acts on. A service project of a Shared VPC host with such an ID has no number to be excluded by, so
+acts on, and the only exclusion that keeps a monitored project out of the bindings: the reconcile
+has to name a monitored project, with the agent's own grant in it, before it can match an ID
+entry, so `kube-agents-iam` leaves the grant of a monitored project excluded by ID in place. A service project of a Shared VPC host with such an ID has no number to be excluded by, so
 it is left out of `members` on its own, listed in `uncarriable_members`, and warned about by a
-`check` block on every plan, while the host's other service projects are bound as usual. IDs and globs are the callers': `kube-agents-iam` withholds the grant of a member an entry
-names by ID, the reconcile evaluates globs.
+`check` block on every plan, while the host's other service projects are bound as usual. IDs and globs are the callers': `kube-agents-iam` withholds the grant of a Shared VPC service
+project an entry names by ID, the reconcile evaluates globs.
 
 ## Why a module of its own
 

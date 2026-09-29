@@ -275,6 +275,10 @@ module "scope_resolver" {
   shared_vpc_hosts = var.scope.shared_vpc_hosts
   metrics_scopes   = var.scope.metrics_scopes
   exclude_projects = var.scope.exclude.projects
+  # The consumer project of the reads: the management project, whose APIs
+  # this composition enables (and install.sh pre-enables before a first apply,
+  # since the reads run in the plan).
+  quota_project = var.project_id
 }
 
 module "kube_agents_iam" {
