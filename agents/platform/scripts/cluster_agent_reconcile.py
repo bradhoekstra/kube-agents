@@ -743,6 +743,15 @@ def _resolve_projects(management: str | None, scope: dict,
     patterns = scope["exclude"]["projects"]
     entries: list[dict] = []
 
+    def excluded(project: str, number: str | None) -> bool:
+        # A selector's member matches an entry by the ID it is keyed under or by the number
+        # a Metrics Scope named it by. The number is the only handle an operator has before
+        # the project is named, and the one the install path withholds the grant on, so it
+        # has to keep matching once a past run has named the project and this run's naming
+        # call is refused because that grant is gone: the member is keyed under the ID the
+        # snapshot remembers then, and on the ID alone it would read denied on every tick.
+        return bool(_excluded_by(project, patterns) or (number and _excluded_by(number, patterns)))
+
     def listed_count() -> int:
         # What the cap counts: the projects this run lists, and the ones a frozen container
         # last listed. A member carried over-cap is in the set but not listed, so it does
@@ -847,7 +856,7 @@ def _resolve_projects(management: str | None, scope: dict,
             keep_number(project, info[NUMBER_KEY])
             continue
         seen.add(project)
-        if _excluded_by(project, patterns):
+        if excluded(project, info[NUMBER_KEY]):
             continue
         outcome = info["outcome"]
         if outcome is None and listed_count() >= RESOLVED_SET_CAP:
@@ -866,7 +875,7 @@ def _resolve_projects(management: str | None, scope: dict,
             add_via(project, selector)
             keep_number(project, _previous_number(previous, project))
             continue
-        if _excluded_by(project, patterns):
+        if excluded(project, _previous_number(previous, project)):
             continue
         seen.add(project)
         # Frozen (design §4): carried under the selector's outcome, so a failed lookup never
@@ -1501,7 +1510,9 @@ def reconcile(dry_run: bool = False) -> dict:
         container_vias = [v for v in via if _is_container(v)]
         if VIA_MANAGEMENT in via:
             return False
-        if _excluded_by(project, exclude_patterns):
+        # By ID, or by the number the row keeps: the declaration speaking, either way.
+        number = _previous_number(previous, project)
+        if _excluded_by(project, exclude_patterns) or (number and _excluded_by(number, exclude_patterns)):
             return False
         if not container_vias:
             # A selector has no index and no lag: a member it no longer names is the

@@ -224,7 +224,9 @@ locals {
   }
 
   # A scope's monitored projects as the API named them: by number, or, should
-  # the API ever name one by ID, as it came.
+  # the API ever name one by ID, as it came; an ID that came that way is
+  # filtered below like a service project's, since it has no number to be
+  # excluded by and the by-number postcondition never saw it.
   scope_monitored_projects = {
     for scope, response in data.http.scope_metrics_scope :
     scope => distinct(compact([
@@ -272,13 +274,27 @@ locals {
     number => try(jsondecode(response.response_body).projectId, "")
   }
 
-  scope_metrics_scope_members = {
+  scope_metrics_scope_named = {
     for scope, members in local.scope_monitored_projects :
     scope => sort(distinct(compact([
       for member in members :
       can(regex(local.scope_project_number_pattern, member)) ? lookup(local.scope_project_id_by_number, member, "") : member
     ])))
   }
+  # A number the postcondition above let through names an ID the scope can
+  # carry, so this filter only ever holds back a member the API named by an
+  # ID it cannot; such a member is reported, not bound, and never refuses the
+  # scope, the rule the host path applies.
+  scope_metrics_scope_members = {
+    for scope, named in local.scope_metrics_scope_named :
+    scope => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]
+  }
+  scope_metrics_scope_uncarriable = {
+    for scope, named in local.scope_metrics_scope_named :
+    "metricsScopes/${scope}" => [for member in named : member if !can(regex(local.scope_project_id_pattern, member))]
+    if length([for member in named : member if !can(regex(local.scope_project_id_pattern, member))]) > 0
+  }
+  scope_selector_uncarriable = merge(local.scope_shared_vpc_uncarriable, local.scope_metrics_scope_uncarriable)
 
   # Each selector's members under the name the snapshot's `containers` array
   # gives it, so the output is comparable with fleet_scope.json line by line.
@@ -289,12 +305,12 @@ locals {
 }
 
 # A warning, not a refusal: the member is not in the set, and the plan says so
-# here and in `uncarriable_members`, while the rest of the host's service
-# projects are bound as usual.
-check "shared_vpc_members_the_scope_can_carry" {
+# here and in `uncarriable_members`, while the rest of the selector's members
+# are bound as usual.
+check "selector_members_the_scope_can_carry" {
   assert {
-    condition     = length(local.scope_shared_vpc_uncarriable) == 0
-    error_message = "shared_vpc_hosts: ${join("; ", [for selector, members in local.scope_shared_vpc_uncarriable : "${selector} has service project(s) ${join(", ", members)}"])} with an ID the scope cannot carry (the CRD accepts ${local.scope_project_id_pattern}; a legacy domain-scoped ID does not match). Left out of the bindings; the reconcile reports such a project on its own."
+    condition     = length(local.scope_selector_uncarriable) == 0
+    error_message = "shared_vpc_hosts / metrics_scopes: ${join("; ", [for selector, members in local.scope_selector_uncarriable : "${selector} names project(s) ${join(", ", members)}"])} with an ID the scope cannot carry (the CRD accepts ${local.scope_project_id_pattern}; a legacy domain-scoped ID does not match). Left out of the bindings; the reconcile reports such a project on its own."
   }
 }
 

@@ -61,8 +61,9 @@ variable "exclude_projects" {
   description = <<-EOT
     The scope's `exclude.projects` entries. Only an entry that is a bare
     project number acts here: a monitored project the Monitoring API returned
-    under that number is neither named nor listed, the runtime's own escape
-    for a project the account cannot name. IDs and globs are the caller's to
+    under that number is neither named nor listed, and the reconcile matches
+    the number on every row a scope named by it, so the member leaves the set
+    whether or not a run had named it before. IDs and globs are the caller's to
     apply (kube-agents-iam withholds the grant of a member an entry names by
     ID; the reconcile evaluates globs).
   EOT

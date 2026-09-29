@@ -2436,6 +2436,34 @@ class ScopeTest(HomesMixin):
         self.assertEqual(sorted(report["projects"]), [self.MGMT])
         self.assertNotIn("333", {p["id"] for p in self._snapshot()["projects"]})
 
+    def test_excluding_the_number_drops_a_member_a_past_run_named_once_its_grant_is_gone(self):
+        # Run N named 111 as team-a and listed it. The operator then names 111 in
+        # exclude.projects and applies: the install path withholds team-a's grant on that
+        # entry, so this run's naming call is refused and the member is keyed under the ID
+        # the snapshot remembers. The entry has to match that row by its number, or the
+        # project reads denied under its ID on every tick, profiles kept, instead of leaving.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"metricsScopes": ["mon-proj"], "exclude": {"projects": ["111"]}}
+        report, created, deleted = self._run(declaration, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                             numbers={"111": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual((created, deleted), ([], []))
+        self.assertNotIn("team-a", report["projects"])
+        self.assertEqual(report["retiring"], ["team-a"])
+        row = next(p for p in self._snapshot()["projects"] if p["id"] == "team-a")
+        self.assertEqual((row["state"], row[rec.NUMBER_KEY]), (rec.STATE_RETIRING, "111"))
+        # The same entry keeps the member out when the selector's own lookup fails and its
+        # previous members are carried frozen.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, _, _ = self._run(declaration, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
+                                 selectors={self.SCOPE: (None, rec.OUTCOME_DENIED)})
+        self.assertNotIn("team-a", report["projects"])
+
     def test_a_row_written_under_the_bare_number_is_no_mapping(self):
         self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
                               {"id": "222", "via": [self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "222"}])

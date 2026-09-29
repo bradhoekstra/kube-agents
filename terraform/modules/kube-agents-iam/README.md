@@ -71,8 +71,7 @@ both managing roles carry), even when an exclude entry names them, and the plan 
 `project_roles` carries no `roles/compute.viewer` beside a host. Binding a resolved project needs
 `setIamPolicy` there for the applying identity, as for an explicit project; a failure lands inside
 the apply, not in the plan. An `exclude.projects` entry
-that names a Shared VPC service project by ID, or a monitored project by its project number, keeps
-it out of the bindings, the one place `exclude` reaches IAM; a monitored project excluded by ID
+that names a Shared VPC service project by ID, or a monitored project by its project number, keeps it out of the bindings, the one place `exclude` reaches IAM, and the reconcile matches a number against every row a scope named by it, so the member leaves the set whether or not the run named it before; a monitored project excluded by ID
 keeps its grant, because the reconcile names every monitored project with the agent's own
 credentials before it can match the entry, and without the grant the member is reported by number
 as unnamed and holds the scope prune on every tick. Removing an entry revokes its bindings on the next apply, and

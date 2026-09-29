@@ -187,8 +187,11 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # and fails a for_each keyed on the read; so the IAM module reads
         # nothing and takes the members as an input, and refuses a declared
         # selector the input does not carry.
-        self.assertNotIn('data "http"', self.scope_tf)
-        self.assertNotIn('data "google_client_config"', self.scope_tf)
+        # Any data source, in any of the module's files: the hazard is a for_each
+        # keyed on a deferred read, whichever provider answers it.
+        for tf in sorted(_MODULE.glob("*.tf")):
+            with self.subTest(file=tf.name):
+                self.assertNotRegex(tf.read_text(), r'(?m)^data\s+"', "the IAM module reads nothing")
         self.assertNotIn("hashicorp/http", (_MODULE / "versions.tf").read_text())
         self.assertIn('variable "scope_selector_members"', (_MODULE / "variables.tf").read_text())
         self.assertIn("condition     = local.scope_selectors_resolved", self.main_tf)
@@ -286,8 +289,14 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("can(regex(local.scope_project_id_pattern, jsondecode(self.response_body).projectId))", self._data("http", "scope_monitored_project"))
         self.assertIn("Name the number in exclude_projects", self._data("http", "scope_monitored_project"))
         self.assertIn("host => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]", self.resolver_tf)
-        self.assertIn('check "shared_vpc_members_the_scope_can_carry"', self.resolver_tf)
-        self.assertIn("value       = local.scope_shared_vpc_uncarriable", (_RESOLVER / "outputs.tf").read_text())
+        # And a monitored project the API should ever name by such an ID, which
+        # the by-number postcondition never saw, goes through the same filter
+        # rather than reaching kube-agents-iam's variable validation unnamed.
+        self.assertIn("scope => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]", self.resolver_tf)
+        self.assertIn("scope_selector_uncarriable = merge(local.scope_shared_vpc_uncarriable, local.scope_metrics_scope_uncarriable)", self.resolver_tf)
+        self.assertIn('check "selector_members_the_scope_can_carry"', self.resolver_tf)
+        self.assertIn("condition     = length(local.scope_selector_uncarriable) == 0", self.resolver_tf)
+        self.assertIn("value       = local.scope_selector_uncarriable", (_RESOLVER / "outputs.tf").read_text())
 
     def test_the_members_reach_the_one_project_binding_with_the_lookup_projects_and_less_an_exact_exclude(self):
         self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
