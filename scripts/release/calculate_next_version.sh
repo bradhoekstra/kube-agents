@@ -12,6 +12,13 @@ EXPLICIT_RELEASE_VERSION="${EXPLICIT_RELEASE_VERSION:-${3:-}}"
 BASE_TAG_PARAM="${1:-${BASE_TAG_PARAM:-${BASE_TAG:-}}}"
 TARGET_REF_PARAM="${2:-${TARGET_REF_PARAM:-${TARGET_COMMIT:-${TARGET_REF:-}}}}"
 SKIP_VALIDATION="${SKIP_STAGING_VALIDATION:-${4:-false}}"
+# A release line (`X.Y`) cuts patches from its own branch: the candidate is the
+# line's head, the base is the line's last release, and the bump is PATCH.
+RELEASE_LINE="${RELEASE_LINE:-}"
+if [ -n "${RELEASE_LINE}" ] && ! [[ "${RELEASE_LINE}" =~ ${RELEASE_LINE_SHAPE_REGEX} ]]; then
+  echo "❌ ERROR: RELEASE_LINE '${RELEASE_LINE}' is not a release line; expected X.Y." >&2
+  exit 1
+fi
 
 # 0. Protection against Shallow Checkout and Remote Tag Sync in CI
 if is_ci_pipeline; then
@@ -26,7 +33,22 @@ if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo "false")" = "t
 fi
 
 # 1. Resolve Target Commit / Ref for version calculation
-if [ -z "${TARGET_REF_PARAM}" ] || [ "${TARGET_REF_PARAM}" = "null" ]; then
+if [ -n "${RELEASE_LINE}" ]; then
+  # The line names its own candidate. A TARGET_COMMIT that says otherwise is a
+  # contradiction to refuse, not a preference to honour: the branch step can
+  # only fast-forward from the head, and the line's protection vouches for the
+  # head alone.
+  LINE_CANDIDATE="$(release_line_candidate "${RELEASE_LINE}")" || exit 1
+  if [ -n "${TARGET_REF_PARAM}" ] && [ "${TARGET_REF_PARAM}" != "null" ]; then
+    NAMED_COMMIT="$(git rev-parse --verify "${TARGET_REF_PARAM}^{commit}" 2>/dev/null || echo "")"
+    if [ "${NAMED_COMMIT}" != "${LINE_CANDIDATE}" ]; then
+      echo "❌ ERROR: Release line ${RELEASE_LINE} releases its own head (${LINE_CANDIDATE:0:7}); target commit '${TARGET_REF_PARAM}' cannot be named alongside it." >&2
+      exit 1
+    fi
+  fi
+  TARGET_REF_PARAM="${LINE_CANDIDATE}"
+  echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${LINE_CANDIDATE:0:7}" >&2
+elif [ -z "${TARGET_REF_PARAM}" ] || [ "${TARGET_REF_PARAM}" = "null" ]; then
   if is_truthy "${SKIP_VALIDATION}"; then
     TARGET_REF_PARAM="HEAD"
     echo "ℹ️ Emergency override: calculating version from HEAD" >&2
@@ -58,7 +80,41 @@ if [ -n "${BASE_TAG_PARAM}" ]; then
   fi
   LATEST_GA_TAG="${BASE_TAG_PARAM}"
 else
-  LATEST_GA_TAG="$(get_latest_ga_tag)"
+  # By ancestry, not by number: once release/0.7 has cut 0.7.1, main's base is
+  # still 0.7.0 and the line's is 0.7.1. On main the tags are qualified against
+  # main's head, so a release cut by hand from a later main commit still counts.
+  # See get_base_ga_tag_for_commit.
+  BASE_TIP=""
+  if [ -z "${RELEASE_LINE}" ]; then
+    BASE_TIP="$(release_main_tip)" || exit 1
+  fi
+  LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RC_CANDIDATE_COMMIT}" "" "${BASE_TIP}")" || exit 1
+fi
+
+if [ -n "${RELEASE_LINE}" ]; then
+  if [ -z "${LATEST_GA_TAG}" ]; then
+    echo "❌ ERROR: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT:0:7} descends from no GA release; a line is cut from its minor's release." >&2
+    exit 1
+  fi
+  if [ "$(release_line_for_version "${LATEST_GA_TAG}")" != "${RELEASE_LINE}" ]; then
+    echo "❌ ERROR: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT:0:7} descends from ${LATEST_GA_TAG}, which is not on the line; refusing." >&2
+    exit 1
+  fi
+fi
+
+# Whether the base's line has its own branch. Once it does, PATCH numbers belong
+# to the line: main bumps at least MINOR (step 6), and an explicit version on
+# main may not name the line's next patch (step 3). Read from the remote in CI;
+# an unreadable remote is an error rather than a guess.
+BASE_LINE_HAS_BRANCH="false"
+if [ -z "${RELEASE_LINE}" ] && [ -n "${LATEST_GA_TAG}" ]; then
+  BASE_LINE="$(release_line_for_version "${LATEST_GA_TAG}")"
+  if release_line_branch_exists "${BASE_LINE}"; then
+    BASE_LINE_HAS_BRANCH="true"
+  elif [ $? -eq 2 ]; then
+    echo "❌ ERROR: Could not read whether release line ${BASE_LINE} exists; refusing to pick a version without knowing." >&2
+    exit 1
+  fi
 fi
 
 # 3. Handle explicit version override (EXPLICIT_RELEASE_VERSION) with downgrade and collision protection
@@ -66,13 +122,26 @@ if [ -n "${EXPLICIT_RELEASE_VERSION}" ]; then
   # 3.1 Validate SemVer 2.0 format
   validate_pure_numeric_semver "${EXPLICIT_RELEASE_VERSION}" "Explicit release version" || exit 1
 
-  # 3.2 Protect against version downgrade
+  # 3.2 Protect against version downgrade, against the candidate's own base:
+  # 0.7.1 on release/0.7 is fine while 0.8.0 exists on main.
   if [ -n "${LATEST_GA_TAG}" ]; then
     CMP_RES="$(compare_semver "${EXPLICIT_RELEASE_VERSION}" "${LATEST_GA_TAG}")"
     if [ "${CMP_RES}" = "-1" ]; then
-      echo "❌ ERROR: Explicit release version '${EXPLICIT_RELEASE_VERSION}' is lower than latest GA release '${LATEST_GA_TAG}'. Version downgrade is prohibited." >&2
+      echo "❌ ERROR: Explicit release version '${EXPLICIT_RELEASE_VERSION}' is lower than the candidate's base release '${LATEST_GA_TAG}'. Version downgrade is prohibited." >&2
       exit 1
     fi
+  fi
+
+  # 3.2b A line takes its own patch numbers and nothing else; main keeps off
+  # them once the line has a branch.
+  if [ -n "${RELEASE_LINE}" ]; then
+    if [ "$(release_line_for_version "${EXPLICIT_RELEASE_VERSION}")" != "${RELEASE_LINE}" ]; then
+      echo "❌ ERROR: Explicit release version '${EXPLICIT_RELEASE_VERSION}' is not on release line ${RELEASE_LINE}." >&2
+      exit 1
+    fi
+  elif [ "${BASE_LINE_HAS_BRANCH}" = "true" ] && [ "$(release_line_for_version "${EXPLICIT_RELEASE_VERSION}")" = "${BASE_LINE}" ]; then
+    echo "❌ ERROR: Explicit release version '${EXPLICIT_RELEASE_VERSION}' is a patch on line ${BASE_LINE}, which has its own branch; release it from release/${BASE_LINE}, or bump MINOR on main." >&2
+    exit 1
   fi
 
   # 3.3 Protect against tag collisions on different commits
@@ -146,6 +215,21 @@ fi
 BUMP_TYPE="patch"
 HAS_BREAKING="false"
 
+# A release line takes fixes only. A feat: or a breaking change on it is refused
+# by name; explicit_release_version is the way to release one on purpose.
+if [ -n "${RELEASE_LINE}" ]; then
+  if commit_messages_have_breaking_change "${COMMITS_SUBJECTS}" "${COMMITS_BODIES}"; then
+    echo "❌ ERROR: Release line ${RELEASE_LINE} carries a breaking change since ${LATEST_GA_TAG}; a line takes fixes only. Release it with explicit_release_version if you mean it." >&2
+    exit 1
+  fi
+  if FEAT_SUBJECTS="$(grep -E "^feat(\([^)]+\))?:" <<<"${COMMITS_SUBJECTS}")"; then
+    echo "❌ ERROR: Release line ${RELEASE_LINE} carries a feature since ${LATEST_GA_TAG}; a line takes fixes only:" >&2
+    sed 's/^/   /' <<<"${FEAT_SUBJECTS}" >&2
+    echo "   Release it with explicit_release_version if you mean it." >&2
+    exit 1
+  fi
+fi
+
 # Check for Breaking Changes in subject (feat!:, fix!:) or footer (BREAKING CHANGE: / BREAKING-CHANGE:).
 # The definition lives in common.sh because resolve_scheduled_release.sh gates an
 # unattended release on stable GA (>= 1.0.0) on the same question, while in 0.y.z
@@ -177,6 +261,15 @@ elif grep -qE "^feat(\([^)]+\))?:" <<<"${COMMITS_SUBJECTS}"; then
 else
   BUMP_TYPE="patch"
   PATCH=$((PATCH + 1))
+fi
+
+# Once the base's line has its own branch, its patch numbers are the line's:
+# a fix-only range on main bumps MINOR instead.
+if [ "${BUMP_TYPE}" = "patch" ] && [ "${BASE_LINE_HAS_BRANCH}" = "true" ]; then
+  echo "ℹ️ release/${BASE_LINE} exists, so patch numbers are the line's; main bumps MINOR." >&2
+  BUMP_TYPE="minor-line"
+  MINOR=$((MINOR + 1))
+  PATCH=0
 fi
 
 NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"

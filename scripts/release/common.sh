@@ -285,18 +285,26 @@ ga_tag_is_stamped() {
   is_valid_stamped_or_direct_release_commit "${parent}" "${tag_commit}" "${tag}" 2>/dev/null
 }
 
-# A GA tag is a base for a candidate when the candidate descends from, or is,
-# the tag's commit — a release line's head, or a pre-stamp tag on main — or, for
-# a stamped tag, from the commit the stamp was cut from, which is where main's
-# history meets it. `--is-ancestor` holds for equality, which is what lets a
-# re-run whose tag already exists (parent == candidate) find its own release.
-# Arguments: $1 = tag, $2 = candidate commit
+# A GA tag is a base for a candidate when the tag's commit — or, for a stamped
+# tag, the commit the stamp was cut from, which is where the branch's history
+# meets it — is in the history of `tip`, which defaults to the candidate itself.
+# `--is-ancestor` holds for equality, which is what lets a re-run whose tag
+# already exists (parent == candidate) find its own release.
+#
+# The tip is the branch the candidate is released from, when that is more than
+# the candidate: main's callers pass main's head, so a release somebody cut by
+# hand from a later main commit still counts as main's base and an older
+# candidate reads as "nothing new" rather than as a new release that would
+# collide with it. A release line's stamps have parents off main, so they never
+# qualify for main whichever tip is given.
+# Arguments: $1 = tag, $2 = candidate commit, $3 = branch tip (optional)
 ga_tag_is_base_of() {
-  local tag="${1:-}" candidate="${2:-}" tag_commit
+  local tag="${1:-}" candidate="${2:-}" tip="${3:-}" tag_commit
+  tip="${tip:-${candidate}}"
   tag_commit="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" || return 1
-  git merge-base --is-ancestor "${tag_commit}" "${candidate}" 2>/dev/null && return 0
+  git merge-base --is-ancestor "${tag_commit}" "${tip}" 2>/dev/null && return 0
   ga_tag_is_stamped "${tag}" "${tag_commit}" || return 1
-  git merge-base --is-ancestor "${tag_commit}^1" "${candidate}" 2>/dev/null
+  git merge-base --is-ancestor "${tag_commit}^1" "${tip}" 2>/dev/null
 }
 
 # The highest GA tag in a candidate's own history: the base the version bump,
@@ -304,10 +312,12 @@ ga_tag_is_base_of() {
 # ancestry, not by number, so main's base stays 0.7.0 once 0.7.1 exists on
 # release/0.7, and 0.7.1's base is 0.7.0. Optional $2 looks strictly below a
 # version: the notes step passes the release being published, whose own tag is
-# by then in its history. Prints nothing when no GA tag is in the history.
-# Arguments: $1 = candidate commit-ish, $2 = ceiling version (exclusive), optional
+# by then in its history. Optional $3 is the branch tip the tags are qualified
+# against (see ga_tag_is_base_of). Prints nothing when no GA tag qualifies.
+# Arguments: $1 = candidate commit-ish, $2 = ceiling version (exclusive), optional,
+#            $3 = branch tip commit-ish, optional
 get_base_ga_tag_for_commit() {
-  local candidate="${1:-}" below="${2:-}" candidate_sha best="" tag
+  local candidate="${1:-}" below="${2:-}" tip="${3:-}" candidate_sha best="" tag
 
   if [ -z "${candidate}" ]; then
     echo "❌ ERROR: a candidate commit is required for get_base_ga_tag_for_commit." >&2
@@ -326,7 +336,7 @@ get_base_ga_tag_for_commit() {
     if [ -n "${below}" ] && [ "$(compare_semver "${tag}" "${below}")" != "-1" ]; then
       continue
     fi
-    ga_tag_is_base_of "${tag}" "${candidate_sha}" || continue
+    ga_tag_is_base_of "${tag}" "${candidate_sha}" "${tip}" || continue
     if [ -z "${best}" ] || [ "$(compare_semver "${tag}" "${best}")" = "1" ]; then
       best="${tag}"
     fi
@@ -375,6 +385,23 @@ release_main_ref() {
     fi
   done
   return 1
+}
+
+# The commit main is at, for the callers that qualify a GA base against main's
+# whole history rather than the candidate's (get_base_ga_tag_for_commit). In CI
+# an unreadable main is an error; off CI it prints nothing, and the caller
+# falls back to the candidate's own history.
+release_main_tip() {
+  local main_ref
+  if ! main_ref="$(release_main_ref)"; then
+    if is_ci_pipeline; then
+      echo "❌ ERROR: Could not resolve main in this checkout; refusing to pick a GA base without it." >&2
+      return 1
+    fi
+    echo "⚠️ Warning: main cannot be read reliably here; qualifying the GA base against the candidate alone." >&2
+    return 0
+  fi
+  git rev-parse --verify "${main_ref}^{commit}"
 }
 
 # Lists the tags matching a glob whose commit is on main, newest by name first,

@@ -166,6 +166,16 @@ if ! RELEASE_COMMIT="$(git rev-parse --verify "${GATE_TAG}^{commit}" 2>/dev/null
   emit_and_exit
 fi
 
+# The base is the candidate's own last release, by ancestry: with 0.7.1 cut on
+# release/0.7, the numerically highest tag is not main's base and condition 2
+# would name the wrong tag. Read once the candidate is known, in place of the
+# numeric read above that the no-candidate messages used.
+if ! MAIN_TIP="$(release_main_tip)" || ! LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RELEASE_COMMIT}" "" "${MAIN_TIP}")"; then
+  ERRORED="true"
+  SKIP_REASON="Could not read the GA base of the gate-passing commit ${RELEASE_COMMIT:0:7} — see the log."
+  emit_and_exit
+fi
+
 # ── 2. Is there anything new in it? ──────────────────────────────────────────
 #
 # With no GA tag there is no range and nothing to check: the repository has never

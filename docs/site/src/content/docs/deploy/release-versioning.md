@@ -17,14 +17,14 @@ older release's checkout, and what they leave as it is.
 
 Every commit and build progresses through six distinct lifecycle tiers:
 
-| Tier                       | Format                                | Trigger                                       | Purpose and guarantees                                                                                                                                   |
-| :------------------------- | :------------------------------------ | :-------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Candidate Build**        | `<COMMIT_SHA>` (bare 40-char SHA)     | Push to `main` or to a `release/<X.Y>` branch | Developer build in GHCR; container images built once.                                                                                                    |
-| **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch                 | Candidate build selected for live cluster testing.                                                                                                       |
-| **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite                      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                                                   |
-| **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix                     | Nomination, not a promotion: starts the agent eval against the candidate's images, over the same case matrix that gates a pull request. Deploys nothing. |
-| **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination                  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                              |
-| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch                 | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).                                      |
+| Tier                       | Format                                | Trigger                                       | Purpose and guarantees                                                                                                                                                      |
+| :------------------------- | :------------------------------------ | :-------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Candidate Build**        | `<COMMIT_SHA>` (bare 40-char SHA)     | Push to `main` or to a `release/<X.Y>` branch | Developer build in GHCR; container images built once.                                                                                                                       |
+| **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch                 | Candidate build selected for live cluster testing.                                                                                                                          |
+| **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite                      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                                                                      |
+| **Eval Candidate**         | `evalcand_YYMMDDHHMM_<SHORT_SHA>`     | Successful nightly matrix                     | Nomination, not a promotion: starts the agent eval against the candidate's images, over the same case matrix that gates a pull request. Deploys nothing.                    |
+| **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination                  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                                                 |
+| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch                 | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default), and pushed to the version's release line `release/X.Y`. |
 
 Only a staging-promoted commit is releasable. An `rc_*_validated` tag records the narrow
 three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag, which the nightly pipeline
@@ -89,7 +89,7 @@ Before it exists, the next release is whatever has merged since the latest GA ta
 
 ## Automated SemVer 2.0 calculation
 
-When the GA release workflow runs, it inspects Conventional Commits in the range `<LATEST_GA_TAG>..<TARGET_COMMIT>` (resolving to the latest staging-promoted commit on the standard automated path, or the specified commit / `HEAD` under emergency bypass):
+When the GA release workflow runs, it inspects Conventional Commits in the range `<BASE_GA_TAG>..<TARGET_COMMIT>`, where the base is the GA release the target's own history descends from (resolving to the latest staging-promoted commit on the standard automated path, the specified commit / `HEAD` under emergency bypass, or the head of `release/X.Y` for a patch from a release line):
 
 <!-- prettier-ignore -->
 | Commit type in release range | Current version | Calculated next version | Precedence and action |
@@ -99,6 +99,8 @@ When the GA release workflow runs, it inspects Conventional Commits in the range
 | `feat!:`, `fix!:`, `BREAKING CHANGE:` | `0.2.0` | `0.3.0` | Minor bump (SemVer 2.0 Clause 4 in `0.y.z`) |
 | `feat!:`, `fix!:`, `BREAKING CHANGE:` | `1.2.0` | `2.0.0` | Major bump (in `1.x.x`+) |
 | _(No new commits in release range)_ | `0.2.0` | `0.2.0` | No changes; the eligibility check then skips the release (`skip_release=true`) |
+| `fix:` on `main` once `release/0.2` exists | `0.2.0` | `0.3.0` | Minor bump: patch numbers belong to the line |
+| `fix:` on `release/0.2` | `0.2.0` | `0.2.1` | Patch bump; a `feat:` or a breaking change on a line is refused |
 
 ### SemVer 2.0 Clause 4 and the 1.0.0 manual governance rule
 
@@ -110,7 +112,7 @@ Once `1.0.0` is established, the automated calculator resumes standard SemVer ru
 
 ## Who cuts a release
 
-Maintainers do, on the Friday schedule above or by hand. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
+Maintainers do, on the Friday schedule above or by hand. A patch release, `X.Y.Z+1`, is cut from the release line `release/X.Y` rather than from `main`: fixes are cherry-picked onto the line, its head passes the RC validation, and a maintainer dispatches the release naming the line; once a line has its branch, a fix-only week on `main` releases as the next minor. An emergency hotfix can skip the live-cluster validation gate — reserved for a zero-day vulnerability in a container dependency or a regression prolonging user-facing downtime — but never the build-integrity guarantees below: the images must already exist for the commit, a written justification is required, and a version tag that already points at another commit aborts the release. The dispatch commands, the bypass, and the post-release reconciliation are the maintainers' runbook in [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
 
 ## Clean promotion and artifact guarantees
 
@@ -119,7 +121,7 @@ The release publish workflow enforces byte-for-byte fidelity with tested candida
 1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; on a release line a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to a `release/X.Y.Z` branch builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
 2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens.
 3. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed via Cosign.
-4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit, which is then pushed to the branch `release/X.Y.Z`.
+4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit, which is then pushed to the release line `release/X.Y`: created at a minor, fast-forwarded by each patch.
 5. `install.sh` and `upgrade.sh` verify that unversioned source directories match `BAKED_RELEASE_VERSION` and that Git checkouts match the requested tag's commit, halting if local scripts diverge from the container images.
 6. The offline release bundle is staged directly from the tagged release commit with `git archive`, carries the `.release-bundle` provenance marker, and is packaged as both `.tar.gz` and `.zip`.
 7. Software Bills of Materials are generated with Syft — SPDX 2.3 JSON and CycloneDX 1.5 JSON for the filesystem bundle, SPDX 2.3 JSON for each container image — and published alongside `checksums.txt` with SHA256 checksums for every release asset.

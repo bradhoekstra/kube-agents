@@ -666,5 +666,56 @@ exit {docker_exit}
             temp_dir.cleanup()
 
 
+    # ─── release lines ───────────────────────────────────────────────────────
+    # A line's gate is rc_*_validated on its head, and its candidate is the head.
+
+    def _line_repo(self):
+        temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
+        self.addCleanup(temp_dir.cleanup)
+        git("switch", "-c", "release/0.2")
+        (pathlib.Path(repo_dir) / "backport.txt").write_text("fix")
+        git("add", "backport.txt")
+        git("commit", "-m", "fix: backport")
+        head = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+        return repo_dir, git, bin_dir, commit_sha, head
+
+    def test_a_line_is_eligible_on_its_validated_head(self):
+        repo_dir, git, bin_dir, _, head = self._line_repo()
+        git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
+        proc = self._run_verify_script(
+            repo_dir, env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("candidate is the line's own", proc.stdout)
+        self.assertIn("Found RC validation tag(s)", proc.stdout)
+        self.assertIn("rc_2609290000_1234567_validated", proc.stdout)
+
+    def test_a_line_is_blocked_by_a_staging_tag_alone(self):
+        repo_dir, git, bin_dir, _, head = self._line_repo()
+        git("tag", "-a", "staging_2609290000_1234567", "-m", "not the line's gate", head)
+        proc = self._run_verify_script(
+            repo_dir, env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("has NOT passed the RC validation", proc.stderr)
+        self.assertIn("rc-release-pipeline.yml", proc.stderr)
+
+    def test_a_line_refuses_a_version_off_the_line_and_a_candidate_that_is_not_its_head(self):
+        repo_dir, git, bin_dir, base_commit, head = self._line_repo()
+        git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
+        off = self._run_verify_script(
+            repo_dir, env={"RELEASE_VERSION": "0.3.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+        )
+        self.assertNotEqual(off.returncode, 0)
+        self.assertIn("is not on release line 0.2", off.stderr)
+        other = self._run_verify_script(
+            repo_dir,
+            env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2", "RC_CANDIDATE_COMMIT": base_commit},
+            bin_dir=bin_dir,
+        )
+        self.assertNotEqual(other.returncode, 0)
+        self.assertIn("releases its own head", other.stderr)
+
 if __name__ == "__main__":
     unittest.main()

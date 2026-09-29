@@ -5,10 +5,14 @@
 # under the EXACT SAME tag.
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 #
-# The gate is the staging_<ts>_<sha> tag and nothing beside it. An rc_*_validated tag is not checked
-# as well, because it is implied: a staging tag is only ever created by the nightly pipeline, which
-# only ever promotes a candidate that already carries one. Two gates to keep in step is how one of
-# them ends up answering for the other.
+# The gate for a release from main is the staging_<ts>_<sha> tag and nothing beside it. An
+# rc_*_validated tag is not checked as well, because it is implied: a staging tag is only ever
+# created by the nightly pipeline, which only ever promotes a candidate that already carries one.
+# Two gates to keep in step is how one of them ends up answering for the other.
+#
+# A release line (RELEASE_LINE=X.Y) has the other gate: rc_*_validated on the line's head, earned
+# by dispatching rc-release-pipeline.yml against it. The nightly matrix and the eval nominate main
+# commits only, so a line never carries a staging_ tag, and its candidate is the head alone.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +24,11 @@ TARGET_COMMIT_INPUT="${2:-${RC_CANDIDATE_COMMIT:-${TARGET_COMMIT:-}}}"
 TARGET_REPO="$(get_target_repo)"
 SKIP_VALIDATION="${SKIP_STAGING_VALIDATION:-${3:-false}}"
 EMERGENCY_REASON="${EMERGENCY_OVERRIDE_REASON:-${4:-}}"
+RELEASE_LINE="${RELEASE_LINE:-}"
+if [ -n "${RELEASE_LINE}" ] && ! [[ "${RELEASE_LINE}" =~ ${RELEASE_LINE_SHAPE_REGEX} ]]; then
+  echo "❌ ERROR: RELEASE_LINE '${RELEASE_LINE}' is not a release line; expected X.Y." >&2
+  exit 1
+fi
 
 if [ -z "${TARGET_VERSION}" ]; then
   echo "❌ ERROR: TARGET_VERSION is required as first argument or environment variable." >&2
@@ -54,7 +63,22 @@ fi
 
 # 2. Resolve Candidate Commit SHA
 RC_CANDIDATE_COMMIT=""
-if [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
+if [ -n "${RELEASE_LINE}" ]; then
+  if [ "$(release_line_for_version "${TARGET_VERSION}")" != "${RELEASE_LINE}" ]; then
+    echo "❌ ERROR: Version '${TARGET_VERSION}' is not on release line ${RELEASE_LINE}." >&2
+    exit 1
+  fi
+  LINE_CANDIDATE="$(release_line_candidate "${RELEASE_LINE}")" || exit 1
+  if [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
+    NAMED_COMMIT="$(git rev-parse --verify "${TARGET_COMMIT_INPUT}^{commit}" 2>/dev/null || echo "")"
+    if [ "${NAMED_COMMIT}" != "${LINE_CANDIDATE}" ]; then
+      echo "❌ ERROR: Release line ${RELEASE_LINE} releases its own head (${LINE_CANDIDATE:0:7}); '${TARGET_COMMIT_INPUT}' is not it." >&2
+      exit 1
+    fi
+  fi
+  RC_CANDIDATE_COMMIT="${LINE_CANDIDATE}"
+  echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${RC_CANDIDATE_COMMIT:0:7}"
+elif [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
   if ! RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${TARGET_COMMIT_INPUT}^{commit}" 2>/dev/null)"; then
     echo "❌ ERROR: Cannot resolve valid Git commit from '${TARGET_COMMIT_INPUT}'!" >&2
     exit 1
@@ -169,6 +193,18 @@ fi
 #
 # Shape-matched via common.sh rather than by the staging_ prefix: the prefix is a live deploy
 # trigger anyone can push, so a hand-made 'staging_hotfix' would otherwise satisfy the release gate.
+if [ -n "${RELEASE_LINE}" ]; then
+  echo "🔎 Checking for rc_*_validated tags pointing at release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT}..."
+  VALIDATED_TAGS="$(validated_rc_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
+  if [ -z "${VALIDATED_TAGS}" ]; then
+    echo "❌ BLOCKED: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT} has NOT passed the RC validation!" >&2
+    echo "   No 'rc_*_validated' tag points to this commit." >&2
+    echo "   Dispatch '.github/workflows/rc-release-pipeline.yml' with commit_sha=${RC_CANDIDATE_COMMIT} and wait for it to tag the commit validated." >&2
+    exit 1
+  fi
+  FIRST_VAL_TAG="$(head -n 1 <<<"${VALIDATED_TAGS}")"
+  echo "✅ ELIGIBLE: Found RC validation tag(s) on commit ${RC_CANDIDATE_COMMIT}:"
+else
 echo "🔎 Checking for staging_<ts>_<sha> tags pointing at commit ${RC_CANDIDATE_COMMIT}..."
 VALIDATED_TAGS="$(staging_promotion_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
 
@@ -184,6 +220,7 @@ fi
 
 FIRST_VAL_TAG="$(head -n 1 <<<"${VALIDATED_TAGS}")"
 echo "✅ ELIGIBLE: Found staging promotion tag(s) on commit ${RC_CANDIDATE_COMMIT}:"
+fi
 for tag in ${VALIDATED_TAGS}; do
   echo "   • ${tag}"
 done
