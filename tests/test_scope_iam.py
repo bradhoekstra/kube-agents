@@ -364,7 +364,11 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("toset([var.project_id]),", self.scope_tf)
         self.assertIn("toset([for project in var.scope.projects : project if !contains(var.scope.exclude.projects, project)]),", self.scope_tf)
         self.assertIn("for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project", self.scope_tf)
-        self.assertIn("condition     = length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
+        # Held while a selector is declared, and not otherwise: an install with
+        # the CRD's hundred explicit projects and no selector planned before this
+        # precondition existed, and a plan that declares no selector must not
+        # start refusing it.
+        self.assertIn("condition     = length(local.scope_selector_names) == 0 || length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
         self.assertIn("a glob is applied by the reconcile alone", self.main_tf)
         # Containers are not in the count: their members are unknown at plan
         # time, they are listed last, and their binding is on the container.

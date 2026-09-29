@@ -36,9 +36,13 @@ resource "google_service_account" "agent" {
     # The whole resolved set, as far as a plan can count it (scope.tf,
     # scope_listed_projects): the reconcile lists at most the cap and reads
     # the rest over-cap, so the members past it would be bound for nothing.
-    # The resolver's own bound is per selector; this is the sum.
+    # The resolver's own bound is per selector; this is the sum. Held only
+    # while a selector is declared: without one the count is the CRD's own
+    # list cap plus the management project, a declaration the plan admitted
+    # before the selectors existed, and a plan that declares no selector
+    # changes nothing about it.
     precondition {
-      condition     = length(local.scope_listed_projects) <= local.scope_resolved_set_cap
+      condition     = length(local.scope_selector_names) == 0 || length(local.scope_listed_projects) <= local.scope_resolved_set_cap
       error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the reconcile's resolved-set cap of ${local.scope_resolved_set_cap} (RESOLVED_SET_CAP in cluster_agent_reconcile.py): the reconcile lists the first ${local.scope_resolved_set_cap} of them, in that order, and reads the rest over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare fewer projects, a narrower selector, or a folder that holds them (a container's members are listed after these and bound on the container, not one by one). An exclude.projects entry lowers this count only when it names a project exactly, by ID or by the number a Metrics Scope returns; a glob is applied by the reconcile alone."
     }
     precondition {

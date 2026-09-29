@@ -129,6 +129,10 @@ PROJECT_ID_FORMAT = "value(projectId)"
 # A snapshot row of a member the run named by number keeps the number, so the next run can
 # still name the project when the naming call is refused (no outcome is silent, design §4).
 NUMBER_KEY = "number"
+# The snapshot's number -> ID map: every pair the naming pass has returned while a selector
+# still reports the number, so the tie outlives the project's row, which a project an
+# `exclude.projects` number names does not have (`_numbers_memo`).
+NUMBERS_KEY = "numbers"
 ASSET_TYPE_CLUSTER = "container.googleapis.com/Cluster"
 # The two fields the resolver reads, projected so a container of thousands of clusters
 # stays far below the credential proxy's output cap; full-fidelity JSON is ~1 KB a row.
@@ -644,14 +648,21 @@ def _project_id_of(number: str, timeout: float = LIST_TIMEOUT_SECONDS) -> tuple[
 
 
 def _previous_numbers(previous: dict | None) -> dict[str, str]:
-    """project number -> ID, from every snapshot row a past run named by number.
+    """project number -> ID, from every pair a past run named.
 
-    A row written under the bare number (never named) is not a mapping and is left out, so
-    the log says "reported by number" for it rather than naming an ID that is the number.
+    The snapshot's `numbers` memo keeps the pairs the naming pass returned while a selector
+    still reports the number, a project the declaration excluded and so has no row included;
+    a row that carries a number is a pair too. A row written under the bare number (never
+    named) is not a mapping and is left out, so the log says "reported by number" for it
+    rather than naming an ID that is the number.
     """
-    return {p[NUMBER_KEY]: p["id"] for p in (previous or {}).get("projects", [])
-            if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)
-            and p["id"] != p[NUMBER_KEY]}
+    memo = (previous or {}).get(NUMBERS_KEY)
+    known = ({n: p for n, p in memo.items() if isinstance(n, str) and isinstance(p, str) and n != p}
+             if isinstance(memo, dict) else {})
+    known.update({p[NUMBER_KEY]: p["id"] for p in (previous or {}).get("projects", [])
+                  if isinstance(p, dict) and isinstance(p.get(NUMBER_KEY), str) and isinstance(p.get("id"), str)
+                  and p["id"] != p[NUMBER_KEY]})
+    return known
 
 
 def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: dict | None,
@@ -671,10 +682,14 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     members means the selector's own lookup failed. A number an `exclude.projects` entry
     (`patterns`) names is named like any other, because the ID is what lets
     `_resolve_projects` drop the project on the routes that reach it by ID (an explicit
-    entry, a folder), and the grant those routes carry is what makes the call succeed; when
-    the call is refused, the install path having withheld the grant, the member is keyed under
-    the bare number for `_resolve_projects` to drop, with no unnamed mark and no hold on the
-    prune: the number is the declaration speaking.
+    entry, a folder), and the grant those routes carry is what makes the call succeed. When
+    the call fails, the member is keyed under the ID a past run named it by, which the
+    snapshot's `numbers` memo keeps after the project has left the set, so those routes
+    still drop it; under the bare number when no run has named it, with no unnamed mark and
+    no hold on the prune either way: the number is the declaration speaking. A refusal is
+    the install path having withheld the grant on the entry, and no route lists a project
+    without one; any other failure on a number no run has named is logged, because the entry
+    reaches no route that names the project by ID until a run names it.
     """
     patterns = patterns or []
     numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
@@ -694,7 +709,11 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
             if project and naming == OUTCOME_OK:
                 resolved.setdefault(project, {"outcome": None, NUMBER_KEY: member})
             elif _excluded_by(member, patterns):
-                resolved.setdefault(member, {"outcome": None, NUMBER_KEY: member})
+                if member not in known and naming != OUTCOME_DENIED:
+                    log(f"{selector}: project {member} is named in exclude.projects and could not be named this run "
+                        f"({naming}); no run has named it, so the entry drops the member by number and reaches no "
+                        "route that names the project by ID until a run names it.")
+                resolved.setdefault(known.get(member, member), {"outcome": None, NUMBER_KEY: member})
             elif project:
                 # Named, to an ID the set cannot carry: a known identity, reported by number.
                 resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member})
@@ -730,6 +749,13 @@ def _previous_container_members(previous: dict | None, container: str) -> list[s
     })
 
 
+def _numbers_named(selections: dict[str, tuple[dict | None, str]] | None) -> dict[str, str]:
+    """project ID -> the number a Metrics Scope named it by this run (`_selector_members`)."""
+    return {project: info[NUMBER_KEY]
+            for members, _ in (selections or {}).values() if members
+            for project, info in members.items() if info.get(NUMBER_KEY) and project != info[NUMBER_KEY]}
+
+
 def _resolve_projects(management: str | None, scope: dict,
                       searches: dict[str, tuple[dict | None, str]] | None = None,
                       previous: dict | None = None,
@@ -762,13 +788,11 @@ def _resolve_projects(management: str | None, scope: dict,
         return bool(_excluded_by(project, patterns) or (number and _excluded_by(number, patterns)))
 
     # The number a Metrics Scope named a project by, from this run's naming pass or from the
-    # row the last snapshot kept, so a number entry matches the project on every route it is
-    # reached through -- explicit, container or selector -- as an ID entry does (design §3:
-    # an excluded project is dropped whichever route reached it). A number no run has tied
-    # to an ID matches only its bare-number row, which is all there is to match.
-    numbers_named = {project: info[NUMBER_KEY]
-                     for members, _ in (selections or {}).values() if members
-                     for project, info in members.items() if info.get(NUMBER_KEY) and project != info[NUMBER_KEY]}
+    # row or memo the last snapshot kept, so a number entry matches the project on every
+    # route it is reached through -- explicit, container or selector -- as an ID entry does
+    # (design §3: an excluded project is dropped whichever route reached it). A number no run
+    # has tied to an ID matches only its bare-number row, which is all there is to match.
+    numbers_named = _numbers_named(selections)
 
     def number_of(project: str) -> str | None:
         return numbers_named.get(project) or _previous_number(previous, project)
@@ -785,10 +809,15 @@ def _resolve_projects(management: str | None, scope: dict,
     ignored: list[dict] = []
     seen: set[str] = set()
     if management:
-        pattern = _excluded_by(management, patterns)
+        # By ID, or by the number a Metrics Scope named it by: an entry an operator wrote to
+        # drop a monitored project matches the management project the same way when the
+        # scope monitors it, and is recorded as ignored the same way.
+        by_id = _excluded_by(management, patterns)
+        number = number_of(management)
+        pattern = by_id or (number and _excluded_by(number, patterns))
         if pattern:
-            log(f"exclude.projects entry {pattern!r} matches the management project {management}; "
-                "ignored, the management project is always in scope.")
+            log(f"exclude.projects entry {pattern!r} matches the management project {management}"
+                f"{'' if by_id else f' by its number {number}'}; ignored, the management project is always in scope.")
             ignored.append({"project": management, "pattern": pattern})
         entries.append({"id": management, "via": [VIA_MANAGEMENT], "outcome": None})
         seen.add(management)
@@ -1005,11 +1034,37 @@ def _write_snapshot(snapshot: dict) -> None:
 
 
 def _previous_number(previous: dict | None, project: str) -> str | None:
-    """The project number the last snapshot recorded for the project, if any."""
+    """The project number the last snapshot recorded for the project: on its row, or in the memo."""
     for p in (previous or {}).get("projects", []):
-        if isinstance(p, dict) and p.get("id") == project:
-            return p.get(NUMBER_KEY) if isinstance(p.get(NUMBER_KEY), str) else None
+        if isinstance(p, dict) and p.get("id") == project and isinstance(p.get(NUMBER_KEY), str):
+            return p[NUMBER_KEY]
+    memo = (previous or {}).get(NUMBERS_KEY)
+    if isinstance(memo, dict):
+        for number, pid in memo.items():
+            if pid == project and isinstance(number, str) and number != project:
+                return number
     return None
+
+
+def _numbers_memo(previous: dict | None, selector_reports: dict[str, tuple[list[str] | None, str]],
+                  numbers_named: dict[str, str], scope_readable: bool) -> dict[str, str]:
+    """The number -> ID pairs the snapshot keeps for the next run.
+
+    Every pair this run's naming pass returned, and every pair the last snapshot knew whose
+    number a selector still reports; all of them when a selector's lookup failed or the
+    declaration could not be read, since what would be reported is then unknown. The memo is
+    what lets a run whose naming call is cut or refused still tie the number to the ID: a
+    project an `exclude.projects` number names has no row to keep the pair on, and without
+    it such a run would find nothing tying the number to the project and admit it again on
+    a route that names it by ID, creating profiles the next run retires. A number and an ID
+    are immutable and unique per project, so a pair never goes stale; a number no selector
+    reports any more is dropped, which bounds the memo by the estate the selectors reach.
+    """
+    reported = {m for members, _ in selector_reports.values() if members for m in members if m.isdigit()}
+    keep_all = not scope_readable or any(members is None for members, _ in selector_reports.values())
+    memo = {n: p for n, p in _previous_numbers(previous).items() if keep_all or n in reported}
+    memo.update({n: p for p, n in numbers_named.items()})
+    return dict(sorted(memo.items()))
 
 
 def _previous_via(previous: dict | None, project: str) -> list[str]:
@@ -1308,8 +1363,18 @@ def reconcile(dry_run: bool = False) -> dict:
         listings[management] = _list_project(management)
     groups = _resolve_groups(_container_ids(scope) + _selector_ids(scope), listing_deadline)
     searches = {g: r for g, r in groups.items() if _is_container(g)}
-    selections = _selector_members({g: r for g, r in groups.items() if _is_selector(g)}, previous, listing_deadline,
-                                   scope["exclude"]["projects"])
+    selector_reports = {g: r for g, r in groups.items() if _is_selector(g)}
+    selections = _selector_members(selector_reports, previous, listing_deadline, scope["exclude"]["projects"])
+    numbers_named = _numbers_named(selections)
+
+    def known_number(project: str) -> str | None:
+        # The number the project was named by: this run's naming pass first, then the row or
+        # memo the last snapshot kept, so the retire hold and every row written below see the
+        # same tie `_resolve_projects` matched an exclude entry on. A row without the number
+        # under a folder, the number tied for the first time this run, would otherwise be held
+        # a day as an index lag rather than retired as the declaration asks.
+        return numbers_named.get(project) or _previous_number(previous, project)
+
     entries, ignored_excludes, containers = _resolve_projects(management or carried_management, scope, searches, previous, selections)
     report["containers"] = [dict(c) for c in containers]
     if carried_management:
@@ -1532,8 +1597,9 @@ def reconcile(dry_run: bool = False) -> dict:
         container_vias = [v for v in via if _is_container(v)]
         if VIA_MANAGEMENT in via:
             return False
-        # By ID, or by the number the row keeps: the declaration speaking, either way.
-        number = _previous_number(previous, project)
+        # By ID, or by the number this run or the row tied to it: the declaration speaking,
+        # either way.
+        number = known_number(project)
         if _excluded_by(project, exclude_patterns) or (number and _excluded_by(number, exclude_patterns)):
             return False
         if not container_vias:
@@ -1741,8 +1807,8 @@ def reconcile(dry_run: bool = False) -> dict:
          # container, a frozen carry), so a later run that cannot name the number (the grant
          # revoked) still reports the project under its ID rather than retiring it. A number
          # and an ID are immutable and unique per project, so a recorded pair never goes stale.
-         **({NUMBER_KEY: e.get(NUMBER_KEY) or _previous_number(previous, e["id"])}
-            if (e.get(NUMBER_KEY) or _previous_number(previous, e["id"])) else {})}
+         **({NUMBER_KEY: e.get(NUMBER_KEY) or known_number(e["id"])}
+            if (e.get(NUMBER_KEY) or known_number(e["id"])) else {})}
         for e in entries
     ] + [
         # Carried with the via it had, so a container frozen on a later run still finds the
@@ -1755,7 +1821,7 @@ def reconcile(dry_run: bool = False) -> dict:
          "state": STATE_IN_SCOPE, "clusters": remaining(pid),
          **({ABSENT_SINCE_KEY: absent_since.get(pid) or _previous_absent_since(previous, pid)}
             if (pid in absent_since or _previous_absent_since(previous, pid)) else {}),
-         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
+         **({NUMBER_KEY: known_number(pid)} if known_number(pid) else {})}
         for pid in sorted(carried_in_scope - resolved_ids)
     ] + [
         # With the number it was named by, so a run that relinks it while the naming call is
@@ -1763,7 +1829,7 @@ def reconcile(dry_run: bool = False) -> dict:
         # retiring project the run did not see.
         {"id": pid, "via": [], "outcome": OUTCOME_OK, "state": STATE_RETIRING,
          "clusters": remaining(pid),
-         **({NUMBER_KEY: _previous_number(previous, pid)} if _previous_number(previous, pid) else {})}
+         **({NUMBER_KEY: known_number(pid)} if known_number(pid) else {})}
         for pid in sorted(still_retiring - carried_in_scope)
     ], key=lambda p: p["id"])
     if not dry_run:
@@ -1785,6 +1851,7 @@ def reconcile(dry_run: bool = False) -> dict:
             "projects": snapshot_projects,
             "unmanaged": sorted(unmanaged, key=lambda u: u["profile"]),
             "ignoredExcludes": ignored_excludes,
+            NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named, scope_readable),
         })
 
     return report

@@ -136,7 +136,7 @@ Rules:
 - **`exclude.projects` entries are project IDs or shell-style globs.** A glob (`*-sandbox`) is
   matched against the resolved project ID with `fnmatch`, after every selector has contributed.
   Globs are deterministic, so §5's byte-identical snapshot rule holds. An entry, ID or glob, that
-  matches the management project does not exclude it, by the rule above; the run keeps the project, logs the
+  matches the management project, by ID or by the number a Metrics Scope named it by, does not exclude it, by the rule above; the run keeps the project, logs the
   match, and records the first such entry under the snapshot's `ignoredExcludes` (§5), because a silently ignored
   exclusion is the kind of outcome §4 forbids. Decided 2026-09-21, from the first enterprise request for this feature.
 - **The resolved set is the management project plus every project a selector produced and no
@@ -293,6 +293,7 @@ profiles, on the data PVC, in a snapshot the reconcile run rewrites every hour:
   "declared": { "projects": [...], "folders": [...], "organizations": [...], "sharedVpcHosts": [...], "metricsScopes": [...], "exclude": {...} },
   "resolver": "asset-inventory",
   "ignoredExcludes": [{ "project": "ops-mgmt", "pattern": "ops-*" }],
+  "numbers": { "111222333444": "team-a" },
   "containers": [
     { "id": "folders/123456789012", "outcome": "ok", "projects": 3 }
   ],
@@ -324,7 +325,7 @@ that could read it did: a profile whose `cluster_identity` cannot be read this r
 through this map, so a `retiring` project whose remaining profile is unreadable stays `retiring`
 rather than leaving the snapshot and reading as never in scope once the identity is readable again.
 
-A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, and every later row for the project keeps it, explicit, management, container and `retiring` rows included, so a later run whose naming call is refused can still report the project under its ID (§10 step 3).
+A row named through a Metrics Scope also carries `number`, the project number the Monitoring API returned it under, and every later row for the project keeps it, explicit, management, container and `retiring` rows included, so a later run whose naming call is refused can still report the project under its ID (§10 step 3). `numbers` keeps every number-to-ID pair the naming pass has returned while a selector still reports the number, so the pair outlives the project's row: a project an `exclude.projects` number names has no row, and without the pair a run whose naming call is cut would tie nothing to the ID and admit the project again on a route that names it by ID, creating profiles the next run retires. A number no selector reports any more leaves the map; every pair is kept on a run whose selector lookup failed or whose declaration could not be read.
 
 A project entry carries two fields that answer different questions. `outcome` (§4) says whether
 the run could read the project this tick. `state` says what the declaration wants: `in-scope` for
@@ -450,9 +451,9 @@ Prerequisites the design has to state and the installer has to preflight:
   `serviceusage.services.use` the identity lacks there when it says the consumer project refused
   it. The resolved-set cap (100) is on the whole set, so the plan counts what it can of it as the
   reconcile does, the management project, the explicit projects and every selector's members once
-  each less an exact exclude entry, and refuses a declaration past it: the members past the cap
+  each less an exact exclude entry, and refuses a declaration past it while a selector is declared: the members past the cap
   would read `over-cap` with nothing created, so their bindings would be reach the agent never
-  uses. A single selector past the cap is refused at its read, before the naming reads.
+  uses. Without a selector the count is `projects` and the management project, which the CRD's list cap bounds and the plan admitted before, so a declaration without one is not refused for it. A single selector past the cap is refused at its read, before the naming reads.
 - When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
   the host project. The preflight checks, before the apply that then binds the agent's
   `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced

@@ -193,8 +193,13 @@ locals {
   # selectors' members, then the containers' -- and a project past the cap
   # reads `over-cap` with nothing created under it. The first three groups are
   # known here at plan time, so a declaration they alone carry past the cap is
-  # refused (main.tf) rather than bound: the read roles in the members past it
-  # would be reach the agent never uses. Counted as the reconcile counts, once
+  # refused (main.tf) rather than bound, while a selector is declared: the
+  # read roles in the members past it would be reach the agent never uses.
+  # Without a selector the count is scope.projects and the management project,
+  # which the CRD's own list cap bounds and this module admitted before the
+  # selectors existed, so a plan that declares none is not refused for it and
+  # the reconcile reads a hundred-and-first over-cap as it did. Counted as the
+  # reconcile counts, once
   # each and less an exact exclude entry; a glob is the reconcile's alone, so
   # a set only a glob brings under the cap at runtime is refused here and
   # wants its entries named exactly. Containers are not counted: their members
