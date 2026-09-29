@@ -2,11 +2,14 @@ name: Publish Images to GHCR
 
 on:
   push:
-    # `release/**` too: a backport merged onto a release line needs the SHA-tagged
-    # images every rung of the release ladder checks for, and this is the only
-    # workflow that publishes them. `:latest` still follows `main` alone; see the
-    # `tags:` blocks below.
-    branches: [main, "release/**"]
+    # Release lines too: a backport merged onto `release/<X.Y>` needs the
+    # SHA-tagged images every rung of the release ladder checks for, and this is
+    # the only workflow that publishes them. The pattern admits the line shape
+    # alone, not the per-release `release/<X.Y.Z>` branches the GA tagger pushes
+    # and not an arbitrary `release/anything`, which would otherwise mint signed
+    # images from any branch a collaborator can push. `:latest` still follows
+    # `main` alone; see the `tags:` blocks below.
+    branches: [main, "release/[0-9]+.[0-9]+"]
 
 # Queue rather than cancel: every publish should complete, but not interleave.
 concurrency:
@@ -20,7 +23,10 @@ jobs:
   publish-operator:
     name: Publish Controller to GHCR
     runs-on: ubuntu-latest
-    if: github.repository == 'gke-labs/kube-agents'
+    # The second clause skips the stamped release commit the GA tagger pushes to
+    # a release line: nothing deploys its images, the release is promoted from
+    # the candidate's, and building it would cost a full publish per release.
+    if: "github.repository == 'gke-labs/kube-agents' && !startsWith(github.event.head_commit.message, 'chore(release): stamp release version')"
     permissions:
       contents: read
       packages: write
@@ -75,7 +81,10 @@ jobs:
   publish-agents:
     name: Publish Agent Images to GHCR
     runs-on: ubuntu-latest
-    if: github.repository == 'gke-labs/kube-agents'
+    # The second clause skips the stamped release commit the GA tagger pushes to
+    # a release line: nothing deploys its images, the release is promoted from
+    # the candidate's, and building it would cost a full publish per release.
+    if: "github.repository == 'gke-labs/kube-agents' && !startsWith(github.event.head_commit.message, 'chore(release): stamp release version')"
     permissions:
       contents: read
       packages: write

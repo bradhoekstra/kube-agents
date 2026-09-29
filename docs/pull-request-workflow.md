@@ -454,13 +454,11 @@ gh api repos/gke-labs/kube-agents/branches/main/protection \
   --jq '.required_status_checks.contexts'
 ```
 
-A release line, `release/<X.Y>`, carries the same ten contexts and the same conversation-resolution
-rule through its own branch protection, and Tide reads that protection the way it reads `main`'s.
-Read one back by substituting the branch, URL-encoded, for `main` in the command above
-(`release%2F0.8`). A backport pull request branches from `upstream/release/<X.Y>` and targets it;
-every workflow behind a required context runs for such a pull request, and
-`tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. Everything else on
-this page applies to it unchanged.
+Every workflow behind one of those contexts also runs for a pull request whose base is a `release/`
+branch, and `tests/test_merge_group_triggers.py` fails if one is filtered back to `main`. Which of
+them a `release/` branch _requires_ is a repository setting like `main`'s, read back with the same
+command and the branch substituted, URL-encoded (`release%2F0.7.0`); no `release/` branch carries
+one today.
 
 **A green smoke run stays valid when `main` moves — usually.** Tide credits a Prow presubmit only
 against the base SHA it ran on — crier records it as a `BaseSHA:<sha>` suffix on the commit status

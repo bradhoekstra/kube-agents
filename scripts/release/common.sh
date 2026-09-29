@@ -29,6 +29,11 @@ readonly RELEASE_BRANCH_PREFIX="release/"
 # The full ref a branch lives under, for the lookups and refspecs that must not
 # be satisfied by a tag of the same name.
 readonly GIT_BRANCH_REF_PREFIX="refs/heads/"
+# The branch every nightly and eval candidate is cut from, the remote-tracking
+# ref a full clone keeps for it, and the ref a bare `git fetch` leaves behind.
+readonly RELEASE_MAIN_BRANCH="main"
+readonly RELEASE_MAIN_TRACKING_REF="refs/remotes/origin/main"
+readonly GIT_FETCH_HEAD_REF="FETCH_HEAD"
 
 # The registry the docker-free existence probe below knows how to query, and the
 # manifest media types that probe must accept. Omitting the OCI types gets a
@@ -295,65 +300,84 @@ get_previous_ga_tag() {
   echo "${previous}"
 }
 
-# The ref that stands for `main` in this checkout: the remote-tracking ref of a
-# full clone, else (in CI) a fresh fetch of the release repository's `main`,
-# else a local `main`, which is what the test repositories have. Prints nothing
-# when none resolves; the callers decide what that means.
+# The ref that stands for `main` in this checkout, freshest first. In CI it is
+# fetched from the release repository, so a checkout whose origin is a fork, or
+# whose remote-tracking ref is stale, cannot answer with an old main; the
+# tracking ref and a local `main` are the fallbacks, and all a hand run has. A
+# shallow checkout is unshallowed in CI and refused if that fails: past a
+# shallow boundary every ancestry test reads "no", which would drop every
+# candidate but the tip. Prints nothing when none resolves.
 release_main_ref() {
-  if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
-    echo "refs/remotes/origin/main"
-    return 0
+  local shallow
+  shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)"
+  if is_ci_pipeline; then
+    if [ "${shallow}" = "true" ]; then
+      git fetch --unshallow "$(release_repo_url)" >/dev/null 2>&1 || true
+      if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+        echo "❌ ERROR: This checkout is shallow, and ancestry against main cannot be read past its boundary." >&2
+        return 1
+      fi
+    fi
+    if git fetch "$(release_repo_url)" "${RELEASE_MAIN_BRANCH}" >/dev/null 2>&1; then
+      echo "${GIT_FETCH_HEAD_REF}"
+      return 0
+    fi
+  elif [ "${shallow}" = "true" ]; then
+    return 1
   fi
-  if is_ci_pipeline && git fetch "$(release_repo_url)" main >/dev/null 2>&1; then
-    echo "FETCH_HEAD"
-    return 0
-  fi
-  if git rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1; then
-    echo "refs/heads/main"
-    return 0
-  fi
+  local ref
+  for ref in "${RELEASE_MAIN_TRACKING_REF}" "${GIT_BRANCH_REF_PREFIX}${RELEASE_MAIN_BRANCH}"; do
+    if git rev-parse --verify --quiet "${ref}" >/dev/null 2>&1; then
+      if ! is_ci_pipeline; then
+        echo "ℹ️ Filtering candidates against ${ref}, which is as fresh as this checkout's last fetch." >&2
+      fi
+      echo "${ref}"
+      return 0
+    fi
+  done
   return 1
 }
 
-# Keeps, from a newline-separated list of tags on stdin, those whose commit is
-# on `main`. The candidate pickers below sort tags by name, which is by
-# timestamp, and a release line's RC tags share the namespace: without this
-# filter the first `rc_` tag cut on `release/<X.Y>` would be the newest of all
-# and the nightly promotion and the Prow eval would both adopt a line commit as
-# main's candidate. In CI a `main` that cannot be resolved is an error rather
+# Lists the tags matching a glob whose commit is on main, newest by name first,
+# which for the rc_ families is newest by timestamp. The candidate pickers below
+# sort tags by name, and a release line's RC tags share the namespace: without
+# this the first `rc_` tag cut on `release/<X.Y>` would be the newest of all,
+# and the nightly promotion and the Prow eval would both adopt a line commit
+# as main's candidate. In CI a `main` that cannot be read is an error rather
 # than a guess; off CI the list passes through unfiltered with a warning, so a
 # hand run in a partial checkout still answers.
-filter_tags_on_main() {
+# Arguments: $1 = tag glob
+list_tags_on_main() {
+  local glob="${1:-}"
+
+  if [ -z "${glob}" ]; then
+    echo "❌ ERROR: a tag glob is required for list_tags_on_main." >&2
+    return 1
+  fi
+
   local main_ref
   if ! main_ref="$(release_main_ref)"; then
     if is_ci_pipeline; then
       echo "❌ ERROR: Could not resolve main in this checkout; refusing to pick a candidate without it." >&2
       return 1
     fi
-    echo "⚠️ Warning: main is not resolvable here; not filtering candidates to it." >&2
-    cat
+    echo "⚠️ Warning: main cannot be read reliably here (missing, or a shallow checkout); not filtering candidates to it." >&2
+    git tag -l --sort=-v:refname "${glob}" 2>/dev/null || true
     return 0
   fi
-  local tag sha
-  while IFS= read -r tag; do
-    [ -n "${tag}" ] || continue
-    sha="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" || continue
-    if git merge-base --is-ancestor "${sha}" "${main_ref}" 2>/dev/null; then
-      echo "${tag}"
-    fi
-  done
+  git tag -l --sort=-v:refname --merged "${main_ref}" "${glob}" 2>/dev/null || true
 }
 
 # Finds the latest validated release candidate tag (rc_*_validated) on main.
-# A line's validation (`release-publish.yml` with `release_line`) is a gate for
-# that line's patch release, never a nightly candidate: see filter_tags_on_main.
+# A release line's validation is the gate for that line's own patch release,
+# never a nightly candidate: see list_tags_on_main.
 get_latest_validated_rc_tag() {
-  local listing on_main
-  listing="$(git tag -l --sort=-v:refname 'rc_*_validated' 2>/dev/null | grep -E '^rc_.*_validated$' || true)"
+  local on_main validated
+  on_main="$(list_tags_on_main 'rc_*_validated')" || return 1
   # Materialised before `head`: under pipefail, `head` closing the pipe after
-  # the first line would end the filter with SIGPIPE and read as a failure.
-  on_main="$(filter_tags_on_main <<<"${listing}")" || return 1
-  head -n 1 <<<"${on_main}"
+  # the first line would end the producer with SIGPIPE and read as a failure.
+  validated="$(grep -E '^rc_.*_validated$' <<<"${on_main}" || true)"
+  head -n 1 <<<"${validated}"
 }
 
 # Reads the commits between the last GA tag and a candidate, into

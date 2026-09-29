@@ -730,19 +730,27 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         self.assertIn("publish-agents", self.jobs)
         self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
 
+    _RELEASE_LINE_PUSH_PATTERN = "release/[0-9]+.[0-9]+"
+    _STAMP_SUBJECT_GUARD = "!startsWith(github.event.head_commit.message, 'chore(release): stamp release version')"
+
     def test_a_release_line_push_builds_sha_tags_but_never_moves_latest(self):
         """A backport merged onto `release/<X.Y>` needs `:<sha>` images, and only those.
 
         Every rung of the release ladder checks GHCR for the candidate's SHA tag,
         and this is the only workflow that publishes it, so it has to fire for the
-        release lines. `:latest` is what autopush and the presubmit cache follow
-        and must keep tracking `main` alone: each `:latest` line is guarded by
-        the ref, and `docker/build-push-action` drops the empty line the guard
-        leaves behind on a line push.
+        release lines. Only for those: the pattern is the line shape, so neither
+        the per-release `release/<X.Y.Z>` branches nor an arbitrary
+        `release/anything` a collaborator pushes can mint signed images, and both
+        jobs skip the stamped release commit the GA tagger pushes to a line.
+        `:latest` is what autopush and the presubmit cache follow and must keep
+        tracking `main` alone: each `:latest` line is guarded by the ref, and
+        `docker/build-push-action` drops the empty line the guard leaves behind.
         """
         on = self.doc.get("on", self.doc.get(True))
-        self.assertIn("release/**", on["push"]["branches"])
-        self.assertIn("main", on["push"]["branches"])
+        self.assertEqual(on["push"]["branches"], ["main", self._RELEASE_LINE_PUSH_PATTERN])
+        for name, job in self.jobs.items():
+            with self.subTest(job=name):
+                self.assertIn(self._STAMP_SUBJECT_GUARD, str(job.get("if", "")))
         build_steps = [
             step
             for job in self.jobs.values()

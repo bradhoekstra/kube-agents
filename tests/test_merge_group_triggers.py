@@ -31,10 +31,14 @@ _REQUIRED_CHECK_WORKFLOWS = (
 )
 
 
-def _triggers(path: pathlib.Path) -> set[str]:
+def _on(path: pathlib.Path):
     doc = yaml.safe_load(path.read_text())
     # PyYAML reads an unquoted `on:` key as the boolean True (YAML 1.1).
-    on = doc.get("on", doc.get(True))
+    return doc.get("on", doc.get(True))
+
+
+def _triggers(path: pathlib.Path) -> set[str]:
+    on = _on(path)
     if isinstance(on, str):
         return {on}
     if isinstance(on, list):
@@ -44,11 +48,6 @@ def _triggers(path: pathlib.Path) -> set[str]:
 
 _PULL_REQUEST = "pull_request"
 _RELEASE_LINE_GLOB = "release/**"
-
-
-def _on(path: pathlib.Path) -> dict:
-    doc = yaml.safe_load(path.read_text())
-    return doc.get("on", doc.get(True))
 
 
 class MergeGroupTriggerTest(unittest.TestCase):
