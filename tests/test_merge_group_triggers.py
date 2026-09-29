@@ -57,13 +57,13 @@ class MergeGroupTriggerTest(unittest.TestCase):
                 self.assertIn(_MERGE_GROUP, _triggers(_WORKFLOWS / name))
 
     def test_required_check_workflows_run_for_pull_requests_against_a_release_line(self) -> None:
-        """A backport targets `release/<X.Y>` and needs the same ten contexts.
+        """A pull request against a `release/` branch must be able to earn the same contexts.
 
-        Branch protection on a release line requires the contexts `main` does,
-        and Tide reads that protection. A workflow whose `pull_request` trigger
-        is filtered to `main` never posts on such a pull request, so the context
-        stays pending and nothing can merge onto the line. A filter is allowed;
-        one that omits the release lines is not.
+        Tide reads the target branch's protection, and protection that requires
+        a context a workflow never posts holds the pull request forever. A
+        workflow whose `pull_request` trigger is filtered to `main` never posts
+        on such a pull request. A filter is allowed; one that omits the release
+        branches is not.
         """
         for name in _REQUIRED_CHECK_WORKFLOWS:
             with self.subTest(workflow=name):

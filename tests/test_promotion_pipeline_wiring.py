@@ -731,7 +731,10 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
 
     _RELEASE_LINE_PUSH_PATTERN = "release/[0-9]+.[0-9]+"
-    _STAMP_SUBJECT_GUARD = "!startsWith(github.event.head_commit.message, 'chore(release): stamp release version')"
+    _STAMP_SUBJECT_GUARD = (
+        "(github.ref == 'refs/heads/main' || "
+        "!startsWith(github.event.head_commit.message, 'chore(release): stamp release version'))"
+    )
 
     def test_a_release_line_push_builds_sha_tags_but_never_moves_latest(self):
         """A backport merged onto `release/<X.Y>` needs `:<sha>` images, and only those.

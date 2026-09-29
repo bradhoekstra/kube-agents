@@ -5,10 +5,10 @@ on:
     # Release lines too: a backport merged onto `release/<X.Y>` needs the
     # SHA-tagged images every rung of the release ladder checks for, and this is
     # the only workflow that publishes them. The pattern admits the line shape
-    # alone, not the per-release `release/<X.Y.Z>` branches the GA tagger pushes
-    # and not an arbitrary `release/anything`, which would otherwise mint signed
-    # images from any branch a collaborator can push. `:latest` still follows
-    # `main` alone; see the `tags:` blocks below.
+    # alone: not the per-release `release/<X.Y.Z>` branches the GA tagger pushes,
+    # whose stamped commits nothing deploys, and not a misnamed `release/x`. Who
+    # may create or push a `release/<X.Y>` is the repository's branch rules, not
+    # this pattern. `:latest` still follows `main` alone; see the `tags:` below.
     branches: [main, "release/[0-9]+.[0-9]+"]
 
 # Queue rather than cancel: every publish should complete, but not interleave.
@@ -23,10 +23,11 @@ jobs:
   publish-operator:
     name: Publish Controller to GHCR
     runs-on: ubuntu-latest
-    # The second clause skips the stamped release commit the GA tagger pushes to
-    # a release line: nothing deploys its images, the release is promoted from
-    # the candidate's, and building it would cost a full publish per release.
-    if: "github.repository == 'gke-labs/kube-agents' && !startsWith(github.event.head_commit.message, 'chore(release): stamp release version')"
+    # On a release branch the GA tagger's stamped commit is skipped: nothing
+    # deploys its images, the release is promoted from the candidate's, and
+    # building it would cost a full publish per release. `main` is exempt from
+    # the subject test, so a commit that merely starts that way still builds.
+    if: "github.repository == 'gke-labs/kube-agents' && (github.ref == 'refs/heads/main' || !startsWith(github.event.head_commit.message, 'chore(release): stamp release version'))"
     permissions:
       contents: read
       packages: write
@@ -81,10 +82,11 @@ jobs:
   publish-agents:
     name: Publish Agent Images to GHCR
     runs-on: ubuntu-latest
-    # The second clause skips the stamped release commit the GA tagger pushes to
-    # a release line: nothing deploys its images, the release is promoted from
-    # the candidate's, and building it would cost a full publish per release.
-    if: "github.repository == 'gke-labs/kube-agents' && !startsWith(github.event.head_commit.message, 'chore(release): stamp release version')"
+    # On a release branch the GA tagger's stamped commit is skipped: nothing
+    # deploys its images, the release is promoted from the candidate's, and
+    # building it would cost a full publish per release. `main` is exempt from
+    # the subject test, so a commit that merely starts that way still builds.
+    if: "github.repository == 'gke-labs/kube-agents' && (github.ref == 'refs/heads/main' || !startsWith(github.event.head_commit.message, 'chore(release): stamp release version'))"
     permissions:
       contents: read
       packages: write

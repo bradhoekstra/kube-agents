@@ -227,6 +227,7 @@ source "{_COMMON_SH}"
                 cwd=repo_dir,
             )
             self.assertNotEqual(in_ci.returncode, 0)
+            self.assertIn("Could not fetch main", in_ci.stderr)
             self.assertIn("Could not resolve main", in_ci.stderr)
 
             off_ci = self._run_common_func("list_tags_on_main 'rc_*_validated'", cwd=repo_dir)
@@ -235,6 +236,51 @@ source "{_COMMON_SH}"
             self.assertIn("not filtering", off_ci.stderr)
         finally:
             temp_dir.cleanup()
+
+    def test_list_tags_on_main_in_ci_prefers_the_fetched_main_over_a_stale_tracking_ref(self):
+        """A stale `origin/main` must not answer in CI when the release repository's is newer."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        git("tag", "rc_2608191200_2222222_validated")
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        git("push", "--quiet", str(bare_dir), "main", "--tags")
+        # The tracking ref stops here; the release repository's main moves on.
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        (pathlib.Path(repo_dir) / "later.txt").write_text("later\n")
+        git("add", "later.txt")
+        git("commit", "-m", "feat: later")
+        git("tag", "rc_2609291200_3333333_validated")
+        git("push", "--quiet", str(bare_dir), "main", "--tags")
+
+        proc = self._run_common_func(
+            "get_latest_validated_rc_tag",
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "rc_2609291200_3333333_validated")
+
+    def test_list_tags_on_main_in_ci_refuses_a_stale_tracking_ref_when_the_fetch_fails(self):
+        """In CI a failed fetch is an error, not a fall-through to `origin/main`."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        git("tag", "rc_2608191200_2222222_validated")
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+        git(
+            "config",
+            f"url.{unreachable}.insteadOf",
+            f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+        )
+
+        proc = self._run_common_func(
+            "get_latest_validated_rc_tag",
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Could not fetch main", proc.stderr)
+        self.assertNotIn("rc_2608191200_2222222_validated", proc.stdout)
 
     def test_list_tags_on_main_in_ci_reads_main_from_the_release_repository(self):
         """The Prow eval lane has neither `origin/main` nor a local `main`.
@@ -266,6 +312,21 @@ source "{_COMMON_SH}"
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "rc_2608191200_2222222_validated")
+
+    def test_list_tags_on_main_passes_through_a_tag_that_names_no_commit(self):
+        """A broken tag must reach the caller and fail there, not vanish as "no candidate"."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        git("tag", "staging_2608191200_2222222")
+        blob = git("hash-object", "-w", "init.txt").stdout.strip()
+        git("tag", "staging_2609291200_3333333", blob)
+
+        proc = self._run_common_func("list_tags_on_main 'staging_*'", cwd=repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.split(),
+            ["staging_2609291200_3333333", "staging_2608191200_2222222"],
+        )
 
     def test_list_tags_on_main_in_ci_refuses_a_shallow_checkout_it_cannot_deepen(self):
         """Past a shallow boundary every ancestry test reads "no": refuse rather than drop everything."""

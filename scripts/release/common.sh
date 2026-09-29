@@ -300,13 +300,15 @@ get_previous_ga_tag() {
   echo "${previous}"
 }
 
-# The ref that stands for `main` in this checkout, freshest first. In CI it is
-# fetched from the release repository, so a checkout whose origin is a fork, or
-# whose remote-tracking ref is stale, cannot answer with an old main; the
-# tracking ref and a local `main` are the fallbacks, and all a hand run has. A
-# shallow checkout is unshallowed in CI and refused if that fails: past a
-# shallow boundary every ancestry test reads "no", which would drop every
-# candidate but the tip. Prints nothing when none resolves.
+# The ref that stands for `main` in this checkout. In CI it is the release
+# repository's `main`, fetched now: a checkout whose origin is a fork, or whose
+# remote-tracking ref is stale, must not answer with an old main, so a fetch
+# that fails is an error there rather than a fall-through to the tracking ref.
+# A shallow CI checkout is unshallowed first and refused if that fails, since
+# past a shallow boundary every ancestry test reads "no", which would drop every
+# candidate but the tip. Off CI nothing is fetched: the tracking ref or a local
+# `main` answers, with a note that it is only as fresh as the last fetch, and a
+# shallow checkout resolves nothing. Prints the ref, or nothing.
 release_main_ref() {
   local shallow
   shallow="$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)"
@@ -318,19 +320,20 @@ release_main_ref() {
         return 1
       fi
     fi
-    if git fetch "$(release_repo_url)" "${RELEASE_MAIN_BRANCH}" >/dev/null 2>&1; then
-      echo "${GIT_FETCH_HEAD_REF}"
-      return 0
+    if ! git fetch "$(release_repo_url)" "${RELEASE_MAIN_BRANCH}" >/dev/null 2>&1; then
+      echo "❌ ERROR: Could not fetch ${RELEASE_MAIN_BRANCH} from $(release_repo_url); not falling back to a tracking ref that may be stale." >&2
+      return 1
     fi
-  elif [ "${shallow}" = "true" ]; then
+    echo "${GIT_FETCH_HEAD_REF}"
+    return 0
+  fi
+  if [ "${shallow}" = "true" ]; then
     return 1
   fi
   local ref
   for ref in "${RELEASE_MAIN_TRACKING_REF}" "${GIT_BRANCH_REF_PREFIX}${RELEASE_MAIN_BRANCH}"; do
     if git rev-parse --verify --quiet "${ref}" >/dev/null 2>&1; then
-      if ! is_ci_pipeline; then
-        echo "ℹ️ Filtering candidates against ${ref}, which is as fresh as this checkout's last fetch." >&2
-      fi
+      echo "ℹ️ Filtering candidates against ${ref}, which is as fresh as this checkout's last fetch." >&2
       echo "${ref}"
       return 0
     fi
@@ -365,7 +368,21 @@ list_tags_on_main() {
     git tag -l --sort=-v:refname "${glob}" 2>/dev/null || true
     return 0
   fi
-  git tag -l --sort=-v:refname --merged "${main_ref}" "${glob}" 2>/dev/null || true
+  # A tag that does not peel to a commit is passed through rather than dropped:
+  # `--merged` cannot place it, and the caller's own resolution then fails
+  # loudly, which is what a broken tag graph owes rather than a quiet
+  # "no candidate" that stays green until somebody deletes the tag.
+  local all_tags on_main tag
+  all_tags="$(git tag -l --sort=-v:refname "${glob}" 2>/dev/null || true)"
+  on_main="$(git tag -l --sort=-v:refname --merged "${main_ref}" "${glob}" 2>/dev/null || true)"
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    if grep -Fxq "${tag}" <<<"${on_main}"; then
+      echo "${tag}"
+    elif ! git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" >/dev/null 2>&1; then
+      echo "${tag}"
+    fi
+  done <<<"${all_tags}"
 }
 
 # Finds the latest validated release candidate tag (rc_*_validated) on main.
@@ -785,9 +802,14 @@ export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
 # closing the pipe early makes grep exit 141, which a trailing `|| echo ""` then
 # turns into "nothing has passed the gate" — a skipped release, silently, once
 # the tag list outgrows a pipe buffer.
+#
+# On main, like the rc_ pickers (list_tags_on_main): the GA gate, the publish
+# auto-resolve, the version calculator and the staging deploy all read this,
+# and a staging_ tag a hand-dispatched promotion left on a release-line commit
+# must not become main's release candidate.
 get_latest_staging_tag() {
   local tags
-  tags="$(git tag -l --sort=-v:refname "${STAGING_TAG_PREFIX}*" 2>/dev/null || true)"
+  tags="$(list_tags_on_main "${STAGING_TAG_PREFIX}*")" || return 1
   grep -m1 -E "${STAGING_TAG_SHAPE_REGEX}" <<<"${tags}" || true
 }
 
