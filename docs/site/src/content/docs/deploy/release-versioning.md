@@ -83,10 +83,10 @@ release cut from `main`. [The latest release](https://github.com/gke-labs/kube-a
 is the numerically highest version, which may be a patch cut on the newest release line; a patch
 below the newest minor is published without the `latest` mark. Neither moves `main`'s base.
 
-- `https://github.com/gke-labs/kube-agents/compare/<LATEST_GA_TAG>...main` lists every pull
-  request the next release will contain if it is cut from the tip of `main`. The GA tag sits on a
-  stamped commit whose parent is the released candidate, so the three-dot compare starts from that
-  candidate.
+- `https://github.com/gke-labs/kube-agents/compare/<MAIN_GA_TAG>...main`, with the newest GA tag
+  cut from `main`, lists every pull request the next release will contain if it is cut from the
+  tip of `main`. The GA tag sits on a stamped commit whose parent is the released candidate, so
+  the three-dot compare starts from that candidate.
 - Replace `main` with the newest `staging_<ts>_<sha>` tag to see what is releasable now; that is
   the commit an ordinary dispatch releases.
 
@@ -124,7 +124,7 @@ The release publish workflow enforces byte-for-byte fidelity with tested candida
 1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; on a release line a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to one of the legacy per-release `release/X.Y.Z` branches (0.1.0 through 0.7.0) builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
 2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens.
 3. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed via Cosign.
-4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit, which is then pushed to the release line `release/X.Y`: created at a minor, fast-forwarded by each patch.
+4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit and pushed together with the release line `release/X.Y`, in one atomic push: the line is created by its first release and fast-forwarded by each later patch.
 5. `install.sh` and `upgrade.sh` verify that unversioned source directories match `BAKED_RELEASE_VERSION` and that Git checkouts match the requested tag's commit, halting if local scripts diverge from the container images.
 6. The offline release bundle is staged directly from the tagged release commit with `git archive`, carries the `.release-bundle` provenance marker, and is packaged as both `.tar.gz` and `.zip`.
 7. Software Bills of Materials are generated with Syft — SPDX 2.3 JSON and CycloneDX 1.5 JSON for the filesystem bundle, SPDX 2.3 JSON for each container image — and published alongside `checksums.txt` with SHA256 checksums for every release asset.

@@ -443,8 +443,9 @@ class TagGAReleaseScriptTest(unittest.TestCase):
     # ─── the release branch ──────────────────────────────────────────────────
     # The stamped commit is pushed to its release line `release/<X.Y>` together
     # with the tag, so a release commit belongs to a branch on the repository
-    # rather than to its tag alone. tests/test_release_common.py owns ensure_release_branch's own
-    # contract; these pin that the GA tagger calls it, and in which order.
+    # rather than to its tag alone, in one atomic push (ensure_ga_release_refs).
+    # tests/test_release_common.py owns the placement and fast-forward contract;
+    # these pin what the GA tagger does with it.
 
     def test_creates_the_release_branch_at_the_stamped_commit(self):
         temp_dir, repo_dir, git = create_mock_git_repo()

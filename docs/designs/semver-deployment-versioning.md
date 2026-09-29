@@ -34,10 +34,11 @@ documentation and governance playbooks around them.
    see `scripts/release/README.md`.
 4. **GA release pipeline creates stamped release child commit.** When promoting a staging-promoted
    candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD
-   (baking `BAKED_RELEASE_VERSION` into installer scripts, and stamping SemVer release versions into Helm `Chart.yaml` and Terraform defaults), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`), then pushes it to the release line `release/X.Y`,
-   and orchestrates clean image promotion and chart publication. A minor creates the line at its
-   stamped commit; a patch is stamped from the line's head and fast-forwards it, so every release
-   commit stays reachable from a branch and nothing is force-pushed. Patches are cut from the line
+   (baking `BAKED_RELEASE_VERSION` into installer scripts, and stamping SemVer release versions into Helm `Chart.yaml` and Terraform defaults), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`) and pushes the tag and the release line `release/X.Y`
+   together in one atomic push, and orchestrates clean image promotion and chart publication. The
+   line's first release creates it at the stamped commit; a later patch is stamped from the line's
+   head and fast-forwards it, so every release commit stays reachable from a branch and nothing is
+   force-pushed. Patches are cut from the line
    (fixes cherry-picked onto it, `rc_*_validated` on its head, a dispatch naming the line), and
    once a line exists `main` bumps at least MINOR; the base of every version bump and release-notes
    range is found by ancestry, not by number. Because the GA tag points at this

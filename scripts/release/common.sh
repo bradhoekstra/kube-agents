@@ -23,8 +23,9 @@ readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
 readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
 
 # The branch each GA release commit is pushed to, alongside its tag: the
-# release line `release/<X.Y>`. A minor GA creates the line at its stamped
-# commit; each patch GA is stamped as a child of the line's head and
+# release line `release/<X.Y>`. The first release of a line creates it at its
+# stamped commit (a minor, or the first patch of a minor that predates the
+# lines); each later patch is stamped as a child of the line's head and
 # fast-forwards it, so nothing is ever force-pushed and every release commit on
 # the line stays reachable from a branch. (Releases 0.1.0 to 0.7.0 predate the
 # lines and sit on per-release `release/<X.Y.Z>` branches, left as they are.)
@@ -1353,7 +1354,9 @@ release_line_head() {
     return 0
   fi
 
-  if ! head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null)"; then
+  # Off CI: the local branch, else the tracking ref a developer's clone holds.
+  if ! head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null)" &&
+    ! head="$(git rev-parse --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null)"; then
     echo "❌ ERROR: No local release line '${branch}'." >&2
     return 1
   fi
@@ -1371,7 +1374,8 @@ release_line_branch_exists() {
   if is_ci_pipeline; then
     head="$(release_branch_remote_commit "${branch_ref}")" || return 2
   else
-    head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+    head="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null ||
+      git rev-parse --verify --quiet "refs/remotes/origin/${branch}" 2>/dev/null || true)"
   fi
   [ -n "${head}" ]
 }
