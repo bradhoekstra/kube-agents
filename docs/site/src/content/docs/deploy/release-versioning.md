@@ -79,9 +79,9 @@ labelled `duplicate`, `invalid` or `wontfix`, are left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
 
 Before it exists, the next release from `main` is whatever has merged since the most recent
-release cut from `main`, which [the latest release](https://github.com/gke-labs/kube-agents/releases/latest)
-names: a patch cut on a release line is published without the `latest` mark and does not move
-`main`'s base.
+release cut from `main`. [The latest release](https://github.com/gke-labs/kube-agents/releases/latest)
+is the numerically highest version, which may be a patch cut on the newest release line; a patch
+below the newest minor is published without the `latest` mark. Neither moves `main`'s base.
 
 - `https://github.com/gke-labs/kube-agents/compare/<LATEST_GA_TAG>...main` lists every pull
   request the next release will contain if it is cut from the tip of `main`. The GA tag sits on a
@@ -121,7 +121,7 @@ Maintainers do, on the Friday schedule above or by hand. A patch release, `X.Y.Z
 
 The release publish workflow enforces byte-for-byte fidelity with tested candidate binaries across seven layers:
 
-1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; on a release line a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to one of the legacy per-release `release/X.Y.Z` branches (releases before 0.8.0) builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
+1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; on a release line a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to one of the legacy per-release `release/X.Y.Z` branches (0.1.0 through 0.7.0) builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
 2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens.
 3. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed via Cosign.
 4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit, which is then pushed to the release line `release/X.Y`: created at a minor, fast-forwarded by each patch.

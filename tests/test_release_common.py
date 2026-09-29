@@ -1116,8 +1116,8 @@ source "{_COMMON_SH}"
             temp_dir.cleanup()
 
     # ─── ensure_release_branch ───────────────────────────────────────────────
-    # The GA release commit is pushed to `release/<X.Y.Z>` alongside its tag, so
-    # it belongs to a branch on the repository rather than to the tag alone. The
+    # The GA release commit is pushed to its release line `release/<X.Y>` alongside
+    # its tag, so it belongs to a branch on the repository rather than to the tag alone. The
     # contract is ensure_git_tag's, and these pin the two halves of it: the
     # remote decides in CI, and nothing is ever force-pushed.
 

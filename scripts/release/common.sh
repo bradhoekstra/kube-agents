@@ -464,7 +464,7 @@ get_latest_validated_rc_tag() {
   head -n 1 <<<"${validated}"
 }
 
-# Reads the commits between the last GA tag and a candidate, into
+# Reads the commits between a base GA tag and a candidate, into
 # RELEASE_RANGE_SUBJECTS (`%s`) and RELEASE_RANGE_BODIES (`%b`).
 #
 # Shared for the same reason the predicate below is: calculate_next_version.sh
@@ -1235,16 +1235,17 @@ ensure_git_tag() {
   release_push_ref "${rc_tag}" "Git tag '${rc_tag}'"
 }
 
-# Pushes one ref to the release repository: `origin` first, then the plain
-# https URL of the target repository. Never `--force`: a ref the remote already
-# holds at another commit is refused there, and the error names it.
-# Arguments: $1 = refspec, $2 = what it is, for the messages ("Git tag '0.7.0'")
-release_push_ref() {
-  local refspec="${1:-}"
-  local label="${2:-ref '${1:-}'}"
+# Pushes refs to the release repository in one atomic push: all of them land or
+# none does. `origin` first, then the plain https URL of the target repository.
+# Never `--force`: a ref the remote already holds at another commit is refused
+# there, the whole push with it, and the error names it.
+# Arguments: $1 = what is being pushed, for the messages; $2... = refspecs
+release_push_refs() {
+  local label="${1:-}"
+  shift || true
 
-  if [ -z "${refspec}" ]; then
-    echo "❌ ERROR: a refspec is required for release_push_ref." >&2
+  if [ $# -eq 0 ]; then
+    echo "❌ ERROR: at least one refspec is required for release_push_refs." >&2
     return 1
   fi
 
@@ -1255,9 +1256,9 @@ release_push_ref() {
   fallback_url="$(release_repo_url)"
 
   local origin_err fallback_err
-  if origin_err=$(git push origin "${refspec}" 2>&1); then
+  if origin_err=$(git push --atomic origin "$@" 2>&1); then
     echo "✅ ${label} successfully pushed to remote repository (${target_repo})!"
-  elif fallback_err=$(git push "${fallback_url}" "${refspec}" 2>&1); then
+  elif fallback_err=$(git push --atomic "${fallback_url}" "$@" 2>&1); then
     echo "✅ ${label} successfully pushed to remote repository (${target_repo})!"
   else
     # Both attempts are reported: in CI they name the same repository and
@@ -1268,6 +1269,19 @@ release_push_ref() {
     echo "   ${fallback_url}: ${fallback_err}" >&2
     return 1
   fi
+}
+
+# One ref, the form the candidate-rung taggers use.
+# Arguments: $1 = refspec, $2 = what it is, for the messages ("Git tag '0.7.0'")
+release_push_ref() {
+  local refspec="${1:-}"
+  local label="${2:-ref '${1:-}'}"
+
+  if [ -z "${refspec}" ]; then
+    echo "❌ ERROR: a refspec is required for release_push_ref." >&2
+    return 1
+  fi
+  release_push_refs "${label}" "${refspec}"
 }
 
 # The release line a version belongs to: `X.Y.Z` -> `X.Y`.
@@ -1467,8 +1481,43 @@ release_branch_placement() {
   echo "absent"
 }
 
+# Sets the local copy of a release line to the release commit according to its
+# placement: created when absent, left alone when already there, fast-forwarded
+# from the candidate otherwise. Not while it is checked out: update-ref would
+# advance HEAD under a worktree still at the candidate, leaving the stamp staged
+# as a reversal.
+# Arguments: $1 = placement, $2 = branch, $3 = branch ref, $4 = release commit
+set_release_branch_locally() {
+  local placement="${1:-}" branch="${2:-}" branch_ref="${3:-}" target_full_sha="${4:-}"
+  case "${placement}" in
+    absent)
+      git branch "${branch}" "${target_full_sha}"
+      ;;
+    local | remote) ;;
+    remote-candidate | local-candidate)
+      if [ "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)" = "${branch}" ]; then
+        echo "❌ ERROR: Release line '${branch}' is checked out here; switch to another branch before releasing from it." >&2
+        return 1
+      fi
+      local local_sha
+      local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+      if [ -n "${local_sha}" ]; then
+        git update-ref "${branch_ref}" "${target_full_sha}" "${local_sha}"
+      else
+        git branch "${branch}" "${target_full_sha}"
+      fi
+      echo "➡️ Release line '${branch}' fast-forwards to release commit ${target_full_sha:0:7}."
+      ;;
+    *)
+      echo "❌ ERROR: Unexpected release line placement '${placement}'." >&2
+      return 1
+      ;;
+  esac
+}
+
 # Ensures a version's release line exists at the release commit and, in CI, is
-# on the remote. A line already at the commit is an idempotent skip; one at the
+# on the remote. The standalone form; tag_ga_release.sh pushes the line together
+# with the tag through ensure_ga_release_refs. A line already at the commit is an idempotent skip; one at the
 # candidate — the stamped commit's parent — is fast-forwarded; anywhere else is
 # an error; nothing is ever force-pushed. Off CI the branch is created or moved
 # locally and the push is skipped.
@@ -1494,38 +1543,11 @@ ensure_release_branch() {
   local target_full_sha
   target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
 
-  case "${placement}" in
-    remote)
-      echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
-      return 0
-      ;;
-    absent)
-      git branch "${branch}" "${target_full_sha}"
-      ;;
-    local) ;;
-    remote-candidate | local-candidate)
-      # Move the local branch to the release commit, compare-and-swap against
-      # the candidate it is at, or create it when the checkout has no copy. Not
-      # while it is checked out: update-ref would advance HEAD under a worktree
-      # still at the candidate, leaving the stamp staged as a reversal.
-      if [ "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)" = "${branch}" ]; then
-        echo "❌ ERROR: Release line '${branch}' is checked out here; switch to another branch before releasing from it." >&2
-        return 1
-      fi
-      local local_sha
-      local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
-      if [ -n "${local_sha}" ]; then
-        git update-ref "${branch_ref}" "${target_full_sha}" "${local_sha}"
-      else
-        git branch "${branch}" "${target_full_sha}"
-      fi
-      echo "➡️ Release line '${branch}' fast-forwards to release commit ${target_full_sha:0:7}."
-      ;;
-    *)
-      echo "❌ ERROR: Unexpected release line placement '${placement}'." >&2
-      return 1
-      ;;
-  esac
+  if [ "${placement}" = "remote" ]; then
+    echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
+    return 0
+  fi
+  set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}" || return 1
 
   # Safety Guard: Remote push executes exclusively inside CI
   if ! is_ci_pipeline; then
@@ -1537,6 +1559,84 @@ ensure_release_branch() {
   # the placement check above has already read the remote, so the only way to
   # reach it with the branch elsewhere is a push that landed between the two.
   release_push_ref "${branch_ref}:${branch_ref}" "Release line '${branch}'"
+}
+
+# The GA rung: the tag and the release line, pushed in one atomic push so that
+# neither can exist on the remote without the other. That is what makes the run
+# repeatable whatever happens around it: a merge that lands on the line between
+# the placement check and the push rejects both refs, nothing is published, and
+# the re-run stamps from the new head; a run that dies after the push re-runs
+# like one that failed at image promotion, reusing the tagged commit. A tag or
+# a line already on the remote at the release commit is skipped, and whichever
+# is missing is pushed alone. Off CI both are set locally and neither is pushed.
+# Arguments: $1 = version, $2 = release commit, $3 = candidate commit
+ensure_ga_release_refs() {
+  local version="${1:-}"
+  local release_commit="${2:-}"
+  local candidate="${3:-}"
+
+  if [ -z "${version}" ] || [ -z "${release_commit}" ]; then
+    echo "❌ ERROR: version and release commit are required for ensure_ga_release_refs." >&2
+    return 1
+  fi
+
+  local placement
+  placement="$(release_branch_placement "${version}" "${release_commit}" "${candidate}")" || return 1
+
+  local line branch branch_ref
+  line="$(release_line_for_version "${version}")" || return 1
+  branch="$(release_branch_for_line "${line}")" || return 1
+  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
+
+  local target_full_sha
+  target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
+
+  release_fetch_tags
+
+  local tag_ref="refs/tags/${version}" refspecs=() push_tag="false" push_line="false"
+  local existing_tag_sha
+  existing_tag_sha="$(git rev-parse --verify --quiet "${tag_ref}^{commit}" 2>/dev/null || true)"
+  if [ -n "${existing_tag_sha}" ]; then
+    if [ "${existing_tag_sha}" != "${target_full_sha}" ]; then
+      echo "❌ ERROR: Tag '${version}' already exists but points to commit ${existing_tag_sha}, not target SHA ${target_full_sha}!" >&2
+      return 1
+    fi
+    echo "✅ Git tag '${version}' already exists and points to target commit ${target_full_sha}. Idempotent skip."
+  else
+    setup_git_bot_user
+    git tag -a "${version}" "${target_full_sha}" -m "Release ${version}"
+    refspecs+=("${tag_ref}")
+    push_tag="true"
+  fi
+
+  if [ "${placement}" = "remote" ]; then
+    echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
+  else
+    set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}" || return 1
+    refspecs+=("${branch_ref}:${branch_ref}")
+    push_line="true"
+  fi
+
+  # Safety Guard: Remote push executes exclusively inside CI
+  if ! is_ci_pipeline; then
+    echo "⚠️ [Local Execution] Dry-run: Git tag '${version}' and release line '${branch}' set locally. Remote push skipped (runs only in CI)."
+    return 0
+  fi
+
+  if [ ${#refspecs[@]} -eq 0 ]; then
+    echo "✅ Nothing to push: the tag and the release line are already on the remote."
+    return 0
+  fi
+
+  local label
+  if [ "${push_tag}" = "true" ] && [ "${push_line}" = "true" ]; then
+    label="Git tag '${version}' and release line '${branch}'"
+  elif [ "${push_tag}" = "true" ]; then
+    label="Git tag '${version}'"
+  else
+    label="Release line '${branch}'"
+  fi
+  release_push_refs "${label}" "${refspecs[@]}"
 }
 
 # Stamps BAKED_RELEASE_VERSION into root installer scripts (install.sh, uninstall.sh, upgrade.sh)
