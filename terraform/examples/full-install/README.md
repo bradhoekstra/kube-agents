@@ -28,7 +28,10 @@ install without the interview.
   [Remote state](#remote-state)), its read-only project roles, and the Workload
   Identity binding to the agent KSA (`agent_ksa_name`,
   `kubeagents-platform-agent` by default; see
-  [IAM roles](#iam-roles-permission_set-and-project_roles) below).
+  [IAM roles](#iam-roles-permission_set-and-project_roles) below), and, when
+  `scope` names a Shared VPC host or Metrics Scope, the read grants in the projects
+  the [`kube-agents-scope-resolver`](../../modules/kube-agents-scope-resolver)
+  module resolves them to at plan time.
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
   subscription, and Chat integration wiring.

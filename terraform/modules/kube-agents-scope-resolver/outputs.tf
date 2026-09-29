@@ -10,3 +10,14 @@ output "members" {
   EOT
   value       = local.scope_selector_members
 }
+
+output "uncarriable_members" {
+  description = <<-EOT
+    Service projects a Shared VPC host named whose IDs the scope cannot carry
+    (legacy domain-scoped IDs), keyed by the host's snapshot name. Left out
+    of `members`, so bound nowhere, and reported by the module's check block
+    as a warning on every plan they appear in.
+  EOT
+  value       = local.scope_shared_vpc_uncarriable
+}
+

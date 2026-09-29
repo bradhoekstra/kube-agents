@@ -141,12 +141,12 @@ output "scope_container_roles" {
 }
 
 output "scope_shared_vpc_hosts" {
-  description = "The Shared VPC host projects scope.shared_vpc_hosts named; each was resolved at plan time to its service projects (scope_selector_members) and, unless otherwise in scope, is bound with roles/compute.viewer alone for the reconcile's lookup (scope_lookup_only_hosts)."
+  description = "The Shared VPC host projects scope.shared_vpc_hosts named; each was resolved at plan time to its service projects (scope_selector_members) and, unless otherwise in scope or project_id itself, is bound with roles/compute.viewer alone for the reconcile's lookup (scope_lookup_only_hosts)."
   value       = module.kube_agents_iam.scope_shared_vpc_hosts
 }
 
 output "scope_metrics_scopes" {
-  description = "The Metrics Scope scoping projects scope.metrics_scopes named; each was resolved at plan time to the projects it monitors (scope_selector_members) and is bound with scope_roles itself for the reconcile's lookup."
+  description = "The Metrics Scope scoping projects scope.metrics_scopes named; each was resolved at plan time to the projects it monitors (scope_selector_members) and, unless it is project_id, is bound with scope_roles itself for the reconcile's lookup."
   value       = module.kube_agents_iam.scope_metrics_scopes
 }
 

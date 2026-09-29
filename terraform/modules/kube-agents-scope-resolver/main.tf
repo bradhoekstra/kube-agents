@@ -139,12 +139,29 @@ data "http" "scope_metrics_scope" {
 }
 
 locals {
-  scope_shared_vpc_members = {
+  # Every service project the API named, by ID, and the ones the scope can
+  # carry. A legacy domain-scoped ID (`example.com:name`) cannot be declared,
+  # bound under a state key the CRD's patterns accept, excluded (the exclude
+  # pattern carries no `:`) or given a profile, and unlike a monitored project
+  # it has no number to be excluded by, so it is left out of `members` and
+  # reported in `uncarriable_members` and by the check below, rather than
+  # refusing the whole host over one project nothing in the scope model can
+  # hold.
+  scope_shared_vpc_named = {
     for host, response in data.http.scope_shared_vpc_host :
     host => response.status_code == 200 ? sort(distinct(compact([
       for resource in try(jsondecode(response.response_body).resources, []) :
       try(resource.type, "") == local.scope_xpn_resource_type_project ? try(resource.id, "") : ""
     ]))) : []
+  }
+  scope_shared_vpc_members = {
+    for host, named in local.scope_shared_vpc_named :
+    host => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]
+  }
+  scope_shared_vpc_uncarriable = {
+    for host, named in local.scope_shared_vpc_named :
+    "sharedVpcHosts/${host}" => [for member in named : member if !can(regex(local.scope_project_id_pattern, member))]
+    if length([for member in named : member if !can(regex(local.scope_project_id_pattern, member))]) > 0
   }
 
   # A scope's monitored projects as the API named them: by number, or, should
@@ -211,3 +228,14 @@ locals {
     { for scope, members in local.scope_metrics_scope_members : "metricsScopes/${scope}" => members },
   )
 }
+
+# A warning, not a refusal: the member is not in the set, and the plan says so
+# here and in `uncarriable_members`, while the rest of the host's service
+# projects are bound as usual.
+check "shared_vpc_members_the_scope_can_carry" {
+  assert {
+    condition     = length(local.scope_shared_vpc_uncarriable) == 0
+    error_message = "shared_vpc_hosts: ${join("; ", [for selector, members in local.scope_shared_vpc_uncarriable : "${selector} has service project(s) ${join(", ", members)}"])} with an ID the scope cannot carry (the CRD accepts ${local.scope_project_id_pattern}; a legacy domain-scoped ID does not match). Left out of the bindings; the reconcile reports such a project on its own."
+  }
+}
+

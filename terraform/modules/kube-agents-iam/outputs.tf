@@ -70,19 +70,20 @@ output "scope_container_roles" {
 output "scope_shared_vpc_hosts" {
   description = <<-EOT
     The Shared VPC host projects scope.shared_vpc_hosts named. One that is
-    not otherwise in scope is bound with roles/compute.viewer alone, so the
-    reconcile's lookup can read it (scope_lookup_only_hosts); one that is
-    carries scope_roles like any other member.
+    not otherwise in scope, and is not project_id, is bound with
+    roles/compute.viewer alone, so the reconcile's lookup can read it
+    (scope_lookup_only_hosts); one that is in scope carries scope_roles like
+    any other member.
   EOT
   value       = sort(tolist(local.scope_shared_vpc_hosts))
 }
 
 output "scope_metrics_scopes" {
   description = <<-EOT
-    The Metrics Scope scoping projects scope.metrics_scopes named. Each is
-    bound with scope_roles itself, so the reconcile's lookup can read the
-    scope there, beside the monitored projects scope_selector_members
-    resolved it to.
+    The Metrics Scope scoping projects scope.metrics_scopes named. Each
+    other than project_id is bound with scope_roles itself, so the
+    reconcile's lookup can read the scope there, beside the monitored
+    projects scope_selector_members resolved it to.
   EOT
   value       = sort(tolist(local.scope_metrics_scopes))
 }

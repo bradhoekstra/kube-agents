@@ -242,9 +242,15 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         scope = self._data("http", "scope_metrics_scope")
         self.assertIn("can(jsondecode(self.response_body)) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0", scope)
         self.assertIn("can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)])", scope)
-        # A legacy domain-scoped ID the scope cannot carry is refused by number.
+        # A legacy domain-scoped ID the scope cannot carry is refused by number
+        # for a monitored project, which has a number to be excluded by; a
+        # service project has none, so it is left out, listed and warned about
+        # rather than refusing the host.
         self.assertIn("can(regex(local.scope_project_id_pattern, jsondecode(self.response_body).projectId))", self._data("http", "scope_monitored_project"))
         self.assertIn("Name the number in exclude_projects", self._data("http", "scope_monitored_project"))
+        self.assertIn("host => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]", self.resolver_tf)
+        self.assertIn('check "shared_vpc_members_the_scope_can_carry"', self.resolver_tf)
+        self.assertIn("value       = local.scope_shared_vpc_uncarriable", (_RESOLVER / "outputs.tf").read_text())
 
     def test_the_members_reach_the_one_project_binding_with_the_lookup_projects_and_less_an_exact_exclude(self):
         self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
@@ -272,7 +278,8 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
     def test_a_host_without_the_lookup_role_fails_the_plan(self):
         self.assertIn('scope_shared_vpc_lookup_role = "roles/compute.viewer"', self.scope_tf)
         self.assertIn("roles/compute.viewer", DESIGN_ALLOWLIST)
-        precondition = re.search(r"length\(local\.scope_shared_vpc_hosts\) == 0 \|\| contains\(local\.scope_roles, local\.scope_shared_vpc_lookup_role\)", self.main_tf)
+        # The host project itself is read under project_roles, so it is carved out.
+        precondition = re.search(r"length\(\[for host in local\.scope_shared_vpc_hosts : host if host != var\.project_id\]\) == 0 \|\| contains\(local\.scope_roles, local\.scope_shared_vpc_lookup_role\)", self.main_tf)
         self.assertIsNotNone(precondition, "main.tf carries no precondition for the host lookup role")
         self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) + length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0",
                       self.scope_tf)

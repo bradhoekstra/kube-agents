@@ -403,7 +403,7 @@ in `terraform/modules/kube-agents-iam/variables.tf`) mirrors. The intersection m
 quota-consuming role such as `roles/serviceusage.serviceUsageConsumer` must not consume quota in
 projects the agent only reads. Widening `project_roles` widens the host project alone; widening
 what the scope carries is an edit to the allowlist, in one file, on purpose. The module refuses the
-plan when `scope.projects`, `scope.folders` or `scope.organizations` is non-empty and the intersection carries neither
+plan when `scope.projects`, `scope.folders`, `scope.organizations`, `scope.shared_vpc_hosts` or `scope.metrics_scopes` is non-empty and the intersection carries neither
 `roles/container.clusterViewer` nor `roles/container.viewer`, the two allowlist roles that carry
 `container.clusters.get` as well as `container.clusters.list`: `roles/iam.securityReviewer` lists
 but cannot get, so a project bound with it alone would read `ok` and fail every profile create.
@@ -432,6 +432,13 @@ Prerequisites the design has to state and the installer has to preflight:
   the way the google provider reads them, rather than as gcloud's active account.
 - A project in scope with `container.googleapis.com` disabled reads `api-disabled` (§4: its
   profiles kept, CREATE skipped); Terraform must not enable the API in other people's projects.
+- For a Shared VPC host or a Metrics Scope, the identity running Terraform needs
+  `compute.projects.get` on each host, to read the Metrics Scope in its scoping project with
+  `monitoring.googleapis.com` enabled there, `resourcemanager.projects.get` on each monitored
+  project, and `setIamPolicy` in every project resolved. No shell preflight probes them: a read
+  the identity cannot make fails the plan itself, before anything is applied, and a binding it
+  cannot make fails inside the apply exactly as an explicit project's does (the phase 3 bullet
+  above says why).
 - When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
   the host project. The preflight checks, before the apply that then binds the agent's
   `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced

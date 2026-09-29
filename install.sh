@@ -564,7 +564,7 @@ Flags for AI Agents & Automation:
                                 prefer folders)
   --scope-shared-vpc-hosts=IDS  Shared VPC host project IDs; every attached service project
                                 is in scope, resolved when Terraform plans and granted the
-                                read roles (the host too, for the lookup)
+                                read roles (and roles/compute.viewer in the host, for the lookup)
   --scope-metrics-scopes=IDS    Metrics Scope scoping-project IDs; every project the scope
                                 monitors is in scope, resolved and granted the same way
   --scope-exclude-projects=IDS  Project IDs or shell-style globs (*-sandbox) to leave

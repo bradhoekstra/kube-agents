@@ -24,7 +24,9 @@ module reads is refused rather than read as an empty selector, since an empty se
 apply is every member's bindings revoked. A monitored project the identity cannot name, or whose ID
 the scope cannot carry (a legacy domain-scoped ID), is left out by naming its project number in
 `exclude_projects`, the scope's `exclude.projects`; that is the only entry of that list this module
-acts on. IDs and globs are the callers': `kube-agents-iam` withholds the grant of a member an entry
+acts on. A service project of a Shared VPC host with such an ID has no number to be excluded by, so
+it is left out of `members` on its own, listed in `uncarriable_members`, and warned about by a
+`check` block on every plan, while the host's other service projects are bound as usual. IDs and globs are the callers': `kube-agents-iam` withholds the grant of a member an entry
 names by ID, the reconcile evaluates globs.
 
 ## Why a module of its own
