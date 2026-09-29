@@ -179,6 +179,63 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_get_latest_validated_rc_tag_ignores_a_newer_tag_off_main(self):
+        """A release line's RC validation must never become the nightly's candidate.
+
+        The picker sorts by name, which is by timestamp, and a line's rc_ tags
+        share the namespace: the first one cut on `release/<X.Y>` would be the
+        newest of all. Only tags whose commit is on `main` may answer.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "-a", "rc_2608191200_2222222_validated", "-m", "On main")
+            git("switch", "-c", "release/0.2")
+            (pathlib.Path(repo_dir) / "backport.txt").write_text("fix\n")
+            git("add", "backport.txt")
+            git("commit", "-m", "fix: backport")
+            git("tag", "-a", "rc_2609291200_3333333_validated", "-m", "Newer, on the line")
+            git("switch", "main")
+
+            proc = self._run_common_func("get_latest_validated_rc_tag", cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "rc_2608191200_2222222_validated")
+        finally:
+            temp_dir.cleanup()
+
+    def test_filter_tags_on_main_fails_closed_in_ci_without_a_main(self):
+        """No `main` to compare against is an error in CI and a warning by hand.
+
+        In CI the helper also tries a fetch of the release repository's `main`;
+        its https URL is rewritten onto a path that does not exist so the test
+        stays off the network and that fetch fails like the two lookups before it.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "rc_2608191200_2222222_validated")
+            git("switch", "-c", "elsewhere")
+            git("branch", "-D", "main")
+            unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+            git(
+                "config",
+                f"url.{unreachable}.insteadOf",
+                f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git",
+            )
+
+            in_ci = self._run_common_func(
+                'filter_tags_on_main <<<"rc_2608191200_2222222_validated"',
+                env={"CI": "true", **self._FAKE_RELEASE_REPO},
+                cwd=repo_dir,
+            )
+            self.assertNotEqual(in_ci.returncode, 0)
+            self.assertIn("Could not resolve main", in_ci.stderr)
+
+            off_ci = self._run_common_func('filter_tags_on_main <<<"rc_2608191200_2222222_validated"', cwd=repo_dir)
+            self.assertEqual(off_ci.returncode, 0, off_ci.stderr)
+            self.assertEqual(off_ci.stdout.strip(), "rc_2608191200_2222222_validated")
+            self.assertIn("not filtering", off_ci.stderr)
+        finally:
+            temp_dir.cleanup()
+
     def test_get_latest_staging_tag_matches_the_shape_not_the_prefix(self):
         """`staging_*` is a deploy trigger anyone can push; the GA gate reads this.
 

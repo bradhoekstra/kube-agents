@@ -295,9 +295,65 @@ get_previous_ga_tag() {
   echo "${previous}"
 }
 
-# Finds the latest validated release candidate tag (rc_*_validated)
+# The ref that stands for `main` in this checkout: the remote-tracking ref of a
+# full clone, else (in CI) a fresh fetch of the release repository's `main`,
+# else a local `main`, which is what the test repositories have. Prints nothing
+# when none resolves; the callers decide what that means.
+release_main_ref() {
+  if git rev-parse --verify --quiet refs/remotes/origin/main >/dev/null 2>&1; then
+    echo "refs/remotes/origin/main"
+    return 0
+  fi
+  if is_ci_pipeline && git fetch "$(release_repo_url)" main >/dev/null 2>&1; then
+    echo "FETCH_HEAD"
+    return 0
+  fi
+  if git rev-parse --verify --quiet refs/heads/main >/dev/null 2>&1; then
+    echo "refs/heads/main"
+    return 0
+  fi
+  return 1
+}
+
+# Keeps, from a newline-separated list of tags on stdin, those whose commit is
+# on `main`. The candidate pickers below sort tags by name, which is by
+# timestamp, and a release line's RC tags share the namespace: without this
+# filter the first `rc_` tag cut on `release/<X.Y>` would be the newest of all
+# and the nightly promotion and the Prow eval would both adopt a line commit as
+# main's candidate. In CI a `main` that cannot be resolved is an error rather
+# than a guess; off CI the list passes through unfiltered with a warning, so a
+# hand run in a partial checkout still answers.
+filter_tags_on_main() {
+  local main_ref
+  if ! main_ref="$(release_main_ref)"; then
+    if is_ci_pipeline; then
+      echo "❌ ERROR: Could not resolve main in this checkout; refusing to pick a candidate without it." >&2
+      return 1
+    fi
+    echo "⚠️ Warning: main is not resolvable here; not filtering candidates to it." >&2
+    cat
+    return 0
+  fi
+  local tag sha
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    sha="$(git rev-parse --verify --quiet "refs/tags/${tag}^{commit}" 2>/dev/null)" || continue
+    if git merge-base --is-ancestor "${sha}" "${main_ref}" 2>/dev/null; then
+      echo "${tag}"
+    fi
+  done
+}
+
+# Finds the latest validated release candidate tag (rc_*_validated) on main.
+# A line's validation (`release-publish.yml` with `release_line`) is a gate for
+# that line's patch release, never a nightly candidate: see filter_tags_on_main.
 get_latest_validated_rc_tag() {
-  git tag -l --sort=-v:refname 'rc_*_validated' 2>/dev/null | grep -E '^rc_.*_validated$' | head -n 1 || echo ""
+  local listing on_main
+  listing="$(git tag -l --sort=-v:refname 'rc_*_validated' 2>/dev/null | grep -E '^rc_.*_validated$' || true)"
+  # Materialised before `head`: under pipefail, `head` closing the pipe after
+  # the first line would end the filter with SIGPIPE and read as a failure.
+  on_main="$(filter_tags_on_main <<<"${listing}")" || return 1
+  head -n 1 <<<"${on_main}"
 }
 
 # Reads the commits between the last GA tag and a candidate, into

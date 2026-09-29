@@ -62,8 +62,13 @@ RC_TAG="${RC_TAG:-}"
 
 if [ -z "${RC_TAG}" ]; then
   release_fetch_tags
-  RC_TAG="$(git tag -l --sort=-v:refname "${RC_TAG_GLOB}" 2>/dev/null |
-    grep -v '_validated$' | head -n 1 || echo "")"
+  # Newest by name among the candidates on main. A release line's rc_ tags
+  # share the namespace and would otherwise be the newest of all the moment one
+  # is cut; the eval grades main's candidates, and a line pins its own with RC_TAG.
+  rc_candidates="$(git tag -l --sort=-v:refname "${RC_TAG_GLOB}" 2>/dev/null |
+    grep -v '_validated$' || true)"
+  rc_candidates="$(filter_tags_on_main <<<"${rc_candidates}")" || exit 1
+  RC_TAG="$(head -n 1 <<<"${rc_candidates}")"
   if [ -z "${RC_TAG}" ]; then
     echo "❌ ERROR: no ${RC_TAG_GLOB} tag found. Set RC_TAG explicitly, or wait for rc-scheduler.yml to cut a candidate." >&2
     exit 1

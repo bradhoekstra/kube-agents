@@ -730,6 +730,34 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         self.assertIn("publish-agents", self.jobs)
         self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
 
+    def test_a_release_line_push_builds_sha_tags_but_never_moves_latest(self):
+        """A backport merged onto `release/<X.Y>` needs `:<sha>` images, and only those.
+
+        Every rung of the release ladder checks GHCR for the candidate's SHA tag,
+        and this is the only workflow that publishes it, so it has to fire for the
+        release lines. `:latest` is what autopush and the presubmit cache follow
+        and must keep tracking `main` alone: each `:latest` line is guarded by
+        the ref, and `docker/build-push-action` drops the empty line the guard
+        leaves behind on a line push.
+        """
+        on = self.doc.get("on", self.doc.get(True))
+        self.assertIn("release/**", on["push"]["branches"])
+        self.assertIn("main", on["push"]["branches"])
+        build_steps = [
+            step
+            for job in self.jobs.values()
+            for step in (job.get("steps") or [])
+            if str(step.get("uses", "")).startswith("docker/build-push-action@")
+        ]
+        self.assertTrue(build_steps)
+        for step in build_steps:
+            tag_lines = [line.strip() for line in str(step["with"]["tags"]).splitlines() if line.strip()]
+            with self.subTest(tags=tag_lines):
+                self.assertTrue(any(":${{ github.sha }}" in line for line in tag_lines))
+                for line in tag_lines:
+                    if ":latest" in line:
+                        self.assertIn("github.ref == 'refs/heads/main'", line)
+
 
 class ReleaseBotTokenWiringTest(unittest.TestCase):
     """Every workflow that mints a token for RELEASE_BOT_APP_ID must request both
