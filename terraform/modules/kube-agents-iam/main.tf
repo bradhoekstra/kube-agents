@@ -28,10 +28,13 @@ resource "google_service_account" "agent" {
       condition     = local.scope_selectors_resolved
       error_message = "scope.shared_vpc_hosts or scope.metrics_scopes names a selector that scope_selector_members has no entry for. Resolve the selectors with the kube-agents-scope-resolver module (terraform/modules/kube-agents-scope-resolver) and pass its members output as scope_selector_members, as terraform/examples/full-install does."
     }
-    # The host project itself is read under project_roles as granted, custom
-    # roles included, so a host that is project_id needs no allowlist entry.
+    # No carve-out for a host that is project_id: it is read under
+    # project_roles, but a custom set that carries the permission through a
+    # custom role and one that carries it through nothing look the same from
+    # here, and the second would freeze the selector every tick; adding
+    # roles/compute.viewer costs the first nothing.
     precondition {
-      condition     = length([for host in local.scope_shared_vpc_hosts : host if host != var.project_id]) == 0 || contains(local.scope_roles, local.scope_shared_vpc_lookup_role)
+      condition     = length(local.scope_shared_vpc_hosts) == 0 || contains(local.scope_roles, local.scope_shared_vpc_lookup_role)
       error_message = "scope.shared_vpc_hosts names a host but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries no roles/compute.viewer, the role whose compute.projects.get the reconcile needs in the host project to list its service projects; a custom IAM role is not carried into scoped projects. Add it (it is bound in the host project as well) or empty scope.shared_vpc_hosts."
     }
   }

@@ -278,8 +278,10 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
     def test_a_host_without_the_lookup_role_fails_the_plan(self):
         self.assertIn('scope_shared_vpc_lookup_role = "roles/compute.viewer"', self.scope_tf)
         self.assertIn("roles/compute.viewer", DESIGN_ALLOWLIST)
-        # The host project itself is read under project_roles, so it is carved out.
-        precondition = re.search(r"length\(\[for host in local\.scope_shared_vpc_hosts : host if host != var\.project_id\]\) == 0 \|\| contains\(local\.scope_roles, local\.scope_shared_vpc_lookup_role\)", self.main_tf)
+        # No carve-out for a host that is the management project: a custom
+        # set with the permission in a custom role and one with no such
+        # permission look alike here, and the second would freeze the selector.
+        precondition = re.search(r"length\(local\.scope_shared_vpc_hosts\) == 0 \|\| contains\(local\.scope_roles, local\.scope_shared_vpc_lookup_role\)", self.main_tf)
         self.assertIsNotNone(precondition, "main.tf carries no precondition for the host lookup role")
         self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) + length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0",
                       self.scope_tf)
