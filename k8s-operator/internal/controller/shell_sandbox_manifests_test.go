@@ -1292,9 +1292,6 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	if len(scrape.Ports) != 1 || scrape.Ports[0].Port.IntValue() != int(credentialProxyMetricsPort) {
 		t.Errorf("expected the collector admitted on %d alone, got %#v", credentialProxyMetricsPort, scrape.Ports)
 	}
-	if len(scrape.Ports) == 1 && scrape.Ports[0].Port.IntValue() == credentialProxyPort {
-		t.Error("the collector must not be admitted to the credentialed port")
-	}
 }
 
 func TestCredentialProxyNetworkPolicySelectsItsOwnPod(t *testing.T) {

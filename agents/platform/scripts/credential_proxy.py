@@ -5382,22 +5382,29 @@ class MetricsHandler(BaseHTTPRequestHandler):
     sys_version = ""
     timeout = RESPONSE_WRITE_TIMEOUT_SECONDS
 
+    def handle_one_request(self) -> None:
+        # One guard for every byte this listener writes, on any path or
+        # method: a peer that hangs up before the reply is on the wire (a
+        # collector's aborted scrape, a probe at a path this listener does not
+        # serve, a method it does not implement) is a debug line and a closed
+        # connection, not the traceback the server prints for an exception
+        # out of a handler. The next scrape reads the same counters.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("metrics request not answered type=%s", type(exc).__name__)
+
     def do_GET(self) -> None:  # noqa: N802
         if self.path != METRICS_PATH:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         body = CredentialProxyHandler.metrics.render().encode("utf-8")
-        try:
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", METRICS_CONTENT_TYPE)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        except OSError as exc:
-            # The collector closed the connection mid-scrape. The next scrape
-            # reads the same counters, so this is a debug line, not the
-            # traceback the server would otherwise print for it.
-            LOGGER.debug("scrape not delivered bytes=%d type=%s", len(body), type(exc).__name__)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", METRICS_CONTENT_TYPE)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, message: str, *args: Any) -> None:
         # A scrape every thirty seconds is not an audit event, and the broker's

@@ -375,7 +375,8 @@ class MetricsListenerTest(unittest.TestCase):
         second = urllib.request.urlopen(self.endpoint + "/metrics").read()
         self.assertEqual(first, second)
 
-    def test_a_scrape_the_collector_abandons_is_not_a_traceback(self):
+    def _hung_up_peer(self, request_line):
+        """A handler whose peer has gone: the request is readable, every write fails."""
         class _Gone:
             def write(self, data):
                 raise BrokenPipeError()
@@ -388,16 +389,27 @@ class MetricsListenerTest(unittest.TestCase):
         )
         CredentialProxyHandler.metrics = ProxyMetrics()
         handler = MetricsHandler.__new__(MetricsHandler)
-        handler.request_version = "HTTP/1.1"
-        handler.command = "GET"
-        handler.path = credential_proxy.METRICS_PATH
-        handler.requestline = "GET /metrics HTTP/1.1"
         handler.client_address = ("127.0.0.1", 0)
-        handler.close_connection = True
+        handler.rfile = io.BytesIO(request_line + b"\r\nHost: broker\r\n\r\n")
         handler.wfile = _Gone()
+        return handler
+
+    def test_a_scrape_the_collector_abandons_is_not_a_traceback(self):
+        handler = self._hung_up_peer(b"GET /metrics HTTP/1.1")
         with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
-            handler.do_GET()
-        self.assertTrue(any("scrape not delivered" in line and "BrokenPipeError" in line for line in logs.output), logs.output)
+            handler.handle_one_request()
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(any("metrics request not answered" in line and "BrokenPipeError" in line for line in logs.output), logs.output)
+
+    def test_a_hung_up_peer_on_any_other_path_is_not_a_traceback_either(self):
+        # The 404 is written by send_error, outside do_GET's own lines; the
+        # guard sits above both, so a probe at `/` from a peer that leaves is
+        # the same debug line.
+        handler = self._hung_up_peer(b"GET / HTTP/1.1")
+        with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+            handler.handle_one_request()
+        self.assertTrue(handler.close_connection)
+        self.assertTrue(any("metrics request not answered" in line for line in logs.output), logs.output)
 
 
 class ListenerStartTest(unittest.TestCase):

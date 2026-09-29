@@ -144,11 +144,13 @@ func credentialProxyName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // credentialProxySelector reproduces the labels the pre-#368 standalone proxy
-// carried, down to the component label nothing reads any more. A Deployment's
-// spec.selector is immutable, so an install old enough to still have that
-// Deployment — one that has not reconciled since #368's cleanup removed it —
-// would otherwise fail the apply and wedge the whole reconcile rather than
-// adopting the object.
+// carried, component label included. A Deployment's spec.selector is
+// immutable, so an install old enough to still have that Deployment — one
+// that has not reconciled since #368's cleanup removed it — would otherwise
+// fail the apply and wedge the whole reconcile rather than adopting the
+// object. The chart's PodMonitoring for the broker selects on both labels as
+// well (tests/test_chart_platform_agent_monitoring.py holds it to them), so a
+// change here is a change there.
 func credentialProxySelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{
 		"app":                           credentialProxyName(agent),

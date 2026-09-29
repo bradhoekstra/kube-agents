@@ -1994,8 +1994,8 @@ the gateway. The point of the proxy is that raw credentials never reach the agen
 that no process can invoke a command, so this is the property that matters. What settles
 the rest of it is per-caller authentication: the broker is in a pod of its own, its
 callers reach it over a Service, and none reaches the credentialed listener without a
-bearer token; the one other listener in that pod serves Prometheus counters and nothing
-else ([credential isolation](../credential-isolation-design.md#architecture)).
+bearer token; the one other TCP listener in that pod serves Prometheus counters and
+nothing else ([credential isolation](../credential-isolation-design.md#architecture)).
 
 The kubeconfig entanglement that used to argue for a shared volume is gone. `gcloud
 container clusters get-credentials` writes a kubeconfig, and the broker used to validate
