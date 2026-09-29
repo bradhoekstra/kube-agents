@@ -300,6 +300,31 @@ source "{_COMMON_SH}"
         self.assertIn("Could not fetch main", proc.stderr)
         self.assertNotIn("rc_2608191200_2222222_validated", proc.stdout)
 
+    def test_list_tags_on_main_in_ci_is_not_fooled_by_a_tag_named_main(self):
+        """A bare `main` refspec resolves a tag before the branch; the fetch names the branch ref."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        old = git("rev-parse", "HEAD").stdout.strip()
+        git("tag", "rc_2608191200_2222222_validated")
+        (pathlib.Path(repo_dir) / "later.txt").write_text("later\n")
+        git("add", "later.txt")
+        git("commit", "-m", "feat: later")
+        git("tag", "rc_2609291200_3333333_validated")
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        git("push", "--quiet", str(bare_dir), "main", "--tags")
+        # A tag literally named `main`, pointing at the old commit, on the remote.
+        git("push", "--quiet", str(bare_dir), f"{old}:refs/tags/main")
+        git("switch", "--detach", "-q")
+        git("branch", "-D", "main")
+
+        proc = self._run_common_func(
+            "get_latest_validated_rc_tag",
+            env={"CI": "true", **self._FAKE_RELEASE_REPO},
+            cwd=repo_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "rc_2609291200_3333333_validated")
+
     def test_list_tags_on_main_in_ci_reads_main_from_the_release_repository(self):
         """The Prow eval lane has neither `origin/main` nor a local `main`.
 

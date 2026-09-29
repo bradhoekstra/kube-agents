@@ -327,7 +327,9 @@ release_main_ref() {
         return 1
       fi
     fi
-    if ! git fetch "$(release_repo_url)" "${RELEASE_MAIN_BRANCH}" >/dev/null 2>&1; then
+    # The full ref, so a tag that happens to be named `main` cannot answer for
+    # the branch: a bare `main` refspec resolves tags before heads.
+    if ! git fetch "$(release_repo_url)" "${GIT_BRANCH_REF_PREFIX}${RELEASE_MAIN_BRANCH}" >/dev/null 2>&1; then
       echo "❌ ERROR: Could not fetch ${RELEASE_MAIN_BRANCH} from $(release_repo_url); not falling back to a tracking ref that may be stale." >&2
       return 1
     fi
