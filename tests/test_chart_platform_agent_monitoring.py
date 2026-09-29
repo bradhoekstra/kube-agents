@@ -37,6 +37,8 @@ _REQUIRED = [
     "--set", "platformAgent.harness.projectId=ci-project",
 ]
 _AGENT = "platform-agent"
+# The CR name the golden renders; the operator's pod labels carry it.
+_GOLDEN_AGENT = "platformagent"
 _GMP_API = "monitoring.googleapis.com/v1/PodMonitoring"
 # What a cluster with GKE Managed Prometheus tells helm it serves.
 _ON_GKE = ["--api-versions", _GMP_API]
@@ -44,21 +46,23 @@ _GATE = '{{- if and .Values.platformAgent.enabled (include "kube-agents.platform
 
 # One row per scraped pod: the PodMonitoring name suffix, the Deployment and
 # container the golden declares the port on, the port's name there, and the
-# pod labels the selector has to carry.
+# keys of the pod labels the selector has to carry. The values come from the
+# golden, so a label the operator moves fails this test until the template
+# follows.
 _SCRAPES = (
     {
         "suffix": "-gateway-monitoring",
         "deployment": "platformagent-gateway",
         "container": "agent-api-auth",
         "port_name": "event-metrics",
-        "selector": {"app": "{name}-gateway"},
+        "selector_keys": ("app",),
     },
     {
         "suffix": "-credential-proxy-monitoring",
         "deployment": "platformagent-credential-proxy",
         "container": "envoy-credential-proxy",
         "port_name": "cred-metrics",
-        "selector": {"app": "{name}-credential-proxy", "kubeagents.x-k8s.io/component": "credential-proxy"},
+        "selector_keys": ("app", "kubeagents.x-k8s.io/component"),
     },
 )
 
@@ -80,8 +84,19 @@ def _golden_port(deployment, container, port_name):
     raise AssertionError(f"no {port_name} port on {deployment}/{container} in {_GOLDEN}")
 
 
+def _golden_pod_labels(deployment):
+    """The pod-template labels the operator puts on the named Deployment, from the golden."""
+    for document in yaml.safe_load_all(_GOLDEN.read_text()):
+        if isinstance(document, dict) and document.get("kind") == "Deployment" and document["metadata"]["name"] == deployment:
+            return document["spec"]["template"]["metadata"]["labels"]
+    raise AssertionError(f"no Deployment {deployment} in {_GOLDEN}")
+
+
 def _selector(scrape, name):
-    return {key: value.format(name=name) for key, value in scrape["selector"].items()}
+    """The selector the PodMonitoring has to carry for agent `name`: the golden's
+    values for the keys the row names, with the golden's agent name replaced."""
+    labels = _golden_pod_labels(scrape["deployment"])
+    return {key: labels[key].replace(_GOLDEN_AGENT, name) for key in scrape["selector_keys"]}
 
 
 class MonitoringShapeTest(unittest.TestCase):
@@ -113,10 +128,8 @@ class MonitoringShapeTest(unittest.TestCase):
     def test_the_selectors_are_the_operators_pod_labels(self):
         for scrape in _SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
-                for key, value in scrape["selector"].items():
-                    self.assertIn(
-                        f"{key}: {value.format(name='{{ .Values.platformAgent.name }}')}", self.template
-                    )
+                for key, value in _selector(scrape, "{{ .Values.platformAgent.name }}").items():
+                    self.assertIn(f"{key}: {value}", self.template)
 
     def test_the_gate_asks_the_helper_and_the_helper_asks_the_cluster(self):
         self.assertIn(_GATE, self.template)

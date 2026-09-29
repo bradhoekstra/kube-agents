@@ -698,6 +698,17 @@ class PolicyReadCoverageTest(unittest.TestCase):
         vocabulary = credential_proxy._subcommand_vocabulary("gcloud")
         self.assertFalse(vocabulary & command_policy._GCLOUD_RELEASE_TRACKS, "a release track is never a label")
 
+    def test_every_git_verb_a_gate_reads_labels_as_itself(self):
+        # The lease gate's list and the workspace's list are the vocabulary's
+        # sources, so a verb either refuses or runs under its own name.
+        import content_workspace
+
+        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS | content_workspace.WORKSPACE_GIT_SUBCOMMANDS
+                 | credential_proxy.VCS_GIT_SUBCOMMANDS | credential_proxy.GIT_READ_SUBCOMMANDS)
+        for verb in sorted(verbs):
+            with self.subTest(verb=verb):
+                self.assertEqual(("git", verb), credential_proxy._tool_labels(["git", verb]))
+
     def test_a_forge_cli_without_a_vocabulary_reads_other_not_another_tools_verbs(self):
         allowed = set(CommandExecutor.ALLOWED_EXECUTABLES) | {"glab"}
         with mock.patch.object(CommandExecutor, "ALLOWED_EXECUTABLES", allowed):

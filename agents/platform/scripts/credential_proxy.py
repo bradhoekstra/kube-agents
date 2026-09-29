@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import http.client
 import io
+import functools
 import json
 import logging
 import os
@@ -316,12 +317,9 @@ SUBCOMMAND_NONE = "none"
 # The `subcommand` vocabularies the policy tables do not already supply. The
 # kubectl read verbs and the gcloud command groups come from command_policy's
 # tables -- a gcloud command is labelled by its group, `container` or `iam`,
-# never by a verb -- and the broker-side git verbs from VCS_GIT_SUBCOMMANDS
-# below; these add the kubectl write verbs and the gcloud groups a refused
-# command is counted under -- "how often does the model try to apply" is the
-# question a blocked-command series answers -- and the porcelain the content
-# workspace runs, which content_workspace names and this module does not
-# import.
+# never by a verb -- and these add the kubectl write verbs and the gcloud
+# groups a refused command is counted under: "how often does the model try to
+# apply" is the question a blocked-command series answers.
 KUBECTL_WRITE_VERBS = frozenset(
     {
         "annotate", "apply", "attach", "autoscale", "cordon", "cp", "create", "debug",
@@ -330,14 +328,12 @@ KUBECTL_WRITE_VERBS = frozenset(
     }
 )
 GCLOUD_EXTRA_SURFACES = frozenset({"components", "iam", "init", "resource-manager", "services"})
-GIT_EXTRA_SUBCOMMANDS = frozenset(
-    {
-        "add", "apply", "blame", "branch", "check-ref-format", "cherry-pick", "clean",
-        "commit", "describe", "diff", "grep", "log", "ls-files", "merge", "mv", "pull",
-        "rebase", "reset", "restore", "rm", "show", "stash", "status", "switch", "tag",
-        "worktree",
-    }
-)
+# The read-only git porcelain the sandbox runs that no gate lists: the lease
+# gate reads GIT_MUTATING_SUBCOMMANDS and the workspace runs
+# content_workspace.WORKSPACE_GIT_SUBCOMMANDS, and the git vocabulary is the
+# union of those two, VCS_GIT_SUBCOMMANDS and this, so a verb added to a gate's
+# list is labelled by name without a second edit here.
+GIT_READ_SUBCOMMANDS = frozenset({"blame", "describe", "log", "ls-files", "show", "status"})
 FORGE_CLI_SUBCOMMANDS = frozenset(
     {
         "api", "auth", "browse", "gist", "issue", "label", "pr", "project", "release",
@@ -5218,8 +5214,13 @@ def _endpoint_label(path: str) -> str:
     return LABEL_OTHER
 
 
+@functools.lru_cache(maxsize=None)
 def _subcommand_vocabulary(tool: str) -> frozenset[str]:
-    """The ``subcommand`` values ``tool`` may be counted under."""
+    """The ``subcommand`` values ``tool`` may be counted under.
+
+    Built from module constants, so once per tool for the life of the process
+    rather than once per request.
+    """
     if tool == "kubectl":
         return frozenset(verb[0] for verb in command_policy.KUBECTL_READ_VERBS) | KUBECTL_WRITE_VERBS
     if tool == "gcloud":
@@ -5228,7 +5229,9 @@ def _subcommand_vocabulary(tool: str) -> frozenset[str]:
         surfaces = (command_policy._gcloud_surface(list(command)) for command in command_policy.GCLOUD_READ_COMMANDS)
         return frozenset(surface for surface in surfaces if surface) | GCLOUD_EXTRA_SURFACES
     if tool == "git":
-        return VCS_GIT_SUBCOMMANDS | GIT_EXTRA_SUBCOMMANDS
+        from content_workspace import WORKSPACE_GIT_SUBCOMMANDS  # local, as every import of it here is
+
+        return VCS_GIT_SUBCOMMANDS | GIT_MUTATING_SUBCOMMANDS | WORKSPACE_GIT_SUBCOMMANDS | GIT_READ_SUBCOMMANDS
     return FORGE_CLI_VOCABULARIES.get(tool, frozenset())
 
 
