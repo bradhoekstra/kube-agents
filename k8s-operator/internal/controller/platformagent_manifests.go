@@ -4088,6 +4088,12 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
+		// Both port variables are in the broker's `managed` (buildCredentialProxyEnv)
+		// and so reserved there by the loop above; listed for buildAgentAPIAuthEnv,
+		// whose managed set carries neither, and whose credential_proxy.py parses
+		// CREDENTIAL_PROXY_PORT as an integer before the api-proxy role returns.
+		credentialProxyPortEnv,
+		credentialProxyMetricsPortEnv,
 		"CREDENTIAL_PROXY_ROLE",
 		// Same argument as the authentication settings above, one layer over.
 		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch

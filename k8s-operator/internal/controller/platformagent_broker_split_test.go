@@ -821,6 +821,27 @@ func TestTheBrokerIsToldItsCredentialedPort(t *testing.T) {
 	}
 }
 
+// The merge has two callers, and the agent-api-auth sidecar's managed set
+// carries neither port variable, so the explicit reserved list is what keeps
+// a spec.deployment.env entry out of that container. credential_proxy.py
+// parses CREDENTIAL_PROXY_PORT as an integer before the api-proxy role
+// returns, so an entry that reached the sidecar with a value int() rejects
+// would end the container.
+func TestTheSidecarKeepsBothPortVariablesReserved(t *testing.T) {
+	agent := brokerPodAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{
+			{Name: "CREDENTIAL_PROXY_PORT", Value: "auto"},
+			{Name: "CREDENTIAL_PROXY_METRICS_PORT", Value: "1"},
+		},
+	}
+	for _, env := range buildAgentAPIAuthEnv(agent) {
+		if env.Name == "CREDENTIAL_PROXY_PORT" || env.Name == "CREDENTIAL_PROXY_METRICS_PORT" {
+			t.Errorf("spec.deployment.env moved %s into the agent-api-auth sidecar: %#v", env.Name, env)
+		}
+	}
+}
+
 func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 	agent := brokerPodAgent()
 	container := buildCredentialProxyContainer(agent)
