@@ -811,7 +811,7 @@ class ServeWiringTest(unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _serve(self, metrics_port, env_value=None):
+    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         policy_path = Path(tmp.name) / "policy.json"
@@ -849,9 +849,11 @@ class ServeWiringTest(unittest.TestCase):
             def start(self):
                 pass
 
-        started = mock.MagicMock(return_value=None)
+        started = started if started is not None else mock.MagicMock(return_value=None)
+        unix_server = unix_server if unix_server is not None else credential_proxy.ThreadingUnixHTTPServer
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingUnixHTTPServer", unix_server), \
                     mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
@@ -875,6 +877,31 @@ class ServeWiringTest(unittest.TestCase):
             any("ALERT" in line and credential_proxy.METRICS_PORT_ENV in line and "70000" in line for line in logs),
             logs,
         )
+
+    def test_the_listener_opens_after_the_credentialed_server_holds_its_socket(self):
+        # The order is the guarantee: whatever port the metrics listener is
+        # given, a collision then costs the metrics and never the commands.
+        order = []
+
+        class _Recording(credential_proxy.ThreadingUnixHTTPServer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                order.append("credentialed")
+
+        started = mock.MagicMock(side_effect=lambda *args: order.append("metrics"))
+        self._serve(8766, started=started, unix_server=_Recording)
+        self.assertEqual(["credentialed", "metrics"], order)
+
+    def test_the_credentialed_port_is_refused_by_name_and_never_bound(self):
+        # The harness serves on the socket, where Envoy holds port 8765 in the
+        # shipped layout; the refusal has to hold there too.
+        args_port = 8765
+        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"))
+        self.assertIn("8765", refusal)
+        self.assertIn("credentialed", refusal)
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket="")))
+        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="")))
+        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket="")))
 
     def test_a_zero_or_refused_port_is_reported_as_what_it_is(self):
         # Three ways to arrive at 0, three different things an operator

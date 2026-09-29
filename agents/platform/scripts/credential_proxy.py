@@ -7069,26 +7069,6 @@ def serve(args: argparse.Namespace) -> None:
     if role == "combined":
         api_server = start_agent_api_proxy()
         threading.Thread(target=api_server.serve_forever, daemon=True).start()
-    # Last, so a scrape never sees a half-configured broker. Exempt from the
-    # reachable-off-pod refusal above on purpose: that rule guards a listener
-    # that hands out credentials, and this one serves counters.
-    metrics_port = int(getattr(args, "metrics_port", 0) or 0)
-    if not metrics_port:
-        raw = os.getenv(METRICS_PORT_ENV)
-        LOGGER.info(
-            "metrics listener disabled: --metrics-port resolved to 0 (%s is %s)",
-            METRICS_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
-        )
-    elif not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
-        # A hand-edited Deployment or a mismatched image: refused here by
-        # name, since bind() would raise past the listener's guard.
-        LOGGER.error(
-            "ALERT %s=%d is not a port in %d-%d; the broker serves no /metrics until "
-            "it restarts with one, and commands are unaffected",
-            METRICS_PORT_ENV, metrics_port, METRICS_PORT_MIN, METRICS_PORT_MAX,
-        )
-    else:
-        start_metrics_listener(args.host, metrics_port)
     if args.unix_socket:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -7109,7 +7089,46 @@ def serve(args: argparse.Namespace) -> None:
     else:
         server = ThreadingHTTPServer((args.host, args.port), CredentialProxyHandler)
         LOGGER.info("credential proxy listening on %s:%d", args.host, args.port)
+    # Last, once the credentialed server holds its socket: a scrape never sees
+    # a half-configured broker, and a port collision costs the metrics rather
+    # than the commands, whatever the ports are. Exempt from the
+    # reachable-off-pod refusal above on purpose: that rule guards a listener
+    # that hands out credentials, and this one serves counters.
+    metrics_port = int(getattr(args, "metrics_port", 0) or 0)
+    if not metrics_port:
+        raw = os.getenv(METRICS_PORT_ENV)
+        LOGGER.info(
+            "metrics listener disabled: --metrics-port resolved to 0 (%s is %s)",
+            METRICS_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
+        )
+    else:
+        refusal = _metrics_port_refusal(metrics_port, args)
+        if refusal is not None:
+            LOGGER.error(
+                "ALERT %s=%d %s; the broker serves no /metrics until it restarts with "
+                "another, and commands are unaffected",
+                METRICS_PORT_ENV, metrics_port, refusal,
+            )
+        else:
+            start_metrics_listener(args.host, metrics_port)
     server.serve_forever()
+
+
+def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | None:
+    """Why the metrics listener must not open on this port, or None if it may.
+
+    Both are hand-edit cases the operator's managed env never produces, refused
+    by name so the ALERT says what to fix rather than what bind() thought of
+    it. The credentialed port is refused whether this process binds it (the
+    TCP branch) or Envoy does in front of the Unix socket: which of two
+    processes wins a port depends on start order, and the loser must never
+    be the one holding the credentials.
+    """
+    if not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
+        return f"is not a port in {METRICS_PORT_MIN}-{METRICS_PORT_MAX}"
+    if metrics_port == args.port:
+        return f"is the credentialed listener's port {args.port}"
+    return None
 
 
 def _metrics_port_default() -> int:
