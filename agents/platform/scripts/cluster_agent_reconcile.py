@@ -669,13 +669,15 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
     `projects`, and a project pruned on that guess is the deletion this script never makes. A
     number named to an ID the scope cannot carry is a known identity and holds nothing. None
     members means the selector's own lookup failed. A number an `exclude.projects` entry
-    (`patterns`) names is not named at all: the install path withholds the grant on that entry,
-    so the call would be refused, and `_resolve_projects` drops the member on the number
-    whatever ID a past run knew it by, so it is neither unnamed nor a hold on the prune.
+    (`patterns`) names is named like any other, because the ID is what lets
+    `_resolve_projects` drop the project on the routes that reach it by ID (an explicit
+    entry, a folder), and the grant those routes carry is what makes the call succeed; when
+    the call is refused, the install path having withheld the grant, the member is keyed under
+    the bare number for `_resolve_projects` to drop, with no unnamed mark and no hold on the
+    prune: the number is the declaration speaking.
     """
     patterns = patterns or []
-    numbers = sorted({m for members, _ in raw.values() if members for m in members
-                      if m.isdigit() and not _excluded_by(m, patterns)})
+    numbers = sorted({m for members, _ in raw.values() if members for m in members if m.isdigit()})
     named = _bounded_map(_project_id_of, numbers, deadline, "naming project") if numbers else {}
     known = _previous_numbers(previous)
     out: dict[str, tuple[dict[str, dict] | None, str]] = {}
@@ -688,12 +690,11 @@ def _selector_members(raw: dict[str, tuple[list[str] | None, str]], previous: di
             if not member.isdigit():
                 resolved.setdefault(member, {"outcome": None, NUMBER_KEY: None})
                 continue
-            if _excluded_by(member, patterns):
-                resolved.setdefault(member, {"outcome": None, NUMBER_KEY: member})
-                continue
             project, naming = named.get(member, (None, OUTCOME_UNREACHABLE))
             if project and naming == OUTCOME_OK:
                 resolved.setdefault(project, {"outcome": None, NUMBER_KEY: member})
+            elif _excluded_by(member, patterns):
+                resolved.setdefault(member, {"outcome": None, NUMBER_KEY: member})
             elif project:
                 # Named, to an ID the set cannot carry: a known identity, reported by number.
                 resolved.setdefault(member, {"outcome": naming, NUMBER_KEY: member})

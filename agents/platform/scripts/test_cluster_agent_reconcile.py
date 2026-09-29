@@ -2429,15 +2429,13 @@ class ScopeTest(HomesMixin):
         self.assertNotIn("222", report["projects"])
 
     def test_excluding_the_bare_number_drops_a_member_the_run_could_not_name(self):
-        # An excluded number is not named at all (the install path withholds the grant on
-        # that entry, so the call would only be refused), and it is neither reported as
-        # unnamed nor a hold on the prune: the number is the declaration speaking.
-        def never_named(number, timeout=None):
-            raise AssertionError(f"named the excluded number {number}")
+        # An excluded number whose naming call is refused (the install path withheld the
+        # grant on that entry) is dropped on the number, and is neither reported as unnamed
+        # nor a hold on the prune: the number is the declaration speaking.
         with mock.patch.object(rec, "log") as logged:
             report, created, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["333"]}},
                                            {self.MGMT: [(self.MGMT, "m", "us-central1")]},
-                                           selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers=never_named)
+                                           selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
         self.assertEqual(created, [(self.MGMT, "m", "us-central1")])
         self.assertEqual(sorted(report["projects"]), [self.MGMT])
         self.assertNotIn("333", {p["id"] for p in self._snapshot()["projects"]})
@@ -2473,28 +2471,43 @@ class ScopeTest(HomesMixin):
         self.assertNotIn("team-a", report["projects"])
 
     def test_excluding_the_number_drops_the_project_on_the_explicit_and_container_routes_too(self):
-        # Run N named 111 as team-a, which is also declared in `projects` and sits under a
-        # declared folder. The number is then excluded: the selector never names it, and the
-        # explicit and folder routes have to match the entry on the number the row keeps,
-        # or the project stays fully managed with nothing saying the entry matched nothing.
-        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
-                              {"id": "team-a", "via": ["explicit", self.FOLDER, self.SCOPE], "state": rec.STATE_IN_SCOPE,
-                               rec.NUMBER_KEY: "111"}],
-                             containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1},
-                                         {"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        # team-a is monitored by the scope (number 111), declared in `projects` and under a
+        # declared folder; 111 is excluded. The explicit and folder routes reach it by ID, so
+        # the entry has to be tied to the ID: by naming the number, which the grant those
+        # routes carry allows, whether or not a past row kept it. Without that the project
+        # stays fully managed with nothing saying the entry matched nothing.
         ids = {"cluster-a": _identity("team-a", "prod")}
         declaration = {"projects": ["team-a"], "folders": ["123456789012"], "metricsScopes": ["mon-proj"],
                        "exclude": {"projects": ["111"]}}
         members = {"team-a": [("team-a", "prod", "us-central1")]}
-        report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
-                                             profiles=["cluster-a"], identities=ids,
-                                             searches={self.FOLDER: (members, rec.OUTCOME_OK)},
-                                             selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)})
-        self.assertEqual((created, deleted), ([], []))
+        for previous in (None, "named"):
+            with self.subTest(previous_row=previous):
+                if previous:
+                    self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                                          {"id": "team-a", "via": ["explicit", self.FOLDER, self.SCOPE], "state": rec.STATE_IN_SCOPE,
+                                           rec.NUMBER_KEY: "111"}],
+                                         containers=[{"id": self.FOLDER, "outcome": rec.OUTCOME_OK, "projects": 1},
+                                                     {"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+                report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                                     profiles=["cluster-a"], identities=ids,
+                                                     searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                                     selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                                     numbers={"111": ("team-a", rec.OUTCOME_OK)})
+                self.assertEqual((created, deleted), ([], []))
+                self.assertNotIn("team-a", report["projects"])
+                # In scope last run: retiring now, its profile kept until the next clean run.
+                self.assertEqual(report["retiring"], ["team-a"] if previous else [])
+        # A snapshot that no longer carries the row (the project dropped last run, nothing
+        # to retire) still drops it: the naming pass ties the number every run.
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE}])
+        report, _, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
+                                 searches={self.FOLDER: (members, rec.OUTCOME_OK)},
+                                 selectors={self.SCOPE: (["111"], rec.OUTCOME_OK)},
+                                 numbers={"111": ("team-a", rec.OUTCOME_OK)})
         self.assertNotIn("team-a", report["projects"])
-        self.assertEqual(report["retiring"], ["team-a"])
-        # An ID no run has tied to the number is beyond the entry's reach on those routes:
-        # the number matches the bare-number row a selector keys it under, and that only.
+        # An ID no run can tie to the number (the naming call refused, no row kept) is beyond
+        # the entry's reach on those routes: the number matches the bare-number row a
+        # selector keys it under, and that only.
         declaration["exclude"]["projects"].append("222")
         report, created, _ = self._run(declaration, {self.MGMT: [], "team-b": [("team-b", "x", "us-central1")]},
                                        searches={self.FOLDER: ({"team-b": [("team-b", "x", "us-central1")]}, rec.OUTCOME_OK)},
