@@ -513,7 +513,8 @@ rendered on every apply, empty lists included: an emptied `projects` list is the
 drops projects (their read roles are revoked and their Cluster Agent profiles retire over the
 reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
-`cluster_name` triple; neither changes IAM. Through the installer the value comes from
+`cluster_name` triple; neither changes IAM, except that an entry naming a selector's member exactly
+withholds its grant (below). Through the installer the value comes from
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
 `SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
@@ -547,13 +548,17 @@ pool grants authority ([`docs/designs/multi-project-scope.md`](../../../docs/des
 `scope.shared_vpc_hosts` and `scope.metrics_scopes` take project IDs: a Shared VPC host project,
 whose attached service projects are in scope, and the scoping project of a Cloud Monitoring
 Metrics Scope, whose monitored projects are. Neither is a Resource Manager container, so nothing
-is inherited through them. The module resolves each at plan time, with the same three reads the
-reconcile makes each run (the Compute API for a host's service projects, the Monitoring API for a
-scope's monitored projects, Resource Manager to name each of those, which the Monitoring API
-returns by number), made with the google provider's own token so they are answered for the
-identity that applies, and binds the allowlist in every project resolved, and in each host
-itself, which the reconcile's lookup has to read. A read that identity cannot make fails the plan
-before anything is applied, naming the selector and the API's answer: it needs
+is inherited through them. The composition resolves each at plan time through the
+[`kube-agents-scope-resolver`](../../modules/kube-agents-scope-resolver/README.md) module, with the
+same three reads the reconcile makes each run (the Compute API for a host's service projects, the
+Monitoring API for a scope's monitored projects, Resource Manager to name each of those, which the
+Monitoring API returns by number), made with the google provider's own token so they are answered
+for the identity that applies, and hands the members to the IAM module, which binds the allowlist
+in every project resolved, and in each host and scoping project, which the reconcile's lookups
+have to read. The resolver is a module of its own, called without a `depends_on`, because the IAM
+module's module-level `depends_on` would defer a read inside it to apply time and fail the plan on
+a first install. A read that identity cannot make fails the plan before anything is applied,
+naming the selector and the API's answer: it needs
 `compute.projects.get` on a host, to read the Metrics Scope in its scoping project
 (`roles/monitoring.metricsScopesViewer` is the narrowest role) with `monitoring.googleapis.com`
 enabled there, and `resourcemanager.projects.get` on each monitored project; a monitored project

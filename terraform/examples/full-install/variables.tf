@@ -189,7 +189,8 @@ variable "scope" {
     are project IDs, of a Shared VPC host and of a Metrics Scope's scoping
     project: the module resolves each to the projects it reaches at plan
     time, as the identity Terraform plans with, and binds the allowlist in
-    every one (and in the host itself, which the reconcile's lookup reads),
+    every one (and in the host and scoping project themselves, which the
+    reconcile's lookups read),
     because nothing is inherited through either; a project attached or
     linked after the apply reads denied until the next one. A lookup the
     planning identity cannot make fails the plan with the selector named,

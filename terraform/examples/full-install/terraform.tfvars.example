@@ -150,15 +150,16 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # means naming the roles, so that the grant is explicit and reviewed.
 # permission_set = "read-only"
 
-# Multi-project scope: the projects, folders and organisations beyond
-# project_id whose GKE clusters get a Cluster Agent, and what to leave
+# Multi-project scope: the projects, folders, organisations, Shared VPC hosts
+# and Metrics Scopes beyond project_id whose GKE clusters get a Cluster Agent, and what to leave
 # unmanaged. The IAM module binds the read roles in each listed project, and
 # the read roles plus roles/cloudasset.viewer on each folder and organisation
 # (numeric IDs; every project beneath inherits the grant), and the chart
 # renders the same object into the PlatformAgent CR. A folder or organisation
 # also enables cloudasset.googleapis.com in project_id. A Shared VPC host or a
 # Metrics Scope's scoping project (project IDs) is resolved at plan time, as
-# the identity planning, to the projects it reaches, and each of those is
+# the identity planning, to the projects it reaches, and each of those, and the
+# host or scoping project itself, is
 # bound like a listed project; nothing is inherited through either, so a
 # project attached or linked later waits for the next apply. Omit the block, or
 # leave the lists empty, for the management project alone. A PlatformAgent

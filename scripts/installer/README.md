@@ -241,11 +241,12 @@ A folder or organisation also adds `cloudasset.googleapis.com` to the APIs the c
 in the host project, because the reconcile resolves a container's members through it; an install
 that names explicit projects alone never enables it.
 
-A Shared VPC host or a Metrics Scope inherits nothing, so the module resolves it to projects when
-Terraform plans, with the same reads the reconcile makes each run (the Compute API for a host's
-service projects, the Monitoring API for a scope's monitored projects, Resource Manager to name
-each of those by ID) made with the google provider's own token, and binds the read roles in each,
-and in the host itself, which the reconcile's lookup reads. A read that identity cannot make fails
+A Shared VPC host or a Metrics Scope inherits nothing, so the composition resolves it to projects
+when Terraform plans (the `kube-agents-scope-resolver` module), with the same reads the reconcile
+makes each run (the Compute API for a host's service projects, the Monitoring API for a scope's
+monitored projects, Resource Manager to name each of those by ID) made with the google provider's
+own token, and the IAM module binds the read roles in each, and in the host and scoping project
+themselves, which the reconcile's lookups read. A read that identity cannot make fails
 the plan, before anything is applied, naming the selector, the status and the API's message: it
 needs `compute.projects.get` on a host, to read the Metrics Scope in its scoping project with the
 Monitoring API enabled there, and `resourcemanager.projects.get` on every monitored project; a
@@ -328,8 +329,10 @@ The bindings live in projects, folders and organisations the applying identity h
 set IAM policy in. A scoped project or container that is deleted, or whose owner revokes that
 permission, fails the refresh or destroy of its bindings on every later plan, full upgrade and
 uninstall (a Shared VPC host or Metrics Scope this identity can no longer read fails the plan the
-same way, since the lookup runs on every plan). Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS`,
-`SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES` and forget
+same way, since the lookup runs on every plan except `uninstall.sh`'s destroy, which blanks the
+selector keys). Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`,
+`SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES`, or, for a project a selector resolved to, name
+it exactly in `SCOPE_EXCLUDE_PROJECTS` (its ID, or its project number for a monitored project), and forget
 its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
 against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
 `module.kube_agents_iam.google_folder_iam_member.scope_roles` or

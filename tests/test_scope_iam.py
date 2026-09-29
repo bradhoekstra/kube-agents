@@ -24,6 +24,7 @@ except ImportError:  # run from inside tests/
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULE = _REPO_ROOT / "terraform" / "modules" / "kube-agents-iam"
 _COMPOSITION = _REPO_ROOT / "terraform" / "examples" / "full-install"
+_RESOLVER = _REPO_ROOT / "terraform" / "modules" / "kube-agents-scope-resolver"
 # The chart's copy of the CRD, which make chart-check holds byte-identical to
 # the operator's generated one; the constraints below are read from it.
 _CRD = _REPO_ROOT / "charts" / "kube-agents" / "crds" / "kubeagents.x-k8s.io_platformagents.yaml"
@@ -162,21 +163,36 @@ class ScopeContainerBindingsTest(unittest.TestCase):
 
 
 class ScopeSelectorResolutionTest(unittest.TestCase):
-    """A Shared VPC host or a Metrics Scope inherits nothing, so the module
-    resolves it to projects at plan time, as the identity the provider applies
-    with, and binds the same allowlist in each (design §6, §10 step 3). Read as
-    text: the reads, whose token they carry, what fails the plan, and that the
-    members reach the one project binding."""
+    """A Shared VPC host or a Metrics Scope inherits nothing, so it is resolved
+    to projects at plan time, as the identity the provider applies with, by the
+    kube-agents-scope-resolver module, and the IAM module binds the same
+    allowlist in each (design §6, §10 step 3). Read as text: the reads, whose
+    token they carry, what fails the plan, and that the members reach the one
+    project binding."""
 
     def setUp(self):
+        self.resolver_tf = (_RESOLVER / "main.tf").read_text()
         self.scope_tf = (_MODULE / "scope.tf").read_text()
         self.main_tf = (_MODULE / "main.tf").read_text()
-        self.versions = (_MODULE / "versions.tf").read_text()
+        self.versions = (_RESOLVER / "versions.tf").read_text()
 
     def _data(self, kind, name):
-        match = re.search(rf'^data\s+"{kind}"\s+"{name}"\s*\{{(.*?)^\}}', self.scope_tf, re.MULTILINE | re.DOTALL)
-        self.assertIsNotNone(match, f"data {kind}.{name} not found")
+        match = re.search(rf'^data\s+"{kind}"\s+"{name}"\s*\{{(.*?)^\}}', self.resolver_tf, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, f"data {kind}.{name} not found in the resolver")
         return match.group(1)
+
+    def test_the_resolution_is_not_inside_the_module_the_composition_orders(self):
+        # The composition calls kube-agents-iam with a module-level depends_on,
+        # which defers every data source in it to apply time on a first install
+        # and fails a for_each keyed on the read; so the IAM module reads
+        # nothing and takes the members as an input, and refuses a declared
+        # selector the input does not carry.
+        self.assertNotIn('data "http"', self.scope_tf)
+        self.assertNotIn('data "google_client_config"', self.scope_tf)
+        self.assertNotIn("hashicorp/http", (_MODULE / "versions.tf").read_text())
+        self.assertIn('variable "scope_selector_members"', (_MODULE / "variables.tf").read_text())
+        self.assertIn("condition     = local.scope_selectors_resolved", self.main_tf)
+        self.assertIn("kube-agents-scope-resolver", self.main_tf)
 
     def test_the_reads_are_the_reconciles_three_against_the_apis_it_calls(self):
         host = self._data("http", "scope_shared_vpc_host")
@@ -188,56 +204,66 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         named = self._data("http", "scope_monitored_project")
         self.assertIn("for_each = local.scope_monitored_numbers", named)
         self.assertIn('url                = "${local.scope_resource_manager_api_url}/projects/${each.key}"', named)
-        self.assertIn('scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"', self.scope_tf)
-        self.assertIn('scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"', self.scope_tf)
-        self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"', self.scope_tf)
+        self.assertIn('scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"', self.resolver_tf)
+        self.assertIn('scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"', self.resolver_tf)
+        self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"', self.resolver_tf)
 
     def test_every_read_carries_the_providers_own_token(self):
         # google_client_config is the provider's configured identity, impersonation
         # included: the lookup passes or fails for the principal that applies.
-        self.assertIn('data "google_client_config" "scope_resolver"', self.scope_tf)
-        self.assertIn('Authorization = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"', self.scope_tf)
+        self.assertIn('data "google_client_config" "scope_resolver"', self.resolver_tf)
+        self.assertIn('Authorization = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"', self.resolver_tf)
         for name in ("scope_shared_vpc_host", "scope_metrics_scope", "scope_monitored_project"):
             with self.subTest(read=name):
                 self.assertIn("request_headers    = local.scope_resolver_headers", self._data("http", name))
         # No read shells out: an external program would answer for gcloud's
         # active account, which need not be the provider's identity.
-        self.assertNotIn('data "external"', self.scope_tf)
-        self.assertNotIn("local-exec", self.scope_tf)
+        self.assertNotIn('data "external"', self.resolver_tf)
+        self.assertNotIn("local-exec", self.resolver_tf)
 
     def test_the_http_provider_is_required_and_no_lookup_is_made_without_a_selector(self):
         self.assertIn('source  = "hashicorp/http"', self.versions)
         self.assertIn("count = local.scope_resolves_selectors ? 1 : 0", self._data("google_client_config", "scope_resolver"))
-        self.assertIn("scope_resolves_selectors = length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0", self.scope_tf)
+        self.assertIn("scope_resolves_selectors = length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0", self.resolver_tf)
 
     def test_a_failed_read_fails_the_plan_and_a_non_host_resolves_to_nothing(self):
         host = self._data("http", "scope_shared_vpc_host")
         self.assertIn("self.status_code == 200 || (self.status_code == 400 && strcontains(self.response_body, local.scope_not_xpn_host_marker))", host)
-        self.assertIn('scope_not_xpn_host_marker            = "is not a shared VPC host project"', self.scope_tf)
+        self.assertIn('scope_not_xpn_host_marker            = "is not a shared VPC host project"', self.resolver_tf)
         self.assertIn("Nothing was applied.", host)
         self.assertIn("!can(jsondecode(self.response_body).nextPageToken)", host)
         for name in ("scope_metrics_scope", "scope_monitored_project"):
             with self.subTest(read=name):
                 self.assertIn("condition     = self.status_code == 200\n", self._data("http", name))
-        # A body that is not the document the module reads is refused, never read as empty.
-        self.assertIn('can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"])', host)
-        self.assertIn("can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)])",
-                      self._data("http", "scope_metrics_scope"))
+        # A 200 whose body does not decode, or is not the document the module
+        # reads, is refused, never read as an empty selector: try(..., [])
+        # alone would pass it and the next apply would revoke every member.
+        self.assertIn('(can(jsondecode(self.response_body)) && can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"]))', host)
+        scope = self._data("http", "scope_metrics_scope")
+        self.assertIn("can(jsondecode(self.response_body)) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0", scope)
+        self.assertIn("can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)])", scope)
         # A legacy domain-scoped ID the scope cannot carry is refused by number.
         self.assertIn("can(regex(local.scope_project_id_pattern, jsondecode(self.response_body).projectId))", self._data("http", "scope_monitored_project"))
-        self.assertIn("name the number in scope.exclude.projects", self._data("http", "scope_monitored_project"))
+        self.assertIn("Name the number in exclude_projects", self._data("http", "scope_monitored_project"))
 
-    def test_the_members_reach_the_one_project_binding_with_the_host_and_less_an_exact_exclude(self):
+    def test_the_members_reach_the_one_project_binding_with_the_lookup_projects_and_less_an_exact_exclude(self):
         self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
         self.assertIn("for pair in setproduct(sort(tolist(local.scope_bound_projects)), local.scope_roles) :", self.scope_tf)
         selector = re.search(r"scope_selector_projects = toset\(concat\((.*?)\n  \)\)", self.scope_tf, re.DOTALL).group(1)
+        # Only the declared selectors' entries are read from the input.
+        self.assertIn("lookup(var.scope_selector_members, name, [])", selector)
         self.assertIn("if project != var.project_id && !contains(var.scope.exclude.projects, project)", selector)
+        # The host and the scoping project are bound whatever exclude says:
+        # the reconcile's lookups read them, and an unbound one freezes the
+        # selector every tick.
         self.assertIn("[for host in local.scope_shared_vpc_hosts : host if host != var.project_id]", selector)
-        # An excluded number is neither named nor bound.
-        self.assertIn("if can(regex(local.scope_project_number_pattern, member)) && !contains(var.scope.exclude.projects, member)", self.scope_tf)
+        self.assertIn("[for scope in local.scope_metrics_scopes : scope if scope != var.project_id]", selector)
+        # An excluded number is neither named nor bound, in the resolver.
+        self.assertIn("if can(regex(local.scope_project_number_pattern, member)) && !contains(var.exclude_projects, member)", self.resolver_tf)
         # The snapshot's names, so the output reads beside fleet_scope.json.
-        self.assertIn('"sharedVpcHosts/${host}" => members', self.scope_tf)
-        self.assertIn('"metricsScopes/${scope}" => members', self.scope_tf)
+        self.assertIn('"sharedVpcHosts/${host}" => members', self.resolver_tf)
+        self.assertIn('"metricsScopes/${scope}" => members', self.resolver_tf)
+        self.assertIn("value       = local.scope_selector_members", (_RESOLVER / "outputs.tf").read_text())
 
     def test_a_host_without_the_lookup_role_fails_the_plan(self):
         self.assertIn('scope_shared_vpc_lookup_role = "roles/compute.viewer"', self.scope_tf)
@@ -251,7 +277,6 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         outputs = (_MODULE / "outputs.tf").read_text()
         self.assertIn("value       = sort(tolist(local.scope_shared_vpc_hosts))", outputs)
         self.assertIn("value       = sort(tolist(local.scope_metrics_scopes))", outputs)
-        self.assertIn("value       = local.scope_selector_members", outputs)
         self.assertIn("value       = sort(tolist(local.scope_bound_projects))", outputs)
 
 
@@ -374,7 +399,24 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
 
     def test_the_module_gets_the_variable(self):
         module = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', self.main_tf, re.DOTALL).group(1)
-        self.assertIn("scope              = var.scope", module)
+        self.assertRegex(module, r"\n  scope +=  *var\.scope\n")
+
+    def test_the_selectors_are_resolved_beside_the_module_and_outside_its_depends_on(self):
+        # The resolver is called with no depends_on and no managed-resource
+        # input, so its reads happen at plan time on a first install too; the
+        # IAM module, which carries the depends_on, gets the members as data.
+        resolver = re.search(r'module "scope_resolver" \{(.*?)\n\}', self.main_tf, re.DOTALL)
+        self.assertIsNotNone(resolver, "module.scope_resolver is not in the composition")
+        body = resolver.group(1)
+        self.assertIn('source = "../../modules/kube-agents-scope-resolver"', body)
+        self.assertIn("shared_vpc_hosts = var.scope.shared_vpc_hosts", body)
+        self.assertIn("metrics_scopes   = var.scope.metrics_scopes", body)
+        self.assertIn("exclude_projects = var.scope.exclude.projects", body)
+        self.assertNotIn("depends_on", body)
+        self.assertNotRegex(body, r"(google_|module\.gke)")
+        iam = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', self.main_tf, re.DOTALL).group(1)
+        self.assertIn("scope_selector_members = module.scope_resolver.members", iam)
+        self.assertIn("depends_on = [google_project_service.required, module.gke_cluster]", iam)
 
     def test_the_chart_gets_the_same_object_with_the_crds_keys(self):
         values = re.search(r"\n      scope = \{\n(?P<body>.*?)\n      \}\n", self.main_tf, re.DOTALL)
@@ -400,9 +442,10 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
     def test_the_outputs_are_surfaced(self):
         outputs = (_COMPOSITION / "outputs.tf").read_text()
         for name in ("scope_projects", "scope_roles", "scope_folders", "scope_organizations", "scope_container_roles",
-                     "scope_shared_vpc_hosts", "scope_metrics_scopes", "scope_selector_members", "scope_bound_projects"):
+                     "scope_shared_vpc_hosts", "scope_metrics_scopes", "scope_bound_projects"):
             with self.subTest(output=name):
                 self.assertIn(f"value       = module.kube_agents_iam.{name}", outputs)
+        self.assertIn("value       = module.scope_resolver.members", outputs)
 
     def test_the_asset_api_is_enabled_only_when_a_container_is_declared(self):
         # An install that names explicit projects alone never calls the Asset

@@ -261,15 +261,34 @@ locals {
   }
 }
 
+# The two scope selectors that are not containers, resolved to projects at
+# plan time. Called with no depends_on and no input a managed resource
+# produces, on purpose: module.kube_agents_iam below carries a module-level
+# depends_on, which would defer a data source inside it to apply time on a
+# first install or on any upgrade that enables an API, and the bindings keyed
+# on the resolved projects would then fail the plan as unknown. Here the reads
+# happen on every plan, and a read the planning identity cannot make fails
+# the plan with the selector named, before anything is applied.
+module "scope_resolver" {
+  source = "../../modules/kube-agents-scope-resolver"
+
+  shared_vpc_hosts = var.scope.shared_vpc_hosts
+  metrics_scopes   = var.scope.metrics_scopes
+  exclude_projects = var.scope.exclude.projects
+}
+
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id         = var.project_id
-  namespace          = var.namespace
-  project_roles      = local.agent_project_roles
-  scoped_clusters    = var.scoped_clusters
-  scope              = var.scope
-  service_account_id = var.agent_service_account_id
+  project_id      = var.project_id
+  namespace       = var.namespace
+  project_roles   = local.agent_project_roles
+  scoped_clusters = var.scoped_clusters
+  scope           = var.scope
+  # What the selectors resolved to, from the module above; the IAM module
+  # binds these and refuses a selector with no entry.
+  scope_selector_members = module.scope_resolver.members
+  service_account_id     = var.agent_service_account_id
   # The KSA half of the Workload Identity member; the same variable is the
   # chart's platformAgent.security.serviceAccountName below. The variable's
   # description in variables.tf says why it exists and what bounds it.

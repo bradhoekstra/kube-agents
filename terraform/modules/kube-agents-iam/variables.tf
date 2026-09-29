@@ -142,14 +142,15 @@ variable "scope" {
     project, whose attached service projects are in scope, and the scoping
     project of a Cloud Monitoring Metrics Scope, whose monitored projects are.
     Neither is a Resource Manager container, so nothing is inherited through
-    them: the module resolves each to its projects at plan time, as the
-    identity the google provider applies with (design §10 step 3), and binds
-    the same allowlist in every one, the Shared VPC host itself included
-    because the reconcile's lookup reads it. A project attached or linked
-    after the last apply reads `denied` until the next one. An exclude entry
-    that names a resolved member exactly, by ID or by the project number the
-    Monitoring API returns, keeps it out of the plan-time set; a glob is
-    evaluated by the reconcile alone.
+    them: each is resolved to its projects at plan time by the
+    kube-agents-scope-resolver module, handed in through
+    scope_selector_members, and this module binds the same allowlist in every
+    one, the Shared VPC host and the scoping project included because the
+    reconcile's lookups read them. A project attached or linked after the
+    last apply reads `denied` until the next one. An exclude entry that names
+    a resolved member exactly, by ID or by the project number the Monitoring
+    API returns, keeps it out of the bindings; a glob is evaluated by the
+    reconcile alone.
 
     Empty, the default, binds nothing and the reconcile lists project_id alone.
   EOT
@@ -236,5 +237,30 @@ variable "scope" {
       && length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)
     )
     error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts, scope.metrics_scopes, scope.exclude.projects and scope.exclude.clusters each name an entry once; the CRD rejects a repeat at admission, after IAM has been applied."
+  }
+}
+
+variable "scope_selector_members" {
+  description = <<-EOT
+    What each of scope.shared_vpc_hosts and scope.metrics_scopes resolved to
+    at plan time: the kube-agents-scope-resolver module's `members` output, a
+    map from the selector's snapshot name (sharedVpcHosts/<host>,
+    metricsScopes/<scope>) to the project IDs it reaches. Every declared
+    selector needs an entry, or the plan is refused (main.tf); a key for a
+    selector the scope does not declare binds nothing. Resolved outside this
+    module because the composition calls it with a module-level depends_on,
+    which would defer a data source here to apply time (scope.tf).
+  EOT
+  type        = map(list(string))
+  nullable    = false
+  default     = {}
+
+  validation {
+    condition = alltrue([
+      for name, members in var.scope_selector_members :
+      can(regex("^(sharedVpcHosts|metricsScopes)/[a-z][a-z0-9-]{4,28}[a-z0-9]$", name))
+      && alltrue([for member in members : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
+    ])
+    error_message = "Each scope_selector_members key is sharedVpcHosts/<project id> or metricsScopes/<project id>, and each member a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's members output as it is."
   }
 }

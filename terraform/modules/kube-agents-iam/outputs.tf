@@ -69,39 +69,28 @@ output "scope_container_roles" {
 
 output "scope_shared_vpc_hosts" {
   description = <<-EOT
-    The Shared VPC host projects scope.shared_vpc_hosts named. Each was
-    resolved at plan time to its attached service projects, which are bound
-    with scope_roles (see scope_selector_members), and is bound with
-    scope_roles itself so the reconcile's lookup can read it.
+    The Shared VPC host projects scope.shared_vpc_hosts named. Each is bound
+    with scope_roles itself, so the reconcile's lookup can read it, beside
+    the service projects scope_selector_members resolved it to.
   EOT
   value       = sort(tolist(local.scope_shared_vpc_hosts))
 }
 
 output "scope_metrics_scopes" {
   description = <<-EOT
-    The Metrics Scope scoping projects scope.metrics_scopes named. Each was
-    resolved at plan time to the projects it monitors, named through Resource
-    Manager, which are bound with scope_roles (see scope_selector_members).
+    The Metrics Scope scoping projects scope.metrics_scopes named. Each is
+    bound with scope_roles itself, so the reconcile's lookup can read the
+    scope there, beside the monitored projects scope_selector_members
+    resolved it to.
   EOT
   value       = sort(tolist(local.scope_metrics_scopes))
-}
-
-output "scope_selector_members" {
-  description = <<-EOT
-    What each Shared VPC host and Metrics Scope resolved to at plan time, by
-    project ID, under the name the reconcile's snapshot gives the selector
-    (sharedVpcHosts/<host>, metricsScopes/<scope>), so this output and the
-    `containers` array of fleet_scope.json can be read side by side. A member
-    an exclude entry names exactly is listed here and bound nowhere.
-  EOT
-  value       = local.scope_selector_members
 }
 
 output "scope_bound_projects" {
   description = <<-EOT
     Every project beyond project_id bound with scope_roles: the explicit
     scope.projects, the selectors' members less an exact exclude entry, and
-    each Shared VPC host, once each.
+    each Shared VPC host and Metrics Scope scoping project, once each.
   EOT
   value       = sort(tolist(local.scope_bound_projects))
 }

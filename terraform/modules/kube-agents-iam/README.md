@@ -1,6 +1,6 @@
 # Kube-Agents IAM & Workload Identity Module
 
-Reusable Terraform module for provisioning the Platform Agent's Google Service Account (GSA), its Workload Identity binding, its project-level IAM roles, and the read grants in the projects, folders and organisations its `scope` input names.
+Reusable Terraform module for provisioning the Platform Agent's Google Service Account (GSA), its Workload Identity binding, its project-level IAM roles, and the read grants in the projects, folders and organisations its `scope` input names and in the projects its Shared VPC host and Metrics Scope selectors resolve to.
 
 ## Relationship to the install
 
@@ -48,7 +48,8 @@ lists and gets clusters (`roles/container.clusterViewer` or `roles/container.vie
 `roles/iam.securityReviewer` lists but cannot get). `exclude` binds nothing and revokes nothing: it
 travels in the object so the composition renders the CR from the same value, and a project named
 in `projects` is bound even when an exclude entry removes it from the resolved set, so drop it
-from `projects` instead. A folder or organisation (`folders`, `organizations`: numeric IDs)
+from `projects` instead. The one exception is a project a selector resolved to (below), which has
+no list to be dropped from: an exclude entry that names it exactly withholds its grant. A folder or organisation (`folders`, `organizations`: numeric IDs)
 gets the same intersected allowlist plus `roles/cloudasset.viewer`, bound on the container
 itself (`google_folder_iam_member`, `google_organization_iam_member`), so every project beneath
 it inherits the grant, including one created after the apply, and the reconcile can search the
@@ -56,21 +57,23 @@ container's asset index for clusters; the identity running the apply needs
 `resourcemanager.folders.setIamPolicy` or `resourcemanager.organizations.setIamPolicy` there.
 The same manageability check applies to a container as to a project. A Shared VPC host or a
 Metrics Scope's scoping project (`shared_vpc_hosts`, `metrics_scopes`: project IDs) is not a
-container and inherits nothing, so the module resolves it to projects at plan time and binds the
-same intersected allowlist in each: `data "http"` reads of the Compute API (`getXpnResources`),
-the Monitoring API (`metricsScopes.get`) and Resource Manager (to name each monitored project,
-returned by number), made with the google provider's own access token
-(`data "google_client_config"`) so they are answered for the identity that applies. Each host is
-bound too, because the reconcile's lookup reads it with `compute.projects.get`, and the plan is
-refused when `project_roles` carries no `roles/compute.viewer` beside a host. A read that fails
-fails the plan, before anything is applied, with the selector and the API's answer in the error;
-a project that is not a Shared VPC host resolves to no members; and an `exclude.projects` entry
+container and inherits nothing, so it is resolved to projects at plan time and the module binds the
+same intersected allowlist in each. The resolution is the
+[`kube-agents-scope-resolver`](../kube-agents-scope-resolver/README.md) module's, whose `members`
+output is this module's `scope_selector_members` input; the plan is refused when a declared
+selector has no entry there, so a caller that skips the resolver is told so rather than getting
+the host bound and its members not. Not resolved here because the composition calls this module
+with a module-level `depends_on`, which would defer a data source inside it to apply time and fail
+the bindings' `for_each` as unknown on a first install. Each host, and each scoping project, is
+bound too, because the reconcile's lookups read them (`compute.projects.get` in the host; the
+scope in the scoping project), even when an exclude entry names them, and the plan is refused
+when `project_roles` carries no `roles/compute.viewer` beside a host. An `exclude.projects` entry
 that names a member exactly, by ID or by project number, keeps it out of the bindings, the one
 place `exclude` reaches IAM. Removing an entry revokes its bindings on the next apply, and
 `terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,
-`scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_selector_members`,
-`scope_bound_projects`, `scope_roles` and `scope_container_roles` outputs surface what was bound.
-An organisation binding is wide; the design is
+`scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_bound_projects`,
+`scope_roles` and `scope_container_roles` outputs surface what was bound. An organisation binding
+is wide; the design is
 [`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
 §10 step 3.
 
