@@ -287,6 +287,13 @@ METRICS_PATH = "/metrics"
 HEALTHZ_PATH = "/healthz"
 METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
 METRICS_SERVER_HEADER = "credential-proxy-metrics"
+# The metrics listener shares the process with the credentialed handler, so a
+# peer that reaches the port must not be able to spend its threads: at most
+# this many connections are served at once, the rest are closed unserved, and
+# each one is cut off this many seconds after it opened whatever the peer
+# sends -- the bound the gateway's Go listener puts on its header read.
+METRICS_MAX_CONNECTIONS = 16
+METRICS_CONNECTION_DEADLINE_SECONDS = 10
 # Metric names, and the vocabulary of every label value. Nothing served is
 # caller text: a label value is one of these strings or a member of the
 # vocabularies below, so a caller cannot grow the series set by varying what
@@ -5287,6 +5294,9 @@ def _tool_labels(argv: list[str]) -> tuple[str, str]:
 
 
 def _escape_label_value(value: str) -> str:
+    # Every label value today is a static enum or a vocabulary word, none of
+    # which carries these characters. Kept because the exposition format's
+    # correctness should not rest on an invariant held three functions away.
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
 
 
@@ -5378,12 +5388,35 @@ class MetricsHandler(BaseHTTPRequestHandler):
     the operator's NetworkPolicy on this pod is what bounds who reaches the
     port. It serves the registry the credentialed handler writes and holds no
     route, credential or policy of its own, which is why it may bind a TCP
-    port the credential runtime otherwise refuses to (see serve).
+    port the credential runtime otherwise refuses to (see serve). Bounded
+    because it shares the process with that handler: MetricsServer admits
+    METRICS_MAX_CONNECTIONS at a time and handle() cuts every connection
+    off at METRICS_CONNECTION_DEADLINE_SECONDS, so a peer that reaches the
+    port cannot spend the threads the credentialed handler needs.
     """
 
     server_version = METRICS_SERVER_HEADER
     sys_version = ""
-    timeout = RESPONSE_WRITE_TIMEOUT_SECONDS
+    # Per-recv: an idle peer is dropped here. A peer that trickles bytes
+    # resets this on every byte, which is what the timer in handle() is for.
+    timeout = METRICS_CONNECTION_DEADLINE_SECONDS
+
+    def handle(self) -> None:
+        # One absolute deadline per connection, from accept to the last byte
+        # written, whatever the peer sends in between.
+        cutoff = threading.Timer(METRICS_CONNECTION_DEADLINE_SECONDS, self._cut_off)
+        cutoff.daemon = True
+        cutoff.start()
+        try:
+            super().handle()
+        finally:
+            cutoff.cancel()
+
+    def _cut_off(self) -> None:
+        # Shutting the socket makes the blocked read return, and the guard in
+        # handle_one_request turns whatever that raises into a debug line.
+        with contextlib.suppress(OSError):
+            self.connection.shutdown(socket.SHUT_RDWR)
 
     def handle_one_request(self) -> None:
         # One guard for every byte this listener writes, on any path or
@@ -5416,7 +5449,40 @@ class MetricsHandler(BaseHTTPRequestHandler):
         return
 
 
-def start_metrics_listener(host: str, port: int) -> ThreadingHTTPServer | None:
+class MetricsServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a ceiling on live connections.
+
+    The stdlib server starts one thread per accepted connection with no cap,
+    and the credentialed handler lives in this process: a peer holding
+    thousands of connections open would spend the threads every brokered
+    command needs. Connections past METRICS_MAX_CONNECTIONS are closed
+    unserved before any thread is spent on them; the ones admitted are held
+    to MetricsHandler's deadline.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(METRICS_MAX_CONNECTIONS)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            LOGGER.debug("metrics connection closed unserved: %d already open", METRICS_MAX_CONNECTIONS)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+
+def start_metrics_listener(host: str, port: int) -> MetricsServer | None:
     """Open the metrics-only listener on a daemon thread; log, not raise, when it cannot.
 
     Never fatal: a port that cannot be bound, or that is no port at all (bind
@@ -5425,7 +5491,7 @@ def start_metrics_listener(host: str, port: int) -> ThreadingHTTPServer | None:
     signal.
     """
     try:
-        server = ThreadingHTTPServer((host, port), MetricsHandler)
+        server = MetricsServer((host, port), MetricsHandler)
     except (OSError, OverflowError) as exc:
         LOGGER.error(
             "ALERT metrics listener on %s:%d unavailable type=%s; the broker serves no "

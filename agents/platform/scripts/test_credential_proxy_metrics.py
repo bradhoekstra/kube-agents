@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.error
@@ -410,6 +411,87 @@ class MetricsListenerTest(unittest.TestCase):
             handler.handle_one_request()
         self.assertTrue(handler.close_connection)
         self.assertTrue(any("metrics request not answered" in line for line in logs.output), logs.output)
+
+
+class ListenerBoundsTest(unittest.TestCase):
+    """The listener shares the process with the credentialed handler, so a peer
+    that reaches the port gets at most METRICS_MAX_CONNECTIONS threads for at most
+    METRICS_CONNECTION_DEADLINE_SECONDS each, whatever it sends."""
+
+    _DEADLINE = 1
+    _GRACE = 5
+
+    def _listener(self, timeout, **overrides):
+        for name, value in overrides.items():
+            patcher = mock.patch.object(credential_proxy, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # The per-recv timeout MetricsHandler.setup() applies; short where the
+        # test is about an idle peer, long where the holders must stay parked.
+        timeout_patch = mock.patch.object(MetricsHandler, "timeout", timeout)
+        timeout_patch.start()
+        self.addCleanup(timeout_patch.stop)
+        server = credential_proxy.start_metrics_listener("127.0.0.1", 0)
+        self.assertIsInstance(server, credential_proxy.MetricsServer)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def _connect(self, port):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=self._GRACE)
+        self.addCleanup(sock.close)
+        return sock
+
+    @staticmethod
+    def _closed_by_server(sock):
+        """True once the server has closed the connection: a read returns EOF or fails."""
+        try:
+            return sock.recv(1) == b""
+        except OSError:
+            return True
+
+    def test_an_idle_peer_is_dropped_at_the_deadline(self):
+        port = self._listener(self._DEADLINE, METRICS_CONNECTION_DEADLINE_SECONDS=self._DEADLINE)
+        sock = self._connect(port)
+        self.assertTrue(self._closed_by_server(sock))
+
+    def test_a_trickling_peer_is_cut_off_at_the_deadline(self):
+        port = self._listener(self._DEADLINE, METRICS_CONNECTION_DEADLINE_SECONDS=self._DEADLINE)
+        sock = self._connect(port)
+        sock.sendall(b"GET /metr")
+        started = time.monotonic()
+        cut = False
+        while time.monotonic() - started < self._GRACE:
+            time.sleep(self._DEADLINE / 5)
+            try:
+                sock.sendall(b"i")
+            except OSError:
+                cut = True
+                break
+            sock.settimeout(0.1)
+            try:
+                if sock.recv(1) == b"":
+                    cut = True
+                    break
+            except TimeoutError:
+                continue
+            except OSError:
+                cut = True
+                break
+        self.assertTrue(cut, "a peer sending one byte at a time held its thread past the deadline")
+
+    def test_connections_past_the_cap_are_closed_unserved_and_slots_come_back(self):
+        port = self._listener(self._GRACE, METRICS_MAX_CONNECTIONS=2, METRICS_CONNECTION_DEADLINE_SECONDS=self._GRACE)
+        holders = [self._connect(port) for _ in range(2)]
+        time.sleep(1)  # let the listener accept both and park a thread on each
+        extra = self._connect(port)
+        extra.sendall(b"GET /metrics HTTP/1.1\r\nHost: broker\r\n\r\n")
+        self.assertTrue(self._closed_by_server(extra), "a third connection was served past the cap")
+        for holder in holders:
+            holder.close()
+        time.sleep(0.5)  # the parked threads notice EOF and release their slots
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/metrics", timeout=self._GRACE) as response:
+            self.assertEqual(200, response.status)
 
 
 class ListenerStartTest(unittest.TestCase):
