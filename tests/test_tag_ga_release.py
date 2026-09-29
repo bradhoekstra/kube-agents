@@ -493,6 +493,11 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
             self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
             self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), tag_commit)
+            # Tag first, then branch: the order the recovery test below depends on.
+            self.assertLess(
+                proc.stdout.index(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' successfully pushed"),
+                proc.stdout.index(f"Release branch '{branch}' successfully pushed"),
+            )
         finally:
             temp_dir.cleanup()
 
@@ -537,13 +542,47 @@ class TagGAReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_a_run_that_pushed_the_tag_but_not_the_branch_finishes_on_re_run_from_a_fresh_checkout(self):
-        """The tag is what a re-run keys on, so a run that died before the branch is repeatable.
+    _REJECT_RELEASE_BRANCH_MARKER = "reject-release-branch"
 
-        create_stamped_release_commit reuses the tagged commit, so the second run,
-        from a fresh checkout with no local release branch, pushes the same commit
-        to the branch it did not get to. Pushed the other way round, the re-run
-        would stamp a fresh commit and refuse the branch its first attempt pushed.
+    def _install_release_branch_rejecting_hook(self, git, bare_dir):
+        """A pre-receive hook on the bare remote that refuses `refs/heads/release/*`
+        while a marker file exists in the repository, and accepts everything else.
+
+        This is how a push of the release branch is made to fail for real, rather
+        than by deleting the branch afterwards: what the remote holds when the
+        script exits non-zero is then what a run that died at that push leaves.
+        """
+        hooks_dir = bare_dir / "hooks"
+        hooks_dir.mkdir(exist_ok=True)
+        hook = hooks_dir / "pre-receive"
+        hook.write_text(
+            "#!/bin/sh\n"
+            "while read -r old new ref; do\n"
+            "  case \"$ref\" in\n"
+            "    refs/heads/release/*)\n"
+            f"      if [ -f \"{self._REJECT_RELEASE_BRANCH_MARKER}\" ]; then\n"
+            "        echo 'release branch rejected by the test hook' >&2\n"
+            "        exit 1\n"
+            "      fi\n"
+            "      ;;\n"
+            "  esac\n"
+            "done\n"
+            "exit 0\n"
+        )
+        hook.chmod(0o755)
+        # A developer's global core.hooksPath would otherwise bypass this directory.
+        git("--git-dir", str(bare_dir), "config", "core.hooksPath", str(hooks_dir))
+        return bare_dir / self._REJECT_RELEASE_BRANCH_MARKER
+
+    def test_a_run_whose_branch_push_fails_leaves_the_tag_and_finishes_on_re_run_from_a_fresh_checkout(self):
+        """The tag is pushed before the branch, and that order is what makes the run repeatable.
+
+        The remote refuses the branch push on the first run. Because the tag went
+        first it is on the remote when the run fails, and the second run, from a
+        fresh checkout with no local release branch, reuses the tagged commit and
+        pushes the same commit to the branch. With the two pushes the other way
+        round the first run would push nothing, so the re-run's reuse of the
+        tagged commit — asserted below — could not happen: it would stamp afresh.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
@@ -553,21 +592,28 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             main_commit = git("rev-parse", "HEAD").stdout.strip()
             bare_dir = self._bare_origin_for(git, repo_dir)
             branch = f"release/{MOCK_TARGET_RELEASE_TAG}"
+            reject_marker = self._install_release_branch_rejecting_hook(git, bare_dir)
 
             def remote(ref):
                 return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
 
+            reject_marker.touch()
             first = self._run_script(
                 [MOCK_TARGET_RELEASE_TAG, main_commit],
                 env={"CI": "true", **self._FAKE_RELEASE_REPO},
                 cwd=repo_dir,
             )
-            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertNotEqual(first.returncode, 0)
+            self.assertIn(f"Could not push Release branch '{branch}'", first.stderr)
+            self.assertIn("rejected by the test hook", first.stderr)
             tag_commit = git("rev-parse", f"{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
-            self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
+            # What the failed run left behind: the tag, and no branch.
+            self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), tag_commit)
+            self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", branch).stdout.strip(), "")
 
-            # Stage the failure: the tag is on the remote and the branch is not.
-            git("--git-dir", str(bare_dir), "branch", "-D", branch)
+            # The re-run is a fresh checkout: no local release branch, only what
+            # the clone fetched from the remote, and the remote no longer refuses.
+            reject_marker.unlink()
             rerun_dir = pathlib.Path(repo_dir).parent / "rerun"
             git("clone", "--quiet", str(bare_dir), str(rerun_dir))
             git("config", "user.name", "Test User", cwd=rerun_dir)
