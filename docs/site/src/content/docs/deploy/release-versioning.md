@@ -26,8 +26,9 @@ Every commit and build progresses through six distinct lifecycle tiers:
 | **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Green eval on the nomination                  | Quality gate for GA: the nightly E2E matrix and the agent eval both passed. Also the deploy trigger for the staging estate.                                                 |
 | **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch                 | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default), and pushed to the version's release line `release/X.Y`. |
 
-Only a staging-promoted commit is releasable. An `rc_*_validated` tag records the narrow
-three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag, which the nightly pipeline
+Only a staging-promoted commit is releasable from `main`; a patch from a release line is gated on
+the `rc_*_validated` tag on the line's head instead. An `rc_*_validated` tag records the narrow
+three-hourly suite; `main`'s GA gate reads the `staging_<ts>_<sha>` tag, which the nightly pipeline
 pushes only after the full matrix passes and the agent eval it nominated the candidate for comes
 back green.
 
@@ -77,8 +78,10 @@ so a pull request's labels decide the heading it appears under. Dependabot's pul
 labelled `duplicate`, `invalid` or `wontfix`, are left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
 
-Before it exists, the next release is whatever has merged since the latest GA tag, which
-[the latest release](https://github.com/gke-labs/kube-agents/releases/latest) names:
+Before it exists, the next release from `main` is whatever has merged since the most recent
+release cut from `main`, which [the latest release](https://github.com/gke-labs/kube-agents/releases/latest)
+names: a patch cut on a release line is published without the `latest` mark and does not move
+`main`'s base.
 
 - `https://github.com/gke-labs/kube-agents/compare/<LATEST_GA_TAG>...main` lists every pull
   request the next release will contain if it is cut from the tip of `main`. The GA tag sits on a
@@ -118,7 +121,7 @@ Maintainers do, on the Friday schedule above or by hand. A patch release, `X.Y.Z
 
 The release publish workflow enforces byte-for-byte fidelity with tested candidate binaries across seven layers:
 
-1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; on a release line a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to a `release/X.Y.Z` branch builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
+1. Container images are compiled once, when a commit is pushed to `main` or merged onto a `release/<X.Y>` branch; on a release line a commit that already has images is never rebuilt, `:latest` moves only for `main`, and a push to one of the legacy per-release `release/X.Y.Z` branches (releases before 0.8.0) builds nothing. The release retags the existing `<TARGET_COMMIT>` manifests to numeric `X.Y.Z` in GHCR without rebuilding.
 2. Promoted container images in GHCR are cryptographically signed using Keyless Cosign via GitHub Actions OIDC tokens.
 3. The Helm chart is packaged at version `X.Y.Z` (matching `appVersion`), pushed as an OCI package to `oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents:X.Y.Z`, and its OCI manifest signed via Cosign.
 4. A single-parent release commit is created on detached HEAD with `BAKED_RELEASE_VERSION="X.Y.Z"` stamped into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`); the tag is placed on that stamped commit, which is then pushed to the release line `release/X.Y`: created at a minor, fast-forwarded by each patch.

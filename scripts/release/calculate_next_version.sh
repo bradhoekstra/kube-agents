@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Calculates the next semantic version (X.Y.Z) based on Conventional Commits since the last GA release tag.
+# Calculates the next semantic version (X.Y.Z) based on Conventional Commits since the GA release
+# the candidate's history descends from (get_base_ga_tag_for_commit), on main or on a release line.
 # Correctly implements SemVer 2.0 clause 4: in 0.y.z initial development, Breaking Changes bump MINOR (0.1.0 -> 0.2.0).
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
 set -euo pipefail
@@ -38,14 +39,7 @@ if [ -n "${RELEASE_LINE}" ]; then
   # contradiction to refuse, not a preference to honour: the branch step can
   # only fast-forward from the head, and the line's protection vouches for the
   # head alone.
-  LINE_CANDIDATE="$(release_line_candidate "${RELEASE_LINE}")" || exit 1
-  if [ -n "${TARGET_REF_PARAM}" ] && [ "${TARGET_REF_PARAM}" != "null" ]; then
-    NAMED_COMMIT="$(git rev-parse --verify "${TARGET_REF_PARAM}^{commit}" 2>/dev/null || echo "")"
-    if [ "${NAMED_COMMIT}" != "${LINE_CANDIDATE}" ]; then
-      echo "❌ ERROR: Release line ${RELEASE_LINE} releases its own head (${LINE_CANDIDATE:0:7}); target commit '${TARGET_REF_PARAM}' cannot be named alongside it." >&2
-      exit 1
-    fi
-  fi
+  LINE_CANDIDATE="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_REF_PARAM}")" || exit 1
   TARGET_REF_PARAM="${LINE_CANDIDATE}"
   echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${LINE_CANDIDATE:0:7}" >&2
 elif [ -z "${TARGET_REF_PARAM}" ] || [ "${TARGET_REF_PARAM}" = "null" ]; then
@@ -222,7 +216,7 @@ if [ -n "${RELEASE_LINE}" ]; then
     echo "❌ ERROR: Release line ${RELEASE_LINE} carries a breaking change since ${LATEST_GA_TAG}; a line takes fixes only. Release it with explicit_release_version if you mean it." >&2
     exit 1
   fi
-  if FEAT_SUBJECTS="$(grep -E "^feat(\([^)]+\))?:" <<<"${COMMITS_SUBJECTS}")"; then
+  if FEAT_SUBJECTS="$(grep -E "${FEAT_SUBJECT_REGEX}" <<<"${COMMITS_SUBJECTS}")"; then
     echo "❌ ERROR: Release line ${RELEASE_LINE} carries a feature since ${LATEST_GA_TAG}; a line takes fixes only:" >&2
     sed 's/^/   /' <<<"${FEAT_SUBJECTS}" >&2
     echo "   Release it with explicit_release_version if you mean it." >&2
@@ -254,7 +248,7 @@ if [ "${HAS_BREAKING}" = "true" ]; then
 # the reason commit_messages_have_breaking_change gives: under pipefail grep exits
 # on its first match, the producer dies on SIGPIPE, and a large enough range reads
 # as "no feat:" — a patch bump where a minor was owed.
-elif grep -qE "^feat(\([^)]+\))?:" <<<"${COMMITS_SUBJECTS}"; then
+elif grep -qE "${FEAT_SUBJECT_REGEX}" <<<"${COMMITS_SUBJECTS}"; then
   BUMP_TYPE="minor"
   MINOR=$((MINOR + 1))
   PATCH=0

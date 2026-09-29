@@ -32,7 +32,7 @@ on:
           - dry-run
           - evaluate
       explicit_release_version:
-        description: "Explicit release version override (e.g. 0.2.0). If omitted, automatically calculated via Conventional Commits."
+        description: "Explicit release version override (e.g. 0.2.0). If omitted, automatically calculated via Conventional Commits. With release_line it must stay on that line; on main it may not name a patch of a line that has its own branch."
         required: false
         type: string
       target_commit:
@@ -44,7 +44,7 @@ on:
         required: false
         type: string
       skip_staging_validation:
-        description: "Emergency override: bypass the staging promotion gate (the full nightly E2E matrix)."
+        description: "Emergency override: bypass the validation gate (the staging promotion for a release from main; the rc_*_validated tag for a release line)."
         required: false
         type: boolean
         default: false

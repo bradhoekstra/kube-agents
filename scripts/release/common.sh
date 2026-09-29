@@ -31,6 +31,10 @@ readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
 readonly RELEASE_BRANCH_PREFIX="release/"
 # The shape of a release line: `X.Y`, the version with its patch component off.
 readonly RELEASE_LINE_SHAPE_REGEX='^[0-9]+\.[0-9]+$'
+# A Conventional Commits feature subject, which bumps MINOR on main and is
+# refused on a release line. Read by calculate_next_version.sh.
+# shellcheck disable=SC2034
+readonly FEAT_SUBJECT_REGEX='^feat(\([^)]+\))?:'
 # The full ref a branch lives under, for the lookups and refspecs that must not
 # be satisfied by a tag of the same name.
 readonly GIT_BRANCH_REF_PREFIX="refs/heads/"
@@ -743,10 +747,7 @@ is_commit_already_attempted() {
 # verify_release_eligibility.sh reads the staging family alone, and takes the RC
 # validation as implied by it — see STAGING_TAG_SHAPE_REGEX below.
 is_rc_candidate_commit_already_validated() {
-  local sha="$1"
-  local validated_tags
-  validated_tags=$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || echo "")
-  [ -n "${validated_tags}" ]
+  [ -n "$(validated_rc_tags_at_commit "${1:-}")" ]
 }
 
 # ─── Promotion tag cores ──────────────────────────────────────────────────────
@@ -1380,6 +1381,25 @@ release_line_candidate() {
   echo "${head}"
 }
 
+# The line's candidate, or an error when a commit named alongside the line is
+# not it. The calculator and the eligibility check both resolve through this,
+# so the two cannot disagree about which commit a line releases: the branch
+# step can only fast-forward from the head, and the line's branch protection,
+# once it exists, vouches for the head alone.
+# Arguments: $1 = line (X.Y), $2 = commit-ish named by the caller (optional)
+release_line_resolve_candidate() {
+  local line="${1:-}" named="${2:-}" candidate named_sha
+  candidate="$(release_line_candidate "${line}")" || return 1
+  if [ -n "${named}" ] && [ "${named}" != "null" ]; then
+    named_sha="$(git rev-parse --verify "${named}^{commit}" 2>/dev/null || echo "")"
+    if [ "${named_sha}" != "${candidate}" ]; then
+      echo "❌ ERROR: Release line ${line} releases its own head (${candidate:0:7}); target commit '${named}' cannot be named alongside it." >&2
+      return 1
+    fi
+  fi
+  echo "${candidate}"
+}
+
 # The rc_*_validated tags on a commit, one per line: a release line's gate.
 validated_rc_tags_at_commit() {
   local sha="${1:-}"
@@ -1485,7 +1505,13 @@ ensure_release_branch() {
     local) ;;
     remote-candidate | local-candidate)
       # Move the local branch to the release commit, compare-and-swap against
-      # the candidate it is at, or create it when the checkout has no copy.
+      # the candidate it is at, or create it when the checkout has no copy. Not
+      # while it is checked out: update-ref would advance HEAD under a worktree
+      # still at the candidate, leaving the stamp staged as a reversal.
+      if [ "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)" = "${branch}" ]; then
+        echo "❌ ERROR: Release line '${branch}' is checked out here; switch to another branch before releasing from it." >&2
+        return 1
+      fi
       local local_sha
       local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
       if [ -n "${local_sha}" ]; then

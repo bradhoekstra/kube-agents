@@ -30,7 +30,7 @@ documentation and governance playbooks around them.
    validated candidate that passes the full E2E matrix to `staging_YYMMDDHHMM_<short_sha>`. The
    promotion has a second gate in front of it: the nightly first pushes
    `evalcand_YYMMDDHHMM_<short_sha>`, which triggers the release-candidate eval on Prow, and only a
-   GREEN verdict there produces the staging tag. That staging tag is what a GA release is gated on —
+   GREEN verdict there produces the staging tag. That staging tag is what a GA release from `main` is gated on —
    see `scripts/release/README.md`.
 4. **GA release pipeline creates stamped release child commit.** When promoting a staging-promoted
    candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD

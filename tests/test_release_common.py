@@ -1377,6 +1377,77 @@ source "{_COMMON_SH}"
         self.assertIn("Dry-run", local.stdout)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), release_commit)
 
+    def test_ensure_release_branch_refuses_to_move_the_checked_out_line(self):
+        """update-ref on HEAD's branch would leave the worktree behind at the candidate."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        candidate = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+        git("branch", branch, candidate)
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
+        git("add", "stamp.txt")
+        git("commit", "-m", "chore(release): stamp release version 0.2.1")
+        release_commit = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", branch)
+
+        proc = self._run_common_func(
+            f'ensure_release_branch "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("is checked out here", proc.stderr)
+        self.assertEqual(git("rev-parse", branch).stdout.strip(), candidate)
+        self.assertEqual(git("status", "--porcelain").stdout.strip(), "")
+
+    def test_release_line_helpers_in_ci_read_the_release_repository(self):
+        """The CI arm: the head comes from the remote (fetched when the checkout lacks it),
+        the candidate steps back from a stamped head, and an unreadable remote is 2, not "no"."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        base = git("rev-parse", "HEAD").stdout.strip()
+        git("push", "--quiet", str(bare_dir), "main")
+        # A line that advanced on the remote only: a second clone pushes a backport and a stamp.
+        other = pathlib.Path(repo_dir).parent / "other"
+        git("clone", "--quiet", str(bare_dir), str(other))
+        git("config", "user.name", "Test User", cwd=other)
+        git("config", "user.email", "test@example.com", cwd=other)
+        git("config", "commit.gpgsign", "false", cwd=other)
+        git("switch", "-c", "release/0.2", cwd=other)
+        (other / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt", cwd=other)
+        git("commit", "-m", "fix: backport", cwd=other)
+        l1 = git("rev-parse", "HEAD", cwd=other).stdout.strip()
+        git("push", "--quiet", "origin", "release/0.2", cwd=other)
+        ci = {"CI": "true", **self._FAKE_RELEASE_REPO}
+
+        head = self._run_common_func('release_line_head "0.2"', env=ci, cwd=repo_dir)
+        self.assertEqual(head.returncode, 0, head.stderr)
+        self.assertEqual(head.stdout.strip(), l1)
+        self.assertEqual(git("rev-parse", "--verify", f"{l1}^{{commit}}").stdout.strip(), l1, "fetched into the checkout")
+
+        exists = self._run_common_func('if release_line_branch_exists "0.2"; then echo rc=0; else echo "rc=$?"; fi', env=ci, cwd=repo_dir)
+        self.assertIn("rc=0", exists.stdout)
+        absent = self._run_common_func('if release_line_branch_exists "9.9"; then echo rc=0; else echo "rc=$?"; fi', env=ci, cwd=repo_dir)
+        self.assertIn("rc=1", absent.stdout)
+
+        (other / "stamp.txt").write_text("0.2.1\n")
+        git("add", "stamp.txt", cwd=other)
+        git("commit", "-m", "chore(release): stamp release version 0.2.1", cwd=other)
+        git("tag", "-a", "0.2.1", "-m", "release 0.2.1", cwd=other)
+        git("push", "--quiet", "origin", "release/0.2", "--tags", cwd=other)
+        git("fetch", "--quiet", str(bare_dir), "+refs/tags/*:refs/tags/*")
+        candidate = self._run_common_func('release_line_candidate "0.2"', env=ci, cwd=repo_dir)
+        self.assertEqual(candidate.returncode, 0, candidate.stderr)
+        self.assertEqual(candidate.stdout.strip(), l1)
+
+        # Point the release repository's URL at a path that does not exist instead.
+        unreachable = pathlib.Path(repo_dir).parent / "unreachable.git"
+        git("config", "--unset-all", f"url.{bare_dir}.insteadOf")
+        git("config", f"url.{unreachable}.insteadOf", f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git")
+        broken = self._run_common_func('if release_line_branch_exists "0.2"; then echo rc=0; else echo "rc=$?"; fi', env=ci, cwd=repo_dir)
+        self.assertIn("rc=2", broken.stdout)
+
     def test_release_branch_placement_reports_where_the_branch_is(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)

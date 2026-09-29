@@ -68,15 +68,7 @@ if [ -n "${RELEASE_LINE}" ]; then
     echo "❌ ERROR: Version '${TARGET_VERSION}' is not on release line ${RELEASE_LINE}." >&2
     exit 1
   fi
-  LINE_CANDIDATE="$(release_line_candidate "${RELEASE_LINE}")" || exit 1
-  if [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
-    NAMED_COMMIT="$(git rev-parse --verify "${TARGET_COMMIT_INPUT}^{commit}" 2>/dev/null || echo "")"
-    if [ "${NAMED_COMMIT}" != "${LINE_CANDIDATE}" ]; then
-      echo "❌ ERROR: Release line ${RELEASE_LINE} releases its own head (${LINE_CANDIDATE:0:7}); '${TARGET_COMMIT_INPUT}' is not it." >&2
-      exit 1
-    fi
-  fi
-  RC_CANDIDATE_COMMIT="${LINE_CANDIDATE}"
+  RC_CANDIDATE_COMMIT="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_COMMIT_INPUT}")" || exit 1
   echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${RC_CANDIDATE_COMMIT:0:7}"
 elif [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
   if ! RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${TARGET_COMMIT_INPUT}^{commit}" 2>/dev/null)"; then
