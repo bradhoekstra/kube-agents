@@ -595,8 +595,9 @@ platformAgent:
   # where the k8s-event-watcher serves its metrics on the agent-api-auth
   # sidecar's event-metrics port (9095), and the credential proxy, where the
   # broker serves its own on the metrics-only cred-metrics port (8766). The
-  # operator's policies on both pods admit the collector on those ports
-  # whatever this is set to; this decides only whether a scrape is configured.
+  # operator's policies on both pods admit the collector's namespace,
+  # gke-gmp-system, on those ports whatever this is set to; this decides only
+  # whether a scrape is configured.
   # A tri-state: null (the default) renders them when the cluster serves
   # monitoring.googleapis.com/v1/PodMonitoring, which is where Managed
   # Prometheus is installed, and renders nothing elsewhere, so an install on a

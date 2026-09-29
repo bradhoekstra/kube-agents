@@ -313,7 +313,6 @@ TOOL_STATUS_BUSY = "busy"
 LABEL_OTHER = "other"
 # `subcommand` when the argv names the tool and nothing after it.
 SUBCOMMAND_NONE = "none"
-SUBCOMMAND_LABEL_MAX_LENGTH = 32
 # The `subcommand` vocabularies the policy tables do not already supply. The
 # kubectl read verbs and the gcloud command groups come from command_policy's
 # tables -- a gcloud command is labelled by its group, `container` or `iam`,
@@ -350,6 +349,9 @@ FORGE_CLI_SUBCOMMANDS = frozenset(
 # forges an install declares; a CLI with no entry here labels every
 # subcommand `other` rather than being judged against another tool's verbs.
 FORGE_CLI_VOCABULARIES = {"gh": FORGE_CLI_SUBCOMMANDS}
+# The global flags a forge CLI takes a value for ahead of its subcommand, so
+# `gh -R owner/repo pr list` labels `pr` rather than the repository.
+FORGE_CLI_VALUE_FLAGS = {"gh": frozenset({"-R", "--repo"})}
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -5230,6 +5232,24 @@ def _subcommand_vocabulary(tool: str) -> frozenset[str]:
     return FORGE_CLI_VOCABULARIES.get(tool, frozenset())
 
 
+def _forge_subcommand(tool: str, argv: list[str]) -> str | None:
+    """The first bare word after a forge CLI's global flags, or None.
+
+    A flag that takes a value (`-R owner/repo`) is skipped with its value;
+    `--repo=owner/repo` is one token and skips itself.
+    """
+    value_flags = FORGE_CLI_VALUE_FLAGS.get(tool, frozenset())
+    tokens = iter(argv[1:])
+    for token in tokens:
+        if token in value_flags:
+            next(tokens, None)
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
 def _tool_labels(argv: list[str]) -> tuple[str, str]:
     """The ``tool`` and ``subcommand`` labels for an exec request.
 
@@ -5238,9 +5258,9 @@ def _tool_labels(argv: list[str]) -> tuple[str, str]:
     subcommand is the first bare word after the tool, read with the same
     parsers the policy uses -- a kubectl or gcloud global flag that takes a
     value would otherwise hand its value up as the verb -- and kept only when
-    the tool's vocabulary lists it. Unreadable, unlisted, or a label longer
-    than SUBCOMMAND_LABEL_MAX_LENGTH all read LABEL_OTHER; a bare tool reads
-    SUBCOMMAND_NONE.
+    the tool's vocabulary lists it. Unreadable or unlisted reads LABEL_OTHER; a
+    bare tool reads SUBCOMMAND_NONE. A forge CLI's value-taking global flags
+    (`gh -R owner/repo pr list`) are stepped over on the way to the subcommand.
     """
     tool = argv[0]
     if tool not in CommandExecutor.ALLOWED_EXECUTABLES:
@@ -5255,10 +5275,10 @@ def _tool_labels(argv: list[str]) -> tuple[str, str]:
     elif tool == "git":
         word, _ = _git_plan(argv)
     else:
-        word = next((token for token in argv[1:] if not token.startswith("-")), None)
+        word = _forge_subcommand(tool, argv)
     if word is None:
         return tool, SUBCOMMAND_NONE
-    if word in _subcommand_vocabulary(tool) and len(word) <= SUBCOMMAND_LABEL_MAX_LENGTH:
+    if word in _subcommand_vocabulary(tool):
         return tool, word
     return tool, LABEL_OTHER
 
@@ -5367,11 +5387,17 @@ class MetricsHandler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         body = CredentialProxyHandler.metrics.render().encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", METRICS_CONTENT_TYPE)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", METRICS_CONTENT_TYPE)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except OSError as exc:
+            # The collector closed the connection mid-scrape. The next scrape
+            # reads the same counters, so this is a debug line, not the
+            # traceback the server would otherwise print for it.
+            LOGGER.debug("scrape not delivered bytes=%d type=%s", len(body), type(exc).__name__)
 
     def log_message(self, message: str, *args: Any) -> None:
         # A scrape every thirty seconds is not an audit event, and the broker's
@@ -6972,7 +6998,11 @@ def serve(args: argparse.Namespace) -> None:
     # that hands out credentials, and this one serves counters.
     metrics_port = int(getattr(args, "metrics_port", 0) or 0)
     if not metrics_port:
-        LOGGER.info("metrics listener disabled: %s is unset", METRICS_PORT_ENV)
+        raw = os.getenv(METRICS_PORT_ENV)
+        LOGGER.info(
+            "metrics listener disabled: --metrics-port resolved to 0 (%s is %s)",
+            METRICS_PORT_ENV, "unset" if raw is None or not raw.strip() else repr(raw),
+        )
     elif not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
         # A hand-edited Deployment or a mismatched image: refused here by
         # name, since bind() would raise past the listener's guard.

@@ -99,7 +99,8 @@ it with a `TokenReview` before serving any path on that listener but `/healthz`;
 listener in the pod is the runtime's metrics-only one on 8766, unauthenticated like
 `/healthz`: it serves Prometheus counters whose label values are static enums and closed
 vocabularies, holds no route, credential or policy, and is the one port the broker's
-NetworkPolicy admits the managed-Prometheus collector to
+NetworkPolicy opens to the `gke-gmp-system` namespace, where the managed-Prometheus
+collector runs, and to no other peer
 ([design](credential-isolation-design.md#architecture)). Three properties do not follow from that. The
 allowlist names the gateway's ServiceAccount and the sandbox's and does not vary on which one
 presented the token (the audience and the route table it feeds do), so the allowlist is a

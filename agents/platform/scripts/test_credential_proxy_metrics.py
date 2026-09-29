@@ -28,6 +28,7 @@ from unittest import mock
 
 import command_policy
 import credential_proxy
+import scoped_sa_pool
 from credential_proxy import (
     CommandExecutor,
     CredentialProxyHandler,
@@ -213,6 +214,44 @@ class ToolInvocationCountingTest(_BrokerFixture):
             exposition,
         )
 
+    def test_a_policy_rule_match_counts_as_blocked_under_its_verb(self):
+        policy_path = Path(self.temp_dir.name) / "policy-with-rule.json"
+        policy_path.write_text(
+            json.dumps({"blockedMessage": "blocked", "rules": [
+                {"id": "kubernetes.no-secrets", "pattern": r"\bkubectl\b.*\bsecrets?\b", "message": "no secrets"},
+            ]}),
+            encoding="utf-8",
+        )
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        status, body = self.post(["kubectl", "get", "secrets"])
+        self.assertEqual(403, status)
+        self.assertIn("kubernetes.no-secrets", json.dumps(body))
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+
+    def test_a_refused_git_argument_counts_as_blocked(self):
+        status, body = self.post(["git", "-c", "x=y", "status"])
+        self.assertEqual(403, status)
+        self.assertEqual("git.argument.refused", body.get("rule"))
+        self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="status", status="blocked"))
+
+    def test_a_git_write_outside_a_lease_counts_as_blocked(self):
+        # No cwd, so the command would run at the shared workspace root, which
+        # the lease floor refuses for a write.
+        status, body = self.post(["git", "commit", "-m", "x"])
+        self.assertEqual(403, status)
+        self.assertEqual("git.workspace.lease", body.get("rule"))
+        self.assertEqual(1, _series(self.families(), "kubeagents_tool_invocations_total", tool="git", subcommand="commit", status="blocked"))
+
+    def test_a_cwd_outside_the_workspace_counts_as_error_and_is_not_timed(self):
+        status, _ = self.post(["kubectl", "get", "pods"], cwd="/etc")
+        self.assertEqual(400, status)
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="400"))
+
 
 class AbandonedCommandTest(unittest.TestCase):
     """A command the caller hung up on ran and was killed: counted and timed under
@@ -335,6 +374,30 @@ class MetricsListenerTest(unittest.TestCase):
         first = urllib.request.urlopen(self.endpoint + "/metrics").read()
         second = urllib.request.urlopen(self.endpoint + "/metrics").read()
         self.assertEqual(first, second)
+
+    def test_a_scrape_the_collector_abandons_is_not_a_traceback(self):
+        class _Gone:
+            def write(self, data):
+                raise BrokenPipeError()
+
+            def flush(self):
+                return None
+
+        self.addCleanup(
+            _BrokerFixture._restore, "metrics", "metrics" in CredentialProxyHandler.__dict__, CredentialProxyHandler.__dict__.get("metrics")
+        )
+        CredentialProxyHandler.metrics = ProxyMetrics()
+        handler = MetricsHandler.__new__(MetricsHandler)
+        handler.request_version = "HTTP/1.1"
+        handler.command = "GET"
+        handler.path = credential_proxy.METRICS_PATH
+        handler.requestline = "GET /metrics HTTP/1.1"
+        handler.client_address = ("127.0.0.1", 0)
+        handler.close_connection = True
+        handler.wfile = _Gone()
+        with self.assertLogs(credential_proxy.LOGGER, level="DEBUG") as logs:
+            handler.do_GET()
+        self.assertTrue(any("scrape not delivered" in line and "BrokenPipeError" in line for line in logs.output), logs.output)
 
 
 class ListenerStartTest(unittest.TestCase):
@@ -541,6 +604,68 @@ class NeverStartedCommandTest(unittest.TestCase):
         self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
 
 
+class FaultOutcomeTest(unittest.TestCase):
+    """The two outcomes that end in the route's exception handlers: a scoped
+    service-account pool with no member for the request, answered 403 as a
+    refusal, and a broker fault, answered 500. Both are counted before the
+    response is written and neither is timed, since the command never ran."""
+
+    class _Raising:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def __init__(self, exc):
+            self.exc = exc
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, *args, **kwargs):
+            raise self.exc
+
+    def _post_with(self, exc):
+        names = ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator")
+        previous = {name: CredentialProxyHandler.__dict__.get(name) for name in names}
+        for name, value in previous.items():
+            self.addCleanup(setattr, CredentialProxyHandler, name, value)
+        CredentialProxyHandler.executor = self._Raising(exc)
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.metrics = ProxyMetrics()
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/v1/exec",
+            data=json.dumps({"requestId": "req-f", "argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_a_pool_refusal_counts_as_blocked(self):
+        status, body = self._post_with(scoped_sa_pool.PoolRefusal("no member covers the scope"))
+        self.assertEqual(403, status)
+        self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"))
+        families = _parse(CredentialProxyHandler.metrics.render())
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+
+    def test_a_broker_fault_counts_as_error(self):
+        status, _ = self._post_with(RuntimeError("boom"))
+        self.assertEqual(500, status)
+        families = _parse(CredentialProxyHandler.metrics.render())
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="500"))
+
+
 class PolicyReadCoverageTest(unittest.TestCase):
     """Every read the policy tables allow labels as itself, so a panel over the
     policy's own vocabulary sees every allowed command and `other` means what it
@@ -567,6 +692,11 @@ class PolicyReadCoverageTest(unittest.TestCase):
             self.assertEqual(("glab", credential_proxy.LABEL_OTHER), credential_proxy._tool_labels(["glab", "pr", "list"]))
             self.assertEqual(("gh", "pr"), credential_proxy._tool_labels(["gh", "pr", "list"]))
 
+    def test_a_forge_clis_global_flags_are_stepped_over(self):
+        self.assertEqual(("gh", "pr"), credential_proxy._tool_labels(["gh", "-R", "owner/repo", "pr", "list"]))
+        self.assertEqual(("gh", "issue"), credential_proxy._tool_labels(["gh", "--repo=owner/repo", "issue", "view", "1"]))
+        self.assertEqual(("gh", credential_proxy.SUBCOMMAND_NONE), credential_proxy._tool_labels(["gh", "--repo", "owner/repo"]))
+
 
 class ServeWiringTest(unittest.TestCase):
     """serve() is the one place the operator's port becomes a listener: the
@@ -576,7 +706,7 @@ class ServeWiringTest(unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _serve(self, metrics_port):
+    def _serve(self, metrics_port, env_value=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         policy_path = Path(tmp.name) / "policy.json"
@@ -598,6 +728,8 @@ class ServeWiringTest(unittest.TestCase):
             "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
             "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
         }
+        if env_value is not None:
+            environment[credential_proxy.METRICS_PORT_ENV] = env_value
         bound = []
         owner = self
 
@@ -638,6 +770,17 @@ class ServeWiringTest(unittest.TestCase):
             any("ALERT" in line and credential_proxy.METRICS_PORT_ENV in line and "70000" in line for line in logs),
             logs,
         )
+
+    def test_a_zero_or_refused_port_is_reported_as_what_it_is(self):
+        # Three ways to arrive at 0, three different things an operator
+        # should read: unset, set to 0, or refused above as no integer.
+        for env_value, expected in ((None, "is unset"), ("0", "'0'"), ("8766a", "'8766a'")):
+            with self.subTest(env_value=env_value):
+                started, logs = self._serve(0, env_value)
+                started.assert_not_called()
+                self.assertTrue(any("metrics listener disabled" in line and expected in line for line in logs), logs)
+                if env_value is not None:
+                    self.assertFalse(any("is unset" in line for line in logs), logs)
 
 
 if __name__ == "__main__":
