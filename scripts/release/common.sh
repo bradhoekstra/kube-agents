@@ -45,6 +45,9 @@ readonly GIT_FETCH_HEAD_REF="FETCH_HEAD"
 # 404 that reads as a missing image rather than as a wrong header.
 export GHCR_REGISTRY_HOST="ghcr.io"
 export GHCR_MANIFEST_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+# The two registry answers ghcr_image_status tells apart; anything else is an error.
+readonly HTTP_STATUS_OK="200"
+readonly HTTP_STATUS_NOT_FOUND="404"
 
 # Declarative registry of all required release container images
 export REQUIRED_RELEASE_IMAGES=(
@@ -588,6 +591,62 @@ registry_image_exists() {
     -H "Authorization: Bearer ${token}" \
     -H "Accept: ${GHCR_MANIFEST_ACCEPT}" \
     "https://${GHCR_REGISTRY_HOST}/v2/${repo}/manifests/${reference}" >/dev/null 2>&1
+}
+
+# Whether a GHCR image is there, with the answer the boolean probe above
+# cannot give: `present`, `absent` (the registry said 404) or `error` (the
+# registry could not be asked, or answered anything else). A caller deciding
+# whether to overwrite a tag needs the third answer; a probe failure read as
+# "absent" is a rebuild over manifests that were validated. Always exits 0 and
+# prints one word; the registry is asked over its API, never through docker,
+# whose `manifest inspect` exits 1 for a missing image and an outage alike.
+# Arguments: $1 = image reference under GHCR_REGISTRY_HOST
+ghcr_image_status() {
+  local img="${1:-}"
+
+  case "${img}" in
+    "${GHCR_REGISTRY_HOST}"/*) ;;
+    *)
+      echo "error"
+      return 0
+      ;;
+  esac
+
+  local path="${img#"${GHCR_REGISTRY_HOST}"/}"
+  local last_segment="${path##*/}"
+  local repo reference
+  if [ "${path}" != "${path#*@}" ]; then
+    repo="${path%%@*}"
+    reference="${path#*@}"
+  elif [ "${last_segment}" != "${last_segment%:*}" ]; then
+    repo="${path%:*}"
+    reference="${path##*:}"
+  else
+    repo="${path}"
+    reference="latest"
+  fi
+
+  local token
+  token="$(curl -fsSL "https://${GHCR_REGISTRY_HOST}/token?scope=repository:${repo}:pull&service=${GHCR_REGISTRY_HOST}" 2>/dev/null |
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  if [ -z "${token}" ]; then
+    echo "error"
+    return 0
+  fi
+
+  local http_code
+  if ! http_code="$(curl -sS -o /dev/null -I -w '%{http_code}' \
+    -H "Authorization: Bearer ${token}" \
+    -H "Accept: ${GHCR_MANIFEST_ACCEPT}" \
+    "https://${GHCR_REGISTRY_HOST}/v2/${repo}/manifests/${reference}" 2>/dev/null)"; then
+    echo "error"
+    return 0
+  fi
+  case "${http_code}" in
+    "${HTTP_STATUS_OK}") echo "present" ;;
+    "${HTTP_STATUS_NOT_FOUND}") echo "absent" ;;
+    *) echo "error" ;;
+  esac
 }
 
 # Checks if all required candidate container images exist in GHCR for a specific commit SHA

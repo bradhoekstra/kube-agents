@@ -35,10 +35,11 @@ class DecideImagePublishTest(unittest.TestCase):
         self.bin_dir = create_minimal_tools_bin(root)
         self.output = root / "github_output.txt"
 
-    def run_script(self, ref, actor=_MERGER, subject="fix: a backport", images_exist=False):
+    def run_script(self, ref, actor=_MERGER, subject="fix: a backport", images_exist=False, **curl):
         create_mock_ghcr_curl_binary(
             self.bin_dir,
             manifest_status=0 if images_exist else _MOCK_CURL_MISSING_IMAGE_EXIT,
+            **curl,
         )
         self.output.write_text("")
         env = get_isolated_test_env(
@@ -83,6 +84,39 @@ class DecideImagePublishTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(outputs["build"], "false")
         self.assertIn("already exist", outputs["reason"])
+
+    def test_a_registry_that_cannot_be_asked_fails_the_decision_rather_than_building(self):
+        """A probe error is neither "present" nor "absent"; guessing "absent" would rebuild.
+
+        Staged two ways: the token call failing outright, and the manifest call
+        answering something other than 200 or 404.
+        """
+        for curl in ({"token_exit": 7}, {"manifest_http_status": 503}):
+            with self.subTest(curl=curl):
+                proc, outputs = self.run_script(_LINE_REF, **curl)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("refusing to build", proc.stderr)
+                self.assertNotIn("build", outputs)
+
+    def test_a_push_that_builds_nothing_says_so_outside_the_log(self):
+        summary = pathlib.Path(self._tmp.name) / "summary.md"
+        summary.write_text("")
+        create_mock_ghcr_curl_binary(self.bin_dir, manifest_status=_MOCK_CURL_MISSING_IMAGE_EXIT)
+        env = get_isolated_test_env(
+            overrides={
+                "PATH": str(self.bin_dir),
+                "REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX,
+                "GITHUB_REF": _LINE_REF,
+                "GITHUB_SHA": _SHA,
+                "GITHUB_ACTOR": "a-collaborator",
+                "HEAD_COMMIT_MESSAGE": "fix: pushed by hand",
+                "GITHUB_STEP_SUMMARY": str(summary),
+            }
+        )
+        proc = subprocess.run(["bash", str(_SCRIPT)], capture_output=True, text=True, env=env, cwd=_REPO_ROOT)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("::notice::Nothing published for release/0.8@", proc.stdout)
+        self.assertIn("build=false", summary.read_text())
 
     def test_missing_ref_or_sha_is_an_error(self):
         env = get_isolated_test_env(overrides={"PATH": str(self.bin_dir), "GITHUB_REF": _LINE_REF})

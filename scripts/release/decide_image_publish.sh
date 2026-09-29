@@ -14,6 +14,11 @@
 #     line opened at, or fast-forwarded to, a commit `main` already built would
 #     otherwise rebuild it under the same `:<sha>` tags, replacing the manifests
 #     its validation tags were earned against with a build no gate has seen.
+#     The registry is asked per image with ghcr_image_status; if it cannot be
+#     asked, this script fails rather than guess, so nothing builds.
+#
+# A push that builds nothing is a green run: the reason is printed, written to
+# the step summary and raised as a workflow notice, so it is not only in the log.
 #
 # Inputs (environment): GITHUB_REF, GITHUB_SHA, GITHUB_ACTOR, HEAD_COMMIT_MESSAGE.
 set -euo pipefail
@@ -52,16 +57,41 @@ decide() {
       return
       ;;
   esac
-  if check_commit_images_exist "${SHA}" >/dev/null 2>&1; then
+  local registry_prefix img status present=0
+  registry_prefix="$(get_registry_prefix)"
+  for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
+    status="$(ghcr_image_status "${registry_prefix}/${img}:${SHA}")"
+    case "${status}" in
+      present) present=$((present + 1)) ;;
+      absent) ;;
+      *)
+        echo "❌ ERROR: could not ask ${registry_prefix} whether ${img}:${SHA:0:7} exists; refusing to build rather than risk replacing published images." >&2
+        exit 1
+        ;;
+    esac
+  done
+  if [ "${present}" -eq "${#REQUIRED_RELEASE_IMAGES[@]}" ]; then
     echo "false" "images for ${SHA:0:7} already exist; a rebuild would replace manifests the release ladder validated"
     return
   fi
   echo "true" "a merge onto a release branch whose commit has no images yet"
 }
 
-read -r BUILD REASON <<<"$(decide)"
+# Captured through an assignment, not read straight from the substitution: an
+# `exit` inside `$(decide)` ends only that subshell, and a plain here-string
+# would carry on with an empty decision.
+if ! DECISION="$(decide)"; then
+  exit 1
+fi
+read -r BUILD REASON <<<"${DECISION}"
 
 echo "==> build=${BUILD}: ${REASON}"
+if [ "${BUILD}" != "true" ]; then
+  echo "::notice::Nothing published for ${REF#"${GIT_BRANCH_REF_PREFIX}"}@${SHA:0:7}: ${REASON}"
+fi
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  echo "**Image publish for \`${REF#"${GIT_BRANCH_REF_PREFIX}"}\` @ \`${SHA:0:7}\`:** build=${BUILD} — ${REASON}" >>"${GITHUB_STEP_SUMMARY}"
+fi
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
     echo "build=${BUILD}"
