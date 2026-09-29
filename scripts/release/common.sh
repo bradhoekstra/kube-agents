@@ -22,6 +22,11 @@ readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
 # follows. What is_valid_stamped_or_direct_release_commit recognises, and what
 # the image publish skips on a release branch.
 readonly RELEASE_STAMP_SUBJECT_PREFIX="chore(release): stamp release version"
+# The whole subject as a regular expression: the prefix (its parentheses
+# escaped, since in a pattern they would group rather than match), a space, and
+# a pure numeric X.Y.Z, nothing after. Read by decide_image_publish.sh.
+# shellcheck disable=SC2034
+readonly RELEASE_STAMP_SUBJECT_REGEX='^chore\(release\): stamp release version [0-9]+\.[0-9]+\.[0-9]+$'
 
 # The branch each GA release commit is pushed to, alongside its tag:
 # `release/<X.Y.Z>`. One branch per release rather than per line, because every
@@ -858,8 +863,8 @@ staging_tag_for_rc() {
 # guarantee the shape makes it look like.
 export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
 
-# Finds the newest shape-valid staging promotion tag anywhere in the repository.
-# Empty output means nothing has been promoted to staging.
+# Finds the newest shape-valid staging promotion tag on main. Empty output
+# means nothing has been promoted to staging.
 #
 # `--sort=-v:refname` orders by the timestamp immediately after the prefix, which
 # is why staging_tag_for_rc puts it there. The list is materialised before it is
@@ -867,7 +872,6 @@ export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
 # closing the pipe early makes grep exit 141, which a trailing `|| echo ""` then
 # turns into "nothing has passed the gate" — a skipped release, silently, once
 # the tag list outgrows a pipe buffer.
-#
 # On main, like the rc_ pickers (list_tags_on_main): the GA gate, the publish
 # auto-resolve, the version calculator and the staging deploy all read this,
 # and a staging_ tag a hand-dispatched promotion left on a release-line commit

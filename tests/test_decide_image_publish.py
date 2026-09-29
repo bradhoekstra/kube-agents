@@ -79,6 +79,14 @@ class DecideImagePublishTest(unittest.TestCase):
         self.assertEqual(outputs["build"], "false")
         self.assertIn("stamped release commit", outputs["reason"])
 
+    def test_a_backport_whose_title_merely_starts_like_a_stamp_still_builds(self):
+        """Only the tagger's exact subject is a stamp; a title with those words and more is a backport."""
+        for subject in ("chore(release): stamp release version helper", "chore(release): stamp release version 0.8.1 again"):
+            with self.subTest(subject=subject):
+                proc, outputs = self.run_script(_LINE_REF, subject=subject)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(outputs["build"], "true")
+
     def test_a_commit_whose_images_exist_is_never_rebuilt_on_a_release_branch(self):
         proc, outputs = self.run_script(_LINE_REF, images_exist=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)

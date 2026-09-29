@@ -55,12 +55,12 @@ decide() {
     echo "false" "only merges pushed by ${RELEASE_MERGE_ACTOR} build on a release branch; this push is by '${ACTOR}'"
     return
   fi
-  case "${HEAD_SUBJECT}" in
-    "${RELEASE_STAMP_SUBJECT_PREFIX}"*)
-      echo "false" "the head commit is the GA tagger's stamped release commit, whose images nothing deploys"
-      return
-      ;;
-  esac
+  # The whole subject the tagger writes, not the prefix alone: a backport titled
+  # with those words and more is a backport, and needs its images.
+  if [[ "${HEAD_SUBJECT}" =~ ${RELEASE_STAMP_SUBJECT_REGEX} ]]; then
+    echo "false" "the head commit is the GA tagger's stamped release commit, whose images nothing deploys"
+    return
+  fi
   local registry_prefix img status present=0
   registry_prefix="$(get_registry_prefix)"
   for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
