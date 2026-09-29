@@ -7663,6 +7663,20 @@ class ScopeCheckWiringTest(unittest.TestCase):
         menu_check = self.text.index('        check_scope_container_access || exit 1\n        enable_scope_selector_apis "$PROJECT_ID"\n        apply_crd_upgrades "$repo_dir"')
         self.assertLess(menu_check, handoff)
 
+    def test_the_dry_run_skips_its_plan_while_a_selector_api_is_off(self):
+        # A dry run enables nothing, so with a selector declared and one of
+        # the three APIs off its plan would be refused for a reason the real
+        # run, which enables them prior to apply, does not have: it skips the
+        # plan with the command instead, beside the other known-postcondition
+        # skips, and a listing that failed lets the plan speak.
+        branch = self.text.index('elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \\\n        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then')
+        node_pools = self.text.index('elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then')
+        plan = self.text.index('print_info "Previewing the resources a real run would create (terraform plan)..."')
+        self.assertLess(node_pools, branch)
+        self.assertLess(branch, plan)
+        self.assertIn('print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project', self.text[branch:plan])
+        self.assertIn('gcloud services enable ${missing_apis} --project=${project_id}', self.text[branch:plan])
+
     def test_the_generate_only_handoff_names_the_selector_apis_only_when_a_selector_is_declared(self):
         cmd_template = """
 {source}
@@ -7683,6 +7697,8 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(line, proc.stdout)
             self.assertIn("enable them first, or the plan is refused", proc.stdout)
+            # Above the apply it has to precede, for an operator pasting top to bottom.
+            self.assertLess(proc.stdout.index(line), proc.stdout.index("./lifecycle.sh apply"))
             proc = run("")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn(line, proc.stdout)

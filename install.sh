@@ -2482,6 +2482,11 @@ print_generate_only_handoff() {
   echo -e "  # schema lacks is otherwise pruned from the PlatformAgent for good."
   echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
   echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading three APIs the"
+    echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
+    echo -e "  gcloud services enable ${SCOPE_SELECTOR_APIS} --project=${project_id}"
+  fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
   echo -e "  # The live-scope check does not run here. On an existing install, a scope the PlatformAgent"
@@ -2493,11 +2498,6 @@ print_generate_only_handoff() {
     echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
     echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
     echo -e "  # on the container, and a warning above, if any, says what this identity could not."
-  fi
-  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
-    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading three APIs"
-    echo -e "  # this apply is what enables, so on a first install enable them first, or the plan is refused:"
-    echo -e "  gcloud services enable ${SCOPE_SELECTOR_APIS} --project=${project_id}"
   fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
@@ -5286,7 +5286,7 @@ main() {
       fi
     )
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-      local np_status=0
+      local np_status=0 missing_apis=""
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
       if [ "$np_status" -eq 2 ]; then
         print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
@@ -5309,6 +5309,14 @@ main() {
           print_info "To remediate manually beforehand, update each legacy node pool:"
           print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
         fi
+      elif [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] \
+        && missing_apis="$(scope_selector_apis_missing "$project_id")" && [ -n "$missing_apis" ]; then
+        # The plan resolves a declared Shared VPC host or Metrics Scope by
+        # reading APIs a real run enables prior to apply; a dry run enables
+        # nothing, so its plan would be refused for a reason the real run
+        # does not have. A listing that failed runs the plan and lets it speak.
+        print_warning "Dry-run: skipping terraform plan because ${missing_apis// /, } is not enabled in project '$project_id', and the plan resolves the declared Shared VPC host or Metrics Scope through it (a real run enables it prior to apply)."
+        print_info "To preview anyway, enable it first: gcloud services enable ${missing_apis} --project=${project_id}"
       else
         # Reached with an unenforcing cluster only under --accept-no-network-policy,
         # whose tfvars carry the variable that passes the module's postcondition.

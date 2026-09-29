@@ -91,9 +91,11 @@ output "scope_metrics_scopes" {
 output "scope_bound_projects" {
   description = <<-EOT
     Every project beyond project_id bound with scope_roles: the explicit
-    scope.projects, the selectors' members less an exact exclude entry, and
-    each Metrics Scope scoping project, once each. A Shared VPC host that is
-    not among them is in scope_lookup_only_hosts instead.
+    scope.projects, the selectors' members (less a Shared VPC service project
+    an exclude entry names by ID; a monitored project excluded by number never
+    reached the input, and one excluded by ID keeps its grant), and each
+    Metrics Scope scoping project, once each. A Shared VPC host that is not
+    among them is in scope_lookup_only_hosts instead.
   EOT
   value       = sort(tolist(local.scope_bound_projects))
 }

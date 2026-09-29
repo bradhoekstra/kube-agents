@@ -443,9 +443,13 @@ Prerequisites the design has to state and the installer has to preflight:
   cannot make fails inside the apply exactly as an explicit project's does (the phase 3 bullet
   above says why). The reads name the management project as their consumer project, so they use
   its `cloudresourcemanager`, `monitoring` and `compute` APIs whichever credential type applies;
-  the composition enables those in the apply, so `install.sh` enables them before a first
-  install's apply, the one out-of-Terraform step the selectors add, and the resolver's refusal
-  names that project when the API's answer says the API is off.
+  the composition enables those in the apply, so `install.sh` enables whichever is off before an
+  apply that carries a selector (nothing on an existing install, where all three are on), the one
+  out-of-Terraform step the selectors add; its dry run skips the plan while one is off; and the
+  resolver's refusal names that project when the API's answer says the API is off. A selector
+  that resolves to more than the resolved-set cap (100) is refused at plan: the members past it
+  would read `over-cap` with nothing created, so their bindings would be reach the agent never
+  uses.
 - When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
   the host project. The preflight checks, before the apply that then binds the agent's
   `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced

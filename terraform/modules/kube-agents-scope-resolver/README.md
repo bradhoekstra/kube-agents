@@ -25,8 +25,12 @@ the HTTP status and the API's message in the error: the identity needs `compute.
 host, to read the Metrics Scope in its scoping project (`roles/monitoring.metricsScopesViewer` is
 the narrowest role) with `monitoring.googleapis.com` enabled there, and
 `resourcemanager.projects.get` on each monitored project. A 200 whose body is not the document the
-module reads is refused rather than read as an empty selector, since an empty selector on the next
-apply is every member's bindings revoked. A monitored project the identity cannot name, or whose ID
+module reads (a JSON object of the documented shape; a list, a string or `null` decode too and are
+refused as well) is refused rather than read as an empty selector, since an empty selector on the
+next apply is every member's bindings revoked. A selector that resolves to more than 100 projects,
+the cap the CRD puts on every declared list and the reconcile's resolved-set cap, is refused too:
+the members past the cap would read `over-cap` with nothing created under them, so their read
+roles would be reach the agent never uses. A monitored project the identity cannot name, or whose ID
 the scope cannot carry (a legacy domain-scoped ID), is left out by naming its project number in
 `exclude_projects`, the scope's `exclude.projects`; that is the only entry of that list this module
 acts on, and the only exclusion that keeps a monitored project out of the bindings: the reconcile

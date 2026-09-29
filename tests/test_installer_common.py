@@ -3075,44 +3075,80 @@ _GOOGLE_CREDENTIAL_VARIABLES = (
 
 class ScopeSelectorApisTest(unittest.TestCase):
     """enable_scope_selector_apis: silent with no selector declared; with one,
-    enables the three APIs the plan-time resolution reads, in the management
-    project, since the reads run in the plan and the composition enables the
-    APIs only in the apply that follows."""
+    lists the management project's enabled APIs and enables whichever of the
+    three the plan-time resolution reads is off, since the reads run in the
+    plan and the composition enables the APIs only in the apply that follows.
+    Nothing is called when all three are on; a listing that fails enables all
+    three; an enable that fails is a warning, not an abort."""
 
-    def _run(self, keys):
+    ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
+
+    def _run(self, keys, enabled=ALL, list_fails=False, enable_fails=False):
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
             log = pathlib.Path(tmp) / "gcloud.log"
             log.write_text("")
-            (bin_dir / "gcloud").write_text('#!/usr/bin/env bash\necho "$*" >>"$GCLOUD_LOG"\nexit 0\n')
+            listing = "exit 1" if list_fails else "printf '%s\\n' " + " ".join(enabled.split()) + "; exit 0"
+            (bin_dir / "gcloud").write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f'  *"services list --enabled"*) {listing} ;;\n'
+                f'  *"services enable"*) echo "$*" >>"$GCLOUD_LOG"; exit {1 if enable_fails else 0} ;;\n'
+                "esac\nexit 1\n"
+            )
             (bin_dir / "gcloud").chmod(0o755)
             env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                    "GCLOUD_LOG": str(log)}
             env.update(keys)
             body = (
                 "set -u\n"
-                'print_info() { echo "INFO: $*"; }; print_error() { echo "ERROR: $*"; }; print_warning() { :; }; print_success() { :; }\n'
+                'print_info() { echo "INFO: $*"; }; print_error() { echo "ERROR: $*"; }\n'
+                'print_warning() { echo "WARN: $*"; }; print_success() { :; }\n'
                 f'source "{_INSTALLER_COMMON}"\n'
-                'enable_scope_selector_apis; echo "rc=$?"\n'
+                'trap \'echo TRAP-FIRED\' ERR; set -eEo pipefail; enable_scope_selector_apis; echo "rc=$?"\n'
             )
             proc = subprocess.run(["bash", "-c", body], capture_output=True, text=True,
                                   env=get_isolated_test_env(overrides=env, bin_dir=str(bin_dir)), cwd=str(_REPO_ROOT))
             return proc, log.read_text()
 
     def test_no_selector_calls_nothing(self):
-        proc, calls = self._run({"SCOPE_PROJECTS": "p2-project", "SCOPE_FOLDERS": "123456789012"})
+        proc, calls = self._run({"SCOPE_PROJECTS": "p2-project", "SCOPE_FOLDERS": "123456789012"}, list_fails=True)
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertEqual(calls, "")
         self.assertNotIn("INFO", proc.stdout)
 
-    def test_a_selector_enables_the_three_apis_in_the_management_project(self):
+    def test_every_api_already_on_calls_nothing(self):
+        # A re-run or a Day-2 apply of an existing install: the previous apply
+        # enabled all three, so no enable and no line.
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_only_the_apis_that_are_off_are_enabled(self):
         for keys in ({"SCOPE_METRICS_SCOPES": "observability-hub"}, {"SCOPE_SHARED_VPC_HOSTS": "shared-net-host, other-host"}):
             with self.subTest(keys=keys):
-                proc, calls = self._run(keys)
+                proc, calls = self._run(keys, enabled="monitoring.googleapis.com container.googleapis.com")
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
-                self.assertEqual(calls, "services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com --project=test-project\n")
-                self.assertIn("INFO: Enabling the APIs the scope's Shared VPC host and Metrics Scope lookups read in project 'test-project'", proc.stdout)
+                self.assertEqual(calls, "services enable cloudresourcemanager.googleapis.com compute.googleapis.com --project=test-project\n")
+                self.assertIn("INFO: Enabling cloudresourcemanager.googleapis.com, compute.googleapis.com in project 'test-project'", proc.stdout)
+
+    def test_a_listing_that_fails_enables_all_three(self):
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"}, list_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, f"services enable {self.ALL} --project=test-project\n")
+        self.assertIn("could not be listed", proc.stdout)
+
+    def test_an_enable_that_fails_warns_and_goes_on(self):
+        # Under the front doors' set -eE and ERR trap: the plan reports a
+        # disabled API with the same command as its remedy, and gcloud's active
+        # account need not be the one Terraform applies with.
+        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"}, enabled="monitoring.googleapis.com", enable_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("TRAP-FIRED", proc.stdout)
+        self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com, compute.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com compute.googleapis.com --project=test-project", proc.stdout)
 
 
 class ScopeContainerPreflightTest(unittest.TestCase):

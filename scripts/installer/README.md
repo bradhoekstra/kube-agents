@@ -265,9 +265,16 @@ keeps it out of the bindings, the one place an exclusion reaches IAM, because th
 to be dropped from; a monitored project excluded by ID keeps its grant, which the reconcile's naming
 call needs before the exclusion can match. The reads are billed to the management project and use
 its `cloudresourcemanager`, `monitoring` and `compute` APIs, which the composition enables in the
-apply that follows the plan, so `install.sh` enables them before a first install's apply
-(`enable_scope_selector_apis`) and the generate-only handoff names the command; `upgrade.sh` does
-not, because an existing install has them on.
+apply that follows the plan. So before an `install.sh` apply that carries a selector,
+`enable_scope_selector_apis` lists the project's enabled APIs and enables whichever of the three
+is off, as gcloud's active account, like the KMS enablement beside it: nothing is called when all
+three are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
+warning, since the plan reports a disabled API with the same command as its remedy. The
+generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
+with the command while one of the three is off (a dry run enables nothing, and its plan would
+otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
+because an existing install has them on. A selector that resolves to more than 100 projects, the
+reconcile's resolved-set cap, is refused at plan rather than bound in full.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a

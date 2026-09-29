@@ -246,9 +246,16 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # A 200 whose body does not decode, or is not the document the module
         # reads, is refused, never read as an empty selector: try(..., [])
         # alone would pass it and the next apply would revoke every member.
-        self.assertIn('(can(jsondecode(self.response_body)) && can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"]))', host)
+        # An object, not merely JSON: a list, a string or null decode too, and
+        # `.resources` on them is what try() would swallow into an empty host.
+        self.assertIn('(can(keys(jsondecode(self.response_body))) && can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"]))', host)
+        self.assertIn("response.status_code == 200 && can(keys(jsondecode(response.response_body)))", self.resolver_tf)
         scope = self._data("http", "scope_metrics_scope")
-        self.assertIn("can(jsondecode(self.response_body)) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0", scope)
+        self.assertIn("can(keys(jsondecode(self.response_body))) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0", scope)
+        # A selector past the resolved-set cap is refused rather than bound in full.
+        self.assertIn("scope_selector_member_cap       = 100", self.resolver_tf)
+        self.assertIn("<= local.scope_selector_member_cap", host)
+        self.assertIn("length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap", scope)
         self.assertIn("can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)])", scope)
         # A legacy domain-scoped ID the scope cannot carry is refused by number
         # for a monitored project, which has a number to be excluded by; a

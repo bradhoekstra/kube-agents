@@ -187,10 +187,11 @@ readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not b
 readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
 # The APIs the plan-time resolution of a Shared VPC host or Metrics Scope
 # reads (terraform/modules/kube-agents-scope-resolver), billed to the
-# management project, which the resolver sends as the quota project: enabled
-# before a first install's apply by enable_scope_selector_apis, because the
-# reads run in the plan and the composition enables them only in the apply
-# that follows.
+# management project, which the resolver sends as the quota project. The
+# reads run in the plan and the composition enables the APIs only in the
+# apply that follows, so enable_scope_selector_apis enables the ones not yet
+# on before an install.sh apply, and the dry-run skips its plan while one is
+# off.
 readonly SCOPE_SELECTOR_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
@@ -1273,22 +1274,50 @@ check_scope_container_access() {
   return 1
 }
 
-# Enables, in the management project, the APIs the plan-time resolution of a
-# declared Shared VPC host or Metrics Scope reads (SCOPE_SELECTOR_APIS). The
-# reads run in the plan and are billed to that project, and the composition
-# enables the APIs only in the apply that follows, so a first install that
-# declared a selector would otherwise be refused at plan with the API
-# reported disabled. Idempotent, and an existing install has them on already;
-# silent when no selector is declared, so an install without one never calls
-# gcloud here. Runs where the apply is about to happen, never on a plan or a
-# generate-only run, whose handoff names the command instead. $1 the project
-# (PROJECT_ID by default). Caller defines print_info.
+# Prints the SCOPE_SELECTOR_APIS not enabled in project $1, space-separated
+# (nothing when all are on); returns 1 when the listing failed, and the
+# caller decides what that means. Read through gcloud's active account, whose
+# answer does not depend on who asks.
+scope_selector_apis_missing() {
+  local project="$1" enabled api missing=""
+  enabled="$(trap - ERR; gcloud services list --enabled --project "$project" --format='value(config.name)' 2>/dev/null)" || return 1
+  for api in $SCOPE_SELECTOR_APIS; do
+    grep -qx "$api" <<<"$enabled" || missing+="${missing:+ }$api"
+  done
+  printf '%s' "$missing"
+}
+
+# Enables, in the management project, whichever of the APIs the plan-time
+# resolution of a declared Shared VPC host or Metrics Scope reads
+# (SCOPE_SELECTOR_APIS) is not enabled yet. The reads run in the plan and are
+# billed to that project, and the composition enables the APIs only in the
+# apply that follows, so a first install that declared a selector would
+# otherwise be refused at plan with the API reported disabled. Nothing is
+# called when every API is on already, which is every re-run and every Day-2
+# apply of an existing install, and nothing when no selector is declared. The
+# enable runs as gcloud's active account, like the KMS enablement beside it;
+# a failure is a warning and the run goes on, because the plan reports a
+# disabled API with the same command as the remedy, and an account that
+# cannot enable services may still not be the one Terraform applies with.
+# Runs where the apply is about to happen, never on a plan or a generate-only
+# run, whose handoff names the command instead. $1 the project (PROJECT_ID by
+# default). Caller defines print_info / print_warning.
 enable_scope_selector_apis() {
   [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]] || return 0
-  local project="${1:-${PROJECT_ID:-}}"
-  print_info "Enabling the APIs the scope's Shared VPC host and Metrics Scope lookups read in project '${project}' (${SCOPE_SELECTOR_APIS// /, }), which the plan makes before the apply enables them..."
+  local project="${1:-${PROJECT_ID:-}}" missing rc=0
+  missing="$(scope_selector_apis_missing "$project")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    missing="$SCOPE_SELECTOR_APIS"
+    print_info "The enabled APIs of project '${project}' could not be listed; enabling the three the scope's Shared VPC host and Metrics Scope lookups read, which is idempotent..."
+  elif [ -z "$missing" ]; then
+    return 0
+  else
+    print_info "Enabling ${missing// /, } in project '${project}': the plan resolves the declared Shared VPC host or Metrics Scope through it, before the apply that would otherwise enable it..."
+  fi
   # shellcheck disable=SC2086
-  gcloud services enable $SCOPE_SELECTOR_APIS --project="$project"
+  if ! (trap - ERR; gcloud services enable $missing --project="$project"); then
+    print_warning "Could not enable ${missing// /, } in project '${project}' as gcloud's active account. If the plan is refused with the API reported disabled, enable it with an account that can (gcloud services enable ${missing} --project=${project}) and re-run."
+  fi
 }
 
 # The credentials the google provider will apply with, read in its own order

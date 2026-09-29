@@ -47,7 +47,15 @@ locals {
   # getXpnResources is paged; one page of the API's maximum holds five times
   # the cap the CRD puts on any scope list, so a second page is refused rather
   # than followed, which HCL cannot do.
-  scope_xpn_page_size             = 500
+  scope_xpn_page_size = 500
+  # The most projects one selector may resolve to: the cap the CRD puts on
+  # every declared list and the reconcile's resolved-set cap
+  # (RESOLVED_SET_CAP in cluster_agent_reconcile.py). A member past it reads
+  # `over-cap` with nothing created under it, so binding the read roles in it
+  # would be reach the agent never uses; a Metrics Scope may monitor 375
+  # projects and a host carry hundreds of service projects, and a selector
+  # past the cap is refused here rather than bound in full.
+  scope_selector_member_cap       = 100
   scope_xpn_resource_type_project = "PROJECT"
   # What the Compute API answers, with HTTP 400, for a project that is not a
   # Shared VPC host. It has no service projects, which is a fact about the
@@ -106,12 +114,18 @@ data "http" "scope_shared_vpc_host" {
       error_message = "shared_vpc_hosts: the service projects of ${each.key} could not be listed by ${local.scope_resolver_identity}; the Compute API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs compute.projects.get on the host project (roles/compute.viewer carries it), and the Compute API enabled there; or drop the host from shared_vpc_hosts.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: compute.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable compute.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
     }
     postcondition {
-      # A 200 whose body does not decode, or whose resources lack an id or a
-      # type, is refused rather than read as a host with no service projects,
-      # which the next apply would turn into revoked bindings. An absent
-      # `resources` key stays legal: a host with nothing attached answers so.
-      condition     = self.status_code != 200 || (can(jsondecode(self.response_body)) && can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"]))
+      # A 200 whose body does not decode to an object (a list, a string, null
+      # decode too, and `.resources` on them is what try() would swallow), or
+      # whose resources lack an id or a type, is refused rather than read as a
+      # host with no service projects, which the next apply would turn into
+      # revoked bindings. An absent `resources` key stays legal: a host with
+      # nothing attached answers so.
+      condition     = self.status_code != 200 || (can(keys(jsondecode(self.response_body))) && can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"]))
       error_message = "shared_vpc_hosts: the Compute API's answer for ${each.key} is not the getXpnResources document this module reads (a JSON object whose resources each carry an id and a type); refusing to resolve the host from it rather than bind a set that may be short. Nothing was applied."
+    }
+    postcondition {
+      condition     = self.status_code != 200 || length([for resource in try(jsondecode(self.response_body).resources, []) : resource if try(resource.type, "") == local.scope_xpn_resource_type_project]) <= local.scope_selector_member_cap
+      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_selector_member_cap} attached service projects, the reconcile's resolved-set cap; the members past it would read over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare the service projects wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
     }
     postcondition {
       condition     = !can(jsondecode(self.response_body).nextPageToken)
@@ -140,8 +154,12 @@ data "http" "scope_metrics_scope" {
       # A scope always monitors its own scoping project, so a 200 that
       # decodes to no monitored project is not a document this module reads
       # either, and is refused rather than resolved to nothing.
-      condition     = self.status_code != 200 || (can(jsondecode(self.response_body)) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0 && can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)]))
+      condition     = self.status_code != 200 || (can(keys(jsondecode(self.response_body))) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0 && can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)]))
       error_message = "metrics_scopes: the Monitoring API's answer for ${each.key} is not the metricsScopes.get document this module reads (a JSON object with at least one monitored project, each named locations/global/metricsScopes/<scope>/projects/<number>); refusing to resolve the scope from it rather than bind a set that may be short. Nothing was applied."
+    }
+    postcondition {
+      condition     = self.status_code != 200 || length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap
+      error_message = "metrics_scopes: the Metrics Scope of ${each.key} monitors more than ${local.scope_selector_member_cap} projects, the reconcile's resolved-set cap; the members past it would read over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare a narrower scope, name the numbers not wanted in exclude_projects, or declare the projects wanted in the scope's projects instead. Nothing was applied."
     }
   }
 }
@@ -157,7 +175,7 @@ locals {
   # hold.
   scope_shared_vpc_named = {
     for host, response in data.http.scope_shared_vpc_host :
-    host => response.status_code == 200 ? sort(distinct(compact([
+    host => response.status_code == 200 && can(keys(jsondecode(response.response_body))) ? sort(distinct(compact([
       for resource in try(jsondecode(response.response_body).resources, []) :
       try(resource.type, "") == local.scope_xpn_resource_type_project ? try(resource.id, "") : ""
     ]))) : []
