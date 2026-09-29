@@ -6,8 +6,12 @@
 # `main` always builds, as it always has. A release branch builds only when all
 # of these hold, each one closing a way the publish could do harm:
 #
-#   - the push came from the merger (Tide), so a collaborator's push of an
-#     unreviewed commit under a release-branch name mints no signed images;
+#   - the push came from the merger (Tide), so a mistaken or hand-made push
+#     under a release-branch name publishes nothing. This is a guard against
+#     accident, not a security boundary: the workflow and this script run from
+#     the pushed commit, so a collaborator who edits them in the same push is
+#     not stopped here. What bounds that is who may push at all, a repository
+#     rule, and it holds for any branch name, not only these;
 #   - the head commit is not the GA tagger's stamped release commit, whose
 #     images nothing deploys;
 #   - the commit has no published images yet. Image tags are mutable, and a
