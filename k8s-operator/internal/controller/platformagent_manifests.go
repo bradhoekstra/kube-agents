@@ -102,6 +102,10 @@ const (
 	credentialProxyMetricsPort     int32 = 8766
 	credentialProxyMetricsPortName       = "cred-metrics"                  // #nosec G101 -- Container port name, not a credential
 	credentialProxyMetricsPortEnv        = "CREDENTIAL_PROXY_METRICS_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
+	// credentialProxyPortEnv tells the runtime the credentialed port, so its
+	// refusal of a metrics port equal to it compares against the number the
+	// operator renders rather than the runtime's own default.
+	credentialProxyPortEnv = "CREDENTIAL_PROXY_PORT" // #nosec G101 -- Environment variable name, not hardcoded credentials
 	// dashboardPort is the port `hermes dashboard` listens on. It is loopback-only
 	// (see the readiness probe in buildBaseContainers), so the container port, the
 	// Service port, and the NetworkPolicy rule below all describe a listener that
@@ -3891,6 +3895,12 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
+		// The credentialed port, the same constant the container port and the
+		// policy are rendered from: the runtime refuses a metrics port equal to
+		// it before binding, so its idea of that port has to be the operator's.
+		// Envoy's listener carries the same number in its config, held to this
+		// constant by the runtime's OperatorContractTest.
+		{Name: credentialProxyPortEnv, Value: strconv.Itoa(credentialProxyPort)},
 		// The metrics-only listener's port (see credentialProxyMetricsPort). In
 		// the managed set, so a spec.deployment.env entry cannot move the
 		// listener off the port the container declares and the policy admits.
@@ -4078,7 +4088,6 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_MAX_OUTPUT_BYTES",
 		"CREDENTIAL_PROXY_MAX_REQUEST_BYTES",
 		"CREDENTIAL_PROXY_POLICY",
-		"CREDENTIAL_PROXY_PORT",
 		"CREDENTIAL_PROXY_ROLE",
 		// Same argument as the authentication settings above, one layer over.
 		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch

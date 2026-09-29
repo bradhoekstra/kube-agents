@@ -878,6 +878,8 @@ spec:
               value: /var/lib/credential-proxy
             - name: CREDENTIAL_PROXY_UNIX_SOCKET
               value: /var/run/credential-proxy/backend.sock
+            - name: CREDENTIAL_PROXY_PORT
+              value: "8765"
             - name: CREDENTIAL_PROXY_METRICS_PORT
               value: "8766"
             - name: KUBECONFIG

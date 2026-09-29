@@ -444,14 +444,22 @@ class ListenerBoundsTest(unittest.TestCase):
 
     @staticmethod
     def _closed_by_server(sock):
-        """True once the server has closed the connection: a read returns EOF or fails."""
+        """True once the server has closed the connection: a read returns EOF or fails.
+
+        The client's own timeout is not a close: it is re-raised, so a server
+        that parks a connection unanswered fails the test instead of passing it.
+        """
         try:
             return sock.recv(1) == b""
+        except TimeoutError:
+            raise
         except OSError:
             return True
 
     def test_an_idle_peer_is_dropped_at_the_deadline(self):
-        port = self._listener(self._DEADLINE, METRICS_CONNECTION_DEADLINE_SECONDS=self._DEADLINE)
+        # The per-recv timeout is long here, so the deadline timer is the only
+        # thing that can end the connection.
+        port = self._listener(self._GRACE, METRICS_CONNECTION_DEADLINE_SECONDS=self._DEADLINE)
         sock = self._connect(port)
         self.assertTrue(self._closed_by_server(sock))
 
@@ -536,6 +544,11 @@ class ListenerStartTest(unittest.TestCase):
             self.assertEqual(0, credential_proxy.parse_args().metrics_port)
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_OPERATOR_MANIFESTS = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
+_ENVOY_CONFIG = _REPO_ROOT / "deploy" / "shared" / "envoy-credential-proxy.yaml"
+
+
 class OperatorContractTest(unittest.TestCase):
     """The operator sets the variable the runtime reads: one name, pinned from
     the runtime's side. The operator's own test pins its literal; without this
@@ -543,13 +556,29 @@ class OperatorContractTest(unittest.TestCase):
     `metrics listener disabled` under a declared port and an open policy."""
 
     def test_the_operator_names_the_variable_the_runtime_reads(self):
-        manifests = (
-            Path(__file__).resolve().parents[3] / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
-        ).read_text()
+        manifests = _OPERATOR_MANIFESTS.read_text()
         self.assertRegex(
             manifests,
             r'credentialProxyMetricsPortEnv\s*=\s*"' + re.escape(credential_proxy.METRICS_PORT_ENV) + '"',
             f"the operator does not set {credential_proxy.METRICS_PORT_ENV}; the listener is never switched on",
+        )
+
+    def test_the_credentialed_port_has_one_number_across_operator_envoy_and_runtime(self):
+        # _metrics_port_refusal compares the metrics port against args.port, so
+        # args.port has to be the port Envoy binds in front of the socket. The
+        # operator sets it from credentialProxyPort, Envoy's config carries the
+        # literal, and the runtime's default is the fallback for a hand run:
+        # one number, or the refusal guards the wrong port.
+        manifests = _OPERATOR_MANIFESTS.read_text()
+        self.assertRegex(manifests, r'credentialProxyPortEnv\s*=\s*"CREDENTIAL_PROXY_PORT"')
+        operator_port = int(re.search(r"^\s*credentialProxyPort\s*=\s*(\d+)", manifests, re.MULTILINE).group(1))
+        envoy_port = int(re.search(r"port_value:\s*(\d+)", _ENVOY_CONFIG.read_text()).group(1))
+        with mock.patch.object(sys, "argv", ["credential_proxy.py"]), mock.patch.dict(os.environ):
+            os.environ.pop("CREDENTIAL_PROXY_PORT", None)
+            runtime_default = credential_proxy.parse_args().port
+        self.assertEqual(
+            (operator_port, operator_port), (envoy_port, runtime_default),
+            f"operator {operator_port}, Envoy {envoy_port}, runtime default {runtime_default}: the refusal guards a port nobody binds",
         )
 
 

@@ -7119,10 +7119,12 @@ def _metrics_port_refusal(metrics_port: int, args: argparse.Namespace) -> str | 
 
     Both are hand-edit cases the operator's managed env never produces, refused
     by name so the ALERT says what to fix rather than what bind() thought of
-    it. The credentialed port is refused whether this process binds it (the
-    TCP branch) or Envoy does in front of the Unix socket: which of two
-    processes wins a port depends on start order, and the loser must never
-    be the one holding the credentials.
+    it. args.port is the operator's credentialProxyPort, set in the broker's
+    managed env, and Envoy's listener carries the same number, held to that
+    constant by OperatorContractTest; so the comparison is against the port
+    that is bound, by this process on the TCP branch or by Envoy in front of
+    the Unix socket. Which of two processes wins a port depends on start
+    order, and the loser must never be the one holding the credentials.
     """
     if not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
         return f"is not a port in {METRICS_PORT_MIN}-{METRICS_PORT_MAX}"

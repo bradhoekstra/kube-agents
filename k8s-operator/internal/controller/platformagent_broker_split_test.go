@@ -781,6 +781,46 @@ func TestTheBrokerPodIsNotDeletedByTheLegacyCleanup(t *testing.T) {
 // container declares and the port the policy admits are one constant, and this
 // pins the two the container carries. The policy's is
 // TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape.
+// The runtime refuses a metrics port equal to the credentialed port before it
+// binds, so that number has to be the operator's rather than the runtime's own
+// default: set from the constant the container port is rendered from, and
+// reserved so a CR cannot move it.
+func TestTheBrokerIsToldItsCredentialedPort(t *testing.T) {
+	agent := brokerPodAgent()
+	container := buildCredentialProxyContainer(agent)
+	var ports []corev1.ContainerPort
+	for _, p := range container.Ports {
+		if p.Name == "cred-proxy" {
+			ports = append(ports, p)
+		}
+	}
+	if len(ports) != 1 {
+		t.Fatalf("want exactly one cred-proxy container port, got %#v", container.Ports)
+	}
+	want := strconv.Itoa(int(ports[0].ContainerPort))
+	var found []corev1.EnvVar
+	for _, e := range container.Env {
+		if e.Name == "CREDENTIAL_PROXY_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 || found[0].Value != want {
+		t.Fatalf("want exactly one CREDENTIAL_PROXY_PORT=%s, the cred-proxy container port, got %#v", want, found)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "CREDENTIAL_PROXY_PORT", Value: "1"}},
+	}
+	found = nil
+	for _, e := range buildCredentialProxyContainer(agent).Env {
+		if e.Name == "CREDENTIAL_PROXY_PORT" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 || found[0].Value != want {
+		t.Fatalf("a spec.deployment.env entry moved CREDENTIAL_PROXY_PORT: %#v", found)
+	}
+}
+
 func TestTheBrokerDeclaresItsMetricsListener(t *testing.T) {
 	agent := brokerPodAgent()
 	container := buildCredentialProxyContainer(agent)
