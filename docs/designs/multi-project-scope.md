@@ -446,10 +446,13 @@ Prerequisites the design has to state and the installer has to preflight:
   the composition enables those in the apply, so `install.sh` enables whichever is off before an
   apply that carries a selector (nothing on an existing install, where all three are on), the one
   out-of-Terraform step the selectors add; its dry run skips the plan while one is off; and the
-  resolver's refusal names that project when the API's answer says the API is off. A selector
-  that resolves to more than the resolved-set cap (100) is refused at plan: the members past it
+  resolver's refusal names that project when the API's answer says the API is off, and the
+  `serviceusage.services.use` the identity lacks there when it says the consumer project refused
+  it. The resolved-set cap (100) is on the whole set, so the plan counts what it can of it as the
+  reconcile does, the management project, the explicit projects and every selector's members once
+  each less an exact exclude entry, and refuses a declaration past it: the members past the cap
   would read `over-cap` with nothing created, so their bindings would be reach the agent never
-  uses.
+  uses. A single selector past the cap is refused at its read, before the naming reads.
 - When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in
   the host project. The preflight checks, before the apply that then binds the agent's
   `roles/cloudasset.viewer` on each container, that the API is enabled already or that no enforced

@@ -19,8 +19,11 @@ active account, and names `quota_project` (the management project) as the consum
 APIs it uses and the quota it draws are that project's whichever credential type the provider
 holds. Those APIs (`cloudresourcemanager`, `monitoring`, `compute`) are ones the composition
 enables in the apply that follows the plan, so `install.sh` enables them before a first install's
-apply; a 403 that names a disabled API or the consumer project is reported with that remedy rather
-than as a missing grant. A read that fails fails the plan, before anything is applied, with the selector,
+apply. A 403 that is not a grant on the project read is reported with its own remedy rather than as
+one: an API off in the consumer project with the enable command, and an identity the consumer
+project refuses (`USER_PROJECT_DENIED`, a plan-only or narrowly granted credential) with the
+`serviceusage.services.use` it needs there, since enabling an API that is on fixes nothing. A read
+that fails fails the plan, before anything is applied, with the selector,
 the HTTP status and the API's message in the error: the identity needs `compute.projects.get` on a
 host, to read the Metrics Scope in its scoping project (`roles/monitoring.metricsScopesViewer` is
 the narrowest role) with `monitoring.googleapis.com` enabled there, and
@@ -28,9 +31,12 @@ the narrowest role) with `monitoring.googleapis.com` enabled there, and
 module reads (a JSON object of the documented shape; a list, a string or `null` decode too and are
 refused as well) is refused rather than read as an empty selector, since an empty selector on the
 next apply is every member's bindings revoked. A selector that resolves to more than 100 projects,
-the cap the CRD puts on every declared list and the reconcile's resolved-set cap, is refused too:
-the members past the cap would read `over-cap` with nothing created under them, so their read
-roles would be reach the agent never uses. A monitored project the identity cannot name, or whose ID
+less the members an `exclude_projects` entry names exactly, is refused too. The reconcile lists at
+most that many projects of the whole resolved set, the management project included, and reads the
+rest `over-cap` with nothing created under them, so a single selector past it cannot fit whatever
+else is declared, and refusing it at its read spares the naming reads, one per monitored project;
+the cap on the whole set, the management project, `scope.projects` and every selector's members
+together, is `kube-agents-iam`'s precondition, since only that module sees all three. A monitored project the identity cannot name, or whose ID
 the scope cannot carry (a legacy domain-scoped ID), is left out by naming its project number in
 `exclude_projects`, the scope's `exclude.projects`; that is the only entry of that list this module
 acts on, and the only exclusion that keeps a monitored project out of the bindings: the reconcile

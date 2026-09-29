@@ -215,15 +215,30 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn('Authorization         = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"', self.resolver_tf)
         # And the management project as the consumer project, so the APIs the
         # reads use are the ones the composition enables there, whichever
-        # credential type the provider holds; a 403 that names a disabled API
-        # is reported with that remedy rather than as a missing grant.
+        # credential type the provider holds. A 403 that is not a grant on the
+        # project read is named for what it is, with its own remedy: the API
+        # off in the consumer project gets the enable command, the identity
+        # refused the consumer project (USER_PROJECT_DENIED) gets the
+        # serviceusage.services.use grant it needs there, and the consumer
+        # clause is read first, since a credential without a consumer project
+        # is answered with both sentences. Enabling an API that is on fixes
+        # nothing, so the two must not share a remedy.
         self.assertIn('"x-goog-user-project" = var.quota_project', self.resolver_tf)
         self.assertIn('variable "quota_project"', (_RESOLVER / "variables.tf").read_text())
-        self.assertIn('scope_api_off_markers = ["SERVICE_DISABLED", "has not been used in project", "quota project", "USER_PROJECT_DENIED"]', self.resolver_tf)
-        self.assertEqual(self.resolver_tf.count("is off in ${var.quota_project}, the project these reads are billed to"), 3)
-        for name in ("scope_shared_vpc_host", "scope_metrics_scope", "scope_monitored_project"):
+        self.assertIn('scope_api_off_markers              = ["SERVICE_DISABLED", "has not been used in project"]', self.resolver_tf)
+        self.assertIn('scope_consumer_denied_markers      = ["USER_PROJECT_DENIED", "quota project"]', self.resolver_tf)
+        self.assertIn('scope_consumer_role                = "roles/serviceusage.serviceUsageConsumer"', self.resolver_tf)
+        self.assertEqual(self.resolver_tf.count("is off in ${var.quota_project}, the project these reads are billed to"), 1)
+        self.assertEqual(self.resolver_tf.count("It needs serviceusage.services.use there (${local.scope_consumer_role} carries it"), 1)
+        self.assertIn("the API is on, and enabling it changes nothing.", self.resolver_tf)
+        consumer_first = ('${anytrue([for marker in local.scope_consumer_denied_markers : strcontains(self.response_body, marker)]) ? local.scope_consumer_denied_clause : '
+                          'anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.')
+        for name, api in (("scope_shared_vpc_host", "scope_compute_api_service"),
+                          ("scope_metrics_scope", "scope_monitoring_api_service"),
+                          ("scope_monitored_project", "scope_resource_manager_api_service")):
             with self.subTest(read=name):
                 self.assertIn("request_headers    = local.scope_resolver_headers", self._data("http", name))
+                self.assertIn(consumer_first + api + '] : ""}', self._data("http", name))
         # No read shells out: an external program would answer for gcloud's
         # active account, which need not be the provider's identity.
         self.assertNotIn('data "external"', self.resolver_tf)
@@ -252,10 +267,17 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("response.status_code == 200 && can(keys(jsondecode(response.response_body)))", self.resolver_tf)
         scope = self._data("http", "scope_metrics_scope")
         self.assertIn("can(keys(jsondecode(self.response_body))) && length(try(jsondecode(self.response_body).monitoredProjects, [])) > 0", scope)
-        # A selector past the resolved-set cap is refused rather than bound in full.
+        # A selector past the cap is refused rather than bound in full, counted
+        # as the reconcile counts: less the members an exclude entry names
+        # exactly (by ID for a service project, by number for a monitored
+        # project), so the exclusion the message offers as a remedy lowers the
+        # count it is tested against.
         self.assertIn("scope_selector_member_cap       = 100", self.resolver_tf)
-        self.assertIn("<= local.scope_selector_member_cap", host)
-        self.assertIn("length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap", scope)
+        self.assertIn('try(resource.type, "") == local.scope_xpn_resource_type_project && !contains(var.exclude_projects, try(resource.id, ""))])) <= local.scope_selector_member_cap', host)
+        self.assertIn('if !contains(var.exclude_projects, try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], ""))])) <= local.scope_selector_member_cap', scope)
+        self.assertNotIn("length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap", scope)
+        self.assertIn("not named by number in exclude_projects", scope)
+        self.assertIn("not named in exclude_projects", host)
         self.assertIn("can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)])", scope)
         # A legacy domain-scoped ID the scope cannot carry is refused by number
         # for a monitored project, which has a number to be excluded by; a
@@ -304,6 +326,32 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIsNotNone(precondition, "main.tf carries no precondition for the host lookup role")
         self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) + length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0",
                       self.scope_tf)
+
+    def test_the_whole_resolved_set_past_the_reconciles_cap_fails_the_plan(self):
+        # The resolver's bound is per selector; the reconcile's cap is on the
+        # whole set (management project, explicit projects, selector members,
+        # containers, in that order), so two selectors of 60, or one of 60
+        # beside 50 explicit projects, would pass the resolver and bind the
+        # read roles in members the reconcile reads over-cap. The IAM module
+        # counts the three groups a plan can know, as the reconcile counts
+        # them: once each, less an exact exclude entry, the management project
+        # always in.
+        reconcile = (_REPO_ROOT / "agents" / "platform" / "scripts" / "cluster_agent_reconcile.py").read_text()
+        cap = re.search(r"^RESOLVED_SET_CAP = (\d+)$", reconcile, re.MULTILINE)
+        self.assertIsNotNone(cap, "cluster_agent_reconcile.py has no RESOLVED_SET_CAP")
+        self.assertIn(f"scope_resolved_set_cap = {cap.group(1)}", self.scope_tf)
+        self.assertIn(f"scope_selector_member_cap       = {cap.group(1)}", self.resolver_tf)
+        self.assertIn("toset([var.project_id]),", self.scope_tf)
+        self.assertIn("toset([for project in var.scope.projects : project if !contains(var.scope.exclude.projects, project)]),", self.scope_tf)
+        self.assertIn("for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project", self.scope_tf)
+        self.assertIn("condition     = length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
+        self.assertIn("a glob is applied by the reconcile alone", self.main_tf)
+        # Containers are not in the count: their members are unknown at plan
+        # time, they are listed last, and their binding is on the container.
+        listed = re.search(r"scope_listed_projects = setunion\((.*?)\n  \)", self.scope_tf, re.DOTALL)
+        self.assertIsNotNone(listed)
+        self.assertNotIn("folders", listed.group(1))
+        self.assertNotIn("organizations", listed.group(1))
 
     def test_the_outputs_surface_the_selectors_and_what_they_resolved_to(self):
         outputs = (_MODULE / "outputs.tf").read_text()

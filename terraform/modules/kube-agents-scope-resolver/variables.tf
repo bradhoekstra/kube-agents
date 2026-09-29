@@ -44,7 +44,9 @@ variable "quota_project" {
     reads need (cloudresourcemanager, monitoring, compute) are the ones the
     composition enables there, and install.sh enables before a first apply.
     The identity needs serviceusage.services.use on it, which an identity
-    that applies the composition holds.
+    that applies the composition holds; a plan-only identity without it is
+    refused with that grant named (USER_PROJECT_DENIED), not with the API's
+    enable command.
   EOT
   type        = string
   nullable    = false

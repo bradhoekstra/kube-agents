@@ -187,6 +187,30 @@ locals {
     [for scope in local.scope_metrics_scopes : scope if scope != var.project_id],
   ))
 
+  # What the reconcile lists of the resolved set: at most RESOLVED_SET_CAP
+  # projects (cluster_agent_reconcile.py; design §3), the management project
+  # included, in a fixed order -- the management project, scope.projects, the
+  # selectors' members, then the containers' -- and a project past the cap
+  # reads `over-cap` with nothing created under it. The first three groups are
+  # known here at plan time, so a declaration they alone carry past the cap is
+  # refused (main.tf) rather than bound: the read roles in the members past it
+  # would be reach the agent never uses. Counted as the reconcile counts, once
+  # each and less an exact exclude entry; a glob is the reconcile's alone, so
+  # a set only a glob brings under the cap at runtime is refused here and
+  # wants its entries named exactly. Containers are not counted: their members
+  # are unknown here, they come last in the order, and their binding is one on
+  # the container rather than one per member.
+  scope_resolved_set_cap = 100
+
+  scope_listed_projects = setunion(
+    toset([var.project_id]),
+    toset([for project in var.scope.projects : project if !contains(var.scope.exclude.projects, project)]),
+    toset([
+      for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project
+      if !contains(var.scope.exclude.projects, project)
+    ]),
+  )
+
   # A Shared VPC host the reconcile's lookup has to read (compute.projects.get)
   # but that is not otherwise in scope: it is not among its own service
   # projects, and is named in scope.projects when its clusters are wanted, so

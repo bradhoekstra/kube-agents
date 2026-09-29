@@ -568,9 +568,13 @@ enabled there, and `resourcemanager.projects.get` on each monitored project; a m
 it cannot name, or one whose ID the scope cannot carry, is left out by naming its project number
 in `exclude.projects`. The reads are billed to `project_id`, whose `cloudresourcemanager`,
 `monitoring` and `compute` APIs they use; the composition enables them in the apply, so `install.sh`
-enables whichever is off before an apply that carries a selector, and a 403 that names a disabled
-API is reported with that remedy. A selector that resolves to more than 100 projects, the
-reconcile's resolved-set cap, is refused at plan rather than bound in full. A project that is not a Shared VPC host resolves to no members, as it does
+enables whichever is off before an apply that carries a selector; a 403 that names a disabled
+API is reported with that remedy, and one that refuses the identity the consumer project
+(`USER_PROJECT_DENIED`) with the `serviceusage.services.use` it needs there. The reconcile lists at
+most 100 projects of the resolved set, the management project included, so a declaration whose
+management project, `projects` and selector members together exceed that (once each, less an exact
+`exclude.projects` entry) is refused at plan rather than bound in full, and a single selector past
+it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
 at runtime. An exclude entry that names a Shared VPC service project by ID, or a monitored project
 by number, keeps it out of the bindings, the one place `exclude` reaches IAM, because a selector's
 member has no list to be dropped from; a monitored project excluded by ID keeps its grant, which the

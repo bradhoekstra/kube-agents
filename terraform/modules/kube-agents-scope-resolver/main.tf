@@ -48,13 +48,20 @@ locals {
   # the cap the CRD puts on any scope list, so a second page is refused rather
   # than followed, which HCL cannot do.
   scope_xpn_page_size = 500
-  # The most projects one selector may resolve to: the cap the CRD puts on
-  # every declared list and the reconcile's resolved-set cap
-  # (RESOLVED_SET_CAP in cluster_agent_reconcile.py). A member past it reads
-  # `over-cap` with nothing created under it, so binding the read roles in it
-  # would be reach the agent never uses; a Metrics Scope may monitor 375
-  # projects and a host carry hundreds of service projects, and a selector
-  # past the cap is refused here rather than bound in full.
+  # The most projects one selector may resolve to. The reconcile lists at
+  # most RESOLVED_SET_CAP (cluster_agent_reconcile.py; 100) projects of the
+  # whole resolved set, the management project included, and a project past
+  # that reads `over-cap` with nothing created under it; the cap on the whole
+  # set is kube-agents-iam's precondition, which counts the management
+  # project, the explicit projects and every selector's members together, as
+  # the reconcile does. This bound is per selector and the same number: a
+  # single selector past it cannot fit whatever else the scope declares, and
+  # refusing it at the read it came from spares the naming reads (one
+  # Resource Manager call per monitored project; a Metrics Scope may monitor
+  # 375) the whole-set check would otherwise wait for. Counted as the
+  # reconcile counts: less the members an exclude_projects entry names
+  # exactly, by number for a monitored project and by ID for a service
+  # project, since an excluded member is neither listed nor bound.
   scope_selector_member_cap       = 100
   scope_xpn_resource_type_project = "PROJECT"
   # What the Compute API answers, with HTTP 400, for a project that is not a
@@ -72,11 +79,23 @@ locals {
   scope_lookup_retry_attempts = 2
   # How much of an API's error body an error message carries.
   scope_lookup_error_excerpt_chars = 300
-  # What a 403 says when the cause is the API being off in, or no quota set
-  # for, the consumer project rather than a missing grant: the same reasons
-  # the installer's container preflight reads as not a permission answer.
-  # Here the consumer project is quota_project, so the remedy is one place.
-  scope_api_off_markers = ["SERVICE_DISABLED", "has not been used in project", "quota project", "USER_PROJECT_DENIED"]
+  # What a 403 says when the cause is not a grant on the project read: the
+  # four reasons the installer's container preflight reads as not a permission
+  # answer, in two pairs with a remedy each. The API being off in the consumer
+  # project (SERVICE_DISABLED, "has not been used in project"): enable it in
+  # quota_project, which install.sh does before a first install. The identity
+  # refused the consumer project itself (USER_PROJECT_DENIED, "quota project"):
+  # the API is on and the grant on the target is beside the point; the
+  # identity needs serviceusage.services.use on quota_project, and enabling
+  # the API changes nothing. Read in that order: a credential with no
+  # consumer project of its own is answered with both a disabled API and a
+  # quota-project sentence, and the consumer project is the cause.
+  scope_api_off_markers              = ["SERVICE_DISABLED", "has not been used in project"]
+  scope_consumer_denied_markers      = ["USER_PROJECT_DENIED", "quota project"]
+  scope_consumer_role                = "roles/serviceusage.serviceUsageConsumer"
+  scope_compute_api_service          = "compute.googleapis.com"
+  scope_monitoring_api_service       = "monitoring.googleapis.com"
+  scope_resource_manager_api_service = "cloudresourcemanager.googleapis.com"
 }
 
 # The identity the google provider plans and applies with, so every read
@@ -95,6 +114,15 @@ locals {
   } : {}
 
   scope_resolver_identity = "the identity the google provider plans with (its configured credentials, impersonation included)"
+
+  # The sentence a refusal appends when the 403 is one of the two pairs
+  # above, by API, so each postcondition picks by marker and the text lives
+  # once.
+  scope_api_off_clause = {
+    for api in [local.scope_compute_api_service, local.scope_monitoring_api_service, local.scope_resource_manager_api_service] :
+    api => " That answer names a disabled API rather than a grant: ${api} is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable ${api} --project=${var.quota_project})."
+  }
+  scope_consumer_denied_clause = " That answer refuses the consumer project rather than a grant on the project read: ${local.scope_resolver_identity} may not bill reads to ${var.quota_project}, the project these reads name in x-goog-user-project. It needs serviceusage.services.use there (${local.scope_consumer_role} carries it, as does any role that applies the composition); the API is on, and enabling it changes nothing."
 }
 
 data "http" "scope_shared_vpc_host" {
@@ -111,7 +139,7 @@ data "http" "scope_shared_vpc_host" {
   lifecycle {
     postcondition {
       condition     = self.status_code == 200 || (self.status_code == 400 && strcontains(self.response_body, local.scope_not_xpn_host_marker))
-      error_message = "shared_vpc_hosts: the service projects of ${each.key} could not be listed by ${local.scope_resolver_identity}; the Compute API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs compute.projects.get on the host project (roles/compute.viewer carries it), and the Compute API enabled there; or drop the host from shared_vpc_hosts.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: compute.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable compute.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
+      error_message = "shared_vpc_hosts: the service projects of ${each.key} could not be listed by ${local.scope_resolver_identity}; the Compute API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs compute.projects.get on the host project (roles/compute.viewer carries it), and the Compute API enabled there; or drop the host from shared_vpc_hosts.${anytrue([for marker in local.scope_consumer_denied_markers : strcontains(self.response_body, marker)]) ? local.scope_consumer_denied_clause : anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.scope_compute_api_service] : ""} Nothing was applied."
     }
     postcondition {
       # A 200 whose body does not decode to an object (a list, a string, null
@@ -124,8 +152,10 @@ data "http" "scope_shared_vpc_host" {
       error_message = "shared_vpc_hosts: the Compute API's answer for ${each.key} is not the getXpnResources document this module reads (a JSON object whose resources each carry an id and a type); refusing to resolve the host from it rather than bind a set that may be short. Nothing was applied."
     }
     postcondition {
-      condition     = self.status_code != 200 || length([for resource in try(jsondecode(self.response_body).resources, []) : resource if try(resource.type, "") == local.scope_xpn_resource_type_project]) <= local.scope_selector_member_cap
-      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_selector_member_cap} attached service projects, the reconcile's resolved-set cap; the members past it would read over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare the service projects wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
+      # Counted less an exact exclude entry, as the reconcile counts and as
+      # kube-agents-iam binds: an excluded service project is neither.
+      condition     = self.status_code != 200 || length(distinct([for resource in try(jsondecode(self.response_body).resources, []) : try(resource.id, "") if try(resource.type, "") == local.scope_xpn_resource_type_project && !contains(var.exclude_projects, try(resource.id, ""))])) <= local.scope_selector_member_cap
+      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_selector_member_cap} attached service projects not named in exclude_projects, more than the reconcile lists of the whole resolved set (RESOLVED_SET_CAP, the management project included), so the host cannot fit whatever else the scope declares; the members past the cap would read over-cap with nothing created under them, and their read roles would be reach the agent never uses. Name the service projects not wanted in exclude_projects (the scope's exclude.projects) by ID, or declare the ones wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
     }
     postcondition {
       condition     = !can(jsondecode(self.response_body).nextPageToken)
@@ -148,7 +178,7 @@ data "http" "scope_metrics_scope" {
   lifecycle {
     postcondition {
       condition     = self.status_code == 200
-      error_message = "metrics_scopes: the Metrics Scope of ${each.key} could not be read by ${local.scope_resolver_identity}; the Monitoring API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs to read the scope in its scoping project (roles/monitoring.metricsScopesViewer is the narrowest role), and monitoring.googleapis.com enabled there; or drop it from metrics_scopes.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: monitoring.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable monitoring.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
+      error_message = "metrics_scopes: the Metrics Scope of ${each.key} could not be read by ${local.scope_resolver_identity}; the Monitoring API answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. That identity needs to read the scope in its scoping project (roles/monitoring.metricsScopesViewer is the narrowest role), and monitoring.googleapis.com enabled there; or drop it from metrics_scopes.${anytrue([for marker in local.scope_consumer_denied_markers : strcontains(self.response_body, marker)]) ? local.scope_consumer_denied_clause : anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.scope_monitoring_api_service] : ""} Nothing was applied."
     }
     postcondition {
       # A scope always monitors its own scoping project, so a 200 that
@@ -158,8 +188,11 @@ data "http" "scope_metrics_scope" {
       error_message = "metrics_scopes: the Monitoring API's answer for ${each.key} is not the metricsScopes.get document this module reads (a JSON object with at least one monitored project, each named locations/global/metricsScopes/<scope>/projects/<number>); refusing to resolve the scope from it rather than bind a set that may be short. Nothing was applied."
     }
     postcondition {
-      condition     = self.status_code != 200 || length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap
-      error_message = "metrics_scopes: the Metrics Scope of ${each.key} monitors more than ${local.scope_selector_member_cap} projects, the reconcile's resolved-set cap; the members past it would read over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare a narrower scope, name the numbers not wanted in exclude_projects, or declare the projects wanted in the scope's projects instead. Nothing was applied."
+      # Counted less the monitored projects an exclude entry names by number,
+      # the filter scope_monitored_numbers applies below, so the remedy the
+      # message offers lowers the count it is tested against.
+      condition     = self.status_code != 200 || length(distinct([for row in try(jsondecode(self.response_body).monitoredProjects, []) : try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], "") if !contains(var.exclude_projects, try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], ""))])) <= local.scope_selector_member_cap
+      error_message = "metrics_scopes: the Metrics Scope of ${each.key} monitors more than ${local.scope_selector_member_cap} projects not named by number in exclude_projects, more than the reconcile lists of the whole resolved set (RESOLVED_SET_CAP, the management project included), so the scope cannot fit whatever else the declaration holds; the members past the cap would read over-cap with nothing created under them, and their read roles would be reach the agent never uses. Declare a narrower scope, name the numbers not wanted in exclude_projects (the scope's exclude.projects), or declare the projects wanted in the scope's projects instead. Nothing was applied."
     }
   }
 }
@@ -224,7 +257,7 @@ data "http" "scope_monitored_project" {
   lifecycle {
     postcondition {
       condition     = self.status_code == 200
-      error_message = "metrics_scopes: monitored project ${each.key} could not be named by ${local.scope_resolver_identity}; Resource Manager answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. A project this identity cannot name it cannot bind, and the agent would read it denied. Ask for resourcemanager.projects.get on projects/${each.key} for that identity, or name the number in exclude_projects (the scope's exclude.projects) to leave it out.${anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? " That answer names a disabled API or the consumer project rather than a grant: cloudresourcemanager.googleapis.com is off in ${var.quota_project}, the project these reads are billed to (install.sh enables it before a first install; by hand: gcloud services enable cloudresourcemanager.googleapis.com --project=${var.quota_project})." : ""} Nothing was applied."
+      error_message = "metrics_scopes: monitored project ${each.key} could not be named by ${local.scope_resolver_identity}; Resource Manager answered HTTP ${self.status_code}: ${substr(try(jsondecode(self.response_body).error.message, self.response_body), 0, local.scope_lookup_error_excerpt_chars)}. A project this identity cannot name it cannot bind, and the agent would read it denied. Ask for resourcemanager.projects.get on projects/${each.key} for that identity, or name the number in exclude_projects (the scope's exclude.projects) to leave it out.${anytrue([for marker in local.scope_consumer_denied_markers : strcontains(self.response_body, marker)]) ? local.scope_consumer_denied_clause : anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.scope_resource_manager_api_service] : ""} Nothing was applied."
     }
     postcondition {
       condition     = self.status_code != 200 || can(regex(local.scope_project_id_pattern, jsondecode(self.response_body).projectId))

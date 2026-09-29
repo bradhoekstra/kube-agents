@@ -33,6 +33,14 @@ resource "google_service_account" "agent" {
     # custom role and one that carries it through nothing look the same from
     # here, and the second would freeze the selector every tick; adding
     # roles/compute.viewer costs the first nothing.
+    # The whole resolved set, as far as a plan can count it (scope.tf,
+    # scope_listed_projects): the reconcile lists at most the cap and reads
+    # the rest over-cap, so the members past it would be bound for nothing.
+    # The resolver's own bound is per selector; this is the sum.
+    precondition {
+      condition     = length(local.scope_listed_projects) <= local.scope_resolved_set_cap
+      error_message = "The management project, scope.projects and the projects scope.shared_vpc_hosts and scope.metrics_scopes resolve to come to ${length(local.scope_listed_projects)} once each, past the reconcile's resolved-set cap of ${local.scope_resolved_set_cap} (RESOLVED_SET_CAP in cluster_agent_reconcile.py): the reconcile lists the first ${local.scope_resolved_set_cap} of them, in that order, and reads the rest over-cap with nothing created under them, so their read roles would be reach the agent never uses. Declare fewer projects, a narrower selector, or a folder that holds them (a container's members are listed after these and bound on the container, not one by one). An exclude.projects entry lowers this count only when it names a project exactly, by ID or by the number a Metrics Scope returns; a glob is applied by the reconcile alone."
+    }
     precondition {
       condition     = length(local.scope_shared_vpc_hosts) == 0 || contains(local.scope_roles, local.scope_shared_vpc_lookup_role)
       error_message = "scope.shared_vpc_hosts names a host but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries no roles/compute.viewer, the role whose compute.projects.get the reconcile needs in the host project to list its service projects; a custom IAM role is not carried into scoped projects. Add it (it is bound in the host project as well) or empty scope.shared_vpc_hosts."

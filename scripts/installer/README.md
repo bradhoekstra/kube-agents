@@ -273,8 +273,10 @@ warning, since the plan reports a disabled API with the same command as its reme
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
 with the command while one of the three is off (a dry run enables nothing, and its plan would
 otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
-because an existing install has them on. A selector that resolves to more than 100 projects, the
-reconcile's resolved-set cap, is refused at plan rather than bound in full.
+because an existing install has them on. The reconcile lists at most 100 projects of the resolved
+set, the management project included, so a declaration whose management project, `SCOPE_PROJECTS`
+and selector members together exceed that (once each, less an exact `SCOPE_EXCLUDE_PROJECTS` entry)
+is refused at plan rather than bound in full, and a single selector past it is refused at its read.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a
