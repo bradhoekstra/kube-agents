@@ -669,6 +669,13 @@ class AutopushDeployWiringTest(unittest.TestCase):
         self.assertEqual(on["workflow_run"]["workflows"], ["Publish Images to GHCR"])
         self.assertIn("workflow_dispatch", on)
 
+    def test_only_mains_publishes_create_an_autopush_run(self):
+        """A release-line publish completing must not enter the single concurrency
+        group at all: a run created for it would cancel a pending main deploy
+        before the job's `if:` skipped it."""
+        on = self.doc.get("on", self.doc.get(True))
+        self.assertEqual(on["workflow_run"].get("branches"), ["main"])
+
     def test_concurrency_group_locks_autopush_deploy_without_cancelling(self):
         concurrency = self.doc.get("concurrency", {})
         self.assertEqual(concurrency.get("group"), "autopush-deploy")
