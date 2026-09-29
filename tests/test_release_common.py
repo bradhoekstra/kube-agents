@@ -202,6 +202,24 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_get_latest_staging_tag_ignores_a_newer_tag_off_main(self):
+        """A staging_ tag a hand-dispatched promotion left on a release line is not main's gate."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "-a", "staging_2608191200_2222222", "-m", "On main")
+            git("switch", "-c", "release/0.2")
+            (pathlib.Path(repo_dir) / "backport.txt").write_text("fix\n")
+            git("add", "backport.txt")
+            git("commit", "-m", "fix: backport")
+            git("tag", "-a", "staging_2609291200_3333333", "-m", "Newer, on the line")
+            git("switch", "main")
+
+            proc = self._run_common_func("get_latest_staging_tag", cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "staging_2608191200_2222222")
+        finally:
+            temp_dir.cleanup()
+
     def test_list_tags_on_main_fails_closed_in_ci_without_a_main(self):
         """No `main` to compare against is an error in CI and a warning by hand.
 
