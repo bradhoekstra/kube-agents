@@ -139,3 +139,23 @@ output "scope_container_roles" {
   description = "The roles every folder and organisation in scope carries: scope_roles plus roles/cloudasset.viewer for the reconcile's container search."
   value       = module.kube_agents_iam.scope_container_roles
 }
+
+output "scope_shared_vpc_hosts" {
+  description = "The Shared VPC host projects scope.shared_vpc_hosts named; each was resolved at plan time to its service projects and is bound with scope_roles itself for the reconcile's lookup."
+  value       = module.kube_agents_iam.scope_shared_vpc_hosts
+}
+
+output "scope_metrics_scopes" {
+  description = "The Metrics Scope scoping projects scope.metrics_scopes named; each was resolved at plan time to the projects it monitors."
+  value       = module.kube_agents_iam.scope_metrics_scopes
+}
+
+output "scope_selector_members" {
+  description = "What each Shared VPC host and Metrics Scope resolved to at plan time, by project ID, under the selector's snapshot name (sharedVpcHosts/<host>, metricsScopes/<scope>)."
+  value       = module.kube_agents_iam.scope_selector_members
+}
+
+output "scope_bound_projects" {
+  description = "Every project beyond project_id the IAM module bound scope_roles in: the explicit projects, the selectors' members less an exact exclude entry, and each Shared VPC host."
+  value       = module.kube_agents_iam.scope_bound_projects
+}

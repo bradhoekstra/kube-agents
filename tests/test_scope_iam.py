@@ -106,7 +106,8 @@ class ScopeAllowlistTest(unittest.TestCase):
         # var.scope.projects directly would bind the host twice and leave this
         # local unused.
         self.assertIn("if project != var.project_id]", self.scope_tf)
-        self.assertIn("setproduct(sort(tolist(local.scope_projects)), local.scope_roles)", self.scope_tf)
+        self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
+        self.assertIn("setproduct(sort(tolist(local.scope_bound_projects)), local.scope_roles)", self.scope_tf)
 
     def test_an_unmanageable_scope_fails_the_plan(self):
         # For a container as for a project: a folder bound with no role that
@@ -116,7 +117,7 @@ class ScopeAllowlistTest(unittest.TestCase):
         self.assertIn("PLATFORM_AGENT_CUSTOM_ROLES", agent)
         self.assertIn("scope_can_manage = anytrue([for role in local.scope_roles : contains(local.scope_managing_roles, role)])",
                       self.scope_tf)
-        self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) > 0",
+        self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) + length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0",
                       self.scope_tf)
 
 
@@ -160,6 +161,100 @@ class ScopeContainerBindingsTest(unittest.TestCase):
         self.assertIn("value       = local.scope_container_roles", outputs)
 
 
+class ScopeSelectorResolutionTest(unittest.TestCase):
+    """A Shared VPC host or a Metrics Scope inherits nothing, so the module
+    resolves it to projects at plan time, as the identity the provider applies
+    with, and binds the same allowlist in each (design §6, §10 step 3). Read as
+    text: the reads, whose token they carry, what fails the plan, and that the
+    members reach the one project binding."""
+
+    def setUp(self):
+        self.scope_tf = (_MODULE / "scope.tf").read_text()
+        self.main_tf = (_MODULE / "main.tf").read_text()
+        self.versions = (_MODULE / "versions.tf").read_text()
+
+    def _data(self, kind, name):
+        match = re.search(rf'^data\s+"{kind}"\s+"{name}"\s*\{{(.*?)^\}}', self.scope_tf, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, f"data {kind}.{name} not found")
+        return match.group(1)
+
+    def test_the_reads_are_the_reconciles_three_against_the_apis_it_calls(self):
+        host = self._data("http", "scope_shared_vpc_host")
+        self.assertIn("for_each = local.scope_shared_vpc_hosts", host)
+        self.assertIn('url                = "${local.scope_compute_api_url}/projects/${each.key}/getXpnResources?maxResults=${local.scope_xpn_page_size}"', host)
+        scope = self._data("http", "scope_metrics_scope")
+        self.assertIn("for_each = local.scope_metrics_scopes", scope)
+        self.assertIn('url                = "${local.scope_monitoring_api_url}/locations/global/metricsScopes/${each.key}"', scope)
+        named = self._data("http", "scope_monitored_project")
+        self.assertIn("for_each = local.scope_monitored_numbers", named)
+        self.assertIn('url                = "${local.scope_resource_manager_api_url}/projects/${each.key}"', named)
+        self.assertIn('scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"', self.scope_tf)
+        self.assertIn('scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"', self.scope_tf)
+        self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"', self.scope_tf)
+
+    def test_every_read_carries_the_providers_own_token(self):
+        # google_client_config is the provider's configured identity, impersonation
+        # included: the lookup passes or fails for the principal that applies.
+        self.assertIn('data "google_client_config" "scope_resolver"', self.scope_tf)
+        self.assertIn('Authorization = "Bearer ${data.google_client_config.scope_resolver[0].access_token}"', self.scope_tf)
+        for name in ("scope_shared_vpc_host", "scope_metrics_scope", "scope_monitored_project"):
+            with self.subTest(read=name):
+                self.assertIn("request_headers    = local.scope_resolver_headers", self._data("http", name))
+        # No read shells out: an external program would answer for gcloud's
+        # active account, which need not be the provider's identity.
+        self.assertNotIn('data "external"', self.scope_tf)
+        self.assertNotIn("local-exec", self.scope_tf)
+
+    def test_the_http_provider_is_required_and_no_lookup_is_made_without_a_selector(self):
+        self.assertIn('source  = "hashicorp/http"', self.versions)
+        self.assertIn("count = local.scope_resolves_selectors ? 1 : 0", self._data("google_client_config", "scope_resolver"))
+        self.assertIn("scope_resolves_selectors = length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0", self.scope_tf)
+
+    def test_a_failed_read_fails_the_plan_and_a_non_host_resolves_to_nothing(self):
+        host = self._data("http", "scope_shared_vpc_host")
+        self.assertIn("self.status_code == 200 || (self.status_code == 400 && strcontains(self.response_body, local.scope_not_xpn_host_marker))", host)
+        self.assertIn('scope_not_xpn_host_marker            = "is not a shared VPC host project"', self.scope_tf)
+        self.assertIn("Nothing was applied.", host)
+        self.assertIn("!can(jsondecode(self.response_body).nextPageToken)", host)
+        for name in ("scope_metrics_scope", "scope_monitored_project"):
+            with self.subTest(read=name):
+                self.assertIn("condition     = self.status_code == 200\n", self._data("http", name))
+        # A body that is not the document the module reads is refused, never read as empty.
+        self.assertIn('can([for resource in try(jsondecode(self.response_body).resources, []) : "${resource.id}/${resource.type}"])', host)
+        self.assertIn("can([for row in try(jsondecode(self.response_body).monitoredProjects, []) : regex(local.scope_monitored_project_name_pattern, row.name)])",
+                      self._data("http", "scope_metrics_scope"))
+        # A legacy domain-scoped ID the scope cannot carry is refused by number.
+        self.assertIn("can(regex(local.scope_project_id_pattern, jsondecode(self.response_body).projectId))", self._data("http", "scope_monitored_project"))
+        self.assertIn("name the number in scope.exclude.projects", self._data("http", "scope_monitored_project"))
+
+    def test_the_members_reach_the_one_project_binding_with_the_host_and_less_an_exact_exclude(self):
+        self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
+        self.assertIn("for pair in setproduct(sort(tolist(local.scope_bound_projects)), local.scope_roles) :", self.scope_tf)
+        selector = re.search(r"scope_selector_projects = toset\(concat\((.*?)\n  \)\)", self.scope_tf, re.DOTALL).group(1)
+        self.assertIn("if project != var.project_id && !contains(var.scope.exclude.projects, project)", selector)
+        self.assertIn("[for host in local.scope_shared_vpc_hosts : host if host != var.project_id]", selector)
+        # An excluded number is neither named nor bound.
+        self.assertIn("if can(regex(local.scope_project_number_pattern, member)) && !contains(var.scope.exclude.projects, member)", self.scope_tf)
+        # The snapshot's names, so the output reads beside fleet_scope.json.
+        self.assertIn('"sharedVpcHosts/${host}" => members', self.scope_tf)
+        self.assertIn('"metricsScopes/${scope}" => members', self.scope_tf)
+
+    def test_a_host_without_the_lookup_role_fails_the_plan(self):
+        self.assertIn('scope_shared_vpc_lookup_role = "roles/compute.viewer"', self.scope_tf)
+        self.assertIn("roles/compute.viewer", DESIGN_ALLOWLIST)
+        precondition = re.search(r"length\(local\.scope_shared_vpc_hosts\) == 0 \|\| contains\(local\.scope_roles, local\.scope_shared_vpc_lookup_role\)", self.main_tf)
+        self.assertIsNotNone(precondition, "main.tf carries no precondition for the host lookup role")
+        self.assertIn("scope_declares_anything = length(local.scope_projects) + length(local.scope_folders) + length(local.scope_organizations) + length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0",
+                      self.scope_tf)
+
+    def test_the_outputs_surface_the_selectors_and_what_they_resolved_to(self):
+        outputs = (_MODULE / "outputs.tf").read_text()
+        self.assertIn("value       = sort(tolist(local.scope_shared_vpc_hosts))", outputs)
+        self.assertIn("value       = sort(tolist(local.scope_metrics_scopes))", outputs)
+        self.assertIn("value       = local.scope_selector_members", outputs)
+        self.assertIn("value       = sort(tolist(local.scope_bound_projects))", outputs)
+
+
 def _crd_scope_schema():
     crd = yaml.safe_load(_CRD.read_text())
     spec = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
@@ -182,9 +277,11 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
         self.crd = _crd_scope_schema()
 
     def test_the_shape_and_defaults(self):
-        for line in ("projects      = optional(list(string), [])",
-                     "folders       = optional(list(string), [])",
-                     "organizations = optional(list(string), [])",
+        for line in ("projects         = optional(list(string), [])",
+                     "folders          = optional(list(string), [])",
+                     "organizations    = optional(list(string), [])",
+                     "shared_vpc_hosts = optional(list(string), [])",
+                     "metrics_scopes   = optional(list(string), [])",
                      "clusters = optional(list(object({",
                      "nullable = false",
                      "default  = {}"):
@@ -196,6 +293,8 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
             "var.scope.projects": self.crd["projects"],
             "var.scope.folders": self.crd["folders"],
             "var.scope.organizations": self.crd["organizations"],
+            "var.scope.shared_vpc_hosts": self.crd["sharedVpcHosts"],
+            "var.scope.metrics_scopes": self.crd["metricsScopes"],
             "var.scope.exclude.projects": self.crd["exclude"]["properties"]["projects"],
             "var.scope.exclude.clusters": self.crd["exclude"]["properties"]["clusters"],
         }
@@ -208,6 +307,14 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
         globs = self.crd["exclude"]["properties"]["projects"]["items"]["pattern"]
         self.assertIn(f'regex("{_hcl_regex(projects)}", project)', self.variable)
         self.assertIn(f'regex("{_hcl_regex(globs)}", entry)', self.variable)
+
+    def test_the_selector_pattern_is_the_crds_project_id_for_both_lists(self):
+        # A Shared VPC host and a Metrics Scope's scoping project are project IDs.
+        hosts = self.crd["sharedVpcHosts"]["items"]["pattern"]
+        self.assertEqual(hosts, self.crd["metricsScopes"]["items"]["pattern"])
+        self.assertEqual(hosts, self.crd["projects"]["items"]["pattern"])
+        self.assertIn(f'for selector in concat(var.scope.shared_vpc_hosts, var.scope.metrics_scopes) : can(regex("{_hcl_regex(hosts)}", selector))',
+                      self.variable)
 
     def test_the_container_id_pattern_is_the_crds_for_both_lists(self):
         folders = self.crd["folders"]["items"]["pattern"]
@@ -231,11 +338,15 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
         self.assertEqual(self.crd["projects"]["x-kubernetes-list-type"], "set")
         self.assertEqual(self.crd["folders"]["x-kubernetes-list-type"], "set")
         self.assertEqual(self.crd["organizations"]["x-kubernetes-list-type"], "set")
+        self.assertEqual(self.crd["sharedVpcHosts"]["x-kubernetes-list-type"], "set")
+        self.assertEqual(self.crd["metricsScopes"]["x-kubernetes-list-type"], "set")
         self.assertEqual(self.crd["exclude"]["properties"]["projects"]["x-kubernetes-list-type"], "set")
         self.assertEqual(self.crd["exclude"]["properties"]["clusters"]["x-kubernetes-list-type"], "map")
         for rule in ("length(distinct(var.scope.projects)) == length(var.scope.projects)",
                      "length(distinct(var.scope.folders)) == length(var.scope.folders)",
                      "length(distinct(var.scope.organizations)) == length(var.scope.organizations)",
+                     "length(distinct(var.scope.shared_vpc_hosts)) == length(var.scope.shared_vpc_hosts)",
+                     "length(distinct(var.scope.metrics_scopes)) == length(var.scope.metrics_scopes)",
                      "length(distinct(var.scope.exclude.projects)) == length(var.scope.exclude.projects)",
                      'length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)'):
             with self.subTest(rule=rule[:50]):
@@ -251,9 +362,11 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
 
     def test_the_composition_declares_the_variable_like_the_module(self):
         variable = _block(self.variables, "variable", "scope")
-        for line in ("projects      = optional(list(string), [])",
-                     "folders       = optional(list(string), [])",
-                     "organizations = optional(list(string), [])"):
+        for line in ("projects         = optional(list(string), [])",
+                     "folders          = optional(list(string), [])",
+                     "organizations    = optional(list(string), [])",
+                     "shared_vpc_hosts = optional(list(string), [])",
+                     "metrics_scopes   = optional(list(string), [])"):
             with self.subTest(line=line):
                 self.assertIn(line, variable)
         self.assertIn("nullable = false", variable)
@@ -267,9 +380,11 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         values = re.search(r"\n      scope = \{\n(?P<body>.*?)\n      \}\n", self.main_tf, re.DOTALL)
         self.assertIsNotNone(values, "platformAgent.scope is not in the helm values")
         body = values.group("body")
-        self.assertIn("projects      = var.scope.projects", body)
-        self.assertIn("folders       = var.scope.folders", body)
-        self.assertIn("organizations = var.scope.organizations", body)
+        self.assertIn("projects       = var.scope.projects", body)
+        self.assertIn("folders        = var.scope.folders", body)
+        self.assertIn("organizations  = var.scope.organizations", body)
+        self.assertIn("sharedVpcHosts = var.scope.shared_vpc_hosts", body)
+        self.assertIn("metricsScopes  = var.scope.metrics_scopes", body)
         self.assertIn("projects = var.scope.exclude.projects", body)
         for key in ("projectId   = cluster.project_id",
                     "location    = cluster.location",
@@ -284,7 +399,8 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
 
     def test_the_outputs_are_surfaced(self):
         outputs = (_COMPOSITION / "outputs.tf").read_text()
-        for name in ("scope_projects", "scope_roles", "scope_folders", "scope_organizations", "scope_container_roles"):
+        for name in ("scope_projects", "scope_roles", "scope_folders", "scope_organizations", "scope_container_roles",
+                     "scope_shared_vpc_hosts", "scope_metrics_scopes", "scope_selector_members", "scope_bound_projects"):
             with self.subTest(output=name):
                 self.assertIn(f"value       = module.kube_agents_iam.{name}", outputs)
 

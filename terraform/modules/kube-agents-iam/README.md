@@ -34,11 +34,11 @@ stay there until per-cluster RBAC lands. The site's
 owns the topic, including how the mapping reaches the credential broker and
 what the pool does and does not bound.
 
-## Projects, folders and organisations in scope
+## Projects, folders, organisations and selectors in scope
 
 `scope` mirrors `spec.scope` on the `PlatformAgent`: `projects`, `folders`, `organizations`,
-`exclude.projects` and `exclude.clusters`, with the same caps and patterns the CRD enforces,
-checked at plan time. Each
+`shared_vpc_hosts`, `metrics_scopes`, `exclude.projects` and `exclude.clusters`, with the same
+caps and patterns the CRD enforces, checked at plan time. Each
 project in `projects` other than `project_id` gets the read allowlist in `scope.tf`
 (`roles/container.clusterViewer`, `roles/container.viewer`, `roles/compute.viewer`,
 `roles/monitoring.viewer`, `roles/logging.viewer`, `roles/iam.securityReviewer`) intersected with
@@ -54,11 +54,25 @@ itself (`google_folder_iam_member`, `google_organization_iam_member`), so every 
 it inherits the grant, including one created after the apply, and the reconcile can search the
 container's asset index for clusters; the identity running the apply needs
 `resourcemanager.folders.setIamPolicy` or `resourcemanager.organizations.setIamPolicy` there.
-The same manageability check applies to a container as to a project. Removing an entry revokes
-its bindings on the next apply, and `terraform destroy` revokes them all. The `scope_projects`,
-`scope_folders`, `scope_organizations`, `scope_roles` and `scope_container_roles` outputs surface
-what was bound. An organisation binding is wide; the design is
-[`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6 and §9.
+The same manageability check applies to a container as to a project. A Shared VPC host or a
+Metrics Scope's scoping project (`shared_vpc_hosts`, `metrics_scopes`: project IDs) is not a
+container and inherits nothing, so the module resolves it to projects at plan time and binds the
+same intersected allowlist in each: `data "http"` reads of the Compute API (`getXpnResources`),
+the Monitoring API (`metricsScopes.get`) and Resource Manager (to name each monitored project,
+returned by number), made with the google provider's own access token
+(`data "google_client_config"`) so they are answered for the identity that applies. Each host is
+bound too, because the reconcile's lookup reads it with `compute.projects.get`, and the plan is
+refused when `project_roles` carries no `roles/compute.viewer` beside a host. A read that fails
+fails the plan, before anything is applied, with the selector and the API's answer in the error;
+a project that is not a Shared VPC host resolves to no members; and an `exclude.projects` entry
+that names a member exactly, by ID or by project number, keeps it out of the bindings, the one
+place `exclude` reaches IAM. Removing an entry revokes its bindings on the next apply, and
+`terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,
+`scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_selector_members`,
+`scope_bound_projects`, `scope_roles` and `scope_container_roles` outputs surface what was bound.
+An organisation binding is wide; the design is
+[`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
+§10 step 3.
 
 ## Usage
 

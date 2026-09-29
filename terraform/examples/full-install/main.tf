@@ -675,9 +675,11 @@ resource "helm_release" "kube_agents" {
       # removing the last scoped project here has to reach the CR as an
       # emptied block, never as a missing one.
       scope = {
-        projects      = var.scope.projects
-        folders       = var.scope.folders
-        organizations = var.scope.organizations
+        projects       = var.scope.projects
+        folders        = var.scope.folders
+        organizations  = var.scope.organizations
+        sharedVpcHosts = var.scope.shared_vpc_hosts
+        metricsScopes  = var.scope.metrics_scopes
         exclude = {
           projects = var.scope.exclude.projects
           clusters = [

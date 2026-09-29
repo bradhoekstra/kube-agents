@@ -502,7 +502,7 @@ equivalent set exists). Deliberately no admin list is pre-staged in
 `terraform.tfvars.example` — widening access should be an explicit, reviewed
 choice.
 
-### Projects, folders and organisations in scope (`scope`)
+### Projects, folders, organisations and selectors in scope (`scope`)
 
 `scope` is the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the
 install from this one value: the `kube-agents-iam` module binds its read allowlist (the read
@@ -514,8 +514,8 @@ drops projects (their read roles are revoked and their Cluster Agent profiles re
 reconcile's next two clean runs), and a missing block would declare nothing. `exclude.projects`
 takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`, `location`,
 `cluster_name` triple; neither changes IAM. Through the installer the value comes from
-`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
-`SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
+`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
 forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
 declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that
@@ -543,6 +543,29 @@ check before the apply and the composition run directly does not. An organisatio
 every project in the organisation; the design recommends folders until the scoped service account
 pool grants authority ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
 §9).
+
+`scope.shared_vpc_hosts` and `scope.metrics_scopes` take project IDs: a Shared VPC host project,
+whose attached service projects are in scope, and the scoping project of a Cloud Monitoring
+Metrics Scope, whose monitored projects are. Neither is a Resource Manager container, so nothing
+is inherited through them. The module resolves each at plan time, with the same three reads the
+reconcile makes each run (the Compute API for a host's service projects, the Monitoring API for a
+scope's monitored projects, Resource Manager to name each of those, which the Monitoring API
+returns by number), made with the google provider's own token so they are answered for the
+identity that applies, and binds the allowlist in every project resolved, and in each host
+itself, which the reconcile's lookup has to read. A read that identity cannot make fails the plan
+before anything is applied, naming the selector and the API's answer: it needs
+`compute.projects.get` on a host, to read the Metrics Scope in its scoping project
+(`roles/monitoring.metricsScopesViewer` is the narrowest role) with `monitoring.googleapis.com`
+enabled there, and `resourcemanager.projects.get` on each monitored project; a monitored project
+it cannot name, or one whose ID the scope cannot carry, is left out by naming its project number
+in `exclude.projects`. A project that is not a Shared VPC host resolves to no members, as it does
+at runtime. An exclude entry that names a resolved member exactly (by ID, or by number for a
+monitored project) keeps it out of the bindings, the one place `exclude` reaches IAM, because a
+selector's member has no list to be dropped from; a glob is the reconcile's alone. What the
+selectors do not have is a container's zero-touch onboarding: a service project attached, or a
+project added to the scope, after the last apply reads `denied` in the reconcile's snapshot until
+the next apply binds it. `scope_selector_members` outputs what each resolved to, under the name
+the snapshot's `containers` array uses.
 
 ### Backups
 

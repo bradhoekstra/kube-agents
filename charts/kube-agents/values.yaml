@@ -882,6 +882,8 @@ platformAgent:
   #     projects: [payments-prod, payments-staging]
   #     folders: ["123456789012"]   # numeric IDs; every project beneath, at any depth
   #     organizations: []           # numeric IDs; wide, prefer folders
+  #     sharedVpcHosts: [shared-vpc-host]  # host project IDs; every attached service project
+  #     metricsScopes: []           # scoping project IDs; every project the scope monitors
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple

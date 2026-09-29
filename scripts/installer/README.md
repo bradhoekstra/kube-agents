@@ -165,9 +165,10 @@ absent destroys the stockout log sink, its alerts topic and subscription, and th
 grants; `ENABLE_PUBSUB_PLATFORM` absent removes the adapter plugin from the release (the
 composition owns no Pub/Sub resource for it alone); `GOOGLE_CHAT_ENABLED` absent removes the
 Chat topic and subscription; `PLATFORM_AGENT_PERMISSION_SET` absent falls back to `read-only`
-and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` absent
+and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`,
+`SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES` absent
 renders an empty list for it in the scope block, which revokes the read roles in every project,
-folder or organisation it named and retires those projects' Cluster Agent profiles over the
+folder, organisation or selector member it named and retires those projects' Cluster Agent profiles over the
 reconcile's next two clean runs.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
@@ -221,22 +222,42 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
-### Projects, folders and organisations in scope
+### Projects, folders, organisations and selectors in scope
 
-`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and
-`SCOPE_EXCLUDE_CLUSTERS` are the `PlatformAgent`'s `spec.scope`, declared once and reaching both
-halves of the install from the same value: the generator renders them as the composition's `scope`
-object, the IAM module binds the read roles in every project named and the read roles plus
-`roles/cloudasset.viewer` on every folder and organisation named, and the chart renders the same
-object into the CR. The lists are space- or comma-separated like every other list key; a folder or
-organisation is its bare numeric ID, and an entry that is not one stops the run before
-`terraform.tfvars` is written; an excluded project may be a shell-style glob; an excluded cluster
-is `project/location/cluster`, and an entry that does not split into three parts stops the run the
-same way. The patterns, caps and repeats the CRD enforces are checked by the module's variable
-validation, which fails the plan before any binding. A folder or organisation also adds
-`cloudasset.googleapis.com` to the APIs the composition enables in the host project, because the
-reconcile resolves a container's members through it; an install that names explicit projects
-alone never enables it.
+`SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
+`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` are the
+`PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from the
+same value: the generator renders them as the composition's `scope` object, the IAM module binds
+the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
+folder and organisation named, and the read roles in every project a Shared VPC host or Metrics
+Scope resolves to, and the chart renders the same object into the CR. The lists are space- or
+comma-separated like every other list key; a folder or organisation is its bare numeric ID, and an
+entry that is not one stops the run before `terraform.tfvars` is written; a Shared VPC host or
+Metrics Scope is a project ID (the host's, or the scope's scoping project's); an excluded project
+may be a shell-style glob; an excluded cluster is `project/location/cluster`, and an entry that
+does not split into three parts stops the run the same way. The patterns, caps and repeats the CRD
+enforces are checked by the module's variable validation, which fails the plan before any binding.
+A folder or organisation also adds `cloudasset.googleapis.com` to the APIs the composition enables
+in the host project, because the reconcile resolves a container's members through it; an install
+that names explicit projects alone never enables it.
+
+A Shared VPC host or a Metrics Scope inherits nothing, so the module resolves it to projects when
+Terraform plans, with the same reads the reconcile makes each run (the Compute API for a host's
+service projects, the Monitoring API for a scope's monitored projects, Resource Manager to name
+each of those by ID) made with the google provider's own token, and binds the read roles in each,
+and in the host itself, which the reconcile's lookup reads. A read that identity cannot make fails
+the plan, before anything is applied, naming the selector, the status and the API's message: it
+needs `compute.projects.get` on a host, to read the Metrics Scope in its scoping project with the
+Monitoring API enabled there, and `resourcemanager.projects.get` on every monitored project; a
+monitored project it cannot name is left out by naming its project number in
+`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors as
+`check_scope_container_access` probes a container: a container's failure lands inside the apply,
+after the Asset API is enabled and some containers are bound, while a selector's lands in the plan
+with nothing changed, `upgrade.sh --plan` included. What the selectors do not have is a container's
+zero-touch onboarding: a service project attached, or a project added to the scope, after the last
+full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
+entry that names a selector's member exactly, by ID or by number, keeps it out of the bindings, the
+one place an exclusion reaches IAM, because the member has no list to be dropped from.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a
@@ -256,8 +277,7 @@ kubeconfig context and refuse when it carries a scope that neither the release r
 keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
-`installer_common.sh`; `upgrade.sh --plan` warns instead). The `sharedVpcHosts` and
-`metricsScopes` selectors have no key yet and are reported, never weighed. An `install.sh` re-run
+`installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run
 and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
 every front door rather than being pruned by a served schema that predates the field.
 
@@ -293,19 +313,23 @@ property in the active configuration file, which the provider does not read, mak
 undecided with the property named, unless `GOOGLE_IMPERSONATE_SERVICE_ACCOUNT` overrides the
 first explicitly.
 
-An install that declared a folder or organisation on the `PlatformAgent` by hand before the
-installer had a key for it, and had its roles bound by hand, is refused at its next full upgrade
-like any hand edit, and the lines it prints include `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS`.
-Recording them hands the container's bindings to Terraform, which creates them with the applying
-credentials, so those credentials need `setIamPolicy` on the container even where an
-administrator made the hand grant; the alternatives are to obtain it for the identity that
-applies, or to take the container off the `PlatformAgent`, which retires its members over the
-reconcile's next two clean runs, and manage those projects through `SCOPE_PROJECTS` instead.
+An install that declared a folder, organisation, Shared VPC host or Metrics Scope on the
+`PlatformAgent` by hand before the installer had a key for it, and had its roles bound by hand, is
+refused at its next full upgrade like any hand edit, and the lines it prints include
+`SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES`.
+Recording them hands the bindings to Terraform, which creates them with the applying credentials,
+so those credentials need `setIamPolicy` on the container, or in each project a selector resolves
+to, even where an administrator made the hand grant, and for a selector the reads that resolve it;
+the alternatives are to obtain them for the identity that applies, or to take the entry off the
+`PlatformAgent`, which retires its members over the reconcile's next two clean runs, and manage
+those projects through `SCOPE_PROJECTS` instead.
 
 The bindings live in projects, folders and organisations the applying identity has to be able to
 set IAM policy in. A scoped project or container that is deleted, or whose owner revokes that
 permission, fails the refresh or destroy of its bindings on every later plan, full upgrade and
-uninstall. Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` and forget
+uninstall (a Shared VPC host or Metrics Scope this identity can no longer read fails the plan the
+same way, since the lookup runs on every plan). Remove it from `SCOPE_PROJECTS`, `SCOPE_FOLDERS`,
+`SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES` and forget
 its bindings from state, from the composition directory the last `lifecycle.sh` run initialised
 against the install's backend (the address is `module.kube_agents_iam.google_project_iam_member.scope_roles`,
 `module.kube_agents_iam.google_folder_iam_member.scope_roles` or

@@ -13,7 +13,16 @@ resource "google_service_account" "agent" {
   lifecycle {
     precondition {
       condition     = !local.scope_declares_anything || local.scope_can_manage
-      error_message = "scope.projects, scope.folders or scope.organizations names something but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries neither roles/container.clusterViewer nor roles/container.viewer, the two roles that list and get clusters; a custom IAM role is not carried into scoped projects. Add one of the two (it is bound in the host project as well) or empty the scope lists."
+      error_message = "scope.projects, scope.folders, scope.organizations, scope.shared_vpc_hosts or scope.metrics_scopes names something but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries neither roles/container.clusterViewer nor roles/container.viewer, the two roles that list and get clusters; a custom IAM role is not carried into scoped projects. Add one of the two (it is bound in the host project as well) or empty the scope lists."
+    }
+    # The same shape for a Shared VPC host: the reconcile finds its service
+    # projects with compute.projects.get in the host project, which only
+    # roles/compute.viewer carries among the allowlist, so a host declared
+    # under a role set without it would be resolved here at plan time and read
+    # `denied` in the agent's snapshot on every tick.
+    precondition {
+      condition     = length(local.scope_shared_vpc_hosts) == 0 || contains(local.scope_roles, local.scope_shared_vpc_lookup_role)
+      error_message = "scope.shared_vpc_hosts names a host but project_roles (PLATFORM_AGENT_CUSTOM_ROLES on the installer path) carries no roles/compute.viewer, the role whose compute.projects.get the reconcile needs in the host project to list its service projects; a custom IAM role is not carried into scoped projects. Add it (it is bound in the host project as well) or empty scope.shared_vpc_hosts."
     }
   }
 }

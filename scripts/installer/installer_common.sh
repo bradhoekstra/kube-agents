@@ -499,7 +499,7 @@ load_install_env() {
   # and the Day-2 menu the file is the only way in. A value inherited from the
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -910,19 +910,20 @@ hcl_csv_list() {
   printf '%s]' "$out"
 }
 
-# The five SCOPE_* keys as the composition's `scope` object: `projects`,
-# `folders`, `organizations` and `exclude.projects` are lists like every other
-# list key, `exclude.clusters` is one project/location/cluster triple per
-# entry. Always a full block, empty lists included -- the reconcile reads an
-# emptied projects list as the declaration that drops projects, a container
-# leaving the list as the declaration that retires its members, and a missing
-# block as no declaration (docs/designs/multi-project-scope.md §7). Shape
-# only: the caller has already run require_scope_cluster_triples and
+# The seven SCOPE_* keys as the composition's `scope` object: `projects`,
+# `folders`, `organizations`, `shared_vpc_hosts`, `metrics_scopes` and
+# `exclude.projects` are lists like every other list key, `exclude.clusters`
+# is one project/location/cluster triple per entry. Always a full block, empty
+# lists included -- the reconcile reads an emptied projects list as the
+# declaration that drops projects, a container or selector leaving the list as
+# the declaration that retires its members, and a missing block as no
+# declaration (docs/designs/multi-project-scope.md §7). Shape only: the caller
+# has already run require_scope_cluster_triples and
 # require_scope_container_ids, and the patterns, caps and repeats the CRD
 # enforces are the module variable's validations, which fail the plan before
 # any binding.
 hcl_scope_block() {
-  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" exclude_projects="${4:-}" exclude_clusters="${5:-}"
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}"
   local clusters="[" first=true entry project location cluster had_noglob=false
   local IFS=$', \t\n'
   case "$-" in *f*) had_noglob=true ;; esac
@@ -936,8 +937,9 @@ hcl_scope_block() {
   done
   $had_noglob || set +f
   clusters+="]"
-  printf 'scope = {\n  projects      = %s\n  folders       = %s\n  organizations = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
+    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")" \
     "$(hcl_csv_list "$exclude_projects")" "$clusters"
 }
 
@@ -1008,10 +1010,9 @@ require_scope_cluster_triples() {
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
-# L, R and K are the projects, folders, organisations and exclusions; the
-# sharedVpcHosts and metricsScopes selectors phase 3 added are reported when
-# the CR carries them and never weighed, because the chart renders neither
-# and an apply leaves them as they are.
+# L, R and K are the projects, folders, organisations, Shared VPC hosts,
+# Metrics Scopes and exclusions: every list the chart renders, since a list it
+# renders is one the apply replaces.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1080,7 +1081,7 @@ print(max(served) if served else "")
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
-keys = sys.argv[3:8]
+keys = sys.argv[3:10]
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
@@ -1095,11 +1096,14 @@ def normalise(scope):
         "projects": sorted(set(scope.get("projects") or [])),
         "folders": sorted(set(scope.get("folders") or [])),
         "organizations": sorted(set(scope.get("organizations") or [])),
+        "sharedVpcHosts": sorted(set(scope.get("sharedVpcHosts") or [])),
+        "metricsScopes": sorted(set(scope.get("metricsScopes") or [])),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
     }
 
 def is_empty(scope):
     return not (scope["projects"] or scope["folders"] or scope["organizations"]
+                or scope["sharedVpcHosts"] or scope["metricsScopes"]
                 or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
 
 items = json.loads(cr_text).get("items") or []
@@ -1110,16 +1114,8 @@ if live_raw is None:
     print(ok)
     sys.exit(0)
 live = normalise(live_raw)
-# The two selectors phase 3 added to the CR. The chart renders neither and
-# the installer has no key for them, so an apply leaves them as they are; they
-# are reported on the second output line, never weighed in the verdict.
-containers = " ".join(
-    k + ": " + " ".join(sorted(set(live_raw.get(k) or [])))
-    for k in ("sharedVpcHosts", "metricsScopes") if live_raw.get(k)
-)
 if is_empty(live):
     print(ok)
-    print(containers)
     sys.exit(0)
 def recorded(text):
     raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
@@ -1130,24 +1126,26 @@ declared = normalise({
     "projects": split(keys[0]),
     "folders": split(keys[1]),
     "organizations": split(keys[2]),
+    "sharedVpcHosts": split(keys[3]),
+    "metricsScopes": split(keys[4]),
     "exclude": {
-        "projects": split(keys[3]),
-        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[4])],
+        "projects": split(keys[5]),
+        "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[6])],
     },
 })
 if live in records or live == declared:
     print(ok)
-    print(containers)
     sys.exit(0)
 print(refuse)
-print(containers)
 print(items[0]["metadata"]["name"])
 print("SCOPE_PROJECTS=" + json.dumps(" ".join(live["projects"])))
 print("SCOPE_FOLDERS=" + json.dumps(" ".join(live["folders"])))
 print("SCOPE_ORGANIZATIONS=" + json.dumps(" ".join(live["organizations"])))
+print("SCOPE_SHARED_VPC_HOSTS=" + json.dumps(" ".join(live["sharedVpcHosts"])))
+print("SCOPE_METRICS_SCOPES=" + json.dumps(" ".join(live["metricsScopes"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -1155,15 +1153,9 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
   fi
   rm -f "$err_file"
   first_line="${verdict%%$'\n'*}"
-  local containers lines cr_name
-  lines="${verdict#*$'\n'}"
-  [ "$lines" != "$verdict" ] || lines=""
-  containers="${lines%%$'\n'*}"
-  if [ -n "$containers" ]; then
-    print_info "The PlatformAgent also declares ${containers}, which the installer has no key for yet; this apply renders neither selector and leaves them as they are."
-  fi
   [ "$first_line" != "$SCOPE_VERDICT_OK" ] || return 0
-  lines="${lines#*$'\n'}"
+  local lines cr_name
+  lines="${verdict#*$'\n'}"
   cr_name="${lines%%$'\n'*}"
   lines="${lines#*$'\n'}"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
@@ -2827,13 +2819,15 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
-    echo "# The projects, folders and organisations beyond project_id whose GKE clusters"
-    echo "# get a Cluster Agent, and what to leave unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS,"
-    echo "# SCOPE_ORGANIZATIONS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS in"
-    echo "# install.env). Always written, so this file states the declaration the"
-    echo "# composition renders either way, empty lists included; an emptied list is the"
-    echo "# declaration that drops what it named."
+    echo "# The projects, folders, organisations, Shared VPC hosts and Metrics Scopes"
+    echo "# beyond project_id whose GKE clusters get a Cluster Agent, and what to leave"
+    echo "# unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS,"
+    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS,"
+    echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
+    echo "# the declaration the composition renders either way, empty lists included; an"
+    echo "# emptied list is the declaration that drops what it named."
     hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
+      "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" \
       "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"

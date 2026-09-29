@@ -2683,9 +2683,11 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     EMPTY_BLOCK = (
         "scope = {\n"
-        "  projects      = []\n"
-        "  folders       = []\n"
-        "  organizations = []\n"
+        "  projects         = []\n"
+        "  folders          = []\n"
+        "  organizations    = []\n"
+        "  shared_vpc_hosts = []\n"
+        "  metrics_scopes   = []\n"
         "  exclude = {\n"
         "    projects = []\n"
         "    clusters = []\n"
@@ -2695,6 +2697,7 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
 
     def _scope_env(self, **keys):
         env = {"API_SERVER_KEY": "k", "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+               "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
         env.update(keys)
         return env
@@ -2708,14 +2711,18 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
             SCOPE_PROJECTS="payments-prod, payments-staging",
             SCOPE_FOLDERS="123456789012 210987654321",
             SCOPE_ORGANIZATIONS="987654321098",
+            SCOPE_SHARED_VPC_HOSTS="shared-net-host, shared-net-host-2",
+            SCOPE_METRICS_SCOPES="observability-hub",
             SCOPE_EXCLUDE_PROJECTS="*-sandbox kube-agents-demo-0[2-9]",
             SCOPE_EXCLUDE_CLUSTERS="payments-staging/us-central1/scratch-cluster,p2/us-east1-b/c2",
         ))
         self.assertIn(
             "scope = {\n"
-            '  projects      = ["payments-prod", "payments-staging"]\n'
-            '  folders       = ["123456789012", "210987654321"]\n'
-            '  organizations = ["987654321098"]\n'
+            '  projects         = ["payments-prod", "payments-staging"]\n'
+            '  folders          = ["123456789012", "210987654321"]\n'
+            '  organizations    = ["987654321098"]\n'
+            '  shared_vpc_hosts = ["shared-net-host", "shared-net-host-2"]\n'
+            '  metrics_scopes   = ["observability-hub"]\n'
             "  exclude = {\n"
             '    projects = ["*-sandbox", "kube-agents-demo-0[2-9]"]\n'
             '    clusters = [{ project_id = "payments-staging", location = "us-central1", cluster_name = "scratch-cluster" }, '
@@ -2781,6 +2788,8 @@ _LIVE_SCOPE_LINES = (
     'SCOPE_PROJECTS="p2-project p3-project"',
     'SCOPE_FOLDERS=""',
     'SCOPE_ORGANIZATIONS=""',
+    'SCOPE_SHARED_VPC_HOSTS=""',
+    'SCOPE_METRICS_SCOPES=""',
     'SCOPE_EXCLUDE_PROJECTS=""',
     'SCOPE_EXCLUDE_CLUSTERS="p2-project/us-central1/c1"',
 )
@@ -2848,6 +2857,7 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                 path.chmod(path.stat().st_mode | stat.S_IEXEC)
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
                    "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
+                   "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
                    "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
             env.update(keys or {})
             body = (
@@ -2957,22 +2967,38 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         older = '{"platformAgent":{"scope":{"projects":[],"exclude":{"projects":[],"clusters":[]}}}}'
         self._assert_rc(self._run(only_containers, older), 1)
 
-    def test_selectors_on_the_live_cr_are_reported_and_never_weighed(self):
-        # sharedVpcHosts and metricsScopes (phase 3) have no installer key and
-        # the chart renders neither, so an apply leaves them alone: a CR
-        # carrying only selectors passes with a note, and a refused mixed edit
-        # still prints the lines it can reproduce plus the note.
+    def test_a_hand_declared_selector_is_protected_like_a_project(self):
+        # The chart renders sharedVpcHosts and metricsScopes now, so an apply
+        # over a CR that carries one the record and the keys do not is the
+        # same silent replace as for a project: refused, with the two lines
+        # that reproduce it, passed once the keys carry it, and never a note
+        # about a key the installer lacks.
         only_selectors = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"sharedVpcHosts":["shared-net-host"],'
                           '"metricsScopes":["observability-hub"]}}}]}')
         proc = self._run(only_selectors, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_SHARED_VPC_HOSTS="shared-net-host"', proc.stdout)
+        self.assertIn('INFO:   SCOPE_METRICS_SCOPES="observability-hub"', proc.stdout)
+        self.assertNotIn("has no key for", proc.stdout)
+        proc = self._run(only_selectors, "norelease",
+                         keys={"SCOPE_SHARED_VPC_HOSTS": "shared-net-host", "SCOPE_METRICS_SCOPES": "observability-hub"})
         self._assert_rc(proc, 0)
-        self.assertIn("also declares sharedVpcHosts: shared-net-host metricsScopes: observability-hub, which the installer has no key for yet", proc.stdout)
+        self.assertNotIn("has no key for", proc.stdout)
+        # A record that carries the selectors makes the keys the new
+        # declaration, dropping them included; a record from before the chart
+        # rendered them (the container keys only) does not account for them.
+        record = ('{"platformAgent":{"scope":{"projects":[],"folders":[],"organizations":[],"sharedVpcHosts":["shared-net-host"],'
+                  '"metricsScopes":["observability-hub"],"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_selectors, record), 0)
+        between = ('{"platformAgent":{"scope":{"projects":[],"folders":[],"organizations":[],'
+                   '"exclude":{"projects":[],"clusters":[]}}}}')
+        self._assert_rc(self._run(only_selectors, between), 1)
         mixed = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"projects":["p2-project"],'
                  '"sharedVpcHosts":["shared-net-host"]}}}]}')
         proc = self._run(mixed, "norelease")
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_PROJECTS="p2-project"', proc.stdout)
-        self.assertIn("also declares sharedVpcHosts: shared-net-host, which the installer has no key for yet", proc.stdout)
+        self.assertIn('INFO:   SCOPE_SHARED_VPC_HOSTS="shared-net-host"', proc.stdout)
 
     def test_a_hand_edit_after_the_installer_wrote_it_is_refused(self):
         # L != R (p3-project and the exclusion were added by hand) and L != K.
