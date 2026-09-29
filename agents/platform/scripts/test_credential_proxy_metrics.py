@@ -18,6 +18,7 @@ import socket
 import sys
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
@@ -25,6 +26,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import command_policy
 import credential_proxy
 from credential_proxy import (
     CommandExecutor,
@@ -345,6 +347,13 @@ class ListenerStartTest(unittest.TestCase):
                 self.assertIsNone(credential_proxy.start_metrics_listener("127.0.0.1", port))
         self.assertTrue(any("ALERT" in line and "/metrics" in line for line in logs.output), logs.output)
 
+    def test_a_port_beyond_the_range_is_logged_not_raised(self):
+        # bind() raises OverflowError, not OSError, for this; the guard has
+        # to hold for any int or the broker dies at boot with it.
+        with self.assertLogs(credential_proxy.LOGGER, level="ERROR") as logs:
+            self.assertIsNone(credential_proxy.start_metrics_listener("127.0.0.1", 70000))
+        self.assertTrue(any("ALERT" in line and "OverflowError" in line for line in logs.output), logs.output)
+
     def test_a_free_port_is_served_on_a_daemon_thread(self):
         server = credential_proxy.start_metrics_listener("127.0.0.1", 0)
         self.assertIsNotNone(server)
@@ -457,6 +466,171 @@ class RegistryTest(unittest.TestCase):
         rendered = metrics.render()
         self.assertIn('endpoint="quote\\"back\\\\slash\\nnewline"', rendered)
         self.assertEqual(1, len([line for line in rendered.splitlines() if line.startswith("kubeagents_credential_proxy_requests_total{")]))
+
+
+@contextlib.contextmanager
+def _refusing_slot(exc):
+    """A request slot that refuses on entry the way the real one does when the
+    broker is saturated or the queued caller has gone."""
+    raise exc
+    yield  # pragma: no cover
+
+
+class NeverStartedCommandTest(unittest.TestCase):
+    """Two outcomes end a command before it starts: the slots stay full for the
+    whole wait (a 503), or the caller hangs up while queued (no response at all).
+    Both are counted and neither is timed; the busy one is its own status so a
+    saturated broker reads as saturated rather than as failing commands."""
+
+    class _Idle:
+        ALLOWED_EXECUTABLES = CommandExecutor.ALLOWED_EXECUTABLES
+
+        def git_lease_violation(self, argv, cwd):
+            return None
+
+        def execute(self, *args, **kwargs):
+            raise AssertionError("a command that never got a slot must not run")
+
+    def _serve_refusing(self, exc):
+        names = ("executor", "policy", "metrics", "max_request_bytes", "enforce_read_only", "authenticator", "_request_slot")
+        previous = {name: CredentialProxyHandler.__dict__.get(name) for name in names}
+        for name, value in previous.items():
+            self.addCleanup(setattr, CredentialProxyHandler, name, value)
+        CredentialProxyHandler.executor = self._Idle()
+        CredentialProxyHandler.policy = Policy(rules=[], blocked_message="blocked")
+        CredentialProxyHandler.metrics = ProxyMetrics()
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = True
+        CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
+        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(exc)
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return urllib.request.Request(
+            f"http://127.0.0.1:{server.server_port}/v1/exec",
+            data=json.dumps({"requestId": "req-n", "argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+
+    def test_a_saturated_broker_counts_the_command_as_busy_and_does_not_time_it(self):
+        request = self._serve_refusing(credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands"))
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(503, caught.exception.code)
+        families = _parse(CredentialProxyHandler.metrics.render())
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="503"))
+
+    def test_a_caller_that_leaves_the_queue_is_counted_as_abandoned(self):
+        request = self._serve_refusing(credential_proxy.CallerHungUp())
+        # Nothing is written back, so the client sees the connection close.
+        with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+            urllib.request.urlopen(request, timeout=5)
+        families = _parse(CredentialProxyHandler.metrics.render())
+        self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="abandoned"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+
+
+class PolicyReadCoverageTest(unittest.TestCase):
+    """Every read the policy tables allow labels as itself, so a panel over the
+    policy's own vocabulary sees every allowed command and `other` means what it
+    says. The gcloud table has entries that start with a release track, and the
+    label skips the track the way the policy does."""
+
+    def test_every_kubectl_read_verb_labels_as_itself(self):
+        for verb in sorted(command_policy.KUBECTL_READ_VERBS):
+            with self.subTest(verb=verb):
+                self.assertEqual(("kubectl", verb[0]), credential_proxy._tool_labels(["kubectl", *verb]))
+
+    def test_every_gcloud_read_command_labels_by_its_group(self):
+        for command in sorted(command_policy.GCLOUD_READ_COMMANDS):
+            with self.subTest(command=command):
+                group = command_policy._gcloud_surface(list(command))
+                self.assertNotIn(group, command_policy._GCLOUD_RELEASE_TRACKS)
+                self.assertEqual(("gcloud", group), credential_proxy._tool_labels(["gcloud", *command]))
+        vocabulary = credential_proxy._subcommand_vocabulary("gcloud")
+        self.assertFalse(vocabulary & command_policy._GCLOUD_RELEASE_TRACKS, "a release track is never a label")
+
+    def test_a_forge_cli_without_a_vocabulary_reads_other_not_another_tools_verbs(self):
+        allowed = set(CommandExecutor.ALLOWED_EXECUTABLES) | {"glab"}
+        with mock.patch.object(CommandExecutor, "ALLOWED_EXECUTABLES", allowed):
+            self.assertEqual(("glab", credential_proxy.LABEL_OTHER), credential_proxy._tool_labels(["glab", "pr", "list"]))
+            self.assertEqual(("gh", "pr"), credential_proxy._tool_labels(["gh", "pr", "list"]))
+
+
+class ServeWiringTest(unittest.TestCase):
+    """serve() is the one place the operator's port becomes a listener: the
+    parsed port has to reach start_metrics_listener, and a value that is no port
+    has to be refused there by name rather than left to bind()."""
+
+    class _Stop(Exception):
+        pass
+
+    def _serve(self, metrics_port):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        policy_path = Path(tmp.name) / "policy.json"
+        policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
+        args = types.SimpleNamespace(
+            policy=str(policy_path),
+            host="127.0.0.1",
+            port=0,
+            unix_socket=str(Path(tmp.name) / "backend.sock"),
+            timeout_seconds=5,
+            max_request_bytes=1 << 20,
+            max_output_bytes=1 << 20,
+            state_dir=str(Path(tmp.name) / "state"),
+            role="full",
+            metrics_port=metrics_port,
+        )
+        environment = {
+            "API_SERVER_EXTERNAL_KEY": "external",
+            "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+        }
+        bound = []
+        owner = self
+
+        def stop(server):
+            bound.append(server)
+            raise owner._Stop
+
+        class FakeThread:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+        started = mock.MagicMock(return_value=None)
+        try:
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
+                    mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
+                    mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
+                    mock.patch.object(credential_proxy, "start_metrics_listener", started), \
+                    self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                with self.assertRaises(self._Stop):
+                    credential_proxy.serve(args)
+        finally:
+            for server in bound:
+                server.server_close()
+        return started, logs.output
+
+    def test_the_parsed_port_reaches_the_listener(self):
+        started, _ = self._serve(8766)
+        started.assert_called_once_with("127.0.0.1", 8766)
+
+    def test_a_value_that_is_no_port_is_refused_by_name_and_never_bound(self):
+        started, logs = self._serve(70000)
+        started.assert_not_called()
+        self.assertTrue(
+            any("ALERT" in line and credential_proxy.METRICS_PORT_ENV in line and "70000" in line for line in logs),
+            logs,
+        )
 
 
 if __name__ == "__main__":

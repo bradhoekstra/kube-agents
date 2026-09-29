@@ -95,8 +95,8 @@ The broker authenticates every caller. A caller presents an audience-bound proje
 token (one hour; the audience is per pod, `kubeagents-credential-proxy` for the sandbox and
 `kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path on that listener but `/healthz`;
-`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other
-listener in the pod is the runtime's metrics-only one on TCP 8766, unauthenticated like
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names the ServiceAccounts allowed to call. The one other TCP
+listener in the pod is the runtime's metrics-only one on 8766, unauthenticated like
 `/healthz`: it serves Prometheus counters whose label values are static enums and closed
 vocabularies, holds no route, credential or policy, and is the one port the broker's
 NetworkPolicy admits the managed-Prometheus collector to

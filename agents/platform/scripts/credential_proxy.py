@@ -278,6 +278,10 @@ MILLISECONDS_PER_SECOND = 1000
 # ingress rule, so the three cannot name different ports; unset means no
 # listener, which is what an older operator that declares no port gets.
 METRICS_PORT_ENV = "CREDENTIAL_PROXY_METRICS_PORT"
+# The range a value of METRICS_PORT_ENV has to fall in to be bound at all; a
+# value outside it is refused by name in serve(), never handed to bind().
+METRICS_PORT_MIN = 1
+METRICS_PORT_MAX = 65535
 METRICS_PATH = "/metrics"
 HEALTHZ_PATH = "/healthz"
 METRICS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
@@ -293,11 +297,16 @@ TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 TOOL_STATUS_SUCCESS = "success"
 TOOL_STATUS_ERROR = "error"
 TOOL_STATUS_BLOCKED = "blocked"
-# A command the broker ran and killed because its caller hung up mid-command.
-# Its own outcome rather than `error`: the command's exit is unknown, and the
-# repeated abandon is the pattern the abandon path exists for, so it has to be
-# visible as itself.
+# A command whose caller hung up while it was queued or running; a running
+# one is killed. Its own outcome rather than `error`: the command's exit is
+# unknown, and the repeated abandon is the pattern the abandon path exists
+# for, so it has to be visible as itself.
 TOOL_STATUS_ABANDONED = "abandoned"
+# A command the broker never started because its slots stayed full for the
+# whole wait, the 503 the route answers. Its own outcome rather than `error`:
+# under saturation "never started" and "failed" are the two numbers an
+# operator needs apart.
+TOOL_STATUS_BUSY = "busy"
 # What a label reads when the request named nothing in its vocabulary: an
 # executable the broker does not serve, a verb no policy table lists, a path
 # no route claims, an argv whose verb cannot be read past an unknown flag.
@@ -306,11 +315,14 @@ LABEL_OTHER = "other"
 SUBCOMMAND_NONE = "none"
 SUBCOMMAND_LABEL_MAX_LENGTH = 32
 # The `subcommand` vocabularies the policy tables do not already supply. The
-# read verbs come from command_policy and the broker-side git verbs from
-# VCS_GIT_SUBCOMMANDS below; these add the write verbs a refused command is
-# counted under -- "how often does the model try to apply" is the question a
-# blocked-command series answers -- and the porcelain the content workspace
-# runs, which content_workspace names and this module does not import.
+# kubectl read verbs and the gcloud command groups come from command_policy's
+# tables -- a gcloud command is labelled by its group, `container` or `iam`,
+# never by a verb -- and the broker-side git verbs from VCS_GIT_SUBCOMMANDS
+# below; these add the kubectl write verbs and the gcloud groups a refused
+# command is counted under -- "how often does the model try to apply" is the
+# question a blocked-command series answers -- and the porcelain the content
+# workspace runs, which content_workspace names and this module does not
+# import.
 KUBECTL_WRITE_VERBS = frozenset(
     {
         "annotate", "apply", "attach", "autoscale", "cordon", "cp", "create", "debug",
@@ -334,6 +346,10 @@ FORGE_CLI_SUBCOMMANDS = frozenset(
         "workflow",
     }
 )
+# Which forge CLI reads which vocabulary. broker_executables() grows with the
+# forges an install declares; a CLI with no entry here labels every
+# subcommand `other` rather than being judged against another tool's verbs.
+FORGE_CLI_VOCABULARIES = {"gh": FORGE_CLI_SUBCOMMANDS}
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -5205,10 +5221,13 @@ def _subcommand_vocabulary(tool: str) -> frozenset[str]:
     if tool == "kubectl":
         return frozenset(verb[0] for verb in command_policy.KUBECTL_READ_VERBS) | KUBECTL_WRITE_VERBS
     if tool == "gcloud":
-        return frozenset(command[0] for command in command_policy.GCLOUD_READ_COMMANDS) | GCLOUD_EXTRA_SURFACES
+        # The group the label reads, past any release track, the way
+        # _tool_labels reads it: `beta monitoring ...` is `monitoring`.
+        surfaces = (command_policy._gcloud_surface(list(command)) for command in command_policy.GCLOUD_READ_COMMANDS)
+        return frozenset(surface for surface in surfaces if surface) | GCLOUD_EXTRA_SURFACES
     if tool == "git":
         return VCS_GIT_SUBCOMMANDS | GIT_EXTRA_SUBCOMMANDS
-    return FORGE_CLI_SUBCOMMANDS
+    return FORGE_CLI_VOCABULARIES.get(tool, frozenset())
 
 
 def _tool_labels(argv: list[str]) -> tuple[str, str]:
@@ -5364,12 +5383,14 @@ class MetricsHandler(BaseHTTPRequestHandler):
 def start_metrics_listener(host: str, port: int) -> ThreadingHTTPServer | None:
     """Open the metrics-only listener on a daemon thread; log, not raise, when it cannot.
 
-    Never fatal: a port that cannot be bound costs the broker its metrics, not
-    the commands it exists to broker, and the ALERT line is the signal.
+    Never fatal: a port that cannot be bound, or that is no port at all (bind
+    raises OverflowError, not OSError, past 65535), costs the broker its
+    metrics, not the commands it exists to broker, and the ALERT line is the
+    signal.
     """
     try:
         server = ThreadingHTTPServer((host, port), MetricsHandler)
-    except OSError as exc:
+    except (OSError, OverflowError) as exc:
         LOGGER.error(
             "ALERT metrics listener on %s:%d unavailable type=%s; the broker serves no "
             "/metrics until it restarts, and commands are unaffected",
@@ -5848,6 +5869,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     response["kubeconfig"] = result.kubeconfig
                 self._json(HTTPStatus.OK, response)
         except CallerHungUp:
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
             LOGGER.info(
                 "command abandoned request_id=%s: the caller disconnected while queued "
                 "for a slot; the command was not started",
@@ -5855,6 +5877,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
         except CommandSlotUnavailable as exc:
+            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
             LOGGER.warning("command queued too long request_id=%s", request_id)
             self._busy(exc)
             return
@@ -6948,10 +6971,18 @@ def serve(args: argparse.Namespace) -> None:
     # reachable-off-pod refusal above on purpose: that rule guards a listener
     # that hands out credentials, and this one serves counters.
     metrics_port = int(getattr(args, "metrics_port", 0) or 0)
-    if metrics_port:
-        start_metrics_listener(args.host, metrics_port)
-    else:
+    if not metrics_port:
         LOGGER.info("metrics listener disabled: %s is unset", METRICS_PORT_ENV)
+    elif not METRICS_PORT_MIN <= metrics_port <= METRICS_PORT_MAX:
+        # A hand-edited Deployment or a mismatched image: refused here by
+        # name, since bind() would raise past the listener's guard.
+        LOGGER.error(
+            "ALERT %s=%d is not a port in %d-%d; the broker serves no /metrics until "
+            "it restarts with one, and commands are unaffected",
+            METRICS_PORT_ENV, metrics_port, METRICS_PORT_MIN, METRICS_PORT_MAX,
+        )
+    else:
+        start_metrics_listener(args.host, metrics_port)
     if args.unix_socket:
         socket_path = Path(args.unix_socket)
         socket_path.parent.mkdir(parents=True, exist_ok=True)
