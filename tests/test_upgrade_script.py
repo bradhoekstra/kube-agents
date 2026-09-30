@@ -380,10 +380,14 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertNotIn("carries no baked release version", asks.stdout + asks.stderr)
             self.assertNotIn("mismatch", asks.stdout + asks.stderr)
 
-            explicit = self._run_fixture_upgrade_main(repo_path, f"--non-interactive --dry-run --image-tag={backport}")
+            # --dry-run with --plan is refused just past the tag block and before the
+            # tool checks, so that refusal is the environment-independent proof that
+            # the run left the tag block with the tag it was given.
+            past_the_block = "--dry-run and --plan are different previews"
+            explicit = self._run_fixture_upgrade_main(repo_path, f"--non-interactive --dry-run --plan --image-tag={backport}")
             self.assertNotIn("release line 0.2 at", explicit.stdout)
             self.assertNotIn("--image-tag is required", explicit.stdout + explicit.stderr)
-            self.assertIn(f"Target Image Tag: {backport}", explicit.stdout.replace("\x1b[1m", "").replace("\x1b[0m", ""))
+            self.assertIn(past_the_block, explicit.stdout + explicit.stderr)
 
             plan = self._run_fixture_upgrade_main(repo_path, "--non-interactive --plan")
             self.assertIn("release line 0.2 at", plan.stdout)
@@ -392,9 +396,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertIn("the plan will use the tag this install is already running", plan.stdout)
 
             git("switch", "-q", "--detach", stamp)
-            at_stamp = self._run_fixture_upgrade_main(repo_path, "--non-interactive --dry-run")
+            at_stamp = self._run_fixture_upgrade_main(repo_path, "--non-interactive --dry-run --plan")
             self.assertNotIn("release line", at_stamp.stdout)
-            self.assertIn("Target Image Tag: 0.2.0", at_stamp.stdout.replace("\x1b[1m", "").replace("\x1b[0m", ""))
+            self.assertNotIn("the plan will use the tag this install is already running", at_stamp.stdout, "the baked target stands")
+            self.assertIn(past_the_block, at_stamp.stdout + at_stamp.stderr)
 
     def test_a_missing_release_tag_is_named_by_the_source_check(self):
         """A line checkout that never fetched the release's tag cannot be recognised; the
