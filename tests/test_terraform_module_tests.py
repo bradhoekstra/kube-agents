@@ -11,25 +11,26 @@ target (its help line says it runs everything a pull request must pass
 offline), that no test file anywhere in the repository sits where the loop
 does not look (Terraform roots live under bench/tf and k8s-operator/testing
 too), and a `mock_provider` block, as a block and not a mention in a comment,
-for every provider a root declares in `required_providers` in any of its
-`.tf` files (a composition declares them in providers.tf, a module in
-versions.tf), in every one of its test files. The helpers that make those
-three judgements have cases of their own below, on fixtures, so the pin
-is known to fire on the shapes it exists for. tests/test_shellcheck_gate_wiring.py
-pins a workflow step the same way.
+for every provider a root needs: what it declares in `required_providers` in
+any of its `.tf` files (a composition declares them in providers.tf, a module
+in versions.tf) and what every local module it calls declares, since
+Terraform hands a child a default provider the root never named. Both test
+file spellings Terraform loads, `.tftest.hcl` and `.tftest.json`, count. The
+helpers that make those judgements have cases of their own below, on
+fixtures, so the pin is known to fire on the shapes it exists for.
+tests/test_shellcheck_gate_wiring.py pins a workflow step the same way.
 """
 
 import pathlib
 import re
+import sys
 import tempfile
 import unittest
 
-import yaml
-
 try:
-    from tests.test_shellcheck_gate_wiring import _JOB_ID, _run_lines
+    from tests.test_shellcheck_gate_wiring import _JOB_ID, _run_lines, _steps
 except ImportError:  # run from inside tests/
-    from test_shellcheck_gate_wiring import _JOB_ID, _run_lines
+    from test_shellcheck_gate_wiring import _JOB_ID, _run_lines, _steps
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _TERRAFORM_DIR = _REPO_ROOT / "terraform"
@@ -37,13 +38,16 @@ _TERRAFORM_DIR = _REPO_ROOT / "terraform"
 #: same set the validate job's init-and-validate loop covers.
 _SUITE_PARENTS = (_TERRAFORM_DIR / "modules", _TERRAFORM_DIR / "examples")
 _MAKEFILE = _REPO_ROOT / "Makefile"
-_WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "validate.yml"
-#: Directories a repository walk never reads: provider downloads, the
-#: docs site's dependencies, git's own store.
-_WALK_EXCLUDED_PARTS = frozenset({".terraform", "node_modules", ".git"})
 
-#: `_JOB_ID` and `_run_lines` are the shellcheck wiring test's: the same job
-#: on main's required-status-checks list, read the same way.
+#: Directories a repository walk never reads, the set the Python test
+#: discovery guard keeps for the same walk: provider downloads, the docs
+#: site's dependencies, git's store, and `.claude`, where a review command
+#: leaves worktrees of other branches inside a maintainer's checkout.
+sys.path.insert(0, str(_REPO_ROOT / "scripts"))
+from test_test_discovery import IGNORED_NAMES as _WALK_EXCLUDED_PARTS  # noqa: E402
+
+#: `_JOB_ID`, `_steps` and `_run_lines` are the shellcheck wiring test's: the
+#: same job on main's required-status-checks list, read the same way.
 _TARGET = "terraform-test"
 _GATE_COMMAND = f"make {_TARGET}"
 
@@ -63,19 +67,34 @@ _VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
 _TF_FILE_GLOB = "*.tf"
 _REQUIRED_PROVIDERS_OPEN = re.compile(r"^\s*required_providers\s*\{", re.MULTILINE)
 _REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+)\s*=\s*\{", re.MULTILINE)
+#: A module block calling a local directory, whose providers the root needs
+#: too: Terraform gives such a child a default provider the root never
+#: declared (full-install never declares `http`; the scope resolver it calls
+#: requires it).
+_LOCAL_MODULE_SOURCE = re.compile(r'^\s*source\s*=\s*"(\.\.?/[^"]*)"', re.MULTILINE)
 #: The block a test file needs per provider: at line start, so the literal
 #: surviving only in a comment (`# mock_provider "http" {}`) does not count.
 _MOCK_PROVIDER = r'^\s*mock_provider "{provider}"\s*\{{'
-_TEST_FILE_GLOB = "tests/*.tftest.hcl"
-_TEST_FILE_SUFFIX = ".tftest.hcl"
+#: Both spellings Terraform loads from tests/.
+_TEST_FILE_SUFFIXES = (".tftest.hcl", ".tftest.json")
+_TESTS_DIR = "tests"
+
+
+def _is_test_file(path: pathlib.Path) -> bool:
+    return path.name.endswith(_TEST_FILE_SUFFIXES)
+
+
+def _suite_files(root: pathlib.Path) -> list:
+    tests_dir = root / _TESTS_DIR
+    return sorted(p for p in tests_dir.iterdir() if _is_test_file(p)) if tests_dir.is_dir() else []
 
 
 def _suites(parents=_SUITE_PARENTS) -> dict:
     return {
-        root: sorted(root.glob(_TEST_FILE_GLOB))
+        root: _suite_files(root)
         for parent in parents
         for root in sorted(parent.iterdir())
-        if root.is_dir() and any(root.glob(_TEST_FILE_GLOB))
+        if root.is_dir() and _suite_files(root)
     }
 
 
@@ -83,8 +102,8 @@ def _unreached_test_files(repo_root: pathlib.Path, parents) -> list:
     reached = {path for files in _suites(parents).values() for path in files}
     everywhere = {
         path
-        for path in repo_root.rglob(f"*{_TEST_FILE_SUFFIX}")
-        if not _WALK_EXCLUDED_PARTS & set(path.parts)
+        for path in repo_root.rglob("*")
+        if _is_test_file(path) and not _WALK_EXCLUDED_PARTS & set(path.parts)
     }
     return sorted(everywhere - reached)
 
@@ -116,6 +135,22 @@ def _declared_providers(root: pathlib.Path) -> list:
     return sorted(providers)
 
 
+def _needed_providers(root: pathlib.Path, seen=None) -> list:
+    """What the root declares, plus what every local module it calls declares."""
+    root = root.resolve()
+    seen = set() if seen is None else seen
+    if root in seen:
+        return []
+    seen.add(root)
+    providers = set(_declared_providers(root))
+    for tf_file in sorted(root.glob(_TF_FILE_GLOB)):
+        for source in _LOCAL_MODULE_SOURCE.findall(tf_file.read_text()):
+            child = (root / source).resolve()
+            if child.is_dir():
+                providers.update(_needed_providers(child, seen))
+    return sorted(providers)
+
+
 def _unmocked(text: str, providers) -> list:
     return [
         provider
@@ -126,13 +161,13 @@ def _unmocked(text: str, providers) -> list:
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):
     def test_at_least_one_module_carries_a_suite(self):
-        self.assertTrue(_suites(), f"no {_TEST_FILE_GLOB} under {_SUITE_PARENTS}; this test pins their wiring")
+        self.assertTrue(_suites(), f"no {_TESTS_DIR}/*{_TEST_FILE_SUFFIXES[0]} under {_SUITE_PARENTS}; this test pins their wiring")
 
     def test_no_test_file_sits_where_the_loop_does_not_look(self):
         self.assertEqual(
             _unreached_test_files(_REPO_ROOT, _SUITE_PARENTS),
             [],
-            f"these {_TEST_FILE_SUFFIX} files are outside {_TEST_FILE_GLOB} under {[p.name for p in _SUITE_PARENTS]}, so `{_GATE_COMMAND}` never runs them",
+            f"these test files are outside {_TESTS_DIR}/ under {[p.name for p in _SUITE_PARENTS]}, so `{_GATE_COMMAND}` never runs them",
         )
 
     def test_the_makefile_target_reaches_every_module(self):
@@ -158,25 +193,24 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         )
 
     def test_the_validate_job_runs_the_target_unconditionally(self):
-        steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"][_JOB_ID]["steps"]
-        gate = [s for s in steps if _GATE_COMMAND in _run_lines(s)]
+        gate = [s for s in _steps() if _GATE_COMMAND in _run_lines(s)]
         self.assertEqual(
             len(gate),
             1,
-            f"the `{_JOB_ID}` job in {_WORKFLOW.name} must run `{_GATE_COMMAND}` in exactly one step",
+            f"the `{_JOB_ID}` job in validate.yml must run `{_GATE_COMMAND}` in exactly one step",
         )
         self.assertNotIn("if", gate[0], f"the `{_GATE_COMMAND}` step must not carry an `if:`")
 
-    def test_every_test_file_mocks_every_provider_its_root_declares(self):
+    def test_every_test_file_mocks_every_provider_its_root_needs(self):
         for root, files in _suites().items():
-            providers = _declared_providers(root)
-            self.assertTrue(providers, f"{root.name} declares no provider in any {_TF_FILE_GLOB}")
+            providers = _needed_providers(root)
+            self.assertTrue(providers, f"{root.name} needs no provider in any {_TF_FILE_GLOB}, its own or a called module's")
             for path in files:
                 with self.subTest(root=root.name, file=path.name):
                     self.assertEqual(
                         _unmocked(path.read_text(), providers),
                         [],
-                        f"{path.relative_to(_REPO_ROOT)} does not mock every provider its root declares ({providers}); a read the file forgets to override would reach a real API from CI",
+                        f"{path.relative_to(_REPO_ROOT)} does not mock every provider its root needs ({providers}); a read the file forgets to override would reach a real API from CI",
                     )
 
 
@@ -205,6 +239,45 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         (self.root / "main.tf").write_text("locals {\n  a = {\n    b = {}\n  }\n}\n")
         self.assertEqual(_declared_providers(self.root), [])
 
+    def test_a_called_local_module_adds_the_providers_it_declares(self):
+        # A composition that declares google and calls a module requiring
+        # http, with no providers map: the child gets a default http provider,
+        # so the composition's tests must mock it too. The root file wins for
+        # the declared set, the union for the needed set; a module calling
+        # itself does not recurse forever.
+        composition = self.root / "examples" / "c"
+        module = self.root / "modules" / "m"
+        for directory in (composition, module):
+            directory.mkdir(parents=True)
+        (composition / "providers.tf").write_text(
+            "terraform {\n  required_providers {\n    google = {\n      source = \"hashicorp/google\"\n    }\n  }\n}\n"
+        )
+        (composition / "main.tf").write_text(
+            'module "m" {\n  source = "../../modules/m"\n}\n'
+            'module "remote" {\n  source = "git::https://example.com/x.git//m"\n}\n'
+        )
+        (module / "versions.tf").write_text(
+            "terraform {\n  required_providers {\n    http = {\n      source = \"hashicorp/http\"\n    }\n  }\n}\n"
+        )
+        (module / "main.tf").write_text('module "self" {\n  source = "./"\n}\n')
+        self.assertEqual(_declared_providers(composition), ["google"])
+        self.assertEqual(_needed_providers(composition), ["google", "http"])
+
+    def test_a_json_test_file_counts_as_a_test_file(self):
+        parents = (self.root / "terraform" / "modules",)
+        suite = self.root / "terraform" / "modules" / "m" / "tests"
+        suite.mkdir(parents=True)
+        (suite / "a.tftest.hcl").write_text("")
+        (suite / "b.tftest.json").write_text("{}")
+        (suite / "notes.md").write_text("")
+        stray = self.root / "terraform" / "modules" / "m" / "b.tftest.json"
+        stray.write_text("{}")
+        self.assertEqual(
+            [p.name for p in _suites(parents)[self.root / "terraform" / "modules" / "m"]],
+            ["a.tftest.hcl", "b.tftest.json"],
+        )
+        self.assertEqual(_unreached_test_files(self.root, parents), [stray])
+
     def test_a_mock_in_a_comment_does_not_count(self):
         text = '# mock_provider "http" {}\nmock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n'
         self.assertEqual(_unmocked(text, ["google", "http"]), ["http"])
@@ -218,7 +291,8 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         reached = self.root / "terraform" / "modules" / "m" / "tests"
         stray = self.root / "bench" / "tf" / "fleet" / "tests"
         ignored = self.root / "terraform" / "modules" / "m" / ".terraform" / "tests"
-        for directory in (reached, stray, ignored):
+        worktree = self.root / ".claude" / "worktrees" / "pr-1" / "terraform" / "modules" / "m" / "tests"
+        for directory in (reached, stray, ignored, worktree):
             directory.mkdir(parents=True)
             (directory / "a.tftest.hcl").write_text("")
         self.assertEqual(

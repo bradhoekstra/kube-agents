@@ -649,14 +649,18 @@ tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for 
 # (tests/test_scope_iam.py pins the text; these pin the behaviour). A
 # directory without tests/ is skipped, and a new one's tests/ is reached with
 # no edit here; tests/test_terraform_module_tests.py pins the loop, the step
-# and that no .tftest.hcl sits outside it.
+# and that no test file sits outside it. Every directory runs even after one
+# fails and the failures are named again at the end, for the reason
+# test-python gives: a red run that hides the next suite's result costs a CI
+# round trip to discover.
 terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
-	@set -e; for dir in terraform/modules/*/ terraform/examples/*/; do \
+	@failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
 	    echo "Testing $$dir..."; \
-	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test); \
+	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
 	  fi; \
-	done
+	done; \
+	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi
 
 tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a previous destroy left behind.
 	@./terraform/examples/full-install/lifecycle.sh apply $(ARGS)
