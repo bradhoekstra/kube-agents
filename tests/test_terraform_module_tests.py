@@ -37,10 +37,12 @@ import sys
 import tempfile
 import unittest
 
+import yaml
+
 try:
-    from tests.test_shellcheck_gate_wiring import _JOB_ID, _run_lines, _steps
+    from tests.test_shellcheck_gate_wiring import _JOB_ID, _WORKFLOW, _run_lines
 except ImportError:  # run from inside tests/
-    from test_shellcheck_gate_wiring import _JOB_ID, _run_lines, _steps
+    from test_shellcheck_gate_wiring import _JOB_ID, _WORKFLOW, _run_lines
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _TERRAFORM_DIR = _REPO_ROOT / "terraform"
@@ -56,10 +58,13 @@ _MAKEFILE = _REPO_ROOT / "Makefile"
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 from test_test_discovery import IGNORED_NAMES as _WALK_EXCLUDED_PARTS  # noqa: E402
 
-#: `_JOB_ID`, `_steps` and `_run_lines` are the shellcheck wiring test's: the
-#: same job on main's required-status-checks list, read the same way.
+#: `_JOB_ID`, `_WORKFLOW` and `_run_lines` are the shellcheck wiring test's:
+#: the same job on main's required-status-checks list, read the same way.
 _TARGET = "terraform-test"
 _GATE_COMMAND = f"make {_TARGET}"
+#: What lets a gate step or job run red without failing the check.
+_CONTINUE_ON_ERROR = "continue-on-error"
+_IF = "if"
 
 #: The recipe line that lists the target in `make help`, and the loop that
 #: reaches every module rather than naming the ones that had tests when it
@@ -75,15 +80,29 @@ _MAKE_COMMENT = re.compile(r"^ *#")
 _SHELL_COMMENT = re.compile(r"^\t[ \t]*[@+-]*[ \t]*#")
 _LINE_CONTINUATION = "\\"
 #: The rule line itself, at the start of a line, so a mention of the
-#: target elsewhere (`pre-verify:`, a comment) is not read as the rule.
+#: target elsewhere (`pre-verify:`, a comment) is not read as the rule; the
+#: recipe then runs to the first line that is neither a tab line, blank,
+#: nor a comment, which is where make ends it.
 _RULE_LINE = "^{target}:"
+_RECIPE_LINE_CONTINUES = re.compile(r"^(\t|\s*$|\s*#)")
 #: The shell loop skips a name beginning with a dot, so such a directory
 #: is never a suite the loop runs, whatever it holds.
 _HIDDEN_PREFIX = "."
 _LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
 _TEST_COMMAND = "terraform test"
+#: The command as a command word, after the shell's quoted strings are
+#: removed (an `echo "… terraform test"` is not a run), and the shape that
+#: records rather than swallows its failure.
+_SHELL_STRING = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'')
+_TEST_INVOCATION = re.compile(r"(?:^\s*|[;&|(]\s*)terraform test(?=\s|\)|$)", re.MULTILINE)
+_FAILURE_RECORDED = f"{_TEST_COMMAND}) || failed="
+_FAILURE_EXITS = "exit 1"
 _VERIFY_TARGET = "verify"
 _VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
+#: The whole recipe line, in the recipe's own `@echo "==> …"; command`
+#: shape or bare: make's `@` and `+` prefixes are fine, its `-` (ignore
+#: errors) is not, and nothing may follow the command (`|| true`).
+_VERIFY_LINE_EXACT = re.compile(rf'^\t[@+]*(?:echo "[^"]*"; *)?\$\(MAKE\) --no-print-directory {_TARGET}\s*$', re.MULTILINE)
 
 #: The HCL the pin reads, and the spelling it refuses.
 _TF_FILE_GLOB = "*.tf"
@@ -95,6 +114,8 @@ _HEREDOC_OPEN = re.compile(r"<<-?(\w+)\r?\n")
 _LINE_COMMENT_OPENERS = ("#", "//")
 _BLOCK_COMMENT_OPEN, _BLOCK_COMMENT_CLOSE = "/*", "*/"
 _TEMPLATE_OPENERS = ("${", "%{")
+#: The escapes for a literal `${` and `%{`, which open nothing.
+_TEMPLATE_ESCAPES = ("$${", "%%{")
 _WHITESPACE = " \t\r\n"
 #: Token kinds.
 _STR, _WORD, _OPEN, _CLOSE, _EQUALS, _OTHER = "str", "word", "{", "}", "=", "other"
@@ -177,9 +198,13 @@ def _recipe(makefile: str, target: str) -> str:
     rule = re.search(_RULE_LINE.format(target=re.escape(target)), makefile, re.MULTILINE)
     if rule is None:
         raise AssertionError(f"the Makefile has no `{target}:` rule")
-    recipe = makefile[rule.start():]
-    end = recipe.find("\n\n")
-    return recipe if end < 0 else recipe[:end]
+    lines = makefile[rule.start():].split("\n")
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if not _RECIPE_LINE_CONTINUES.match(line):
+            break
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _recipe_body(makefile: str, target: str) -> str:
@@ -211,6 +236,8 @@ def _string_end(text: str, start: int) -> int:
             index += 2
         elif char == '"':
             return index + 1
+        elif text[index : index + 3] in _TEMPLATE_ESCAPES:
+            index += 3
         elif text[index : index + 2] in _TEMPLATE_OPENERS:
             index = _template_end(text, index + 2)
         else:
@@ -426,6 +453,16 @@ def _json_bodies(value) -> list:
     return [body for body in bodies if isinstance(body, dict)]
 
 
+def _json_labelled(value) -> list:
+    """(label, body) pairs of a labelled JSON block in either form."""
+    elements = [value] if isinstance(value, dict) else [e for e in value if isinstance(e, dict)] if isinstance(value, list) else []
+    pairs = []
+    for element in elements:
+        for label, bodies in element.items():
+            pairs.extend((label, body) for body in _json_unlabelled(bodies))
+    return pairs
+
+
 def _json_unlabelled(value) -> list:
     """An unlabelled JSON block: one object or a list of them."""
     entries = value if isinstance(value, list) else [value]
@@ -492,6 +529,29 @@ def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
     return sorted(providers)
 
 
+def _test_invocations(recipe_body: str) -> list:
+    """Where the recipe runs `terraform test` as a command, quoted strings
+    removed so an echo of the words is not one."""
+    return _TEST_INVOCATION.findall(_SHELL_STRING.sub('""', recipe_body))
+
+
+def _gate_defects(job: dict) -> list:
+    """Why the job would not gate on `make terraform-test`: no such step,
+    more than one, an `if:`, or `continue-on-error` on the step or the job."""
+    defects = []
+    steps = [s for s in job.get("steps", []) if _GATE_COMMAND in _run_lines(s)]
+    if len(steps) != 1:
+        defects.append(f"{len(steps)} steps run `{_GATE_COMMAND}`; exactly one must")
+    for step in steps:
+        if _IF in step:
+            defects.append("the step carries an `if:`")
+        if step.get(_CONTINUE_ON_ERROR):
+            defects.append(f"the step carries `{_CONTINUE_ON_ERROR}`")
+    if job.get(_CONTINUE_ON_ERROR):
+        defects.append(f"the job carries `{_CONTINUE_ON_ERROR}`")
+    return defects
+
+
 def _mock_configurations_in_hcl(text: str) -> set:
     """Each `mock_provider` block as `name` or `name.alias`."""
     configurations = set()
@@ -504,10 +564,9 @@ def _mock_configurations_in_hcl(text: str) -> set:
 def _mock_configurations_in_json(text: str) -> set:
     mocks = json.loads(text).get(_MOCK_PROVIDER_BLOCK, {}) if text.strip() else {}
     configurations = set()
-    for name, entries in (mocks.items() if isinstance(mocks, dict) else []):
-        for entry in _json_unlabelled(entries):
-            alias = entry.get(_ALIAS_ATTRIBUTE)
-            configurations.add(name if alias is None else f"{name}{_ALIAS_SEPARATOR}{alias}")
+    for name, entry in _json_labelled(mocks):
+        alias = entry.get(_ALIAS_ATTRIBUTE)
+        configurations.add(name if alias is None else f"{name}{_ALIAS_SEPARATOR}{alias}")
     return configurations
 
 
@@ -545,23 +604,24 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             body,
             f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs",
         )
-        self.assertIn(_TEST_COMMAND, body, f"`{_TARGET}`'s recipe does not run `{_TEST_COMMAND}`")
+        self.assertTrue(_test_invocations(body), f"`{_TARGET}`'s recipe does not run `{_TEST_COMMAND}` as a command (an echo of the words is not a run)")
+        self.assertIn(_FAILURE_RECORDED, body, f"`{_TARGET}` must record a failing suite (`{_FAILURE_RECORDED}…`) rather than swallow it")
+        self.assertIn(_FAILURE_EXITS, body, f"`{_TARGET}` must exit non-zero once a suite has failed")
 
     def test_make_verify_runs_the_target(self):
-        self.assertIn(
-            _VERIFY_LINE,
+        self.assertRegex(
             _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET),
-            f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them",
+            _VERIFY_LINE_EXACT,
+            f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them, on a line of its own with no `-` prefix and nothing appended that would swallow its exit status",
         )
 
     def test_the_validate_job_runs_the_target_unconditionally(self):
-        gate = [s for s in _steps() if _GATE_COMMAND in _run_lines(s)]
+        job = yaml.safe_load(_WORKFLOW.read_text())["jobs"][_JOB_ID]
         self.assertEqual(
-            len(gate),
-            1,
-            f"the `{_JOB_ID}` job in validate.yml must run `{_GATE_COMMAND}` in exactly one step",
+            _gate_defects(job),
+            [],
+            f"the `{_JOB_ID}` job in validate.yml must run `{_GATE_COMMAND}` in exactly one step, with no `if:` and no `{_CONTINUE_ON_ERROR}` on the step or the job",
         )
-        self.assertNotIn("if", gate[0], f"the `{_GATE_COMMAND}` step must not carry an `if:`")
 
     def test_every_test_file_mocks_every_provider_its_root_needs(self):
         for root, files in _suites().items():
@@ -625,6 +685,14 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             'variable "w" {\n  default = "{"\n}\n'
         )
         self.assertEqual(_declared_providers(self.root), ["google", "http"])
+
+    def test_an_escaped_template_opener_in_a_string_opens_nothing(self):
+        # `$${` is a literal, not a template; the block after it is still read.
+        (self.root / "main.tf").write_text(
+            'variable "v" {\n  default = "$${"\n}\nvariable "w" {\n  default = "%%{ and ${var.x}"\n}\n'
+            "terraform {\n  required_providers {\n    http = {\n      source = \"hashicorp/http\"\n    }\n  }\n}\n"
+        )
+        self.assertEqual(_declared_providers(self.root), ["http"])
 
     def test_a_root_with_a_tf_json_file_is_refused_not_half_read(self):
         (self.root / "versions.tf.json").write_text('{"terraform": {"required_providers": {"http": {}}}}')
@@ -716,6 +784,8 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
     def test_a_json_test_file_is_read_as_json(self):
         text = '{"mock_provider": {"google": {}, "http": [{"alias": "x"}, {}]}, "run": {"x": {"command": "plan"}}}'
         self.assertEqual(_unmocked(text, ["google", "http"], "b.tftest.json"), [])
+        array_form = '{"mock_provider": [{"google": {}}, {"http": {}}], "run": [{"x": {"command": "plan"}}]}'
+        self.assertEqual(_unmocked(array_form, ["google", "http"], "b.tftest.json"), [])
         aliased = '{"mock_provider": {"google": {"alias": "x"}}}'
         self.assertEqual(_unmocked(aliased, ["google"], "b.tftest.json"), ["google"])
         self.assertEqual(_unmocked('{"run": {"x": {}}}', ["google"], "b.tftest.json"), ["google"])
@@ -800,6 +870,38 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
                 self.assertIn("@echo done", _recipe_body(silenced, "v"))
         spaced = "v: ## v\n   # $(MAKE) --no-print-directory terraform-test\n\t@echo done\n"
         self.assertNotIn(_VERIFY_LINE, _recipe_body(spaced, "v"))
+
+    def test_a_recipe_ends_where_make_ends_it(self):
+        # A blank line or a comment inside a recipe does not end it; the
+        # next rule does, with or without a blank line before it.
+        makefile = (
+            "verify: ## v\n\t@echo a\n\n# still the recipe\n\t$(MAKE) --no-print-directory terraform-test\n"
+            "other: ## o\n\t@echo other\n"
+        )
+        body = _recipe_body(makefile, "verify")
+        self.assertRegex(body, _VERIFY_LINE_EXACT)
+        self.assertNotIn("other", body)
+        adjacent = "verify: ## v\n\t@echo a\nother: ## o\n\t$(MAKE) --no-print-directory terraform-test\n"
+        self.assertNotRegex(_recipe_body(adjacent, "verify"), _VERIFY_LINE_EXACT)
+
+    def test_an_echo_of_the_words_is_not_a_run_and_a_swallowed_failure_is_not_a_gate(self):
+        self.assertEqual(_test_invocations('\t@echo "skipping terraform test in $$dir"\n'), [])
+        self.assertTrue(_test_invocations('\t(cd "$$dir" && terraform init && terraform test) || failed="$$failed $$dir"\n'))
+        self.assertTrue(_test_invocations("\tterraform test\n"))
+        for line in ("\t-$(MAKE) --no-print-directory terraform-test", "\t$(MAKE) --no-print-directory terraform-test || true", "\t$(MAKE) --no-print-directory terraform-test; true"):
+            with self.subTest(line=line):
+                self.assertNotRegex(line + "\n", _VERIFY_LINE_EXACT)
+        self.assertRegex("\t@$(MAKE) --no-print-directory terraform-test\n", _VERIFY_LINE_EXACT)
+        self.assertRegex('\t@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test\n', _VERIFY_LINE_EXACT)
+        self.assertNotRegex('\t@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test || true\n', _VERIFY_LINE_EXACT)
+
+    def test_a_gate_step_that_cannot_fail_the_job_is_a_defect(self):
+        good = {"steps": [{"name": "x", "run": "make terraform-test"}]}
+        self.assertEqual(_gate_defects(good), [])
+        self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "continue-on-error": True}]}))
+        self.assertTrue(_gate_defects({"continue-on-error": True, "steps": [{"run": "make terraform-test"}]}))
+        self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "if": "false"}]}))
+        self.assertTrue(_gate_defects({"steps": [{"run": "echo make terraform-test"}]}))
 
     def test_the_rule_is_found_by_its_own_line_not_a_mention(self):
         makefile = (
