@@ -752,7 +752,7 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             (directory / "a.tftest.hcl").write_text("")
         self.assertEqual(
             _unreached_test_files(self.root, parents),
-            [hidden / "a.tftest.hcl", stray / "a.tftest.hcl"],
+            sorted([hidden / "a.tftest.hcl", stray / "a.tftest.hcl"]),
         )
         self.assertNotIn(hidden.parent, _suites(parents))
 
