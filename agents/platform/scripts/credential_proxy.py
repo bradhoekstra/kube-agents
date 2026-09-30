@@ -5595,8 +5595,8 @@ class MetricsHandler(BaseHTTPRequestHandler):
         # method: a peer that hangs up before the reply is on the wire (a
         # collector's aborted scrape, a probe at a path this listener does not
         # serve, a method it does not implement) is a debug line and a closed
-        # connection, not the traceback the server prints for an exception
-        # out of a handler. The next scrape reads the same counters.
+        # connection, not a handler fault for the server's error hook to log
+        # with a traceback. The next scrape reads the same counters.
         try:
             super().handle_one_request()
         except OSError as exc:
