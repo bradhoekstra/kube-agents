@@ -18,6 +18,7 @@ from tests.testing.common import (
     get_isolated_test_env,
 )
 from tests.testing.release import (
+    MOCK_INITIAL_VERSION,
     MOCK_EXPLICIT_RELEASE_VERSION_NEXT,
     MOCK_LINE_PATCH_RELEASE_TAG,
     MOCK_TARGET_RELEASE_LINE,
@@ -27,6 +28,7 @@ from tests.testing.release import (
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _TAG_GA_RELEASE_SH = _REPO_ROOT / "scripts" / "release" / "tag_ga_release.sh"
+_CALCULATE_NEXT_VERSION_SH = _REPO_ROOT / "scripts" / "release" / "calculate_next_version.sh"
 
 
 class TagGAReleaseScriptTest(unittest.TestCase):
@@ -690,11 +692,104 @@ class TagGAReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def _rejected_first_release(self):
-        """A first release whose atomic push the remote rejected, left in the checkout that ran it.
+    def _checkout_holding_an_unpushed_release(self):
+        """A checkout that holds the release's tag and line while the remote has neither.
 
-        Returns what the same-checkout re-run tests need: the leftover local tag
-        and line are both at the stamp, and the remote has neither.
+        Staged with the tagger's own dry run (off CI it sets both locally and
+        pushes nothing), which is also the shape a run killed between the local
+        refs and the push leaves behind. Returns what the same-checkout tests need.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        self._populate_valid_release_files(repo_dir)
+        git("add", ".")
+        git("commit", "-m", "feat: populate release files")
+        main_commit = git("rev-parse", "HEAD").stdout.strip()
+        bare_dir = self._bare_origin_for(git, repo_dir)
+        git("push", "--quiet", "origin", "main")
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+
+        def remote(ref):
+            return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+
+        dry = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env=self._FAKE_RELEASE_REPO, cwd=repo_dir)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("Dry-run", dry.stdout)
+        local_stamp = git("rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
+        self.assertEqual(git("rev-parse", f"refs/heads/{branch}").stdout.strip(), local_stamp)
+        self.assertEqual(git("--git-dir", str(bare_dir), "tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
+        self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", branch).stdout.strip(), "")
+        return repo_dir, git, bare_dir, main_commit, branch, local_stamp, remote
+
+    def test_an_unpushed_release_in_the_checkout_is_pushed_whole_by_a_ci_run_there(self):
+        """The local tag is not proof the remote has it.
+
+        Whether the tag is still to be pushed is read from the remote: a CI run
+        in a checkout that already holds the tag pushes it with the line, where
+        a local read would have pushed the line alone and left the remote in the
+        state the atomic push exists to rule out.
+        """
+        repo_dir, git, bare_dir, main_commit, branch, local_stamp, remote = self._checkout_holding_an_unpushed_release()
+        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("Reusing existing release commit", rerun.stderr)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' exists only in this checkout", rerun.stdout)
+        self.assertIn(f"Release line '{branch}' exists only in this checkout", rerun.stderr)
+        self.assertNotIn("Idempotent skip", rerun.stdout)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", rerun.stdout)
+        self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), local_stamp)
+        self.assertEqual(remote(f"refs/heads/{branch}"), local_stamp)
+
+        third = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertIn("Nothing to push", third.stdout)
+
+    def test_an_unpushed_release_in_the_checkout_does_not_pin_a_candidate_that_moved(self):
+        """The remote lacks the tag, so the local one is recreated at the new stamp
+        rather than refused as "already exists but points to" the old one."""
+        repo_dir, git, bare_dir, main_commit, branch, local_stamp, remote = self._checkout_holding_an_unpushed_release()
+        (pathlib.Path(repo_dir) / "later.txt").write_text("fix")
+        git("add", "later.txt")
+        git("commit", "-m", "fix: landed after the dry run")
+        new_candidate = git("rev-parse", "HEAD").stdout.strip()
+        git("push", "--quiet", "origin", "main")
+
+        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, new_candidate], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("exists only in this checkout", rerun.stdout)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", rerun.stdout)
+        tag_commit = remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}")
+        self.assertNotEqual(tag_commit, local_stamp)
+        self.assertEqual(git("rev-parse", f"{tag_commit}^1").stdout.strip(), new_candidate)
+        self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
+
+    def test_a_tag_the_remote_holds_elsewhere_is_refused_whatever_the_checkout_holds(self):
+        """The one shape only the remote read catches.
+
+        The checkout holds the tag at the release commit, so the local read says
+        "already exists ... idempotent skip" and would push the line alone; the
+        remote holds the tag at another commit, which `git fetch --tags` cannot
+        clobber. The remote read refuses, naming the repository, with nothing pushed.
+        """
+        repo_dir, git, bare_dir, main_commit, branch, local_stamp, remote = self._checkout_holding_an_unpushed_release()
+        first = git("rev-list", "--max-parents=0", "HEAD").stdout.strip().splitlines()[0]
+        git("--git-dir", str(bare_dir), "tag", MOCK_TARGET_RELEASE_TAG, first)
+
+        proc = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertNotEqual(proc.returncode, 0)
+        repo = f"{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}"
+        self.assertIn(f"Tag '{MOCK_TARGET_RELEASE_TAG}' already exists on {repo} but points to commit {first}", proc.stderr)
+        self.assertNotIn("Idempotent skip", proc.stdout)
+        self.assertNotIn("successfully pushed", proc.stdout)
+        self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", branch).stdout.strip(), "")
+
+    def test_a_rejected_push_leaves_the_checkout_as_it_was_found(self):
+        """Nothing local survives a rejected push: not the tag, not the line.
+
+        The tag matters most. The calculator and the publish step read the tag
+        list, so a tag only this checkout held would be the next run's GA base
+        and its notes-start tag; with it taken back, the calculator in this
+        checkout agrees with one in a fresh clone, and the re-run stamps again.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
@@ -706,85 +801,80 @@ class TagGAReleaseScriptTest(unittest.TestCase):
         git("push", "--quiet", "origin", "main")
         branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
         reject_marker = self._install_release_branch_rejecting_hook(git, bare_dir)
-
-        def remote(ref):
-            return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+        ci = {"CI": "true", **self._FAKE_RELEASE_REPO}
 
         reject_marker.touch()
-        first = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        first = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env=ci, cwd=repo_dir)
         self.assertNotEqual(first.returncode, 0)
         self.assertIn("rejected by the test hook", first.stderr)
+        self.assertIn("taken back from this checkout", first.stderr)
+        self.assertEqual(git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
+        self.assertEqual(git("branch", "--list", branch).stdout.strip(), "")
         reject_marker.unlink()
-        leftover = git("rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
-        self.assertEqual(git("rev-parse", f"refs/heads/{branch}").stdout.strip(), leftover)
-        self.assertEqual(git("--git-dir", str(bare_dir), "tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
-        self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", branch).stdout.strip(), "")
-        return repo_dir, git, main_commit, branch, leftover, remote
 
-    def test_a_rejected_push_is_finished_from_the_same_checkout_with_both_refs(self):
-        """The leftover local tag is not proof the remote has it.
-
-        Whether the tag is still to be pushed is read from the remote: a re-run in
-        the checkout the rejected push left its tag in pushes the tag with the
-        line, where a local read would have pushed the line alone and left the
-        remote in the state the atomic push exists to rule out.
-        """
-        repo_dir, git, main_commit, branch, leftover, remote = self._rejected_first_release()
-        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
-        self.assertEqual(rerun.returncode, 0, rerun.stderr)
-        self.assertIn("Reusing existing release commit", rerun.stderr)
-        self.assertNotIn("Idempotent skip", rerun.stdout)
-        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", rerun.stdout)
-        self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), leftover)
-        self.assertEqual(remote(f"refs/heads/{branch}"), leftover)
-
-        third = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
-        self.assertEqual(third.returncode, 0, third.stderr)
-        self.assertIn("Nothing to push", third.stdout)
-
-    def test_a_rejected_push_re_run_from_the_same_checkout_stamps_from_the_new_candidate(self):
-        """The leftover tag does not pin a candidate that has moved on.
-
-        The remote lacks the tag, so the local one is recreated at the new stamp
-        rather than refused as "already exists but points to" the old one, which
-        is what lets the re-run stamp from the new head as the runbook says.
-        """
-        repo_dir, git, main_commit, branch, leftover, remote = self._rejected_first_release()
         (pathlib.Path(repo_dir) / "later.txt").write_text("fix")
         git("add", "later.txt")
         git("commit", "-m", "fix: landed after the rejected push")
         new_candidate = git("rev-parse", "HEAD").stdout.strip()
         git("push", "--quiet", "origin", "main")
+        fresh_dir = pathlib.Path(repo_dir).parent / "fresh"
+        git("clone", "--quiet", str(bare_dir), str(fresh_dir))
+        self._bare_origin_for(git, repo_dir, checkout=fresh_dir)
+        here = self._run_calculator(repo_dir, new_candidate, ci)
+        fresh = self._run_calculator(fresh_dir, new_candidate, ci)
+        self.assertEqual(here.returncode, 0, here.stderr)
+        self.assertEqual(fresh.returncode, 0, fresh.stderr)
+        self.assertEqual(here.stdout.strip(), fresh.stdout.strip())
 
-        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, new_candidate], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, new_candidate], env=ci, cwd=repo_dir)
         self.assertEqual(rerun.returncode, 0, rerun.stderr)
-        self.assertIn("exists only in this checkout", rerun.stdout)
+        self.assertNotIn("Reusing existing release commit", rerun.stderr)
         self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", rerun.stdout)
-        tag_commit = remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}")
-        self.assertNotEqual(tag_commit, leftover)
+        tag_commit = git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
         self.assertEqual(git("rev-parse", f"{tag_commit}^1").stdout.strip(), new_candidate)
-        self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
 
-    def test_a_tag_the_remote_holds_elsewhere_is_refused_by_the_remote_read(self):
-        """A remote tag at another commit is the collision, whatever this checkout holds."""
-        temp_dir, repo_dir, git = create_mock_git_repo()
-        try:
-            self._populate_valid_release_files(repo_dir)
-            git("add", ".")
-            git("commit", "-m", "feat: populate release files")
-            main_commit = git("rev-parse", "HEAD").stdout.strip()
-            bare_dir = self._bare_origin_for(git, repo_dir)
-            git("push", "--quiet", "origin", "main")
-            first = git("rev-list", "--max-parents=0", "HEAD").stdout.strip().splitlines()[0]
-            git("--git-dir", str(bare_dir), "tag", MOCK_TARGET_RELEASE_TAG, first)
+    def test_the_calculator_in_ci_does_not_read_a_tag_only_the_checkout_holds_as_the_base(self):
+        """A release that never landed is not the next version's base.
 
-            proc = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn(f"Tag '{MOCK_TARGET_RELEASE_TAG}' already exists", proc.stderr)
-            self.assertIn(f"points to commit {first}", proc.stderr)
-            self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", f"release/{MOCK_TARGET_RELEASE_LINE}").stdout.strip(), "")
-        finally:
-            temp_dir.cleanup()
+        The tagger's dry run is the fixture because it is what leaves such a tag
+        (as would a run killed before its push). In CI the calculator prunes the
+        tag list to the remote's before reading the base, so a persistent clone
+        answers as a fresh one does, and the publish step that follows in the
+        same checkout reads the same list.
+        """
+        repo_dir, git, bare_dir, main_commit, branch, local_stamp, remote = self._checkout_holding_an_unpushed_release()
+        (pathlib.Path(repo_dir) / "later.txt").write_text("fix")
+        git("add", "later.txt")
+        git("commit", "-m", "fix: landed after the dry run")
+        new_candidate = git("rev-parse", "HEAD").stdout.strip()
+        git("push", "--quiet", "origin", "main")
+        fresh_dir = pathlib.Path(repo_dir).parent / "fresh"
+        git("clone", "--quiet", str(bare_dir), str(fresh_dir))
+        self._bare_origin_for(git, repo_dir, checkout=fresh_dir)
+        ci = {"CI": "true", **self._FAKE_RELEASE_REPO}
+
+        off_ci = self._run_calculator(repo_dir, new_candidate, self._FAKE_RELEASE_REPO)
+        self.assertEqual(off_ci.returncode, 0, off_ci.stderr)
+        self.assertNotEqual(off_ci.stdout.strip(), MOCK_TARGET_RELEASE_TAG, "off CI the local tag is read, as a dry run should")
+
+        here = self._run_calculator(repo_dir, new_candidate, ci)
+        fresh = self._run_calculator(fresh_dir, new_candidate, ci)
+        self.assertEqual(here.returncode, 0, here.stderr)
+        self.assertEqual(fresh.returncode, 0, fresh.stderr)
+        self.assertEqual(here.stdout.strip(), fresh.stdout.strip())
+        self.assertEqual(here.stdout.strip(), MOCK_INITIAL_VERSION, "no GA tag has landed, so this is the first version")
+        self.assertEqual(git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "", "the local-only tag is pruned")
+
+    def _run_calculator(self, repo_dir, candidate, env):
+        gh_out = pathlib.Path(repo_dir) / "calc_out.txt"
+        gh_out.write_text("")
+        return subprocess.run(
+            ["bash", str(_CALCULATE_NEXT_VERSION_SH)],
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(overrides={"TARGET_COMMIT": candidate, "GITHUB_OUTPUT": str(gh_out), **env}),
+        )
 
     def test_a_deleted_line_is_recreated_from_the_tag_on_re_run(self):
         """With the tag on the remote and the line gone, a re-run reuses the tagged commit and pushes the line alone."""

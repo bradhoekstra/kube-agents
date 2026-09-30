@@ -21,11 +21,16 @@ if [ -n "${RELEASE_LINE}" ] && ! [[ "${RELEASE_LINE}" =~ ${RELEASE_LINE_SHAPE_RE
   exit 1
 fi
 
-# 0. Protection against Shallow Checkout and Remote Tag Sync in CI
+# 0. Protection against Shallow Checkout and Remote Tag Sync in CI. Pruned, so
+# that the tag list the base is read from is the remote's: a tag only this
+# checkout holds (a release that never landed, in a persistent clone) would
+# otherwise be the base of the version and, downstream, the notes-start tag of
+# a release the repository does not hold.
 if is_ci_pipeline; then
   TARGET_REPO="$(get_target_repo)"
   echo "📥 Fetching tags from target repository (${TARGET_REPO})..." >&2
-  git fetch "https://github.com/${TARGET_REPO}.git" --tags --force 2>/dev/null || git fetch --tags --force 2>/dev/null || true
+  git fetch "https://github.com/${TARGET_REPO}.git" --tags --force --prune --prune-tags 2>/dev/null ||
+    git fetch --tags --force --prune --prune-tags 2>/dev/null || true
 fi
 
 if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo "false")" = "true" ]; then

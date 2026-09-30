@@ -669,7 +669,8 @@ exit {docker_exit}
 
 
     # ─── release lines ───────────────────────────────────────────────────────
-    # A line's gate is rc_*_validated on its head, and its candidate is the head.
+    # A line's gate is the RC pipeline's rc_<ts>_<sha>_validated on its candidate: the
+    # head, or what a stamped head or a named version was cut from.
 
     def _line_repo(self):
         temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()

@@ -111,7 +111,7 @@ During initial development (`0.y.z`), any breaking change increments `MINOR` (`0
 
 The automated version calculator never promotes `0.y.z` to `1.0.0` on its own. Declaring API stability and graduating to `1.0.0` is a manual governance decision by project maintainers, who publish that release with an explicit version.
 
-Once `1.0.0` is established, the automated calculator resumes standard SemVer rules: breaking changes bump `MAJOR`, new features bump `MINOR`, and bug fixes bump `PATCH`.
+Once `1.0.0` is established, the automated calculator resumes standard SemVer rules: breaking changes bump `MAJOR`, new features bump `MINOR`, and bug fixes bump `PATCH`, except on `main` once the base release's line has its branch, where a fix-only range bumps `MINOR` because the patch numbers belong to the line.
 
 ## Who cuts a release
 

@@ -1324,13 +1324,6 @@ release_branch_for_line() {
   echo "${RELEASE_BRANCH_PREFIX}${line}"
 }
 
-# The commit the release repository's copy of a branch points at, or nothing
-# when it has none. The match is exact: ls-remote's own pattern is tail-matched,
-# so `refs/heads/release/0.7` alone would also answer for a stray
-# `x/refs/heads/release/0.7`. A remote that cannot be read is an error rather
-# than an empty answer: in CI the remote is the truth about the branch, and a
-# guess of "absent" would let a plain push fast-forward a branch that exists.
-# Arguments: $1 = branch ref (refs/heads/...)
 # Prints the commit a tag points at on the release repository (peeled, so an
 # annotated tag reads as its commit), empty when the remote has no such tag,
 # and fails when the remote cannot be read.
@@ -1359,6 +1352,13 @@ release_tag_remote_commit() {
   echo "${peeled:-${plain}}"
 }
 
+# The commit the release repository's copy of a branch points at, or nothing
+# when it has none. The match is exact: ls-remote's own pattern is tail-matched,
+# so `refs/heads/release/0.7` alone would also answer for a stray
+# `x/refs/heads/release/0.7`. A remote that cannot be read is an error rather
+# than an empty answer: in CI the remote is the truth about the branch, and a
+# guess of "absent" would let a plain push fast-forward a branch that exists.
+# Arguments: $1 = branch ref (refs/heads/...)
 release_branch_remote_commit() {
   local branch_ref="${1:-}"
 
@@ -1651,8 +1651,9 @@ ensure_ga_release_refs() {
   release_fetch_tags
 
   local tag_ref="refs/tags/${version}" refspecs=() push_tag="false" push_line="false"
-  local existing_tag_sha
+  local existing_tag_sha prior_branch_sha
   existing_tag_sha="$(git rev-parse --verify --quiet "${tag_ref}^{commit}" 2>/dev/null || true)"
+  prior_branch_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
 
   # In CI the remote decides whether the tag is still to be pushed, not this
   # checkout: a rejected atomic push leaves the local tag behind (nothing takes it
@@ -1726,7 +1727,26 @@ ensure_ga_release_refs() {
   else
     label="Release line '${branch}'"
   fi
-  release_push_refs "${label}" "${refspecs[@]}"
+  if release_push_refs "${label}" "${refspecs[@]}"; then
+    return 0
+  fi
+
+  # A rejected push leaves the checkout as it was found. The workflow's fresh
+  # checkout would not care, but a persistent clone would: the calculator and
+  # the publish step read the tag list, and a local tag the remote never took
+  # would be the next run's GA base and its notes-start tag.
+  if [ "${push_tag}" = "true" ]; then
+    git tag -d "${version}" >/dev/null 2>&1 || true
+  fi
+  if [ "${push_line}" = "true" ]; then
+    if [ -n "${prior_branch_sha}" ]; then
+      git update-ref "${branch_ref}" "${prior_branch_sha}" 2>/dev/null || true
+    else
+      git branch -D "${branch}" >/dev/null 2>&1 || true
+    fi
+  fi
+  echo "↩️ Nothing was pushed; ${label} taken back from this checkout, which is left as it was found." >&2
+  return 1
 }
 
 # Stamps BAKED_RELEASE_VERSION into root installer scripts (install.sh, uninstall.sh, upgrade.sh)
