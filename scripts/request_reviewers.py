@@ -75,14 +75,19 @@ APPROVED_STATE = "APPROVED"
 # life of the pull request and the check-run path would never request a human.
 # A review request outstanding to one of them is not a reviewer already asked.
 ROBOT_ACCOUNTS_OPTION = "robot_accounts"
-# The shape of a GitHub login, checked as two rules so each reads as what it
-# is: at most this many characters, and letters, digits and single hyphens
-# with a hyphen neither first nor last. Both comparisons the robot list feeds
-# are exact against the `login` field GitHub returns, so an entry written any
-# other way (`@kyber775`, `kyber775[bot]`, a trailing space) would pass a
-# non-empty check and then match nothing, silently: the validator refuses it.
+# What a robot entry has to look like to be a login at all: a letter or digit,
+# then letters, digits, hyphens or underscores, at most this many characters.
+# Both comparisons the robot list feeds are exact against the `login` field
+# GitHub returns, so an entry an editor decorated (`@kyber775`,
+# `kyber775[bot]`, a trailing space, `org/kyber775`) would pass a non-empty
+# check and then match nothing, silently: the validator refuses those. It does
+# not restate GitHub's account-creation rules for what comes after the first
+# character -- Enterprise Managed Users carry `handle_shortcode`, older
+# accounts carry underscores of their own, and the rules have changed over
+# the years -- because refusing a login GitHub actually issued is the worse
+# error: the robot could not be listed at all.
 GITHUB_LOGIN_MAX_LENGTH = 39
-GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
+GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*")
 
 # Prow's OWNERS files, read from the checkout the workflow runs in -- the
 # default branch, which is also where Prow reads them. `approvers:` covers the
@@ -162,7 +167,8 @@ def validate_config(config):
             if not is_github_login(login):
                 raise ValueError(
                     f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} is not a bare GitHub login "
-                    "(letters, digits and single hyphens, as GitHub shows them)"
+                    f"(a letter or digit, then letters, digits, hyphens or underscores, at most "
+                    f"{GITHUB_LOGIN_MAX_LENGTH} characters, as GitHub shows them)"
                 )
     for name, is_used in UNSUPPORTED_CONFIG.items():
         if is_used(config):
@@ -176,8 +182,11 @@ def validate_config(config):
 
 
 def is_github_login(login):
-    """Whether `login` could be a GitHub login: the length as a length, the grammar as a pattern."""
-    return isinstance(login, str) and len(login) <= GITHUB_LOGIN_MAX_LENGTH and GITHUB_LOGIN_RE.fullmatch(login) is not None
+    """Whether the text `login` could be a GitHub login: the length as a length, the shape as a pattern.
+
+    Text only; validate_config has already refused anything YAML read as another type.
+    """
+    return len(login) <= GITHUB_LOGIN_MAX_LENGTH and GITHUB_LOGIN_RE.fullmatch(login) is not None
 
 
 def robot_accounts(config):

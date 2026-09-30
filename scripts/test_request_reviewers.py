@@ -253,13 +253,16 @@ class ConfigValidationTest(unittest.TestCase):
     def test_robot_accounts_must_be_a_list_of_logins(self):
         # Both comparisons the list feeds are exact against GitHub's `login`,
         # so a decorated or mistyped entry would pass a non-empty check and
-        # then match nothing, silently: the shape is what is validated.
-        for good in (["kyber775"], ["a"], ["k-y-b-3"], ["A" * 39], ["a" + "-b" * 19]):
+        # then match nothing, silently: the shape is what is validated. Only
+        # the shape: what comes after the first character is GitHub's to rule
+        # on, and an Enterprise Managed User's `handle_shortcode` or an older
+        # account's underscore is a login GitHub issued.
+        for good in (["kyber775"], ["a"], ["k-y-b-3"], ["A" * 39], ["a" + "-b" * 19], ["reviewbot_acme"], ["legacy_user"], ["kyber-"], ["ky--ber"]):
             rr.validate_config({"options": {"robot_accounts": good}})
         rr.validate_config({"options": {}})
         # The hyphenated lengths matter: a pattern that counts repetitions rather
         # than characters lets `a-b-b-…` run to 77 characters.
-        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7], ["@kyber775"], ["kyber775 "], ["kyber775[bot]"], ["-kyber"], ["kyber-"], ["ky--ber"], ["A" * 40], ["a" + "-b" * 20], ["a" + "-b" * 38]):
+        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7], ["@kyber775"], ["kyber775 "], ["kyber775[bot]"], ["org/kyber775"], ["kyber.bot"], ["-kyber"], ["_kyber"], ["A" * 40], ["a" + "-b" * 20], ["a" + "-b" * 38]):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 rr.validate_config({"options": {"robot_accounts": bad}})
         self.assertEqual(rr.robot_accounts({"options": {"robot_accounts": ["Kyber775"]}}), {"kyber775"})
