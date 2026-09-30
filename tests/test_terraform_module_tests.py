@@ -28,7 +28,9 @@ files (block form or version-only shorthand), what its `resource`, `data`,
 `provider =` meta-argument, what every local module it calls declares, and
 what a module a `run` block loads declares; a run whose `providers` map routes
 to a configuration no mock declares is reported too, and the builtin
-`terraform` provider is never demanded. HCL is read through a small tokenizer
+`terraform` provider is never demanded. MAKEFLAGS in any workflow `env:` is
+refused whatever it holds, since make also takes `--eval`, `-n` and `-f`
+from it. HCL is read through a small tokenizer
 that skips comments, strings, heredocs and template interpolation; a
 `.tftest.json` is parsed; a root carrying a `*.tf.json` fails loudly rather
 than being read half-way. The helpers have fixture cases of their own below.
@@ -85,18 +87,11 @@ _REPOSITORY_ROOT_DIRECTORIES = (None, ".", "./")
 #: The shells whose default template fails fast; a template of one's own
 #: (`bash {0}`) or another shell is not read as one.
 _FAIL_FAST_SHELLS = (None, "bash", "sh")
+#: MAKEFLAGS in a workflow `env:` is refused whatever it holds: make reads
+#: `-i`, but also `--eval=.IGNORE:`, `-n`, `-f other`, `-C dir` and `-t`
+#: from it, each a way for a failing suite to exit 0, and nothing in this
+#: workflow needs the variable.
 _MAKEFLAGS_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS")
-#: make reads a MAKEFLAGS word without a leading dash as if it had one
-#: (`MAKEFLAGS=k`), so `i` anywhere in a short-option cluster, or the long
-#: form, ignores errors; a `NAME=value` word is a variable, not a flag.
-_IGNORE_ERRORS_LONG = "--ignore-errors"
-_IGNORE_ERRORS_LETTER = "i"
-#: make's short options that take an argument: the rest of the word, or
-#: the next word when the letter ends it. The letters after such a letter
-#: are the argument, not flags (`-Oline` ignores nothing), and `j`, `l`
-#: and `O` take theirs only when glued.
-_SHORT_OPTIONS_WITH_ARGUMENT = "CfIoWEjlO"
-_SHORT_OPTIONS_WITH_REQUIRED_ARGUMENT = "CfIoWE"
 _TRIGGER, _PULL_REQUEST_TRIGGER, _PATH_FILTERS = "on", "pull_request", ("paths", "paths-ignore")
 #: An earlier step can hand MAKEFLAGS to every later one through
 #: $GITHUB_ENV, so no step's run body may name the variable at all.
@@ -141,12 +136,16 @@ _IGNORE_LINE_PREFIX = "-"
 #: subcommand.
 _FAKE_TERRAFORM = """#!/bin/sh
 printf '%s %s\\n' "$(pwd -P)" "$1" >> "$TERRAFORM_FAKE_LOG"
+if [ "$1" = version ]; then echo "Terraform v${TERRAFORM_FAKE_VERSION:-1.15.8}"; exit 0; fi
 if [ "$1" = test ] && [ "$(pwd -P)" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
   echo "Failure! 1 failed."; exit 1
 fi
 exit 0
 """
-_FAKE_LOG_VARIABLE, _FAKE_FAIL_VARIABLE = "TERRAFORM_FAKE_LOG", "TERRAFORM_FAKE_FAIL_IN"
+_FAKE_LOG_VARIABLE, _FAKE_FAIL_VARIABLE, _FAKE_VERSION_VARIABLE = "TERRAFORM_FAKE_LOG", "TERRAFORM_FAKE_FAIL_IN", "TERRAFORM_FAKE_VERSION"
+#: The floor the target names, the Makefile's own constant.
+_MIN_VERSION_VARIABLE = "TERRAFORM_TEST_MIN_VERSION"
+_TOO_OLD_MESSAGE = "is too old"
 _FAILING_DIRECTORIES_LINE = "Failing Terraform test directories:"
 
 #: The HCL the pin reads, and the spelling it refuses.
@@ -155,7 +154,7 @@ _TF_JSON_GLOB = "*.tf.json"
 #: Tokenizer pieces: an identifier (`google-beta` included, hence the
 #: hyphen), a heredoc opener, the comment and block characters.
 _IDENT = re.compile(r"[A-Za-z_][\w-]*")
-_HEREDOC_OPEN = re.compile(r"<<-?(\w+)\r?\n")
+_HEREDOC_OPEN = re.compile(r"<<-?([\w-]+)\r?\n")
 _LINE_COMMENT_OPENERS = ("#", "//")
 _BLOCK_COMMENT_OPEN, _BLOCK_COMMENT_CLOSE = "/*", "*/"
 _TEMPLATE_OPENERS = ("${", "%{")
@@ -297,7 +296,7 @@ def _ignored_recipe_lines(logical_lines: list) -> list:
     ]
 
 
-def _run_target_against_fake_terraform(fail_in: str = "") -> tuple:
+def _run_target_against_fake_terraform(fail_in: str = "", version: str = "") -> tuple:
     """`make terraform-test` with a fake `terraform` first on PATH that
     records each call's directory and subcommand, failing `test` in
     `fail_in`; returns (exit code, stdout, recorded calls)."""
@@ -314,12 +313,13 @@ def _run_target_against_fake_terraform(fail_in: str = "") -> tuple:
                 "PATH": f"{scratch}{os.pathsep}{os.environ.get('PATH', '')}",
                 _FAKE_LOG_VARIABLE: str(log),
                 _FAKE_FAIL_VARIABLE: fail_in,
+                _FAKE_VERSION_VARIABLE: version,
             },
         )
         # The subcommand never holds a space; the directory may, so split
         # from the right.
         calls = [tuple(line.rsplit(" ", 1)) for line in log.read_text().splitlines()]
-    return result.returncode, result.stdout, calls
+    return result.returncode, result.stdout + result.stderr, calls
 
 
 # ─── Reading HCL ─────────────────────────────────────────────────────────────
@@ -631,39 +631,9 @@ def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
     return sorted(providers)
 
 
-def _flags_ignore_errors(value: str) -> bool:
-    """Whether a MAKEFLAGS value carries -i, as make reads it: a word is a
-    long option, a `NAME=value` variable, or a cluster of short options in
-    which a letter that takes an argument ends the flags."""
-    words = str(value).split()
-    index = 0
-    while index < len(words):
-        word = words[index]
-        index += 1
-        if word.startswith("--"):
-            # getopt accepts any prefix of a long option; a prefix short
-            # enough to be ambiguous errors out, which is refused too.
-            if len(word) > len("--") and _IGNORE_ERRORS_LONG.startswith(word):
-                return True
-            continue
-        if "=" in word:
-            continue
-        cluster = word.lstrip("-")
-        for position, letter in enumerate(cluster):
-            if letter == _IGNORE_ERRORS_LETTER:
-                return True
-            if letter in _SHORT_OPTIONS_WITH_ARGUMENT:
-                if position == len(cluster) - 1 and letter in _SHORT_OPTIONS_WITH_REQUIRED_ARGUMENT:
-                    index += 1  # the next word is this option's argument
-                break
-    return False
-
-
 def _ignores_make_errors(scope: dict) -> bool:
     env = scope.get(_ENV) or {}
-    return isinstance(env, dict) and any(
-        _flags_ignore_errors(env.get(variable, "")) for variable in _MAKEFLAGS_VARIABLES
-    )
+    return isinstance(env, dict) and any(variable in env for variable in _MAKEFLAGS_VARIABLES)
 
 
 def _run_setting(scope: dict, key: str):
@@ -706,7 +676,7 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
         if step.get(_CONTINUE_ON_ERROR):
             defects.append(f"the step carries `{_CONTINUE_ON_ERROR}`")
         if _ignores_make_errors(step):
-            defects.append("the step's env tells make to ignore errors")
+            defects.append("the step's env sets MAKEFLAGS, through which make takes -i, --eval, -n or -f")
     if _shell_defect(job):
         defects.append("the job's default shell is not fail-fast")
     if _working_directory_defect(job):
@@ -716,10 +686,10 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
     if job.get(_CONTINUE_ON_ERROR):
         defects.append(f"the job carries `{_CONTINUE_ON_ERROR}`")
     if _ignores_make_errors(job):
-        defects.append("the job's env tells make to ignore errors")
+        defects.append("the job's env sets MAKEFLAGS, through which make takes -i, --eval, -n or -f")
     if workflow is not None:
         if _ignores_make_errors(workflow):
-            defects.append("the workflow's env tells make to ignore errors")
+            defects.append("the workflow's env sets MAKEFLAGS, through which make takes -i, --eval, -n or -f")
         if _shell_defect(workflow):
             defects.append("the workflow's default shell is not fail-fast")
         if _working_directory_defect(workflow):
@@ -788,6 +758,18 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         self.assertEqual({pathlib.Path(d).resolve() for d, sub in calls if sub == "test"}, entered, f"a failing suite stopped the others from running: {calls}")
         self.assertIn(_FAILING_DIRECTORIES_LINE, out, f"the failing directory is not named at the end:\n{out}")
         self.assertIn(failing.name, out.split(_FAILING_DIRECTORIES_LINE, 1)[1])
+
+    def test_a_terraform_below_the_floor_is_named_not_reported_as_failing_suites(self):
+        floor = _make("-s", f"--eval=print-floor: ;@echo $({_MIN_VERSION_VARIABLE})", "print-floor").stdout.strip()
+        self.assertRegex(floor, r"^\d+\.\d+\.\d+$", f"{_MIN_VERSION_VARIABLE} is not set in the Makefile")
+        code, out, calls = _run_target_against_fake_terraform(version="1.6.6")
+        self.assertNotEqual(code, 0)
+        self.assertIn(_TOO_OLD_MESSAGE, out, f"an old terraform must be named up front, not read as two failing suites:\n{out}")
+        self.assertIn(floor, out)
+        self.assertNotIn(_FAILING_DIRECTORIES_LINE, out)
+        self.assertEqual([sub for _d, sub in calls if sub == "test"], [], "no suite may run under a terraform below the floor")
+        code, out, _calls = _run_target_against_fake_terraform(version=floor)
+        self.assertEqual(code, 0, f"a terraform at the floor must run the suites:\n{out}")
 
     def test_the_resolved_recipes_carry_the_loop_and_no_ignored_line(self):
         database = _database()
@@ -899,7 +881,7 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             "terraform {\n  required_providers {\n    # the {google} entry below }\n    google = {\n"
             "      source  = \"hashicorp/google\"\n      version = \"} // not a comment\"\n    }\n    /* } */\n"
             "    http = {\n      source = \"hashicorp/http\"\n    }\n  }\n}\n\n"
-            'variable "v" {\n  description = <<-EOT\n    A "quote and a } and a # and https://x\n  EOT\n}\n'
+            'variable "v" {\n  description = <<-EO-T\n    A "quote and a } and a # and https://x\n  EO-T\n}\n'
             'variable "w" {\n  default = "{"\n}\n'
         )
         self.assertEqual(_declared_providers(self.root), ["google", "http"])
@@ -1107,13 +1089,12 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "if": "false"}]}))
         self.assertTrue(_gate_defects({"if": "github.actor != 'dependabot[bot]'", "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects({"steps": [{"run": "echo make terraform-test"}]}))
-        for env in ({"MAKEFLAGS": "-i"}, {"MAKEFLAGS": "--ignore-errors"}, {"GNUMAKEFLAGS": "-ki"}, {"MAKEFLAGS": "-j2 -i"}, {"MAKEFLAGS": "i"}, {"MAKEFLAGS": "ki"}, {"GNUMAKEFLAGS": "k i"}):
+        for env in ({"MAKEFLAGS": "-i"}, {"MAKEFLAGS": "--eval=.IGNORE:"}, {"MAKEFLAGS": "-E .IGNORE:"}, {"MAKEFLAGS": "n"}, {"MAKEFLAGS": "-f other.mk"}, {"GNUMAKEFLAGS": "-C bench"}, {"MAKEFLAGS": "-j2"}, {"MAKEFLAGS": ""}):
             with self.subTest(env=env):
                 self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "env": env}]}))
                 self.assertTrue(_gate_defects({"env": env, "steps": [{"run": "make terraform-test"}]}))
                 self.assertTrue(_gate_defects(good, {"env": env}))
-        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"MAKEFLAGS": "-j2 --output-sync"}}]}), [])
-        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"MAKEFLAGS": "k IGNORE=i"}}]}), [])
+        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"TF_PLUGIN_CACHE_DIR": "/x"}}]}), [])
         self.assertTrue(_gate_defects(good, {"on": {"pull_request": {"paths": ["terraform/**"]}}}))
         self.assertTrue(_gate_defects(good, {True: {"pull_request": {"paths-ignore": ["docs/**"]}}}))
         for triggers in (["pull_request", "push"], "pull_request", {"pull_request": None}):
@@ -1136,14 +1117,6 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertTrue(_gate_defects({"defaults": {"run": {"working-directory": "k8s-operator"}}, "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects(good, {"defaults": {"run": {"working-directory": "bench"}}}))
         self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "working-directory": "."}]}), [])
-        for value in ("-i", "--ignore-errors", "-ki", "-j2 -i", "i", "ki", "k i", "--ignore-err", "--ignore", "--ign", "-C dir -i", "-f Makefile i", "-j4 -i", "-Oline -i"):
-            with self.subTest(value=value):
-                self.assertTrue(_flags_ignore_errors(value))
-        # A short option's argument is not a flag cluster: `-Oline` is
-        # --output-sync=line, `-f Makefile` names a file, `-Oi` syncs by `i`.
-        for value in ("-k", "-j2 --output-sync", "k IGNORE=i", "--no-print-directory", "--include-dir=x", "", "-Oline", "-f Makefile", "-I include", "-C dir", "-Oi", "-j4", "-l2.5", "-W file -k", "-o file"):
-            with self.subTest(value=value):
-                self.assertFalse(_flags_ignore_errors(value))
 
 
 

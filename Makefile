@@ -642,6 +642,11 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
 	@./hack/check-tfvar-console.sh
 
+# The version mock_provider needs; the install floor the modules declare is
+# lower, and a binary below this reads two green suites as a parse error, so
+# it is named up front, the way test-python names a missing import.
+TERRAFORM_TEST_MIN_VERSION := 1.7.0
+
 # Every module and composition that carries a tests/ directory -- the set
 # the validate job initialises -- against mocked providers, so a plan-time
 # rule -- a precondition, a postcondition on a read, the set of bindings a
@@ -654,7 +659,12 @@ tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for 
 # test-python gives: a red run that hides the next suite's result costs a CI
 # round trip to discover.
 terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
-	@failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
+	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
+	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
+	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
+	fi; \
+	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
 	    echo "Testing $$dir..."; \
 	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
