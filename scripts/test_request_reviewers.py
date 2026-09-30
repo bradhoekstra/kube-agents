@@ -272,7 +272,7 @@ class ConfigValidationTest(unittest.TestCase):
         # An unquoted all-digit login arrives as an int and an unquoted YAML
         # word as a bool; both are valid logins once quoted, so the message
         # says to quote rather than calling a valid login malformed.
-        for entry in ("12345", "no", "on", "true"):
+        for entry in ("12345", "no", "on", "true", "2024-01-01", "null"):
             with self.subTest(entry=entry):
                 config = yaml.safe_load(f"options:\n  robot_accounts:\n    - {entry}\n")
                 with self.assertRaises(ValueError) as caught:
@@ -281,6 +281,13 @@ class ConfigValidationTest(unittest.TestCase):
                 self.assertNotIn("not a bare GitHub login", str(caught.exception))
                 quoted = yaml.safe_load(f'options:\n  robot_accounts:\n    - "{entry}"\n')
                 rr.validate_config(quoted)
+        # `~` and an empty item arrive as None too; quoted `~` is no login, so
+        # only the message is checked for those.
+        for entry in ("~", ""):
+            with self.subTest(entry=entry), self.assertRaises(ValueError) as caught:
+                rr.validate_config(yaml.safe_load(f"options:\n  robot_accounts:\n    - {entry}\n"))
+            self.assertIn("remove an empty entry", str(caught.exception))
+            self.assertNotIn("not a mapping or a list", str(caught.exception))
         # A mapping or a nested list is a different mistake with a different
         # remedy: quoting does nothing for it, so the message says the shape.
         for entry in ([{"login": "kyber775"}], [["kyber775"]]):

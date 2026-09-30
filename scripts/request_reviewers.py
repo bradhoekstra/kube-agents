@@ -154,23 +154,25 @@ def validate_config(config):
         if not isinstance(robots, list):
             raise ValueError(f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of GitHub logins, got {robots!r}")
         for login in robots:
-            # yaml.safe_load reads an unquoted all-digit login as an int and
-            # `yes`, `no`, `on`, `off`, `true` or `false` as a bool; both are
-            # valid logins once quoted, and `007` would not survive str() of
-            # the int, so the remedy is named rather than guessed at.
-            if isinstance(login, (bool, int, float)):
-                raise ValueError(
-                    f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} was read by YAML as "
-                    f"{type(login).__name__}, not text: quote a login that is all digits or a "
-                    "YAML word such as yes, no, on or off"
-                )
-            if not isinstance(login, str):
-                # A mapping (`- login: kyber775`) or a nested list: quoting is no
-                # remedy for that, so the message says the shape instead.
+            # A mapping (`- login: kyber775`) or a nested list is a shape mistake;
+            # quoting is no remedy for it, so the message says the shape.
+            if isinstance(login, (dict, list)):
                 raise ValueError(
                     f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} is a {type(login).__name__}, not a "
                     "login: write each entry as a bare login on its own line, `- kyber775`, "
                     "not a mapping or a list"
+                )
+            # Every other non-text value is a scalar yaml.safe_load coerced: an
+            # all-digit login to an int, a date-shaped one to a date, `yes`, `no`,
+            # `on`, `off`, `true` or `false` to a bool, `null`, `~` or an empty item
+            # to None. Each is a valid login once quoted, and `007` would not
+            # survive str() of the int, so the remedy is named rather than guessed.
+            if not isinstance(login, str):
+                raise ValueError(
+                    f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} was read by YAML as "
+                    f"{type(login).__name__}, not text: quote a login YAML would otherwise read "
+                    "as a number, a date, a boolean or null (`12345`, `2024-01-01`, `no`, "
+                    "`null`), or remove an empty entry"
                 )
             if not is_github_login(login):
                 raise ValueError(
