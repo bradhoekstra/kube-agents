@@ -8,14 +8,20 @@ reaches is a set of cases that passes by never running, the trap AGENTS.md
 provider but not another would reach a real API from CI on the first read
 nobody overrode. This pins the loop, the step, `make verify` running the
 target (its help line says it runs everything a pull request must pass
-offline), that no test file sits where the loop does not look, and a
-`mock_provider` block for every provider a module declares, in every one of
-its test files. tests/test_shellcheck_gate_wiring.py pins a workflow step the
-same way.
+offline), that no test file anywhere in the repository sits where the loop
+does not look (Terraform roots live under bench/tf and k8s-operator/testing
+too), and a `mock_provider` block, as a block and not a mention in a comment,
+for every provider a root declares in `required_providers` in any of its
+`.tf` files (a composition declares them in providers.tf, a module in
+versions.tf), in every one of its test files. The helpers that make those
+three judgements have cases of their own below, on fixtures, so the pin
+is known to fire on the shapes it exists for. tests/test_shellcheck_gate_wiring.py
+pins a workflow step the same way.
 """
 
 import pathlib
 import re
+import tempfile
 import unittest
 
 import yaml
@@ -32,6 +38,9 @@ _TERRAFORM_DIR = _REPO_ROOT / "terraform"
 _SUITE_PARENTS = (_TERRAFORM_DIR / "modules", _TERRAFORM_DIR / "examples")
 _MAKEFILE = _REPO_ROOT / "Makefile"
 _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "validate.yml"
+#: Directories a repository walk never reads: provider downloads, the
+#: docs site's dependencies, git's own store.
+_WALK_EXCLUDED_PARTS = frozenset({".terraform", "node_modules", ".git"})
 
 #: `_JOB_ID` and `_run_lines` are the shellcheck wiring test's: the same job
 #: on main's required-status-checks list, read the same way.
@@ -47,22 +56,37 @@ _TEST_COMMAND = "terraform test"
 _VERIFY_TARGET = "verify"
 _VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
 
-#: A provider a module declares (`google-beta` included, hence the hyphen),
-#: and the block a test file needs for it.
-_REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+) = \{\s*$", re.MULTILINE)
-_MOCK_PROVIDER = 'mock_provider "{provider}"'
+#: Where a root declares its providers, and the entries inside that block
+#: (`google-beta` included, hence the hyphen). The block is cut at its own
+#: closing brace, so a `kubernetes = {` inside a later `provider "helm"`
+#: block is not read as a provider.
+_TF_FILE_GLOB = "*.tf"
+_REQUIRED_PROVIDERS_OPEN = re.compile(r"^\s*required_providers\s*\{", re.MULTILINE)
+_REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+)\s*=\s*\{", re.MULTILINE)
+#: The block a test file needs per provider: at line start, so the literal
+#: surviving only in a comment (`# mock_provider "http" {}`) does not count.
+_MOCK_PROVIDER = r'^\s*mock_provider "{provider}"\s*\{{'
 _TEST_FILE_GLOB = "tests/*.tftest.hcl"
 _TEST_FILE_SUFFIX = ".tftest.hcl"
-_VERSIONS_FILE = "versions.tf"
 
 
-def _suites() -> dict:
+def _suites(parents=_SUITE_PARENTS) -> dict:
     return {
-        module: sorted(module.glob(_TEST_FILE_GLOB))
-        for parent in _SUITE_PARENTS
-        for module in sorted(parent.iterdir())
-        if module.is_dir() and any(module.glob(_TEST_FILE_GLOB))
+        root: sorted(root.glob(_TEST_FILE_GLOB))
+        for parent in parents
+        for root in sorted(parent.iterdir())
+        if root.is_dir() and any(root.glob(_TEST_FILE_GLOB))
     }
+
+
+def _unreached_test_files(repo_root: pathlib.Path, parents) -> list:
+    reached = {path for files in _suites(parents).values() for path in files}
+    everywhere = {
+        path
+        for path in repo_root.rglob(f"*{_TEST_FILE_SUFFIX}")
+        if not _WALK_EXCLUDED_PARTS & set(path.parts)
+    }
+    return sorted(everywhere - reached)
 
 
 def _recipe(makefile: str, target: str) -> str:
@@ -70,10 +94,34 @@ def _recipe(makefile: str, target: str) -> str:
     return recipe[: recipe.index("\n\n")]
 
 
-def _declared_providers(module: pathlib.Path) -> list:
-    text = (module / _VERSIONS_FILE).read_text()
-    block = text[text.index("required_providers"):]
-    return _REQUIRED_PROVIDER.findall(block)
+def _block(text: str, start: int) -> str:
+    """The text from the `{` at `start` to its matching `}`."""
+    depth = 0
+    for index in range(start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return text[start:]
+
+
+def _declared_providers(root: pathlib.Path) -> list:
+    providers = set()
+    for tf_file in sorted(root.glob(_TF_FILE_GLOB)):
+        text = tf_file.read_text()
+        for match in _REQUIRED_PROVIDERS_OPEN.finditer(text):
+            providers.update(_REQUIRED_PROVIDER.findall(_block(text, match.end() - 1)))
+    return sorted(providers)
+
+
+def _unmocked(text: str, providers) -> list:
+    return [
+        provider
+        for provider in providers
+        if not re.search(_MOCK_PROVIDER.format(provider=provider), text, re.MULTILINE)
+    ]
 
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):
@@ -81,11 +129,8 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         self.assertTrue(_suites(), f"no {_TEST_FILE_GLOB} under {_SUITE_PARENTS}; this test pins their wiring")
 
     def test_no_test_file_sits_where_the_loop_does_not_look(self):
-        reached = {path for files in _suites().values() for path in files}
-        everywhere = set(_TERRAFORM_DIR.rglob(f"*{_TEST_FILE_SUFFIX}"))
-        everywhere = {p for p in everywhere if ".terraform" not in p.parts}
         self.assertEqual(
-            sorted(everywhere - reached),
+            _unreached_test_files(_REPO_ROOT, _SUITE_PARENTS),
             [],
             f"these {_TEST_FILE_SUFFIX} files are outside {_TEST_FILE_GLOB} under {[p.name for p in _SUITE_PARENTS]}, so `{_GATE_COMMAND}` never runs them",
         )
@@ -122,19 +167,64 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         )
         self.assertNotIn("if", gate[0], f"the `{_GATE_COMMAND}` step must not carry an `if:`")
 
-    def test_every_test_file_mocks_every_provider_its_module_declares(self):
-        for module, files in _suites().items():
-            providers = _declared_providers(module)
-            self.assertTrue(providers, f"{module.name}/{_VERSIONS_FILE} declares no provider")
+    def test_every_test_file_mocks_every_provider_its_root_declares(self):
+        for root, files in _suites().items():
+            providers = _declared_providers(root)
+            self.assertTrue(providers, f"{root.name} declares no provider in any {_TF_FILE_GLOB}")
             for path in files:
-                text = path.read_text()
-                for provider in providers:
-                    with self.subTest(module=module.name, file=path.name, provider=provider):
-                        self.assertIn(
-                            _MOCK_PROVIDER.format(provider=provider),
-                            text,
-                            f"{path.relative_to(_REPO_ROOT)} does not mock the `{provider}` provider its module declares; a read the file forgets to override would reach a real API from CI",
-                        )
+                with self.subTest(root=root.name, file=path.name):
+                    self.assertEqual(
+                        _unmocked(path.read_text(), providers),
+                        [],
+                        f"{path.relative_to(_REPO_ROOT)} does not mock every provider its root declares ({providers}); a read the file forgets to override would reach a real API from CI",
+                    )
+
+
+class TerraformModuleTestsHelpersTest(unittest.TestCase):
+    """The three judgements above, on the shapes they exist to catch."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_providers_are_read_from_any_tf_file_and_only_inside_the_block(self):
+        # A composition's shape: providers.tf, no versions.tf, and a
+        # `kubernetes = {` attribute inside a provider block after it.
+        (self.root / "providers.tf").write_text(
+            "terraform {\n  required_providers {\n    google = {\n      source = \"hashicorp/google\"\n    }\n"
+            "    google-beta = {\n      source = \"hashicorp/google-beta\"\n    }\n  }\n}\n\n"
+            "provider \"helm\" {\n  kubernetes = {\n    host = \"x\"\n  }\n}\n"
+        )
+        (self.root / "main.tf").write_text("resource \"null_resource\" \"x\" {}\n")
+        self.assertEqual(_declared_providers(self.root), ["google", "google-beta"])
+
+    def test_a_root_declaring_nothing_reads_as_no_providers(self):
+        (self.root / "main.tf").write_text("locals {\n  a = {\n    b = {}\n  }\n}\n")
+        self.assertEqual(_declared_providers(self.root), [])
+
+    def test_a_mock_in_a_comment_does_not_count(self):
+        text = '# mock_provider "http" {}\nmock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n'
+        self.assertEqual(_unmocked(text, ["google", "http"]), ["http"])
+
+    def test_an_indented_mock_block_counts(self):
+        text = '  mock_provider "google-beta" {\n  }\n'
+        self.assertEqual(_unmocked(text, ["google-beta"]), [])
+
+    def test_a_test_file_outside_the_reached_set_is_reported(self):
+        parents = (self.root / "terraform" / "modules",)
+        reached = self.root / "terraform" / "modules" / "m" / "tests"
+        stray = self.root / "bench" / "tf" / "fleet" / "tests"
+        ignored = self.root / "terraform" / "modules" / "m" / ".terraform" / "tests"
+        for directory in (reached, stray, ignored):
+            directory.mkdir(parents=True)
+            (directory / "a.tftest.hcl").write_text("")
+        self.assertEqual(
+            _unreached_test_files(self.root, parents),
+            [stray / "a.tftest.hcl"],
+        )
 
 
 if __name__ == "__main__":
