@@ -573,7 +573,8 @@ API is reported with that remedy, and one that refuses the identity the consumer
 (`USER_PROJECT_DENIED`) with the `serviceusage.services.use` it needs there. The reconcile lists at
 most 100 projects of the resolved set, the management project included, so a declaration whose
 management project, `projects` and selector members together exceed that (once each, less an exact
-`exclude.projects` entry) is refused at plan rather than bound in full while a selector is declared
+`exclude.projects` entry; a project both in `projects` and excluded by its number stays counted, so drop
+it from `projects`) is refused at plan rather than bound in full while a selector is declared
 (without one the count is the CRD's own, and a plan that declares none is not refused for it), and a
 single selector past it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
 at runtime. An exclude entry that names a Shared VPC service project by ID, or a monitored project

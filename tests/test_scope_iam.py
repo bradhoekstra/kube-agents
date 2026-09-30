@@ -369,7 +369,12 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # precondition existed, and a plan that declares no selector must not
         # start refusing it.
         self.assertIn("condition     = length(local.scope_selector_names) == 0 || length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
-        self.assertIn("a glob is applied by the reconcile alone", self.main_tf)
+        self.assertIn("A glob is applied by the reconcile alone", self.main_tf)
+        # The by-number form lowers the count on the selector leg only: an explicit
+        # project the reconcile drops by its number is counted, and the message says so
+        # and names the remedy rather than promising the entry lowers the count.
+        self.assertIn("is dropped by the reconcile but counted here", self.main_tf)
+        self.assertIn("drop it from scope.projects", self.main_tf)
         # Containers are not in the count: their members are unknown at plan
         # time, they are listed last, and their binding is on the container.
         listed = re.search(r"scope_listed_projects = setunion\((.*?)\n  \)", self.scope_tf, re.DOTALL)

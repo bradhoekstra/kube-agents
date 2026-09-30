@@ -451,7 +451,7 @@ Prerequisites the design has to state and the installer has to preflight:
   `serviceusage.services.use` the identity lacks there when it says the consumer project refused
   it. The resolved-set cap (100) is on the whole set, so the plan counts what it can of it as the
   reconcile does, the management project, the explicit projects and every selector's members once
-  each less an exact exclude entry, and refuses a declaration past it while a selector is declared: the members past the cap
+  each less an exact exclude entry (by ID on the explicit side, by number on the selector's; a project both explicit and excluded by its number stays counted, since the plan does not name a number the exclusion keeps it from reading, and is dropped from `projects` instead), and refuses a declaration past it while a selector is declared: the members past the cap
   would read `over-cap` with nothing created, so their bindings would be reach the agent never
   uses. Without a selector the count is `projects` and the management project, which the CRD's list cap bounds and the plan admitted before, so a declaration without one is not refused for it. A single selector past the cap is refused at its read, before the naming reads.
 - When a folder or organisation is declared, `cloudasset.googleapis.com` has to be enableable in

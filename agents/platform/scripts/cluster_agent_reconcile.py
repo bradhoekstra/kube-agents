@@ -1047,12 +1047,17 @@ def _previous_number(previous: dict | None, project: str) -> str | None:
 
 
 def _numbers_memo(previous: dict | None, selector_reports: dict[str, tuple[list[str] | None, str]],
-                  numbers_named: dict[str, str], scope_readable: bool) -> dict[str, str]:
+                  numbers_named: dict[str, str], selectors_consulted: bool) -> dict[str, str]:
     """The number -> ID pairs the snapshot keeps for the next run.
 
     Every pair this run's naming pass returned, and every pair the last snapshot knew whose
-    number a selector still reports; all of them when a selector's lookup failed or the
-    declaration could not be read, since what would be reported is then unknown. The memo is
+    number a selector still reports; all of them when a selector's lookup failed or when the
+    run consulted no selector at all (`selectors_consulted` False: the declaration could not
+    be read, the CR carries no scope block, or the render predates the selector keys), since
+    what would be reported is then unknown and such a tick carries the last declaration and
+    every row forward rather than retiring anything, so it must not forget the pairs the
+    rows do not hold either. A pair leaves the memo only on a tick that read the selectors
+    and found its number gone. The memo is
     what lets a run whose naming call is cut or refused still tie the number to the ID: a
     project an `exclude.projects` number names has no row to keep the pair on, and without
     it such a run would find nothing tying the number to the project and admit it again on
@@ -1061,7 +1066,7 @@ def _numbers_memo(previous: dict | None, selector_reports: dict[str, tuple[list[
     reports any more is dropped, which bounds the memo by the estate the selectors reach.
     """
     reported = {m for members, _ in selector_reports.values() if members for m in members if m.isdigit()}
-    keep_all = not scope_readable or any(members is None for members, _ in selector_reports.values())
+    keep_all = not selectors_consulted or any(members is None for members, _ in selector_reports.values())
     memo = {n: p for n, p in _previous_numbers(previous).items() if keep_all or n in reported}
     memo.update({n: p for p, n in numbers_named.items()})
     return dict(sorted(memo.items()))
@@ -1851,7 +1856,8 @@ def reconcile(dry_run: bool = False) -> dict:
             "projects": snapshot_projects,
             "unmanaged": sorted(unmanaged, key=lambda u: u["profile"]),
             "ignoredExcludes": ignored_excludes,
-            NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named, scope_readable),
+            NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named,
+                                       scope_readable and scope_present and selectors_known),
         })
 
     return report

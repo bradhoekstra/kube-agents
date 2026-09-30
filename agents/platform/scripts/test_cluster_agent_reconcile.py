@@ -2545,6 +2545,19 @@ class ScopeTest(HomesMixin):
         self.assertEqual((created, sorted(report["projects"])), ([], [self.MGMT]))
         self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
         self.assertEqual(rec._previous_numbers(self._snapshot()), {"111": "team-a"})
+        # A tick that consults no selector keeps every pair, as it carries the last declaration
+        # and every row: the CR without its scope block, a render from before the selector
+        # keys, and an unreadable file. Each would otherwise forget the one pair no row holds.
+        self._run({rec.SCOPE_PRESENT_KEY: False}, {self.MGMT: []})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        (Path(self._tmp.name) / "scope.json").write_text(json.dumps(
+            {rec.SCOPE_PRESENT_KEY: True, "projects": ["team-a"], "folders": ["123456789012"], "organizations": [],
+             "exclude": {"projects": ["111"], "clusters": []}}), encoding="utf-8")
+        self._run(None, {self.MGMT: [], "team-a": members["team-a"]}, searches={self.FOLDER: (members, rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        (Path(self._tmp.name) / "scope.json").write_text("{not json", encoding="utf-8")
+        self._run(None, {self.MGMT: []})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
         for naming in (rec.OUTCOME_UNREACHABLE, rec.OUTCOME_DENIED):
             with self.subTest(naming=naming), mock.patch.object(rec, "log") as logged:
                 report, created, _ = self._run(declaration, {self.MGMT: [], "team-a": members["team-a"]},
