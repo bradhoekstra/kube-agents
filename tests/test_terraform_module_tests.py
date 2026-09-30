@@ -15,12 +15,16 @@ for every provider a root needs: what it declares in `required_providers` in
 any of its `.tf` files (a composition declares them in providers.tf, a module
 in versions.tf) and what every local module it calls declares, since
 Terraform hands a child a default provider the root never named. Both test
-file spellings Terraform loads, `.tftest.hcl` and `.tftest.json`, count. The
-helpers that make those judgements have cases of their own below, on
-fixtures, so the pin is known to fire on the shapes it exists for.
-tests/test_shellcheck_gate_wiring.py pins a workflow step the same way.
+file spellings Terraform loads count: a `.tftest.hcl` is read with comments
+stripped, a `.tftest.json` is parsed. The `.tf` side is read as HCL only;
+a root or called module carrying a `*.tf.json` fails the pin loudly rather
+than being read half-way. The helpers that make those judgements have cases
+of their own below, on fixtures, so the pin is known to fire on the shapes
+it exists for. tests/test_shellcheck_gate_wiring.py pins a workflow step
+the same way.
 """
 
+import json
 import pathlib
 import re
 import sys
@@ -65,6 +69,14 @@ _VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
 #: closing brace, so a `kubernetes = {` inside a later `provider "helm"`
 #: block is not read as a provider.
 _TF_FILE_GLOB = "*.tf"
+#: Terraform also loads this spelling; the pin does not read it, and says so.
+_TF_JSON_GLOB = "*.tf.json"
+#: HCL comments and quoted strings, removed before a block is scanned so a
+#: brace or a `mock_provider` line inside either is not read as syntax.
+_HCL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_HCL_LINE_COMMENT = re.compile(r"(?m)(#|//).*$")
+_HCL_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+_STRING_PLACEHOLDER = '""'
 _REQUIRED_PROVIDERS_OPEN = re.compile(r"^\s*required_providers\s*\{", re.MULTILINE)
 _REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+)\s*=\s*\{", re.MULTILINE)
 #: A module block calling a local directory, whose providers the root needs
@@ -75,8 +87,11 @@ _LOCAL_MODULE_SOURCE = re.compile(r'^\s*source\s*=\s*"(\.\.?/[^"]*)"', re.MULTIL
 #: The block a test file needs per provider: at line start, so the literal
 #: surviving only in a comment (`# mock_provider "http" {}`) does not count.
 _MOCK_PROVIDER = r'^\s*mock_provider "{provider}"\s*\{{'
-#: Both spellings Terraform loads from tests/.
+#: Both spellings Terraform loads from tests/; the JSON form carries its
+#: mocks under this key.
 _TEST_FILE_SUFFIXES = (".tftest.hcl", ".tftest.json")
+_TEST_FILE_JSON_SUFFIX = ".tftest.json"
+_JSON_MOCK_PROVIDER_KEY = "mock_provider"
 _TESTS_DIR = "tests"
 
 
@@ -100,10 +115,13 @@ def _suites(parents=_SUITE_PARENTS) -> dict:
 
 def _unreached_test_files(repo_root: pathlib.Path, parents) -> list:
     reached = {path for files in _suites(parents).values() for path in files}
+    # Filtered on the path below the repository, not the absolute one: a
+    # checkout that itself sits under an ignored name (a review worktree
+    # under .claude/) would otherwise exclude every file and pass vacuously.
     everywhere = {
         path
         for path in repo_root.rglob("*")
-        if _is_test_file(path) and not _WALK_EXCLUDED_PARTS & set(path.parts)
+        if _is_test_file(path) and not _WALK_EXCLUDED_PARTS & set(path.relative_to(repo_root).parts)
     }
     return sorted(everywhere - reached)
 
@@ -113,8 +131,19 @@ def _recipe(makefile: str, target: str) -> str:
     return recipe[: recipe.index("\n\n")]
 
 
+def _without_comments(text: str) -> str:
+    """HCL with its comments removed, line structure kept."""
+    text = _HCL_BLOCK_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+    return _HCL_LINE_COMMENT.sub("", text)
+
+
+def _without_comments_and_strings(text: str) -> str:
+    return _HCL_STRING.sub(_STRING_PLACEHOLDER, _without_comments(text))
+
+
 def _block(text: str, start: int) -> str:
-    """The text from the `{` at `start` to its matching `}`."""
+    """The text from the `{` at `start` to its matching `}`; the caller has
+    already stripped comments and strings, so every brace is syntax."""
     depth = 0
     for index in range(start, len(text)):
         if text[index] == "{":
@@ -127,9 +156,15 @@ def _block(text: str, start: int) -> str:
 
 
 def _declared_providers(root: pathlib.Path) -> list:
+    unread = sorted(root.glob(_TF_JSON_GLOB))
+    if unread:
+        raise AssertionError(
+            f"{root} carries {[p.name for p in unread]}: the mock-provider pin reads HCL only, "
+            "so a provider or module call declared in JSON syntax would go unseen; write it as .tf"
+        )
     providers = set()
     for tf_file in sorted(root.glob(_TF_FILE_GLOB)):
-        text = tf_file.read_text()
+        text = _without_comments_and_strings(tf_file.read_text())
         for match in _REQUIRED_PROVIDERS_OPEN.finditer(text):
             providers.update(_REQUIRED_PROVIDER.findall(_block(text, match.end() - 1)))
     return sorted(providers)
@@ -144,14 +179,23 @@ def _needed_providers(root: pathlib.Path, seen=None) -> list:
     seen.add(root)
     providers = set(_declared_providers(root))
     for tf_file in sorted(root.glob(_TF_FILE_GLOB)):
-        for source in _LOCAL_MODULE_SOURCE.findall(tf_file.read_text()):
+        for source in _LOCAL_MODULE_SOURCE.findall(_without_comments(tf_file.read_text())):
             child = (root / source).resolve()
             if child.is_dir():
                 providers.update(_needed_providers(child, seen))
     return sorted(providers)
 
 
-def _unmocked(text: str, providers) -> list:
+def _mocked_in_json(text: str) -> set:
+    mocks = json.loads(text).get(_JSON_MOCK_PROVIDER_KEY, {}) if text.strip() else {}
+    return set(mocks) if isinstance(mocks, dict) else set()
+
+
+def _unmocked(text: str, providers, name: str = _TEST_FILE_SUFFIXES[0]) -> list:
+    if name.endswith(_TEST_FILE_JSON_SUFFIX):
+        mocked = _mocked_in_json(text)
+        return [provider for provider in providers if provider not in mocked]
+    text = _without_comments(text)
     return [
         provider
         for provider in providers
@@ -208,7 +252,7 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             for path in files:
                 with self.subTest(root=root.name, file=path.name):
                     self.assertEqual(
-                        _unmocked(path.read_text(), providers),
+                        _unmocked(path.read_text(), providers, path.name),
                         [],
                         f"{path.relative_to(_REPO_ROOT)} does not mock every provider its root needs ({providers}); a read the file forgets to override would reach a real API from CI",
                     )
@@ -281,6 +325,29 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
     def test_a_mock_in_a_comment_does_not_count(self):
         text = '# mock_provider "http" {}\nmock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n'
         self.assertEqual(_unmocked(text, ["google", "http"]), ["http"])
+        blocked = '/*\nmock_provider "http" {}\n*/\nmock_provider "google" {}\n'
+        self.assertEqual(_unmocked(blocked, ["google", "http"]), ["http"])
+        slashed = '// mock_provider "http" {}\nmock_provider "google" {}\n'
+        self.assertEqual(_unmocked(slashed, ["google", "http"]), ["http"])
+
+    def test_a_json_test_file_is_read_as_json(self):
+        text = '{"mock_provider": {"google": {}, "http": {}}, "run": {"x": {"command": "plan"}}}'
+        self.assertEqual(_unmocked(text, ["google", "http"], "b.tftest.json"), [])
+        self.assertEqual(_unmocked('{"run": {"x": {}}}', ["google"], "b.tftest.json"), ["google"])
+        self.assertEqual(_unmocked("", ["google"], "b.tftest.json"), ["google"])
+
+    def test_a_brace_in_a_comment_or_string_does_not_end_the_block(self):
+        (self.root / "versions.tf").write_text(
+            "terraform {\n  required_providers {\n    # the {google} entry below }\n    google = {\n"
+            "      source  = \"hashicorp/google\"\n      version = \"}\"\n    }\n    /* } */\n"
+            "    http = {\n      source = \"hashicorp/http\"\n    }\n  }\n}\n"
+        )
+        self.assertEqual(_declared_providers(self.root), ["google", "http"])
+
+    def test_a_root_with_a_tf_json_file_is_refused_not_half_read(self):
+        (self.root / "versions.tf.json").write_text('{"terraform": {"required_providers": {"http": {}}}}')
+        with self.assertRaises(AssertionError):
+            _declared_providers(self.root)
 
     def test_an_indented_mock_block_counts(self):
         text = '  mock_provider "google-beta" {\n  }\n'
@@ -299,6 +366,17 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             _unreached_test_files(self.root, parents),
             [stray / "a.tftest.hcl"],
         )
+
+    def test_a_checkout_under_an_ignored_name_is_still_walked(self):
+        # A review worktree lives under .claude/; the filter applies below
+        # the repository root, not to the root's own ancestors.
+        repo = self.root / ".claude" / "worktrees" / "pr-1"
+        parents = (repo / "terraform" / "modules",)
+        stray = repo / "bench" / "tf" / "fleet" / "tests"
+        stray.mkdir(parents=True)
+        (stray / "a.tftest.hcl").write_text("")
+        (repo / "terraform" / "modules").mkdir(parents=True)
+        self.assertEqual(_unreached_test_files(repo, parents), [stray / "a.tftest.hcl"])
 
 
 if __name__ == "__main__":
