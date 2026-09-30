@@ -135,10 +135,13 @@ _VERIFY_LINE_EXACT = re.compile(rf'^\t[ \t@+]*(?:echo "[^"]*"; *)?\$\(MAKE\) --n
 #: in it tells make to ignore that line's status.
 _RECIPE_PREFIX = re.compile(r"^\t([@+ \t-]*)")
 _IGNORE_LINE_PREFIX = "-"
-#: The fake terraform the target is run against, and what it records.
+#: The fake terraform the target is run against, and what it records: the
+#: physical working directory (`pwd -P`, the form the Python side resolves
+#: to, since the shell keeps a logical `$PWD` through a symlink) and the
+#: subcommand.
 _FAKE_TERRAFORM = """#!/bin/sh
-printf '%s %s\\n' "$PWD" "$1" >> "$TERRAFORM_FAKE_LOG"
-if [ "$1" = test ] && [ "$PWD" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
+printf '%s %s\\n' "$(pwd -P)" "$1" >> "$TERRAFORM_FAKE_LOG"
+if [ "$1" = test ] && [ "$(pwd -P)" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
   echo "Failure! 1 failed."; exit 1
 fi
 exit 0
@@ -313,7 +316,9 @@ def _run_target_against_fake_terraform(fail_in: str = "") -> tuple:
                 _FAKE_FAIL_VARIABLE: fail_in,
             },
         )
-        calls = [tuple(line.split(" ", 1)) for line in log.read_text().splitlines()]
+        # The subcommand never holds a space; the directory may, so split
+        # from the right.
+        calls = [tuple(line.rsplit(" ", 1)) for line in log.read_text().splitlines()]
     return result.returncode, result.stdout, calls
 
 
