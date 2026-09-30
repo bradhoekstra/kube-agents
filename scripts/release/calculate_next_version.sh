@@ -90,8 +90,17 @@ else
     # would be stamped as a release main never sees as its base, and every later
     # main release would collide with it. Its own dispatch is release_line.
     if [ -n "${BASE_TIP}" ] && ! git merge-base --is-ancestor "${RC_CANDIDATE_COMMIT}" "${BASE_TIP}" 2>/dev/null; then
-      echo "❌ ERROR: Target commit ${RC_CANDIDATE_COMMIT:0:7} is not on ${RELEASE_MAIN_BRANCH}; a commit on a release line is released with release_line, not target_commit." >&2
-      exit 1
+      if is_ci_pipeline; then
+        echo "❌ ERROR: Target commit ${RC_CANDIDATE_COMMIT:0:7} is not on ${RELEASE_MAIN_BRANCH}; a commit on a release line is released with release_line, not target_commit." >&2
+        exit 1
+      fi
+      # Off CI the main this checkout can see is a tracking or local ref, as fresh as
+      # the last fetch (release_main_ref), and on a fork clone origin/main is the
+      # fork's: a stale one is the likelier reading of "not on main" than a line
+      # commit, so the check is advisory here and the base is qualified against
+      # the candidate alone, as when main cannot be read at all.
+      echo "⚠️ Warning: Target commit ${RC_CANDIDATE_COMMIT:0:7} is not on the ${RELEASE_MAIN_BRANCH} this checkout can see (${BASE_TIP:0:7}), which is as fresh as its last fetch; qualifying the GA base against the candidate alone. In CI, where ${RELEASE_MAIN_BRANCH} is fetched from the release repository, this is refused." >&2
+      BASE_TIP=""
     fi
   fi
   LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RC_CANDIDATE_COMMIT}" "" "${BASE_TIP}")" || exit 1

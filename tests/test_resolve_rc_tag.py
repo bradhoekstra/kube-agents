@@ -37,6 +37,9 @@ class ResolveRcTagTest(unittest.TestCase):
             head = git("rev-parse", "HEAD").stdout.strip()
             git("tag", "-a", "rc_0.8_backport", "-m", "hand-named")
             git("tag", "-a", "rc_0.8_backport_validated", "-m", "refused by the line gate")
+            # The pipeline's shape with another commit's sha: also hand-named, also refused
+            # by the gate, and the one the bare shape would have picked back up.
+            git("tag", "-a", "rc_2609290000_0000000", "-m", "hand-named in the pipeline's shape")
 
             proc, outputs = self._run(repo_dir, {"COMMIT_SHA": head})
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -65,9 +68,14 @@ class ResolveRcTagTest(unittest.TestCase):
             self.assertIn("release line's gate", proc.stderr)
             self.assertIn("rc_tag empty", proc.stderr)
 
+            proc, outputs = self._run(repo_dir, {"COMMIT_SHA": head, "RC_TAG": "rc_2609290000_0000000"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(outputs["rc_tag"], "rc_2609290000_0000000")
+            self.assertIn("is not the pipeline's own name for commit " + head[:7], proc.stderr, "the shape alone is not the name")
+
             proc, _ = self._run(repo_dir, {"COMMIT_SHA": head, "RC_TAG": "rc_2609290000_" + head[:7]})
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertNotIn("WARNING", proc.stderr, "the pipeline's own shape draws no warning")
+            self.assertNotIn("WARNING", proc.stderr, "the pipeline's own name draws no warning")
         finally:
             temp_dir.cleanup()
 

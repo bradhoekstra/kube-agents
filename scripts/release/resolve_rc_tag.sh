@@ -46,8 +46,8 @@ fi
 
 # Resolve Release Tag Name (User input > the pipeline's existing rc_YYMMDDHHMM_<short_sha> tag > a
 # deterministic new one). A hand-named tag on the commit is not reused: get_existing_rc_tag says why.
-if [ -n "${RC_TAG}" ] && ! [[ "${RC_TAG}" =~ ${RC_TAG_SHAPE_REGEX} ]]; then
-  echo "⚠️ WARNING: rc_tag '${RC_TAG}' is not the pipeline's rc_<ts>_<sha> shape. A pass tags the commit '${RC_TAG}_validated', which a release line's gate (verify_release_eligibility.sh) does not read; to validate a line's head, dispatch with rc_tag empty." >&2
+if [ -n "${RC_TAG}" ] && ! [[ "${RC_TAG}" =~ $(rc_tag_name_regex "${COMMIT_SHA}") ]]; then
+  echo "⚠️ WARNING: rc_tag '${RC_TAG}' is not the pipeline's own name for commit ${COMMIT_SHA:0:7} (rc_<ts>_${COMMIT_SHA:0:7}). A pass tags the commit '${RC_TAG}_validated', which a release line's gate (verify_release_eligibility.sh) does not read; to validate a line's head, dispatch with rc_tag empty." >&2
 fi
 if [ -z "${RC_TAG}" ]; then
   existing_rc_tag="$(get_existing_rc_tag "${COMMIT_SHA}")"

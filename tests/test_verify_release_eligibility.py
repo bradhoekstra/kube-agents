@@ -750,7 +750,7 @@ exit {docker_exit}
             repo_dir, env={"RELEASE_VERSION": "0.3.1", "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
         )
         self.assertNotEqual(off.returncode, 0)
-        self.assertIn("is not on release line 0.2", off.stderr)
+        self.assertIn(f"is not on release line {MOCK_TARGET_RELEASE_LINE}", off.stderr)
         other = self._run_verify_script(
             repo_dir,
             env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "RC_CANDIDATE_COMMIT": base_commit},

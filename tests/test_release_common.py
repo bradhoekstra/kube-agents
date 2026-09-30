@@ -632,25 +632,28 @@ source "{_COMMON_SH}"
 
         resolve_rc_tag.sh reuses what this returns, and tag_validated_release.sh
         appends _validated to it. A hand-named rc_tag input therefore earns a
-        marker the release line's gate (RC_VALIDATED_TAG_SHAPE_REGEX) refuses,
+        marker the release line's gate (rc_validated_tag_name_regex) refuses,
         and reusing that name on the next dispatch would re-earn it: the
         commit could never clear the gate without a tag being deleted by hand.
+        The same holds for a pipeline-shaped name carrying another commit's sha,
+        which is why the match is the commit's own name and not the shape.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
             head = git("rev-parse", "HEAD").stdout.strip()
             git("tag", "-a", "rc_0.8_backport", "-m", "hand-named dispatch input")
             git("tag", "-a", "rc_0.8_backport_validated", "-m", "what that dispatch earned")
+            git("tag", "-a", "rc_2609290000_1234567", "-m", "the pipeline's shape, another commit's sha")
 
             proc = self._run_common_func(f'get_existing_rc_tag "{head}"', cwd=repo_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout.strip(), "", "a hand-named tag must not be reused")
+            self.assertEqual(proc.stdout.strip(), "", "neither hand-named tag may be reused")
             proc = self._run_common_func(f'is_commit_already_attempted "{head}"', cwd=repo_dir)
-            self.assertEqual(proc.returncode, 0, "but it still counts as an attempt")
+            self.assertEqual(proc.returncode, 0, "but they still count as an attempt")
 
-            git("tag", "-a", "rc_2609290000_1234567", "-m", "the pipeline's own")
+            git("tag", "-a", f"rc_2609290000_{head[:7]}", "-m", "the pipeline's own")
             proc = self._run_common_func(f'get_existing_rc_tag "{head}"', cwd=repo_dir)
-            self.assertEqual(proc.stdout.strip(), "rc_2609290000_1234567")
+            self.assertEqual(proc.stdout.strip(), f"rc_2609290000_{head[:7]}")
         finally:
             temp_dir.cleanup()
 

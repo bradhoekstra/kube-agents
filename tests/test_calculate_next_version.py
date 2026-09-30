@@ -716,13 +716,48 @@ class CalculateNextVersionTest(unittest.TestCase):
         self.assertEqual(outputs["rc_candidate_commit"], shas["L1"])
         self.assertEqual(outputs["bump_type"], "manual")
 
+    _FAKE_RELEASE_REPO = {"GH_ORG": "no-such-org-kube-agents", "GH_REPO": "no-such-repo"}
+
+    def _release_repository_for(self, git, repo_dir):
+        """A bare repository standing in for the release repository, as in CI: the
+        calculator fetches its tags and its `main` from the composed GitHub URL,
+        rewritten onto the bare path."""
+        bare_dir = pathlib.Path(repo_dir).parent / "release.git"
+        git("init", "--bare", str(bare_dir))
+        git("config", f"url.{bare_dir}.insteadOf", f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git")
+        git("push", "--quiet", str(bare_dir), "main", "--tags")
+        return bare_dir
+
     def test_a_target_commit_off_main_is_refused_without_a_release_line(self):
-        """A release-line commit named as main's target would stamp a release main never sees as its base."""
+        """In CI a release-line commit named as main's target would stamp a release main
+        never sees as its base; main is the release repository's, fetched then and there."""
         repo_dir, git, shas = self._line_repo()
-        proc = self._run_line(repo_dir, env={"TARGET_COMMIT": shas["L1"]})
+        self._release_repository_for(git, repo_dir)
+        proc = self._run_line(repo_dir, env={"CI": "true", "TARGET_COMMIT": shas["L1"], **self._FAKE_RELEASE_REPO})
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("is not on main", proc.stderr)
         self.assertIn("release_line", proc.stderr)
+
+    def test_off_ci_a_stale_tracking_main_does_not_refuse_the_candidate(self):
+        """The standard fork clone has origin/main weeks behind: off CI the read is advisory.
+
+        release_main_ref prefers refs/remotes/origin/main off CI. With it behind the
+        candidate the calculator warns, qualifies the base against the candidate
+        alone, and prints the version; only CI refuses.
+        """
+        repo_dir, git, shas = self._line_repo()
+        (pathlib.Path(repo_dir) / "c.txt").write_text("c\n")
+        git("add", "c.txt")
+        git("commit", "-m", "fix: c")
+        head = git("rev-parse", "HEAD").stdout.strip()
+        git("update-ref", "refs/remotes/origin/main", shas["B"])
+
+        proc = self._run_line(repo_dir, env={"TARGET_COMMIT": head})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("is not on the main this checkout can see", proc.stderr)
+        self.assertIn("qualifying the GA base against the candidate alone", proc.stderr)
+        self.assertNotIn("❌", proc.stderr)
+        self.assertEqual(self._outputs(repo_dir)["previous_version"], "0.2.0")
 
     def test_a_release_cut_by_hand_from_a_later_main_commit_still_supersedes_an_older_candidate(self):
         """The emergency-leftover shape: main's base is qualified against main's head."""

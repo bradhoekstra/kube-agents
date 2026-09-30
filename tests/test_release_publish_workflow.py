@@ -215,9 +215,7 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
     def test_a_release_line_dispatch_reaches_the_gate_and_the_two_resolving_steps(self):
         """`release_line` is read by the gate (to refuse the resolver modes) and by the
         two steps that pick the candidate and the base; nothing after the tag needs it."""
-        doc = _load()
-        inputs = doc.get("on", doc.get(True))["workflow_dispatch"]["inputs"]
-        self.assertIn("release_line", inputs)
+        self.assertIn("release_line", self.triggers["workflow_dispatch"]["inputs"])
         for job, step in ((_GATE_JOB, "Decide"), (_PUBLISH_JOB, "Calculate Next Release Version"), (_PUBLISH_JOB, "Verify Release Eligibility")):
             with self.subTest(step=step):
                 self.assertEqual(self._step(job, step)["env"]["RELEASE_LINE"], "${{ inputs.release_line }}")

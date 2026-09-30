@@ -729,15 +729,18 @@ check_commit_images_exist() {
 }
 
 # Finds the RC pipeline's own rc_<ts>_<sha> tag on a commit, for resolve_rc_tag.sh to
-# reuse; empty when there is none. Shape-matched (RC_TAG_SHAPE_REGEX), not the rc_*
-# glob: a hand-named `rc_tag` dispatch input earns `<name>_validated`, which a release
-# line's gate does not read (validated_rc_tags_at_commit), and reusing that name on
-# the next dispatch would re-earn the same refused marker. A re-dispatch with the
+# reuse; empty when there is none. Matched by name (rc_tag_name_regex, the sha field
+# bound to this commit), not the rc_* glob and not the bare shape: a hand-named
+# `rc_tag` dispatch input, whether `rc_hotfix` or a pipeline-shaped name carrying
+# another commit's sha, earns `<name>_validated`, which a release line's gate does
+# not read (validated_rc_tags_at_commit, the same name rule), and reusing that name
+# on the next dispatch would re-earn the same refused marker. A re-dispatch with the
 # input empty mints the pipeline's name beside the hand-named tag instead, and the
 # gate clears.
 get_existing_rc_tag() {
-  local sha="$1" tags
-  tags="$(git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -E "${RC_TAG_SHAPE_REGEX}" || true)"
+  local sha="$1" full tags
+  full="$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null || echo "${sha}")"
+  tags="$(git tag --points-at "${full}" "rc_*" 2>/dev/null | grep -E "$(rc_tag_name_regex "${full}")" || true)"
   head -n 1 <<<"${tags}"
 }
 
@@ -755,8 +758,8 @@ is_commit_already_attempted() {
 # family must not read as an RC validation. get_latest_validated_rc_tag anchors
 # the same way. For a release from main the GA gate reads the staging family
 # alone and takes the RC validation as implied by it (STAGING_TAG_SHAPE_REGEX
-# below); for a release line it reads this family, shape-matched
-# (validated_rc_tags_at_commit, RC_VALIDATED_TAG_SHAPE_REGEX).
+# below); for a release line it reads this family by the pipeline's own name
+# for the commit (validated_rc_tags_at_commit, rc_validated_tag_name_regex).
 #
 # The glob, not the shape: this is the "already tried" marker the RC scheduler
 # and the nightly read, and a hand-placed marker suppressing a re-validation is
@@ -929,15 +932,24 @@ staging_tag_for_rc() {
 # tag anyone with push access could create — but it is not the stronger
 # guarantee the shape makes it look like.
 export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
-# The shape of the RC pipeline's validation marker, `rc_<ts>_<sha>_validated`: the
-# release line's gate reads this shape, not the `rc_*_validated` glob, for the
-# reason the staging gate reads STAGING_TAG_SHAPE_REGEX rather than its prefix —
-# a hand-typed `rc_hotfix_validated` must not read as "the RC suite passed here".
-export RC_VALIDATED_TAG_SHAPE_REGEX='^rc_[0-9]{10}_[0-9a-f]{7}_validated$'
-# The RC pipeline's own candidate tag, `rc_<ts>_<sha>`, as resolve_rc_tag.sh mints
-# it when the dispatch names none; the marker above is this name with `_validated`
-# appended, so only a candidate tagged in this shape can earn the line's gate.
-export RC_TAG_SHAPE_REGEX='^rc_[0-9]{10}_[0-9a-f]{7}$'
+# The RC pipeline's own names for a commit: `rc_<ts>_<its short sha>`, as
+# resolve_rc_tag.sh mints it when the dispatch names none, and that with
+# `_validated` appended, which tag_validated_release.sh places when the suite
+# passes. The release line's gate and the name reuse both match these, with the
+# sha field bound to the commit in question, rather than the `rc_*` globs or the
+# bare shape: a hand-typed `rc_hotfix_validated` and a composed
+# `rc_<ts>_0000000_validated` must not read as "the RC suite passed here", and a
+# hand-named tag must not be the name the next dispatch reuses (see
+# get_existing_rc_tag). The pipeline never mints anything else, so a genuine
+# validation loses nothing.
+export RC_TAG_TIMESTAMP_PREFIX_REGEX='^rc_[0-9]{10}_'
+# Arguments: $1 = commit sha (full or short; the first seven characters are the field)
+rc_tag_name_regex() {
+  echo "${RC_TAG_TIMESTAMP_PREFIX_REGEX}${1:0:7}\$"
+}
+rc_validated_tag_name_regex() {
+  echo "${RC_TAG_TIMESTAMP_PREFIX_REGEX}${1:0:7}_validated\$"
+}
 
 # Finds the newest shape-valid staging promotion tag on main. Empty output
 # means nothing has been promoted to staging.
@@ -1489,18 +1501,14 @@ release_line_resolve_candidate() {
 }
 
 # The RC validation markers on a commit, one per line: a release line's gate.
-# Matched to the pipeline's own name for this commit, `rc_<ts>_<its short
-# sha>_validated` (RC_VALIDATED_TAG_SHAPE_REGEX with the sha field bound), not
-# the rc_*_validated glob and not the bare shape: the glob would answer for a
-# hand-typed `rc_hotfix_validated`, and the shape alone for a composed
-# `rc_<ts>_0000000_validated`, on a branch whose only gate this is. The
-# pipeline never mints a mismatched sha field (resolve_rc_tag.sh), so binding
-# it costs a genuine validation nothing.
+# Matched to the pipeline's own name for this commit (rc_validated_tag_name_regex;
+# RC_TAG_TIMESTAMP_PREFIX_REGEX says why that and not the glob or the bare shape),
+# on a branch whose only gate this is.
 validated_rc_tags_at_commit() {
   local sha="${1:-}" full tags
   full="$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null || echo "${sha}")"
   tags="$(git tag --points-at "${full}" "rc_*_validated" 2>/dev/null || true)"
-  grep -E "^rc_[0-9]{10}_${full:0:7}_validated\$" <<<"${tags}" || true
+  grep -E "$(rc_validated_tag_name_regex "${full}")" <<<"${tags}" || true
 }
 
 # Where a version's release line is, relative to the release commit and the
@@ -1666,13 +1674,13 @@ ensure_ga_release_refs() {
   prior_branch_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
 
   # In CI the remote decides whether the tag is still to be pushed, not this
-  # checkout: a rejected atomic push leaves the local tag behind (nothing takes it
-  # back, and release_fetch_tags does not prune), and a re-run in the same checkout
-  # that read the local tag as "already there" would push the line alone, which is
-  # the state the atomic push exists to rule out. A local tag the remote lacks is
-  # that leftover, and is recreated at the release commit, which after a merge on
-  # the line is a new stamp. Off CI nothing is pushed and the local tag is what a
-  # dry run inspects, so there the local read stands.
+  # checkout: a dry run, or a run killed before its push, leaves the local tag
+  # behind (release_fetch_tags does not prune), and a CI run in that checkout
+  # that read the local tag as "already there" would push the line alone, which
+  # is the state the atomic push exists to rule out. A local tag the remote lacks
+  # is that leftover, and is recreated at the release commit, which after a merge
+  # on the line is a new stamp. Off CI nothing is pushed and the local tag is what
+  # a dry run inspects, so there the local read stands.
   if is_ci_pipeline; then
     local remote_tag_sha
     remote_tag_sha="$(release_tag_remote_commit "${version}")" || return 1
