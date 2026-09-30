@@ -2483,9 +2483,9 @@ print_generate_only_handoff() {
   echo -e "  gcloud container clusters get-credentials ${cluster_name} --location ${region} --project ${project_id}"
   echo -e "  kubectl --context $(gke_context_name) apply --server-side --force-conflicts -f ${repo_dir}/charts/kube-agents/crds/"
   if [[ "${SCOPE_SHARED_VPC_HOSTS:-}${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
-    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading three APIs the"
+    echo -e "  # A Shared VPC host or Metrics Scope is declared: the plan resolves it by reading APIs the"
     echo -e "  # apply below is what enables, so on a first install enable them first, or the plan is refused:"
-    echo -e "  gcloud services enable ${SCOPE_SELECTOR_APIS} --project=${project_id}"
+    echo -e "  gcloud services enable $(scope_selector_apis) --project=${project_id}"
   fi
   echo -e "  cd ${repo_dir}/terraform/examples/full-install"
   echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
@@ -5397,7 +5397,7 @@ main() {
   # SKIP_GITHUB_ORG_CHECK=true bypasses it.
   check_github_org_is_organization "${GITOPS_ORG:-}"
   # A declared Shared VPC host or Metrics Scope is resolved in the plan, which
-  # reads three APIs the apply below is what enables; on a first install they
+  # reads APIs the apply below is what enables; on a first install they
   # have to be on before the plan, or it is refused with the API disabled.
   enable_scope_selector_apis "$project_id"
 

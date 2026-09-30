@@ -185,14 +185,17 @@ readonly SCOPE_PROBE_NOT_A_PERMISSION_ANSWER_PATTERN="SERVICE_DISABLED|has not b
 # may well be held, so it is not a permission answer either, and the remedy
 # is the token's scope, not a grant.
 readonly SCOPE_PROBE_TOKEN_SCOPE_PATTERN="insufficient authentication scopes|ACCESS_TOKEN_SCOPE_INSUFFICIENT"
-# The APIs the plan-time resolution of a Shared VPC host or Metrics Scope
-# reads (terraform/modules/kube-agents-scope-resolver), billed to the
-# management project, which the resolver sends as the quota project. The
-# reads run in the plan and the composition enables the APIs only in the
-# apply that follows, so enable_scope_selector_apis enables the ones not yet
-# on before an install.sh apply, and the dry-run skips its plan while one is
-# off.
-readonly SCOPE_SELECTOR_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
+# The APIs the plan-time resolution of a selector reads
+# (terraform/modules/kube-agents-scope-resolver), per selector kind, billed to
+# the management project, which the resolver sends as the quota project: a
+# Metrics Scope's reads use the Monitoring and Resource Manager APIs, a Shared
+# VPC host's the Compute API, the same split the composition's API list makes
+# (terraform/examples/full-install/main.tf). The reads run in the plan and the
+# composition enables the APIs only in the apply that follows, so
+# enable_scope_selector_apis enables the ones not yet on before an install.sh
+# apply, and the dry-run skips its plan while one is off.
+readonly SCOPE_METRICS_SCOPE_APIS="cloudresourcemanager.googleapis.com monitoring.googleapis.com"
+readonly SCOPE_SHARED_VPC_HOST_APIS="compute.googleapis.com"
 # The three answers a container permission probe gives.
 readonly SCOPE_PROBE_GRANTED=0
 readonly SCOPE_PROBE_DENIED=1
@@ -1274,22 +1277,37 @@ check_scope_container_access() {
   return 1
 }
 
-# Prints the SCOPE_SELECTOR_APIS not enabled in project $1, space-separated
-# (nothing when all are on); returns 1 when the listing failed, and the
-# caller decides what that means. Read through gcloud's active account, whose
-# answer does not depend on who asks.
+# Prints, space-separated, the APIs the plan reads for the selectors the
+# environment declares (SCOPE_METRICS_SCOPE_APIS for SCOPE_METRICS_SCOPES,
+# SCOPE_SHARED_VPC_HOST_APIS for SCOPE_SHARED_VPC_HOSTS); nothing when neither
+# is declared.
+scope_selector_apis() {
+  local apis=""
+  if [[ "${SCOPE_METRICS_SCOPES:-}" == *[![:space:],]* ]]; then
+    apis="$SCOPE_METRICS_SCOPE_APIS"
+  fi
+  if [[ "${SCOPE_SHARED_VPC_HOSTS:-}" == *[![:space:],]* ]]; then
+    apis+="${apis:+ }$SCOPE_SHARED_VPC_HOST_APIS"
+  fi
+  printf '%s' "$apis"
+}
+
+# Prints the APIs of scope_selector_apis not enabled in project $1,
+# space-separated (nothing when all are on); returns 1 when the listing
+# failed, and the caller decides what that means. Read through gcloud's
+# active account, whose answer does not depend on who asks.
 scope_selector_apis_missing() {
   local project="$1" enabled api missing=""
   enabled="$(trap - ERR; gcloud services list --enabled --project "$project" --format='value(config.name)' 2>/dev/null)" || return 1
-  for api in $SCOPE_SELECTOR_APIS; do
+  for api in $(scope_selector_apis); do
     grep -qx "$api" <<<"$enabled" || missing+="${missing:+ }$api"
   done
   printf '%s' "$missing"
 }
 
 # Enables, in the management project, whichever of the APIs the plan-time
-# resolution of a declared Shared VPC host or Metrics Scope reads
-# (SCOPE_SELECTOR_APIS) is not enabled yet. The reads run in the plan and are
+# resolution of the declared Shared VPC hosts or Metrics Scopes reads
+# (scope_selector_apis) is not enabled yet. The reads run in the plan and are
 # billed to that project, and the composition enables the APIs only in the
 # apply that follows, so a first install that declared a selector would
 # otherwise be refused at plan with the API reported disabled. Nothing is
@@ -1307,8 +1325,8 @@ enable_scope_selector_apis() {
   local project="${1:-${PROJECT_ID:-}}" missing rc=0
   missing="$(scope_selector_apis_missing "$project")" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    missing="$SCOPE_SELECTOR_APIS"
-    print_info "The enabled APIs of project '${project}' could not be listed; enabling the three the scope's Shared VPC host and Metrics Scope lookups read, which is idempotent..."
+    missing="$(scope_selector_apis)"
+    print_info "The enabled APIs of project '${project}' could not be listed; enabling ${missing// /, }, which the plan's lookup of the declared Shared VPC host or Metrics Scope reads and which is idempotent..."
   elif [ -z "$missing" ]; then
     return 0
   else

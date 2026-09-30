@@ -264,11 +264,11 @@ entry that names a Shared VPC service project by ID, or a monitored project by i
 keeps it out of the bindings, the one place an exclusion reaches IAM, because the member has no list
 to be dropped from; a monitored project excluded by ID keeps its grant, which the reconcile's naming
 call needs before the exclusion can match. The reads are billed to the management project and use
-its `cloudresourcemanager`, `monitoring` and `compute` APIs, which the composition enables in the
-apply that follows the plan. So before an `install.sh` apply that carries a selector,
-`enable_scope_selector_apis` lists the project's enabled APIs and enables whichever of the three
-is off, as gcloud's active account, like the KMS enablement beside it: nothing is called when all
-three are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
+its `cloudresourcemanager` and `monitoring` APIs for a Metrics Scope and its `compute` API for a
+Shared VPC host, which the composition enables in the apply that follows the plan, per selector.
+So before an `install.sh` apply that carries a selector, `enable_scope_selector_apis` lists the
+project's enabled APIs and enables whichever of the ones the declared selectors read is off, as
+gcloud's active account, like the KMS enablement beside it: nothing is called when they are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
 warning, since the plan reports a disabled API with the same command as its remedy. The
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
 with the command while one of the three is off (a dry run enables nothing, and its plan would

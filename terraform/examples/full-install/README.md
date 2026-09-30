@@ -566,9 +566,10 @@ naming the selector and the API's answer: it needs
 (`roles/monitoring.metricsScopesViewer` is the narrowest role) with `monitoring.googleapis.com`
 enabled there, and `resourcemanager.projects.get` on each monitored project; a monitored project
 it cannot name, or one whose ID the scope cannot carry, is left out by naming its project number
-in `exclude.projects`. The reads are billed to `project_id`, whose `cloudresourcemanager`,
-`monitoring` and `compute` APIs they use; the composition enables them in the apply, so `install.sh`
-enables whichever is off before an apply that carries a selector; a 403 that names a disabled
+in `exclude.projects`. The reads are billed to `project_id`, whose `cloudresourcemanager` and
+`monitoring` APIs a Metrics Scope's use and whose `compute` API a Shared VPC host's does; the
+composition enables them in the apply, per selector, so `install.sh` enables whichever the declared
+selectors read is off before an apply that carries one; a 403 that names a disabled
 API is reported with that remedy, and one that refuses the identity the consumer project
 (`USER_PROJECT_DENIED`) with the `serviceusage.services.use` it needs there. The reconcile lists at
 most 100 projects of the resolved set, the management project included, so a declaration whose

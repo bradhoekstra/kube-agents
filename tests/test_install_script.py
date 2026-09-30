@@ -7686,7 +7686,8 @@ INSTALL_ENV_FILE="/tmp/test/install.env"
 export SCOPE_METRICS_SCOPES="{scope}"
 print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
 """
-        line = "gcloud services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com --project=test-proj"
+        # A Metrics Scope alone: the two APIs its reads use, not the Compute API a host's would.
+        line = "gcloud services enable cloudresourcemanager.googleapis.com monitoring.googleapis.com --project=test-proj"
         with tempfile.TemporaryDirectory() as tmp:
             empty = pathlib.Path(tmp) / "install.env"
             empty.write_text("")

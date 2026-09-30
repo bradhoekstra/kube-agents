@@ -3076,10 +3076,12 @@ _GOOGLE_CREDENTIAL_VARIABLES = (
 class ScopeSelectorApisTest(unittest.TestCase):
     """enable_scope_selector_apis: silent with no selector declared; with one,
     lists the management project's enabled APIs and enables whichever of the
-    three the plan-time resolution reads is off, since the reads run in the
-    plan and the composition enables the APIs only in the apply that follows.
-    Nothing is called when all three are on; a listing that fails enables all
-    three; an enable that fails is a warning, not an abort."""
+    APIs the plan-time resolution of that selector reads is off (Resource
+    Manager and Monitoring for a Metrics Scope, Compute for a Shared VPC host,
+    the composition's own split), since the reads run in the plan and the
+    composition enables the APIs only in the apply that follows. Nothing is
+    called when they are on; a listing that fails enables every API the
+    declared selectors read; an enable that fails is a warning, not an abort."""
 
     ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
 
@@ -3126,19 +3128,31 @@ class ScopeSelectorApisTest(unittest.TestCase):
         self.assertEqual(calls, "")
         self.assertNotIn("INFO", proc.stdout)
 
-    def test_only_the_apis_that_are_off_are_enabled(self):
-        for keys in ({"SCOPE_METRICS_SCOPES": "observability-hub"}, {"SCOPE_SHARED_VPC_HOSTS": "shared-net-host, other-host"}):
+    def test_only_the_apis_that_are_off_and_that_the_declared_selector_reads_are_enabled(self):
+        # Monitoring on, Resource Manager and Compute off: a Metrics Scope wants Resource
+        # Manager alone (Compute is not among its reads, as the composition's API list
+        # says), a Shared VPC host Compute alone, and both declared want both.
+        cases = (({"SCOPE_METRICS_SCOPES": "observability-hub"}, "cloudresourcemanager.googleapis.com"),
+                 ({"SCOPE_SHARED_VPC_HOSTS": "shared-net-host, other-host"}, "compute.googleapis.com"),
+                 ({"SCOPE_METRICS_SCOPES": "observability-hub", "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"},
+                  "cloudresourcemanager.googleapis.com compute.googleapis.com"))
+        for keys, expected in cases:
             with self.subTest(keys=keys):
                 proc, calls = self._run(keys, enabled="monitoring.googleapis.com container.googleapis.com")
                 self.assertIn("rc=0", proc.stdout, proc.stderr)
-                self.assertEqual(calls, "services enable cloudresourcemanager.googleapis.com compute.googleapis.com --project=test-project\n")
-                self.assertIn("INFO: Enabling cloudresourcemanager.googleapis.com, compute.googleapis.com in project 'test-project'", proc.stdout)
+                self.assertEqual(calls, f"services enable {expected} --project=test-project\n")
+                self.assertIn(f"INFO: Enabling {expected.replace(' ', ', ')} in project 'test-project'", proc.stdout)
 
-    def test_a_listing_that_fails_enables_all_three(self):
-        proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"}, list_fails=True)
-        self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertEqual(calls, f"services enable {self.ALL} --project=test-project\n")
-        self.assertIn("could not be listed", proc.stdout)
+    def test_a_listing_that_fails_enables_every_api_the_declared_selectors_read(self):
+        cases = (({"SCOPE_METRICS_SCOPES": "observability-hub"}, "cloudresourcemanager.googleapis.com monitoring.googleapis.com"),
+                 ({"SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, "compute.googleapis.com"),
+                 ({"SCOPE_METRICS_SCOPES": "observability-hub", "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, self.ALL))
+        for keys, expected in cases:
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, f"services enable {expected} --project=test-project\n")
+                self.assertIn("could not be listed", proc.stdout)
 
     def test_an_enable_that_fails_warns_and_goes_on(self):
         # Under the front doors' set -eE and ERR trap: the plan reports a
@@ -3147,8 +3161,8 @@ class ScopeSelectorApisTest(unittest.TestCase):
         proc, calls = self._run({"SCOPE_METRICS_SCOPES": "observability-hub"}, enabled="monitoring.googleapis.com", enable_fails=True)
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("TRAP-FIRED", proc.stdout)
-        self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com, compute.googleapis.com in project 'test-project'", proc.stdout)
-        self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com compute.googleapis.com --project=test-project", proc.stdout)
+        self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com --project=test-project", proc.stdout)
 
 
 class ScopeContainerPreflightTest(unittest.TestCase):

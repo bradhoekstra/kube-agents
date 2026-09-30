@@ -443,9 +443,10 @@ Prerequisites the design has to state and the installer has to preflight:
   the identity cannot make fails the plan itself, before anything is applied, and a binding it
   cannot make fails inside the apply exactly as an explicit project's does (the phase 3 bullet
   above says why). The reads name the management project as their consumer project, so they use
-  its `cloudresourcemanager`, `monitoring` and `compute` APIs whichever credential type applies;
-  the composition enables those in the apply, so `install.sh` enables whichever is off before an
-  apply that carries a selector (nothing on an existing install, where all three are on), the one
+  its `cloudresourcemanager` and `monitoring` APIs for a Metrics Scope and its `compute` API for a
+  Shared VPC host, whichever credential type applies; the composition enables those in the apply,
+  per selector, so `install.sh` enables whichever the declared selectors read is off before an
+  apply that carries one (nothing on an existing install, where they are on), the one
   out-of-Terraform step the selectors add; its dry run skips the plan while one is off; and the
   resolver's refusal names that project when the API's answer says the API is off, and the
   `serviceusage.services.use` the identity lacks there when it says the consumer project refused

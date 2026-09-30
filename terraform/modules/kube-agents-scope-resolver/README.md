@@ -17,9 +17,9 @@ number. Every read carries the google provider's own access token (`data "google
 so it is answered for the identity that applies, impersonation included, and not for gcloud's
 active account, and names `quota_project` (the management project) as the consumer project, so the
 APIs it uses and the quota it draws are that project's whichever credential type the provider
-holds. Those APIs (`cloudresourcemanager`, `monitoring`, `compute`) are ones the composition
-enables in the apply that follows the plan, so `install.sh` enables them before a first install's
-apply. A 403 that is not a grant on the project read is reported with its own remedy rather than as
+holds. Those APIs (`cloudresourcemanager` and `monitoring` for a Metrics Scope, `compute` for a Shared VPC
+host) are ones the composition enables in the apply that follows the plan, per selector, so
+`install.sh` enables the ones the declared selectors read before a first install's apply. A 403 that is not a grant on the project read is reported with its own remedy rather than as
 one: an API off in the consumer project with the enable command, and an identity the consumer
 project refuses (`USER_PROJECT_DENIED`, a plan-only or narrowly granted credential) with the
 `serviceusage.services.use` it needs there, since enabling an API that is on fixes nothing. A read
