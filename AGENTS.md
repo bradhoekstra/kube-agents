@@ -34,7 +34,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in eleven places here, with different runners and different answers to "does this catch a
+Tests live in twelve places here, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -66,7 +66,7 @@ One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TE
 suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
 deliberately; its README says why.
 
-The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The twelve homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
