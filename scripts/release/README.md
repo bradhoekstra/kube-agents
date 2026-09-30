@@ -462,7 +462,8 @@ line; a patch is validated by the RC pipeline and released by hand.
 
    The pipeline has one concurrency group, so a dispatch during the three-hourly `main` run waits
    for it. It ends by tagging the head `rc_<ts>_<sha>_validated`, which is the gate the next step
-   checks. The nightly promotion ignores that tag: it reads `main`'s candidates only.
+   checks — that shape exactly, as the staging gate reads its own shape: a hand-typed
+   `rc_hotfix_validated` does not count. The nightly promotion ignores that tag: it reads `main`'s candidates only.
 
 3. **Release.**
 
@@ -486,9 +487,10 @@ line; a patch is validated by the RC pipeline and released by hand.
    version.
 
 If the release job fails with "Release line 'release/<X.Y>' already exists ... but points to
-commit", the line moved after the candidate was picked, usually a merge that landed meanwhile:
-nothing was pushed, and a re-run releases from the new head. If a hand push moved the line
-somewhere else, put it back first.
+commit", or earlier with "Release line X.Y resolves to its own head ..., not to ...", the line
+moved after the candidate was picked, usually a merge that landed meanwhile: nothing was pushed,
+and a re-run releases from the new head. If a hand push moved the line somewhere else, put it
+back first.
 
 ### Scheduled execution & testing the gate
 

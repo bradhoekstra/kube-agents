@@ -224,6 +224,7 @@ source "{_COMMON_SH}"
             git("tag", "rc_2608191200_2222222_validated")
             git("tag", "rc_2608191200_2222222")
             git("tag", "staging_2608191200_2222222")
+            git("tag", "rc_hotfix_validated")
             proc = self._run_common_func(f'validated_rc_tags_at_commit "{head}"', cwd=repo_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.split(), ["rc_2608191200_2222222_validated"])

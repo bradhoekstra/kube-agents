@@ -274,12 +274,10 @@ class DecideReleaseGateTest(unittest.TestCase):
             ({"SCHEDULE_GATE": "bypass", "RELEASE_LINE": "0.2", "TARGET_COMMIT": "abc1234"}, "cannot be named alongside"),
         ):
             with self.subTest(env=env):
-                result = self._run(repo_dir, env=env)
-                proc = result[0] if isinstance(result, tuple) else result
+                proc, _, _ = self._run(repo_dir, env=env)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn(phrase, proc.stderr)
-        result = self._run(repo_dir, env={"SCHEDULE_GATE": "bypass", "RELEASE_LINE": "0.2"})
-        proc = result[0] if isinstance(result, tuple) else result
+        proc, _, _ = self._run(repo_dir, env={"SCHEDULE_GATE": "bypass", "RELEASE_LINE": "0.2"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 if __name__ == "__main__":

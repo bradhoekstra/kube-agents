@@ -133,7 +133,10 @@ if [ -n "${EXPLICIT_RELEASE_VERSION}" ]; then
       echo "❌ ERROR: Explicit release version '${EXPLICIT_RELEASE_VERSION}' is not on release line ${RELEASE_LINE}." >&2
       exit 1
     fi
-  elif [ "${BASE_LINE_HAS_BRANCH}" = "true" ] && [ "$(release_line_for_version "${EXPLICIT_RELEASE_VERSION}")" = "${BASE_LINE}" ]; then
+  # An explicit version equal to the base is a re-run of the release that
+  # created the line (3.3 below admits it only when the tag sits on this
+  # candidate's stamp), not a new patch on it.
+  elif [ "${BASE_LINE_HAS_BRANCH}" = "true" ] && [ "${EXPLICIT_RELEASE_VERSION}" != "${LATEST_GA_TAG}" ] && [ "$(release_line_for_version "${EXPLICIT_RELEASE_VERSION}")" = "${BASE_LINE}" ]; then
     echo "❌ ERROR: Explicit release version '${EXPLICIT_RELEASE_VERSION}' is a patch on line ${BASE_LINE}, which has its own branch; release it from release/${BASE_LINE}, or bump MINOR on main." >&2
     exit 1
   fi

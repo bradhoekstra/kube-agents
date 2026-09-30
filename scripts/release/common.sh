@@ -744,11 +744,18 @@ is_commit_already_attempted() {
 # Anchored to the rc_ family, and named for it: this gates resolve_rc_tag.sh's
 # skip decision and the nightly promotion, so a marker minted by some other tag
 # family must not read as an RC validation. get_latest_validated_rc_tag anchors
-# the same way. The GA gate does not appear in that list any more:
-# verify_release_eligibility.sh reads the staging family alone, and takes the RC
-# validation as implied by it — see STAGING_TAG_SHAPE_REGEX below.
+# the same way. For a release from main the GA gate reads the staging family
+# alone and takes the RC validation as implied by it (STAGING_TAG_SHAPE_REGEX
+# below); for a release line it reads this family, shape-matched
+# (validated_rc_tags_at_commit, RC_VALIDATED_TAG_SHAPE_REGEX).
+#
+# The glob, not the shape: this is the "already tried" marker the RC scheduler
+# and the nightly read, and a hand-placed marker suppressing a re-validation is
+# the operator's own doing. The release line's gate is the stricter question,
+# "did the RC pipeline pass here", and reads the shape (validated_rc_tags_at_commit).
 is_rc_candidate_commit_already_validated() {
-  [ -n "$(validated_rc_tags_at_commit "${1:-}")" ]
+  local sha="${1:-}"
+  [ -n "$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || true)" ]
 }
 
 # ─── Promotion tag cores ──────────────────────────────────────────────────────
@@ -913,6 +920,11 @@ staging_tag_for_rc() {
 # tag anyone with push access could create — but it is not the stronger
 # guarantee the shape makes it look like.
 export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
+# The shape of the RC pipeline's validation marker, `rc_<ts>_<sha>_validated`: the
+# release line's gate reads this shape, not the `rc_*_validated` glob, for the
+# reason the staging gate reads STAGING_TAG_SHAPE_REGEX rather than its prefix —
+# a hand-typed `rc_hotfix_validated` must not read as "the RC suite passed here".
+export RC_VALIDATED_TAG_SHAPE_REGEX='^rc_[0-9]{10}_[0-9a-f]{7}_validated$'
 
 # Finds the newest shape-valid staging promotion tag on main. Empty output
 # means nothing has been promoted to staging.
@@ -1411,17 +1423,20 @@ release_line_resolve_candidate() {
   if [ -n "${named}" ] && [ "${named}" != "null" ]; then
     named_sha="$(git rev-parse --verify "${named}^{commit}" 2>/dev/null || echo "")"
     if [ "${named_sha}" != "${candidate}" ]; then
-      echo "❌ ERROR: Release line ${line} releases its own head (${candidate:0:7}); target commit '${named}' cannot be named alongside it." >&2
+      echo "❌ ERROR: Release line ${line} resolves to its own head (${candidate:0:7}), not to '${named}'. Either a target commit was named — a line takes none — or the line moved since it was last read. Nothing has been pushed; re-run without a target commit." >&2
       return 1
     fi
   fi
   echo "${candidate}"
 }
 
-# The rc_*_validated tags on a commit, one per line: a release line's gate.
+# The RC validation markers on a commit, one per line, shape-matched: a release
+# line's gate. The glob would also answer for a hand-typed `rc_hotfix_validated`,
+# which is the shape the gate exists to refuse; see RC_VALIDATED_TAG_SHAPE_REGEX.
 validated_rc_tags_at_commit() {
-  local sha="${1:-}"
-  git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || true
+  local sha="${1:-}" tags
+  tags="$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || true)"
+  grep -E "${RC_VALIDATED_TAG_SHAPE_REGEX}" <<<"${tags}" || true
 }
 
 # Where a version's release line is, relative to the release commit and the

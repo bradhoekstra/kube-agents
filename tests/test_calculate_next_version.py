@@ -630,7 +630,7 @@ class CalculateNextVersionTest(unittest.TestCase):
         repo_dir, git, shas = self._line_repo()
         proc = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "TARGET_COMMIT": shas["B"]})
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("releases its own head", proc.stderr)
+        self.assertIn("resolves to its own head", proc.stderr)
         same = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "TARGET_COMMIT": shas["L1"]})
         self.assertEqual(same.returncode, 0, same.stderr)
 
@@ -665,6 +665,26 @@ class CalculateNextVersionTest(unittest.TestCase):
         self.assertEqual(outputs["bump_type"], "minor-line")
 
         refused = self._run_line(repo_dir, env={"TARGET_COMMIT": c, "EXPLICIT_RELEASE_VERSION": "0.2.9"})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("release it from release/0.2", refused.stderr)
+
+    def test_a_re_run_of_the_release_that_created_the_line_is_admitted_on_main(self):
+        """After the atomic push, "Re-run failed jobs" replays the same explicit version.
+
+        The base is then the release itself and its line exists; an explicit
+        version equal to the base is that resume, which the collision check
+        admits when the tag sits on this candidate's stamp, not a new patch on
+        the line to refuse.
+        """
+        repo_dir, git, shas = self._line_repo()
+        # release/0.2 exists (created from the stamp); re-run 0.2.0 from its candidate B.
+        proc = self._run_line(repo_dir, env={"EXPLICIT_RELEASE_VERSION": "0.2.0", "TARGET_COMMIT": shas["B"]})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "0.2.0")
+        outputs = self._outputs(repo_dir)
+        self.assertEqual(outputs["bump_type"], "manual")
+        # A different patch on that line from main is still refused.
+        refused = self._run_line(repo_dir, env={"EXPLICIT_RELEASE_VERSION": "0.2.1", "TARGET_COMMIT": shas["B"]})
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("release it from release/0.2", refused.stderr)
 

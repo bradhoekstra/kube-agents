@@ -181,16 +181,18 @@ if is_truthy "${SKIP_VALIDATION}"; then
   exit 0
 fi
 
-# 5. Check for a staging promotion tag pointing at target commit.
+# 5. Check the validation gate at the target commit: a staging promotion tag for a release
+# from main, an RC validation marker for a release line.
 #
-# Shape-matched via common.sh rather than by the staging_ prefix: the prefix is a live deploy
-# trigger anyone can push, so a hand-made 'staging_hotfix' would otherwise satisfy the release gate.
+# Both shape-matched via common.sh rather than by prefix: the staging_ prefix is a live deploy
+# trigger anyone can push and the rc_ family is open to hand-made names, so a 'staging_hotfix' or
+# an 'rc_hotfix_validated' would otherwise satisfy the release gate.
 if [ -n "${RELEASE_LINE}" ]; then
   echo "🔎 Checking for rc_*_validated tags pointing at release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT}..."
   VALIDATED_TAGS="$(validated_rc_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
   if [ -z "${VALIDATED_TAGS}" ]; then
     echo "❌ BLOCKED: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT} has NOT passed the RC validation!" >&2
-    echo "   No 'rc_*_validated' tag points to this commit." >&2
+    echo "   No 'rc_<ts>_<sha>_validated' tag from the RC pipeline points to this commit." >&2
     echo "   Dispatch '.github/workflows/rc-release-pipeline.yml' with commit_sha=${RC_CANDIDATE_COMMIT} and wait for it to tag the commit validated." >&2
     exit 1
   fi

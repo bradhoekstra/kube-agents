@@ -691,15 +691,18 @@ exit {docker_exit}
         self.assertIn("Found RC validation tag(s)", proc.stdout)
         self.assertIn("rc_2609290000_1234567_validated", proc.stdout)
 
-    def test_a_line_is_blocked_by_a_staging_tag_alone(self):
-        repo_dir, git, bin_dir, _, head = self._line_repo()
-        git("tag", "-a", "staging_2609290000_1234567", "-m", "not the line's gate", head)
-        proc = self._run_verify_script(
-            repo_dir, env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("has NOT passed the RC validation", proc.stderr)
-        self.assertIn("rc-release-pipeline.yml", proc.stderr)
+    def test_a_line_is_blocked_by_a_staging_tag_or_a_hand_typed_marker_alone(self):
+        """The line's gate is the RC pipeline's shape, not the rc_*_validated glob."""
+        for tag in ("staging_2609290000_1234567", "rc_hotfix_validated", "rc_x_validated"):
+            with self.subTest(tag=tag):
+                repo_dir, git, bin_dir, _, head = self._line_repo()
+                git("tag", "-a", tag, "-m", "not the line's gate", head)
+                proc = self._run_verify_script(
+                    repo_dir, env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+                )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("has NOT passed the RC validation", proc.stderr)
+                self.assertIn("rc-release-pipeline.yml", proc.stderr)
 
     def test_a_line_refuses_a_version_off_the_line_and_a_candidate_that_is_not_its_head(self):
         repo_dir, git, bin_dir, base_commit, head = self._line_repo()
@@ -715,7 +718,8 @@ exit {docker_exit}
             bin_dir=bin_dir,
         )
         self.assertNotEqual(other.returncode, 0)
-        self.assertIn("releases its own head", other.stderr)
+        self.assertIn("resolves to its own head", other.stderr)
+        self.assertIn("the line moved since it was last read", other.stderr)
 
 if __name__ == "__main__":
     unittest.main()

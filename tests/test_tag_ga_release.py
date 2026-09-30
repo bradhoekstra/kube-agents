@@ -545,9 +545,9 @@ class TagGAReleaseScriptTest(unittest.TestCase):
     def test_a_patch_fast_forwards_the_release_line(self):
         """A minor creates `release/X.Y` at its stamp; a patch stamped from the line head moves it.
 
-        Run in CI mode against a bare origin: the tag is pushed before the line
-        each time, the minor's stamp stays tagged and reachable, and the patch
-        stamp's single parent is the backport that was the line head.
+        Run in CI mode against a bare origin: the tag and the line go in one
+        push each time, the minor's stamp stays tagged and reachable, and the
+        patch stamp's single parent is the backport that was the line head.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
@@ -602,28 +602,29 @@ class TagGAReleaseScriptTest(unittest.TestCase):
     _REJECT_RELEASE_BRANCH_MARKER = "reject-release-branch"
 
     def _install_release_branch_rejecting_hook(self, git, bare_dir):
-        """A pre-receive hook on the bare remote that refuses `refs/heads/release/*`
-        while a marker file exists in the repository, and accepts everything else.
+        """An `update` hook on the bare remote that refuses `refs/heads/release/*`
+        while a marker file exists in the repository, and accepts every other ref.
 
-        This is how a push of the release branch is made to fail for real, rather
-        than by deleting the branch afterwards: what the remote holds when the
-        script exits non-zero is then what a run that died at that push leaves.
+        `update` rather than `pre-receive`, deliberately: a pre-receive hook is
+        all-or-nothing by git's own contract, so it could not tell an atomic push
+        from a plain one. An update hook rejects one ref at a time, which is the
+        shape a moved line produces; without `--atomic` the tag would land and
+        the line be refused, and the test below would see the stranded tag.
         """
         hooks_dir = bare_dir / "hooks"
         hooks_dir.mkdir(exist_ok=True)
-        hook = hooks_dir / "pre-receive"
+        hook = hooks_dir / "update"
         hook.write_text(
             "#!/bin/sh\n"
-            "while read -r old new ref; do\n"
-            "  case \"$ref\" in\n"
-            "    refs/heads/release/*)\n"
-            f"      if [ -f \"{self._REJECT_RELEASE_BRANCH_MARKER}\" ]; then\n"
-            "        echo 'release branch rejected by the test hook' >&2\n"
-            "        exit 1\n"
-            "      fi\n"
-            "      ;;\n"
-            "  esac\n"
-            "done\n"
+            "ref=\"$1\"\n"
+            "case \"$ref\" in\n"
+            "  refs/heads/release/*)\n"
+            f"    if [ -f \"{self._REJECT_RELEASE_BRANCH_MARKER}\" ]; then\n"
+            "      echo 'release branch rejected by the test hook' >&2\n"
+            "      exit 1\n"
+            "    fi\n"
+            "    ;;\n"
+            "esac\n"
             "exit 0\n"
         )
         hook.chmod(0o755)
@@ -634,8 +635,9 @@ class TagGAReleaseScriptTest(unittest.TestCase):
     def test_a_rejected_line_push_takes_the_tag_with_it_and_a_fresh_checkout_re_run_pushes_both(self):
         """The tag and the line go in one atomic push: neither lands without the other.
 
-        The remote refuses the line on the first run, so the tag does not land
-        either and nothing has to be taken back. The second run, from a fresh
+        The remote's update hook refuses the line ref alone on the first run; a
+        plain push would land the tag and leave it stranded, the atomic push
+        lands nothing, and nothing has to be taken back. The second run, from a fresh
         checkout with no local release branch, stamps again (the tag never
         reached the remote) and pushes both. A tag the remote already holds
         with the line missing — a hand deletion — is covered by
