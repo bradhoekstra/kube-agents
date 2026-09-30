@@ -281,6 +281,13 @@ class ConfigValidationTest(unittest.TestCase):
                 self.assertNotIn("not a bare GitHub login", str(caught.exception))
                 quoted = yaml.safe_load(f'options:\n  robot_accounts:\n    - "{entry}"\n')
                 rr.validate_config(quoted)
+        # A mapping or a nested list is a different mistake with a different
+        # remedy: quoting does nothing for it, so the message says the shape.
+        for entry in ([{"login": "kyber775"}], [["kyber775"]]):
+            with self.subTest(entry=entry), self.assertRaises(ValueError) as caught:
+                rr.validate_config({"options": {"robot_accounts": entry}})
+            self.assertIn("not a mapping or a list", str(caught.exception))
+            self.assertNotIn("quote", str(caught.exception))
         # Quoting keeps what the operator typed: `007` is a login, `7` is not it.
         self.assertEqual(rr.robot_accounts(yaml.safe_load('options:\n  robot_accounts:\n    - "007"\n')), {"007"})
 
@@ -645,6 +652,9 @@ class MainTest(unittest.TestCase):
         posts = self.run_main(pull_request(), [review("kyber775", "CHANGES_REQUESTED", submitted_at="1"), review("kyber775", submitted_at="2")])
         self.assertEqual(posts, [self.REQUESTED])
         self.assertEqual(self.code, 0)
+        # The run log names the list in effect, since shape is all that can be
+        # validated and a well-formed login naming no account sits inert.
+        self.assertIn("Robot accounts, whose reviews never count: kyber775", self.stderr.getvalue())
 
     def test_a_request_outstanding_to_a_listed_robot_does_not_block_the_check_run_path(self):
         posts = self.run_main(pull_request(requested_reviewers=[{"login": "kyber775"}]), [])

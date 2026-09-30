@@ -158,11 +158,19 @@ def validate_config(config):
             # `yes`, `no`, `on`, `off`, `true` or `false` as a bool; both are
             # valid logins once quoted, and `007` would not survive str() of
             # the int, so the remedy is named rather than guessed at.
-            if not isinstance(login, str):
+            if isinstance(login, (bool, int, float)):
                 raise ValueError(
                     f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} was read by YAML as "
                     f"{type(login).__name__}, not text: quote a login that is all digits or a "
                     "YAML word such as yes, no, on or off"
+                )
+            if not isinstance(login, str):
+                # A mapping (`- login: kyber775`) or a nested list: quoting is no
+                # remedy for that, so the message says the shape instead.
+                raise ValueError(
+                    f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} is a {type(login).__name__}, not a "
+                    "login: write each entry as a bare login on its own line, `- kyber775`, "
+                    "not a mapping or a list"
                 )
             if not is_github_login(login):
                 raise ValueError(
@@ -754,8 +762,13 @@ def main(argv=None):
     if not args.react_to:
         approvers = applicable_approvers(changed_files, args.owners_root)
         log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
+        robots = robot_accounts(config)
+        # Named in the run log because the list can only be checked for shape,
+        # not identity: a well-formed login that names no account sits inert,
+        # and this line is what shows which logins were in effect.
+        log(f"Robot accounts, whose reviews never count: {', '.join(sorted(robots)) or 'none'}")
         reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
-        reason = already_reviewed_reason(pull_request, reviews, approvers, robot_accounts(config))
+        reason = already_reviewed_reason(pull_request, reviews, approvers, robots)
         if reason:
             decline(api, args, reason)
             return 0
