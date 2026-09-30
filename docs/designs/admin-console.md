@@ -757,10 +757,9 @@ override identity or correlation fields.
   later page fails. Logging uses two queries (the lifted-field form of a record,
   and the wrapped text form of one the sidecar did not lift; the text query
   excludes lifted records, and a record both still return is merged by
-  `insertId`) with
-  500-record pages and a 60-second request timeout; Trace and each Logging query stop
-  after ten pages, and both sources share a 90-second load deadline. Source
-  pagination and ledger pagination remain separate concerns.
+  `insertId`) with 500-record pages and a 60-second request timeout; Trace and
+  each Logging query stop after ten pages, and both sources share a 90-second
+  load deadline. Source pagination and ledger pagination remain separate concerns.
 - **Scheduled Cron:** live Hermes job definitions, scheduler heartbeat state,
   and one execution table with a row per job title. Each row retains run and
   outcome counts, latest activity, and participating profiles, then expands in

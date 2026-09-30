@@ -7009,11 +7009,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     def log_message(self, message: str, *args: Any) -> None:
         # BaseHTTPRequestHandler.log_request passes self.requestline through
         # here verbatim, and this runs on every response - including the 401 an
-        # unauthenticated caller gets. A vertical tab in the request line is
-        # enough to end the record and start another, so an unauthenticated
-        # caller could write a whole audit-shaped line of its own. The request
-        # line's own tokenizer stops at whitespace, which limits the shape of
-        # the forgery and does not prevent it.
+        # unauthenticated caller gets. The deployed formatter is JSON and keeps
+        # a vertical tab in the request line inside the one record; the
+        # sanitiser bounds the length, strips the control characters, and
+        # holds for a text formatter a test or a local run installs, under
+        # which that vertical tab would end the record and let an
+        # unauthenticated caller start an audit-shaped line of its own.
         LOGGER.info("http " + message, *_sanitized_log_args(args))
 
     def _json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:

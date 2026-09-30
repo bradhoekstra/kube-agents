@@ -30,6 +30,7 @@ from credential_proxy import (
     JsonLineFormatter,
     Policy,
     ProxyMetrics,
+    Rule,
 )
 
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
@@ -255,6 +256,21 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
         records = [a for a in self.audits() if a["request_id"] == request_id]
         self.assertTrue(records, f"no audit record for {request_id}: {self.lines()}")
         return records[-1]
+
+    def test_a_command_the_policy_file_refuses(self):
+        # The denylist site, distinct from the read-only gate: the fixture's
+        # policy has no rules, so this one installs a rule of its own.
+        CredentialProxyHandler.policy = Policy(
+            rules=[Rule("kubernetes.secret-read", re.compile(r"kubectl\s+get\s+secrets?\b", re.IGNORECASE), "no")],
+            blocked_message="blocked",
+        )
+        status, body = self.post(["kubectl", "get", "secrets"], request_id="req-p1")
+        self.assertEqual((403, "kubernetes.secret-read"), (status, body["rule"]))
+        record = self._last_audit("req-p1")
+        self.assertEqual(
+            (record["status"], record["rule"], record["tool"], record["subcommand"], record["severity"]),
+            ("blocked", "kubernetes.secret-read", "kubectl", "get", "WARNING"),
+        )
 
     def test_a_refused_git_argument(self):
         status, body = self.post(["git", "-c", "core.hooksPath=/x", "status"], request_id="req-g1")
