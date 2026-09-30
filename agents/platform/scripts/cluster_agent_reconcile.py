@@ -1057,17 +1057,22 @@ def _previous_number(previous: dict | None, project: str) -> str | None:
 
 
 def _numbers_memo(previous: dict | None, selector_reports: dict[str, tuple[list[str] | None, str]],
-                  numbers_named: dict[str, str], selectors_consulted: bool) -> dict[str, str]:
+                  numbers_named: dict[str, str], selectors_consulted: bool, patterns: list[str]) -> dict[str, str]:
     """The number -> ID pairs the snapshot keeps for the next run.
 
-    Every pair this run's naming pass returned, and every pair the last snapshot knew whose
-    number a selector still reports; all of them when a selector's lookup failed or when the
-    run consulted no selector at all (`selectors_consulted` False: the declaration could not
-    be read, the CR carries no scope block, or the render predates the selector keys), since
-    what would be reported is then unknown and such a tick carries the last declaration and
-    every row forward rather than retiring anything, so it must not forget the pairs the
-    rows do not hold either. A pair leaves the memo only on a tick that read the selectors
-    and found its number gone. The memo is
+    Every pair this run's naming pass returned, and every pair the last snapshot knew (memo
+    or row) whose number a selector still reports or an `exclude.projects` entry names; all
+    of them when a selector's lookup failed or when the run consulted no selector at all
+    (`selectors_consulted` False: the declaration could not be read, the CR carries no scope
+    block, or the render predates the selector keys), since what would be reported is then
+    unknown and such a tick carries the last declaration and every row forward rather than
+    retiring anything, so it must not forget the pairs the rows do not hold either. The
+    entry keeps the pair because the entry is what still needs it: a row keeps its number
+    until the project's last profile is pruned, so an entry whose only tie was the row of a
+    project the scope no longer reports would drop the project, prune it, and then, the row
+    gone with the profiles, find nothing tying the number and admit it again, re-creating
+    the profiles it had just deleted. A pair leaves the memo only on a tick that read the
+    selectors and found its number neither reported nor named by an entry. The memo is
     what lets a run whose naming call is cut or refused still tie the number to the ID: a
     project an `exclude.projects` number names has no row to keep the pair on, and without
     it such a run would find nothing tying the number to the project and admit it again on
@@ -1077,7 +1082,7 @@ def _numbers_memo(previous: dict | None, selector_reports: dict[str, tuple[list[
     """
     reported = {m for members, _ in selector_reports.values() if members for m in members if m.isdigit()}
     keep_all = not selectors_consulted or any(members is None for members, _ in selector_reports.values())
-    memo = {n: p for n, p in _previous_numbers(previous).items() if keep_all or n in reported}
+    memo = {n: p for n, p in _previous_numbers(previous).items() if keep_all or n in reported or n in patterns}
     memo.update({n: p for p, n in numbers_named.items()})
     return dict(sorted(memo.items()))
 
@@ -1867,7 +1872,7 @@ def reconcile(dry_run: bool = False) -> dict:
             "unmanaged": sorted(unmanaged, key=lambda u: u["profile"]),
             "ignoredExcludes": ignored_excludes,
             NUMBERS_KEY: _numbers_memo(previous, selector_reports, numbers_named,
-                                       scope_readable and scope_present and selectors_known),
+                                       scope_readable and scope_present and selectors_known, exclude_patterns),
         })
 
     return report

@@ -2580,11 +2580,14 @@ class ScopeTest(HomesMixin):
         self.assertEqual((report["projects"].get("team-a"), created), (rec.OUTCOME_DENIED, []))
         self.assertNotIn("111", report["projects"])
         self.assertNotIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
-        # The memo follows what the selectors report: kept while a lookup fails (what it would
-        # report is unknown), dropped once the scope resolves and no longer names the number.
+        # The memo follows what needs the tie: kept while a lookup fails (what it would report
+        # is unknown), kept while the entry names the number although the scope no longer
+        # reports it, and dropped once neither holds.
         self._run(declaration, {self.MGMT: []}, selectors={self.SCOPE: (None, rec.OUTCOME_UNREACHABLE)})
         self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
         self._run(declaration, {self.MGMT: []}, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        self._run({**declaration, "exclude": {"projects": []}}, {self.MGMT: []}, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
         self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {})
         # No run has ever named the number and this one cannot: the entry drops the member by
         # number alone, and the log says the ID routes are beyond it until a run names it. A
@@ -2600,6 +2603,38 @@ class ScopeTest(HomesMixin):
                 logs = " ".join(str(c) for c in logged.call_args_list)
                 self.assertEqual("reaches no route that names the project by ID" in logs, said, naming)
                 self.assertNotIn("prune", logs)
+
+    def test_an_entry_naming_a_number_only_a_row_tied_keeps_the_tie_past_the_row(self):
+        # team-a was named 111 once (the row keeps it) and has since left the Metrics Scope, so
+        # the memo no longer holds the pair; the operator now excludes 111 while team-a is still
+        # explicit with profiles. The entry drops team-a on the row's number and retires it, the
+        # profiles go on the next clean run, and the row with them: the memo has to keep the
+        # pair for as long as the entry stands, or the third run, finding no row and no pair,
+        # admits team-a again and scaffolds the profiles it just deleted.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "metricsScopes": ["mon-proj"], "exclude": {"projects": ["111"]}}
+        listings = {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")]}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "111"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, created, deleted = self._run(declaration, listings, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted, report["retiring"]), ([], [], ["team-a"]))
+        self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        report, created, deleted = self._run(declaration, listings, profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, deleted), ([], ["cluster-a"]))
+        snap = self._snapshot()
+        self.assertNotIn("team-a", {p["id"] for p in snap["projects"]})
+        self.assertEqual(snap[rec.NUMBERS_KEY], {"111": "team-a"})
+        for _ in range(2):
+            report, created, _ = self._run(declaration, listings, selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+            self.assertEqual((created, sorted(report["projects"])), ([], [self.MGMT]))
+            self.assertEqual(self._snapshot()[rec.NUMBERS_KEY], {"111": "team-a"})
+        # The entry withdrawn, the number unreported: the pair leaves, and team-a is explicit again.
+        report, created, _ = self._run({"projects": ["team-a"], "metricsScopes": ["mon-proj"]}, listings,
+                                       selectors={self.SCOPE: ([], rec.OUTCOME_OK)})
+        self.assertEqual((created, self._snapshot()[rec.NUMBERS_KEY]), ([("team-a", "prod", "us-central1")], {}))
 
     def test_a_glob_never_matches_a_project_number(self):
         # `*[0-9]*` is written against IDs, to keep numbered sandboxes out. Now that a number
