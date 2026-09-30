@@ -338,6 +338,43 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
             ("blocked", "git.workspace.lease", "git", "commit"),
         )
 
+    def _post_raw(self, request_id, argv, cwd):
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps({"requestId": request_id, "argv": argv, "cwd": cwd}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        return caught.exception.code
+
+    def test_a_git_request_with_a_cwd_no_path_can_hold(self):
+        # An embedded NUL raises ValueError out of the git gate's path
+        # resolution, before the command; the request still ends with a
+        # response and the trail with a terminal record, never a fault.
+        status = self._post_raw("req-n1", ["git", "status"], "/opt/data/\u0000")
+        self.assertEqual(400, status)
+        statuses = [a["status"] for a in self.audits() if a["request_id"] == "req-n1"]
+        self.assertEqual(["started", "rejected"], statuses)
+        self.assertEqual([], [r["message"] for r in self.records() if r["severity"] == "ERROR"])
+
+    def test_a_git_request_with_a_cwd_the_broker_cannot_read(self):
+        # Under a directory the broker may not stat, the gate's alias lookup
+        # raises PermissionError on interpreters up to 3.12; on 3.13, or as
+        # root, the lookup reads through and the lease refusal answers. Either
+        # way: a response, a terminal record, no fault.
+        unreadable = Path(self.temp_dir.name) / "unreadable"
+        unreadable.mkdir(mode=0o000)
+        self.addCleanup(unreadable.chmod, 0o700)
+        status = self._post_raw("req-u1", ["git", "foo"], str(unreadable / "repo"))
+        self.assertIn(status, (400, 403))
+        statuses = [a["status"] for a in self.audits() if a["request_id"] == "req-u1"]
+        self.assertEqual(2, len(statuses), statuses)
+        self.assertEqual("started", statuses[0])
+        self.assertIn(statuses[1], ("rejected", "blocked"))
+        self.assertEqual([], [r["message"] for r in self.records() if r["severity"] == "ERROR"])
+
     def test_a_saturated_broker(self):
         CredentialProxyHandler.executor = self._Idle()
         CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(

@@ -5189,14 +5189,17 @@ def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
     # lines in text-mode consumers.
     #
     # Cs is here for the opposite reason: a lone surrogate does not forge a
-    # record, it deletes one. json.loads turns "\\ud800" into a real lone
-    # surrogate, which no UTF-8 encoder will accept, so the handler raises
-    # UnicodeEncodeError, logging prints "--- Logging error ---" to stderr and
-    # drops the record - while the request it was supposed to describe carries
-    # on and succeeds. An authenticated caller could execute a command and
-    # leave no exec line behind. Verified against a byte-encoding handler; a
-    # StringIO one does not reproduce it, which is why the unit tests below
-    # write through a real UTF-8 encoder.
+    # record, it deletes one under a text formatter. json.loads turns
+    # "\\ud800" into a real lone surrogate, which no UTF-8 encoder will
+    # accept, so a text-formatting handler raises UnicodeEncodeError, logging
+    # prints "--- Logging error ---" to stderr and drops the record - while
+    # the request it was supposed to describe carries on and succeeds. The
+    # deployed JsonLineFormatter escapes the surrogate and keeps the record
+    # (test_credential_proxy_audit_json holds that); the strip is what keeps
+    # the property under a text formatter a test or a local run installs.
+    # Verified against a byte-encoding handler; a StringIO one does not
+    # reproduce it, which is why the unit tests below write through a real
+    # UTF-8 encoder.
     filtered = ''.join(
         c for c in s if unicodedata.category(c) not in ('Cc', 'Cf', 'Cs', 'Zl', 'Zp')
     )
@@ -6046,53 +6049,65 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Not a policy rule: the policy matches on argv alone, and this refusal
-        # turns on the working directory as well.
-        if hasattr(self.executor, "resolve_git_command"):
-            violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
-        else:
-            violation = self.executor.git_lease_violation(argv, cwd)
-            exec_argv = argv
-        if violation is not None:
-            LOGGER.warning(
-                "git lease refused request_id=%s cwd=%s",
-                request_id,
-                _sanitize_for_logging(cwd or "", max_length=256),
-                extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_WORKSPACE_LEASE),
-            )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
-            self._json(
-                HTTPStatus.FORBIDDEN,
-                {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": RULE_GIT_WORKSPACE_LEASE,
-                    "message": violation,
-                },
-            )
-            return
-
-        # Runs after the credential denylist above, so rules like
-        # `kubernetes.token-disclosure` keep their own ids and messages rather
-        # than being reported as read-only refusals. For example, `kubectl create
-        # token sa` is on the denylist as `kubernetes.token-disclosure` and will
-        # be refused by the denylist with that rule id. If the gate ran first, it
-        # would refuse as `kubernetes.read-only`, losing the specific rule.
-        refusal_result = read_only_refusal(argv)
-        if refusal_result is None and exec_argv != argv:
-            refusal_result = read_only_refusal(exec_argv)
-        if refusal_result is not None:
-            refusal, log_hint = refusal_result
-            safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
-            LOGGER.warning(
-                "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint,
-                extra=audit(AUDIT_STATUS_BLOCKED, rule=refusal["rule"]),
-            )
-            self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
-            self._json(HTTPStatus.FORBIDDEN, refusal)
-            return
-
         try:
+            # Not a policy rule: the policy matches on argv alone, and this
+            # refusal turns on the working directory as well. Inside the try
+            # with the command it gates: a cwd no path can hold (an embedded
+            # NUL) raises ValueError out of the resolution below and takes
+            # the containment rejection with the other caller errors, so the
+            # request ends with a response and the trail with a terminal
+            # record rather than an exception out of the handler.
+            try:
+                if hasattr(self.executor, "resolve_git_command"):
+                    violation, exec_argv = self.executor.resolve_git_command(argv, cwd)
+                else:
+                    violation = self.executor.git_lease_violation(argv, cwd)
+                    exec_argv = argv
+            except OSError as exc:
+                # A cwd the broker cannot read -- a directory the agent named
+                # that stat refuses -- is the caller's path to fix, not a
+                # broker fault: the same rejection as a path outside the
+                # workspace, not the 500 an exception out of the command gets.
+                raise ValueError(f"cwd cannot be read: {type(exc).__name__}") from exc
+            if violation is not None:
+                LOGGER.warning(
+                    "git lease refused request_id=%s cwd=%s",
+                    request_id,
+                    _sanitize_for_logging(cwd or "", max_length=256),
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=RULE_GIT_WORKSPACE_LEASE),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "status": "blocked",
+                        "code": "SECURITY_POLICY_BLOCKED",
+                        "rule": RULE_GIT_WORKSPACE_LEASE,
+                        "message": violation,
+                    },
+                )
+                return
+
+            # Runs after the credential denylist above, so rules like
+            # `kubernetes.token-disclosure` keep their own ids and messages rather
+            # than being reported as read-only refusals. For example, `kubectl create
+            # token sa` is on the denylist as `kubernetes.token-disclosure` and will
+            # be refused by the denylist with that rule id. If the gate ran first, it
+            # would refuse as `kubernetes.read-only`, losing the specific rule.
+            refusal_result = read_only_refusal(argv)
+            if refusal_result is None and exec_argv != argv:
+                refusal_result = read_only_refusal(exec_argv)
+            if refusal_result is not None:
+                refusal, log_hint = refusal_result
+                safe_hint = _sanitize_for_logging(log_hint) if log_hint else "unknown"
+                LOGGER.warning(
+                    "command refused request_id=%s rule=%s hint=%s", request_id, refusal["rule"], safe_hint,
+                    extra=audit(AUDIT_STATUS_BLOCKED, rule=refusal["rule"]),
+                )
+                self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BLOCKED)
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return
+
             # One slot for the command and its response together; see
             # CommandExecutor.request_slot for why the response is inside it.
             with self._request_slot():
