@@ -1444,12 +1444,14 @@ source "{_COMMON_SH}"
     def test_a_local_line_that_cannot_be_moved_fails_the_run_instead_of_reading_as_moved(self):
         """The fast-forward is a compare-and-swap, and its failure has to be the run's.
 
-        The ref is held by another writer (a lock file, which is what a concurrent
-        move leaves and what git refuses on) between the placement read and the
-        swap. Before, the swap's failure fell through to the success line and the
-        run went on to push a line that was not at the release commit; now the
-        run stops, says why, takes the tag back, and leaves the line where it was.
-        The absent arm's create is held to the same rule.
+        The ref's update is refused between the placement read and the swap, by a
+        reference-transaction hook rather than a lock file so the test does not
+        assume the files ref backend (a git that defaults to reftable has no
+        `refs/heads/` directory to hold a lock in). Before, the swap's failure
+        fell through to the success line and the run went on to push a line that
+        was not at the release commit; now the run stops, says why, takes the tag
+        back, and leaves the line where it was. The absent arm's create is held
+        to the same rule.
         """
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
@@ -1461,9 +1463,20 @@ source "{_COMMON_SH}"
         git("commit", "-m", "chore(release): stamp release version 0.2.1")
         release_commit = git("rev-parse", "HEAD").stdout.strip()
         git("switch", "main")
-        lock = pathlib.Path(repo_dir) / ".git" / "refs" / "heads" / "release" / f"{MOCK_TARGET_RELEASE_LINE}.lock"
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text("")
+        hold = pathlib.Path(repo_dir) / "hold-release-lines"
+        hook = pathlib.Path(repo_dir) / ".git" / "hooks" / "reference-transaction"
+        hook.parent.mkdir(parents=True, exist_ok=True)
+        hook.write_text(
+            "#!/bin/sh\n"
+            f"[ \"$1\" = prepared ] || exit 0\n"
+            f"[ -e '{hold}' ] || exit 0\n"
+            "while read -r old new ref; do\n"
+            "  case \"$ref\" in refs/heads/release/*) exit 1 ;; esac\n"
+            "done\n"
+            "exit 0\n"
+        )
+        hook.chmod(0o755)
+        hold.write_text("")
 
         proc = self._run_common_func(
             f'ensure_ga_release_refs "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
@@ -1476,10 +1489,9 @@ source "{_COMMON_SH}"
         self.assertEqual(git("rev-parse", branch).stdout.strip(), candidate)
         self.assertEqual(git("tag", "-l", MOCK_LINE_PATCH_RELEASE_TAG).stdout.strip(), "")
 
-        lock.unlink()
+        hold.unlink()
         git("branch", "-D", branch)
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        lock.write_text("")
+        hold.write_text("")
         absent = self._run_common_func(
             f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"',
             cwd=repo_dir,
