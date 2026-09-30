@@ -16,20 +16,24 @@ either: on a fork pull request its `GITHUB_TOKEN` is read-only and `permissions:
 cannot raise it, so it cannot request a reviewer at all.
 
 The reviewer *selection* below is a port of the action's `src/reviewer.js` at the
-pinned v0.13.0, reading `.github/auto_request_review.yml` unchanged. Where the
-port had a choice it copies the action, including minimatch's rule that `*` and
+pinned v0.13.0, reading `.github/auto_request_review.yml` in the action's format
+plus one key of this script's own, `options.robot_accounts`. Where the port had
+a choice it copies the action, including minimatch's rule that `*` and
 `**` do not match a path segment beginning with a dot. Anything the port does
 not implement raises rather than guessing -- see `validate_config` and
 `glob_to_regex`.
 
-Two things the action never did. A verdict counts as "already reviewed" only
+Three things the action never did. A verdict counts as "already reviewed" only
 from an `OWNERS` approver for the changed files (`applicable_approvers`), since
 only that approval can produce the `approved` label; an approval from anyone
 else used to suppress the auto-assign for good. And `/request-review`
 (`--react-to`) is a person saying "ask someone anyway", so it skips the verdict
 check, and when it still declines -- draft, closed, someone already requested --
 it says so with a 😕 reaction on the comment and a warning annotation on the run,
-where before it exited green having done nothing.
+where before it exited green having done nothing. And `options.robot_accounts`
+names robots that review under an ordinary user account: their verdicts never
+count, and a review request outstanding to one of them is not a reviewer
+already asked.
 
 Run: python3 scripts/request_reviewers.py --pr 728 --dry-run
 Test: cd scripts && python3 -m unittest test_request_reviewers
@@ -63,6 +67,14 @@ DEFAULT_IGNORED_KEYWORDS = ["DO NOT REVIEW"]
 # of them: GitHub files a `COMMENTED` review for a reply to a review thread.
 HUMAN_VERDICT_STATES = {"APPROVED", "CHANGES_REQUESTED"}
 APPROVED_STATE = "APPROVED"
+# Robots that review under an ordinary user account rather than a GitHub App,
+# so `user.type` reads "User" and nothing else tells them from a person. The
+# roster config lists them under this option and their reviews never count as
+# a verdict either way: one re-reviews every push and files its follow-ups as
+# COMMENTED, so a CHANGES_REQUESTED it once filed would otherwise stand for the
+# life of the pull request and the check-run path would never request a human.
+# A review request outstanding to one of them is not a reviewer already asked.
+ROBOT_ACCOUNTS_OPTION = "robot_accounts"
 
 # Prow's OWNERS files, read from the checkout the workflow runs in -- the
 # default branch, which is also where Prow reads them. `approvers:` covers the
@@ -122,7 +134,11 @@ def load_config(path):
 
 
 def validate_config(config):
-    """Refuse a config using a feature this port does not implement."""
+    """Refuse a config using a feature this port does not implement, or a
+    robot_accounts entry that is not a list of logins."""
+    robots = (config.get("options") or {}).get(ROBOT_ACCOUNTS_OPTION)
+    if robots is not None and (not isinstance(robots, list) or not all(isinstance(login, str) and login for login in robots)):
+        raise ValueError(f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of GitHub logins, got {robots!r}")
     for name, is_used in UNSUPPORTED_CONFIG.items():
         if is_used(config):
             raise ValueError(
@@ -132,6 +148,11 @@ def validate_config(config):
 
     for pattern in (config.get("files") or {}):
         glob_to_regex(pattern)
+
+
+def robot_accounts(config):
+    """The logins the roster lists as robots, lower-cased for comparison."""
+    return frozenset(login.lower() for login in (config.get("options") or {}).get(ROBOT_ACCOUNTS_OPTION) or [])
 
 
 # --------------------------------------------------------------------------- #
@@ -397,7 +418,12 @@ def skip_reason(pull_request, config):
         if keyword in title:
             return f"the title contains the ignored keyword {keyword!r}"
 
-    requested = [user["login"] for user in pull_request.get("requested_reviewers") or []]
+    # A request outstanding to a listed robot is nobody asked: the robot answers
+    # it and GitHub clears it, and nothing re-fires after that.
+    robots = robot_accounts(config)
+    requested = [
+        user["login"] for user in pull_request.get("requested_reviewers") or [] if user["login"].lower() not in robots
+    ]
     requested += [f"team:{team['slug']}" for team in pull_request.get("requested_teams") or []]
     if requested:
         return f"review is already requested from {', '.join(requested)}"
@@ -405,7 +431,7 @@ def skip_reason(pull_request, config):
     return None
 
 
-def already_reviewed_reason(pull_request, reviews, approvers):
+def already_reviewed_reason(pull_request, reviews, approvers, robots=frozenset()):
     """Why a verdict already on the pull request makes a request redundant, or None.
 
     Only a verdict from another person counts. Replying to a review thread
@@ -427,16 +453,19 @@ def already_reviewed_reason(pull_request, reviews, approvers):
     colleague's approvals. A `CHANGES_REQUESTED` counts from anyone: whoever
     filed it, the author owes them a reply, and requesting a fresh reviewer
     over an open objection is noise rather than progress. Bot reviews never
-    count either way.
+    count either way, and neither do reviews from the logins in `robots`: the
+    roster's `options.robot_accounts`, robots that review under a user
+    account and so read as `User` to the API.
     """
     author = ((pull_request.get("user") or {}).get("login") or "").lower()
     approvers = {login.lower() for login in approvers}
+    robots = {login.lower() for login in robots}
 
     latest = {}
     for review in sorted(reviews, key=lambda review: review.get("submitted_at") or ""):
         user = review.get("user") or {}
         login = (user.get("login") or "").lower()
-        if user.get("type") == "Bot" or login == author or review.get("state") not in HUMAN_VERDICT_STATES:
+        if user.get("type") == "Bot" or login in robots or login == author or review.get("state") not in HUMAN_VERDICT_STATES:
             continue
         latest[login] = review
 
@@ -687,7 +716,7 @@ def main(argv=None):
         approvers = applicable_approvers(changed_files, args.owners_root)
         log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
         reviews = api.get_all(f"/repos/{args.repo}/pulls/{number}/reviews")
-        reason = already_reviewed_reason(pull_request, reviews, approvers)
+        reason = already_reviewed_reason(pull_request, reviews, approvers, robot_accounts(config))
         if reason:
             decline(api, args, reason)
             return 0

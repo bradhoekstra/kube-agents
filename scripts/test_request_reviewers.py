@@ -55,6 +55,7 @@ CONFIG = {
         "enable_group_assignment": False,
         "number_of_reviewers": 1,
         "last_files_match_only": True,
+        "robot_accounts": ["kyber775"],
     },
 }
 
@@ -70,7 +71,7 @@ LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 # approval, and `NON_APPROVER` is outside it, so the same review from him
 # does not.
 APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"}
-NON_APPROVER = "kyber775"
+NON_APPROVER = "outside-contributor"
 
 # The root OWNERS, OWNERS_ALIASES and hack/OWNERS as they stand, for the walk
 # tests that need a tree they can also mutate.
@@ -246,6 +247,15 @@ class ConfigValidationTest(unittest.TestCase):
     def test_an_unsupported_glob_in_the_files_map_is_refused(self):
         with self.assertRaises(ValueError):
             rr.validate_config({"files": {"{a,b}/**": ["repository-owners"]}})
+
+    def test_robot_accounts_must_be_a_list_of_logins(self):
+        rr.validate_config({"options": {"robot_accounts": ["kyber775"]}})
+        rr.validate_config({"options": {}})
+        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                rr.validate_config({"options": {"robot_accounts": bad}})
+        self.assertEqual(rr.robot_accounts({"options": {"robot_accounts": ["Kyber775"]}}), {"kyber775"})
+        self.assertEqual(rr.robot_accounts({}), frozenset())
 
 
 class SelectionTest(unittest.TestCase):
@@ -448,6 +458,13 @@ class SkipReasonTest(unittest.TestCase):
         skipped = rr.skip_reason(pull_request(title="DO NOT REVIEW: wip"), CONFIG)
         self.assertIn("DO NOT REVIEW", skipped)
 
+    def test_a_request_outstanding_to_a_listed_robot_is_nobody_asked(self):
+        # The robot answers the request and GitHub clears it, and nothing
+        # re-fires after that; a person requested alongside still counts.
+        self.assertIsNone(rr.skip_reason(pull_request(requested_reviewers=[{"login": "kyber775"}]), CONFIG))
+        both = pull_request(requested_reviewers=[{"login": "kyber775"}, {"login": "jayantid"}])
+        self.assertIn("jayantid", rr.skip_reason(both, CONFIG))
+
     def test_an_existing_request_is_not_duplicated(self):
         # The workflow fires on every completed AI Review check, so a pull
         # request already handed to a human must not be handed over again.
@@ -480,6 +497,19 @@ class AlreadyReviewedTest(unittest.TestCase):
         # Decided, not inherited: whoever asked for changes is owed a reply,
         # and asking a fresh reviewer over an open objection is noise.
         self.assertIn(NON_APPROVER, self.reason([review(NON_APPROVER, "CHANGES_REQUESTED")]))
+
+    def test_a_robot_under_a_user_account_never_counts(self):
+        # kyber775 reviews under a User account, re-reviews every push and files
+        # its follow-ups as COMMENTED, so the CHANGES_REQUESTED it filed on one
+        # commit stood as its verdict for the life of the pull request and a
+        # green AI Review requested nobody. Listed as a robot, it counts no
+        # more than the App's own review does, whatever state it files.
+        robots = {"kyber775"}
+        stale = [review("kyber775", "CHANGES_REQUESTED", submitted_at="1"), review("kyber775", submitted_at="2")]
+        self.assertIsNone(rr.already_reviewed_reason(pull_request(), stale, APPROVERS, robots))
+        self.assertIsNone(rr.already_reviewed_reason(pull_request(), [review("KYBER775", "APPROVED")], APPROVERS, robots))
+        # Not listed, the same review counts, as it does from any other person.
+        self.assertIn("kyber775", rr.already_reviewed_reason(pull_request(), stale, APPROVERS))
 
     def test_approver_logins_match_case_insensitively(self):
         self.assertIsNotNone(self.reason([review("JayantiD", "APPROVED")]))
@@ -578,6 +608,19 @@ class MainTest(unittest.TestCase):
 
     def test_a_non_approvers_approval_no_longer_blocks_the_check_run_path(self):
         posts = self.run_main(pull_request(), [review(NON_APPROVER, "APPROVED")])
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+
+    def test_a_listed_robots_changes_requested_does_not_block_the_check_run_path(self):
+        # Through the live roster, which lists kyber775: the check-run path
+        # reads the robot's standing CHANGES_REQUESTED as no verdict at all
+        # and requests a human.
+        posts = self.run_main(pull_request(), [review("kyber775", "CHANGES_REQUESTED", submitted_at="1"), review("kyber775", submitted_at="2")])
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+
+    def test_a_request_outstanding_to_a_listed_robot_does_not_block_the_check_run_path(self):
+        posts = self.run_main(pull_request(requested_reviewers=[{"login": "kyber775"}]), [])
         self.assertEqual(posts, [self.REQUESTED])
         self.assertEqual(self.code, 0)
 

@@ -46,3 +46,14 @@ options:
   # If it's true, the last matching files-change pattern takes the most precedence (CODEOWNERS-compatible)
   # See https://github.com/necojackarc/auto-request-review/pull/80 for more details.
   last_files_match_only: true
+
+  # Robots that review under an ordinary user account rather than a GitHub
+  # App, so nothing else tells them from a person. Their reviews never count
+  # as a verdict when deciding whether a pull request already has a human
+  # reviewer: one re-reviews every push and files its follow-ups as
+  # COMMENTED, so a CHANGES_REQUESTED it once filed would otherwise stand
+  # for the life of the pull request and the check-run path would never
+  # request a human. A review request outstanding to one of them is not a
+  # reviewer already asked, either.
+  robot_accounts:
+    - kyber775
