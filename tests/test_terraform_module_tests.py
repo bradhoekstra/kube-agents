@@ -69,11 +69,28 @@ _GATE_COMMAND = f"make {_TARGET}"
 _CONTINUE_ON_ERROR = "continue-on-error"
 _IF = "if"
 _ENV = "env"
+_RUN, _SHELL, _DEFAULTS = "run", "shell", "defaults"
+#: The shells whose default template fails fast; a template of one's own
+#: (`bash {0}`) or another shell is not read as one.
+_FAIL_FAST_SHELLS = (None, "bash", "sh")
 _MAKEFLAGS_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS")
-_IGNORE_ERRORS_FLAG = re.compile(r"(^|\s)-\w*i|--ignore-errors")
+#: make reads a MAKEFLAGS word without a leading dash as if it had one
+#: (`MAKEFLAGS=k`), so `i` anywhere in a short-option cluster, or the long
+#: form, ignores errors; a `NAME=value` word is a variable, not a flag.
+_IGNORE_ERRORS_LONG = "--ignore-errors"
+_IGNORE_ERRORS_LETTER = "i"
 _TRIGGER, _PULL_REQUEST_TRIGGER, _PATH_FILTERS = "on", "pull_request", ("paths", "paths-ignore")
-#: The Makefile's own ways of ignoring a failing recipe line.
-_MAKEFILE_IGNORES_ERRORS = re.compile(r"(?m)^\.IGNORE\b|^\s*(?:GNU)?MAKEFLAGS\s*[:+?]?=.*(?:(?:^|\s)-\w*i\b|--ignore-errors)")
+#: The Makefile's own ways of ignoring a failing recipe line: the special
+#: target, or an assignment to MAKEFLAGS in any spelling (`override`,
+#: `export`, `::=`, `+=`, no spaces) whose value ignores errors.
+_IGNORE_TARGET = re.compile(r"(?m)^\.IGNORE\b")
+_MAKEFLAGS_ASSIGNMENT = re.compile(
+    r"(?m)^\s*(?:(?:override|export|unexport)\s+)*(?:GNU)?MAKEFLAGS\s*(?:::?|\+|\?|!)?=(.*)$"
+)
+#: A recipe line's prefix cluster; `-` in it tells make to ignore that
+#: line's status, which no line of a gating recipe may carry.
+_RECIPE_PREFIX = re.compile(r"^\t([@+-]*)")
+_IGNORE_LINE_PREFIX = "-"
 
 #: The recipe line that lists the target in `make help`, and the loop that
 #: reaches every module rather than naming the ones that had tests when it
@@ -104,7 +121,7 @@ _TEST_COMMAND = "terraform test"
 #: records rather than swallows its failure.
 _SHELL_STRING = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'')
 _TEST_INVOCATION = re.compile(r"(?:^\s*|[;&|(]\s*)terraform test(?=\s|\)|$)", re.MULTILINE)
-_FAILURE_RECORDED = f"{_TEST_COMMAND}) || failed="
+_FAILURE_RECORDED = f'{_TEST_COMMAND}) || failed="$$failed $$dir"'
 _FAILURE_EXITS = "exit 1"
 _VERIFY_TARGET = "verify"
 _VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
@@ -138,8 +155,11 @@ _STR, _WORD, _OPEN, _CLOSE, _EQUALS, _OTHER = "str", "word", "{", "}", "=", "oth
 _REQUIRED_PROVIDERS_BLOCK = "required_providers"
 #: Blocks whose type prefix implies a provider the root loads whether or
 #: not it is declared: `resource "google_x"`, `data "http"`, `provider "tls"`.
-_IMPLYING_BLOCKS = (("resource", 2), ("data", 2), ("provider", 1))
+_IMPLYING_BLOCKS = (("resource", 2), ("data", 2), ("ephemeral", 2), ("action", 2), ("provider", 1))
 _TYPE_PREFIX_SEPARATOR = "_"
+#: The meta-argument that routes a resource to another provider
+#: (`provider = google-beta`), which is loaded whether or not declared.
+_PROVIDER_META_ARGUMENT = "provider"
 #: `terraform_data` and `terraform_remote_state` belong to the builtin
 #: provider, which is never fetched and cannot be mocked.
 _BUILTIN_PROVIDER_PREFIX = "terraform"
@@ -216,6 +236,14 @@ def _recipe(makefile: str, target: str) -> str:
             break
         kept.append(line)
     return "\n".join(kept)
+
+
+def _ignored_recipe_lines(recipe_body: str) -> list:
+    """Recipe lines whose prefix cluster carries `-`, make's ignore-errors."""
+    return [
+        line for line in recipe_body.split("\n")
+        if (prefix := _RECIPE_PREFIX.match(line)) is not None and _IGNORE_LINE_PREFIX in prefix.group(1)
+    ]
 
 
 def _recipe_body(makefile: str, target: str) -> str:
@@ -363,10 +391,10 @@ def _blocks(tokens: list, name: str, labels: int) -> list:
     return blocks
 
 
-def _headers_at_any_depth(tokens: list, name: str, labels: int) -> list:
-    """The labels of every `name "label"… {` header, whatever encloses it:
-    a `check` block's scoped data source implies its provider like a
-    top-level one."""
+def _blocks_at_any_depth(tokens: list, name: str, labels: int) -> list:
+    """Every `name "label"… {` block, whatever encloses it, as (labels,
+    body): a `check` block's scoped data source implies its provider like
+    a top-level one."""
     found = []
     for index, token in enumerate(tokens):
         if (
@@ -375,7 +403,7 @@ def _headers_at_any_depth(tokens: list, name: str, labels: int) -> list:
             and all(tokens[index + 1 + n][0] == _STR for n in range(labels))
             and tokens[index + 1 + labels][0] == _OPEN
         ):
-            found.append([tokens[index + 1 + n][1] for n in range(labels)])
+            found.append(([tokens[index + 1 + n][1] for n in range(labels)], _body(tokens, index + 1 + labels)))
     return found
 
 
@@ -408,8 +436,11 @@ def _providers_in(text: str) -> set:
                 name for name, (kind, _value) in _attributes(block).items() if kind in (_OPEN, _STR)
             )
     for block_name, labels in _IMPLYING_BLOCKS:
-        for found in _headers_at_any_depth(tokens, block_name, labels):
+        for found, body in _blocks_at_any_depth(tokens, block_name, labels):
             providers.add(found[0].split(_TYPE_PREFIX_SEPARATOR)[0])
+            routed = _attributes(body).get(_PROVIDER_META_ARGUMENT)
+            if routed is not None and routed[0] == _WORD:
+                providers.add(routed[1])
     providers.discard(_BUILTIN_PROVIDER_PREFIX)
     return providers
 
@@ -546,11 +577,38 @@ def _test_invocations(recipe_body: str) -> list:
     return _TEST_INVOCATION.findall(_SHELL_STRING.sub('""', recipe_body))
 
 
+def _flags_ignore_errors(value: str) -> bool:
+    """Whether a MAKEFLAGS value carries -i, as make reads it."""
+    for word in str(value).split():
+        if word == _IGNORE_ERRORS_LONG:
+            return True
+        if word.startswith("--") or "=" in word:
+            continue
+        if _IGNORE_ERRORS_LETTER in word.lstrip("-"):
+            return True
+    return False
+
+
 def _ignores_make_errors(scope: dict) -> bool:
     env = scope.get(_ENV) or {}
     return isinstance(env, dict) and any(
-        _IGNORE_ERRORS_FLAG.search(str(env.get(variable, ""))) for variable in _MAKEFLAGS_VARIABLES
+        _flags_ignore_errors(env.get(variable, "")) for variable in _MAKEFLAGS_VARIABLES
     )
+
+
+def _makefile_ignores_errors(makefile: str) -> bool:
+    return bool(_IGNORE_TARGET.search(makefile)) or any(
+        _flags_ignore_errors(value) for value in _MAKEFLAGS_ASSIGNMENT.findall(makefile)
+    )
+
+
+def _shell_defect(scope: dict) -> bool:
+    """A shell whose template is not the fail-fast default, on a step or
+    under `defaults.run` of a job or workflow."""
+    shell = scope.get(_SHELL) if _RUN in scope or _SHELL in scope and _DEFAULTS not in scope else None
+    if _DEFAULTS in scope:
+        shell = ((scope.get(_DEFAULTS) or {}).get(_RUN) or {}).get(_SHELL)
+    return shell not in _FAIL_FAST_SHELLS
 
 
 def _gate_defects(job: dict, workflow: dict = None) -> list:
@@ -563,12 +621,18 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
     if len(steps) != 1:
         defects.append(f"{len(steps)} steps run `{_GATE_COMMAND}`; exactly one must")
     for step in steps:
+        if _run_lines(step) != [_GATE_COMMAND]:
+            defects.append(f"the step's run body is more than `{_GATE_COMMAND}` alone; a line before it can set MAKEFLAGS, one after it can hide its status")
+        if _shell_defect(step):
+            defects.append("the step names a shell whose template is not fail-fast")
         if _IF in step:
             defects.append("the step carries an `if:`")
         if step.get(_CONTINUE_ON_ERROR):
             defects.append(f"the step carries `{_CONTINUE_ON_ERROR}`")
         if _ignores_make_errors(step):
             defects.append("the step's env tells make to ignore errors")
+    if _shell_defect(job):
+        defects.append("the job's default shell is not fail-fast")
     if _IF in job:
         defects.append("the job carries an `if:`")
     if job.get(_CONTINUE_ON_ERROR):
@@ -578,6 +642,8 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
     if workflow is not None:
         if _ignores_make_errors(workflow):
             defects.append("the workflow's env tells make to ignore errors")
+        if _shell_defect(workflow):
+            defects.append("the workflow's default shell is not fail-fast")
         trigger = (workflow.get(_TRIGGER) or workflow.get(True) or {}).get(_PULL_REQUEST_TRIGGER) or {}
         if isinstance(trigger, dict) and any(key in trigger for key in _PATH_FILTERS):
             defects.append("the pull_request trigger carries a paths filter")
@@ -637,12 +703,15 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs",
         )
         self.assertTrue(_test_invocations(body), f"`{_TARGET}`'s recipe does not run `{_TEST_COMMAND}` as a command (an echo of the words is not a run)")
-        self.assertIn(_FAILURE_RECORDED, body, f"`{_TARGET}` must record a failing suite (`{_FAILURE_RECORDED}…`) rather than swallow it")
+        self.assertIn(_FAILURE_RECORDED, body, f"`{_TARGET}` must record a failing suite (`{_FAILURE_RECORDED}`) rather than swallow it")
         self.assertIn(_FAILURE_EXITS, body, f"`{_TARGET}` must exit non-zero once a suite has failed")
+        self.assertEqual(_ignored_recipe_lines(body), [], f"a `-` prefix on a `{_TARGET}` recipe line tells make to ignore its status, so the target would exit 0 on a failing suite")
 
     def test_make_verify_runs_the_target(self):
+        body = _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET)
+        self.assertEqual(_ignored_recipe_lines(body), [], f"a `-` prefix on a `{_VERIFY_TARGET}` recipe line tells make to ignore its status")
         self.assertRegex(
-            _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET),
+            body,
             _VERIFY_LINE_EXACT,
             f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them, on a line of its own with no `-` prefix and nothing appended that would swallow its exit status",
         )
@@ -656,9 +725,8 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         )
 
     def test_the_makefile_does_not_ignore_recipe_errors(self):
-        self.assertNotRegex(
-            _MAKEFILE.read_text(),
-            _MAKEFILE_IGNORES_ERRORS,
+        self.assertFalse(
+            _makefile_ignores_errors(_MAKEFILE.read_text()),
             "a `.IGNORE` target or a MAKEFLAGS assignment carrying -i would report a failing suite as ignored and exit 0",
         )
 
@@ -710,6 +778,14 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             'check "health" {\n  data "dns_a_record_set" "probe" {\n    host = "x"\n  }\n  assert {\n    condition     = true\n    error_message = "x"\n  }\n}\n'
         )
         self.assertEqual(_declared_providers(self.root), ["dns", "google", "http", "tls"])
+
+    def test_a_provider_meta_argument_and_the_newer_block_kinds_imply_their_providers(self):
+        (self.root / "main.tf").write_text(
+            'resource "google_pubsub_topic" "t" {\n  provider = google-beta\n  name     = "x"\n}\n'
+            'data "google_project" "p" {\n  provider = google.west\n}\n'
+            'ephemeral "aws_secretsmanager_secret_version" "s" {}\naction "azurerm_run" "a" {}\n'
+        )
+        self.assertEqual(_declared_providers(self.root), ["aws", "azurerm", "google", "google-beta"])
 
     def test_a_root_declaring_nothing_reads_as_no_providers(self):
         (self.root / "main.tf").write_text("locals {\n  a = {\n    b = {}\n  }\n}\n")
@@ -945,18 +1021,31 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "if": "false"}]}))
         self.assertTrue(_gate_defects({"if": "github.actor != 'dependabot[bot]'", "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects({"steps": [{"run": "echo make terraform-test"}]}))
-        for env in ({"MAKEFLAGS": "-i"}, {"MAKEFLAGS": "--ignore-errors"}, {"GNUMAKEFLAGS": "-ki"}, {"MAKEFLAGS": "-j2 -i"}):
+        for env in ({"MAKEFLAGS": "-i"}, {"MAKEFLAGS": "--ignore-errors"}, {"GNUMAKEFLAGS": "-ki"}, {"MAKEFLAGS": "-j2 -i"}, {"MAKEFLAGS": "i"}, {"MAKEFLAGS": "ki"}, {"GNUMAKEFLAGS": "k i"}):
             with self.subTest(env=env):
                 self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "env": env}]}))
                 self.assertTrue(_gate_defects({"env": env, "steps": [{"run": "make terraform-test"}]}))
                 self.assertTrue(_gate_defects(good, {"env": env}))
         self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"MAKEFLAGS": "-j2 --output-sync"}}]}), [])
+        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"MAKEFLAGS": "k IGNORE=i"}}]}), [])
         self.assertTrue(_gate_defects(good, {"on": {"pull_request": {"paths": ["terraform/**"]}}}))
         self.assertTrue(_gate_defects(good, {True: {"pull_request": {"paths-ignore": ["docs/**"]}}}))
-        for text in (".IGNORE:\n", "MAKEFLAGS += -i\n", "MAKEFLAGS := -j2 --ignore-errors\n", "GNUMAKEFLAGS = -i\n"):
+        # The run body is the command alone, under a fail-fast shell.
+        self.assertTrue(_gate_defects({"steps": [{"run": "export MAKEFLAGS=-i\nmake terraform-test"}]}))
+        self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test\ntrue"}]}))
+        self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "shell": "bash {0}"}]}))
+        self.assertTrue(_gate_defects({"defaults": {"run": {"shell": "bash {0}"}}, "steps": [{"run": "make terraform-test"}]}))
+        self.assertTrue(_gate_defects(good, {"defaults": {"run": {"shell": "bash {0}"}}}))
+        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "shell": "bash"}]}), [])
+        self.assertEqual(_gate_defects(good, {"defaults": {"run": {"shell": "bash"}}}), [])
+        for text in (".IGNORE:\n", "MAKEFLAGS += -i\n", "MAKEFLAGS := -j2 --ignore-errors\n", "GNUMAKEFLAGS = -i\n",
+                     "MAKEFLAGS=-i\n", "MAKEFLAGS+=-i\n", "override MAKEFLAGS += -i\n", "export MAKEFLAGS := -i\n", "MAKEFLAGS ::= -i\n", "MAKEFLAGS += i\n"):
             with self.subTest(text=text):
-                self.assertRegex(text, _MAKEFILE_IGNORES_ERRORS)
-        self.assertNotRegex("MAKEFLAGS += --no-print-directory\n# -i is never set\n", _MAKEFILE_IGNORES_ERRORS)
+                self.assertTrue(_makefile_ignores_errors(text))
+        self.assertFalse(_makefile_ignores_errors("MAKEFLAGS += --no-print-directory\n# -i is never set\nexport MAKEFLAGS := -k\n"))
+        self.assertEqual(_ignored_recipe_lines('\t-@failed=""; for dir in x; do \\\n\t  terraform test; \\\n\tdone\n'), ['\t-@failed=""; for dir in x; do \\'])
+        self.assertEqual(_ignored_recipe_lines('\t@failed=""; for dir in x; do \\\n\t  terraform test; \\\n\tdone\n'), [])
+        self.assertNotIn(_FAILURE_RECORDED, '(cd "$$dir" && terraform test) || failed=""; \\')
 
     def test_the_rule_is_found_by_its_own_line_not_a_mention(self):
         makefile = (
