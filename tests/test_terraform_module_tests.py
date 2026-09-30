@@ -91,6 +91,12 @@ _MAKEFLAGS_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS")
 #: form, ignores errors; a `NAME=value` word is a variable, not a flag.
 _IGNORE_ERRORS_LONG = "--ignore-errors"
 _IGNORE_ERRORS_LETTER = "i"
+#: make's short options that take an argument: the rest of the word, or
+#: the next word when the letter ends it. The letters after such a letter
+#: are the argument, not flags (`-Oline` ignores nothing), and `j`, `l`
+#: and `O` take theirs only when glued.
+_SHORT_OPTIONS_WITH_ARGUMENT = "CfIoWEjlO"
+_SHORT_OPTIONS_WITH_REQUIRED_ARGUMENT = "CfIoWE"
 _TRIGGER, _PULL_REQUEST_TRIGGER, _PATH_FILTERS = "on", "pull_request", ("paths", "paths-ignore")
 #: An earlier step can hand MAKEFLAGS to every later one through
 #: $GITHUB_ENV, so no step's run body may name the variable at all.
@@ -131,8 +137,8 @@ _RECIPE_PREFIX = re.compile(r"^\t([@+ \t-]*)")
 _IGNORE_LINE_PREFIX = "-"
 #: The fake terraform the target is run against, and what it records.
 _FAKE_TERRAFORM = """#!/bin/sh
-printf '%s %s\\n' "$(basename "$PWD")" "$1" >> "$TERRAFORM_FAKE_LOG"
-if [ "$1" = test ] && [ "$(basename "$PWD")" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
+printf '%s %s\\n' "$PWD" "$1" >> "$TERRAFORM_FAKE_LOG"
+if [ "$1" = test ] && [ "$PWD" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
   echo "Failure! 1 failed."; exit 1
 fi
 exit 0
@@ -621,8 +627,14 @@ def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
 
 
 def _flags_ignore_errors(value: str) -> bool:
-    """Whether a MAKEFLAGS value carries -i, as make reads it."""
-    for word in str(value).split():
+    """Whether a MAKEFLAGS value carries -i, as make reads it: a word is a
+    long option, a `NAME=value` variable, or a cluster of short options in
+    which a letter that takes an argument ends the flags."""
+    words = str(value).split()
+    index = 0
+    while index < len(words):
+        word = words[index]
+        index += 1
         if word.startswith("--"):
             # getopt accepts any prefix of a long option; a prefix short
             # enough to be ambiguous errors out, which is refused too.
@@ -631,8 +643,14 @@ def _flags_ignore_errors(value: str) -> bool:
             continue
         if "=" in word:
             continue
-        if _IGNORE_ERRORS_LETTER in word.lstrip("-"):
-            return True
+        cluster = word.lstrip("-")
+        for position, letter in enumerate(cluster):
+            if letter == _IGNORE_ERRORS_LETTER:
+                return True
+            if letter in _SHORT_OPTIONS_WITH_ARGUMENT:
+                if position == len(cluster) - 1 and letter in _SHORT_OPTIONS_WITH_REQUIRED_ARGUMENT:
+                    index += 1  # the next word is this option's argument
+                break
     return False
 
 
@@ -751,17 +769,20 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
 
     def test_the_target_runs_every_suite_and_fails_when_one_fails(self):
         # Behaviour, not text: the real target against a fake terraform.
-        suites = [root.name for root in _loop_directories()]
-        self.assertTrue(set(root.name for root in _suites()) <= set(suites))
+        # Compared as resolved paths, so two roots of one name under the
+        # two parents stay distinct and the order is not a name's.
+        entered = {root.resolve() for root in _loop_directories()}
+        self.assertTrue({root.resolve() for root in _suites()} <= entered)
         code, out, calls = _run_target_against_fake_terraform()
         self.assertEqual(code, 0, f"`make {_TARGET}` failed with every suite green:\n{out}")
-        self.assertEqual(sorted({d for d, sub in calls if sub == "test"}), suites, f"`{_TEST_COMMAND}` did not run in every directory the loop enters: {calls}")
-        failing = suites[0]
-        code, out, calls = _run_target_against_fake_terraform(fail_in=failing)
-        self.assertNotEqual(code, 0, f"`make {_TARGET}` exited 0 with the {failing} suite failing:\n{out}")
-        self.assertEqual(sorted({d for d, sub in calls if sub == "test"}), suites, f"a failing suite stopped the others from running: {calls}")
+        tested = {pathlib.Path(d).resolve() for d, sub in calls if sub == "test"}
+        self.assertEqual(tested, entered, f"`{_TEST_COMMAND}` did not run in exactly the directories the loop enters: {calls}")
+        failing = sorted(entered)[0]
+        code, out, calls = _run_target_against_fake_terraform(fail_in=str(failing))
+        self.assertNotEqual(code, 0, f"`make {_TARGET}` exited 0 with the {failing.name} suite failing:\n{out}")
+        self.assertEqual({pathlib.Path(d).resolve() for d, sub in calls if sub == "test"}, entered, f"a failing suite stopped the others from running: {calls}")
         self.assertIn(_FAILING_DIRECTORIES_LINE, out, f"the failing directory is not named at the end:\n{out}")
-        self.assertIn(failing, out.split(_FAILING_DIRECTORIES_LINE, 1)[1])
+        self.assertIn(failing.name, out.split(_FAILING_DIRECTORIES_LINE, 1)[1])
 
     def test_the_resolved_recipes_carry_the_loop_and_no_ignored_line(self):
         database = _database()
@@ -1110,10 +1131,12 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertTrue(_gate_defects({"defaults": {"run": {"working-directory": "k8s-operator"}}, "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects(good, {"defaults": {"run": {"working-directory": "bench"}}}))
         self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "working-directory": "."}]}), [])
-        for value in ("-i", "--ignore-errors", "-ki", "-j2 -i", "i", "ki", "k i", "--ignore-err", "--ignore", "--ign"):
+        for value in ("-i", "--ignore-errors", "-ki", "-j2 -i", "i", "ki", "k i", "--ignore-err", "--ignore", "--ign", "-C dir -i", "-f Makefile i", "-j4 -i", "-Oline -i"):
             with self.subTest(value=value):
                 self.assertTrue(_flags_ignore_errors(value))
-        for value in ("-k", "-j2 --output-sync", "k IGNORE=i", "--no-print-directory", "--include-dir=x", ""):
+        # A short option's argument is not a flag cluster: `-Oline` is
+        # --output-sync=line, `-f Makefile` names a file, `-Oi` syncs by `i`.
+        for value in ("-k", "-j2 --output-sync", "k IGNORE=i", "--no-print-directory", "--include-dir=x", "", "-Oline", "-f Makefile", "-I include", "-C dir", "-Oi", "-j4", "-l2.5", "-W file -k", "-o file"):
             with self.subTest(value=value):
                 self.assertFalse(_flags_ignore_errors(value))
 
