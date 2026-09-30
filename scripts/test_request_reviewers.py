@@ -249,9 +249,13 @@ class ConfigValidationTest(unittest.TestCase):
             rr.validate_config({"files": {"{a,b}/**": ["repository-owners"]}})
 
     def test_robot_accounts_must_be_a_list_of_logins(self):
-        rr.validate_config({"options": {"robot_accounts": ["kyber775"]}})
+        # Both comparisons the list feeds are exact against GitHub's `login`,
+        # so a decorated or mistyped entry would pass a non-empty check and
+        # then match nothing, silently: the shape is what is validated.
+        for good in (["kyber775"], ["a"], ["k-y-b-3"], ["A" * 39]):
+            rr.validate_config({"options": {"robot_accounts": good}})
         rr.validate_config({"options": {}})
-        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7]):
+        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7], ["@kyber775"], ["kyber775 "], ["kyber775[bot]"], ["-kyber"], ["kyber-"], ["ky--ber"], ["A" * 40]):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 rr.validate_config({"options": {"robot_accounts": bad}})
         self.assertEqual(rr.robot_accounts({"options": {"robot_accounts": ["Kyber775"]}}), {"kyber775"})

@@ -75,6 +75,12 @@ APPROVED_STATE = "APPROVED"
 # life of the pull request and the check-run path would never request a human.
 # A review request outstanding to one of them is not a reviewer already asked.
 ROBOT_ACCOUNTS_OPTION = "robot_accounts"
+# The shape of a GitHub login: up to 39 characters, alphanumeric or single
+# hyphens, neither first nor last. Both comparisons the robot list feeds are
+# exact against the `login` field GitHub returns, so an entry written any
+# other way (`@kyber775`, `kyber775[bot]`, a trailing space) would pass a
+# non-empty check and then match nothing, silently: the validator refuses it.
+GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}")
 
 # Prow's OWNERS files, read from the checkout the workflow runs in -- the
 # default branch, which is also where Prow reads them. `approvers:` covers the
@@ -135,10 +141,16 @@ def load_config(path):
 
 def validate_config(config):
     """Refuse a config using a feature this port does not implement, or a
-    robot_accounts entry that is not a list of logins."""
+    robot_accounts entry that is not a list of bare GitHub logins."""
     robots = (config.get("options") or {}).get(ROBOT_ACCOUNTS_OPTION)
-    if robots is not None and (not isinstance(robots, list) or not all(isinstance(login, str) and login for login in robots)):
-        raise ValueError(f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of GitHub logins, got {robots!r}")
+    if robots is not None and (
+        not isinstance(robots, list)
+        or not all(isinstance(login, str) and GITHUB_LOGIN_RE.fullmatch(login) for login in robots)
+    ):
+        raise ValueError(
+            f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of bare GitHub logins "
+            f"(letters, digits and single hyphens, as GitHub shows them), got {robots!r}"
+        )
     for name, is_used in UNSUPPORTED_CONFIG.items():
         if is_used(config):
             raise ValueError(
