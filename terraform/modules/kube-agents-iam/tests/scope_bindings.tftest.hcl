@@ -13,7 +13,9 @@ variables {
   project_id = "mgmt-project-1"
 }
 
-run "an_explicit_project_carries_the_intersected_allowlist" {
+# What the module binds is its own scope_roles; that the set is the
+# intersection is the next run's, with a custom list where the two differ.
+run "an_explicit_project_carries_scope_roles_and_the_management_project_none" {
   command = plan
 
   variables {

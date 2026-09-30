@@ -338,7 +338,7 @@ e2e-test-deps: test-e2e-deps ## Alias for test-e2e-deps.
 # editable, which pulls devops-bench from a pinned git SHA over the network.
 # verify stays offline-runnable; the bench suite gates in CI (bench-tests job)
 # and runs locally with `make test-bench`.
-verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite. The bench suite needs network; run `make test-bench` separately.
+verify: ## Run everything a PR must pass offline: go build, go vet, go test, python tests, the conformance suite, the Terraform module tests. The bench suite needs network; run `make test-bench` separately.
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
@@ -348,6 +348,7 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
 	@echo "==> conformance"; $(MAKE) --no-print-directory conformance
+	@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test
 	@echo "==> verify OK"
 
 test-python: ## Run every Python unit-test directory in PYTHON_TEST_DIRS, the operator's included.
@@ -641,14 +642,16 @@ iac-parity-check: ## Verify DNS egress rule parity across static NetworkPolicy c
 tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for every variable it reads and fail on any unnormalised shape (CI runs this).
 	@./hack/check-tfvar-console.sh
 
-# Every module that carries a tests/ directory, against mocked providers, so
-# a plan-time rule -- a precondition, a postcondition on a read, the set of
-# bindings a declaration plans -- runs rather than being grepped for
-# (tests/test_scope_iam.py pins the text; these pin the behaviour). A module
-# without tests/ is skipped, and a new module's tests/ is reached with no
-# edit here; tests/test_terraform_module_tests.py pins the loop and the step.
-terraform-test: ## Run each terraform/modules/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
-	@set -e; for dir in terraform/modules/*/; do \
+# Every module and composition that carries a tests/ directory -- the set
+# the validate job initialises -- against mocked providers, so a plan-time
+# rule -- a precondition, a postcondition on a read, the set of bindings a
+# declaration plans -- runs rather than being grepped for
+# (tests/test_scope_iam.py pins the text; these pin the behaviour). A
+# directory without tests/ is skipped, and a new one's tests/ is reached with
+# no edit here; tests/test_terraform_module_tests.py pins the loop, the step
+# and that no .tftest.hcl sits outside it.
+terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
+	@set -e; for dir in terraform/modules/*/ terraform/examples/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
 	    echo "Testing $$dir..."; \
 	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test); \

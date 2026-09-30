@@ -1,14 +1,17 @@
-"""Every Terraform module test suite runs, against mocks, on every pull request.
+"""Every Terraform test suite runs, against mocks, on every pull request.
 
-A `terraform/modules/<module>/tests/*.tftest.hcl` file runs only if the
-`terraform-test` Makefile target's loop reaches its module and the `validate`
-job in validate.yml runs the target; a suite that neither reaches is a set of
-cases that passes by never running, the trap AGENTS.md "Where Tests Go" names
-for `PYTHON_TEST_DIRS`. And a suite that mocks one provider but not another
-would reach a real API from CI on the first read nobody overrode. This pins
-the loop, the step, and a `mock_provider` block for every provider a module
-declares, in every one of its test files. tests/test_shellcheck_gate_wiring.py
-pins a workflow step the same way.
+A `*.tftest.hcl` file runs only if the `terraform-test` Makefile target's loop
+reaches its directory (`terraform/modules/*/tests`, `terraform/examples/*/tests`)
+and the `validate` job in validate.yml runs the target; a suite that neither
+reaches is a set of cases that passes by never running, the trap AGENTS.md
+"Where Tests Go" names for `PYTHON_TEST_DIRS`. And a suite that mocks one
+provider but not another would reach a real API from CI on the first read
+nobody overrode. This pins the loop, the step, `make verify` running the
+target (its help line says it runs everything a pull request must pass
+offline), that no test file sits where the loop does not look, and a
+`mock_provider` block for every provider a module declares, in every one of
+its test files. tests/test_shellcheck_gate_wiring.py pins a workflow step the
+same way.
 """
 
 import pathlib
@@ -23,7 +26,10 @@ except ImportError:  # run from inside tests/
     from test_shellcheck_gate_wiring import _JOB_ID, _run_lines
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_MODULES_DIR = _REPO_ROOT / "terraform" / "modules"
+_TERRAFORM_DIR = _REPO_ROOT / "terraform"
+#: The directories the loop reaches: the modules and the compositions, the
+#: same set the validate job's init-and-validate loop covers.
+_SUITE_PARENTS = (_TERRAFORM_DIR / "modules", _TERRAFORM_DIR / "examples")
 _MAKEFILE = _REPO_ROOT / "Makefile"
 _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "validate.yml"
 
@@ -36,23 +42,32 @@ _GATE_COMMAND = f"make {_TARGET}"
 #: reaches every module rather than naming the ones that had tests when it
 #: was written.
 _RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
-_LOOP_GLOB = "for dir in terraform/modules/*/; do"
+_LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
 _TEST_COMMAND = "terraform test"
+_VERIFY_TARGET = "verify"
+_VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
 
 #: A provider a module declares (`google-beta` included, hence the hyphen),
 #: and the block a test file needs for it.
 _REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+) = \{\s*$", re.MULTILINE)
 _MOCK_PROVIDER = 'mock_provider "{provider}"'
 _TEST_FILE_GLOB = "tests/*.tftest.hcl"
+_TEST_FILE_SUFFIX = ".tftest.hcl"
 _VERSIONS_FILE = "versions.tf"
 
 
 def _suites() -> dict:
     return {
         module: sorted(module.glob(_TEST_FILE_GLOB))
-        for module in sorted(_MODULES_DIR.iterdir())
-        if any(module.glob(_TEST_FILE_GLOB))
+        for parent in _SUITE_PARENTS
+        for module in sorted(parent.iterdir())
+        if module.is_dir() and any(module.glob(_TEST_FILE_GLOB))
     }
+
+
+def _recipe(makefile: str, target: str) -> str:
+    recipe = makefile[makefile.index(f"{target}:"):]
+    return recipe[: recipe.index("\n\n")]
 
 
 def _declared_providers(module: pathlib.Path) -> list:
@@ -63,7 +78,17 @@ def _declared_providers(module: pathlib.Path) -> list:
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):
     def test_at_least_one_module_carries_a_suite(self):
-        self.assertTrue(_suites(), f"no {_TEST_FILE_GLOB} under {_MODULES_DIR}; this test pins their wiring")
+        self.assertTrue(_suites(), f"no {_TEST_FILE_GLOB} under {_SUITE_PARENTS}; this test pins their wiring")
+
+    def test_no_test_file_sits_where_the_loop_does_not_look(self):
+        reached = {path for files in _suites().values() for path in files}
+        everywhere = set(_TERRAFORM_DIR.rglob(f"*{_TEST_FILE_SUFFIX}"))
+        everywhere = {p for p in everywhere if ".terraform" not in p.parts}
+        self.assertEqual(
+            sorted(everywhere - reached),
+            [],
+            f"these {_TEST_FILE_SUFFIX} files are outside {_TEST_FILE_GLOB} under {[p.name for p in _SUITE_PARENTS]}, so `{_GATE_COMMAND}` never runs them",
+        )
 
     def test_the_makefile_target_reaches_every_module(self):
         makefile = _MAKEFILE.read_text()
@@ -72,14 +97,20 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             _RECIPE_LINE,
             f"the Makefile has no `{_TARGET}:` recipe with a `## description`; `make help` is the only place a contributor finds it",
         )
-        recipe = makefile[makefile.index(f"{_TARGET}:"):]
-        recipe = recipe[: recipe.index("\n\n")]
+        recipe = _recipe(makefile, _TARGET)
         self.assertIn(
             _LOOP_GLOB,
             recipe,
-            f"`{_TARGET}` must loop over every terraform/modules/*/ rather than name modules: a new module's tests/ is otherwise a suite nothing runs",
+            f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs",
         )
         self.assertIn(_TEST_COMMAND, recipe, f"`{_TARGET}` does not run `{_TEST_COMMAND}`")
+
+    def test_make_verify_runs_the_target(self):
+        self.assertIn(
+            _VERIFY_LINE,
+            _recipe(_MAKEFILE.read_text(), _VERIFY_TARGET),
+            f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them",
+        )
 
     def test_the_validate_job_runs_the_target_unconditionally(self):
         steps = yaml.safe_load(_WORKFLOW.read_text())["jobs"][_JOB_ID]["steps"]

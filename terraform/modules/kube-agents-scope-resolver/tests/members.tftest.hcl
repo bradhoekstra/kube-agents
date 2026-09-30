@@ -5,6 +5,7 @@
 # data.http instance: its request_headers carry the provider token, so the
 # value is marked sensitive and a failing assertion that references it
 # crashes Terraform's diagnostic renderer instead of printing the message.
+# The google_client_config count carries no such mark and is read directly.
 
 mock_provider "google" {}
 mock_provider "http" {}
@@ -28,8 +29,8 @@ run "no_selector_makes_no_read" {
     error_message = "with no selector declared, nothing resolves: ${jsonencode(output.members)}"
   }
   assert {
-    condition     = !local.scope_resolves_selectors && length(local.scope_monitored_numbers) == 0
-    error_message = "with no selector declared, the gate every read and the token fetch hang on is closed, and there is no number to name"
+    condition     = !local.scope_resolves_selectors && length(data.google_client_config.scope_resolver) == 0 && length(local.scope_monitored_numbers) == 0
+    error_message = "with no selector declared, no token is fetched and there is no number to name"
   }
 }
 
