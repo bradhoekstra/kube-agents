@@ -92,6 +92,9 @@ _MAKEFLAGS_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS")
 _IGNORE_ERRORS_LONG = "--ignore-errors"
 _IGNORE_ERRORS_LETTER = "i"
 _TRIGGER, _PULL_REQUEST_TRIGGER, _PATH_FILTERS = "on", "pull_request", ("paths", "paths-ignore")
+#: An earlier step can hand MAKEFLAGS to every later one through
+#: $GITHUB_ENV, so no step's run body may name the variable at all.
+_STEPS = "steps"
 #: How make is asked: its database (`-p`) with a trivial target so nothing
 #: else runs, a dry run of `verify` (recursive `$(MAKE)` lines execute under
 #: `-n`, so the target's own recipe shows if `verify` reaches it), and a
@@ -103,6 +106,12 @@ _DATABASE_ARGS = ("-pn", f"--eval={_PROBE_TARGET}: ;@:", _PROBE_TARGET)
 _FAILING_TARGET = "__terraform_test_failing_recipe"
 _FAILING_RECIPE_ARGS = (f"--eval={_FAILING_TARGET}: ;@false", _FAILING_TARGET)
 _DATABASE_COMMENT = "#"
+#: The target's rule line in the database, with or without prerequisites
+#: (`verify:`, `verify: build`, `verify: | build`).
+_DATABASE_RULE = "^{target}:(\\s|$)"
+#: The special target that ignores errors, bare or per target, as the
+#: database prints it.
+_IGNORE_SPECIAL_TARGET = re.compile(r"(?m)^\.IGNORE:")
 _LINE_CONTINUATION = "\\"
 #: The shell loop skips a name beginning with a dot, so such a directory
 #: is never a suite the loop runs, whatever it holds.
@@ -204,6 +213,17 @@ def _suite_files(root: pathlib.Path) -> list:
     return sorted(p for directory in (root, tests_dir) for p in directory.iterdir() if _is_test_file(p))
 
 
+def _loop_directories(parents=_SUITE_PARENTS) -> list:
+    """The directories the Makefile loop runs `terraform test` in: every
+    non-hidden root under the parents with a tests/ directory, whatever it
+    holds (a tests/ left with only a setup module still runs, and reports
+    0 passed)."""
+    return sorted(
+        root for parent in parents for root in parent.iterdir()
+        if root.is_dir() and not root.name.startswith(_HIDDEN_PREFIX) and (root / _TESTS_DIR).is_dir()
+    )
+
+
 def _suites(parents=_SUITE_PARENTS) -> dict:
     return {
         root: _suite_files(root)
@@ -240,10 +260,10 @@ def _resolved_recipe(database: str, target: str) -> list:
     lines a trailing backslash continues are joined into the logical line
     the shell receives."""
     lines = database.split("\n")
-    try:
-        start = lines.index(f"{target}:")
-    except ValueError:
-        raise AssertionError(f"make's database has no `{target}:` target") from None
+    rule = re.compile(_DATABASE_RULE.format(target=re.escape(target)))
+    start = next((i for i, line in enumerate(lines) if rule.match(line)), None)
+    if start is None:
+        raise AssertionError(f"make's database has no `{target}:` target")
     physical = []
     for line in lines[start + 1:]:
         if line.startswith(_DATABASE_COMMENT):
@@ -603,9 +623,13 @@ def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
 def _flags_ignore_errors(value: str) -> bool:
     """Whether a MAKEFLAGS value carries -i, as make reads it."""
     for word in str(value).split():
-        if word == _IGNORE_ERRORS_LONG:
-            return True
-        if word.startswith("--") or "=" in word:
+        if word.startswith("--"):
+            # getopt accepts any prefix of a long option; a prefix short
+            # enough to be ambiguous errors out, which is refused too.
+            if len(word) > len("--") and _IGNORE_ERRORS_LONG.startswith(word):
+                return True
+            continue
+        if "=" in word:
             continue
         if _IGNORE_ERRORS_LETTER in word.lstrip("-"):
             return True
@@ -641,7 +665,10 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
     make's ignore-errors flag in the env at any level, or a paths filter on
     the pull_request trigger."""
     defects = []
-    steps = [s for s in job.get("steps", []) if _GATE_COMMAND in _run_lines(s)]
+    for step in job.get(_STEPS, []):
+        if any(variable in str(step.get(_RUN, "")) for variable in _MAKEFLAGS_VARIABLES):
+            defects.append(f"a step's run body names {'/'.join(_MAKEFLAGS_VARIABLES)}; through $GITHUB_ENV it reaches every later step, `{_GATE_COMMAND}` included")
+    steps = [s for s in job.get(_STEPS, []) if _GATE_COMMAND in _run_lines(s)]
     if len(steps) != 1:
         defects.append(f"{len(steps)} steps run `{_GATE_COMMAND}`; exactly one must")
     for step in steps:
@@ -674,7 +701,10 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
             defects.append("the workflow's default shell is not fail-fast")
         if _working_directory_defect(workflow):
             defects.append(f"the workflow's default `{_WORKING_DIRECTORY}` is not the repository root")
-        trigger = (workflow.get(_TRIGGER) or workflow.get(True) or {}).get(_PULL_REQUEST_TRIGGER) or {}
+        # `on:` may be a mapping, a list or a bare string; only the mapping
+        # form can carry a paths filter.
+        triggers = workflow.get(_TRIGGER, workflow.get(True))
+        trigger = (triggers or {}).get(_PULL_REQUEST_TRIGGER) if isinstance(triggers, dict) else None
         if isinstance(trigger, dict) and any(key in trigger for key in _PATH_FILTERS):
             defects.append("the pull_request trigger carries a paths filter")
     return defects
@@ -721,10 +751,11 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
 
     def test_the_target_runs_every_suite_and_fails_when_one_fails(self):
         # Behaviour, not text: the real target against a fake terraform.
-        suites = sorted(root.name for root in _suites())
+        suites = [root.name for root in _loop_directories()]
+        self.assertTrue(set(root.name for root in _suites()) <= set(suites))
         code, out, calls = _run_target_against_fake_terraform()
         self.assertEqual(code, 0, f"`make {_TARGET}` failed with every suite green:\n{out}")
-        self.assertEqual(sorted({d for d, sub in calls if sub == "test"}), suites, f"`{_TEST_COMMAND}` did not run in every suite directory: {calls}")
+        self.assertEqual(sorted({d for d, sub in calls if sub == "test"}), suites, f"`{_TEST_COMMAND}` did not run in every directory the loop enters: {calls}")
         failing = suites[0]
         code, out, calls = _run_target_against_fake_terraform(fail_in=failing)
         self.assertNotEqual(code, 0, f"`make {_TARGET}` exited 0 with the {failing} suite failing:\n{out}")
@@ -761,7 +792,11 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         self.assertNotEqual(
             probe.returncode,
             0,
-            "a recipe that runs `false` exited 0: a `.IGNORE` target or MAKEFLAGS carrying -i, in the Makefile or a file it includes, would report a failing suite as ignored",
+            "a recipe that runs `false` exited 0: a bare `.IGNORE` target or MAKEFLAGS carrying -i, in the Makefile or a file it includes, would report a failing suite as ignored",
+        )
+        self.assertIsNone(
+            _IGNORE_SPECIAL_TARGET.search(_database()),
+            f"make's database carries a `.IGNORE` target, bare or per target; `.IGNORE: {_VERIFY_TARGET}` would report a failing suite as ignored for that target alone",
         )
 
     def test_the_validate_job_runs_the_target_unconditionally(self):
@@ -950,6 +985,19 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertEqual(_unmocked('{"run": {"x": {}}}', ["google"], "b.tftest.json"), ["google"])
         self.assertEqual(_unmocked("", ["google"], "b.tftest.json"), ["google"])
 
+    def test_the_loop_enters_a_tests_directory_whatever_it_holds(self):
+        parents = (self.root / "terraform" / "modules",)
+        with_suite = self.root / "terraform" / "modules" / "a" / _TESTS_DIR
+        setup_only = self.root / "terraform" / "modules" / "b" / _TESTS_DIR / "setup"
+        hidden = self.root / "terraform" / "modules" / ".c" / _TESTS_DIR
+        no_tests = self.root / "terraform" / "modules" / "d"
+        for directory in (with_suite, setup_only, hidden, no_tests):
+            directory.mkdir(parents=True)
+        (with_suite / "a.tftest.hcl").write_text("")
+        (setup_only / "main.tf").write_text("")
+        self.assertEqual([r.name for r in _loop_directories(parents)], ["a", "b"])
+        self.assertEqual([r.name for r in _suites(parents)], ["a"])
+
     def test_a_test_file_beside_tests_runs_and_one_without_tests_does_not(self):
         parents = (self.root / "terraform" / "modules",)
         with_tests = self.root / "terraform" / "modules" / "m"
@@ -1011,6 +1059,12 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
                 self.assertIsNone(_VERIFY_LINE_EXACT.match(line))
         with self.assertRaises(AssertionError):
             _resolved_recipe("other:\n\t@echo x\n", "verify")
+        # A rule with prerequisites, ordinary or order-only, is still found;
+        # a target whose name merely starts the same is not.
+        self.assertEqual(_resolved_recipe("verify-docs:\n\t@echo d\nverify: build | tools\n\t@echo v\n", "verify"), ["\t@echo v"])
+        self.assertTrue(_IGNORE_SPECIAL_TARGET.search(".IGNORE: verify\n#  Phony target\n"))
+        self.assertTrue(_IGNORE_SPECIAL_TARGET.search("\n.IGNORE:\n"))
+        self.assertIsNone(_IGNORE_SPECIAL_TARGET.search("# .IGNORE: is not set\nverify:\n"))
 
     def test_a_prefix_with_blanks_still_carries_the_ignore_flag(self):
         for line in ('\t-@failed=""; for dir in x; do \\', '\t -@failed=""; for dir in x; do', '\t@ -failed=""; for dir in x; do'):
@@ -1036,6 +1090,13 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"MAKEFLAGS": "k IGNORE=i"}}]}), [])
         self.assertTrue(_gate_defects(good, {"on": {"pull_request": {"paths": ["terraform/**"]}}}))
         self.assertTrue(_gate_defects(good, {True: {"pull_request": {"paths-ignore": ["docs/**"]}}}))
+        for triggers in (["pull_request", "push"], "pull_request", {"pull_request": None}):
+            with self.subTest(triggers=triggers):
+                self.assertEqual(_gate_defects(good, {True: triggers}), [])
+        # An earlier step can set MAKEFLAGS for every later one.
+        self.assertTrue(_gate_defects({"steps": [{"run": 'echo "MAKEFLAGS=-i" >> "$GITHUB_ENV"'}, {"run": "make terraform-test"}]}))
+        self.assertTrue(_gate_defects({"steps": [{"run": "export GNUMAKEFLAGS=i\nmake terraform-test"}]}))
+        self.assertEqual(_gate_defects({"steps": [{"run": 'echo "TF_PLUGIN_CACHE_DIR=$HOME/x" >> "$GITHUB_ENV"'}, {"run": "make terraform-test"}]}), [])
         # The run body is the command alone, under a fail-fast shell.
         self.assertTrue(_gate_defects({"steps": [{"run": "export MAKEFLAGS=-i\nmake terraform-test"}]}))
         self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test\ntrue"}]}))
@@ -1049,10 +1110,10 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertTrue(_gate_defects({"defaults": {"run": {"working-directory": "k8s-operator"}}, "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects(good, {"defaults": {"run": {"working-directory": "bench"}}}))
         self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "working-directory": "."}]}), [])
-        for value in ("-i", "--ignore-errors", "-ki", "-j2 -i", "i", "ki", "k i"):
+        for value in ("-i", "--ignore-errors", "-ki", "-j2 -i", "i", "ki", "k i", "--ignore-err", "--ignore", "--ign"):
             with self.subTest(value=value):
                 self.assertTrue(_flags_ignore_errors(value))
-        for value in ("-k", "-j2 --output-sync", "k IGNORE=i", "--no-print-directory", ""):
+        for value in ("-k", "-j2 --output-sync", "k IGNORE=i", "--no-print-directory", "--include-dir=x", ""):
             with self.subTest(value=value):
                 self.assertFalse(_flags_ignore_errors(value))
 
