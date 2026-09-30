@@ -12,15 +12,18 @@ import io
 import json
 import logging
 import re
+import socket
+import struct
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import credential_proxy
+import scoped_sa_pool
 from credential_proxy import (
     CommandExecutor,
     CredentialProxyHandler,
@@ -33,6 +36,14 @@ _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 _ENVELOPE = ("severity", "timestamp", "logger", "message")
 _TOOL_AUDIT = ("event_type", "request_id", "principal", "tool", "subcommand", "status")
 _SECRET = "SECRETVALUE0123456789"
+
+
+@contextlib.contextmanager
+def _refusing_slot(exc):
+    """A request slot that refuses on entry, as the real one does when the broker
+    is saturated or the queued caller has gone."""
+    raise exc
+    yield  # pragma: no cover
 
 
 class FormatterTest(unittest.TestCase):
@@ -87,7 +98,9 @@ class _BrokerWithJsonLog(unittest.TestCase):
     """A real broker over TCP, logging through JsonLineFormatter into a buffer."""
 
     def setUp(self):
-        for attribute in ("policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "metrics"):
+        for attribute in (
+            "policy", "executor", "enforce_read_only", "max_request_bytes", "authenticator", "metrics", "_request_slot",
+        ):
             self.addCleanup(
                 self._restore,
                 attribute,
@@ -127,7 +140,8 @@ class _BrokerWithJsonLog(unittest.TestCase):
         self.addCleanup(setattr, credential_proxy.LOGGER, "propagate", propagate)
         self.addCleanup(setattr, credential_proxy.LOGGER, "handlers", previous)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        # The class `serve` opens on TCP, so its error hook is under test too.
+        self.server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
@@ -281,6 +295,110 @@ class EveryOutcomeIsAuditedTest(_BrokerWithJsonLog):
         record = self._last_audit("req-a1")
         self.assertEqual(("abandoned", 250), (record["status"], record["duration_ms"]))
 
+    class _Idle(_Raising):
+        def execute(self, *args, **kwargs):
+            raise AssertionError("a command that never got a slot must not run")
+
+    class _Refusing(_Raising):
+        def __init__(self, exc):
+            self.exc = exc
+
+        def execute(self, *args, **kwargs):
+            raise self.exc
+
+    def test_a_refused_git_lease(self):
+        # `commit` mutates, and with no cwd the candidate directory is the
+        # executor's workspace root, which holds no lease marker.
+        status, body = self.post(["git", "commit", "-m", "x"], request_id="req-g2")
+        self.assertEqual((403, "git.workspace.lease"), (status, body["rule"]))
+        record = self._last_audit("req-g2")
+        self.assertEqual(
+            (record["status"], record["rule"], record["tool"], record["subcommand"]),
+            ("blocked", "git.workspace.lease", "git", "commit"),
+        )
+
+    def test_a_saturated_broker(self):
+        CredentialProxyHandler.executor = self._Idle()
+        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(
+            credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands")
+        )
+        status, body = self.post(["kubectl", "get", "pods"], request_id="req-b1")
+        self.assertEqual((503, "busy"), (status, body["status"]))
+        record = self._last_audit("req-b1")
+        self.assertEqual(("busy", "WARNING"), (record["status"], record["severity"]))
+        self.assertNotIn("duration_ms", record)
+
+    def test_a_caller_that_leaves_the_queue(self):
+        CredentialProxyHandler.executor = self._Idle()
+        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(credential_proxy.CallerHungUp())
+        request = urllib.request.Request(
+            self.endpoint + "/v1/exec",
+            data=json.dumps({"requestId": "req-h1", "argv": ["kubectl", "get", "pods"]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        # Nothing is written back; the record is the only trace of the request.
+        with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+            urllib.request.urlopen(request, timeout=5)
+        record = self._last_audit("req-h1")
+        self.assertEqual("abandoned", record["status"])
+        self.assertNotIn("duration_ms", record)
+
+    def test_a_scoped_credential_refusal(self):
+        CredentialProxyHandler.executor = self._Refusing(scoped_sa_pool.PoolRefusal("no member covers the scope"))
+        status, body = self.post(["kubectl", "get", "pods"], request_id="req-s1")
+        self.assertEqual((403, "gcp.scoped-sa.unmapped-scope"), (status, body["rule"]))
+        record = self._last_audit("req-s1")
+        self.assertEqual(("blocked", "gcp.scoped-sa.unmapped-scope"), (record["status"], record["rule"]))
+
+
+class ListenerFaultsAreJsonTest(_BrokerWithJsonLog):
+    """What escapes a request handler is a record on the JSON log, never a traceback
+    on stderr: the container's two streams are one log, and a traceback is several
+    lines a reader expecting one object per line cannot parse."""
+
+    def _wait_for_line(self, fragment, seconds=5.0):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if any(fragment in line for line in self.lines()):
+                return
+            time.sleep(0.01)
+        self.fail(f"no log line containing {fragment!r}: {self.lines()}")
+
+    def test_an_exception_out_of_a_handler_is_one_record_with_the_traceback_inside(self):
+        def bug(handler):
+            raise RuntimeError("handler bug")
+
+        CredentialProxyHandler.do_PUT = bug
+        self.addCleanup(delattr, CredentialProxyHandler, "do_PUT")
+        request = urllib.request.Request(self.endpoint + "/v1/exec", data=b"{}", method="PUT")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            # The connection closes only after the server's error hook has run.
+            with self.assertRaises((urllib.error.URLError, ConnectionError, OSError)):
+                urllib.request.urlopen(request, timeout=5)
+        self.assertEqual("", stderr.getvalue())
+        faults = [r for r in self.records() if "exception" in r]
+        self.assertEqual(1, len(faults), self.lines())
+        self.assertEqual(
+            ("ERROR", "request handler failed type=RuntimeError"), (faults[0]["severity"], faults[0]["message"])
+        )
+        self.assertIn("handler bug", faults[0]["exception"])
+
+    def test_a_peer_that_resets_mid_request_is_a_debug_line(self):
+        credential_proxy.LOGGER.setLevel(logging.DEBUG)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            peer = socket.create_connection(("127.0.0.1", self.server.server_port))
+            peer.sendall(b"POST /v1/ex")  # part of a request line; the rest never comes
+            # A reset rather than a close: the read in progress fails instead of
+            # ending with a short line, which is the case the guard is for.
+            peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            peer.close()
+            self._wait_for_line("request not answered")
+        self.assertEqual("", stderr.getvalue())
+        self.assertIn("request not answered type=ConnectionResetError", [r["message"] for r in self.records()])
+
 
 class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
     """The two byte-level properties the text-formatter tests guard, under the
@@ -333,7 +451,7 @@ class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
         self.addCleanup(setattr, credential_proxy.LOGGER, "propagate", propagate)
         self.addCleanup(setattr, credential_proxy.LOGGER, "handlers", previous_handlers)
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.server = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
