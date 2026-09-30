@@ -66,13 +66,20 @@ _GATE_COMMAND = f"make {_TARGET}"
 #: was written. The command is looked for in the recipe's body, below the
 #: target line, since the help text names it too.
 _RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
-#: A recipe line make or the shell ignores: `#` at column 0 is make's, and
-#: its trailing backslash carries the next line with it; `#` after the tab,
-#: at any indent, is the shell's, which ends at the newline whatever the
-#: line ends with.
-_MAKE_COMMENT = re.compile(r"^#")
-_SHELL_COMMENT = re.compile(r"^\t[ \t]*#")
+#: A recipe line make or the shell ignores: `#` first on a line that does
+#: not start with a tab is make's, and its trailing backslash carries the
+#: next line with it; `#` after the tab, at any indent and after the `@`,
+#: `-` and `+` prefixes make strips, is the shell's, which ends at the
+#: newline whatever the line ends with.
+_MAKE_COMMENT = re.compile(r"^ *#")
+_SHELL_COMMENT = re.compile(r"^\t[ \t]*[@+-]*[ \t]*#")
 _LINE_CONTINUATION = "\\"
+#: The rule line itself, at the start of a line, so a mention of the
+#: target elsewhere (`pre-verify:`, a comment) is not read as the rule.
+_RULE_LINE = "^{target}:"
+#: The shell loop skips a name beginning with a dot, so such a directory
+#: is never a suite the loop runs, whatever it holds.
+_HIDDEN_PREFIX = "."
 _LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
 _TEST_COMMAND = "terraform test"
 _VERIFY_TARGET = "verify"
@@ -149,7 +156,7 @@ def _suites(parents=_SUITE_PARENTS) -> dict:
         root: _suite_files(root)
         for parent in parents
         for root in sorted(parent.iterdir())
-        if root.is_dir() and _suite_files(root)
+        if root.is_dir() and not root.name.startswith(_HIDDEN_PREFIX) and _suite_files(root)
     }
 
 
@@ -167,7 +174,10 @@ def _unreached_test_files(repo_root: pathlib.Path, parents) -> list:
 
 
 def _recipe(makefile: str, target: str) -> str:
-    recipe = makefile[makefile.index(f"{target}:"):]
+    rule = re.search(_RULE_LINE.format(target=re.escape(target)), makefile, re.MULTILINE)
+    if rule is None:
+        raise AssertionError(f"the Makefile has no `{target}:` rule")
+    recipe = makefile[rule.start():]
     end = recipe.find("\n\n")
     return recipe if end < 0 else recipe[:end]
 
@@ -729,18 +739,22 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertEqual(_unreached_test_files(self.root, parents), [without_tests / "d.tftest.hcl"])
 
     def test_a_test_file_outside_the_reached_set_is_reported(self):
+        # A dot-named module directory is one the shell glob skips, so its
+        # suite is unreached however it is laid out.
         parents = (self.root / "terraform" / "modules",)
         reached = self.root / "terraform" / "modules" / "m" / "tests"
         stray = self.root / "bench" / "tf" / "fleet" / "tests"
+        hidden = self.root / "terraform" / "modules" / ".archived" / "tests"
         ignored = self.root / "terraform" / "modules" / "m" / ".terraform" / "tests"
         worktree = self.root / ".claude" / "worktrees" / "pr-1" / "terraform" / "modules" / "m" / "tests"
-        for directory in (reached, stray, ignored, worktree):
+        for directory in (reached, stray, hidden, ignored, worktree):
             directory.mkdir(parents=True)
             (directory / "a.tftest.hcl").write_text("")
         self.assertEqual(
             _unreached_test_files(self.root, parents),
-            [stray / "a.tftest.hcl"],
+            [hidden / "a.tftest.hcl", stray / "a.tftest.hcl"],
         )
+        self.assertNotIn(hidden.parent, _suites(parents))
 
     def test_a_checkout_under_an_ignored_name_is_still_walked(self):
         # A review worktree lives under .claude/; the filter applies below
@@ -777,6 +791,25 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertNotIn(_TEST_COMMAND, _recipe_body(indented, "t"))
         carried = "v: ## v\n\t#@echo x \\\n\t$(MAKE) --no-print-directory terraform-test\n"
         self.assertIn(_VERIFY_LINE, _recipe_body(carried, "v"))
+        # The prefixes make strips before the shell sees the line, and a
+        # make comment indented with spaces rather than a tab.
+        for prefix in ("@#", "-#", "+#", "@ #", "@-#"):
+            with self.subTest(prefix=prefix):
+                silenced = f"v: ## v\n\t{prefix}echo x; $(MAKE) --no-print-directory terraform-test\n\t@echo done\n"
+                self.assertNotIn(_VERIFY_LINE, _recipe_body(silenced, "v"))
+                self.assertIn("@echo done", _recipe_body(silenced, "v"))
+        spaced = "v: ## v\n   # $(MAKE) --no-print-directory terraform-test\n\t@echo done\n"
+        self.assertNotIn(_VERIFY_LINE, _recipe_body(spaced, "v"))
+
+    def test_the_rule_is_found_by_its_own_line_not_a_mention(self):
+        makefile = (
+            "# run `make verify:` first\npre-verify: ## p\n\t@echo pre\n\n"
+            "verify: ## v\n\t$(MAKE) --no-print-directory terraform-test\n\nother: ## o\n\t@echo verify:\n"
+        )
+        self.assertIn(_VERIFY_LINE, _recipe_body(makefile, "verify"))
+        self.assertNotIn("pre", _recipe_body(makefile, "verify"))
+        with self.assertRaises(AssertionError):
+            _recipe("x: ## x\n\t@echo\n", "verify")
 
 
 if __name__ == "__main__":
