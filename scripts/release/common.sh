@@ -416,18 +416,21 @@ release_main_tip() {
 # and the nightly promotion and the Prow eval would both adopt a line commit
 # as main's candidate. In CI a `main` that cannot be read is an error rather
 # than a guess; off CI the list passes through unfiltered with a warning, so a
-# hand run in a partial checkout still answers.
-# Arguments: $1 = tag glob
+# hand run in a partial checkout still answers. A caller that has already
+# resolved main (release_main_tip) passes it, so one run fetches it once.
+# Arguments: $1 = tag glob, $2 = main's commit or ref, already resolved (optional)
 list_tags_on_main() {
   local glob="${1:-}"
+  local main_ref="${2:-}"
 
   if [ -z "${glob}" ]; then
     echo "❌ ERROR: a tag glob is required for list_tags_on_main." >&2
     return 1
   fi
 
-  local main_ref
-  if ! main_ref="$(release_main_ref)"; then
+  if [ -n "${main_ref}" ]; then
+    :
+  elif ! main_ref="$(release_main_ref)"; then
     if is_ci_pipeline; then
       echo "❌ ERROR: Could not resolve main in this checkout; refusing to pick a candidate without it." >&2
       return 1
@@ -949,9 +952,10 @@ export RC_TAG_SHAPE_REGEX='^rc_[0-9]{10}_[0-9a-f]{7}$'
 # auto-resolve, the version calculator and the staging deploy all read this,
 # and a staging_ tag a hand-dispatched promotion left on a release-line commit
 # must not become main's release candidate.
+# Arguments: $1 = main's commit, already resolved (optional; see list_tags_on_main)
 get_latest_staging_tag() {
   local tags
-  tags="$(list_tags_on_main "${STAGING_TAG_PREFIX}*")" || return 1
+  tags="$(list_tags_on_main "${STAGING_TAG_PREFIX}*" "${1:-}")" || return 1
   grep -m1 -E "${STAGING_TAG_SHAPE_REGEX}" <<<"${tags}" || true
 }
 
@@ -1484,13 +1488,19 @@ release_line_resolve_candidate() {
   echo "${candidate}"
 }
 
-# The RC validation markers on a commit, one per line, shape-matched: a release
-# line's gate. The glob would also answer for a hand-typed `rc_hotfix_validated`,
-# which is the shape the gate exists to refuse; see RC_VALIDATED_TAG_SHAPE_REGEX.
+# The RC validation markers on a commit, one per line: a release line's gate.
+# Matched to the pipeline's own name for this commit, `rc_<ts>_<its short
+# sha>_validated` (RC_VALIDATED_TAG_SHAPE_REGEX with the sha field bound), not
+# the rc_*_validated glob and not the bare shape: the glob would answer for a
+# hand-typed `rc_hotfix_validated`, and the shape alone for a composed
+# `rc_<ts>_0000000_validated`, on a branch whose only gate this is. The
+# pipeline never mints a mismatched sha field (resolve_rc_tag.sh), so binding
+# it costs a genuine validation nothing.
 validated_rc_tags_at_commit() {
-  local sha="${1:-}" tags
-  tags="$(git tag --points-at "${sha}" "rc_*_validated" 2>/dev/null || true)"
-  grep -E "${RC_VALIDATED_TAG_SHAPE_REGEX}" <<<"${tags}" || true
+  local sha="${1:-}" full tags
+  full="$(git rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null || echo "${sha}")"
+  tags="$(git tag --points-at "${full}" "rc_*_validated" 2>/dev/null || true)"
+  grep -E "^rc_[0-9]{10}_${full:0:7}_validated\$" <<<"${tags}" || true
 }
 
 # Where a version's release line is, relative to the release commit and the
@@ -1690,6 +1700,30 @@ ensure_ga_release_refs() {
     push_tag="true"
   fi
 
+  # A run that fails from here on leaves the checkout as it was found: the tag
+  # this run created is deleted and the line put back. The workflow's fresh
+  # checkout would not care, but a persistent clone would, and off CI the
+  # calculator does not prune: a local tag no push ever took would be the next
+  # run's GA base and its notes-start tag. Reads the enclosing locals.
+  take_back_local_refs() {
+    local taken=()
+    if [ "${push_tag}" = "true" ]; then
+      git tag -d "${version}" >/dev/null 2>&1 || true
+      taken+=("Git tag '${version}'")
+    fi
+    if [ "${push_line}" = "true" ]; then
+      if [ -n "${prior_branch_sha}" ]; then
+        git update-ref "${branch_ref}" "${prior_branch_sha}" 2>/dev/null || true
+      else
+        git branch -D "${branch}" >/dev/null 2>&1 || true
+      fi
+      taken+=("release line '${branch}'")
+    fi
+    if [ ${#taken[@]} -gt 0 ]; then
+      echo "↩️ Nothing was pushed; $(IFS=,; echo "${taken[*]}") taken back from this checkout, which is left as it was found." >&2
+    fi
+  }
+
   case "${placement}" in
     remote)
       echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
@@ -1698,7 +1732,10 @@ ensure_ga_release_refs() {
       echo "✅ Release line '${branch}' on $(get_target_repo) is already past release commit ${target_full_sha:0:7}; nothing to move."
       ;;
     *)
-      set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}" || return 1
+      if ! set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}"; then
+        take_back_local_refs
+        return 1
+      fi
       if [ "${placement}" = "local-past" ]; then
         echo "✅ Local release line '${branch}' is already past release commit ${target_full_sha:0:7}; nothing to move."
       else
@@ -1730,22 +1767,7 @@ ensure_ga_release_refs() {
   if release_push_refs "${label}" "${refspecs[@]}"; then
     return 0
   fi
-
-  # A rejected push leaves the checkout as it was found. The workflow's fresh
-  # checkout would not care, but a persistent clone would: the calculator and
-  # the publish step read the tag list, and a local tag the remote never took
-  # would be the next run's GA base and its notes-start tag.
-  if [ "${push_tag}" = "true" ]; then
-    git tag -d "${version}" >/dev/null 2>&1 || true
-  fi
-  if [ "${push_line}" = "true" ]; then
-    if [ -n "${prior_branch_sha}" ]; then
-      git update-ref "${branch_ref}" "${prior_branch_sha}" 2>/dev/null || true
-    else
-      git branch -D "${branch}" >/dev/null 2>&1 || true
-    fi
-  fi
-  echo "↩️ Nothing was pushed; ${label} taken back from this checkout, which is left as it was found." >&2
+  take_back_local_refs
   return 1
 }
 

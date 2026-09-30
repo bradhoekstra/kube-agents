@@ -151,7 +151,14 @@ LATEST_GA_TAG="$(get_latest_ga_tag)"
 # The picker reads main from the release repository in CI and fails when it
 # cannot; that failure has to leave through emit_and_exit like every other, or
 # the outputs the gate job declares are empty for the reader asking why.
-if ! GATE_TAG="$(get_latest_staging_tag)"; then
+# main is resolved once, here, and handed to both reads that need it: the
+# candidate pick and the base read below would otherwise each fetch it.
+if ! MAIN_TIP="$(release_main_tip)"; then
+  ERRORED="true"
+  SKIP_REASON="Could not read the tag graph against main — see the log."
+  emit_and_exit
+fi
+if ! GATE_TAG="$(get_latest_staging_tag "${MAIN_TIP}")"; then
   ERRORED="true"
   SKIP_REASON="Could not read the tag graph against main — see the log."
   emit_and_exit
@@ -171,7 +178,7 @@ fi
 # release/0.7, the numerically highest tag is not main's base and condition 2
 # would name the wrong tag. Read once the candidate is known, in place of the
 # numeric read above that the no-candidate messages used.
-if ! MAIN_TIP="$(release_main_tip)" || ! LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RELEASE_COMMIT}" "" "${MAIN_TIP}")"; then
+if ! LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RELEASE_COMMIT}" "" "${MAIN_TIP}")"; then
   ERRORED="true"
   SKIP_REASON="Could not read the GA base of the gate-passing commit ${RELEASE_COMMIT:0:7} — see the log."
   emit_and_exit

@@ -221,13 +221,43 @@ source "{_COMMON_SH}"
         temp_dir, repo_dir, git = create_mock_git_repo()
         try:
             head = git("rev-parse", "HEAD").stdout.strip()
-            git("tag", "rc_2608191200_2222222_validated")
-            git("tag", "rc_2608191200_2222222")
-            git("tag", "staging_2608191200_2222222")
+            own = f"rc_2608191200_{head[:7]}_validated"
+            git("tag", own)
+            git("tag", f"rc_2608191200_{head[:7]}")
+            git("tag", f"staging_2608191200_{head[:7]}")
             git("tag", "rc_hotfix_validated")
+            # The pipeline's shape with another commit's sha field: composed by hand,
+            # never minted, and the one form the bare shape would have let through.
+            git("tag", "rc_2608191200_2222222_validated")
             proc = self._run_common_func(f'validated_rc_tags_at_commit "{head}"', cwd=repo_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertEqual(proc.stdout.split(), ["rc_2608191200_2222222_validated"])
+            self.assertEqual(proc.stdout.split(), [own])
+        finally:
+            temp_dir.cleanup()
+
+    def test_list_tags_on_main_takes_an_already_resolved_main(self):
+        """A caller that resolved main once hands it over instead of having it fetched again.
+
+        The handed-in ref is what the listing is filtered against: a side tip
+        given as "main" lists that side's tags, which the default read does not.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "rc_2608191200_1111111")
+            git("switch", "-c", "side")
+            (pathlib.Path(repo_dir) / "side.txt").write_text("x")
+            git("add", "side.txt")
+            git("commit", "-m", "fix: side")
+            side = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "rc_2608191300_2222222")
+            git("switch", "main")
+
+            default = self._run_common_func("list_tags_on_main 'rc_*'", cwd=repo_dir)
+            self.assertEqual(default.returncode, 0, default.stderr)
+            self.assertEqual(default.stdout.split(), ["rc_2608191200_1111111"])
+            handed = self._run_common_func(f"list_tags_on_main 'rc_*' \"{side}\"", cwd=repo_dir)
+            self.assertEqual(handed.returncode, 0, handed.stderr)
+            self.assertEqual(handed.stdout.split(), ["rc_2608191300_2222222", "rc_2608191200_1111111"])
         finally:
             temp_dir.cleanup()
 
@@ -1430,6 +1460,10 @@ source "{_COMMON_SH}"
         self.assertIn("is checked out here", proc.stderr)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), candidate)
         self.assertEqual(git("status", "--porcelain").stdout.strip(), "")
+        # The tag created before the refusal is taken back: off CI nothing prunes it,
+        # and a local tag on the stamp would be the next calculator run's base.
+        self.assertEqual(git("tag", "-l", MOCK_LINE_PATCH_RELEASE_TAG).stdout.strip(), "")
+        self.assertIn("taken back from this checkout", proc.stderr)
 
     def test_release_line_helpers_in_ci_read_the_release_repository(self):
         """The CI arm: the head comes from the remote (fetched when the checkout lacks it),

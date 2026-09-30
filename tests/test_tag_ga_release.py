@@ -855,7 +855,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
 
         off_ci = self._run_calculator(repo_dir, new_candidate, self._FAKE_RELEASE_REPO)
         self.assertEqual(off_ci.returncode, 0, off_ci.stderr)
-        self.assertNotEqual(off_ci.stdout.strip(), MOCK_TARGET_RELEASE_TAG, "off CI the local tag is read, as a dry run should")
+        self.assertIn(f"Latest GA Tag: {MOCK_TARGET_RELEASE_TAG}", off_ci.stderr, "off CI the local tag is read, as a dry run should")
 
         here = self._run_calculator(repo_dir, new_candidate, ci)
         fresh = self._run_calculator(fresh_dir, new_candidate, ci)

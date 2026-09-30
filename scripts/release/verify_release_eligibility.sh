@@ -188,16 +188,18 @@ fi
 #
 # Both shape-matched via common.sh rather than by prefix: the staging_ prefix is a live deploy
 # trigger anyone can push and the rc_ family is open to hand-made names, so a 'staging_hotfix' or
-# an 'rc_hotfix_validated' would otherwise satisfy the release gate.
+# an 'rc_hotfix_validated' would otherwise satisfy the release gate. The line's is also bound to
+# the candidate's own short sha, the name the pipeline mints for it, so a composed
+# 'rc_<ts>_0000000_validated' does not satisfy the one gate a line has.
 if [ -n "${RELEASE_LINE}" ]; then
   echo "🔎 Checking for rc_*_validated tags pointing at release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT}..."
   VALIDATED_TAGS="$(validated_rc_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
   if [ -z "${VALIDATED_TAGS}" ]; then
     echo "❌ BLOCKED: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT} has NOT passed the RC validation!" >&2
-    echo "   No 'rc_<ts>_<sha>_validated' tag from the RC pipeline points to this commit." >&2
+    echo "   No 'rc_<ts>_${RC_CANDIDATE_COMMIT:0:7}_validated' tag from the RC pipeline points to this commit." >&2
     OTHER_MARKERS="$(git tag --points-at "${RC_CANDIDATE_COMMIT}" "rc_*_validated" 2>/dev/null | tr '\n' ' ' || true)"
     if [ -n "${OTHER_MARKERS}" ]; then
-      echo "   It carries ${OTHER_MARKERS}- not that shape, so earned under a hand-named rc_tag dispatch input or placed by hand; neither counts here." >&2
+      echo "   It carries ${OTHER_MARKERS}- not that name, so earned under a hand-named rc_tag dispatch input or placed by hand; neither counts here." >&2
     fi
     echo "   Dispatch '.github/workflows/rc-release-pipeline.yml' with commit_sha=${RC_CANDIDATE_COMMIT} and rc_tag empty (it reuses only its own rc_<ts>_<sha> tag and mints one otherwise), and wait for it to tag the commit validated." >&2
     exit 1

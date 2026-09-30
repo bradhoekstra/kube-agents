@@ -685,18 +685,19 @@ exit {docker_exit}
 
     def test_a_line_is_eligible_on_its_validated_head(self):
         repo_dir, git, bin_dir, _, head = self._line_repo()
-        git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
         proc = self._run_verify_script(
             repo_dir, env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("candidate is the line's own", proc.stdout)
         self.assertIn("Found RC validation tag(s)", proc.stdout)
-        self.assertIn("rc_2609290000_1234567_validated", proc.stdout)
+        self.assertIn(f"rc_2609290000_{head[:7]}_validated", proc.stdout)
 
     def test_a_line_is_blocked_by_a_staging_tag_or_a_hand_typed_marker_alone(self):
-        """The line's gate is the RC pipeline's shape, not the rc_*_validated glob."""
-        for tag in ("staging_2609290000_1234567", "rc_hotfix_validated", "rc_x_validated"):
+        """The line's gate is the RC pipeline's own name for the commit, not the rc_*_validated
+        glob and not the bare shape with another sha field composed into it."""
+        for tag in ("staging_2609290000_1234567", "rc_hotfix_validated", "rc_x_validated", "rc_2609290000_0000000_validated"):
             with self.subTest(tag=tag):
                 repo_dir, git, bin_dir, _, head = self._line_repo()
                 git("tag", "-a", tag, "-m", "not the line's gate", head)
@@ -720,7 +721,7 @@ exit {docker_exit}
         """RELEASE_VERSION names a tag on the line: the candidate is what it was cut from, and Scenario A resumes."""
         repo_dir, git, bin_dir, _, head = self._line_repo()
         # The original release's gate, as the RC pipeline left it on the head it released.
-        git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
         git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (pathlib.Path(repo_dir) / "stamp.txt").write_text(MOCK_LINE_PATCH_RELEASE_TAG)
         git("add", "stamp.txt")
@@ -744,7 +745,7 @@ exit {docker_exit}
 
     def test_a_line_refuses_a_version_off_the_line_and_a_candidate_that_is_not_its_head(self):
         repo_dir, git, bin_dir, base_commit, head = self._line_repo()
-        git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
+        git("tag", "-a", f"rc_2609290000_{head[:7]}_validated", "-m", "validated", head)
         off = self._run_verify_script(
             repo_dir, env={"RELEASE_VERSION": "0.3.1", "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
         )
