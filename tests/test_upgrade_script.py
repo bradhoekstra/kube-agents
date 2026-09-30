@@ -356,6 +356,57 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             refused = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
             self.assertNotEqual(refused.returncode, 0)
 
+    def _run_fixture_upgrade_main(self, repo_path, args):
+        """Source the fixture's own stamped copy of this branch's upgrade.sh and run main:
+        the load-time flag, the drop's wiring and the exit arms, as an operator's run."""
+        text = _UPGRADE_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+        (repo_path / "upgrade.sh").write_text(text)
+        return subprocess.run(
+            ["bash", "-c", f"KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; main {args}"],
+            cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+        )
+
+    def test_main_from_a_release_line_checkout_past_its_stamp_asks_for_the_tag(self):
+        """The composed path: the stamped copy computes the baked default at load, main
+        takes it back on this checkout and exits naming the line checkout, an explicit
+        --image-tag is kept, and a --plan is told what it reads instead of what to pass."""
+        with tempfile.TemporaryDirectory(prefix="release-line-upgrade-main-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+
+            asks = self._run_fixture_upgrade_main(repo_path, "--non-interactive --dry-run")
+            self.assertNotEqual(asks.returncode, 0)
+            self.assertIn("release line 0.2 at " + backport[:7], asks.stdout)
+            self.assertIn("--image-tag is required from a release-line checkout past its release", asks.stdout + asks.stderr)
+            self.assertNotIn("carries no baked release version", asks.stdout + asks.stderr)
+            self.assertNotIn("mismatch", asks.stdout + asks.stderr)
+
+            explicit = self._run_fixture_upgrade_main(repo_path, f"--non-interactive --dry-run --image-tag={backport}")
+            self.assertNotIn("release line 0.2 at", explicit.stdout)
+            self.assertNotIn("--image-tag is required", explicit.stdout + explicit.stderr)
+            self.assertIn(f"Target Image Tag: {backport}", explicit.stdout.replace("\x1b[1m", "").replace("\x1b[0m", ""))
+
+            plan = self._run_fixture_upgrade_main(repo_path, "--non-interactive --plan")
+            self.assertIn("release line 0.2 at", plan.stdout)
+            self.assertIn("reads the tag the install already serves", plan.stdout)
+            self.assertNotIn("pass --image-tag", plan.stdout)
+            self.assertIn("the plan will use the tag this install is already running", plan.stdout)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_fixture_upgrade_main(repo_path, "--non-interactive --dry-run")
+            self.assertNotIn("release line", at_stamp.stdout)
+            self.assertIn("Target Image Tag: 0.2.0", at_stamp.stdout.replace("\x1b[1m", "").replace("\x1b[0m", ""))
+
+    def test_a_missing_release_tag_is_named_by_the_source_check(self):
+        """A line checkout that never fetched the release's tag cannot be recognised; the
+        refusal says the scripts carry a release whose tag the checkout lacks, and what to do."""
+        with tempfile.TemporaryDirectory(prefix="release-line-upgrade-tagless-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            git("tag", "-d", "0.2.0")
+            proc = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("does not hold its tag", proc.stdout + proc.stderr)
+            self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+
     def test_script_checkout_dir_names_the_checkout_the_script_runs_from(self):
         """Empty for a body sourced from no file in a checkout; the checkout when upgrade.sh
         is run from one. The marker, not the directory name, is what makes it a checkout."""

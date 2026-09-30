@@ -792,7 +792,22 @@ checkout_is_past_baked_release() {
 
 # The directory this script runs from, when that is a kube-agents checkout;
 # empty under `curl … | bash`, where no file names one. acquire_upgrade_sources
-# says why the file test has to come before dirname.
+# and the release-line check in main both read it.
+#
+# Under `curl … | bash` there is no script file on disk. At the top level
+# `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
+# this runs — what bash reports depends on its version: `main` or nothing on
+# the releases on_error's comment above describes, and `$0` on bash 5.3
+# (measured): `bash` for the documented one-liner, or the interpreter's own
+# path (`/bin/bash`) when it is invoked by path. None of them names this
+# script. An unguarded `dirname` turns the empty value, `main` and a bare
+# `bash` into `.`, and `pwd` into the directory the operator is standing in,
+# which would skip the checkout arms in acquire_upgrade_sources. Two checks
+# share the job:
+# requiring a non-empty path that names an existing file rejects the empty
+# value, `main` and a bare `bash` (short of a file by that name in the
+# working directory), and the installer-helper marker check that follows
+# rejects the interpreter's directory, which carries no checkout.
 script_checkout_dir() {
   local script_path="${BASH_SOURCE[0]:-}" script_dir=""
   if [ -n "$script_path" ] && [ -f "$script_path" ]; then
@@ -819,7 +834,14 @@ drop_baked_default_on_a_line_checkout_past_it() {
   local head_commit count
   head_commit="$(git -C "$repo_dir" rev-parse HEAD)"
   count="$(git -C "$repo_dir" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")"
-  print_info "This checkout is release line ${BAKED_RELEASE_VERSION%.*} at ${head_commit:0:7}, ${count} commit(s) past release ${BAKED_RELEASE_VERSION}, whose version its scripts still carry. Its images are built per commit and not released, so ${BAKED_RELEASE_VERSION} is not this run's default: pass --image-tag ${head_commit} for this commit's images, or run tag ${BAKED_RELEASE_VERSION}'s own upgrade.sh for the release."
+  # The remedy depends on what the run is about: a plan or a --keep-image-tag
+  # run reads the installed tag next and needs no --image-tag, so it is not
+  # told to pass one.
+  local remedy="pass --image-tag ${head_commit} for this commit's images, or run tag ${BAKED_RELEASE_VERSION}'s own upgrade.sh for the release."
+  if [ "$PARAM_KEEP_IMAGE_TAG" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    remedy="this run reads the tag the install already serves instead."
+  fi
+  print_info "This checkout is release line ${BAKED_RELEASE_VERSION%.*} at ${head_commit:0:7}, ${count} commit(s) past release ${BAKED_RELEASE_VERSION}, whose version its scripts still carry. Its images are built per commit and not released, so ${BAKED_RELEASE_VERSION} is not this run's default: ${remedy}"
   PARAM_IMAGE_TAG=""
   BAKED_DEFAULT_DROPPED="true"
 }
@@ -1269,24 +1291,9 @@ acquire_upgrade_sources() {
   # locals dynamically, so a local sharing a name with the variable named in
   # $1 or $2 would be the one printf -v writes to, and the caller would read
   # back an empty string.
-  local resolved_dir="" found_checkout="" script_dir="" script_path="${BASH_SOURCE[0]:-}"
-  # Under `curl … | bash` there is no script file on disk. At the top level
-  # `${BASH_SOURCE[0]:-}` is empty there; inside a function — which is where
-  # this runs — what bash reports depends on its version: `main` or nothing on
-  # the releases on_error's comment above describes, and `$0` on bash 5.3
-  # (measured): `bash` for the documented one-liner, or the interpreter's own
-  # path (`/bin/bash`) when it is invoked by path. None of them names this
-  # script. An unguarded `dirname` turns the empty value, `main` and a bare
-  # `bash` into `.`, and `pwd` into the directory the operator is standing in,
-  # which would skip the checkout arms below. Two checks share the job:
-  # requiring a non-empty path that names an existing file rejects the empty
-  # value, `main` and a bare `bash` (short of a file by that name in the
-  # working directory), and the installer-helper marker check that follows
-  # rejects the interpreter's directory, which carries no checkout.
-  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
-    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd || echo "")"
-  fi
-  if [ -n "$script_dir" ] && [ -f "${script_dir}/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ]; then
+  local resolved_dir="" found_checkout="" script_dir=""
+  script_dir="$(script_checkout_dir)"
+  if [ -n "$script_dir" ]; then
     resolved_dir="$script_dir"
   elif [ -f "$(pwd)/${KUBE_AGENTS_INSTALLER_COMMON_MARKER}" ] && {
     [ -z "$expected_ref" ] || ! is_kube_agents_clone "$(pwd)"
