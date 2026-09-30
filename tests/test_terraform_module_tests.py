@@ -18,7 +18,9 @@ and `provider` blocks imply (Terraform loads `hashicorp/<prefix>` for an
 undeclared type prefix with no warning), what every local module it calls
 declares, since Terraform hands a child a default provider the root never
 named, and what a module a `run` block loads from the test file itself
-declares. HCL is read through a small tokenizer that skips comments,
+declares; a run whose `providers` map routes a provider to a configuration
+no `mock_provider` block declares is reported too, and the builtin
+`terraform` provider is never demanded. HCL is read through a small tokenizer that skips comments,
 strings, heredocs and template interpolation, so none of those can pass for
 syntax; a `.tftest.json` is parsed; the `.tf` side is read as HCL only, and a
 root or called module carrying a `*.tf.json` fails the pin loudly rather than
@@ -64,6 +66,11 @@ _GATE_COMMAND = f"make {_TARGET}"
 #: was written. The command is looked for in the recipe's body, below the
 #: target line, since the help text names it too.
 _RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
+#: A recipe line make or the shell ignores: `#` at column 0 is make's, `#`
+#: after the tab is the shell's, and a trailing backslash carries either
+#: onto the next line.
+_RECIPE_COMMENT = re.compile(r"^\t*#")
+_LINE_CONTINUATION = "\\"
 _LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
 _TEST_COMMAND = "terraform test"
 _VERIFY_TARGET = "verify"
@@ -94,6 +101,14 @@ _REQUIRED_PROVIDERS_BLOCK = "required_providers"
 #: not it is declared: `resource "google_x"`, `data "http"`, `provider "tls"`.
 _IMPLYING_BLOCKS = (("resource", 2), ("data", 2), ("provider", 1))
 _TYPE_PREFIX_SEPARATOR = "_"
+#: `terraform_data` and `terraform_remote_state` belong to the builtin
+#: provider, which is never fetched and cannot be mocked.
+_BUILTIN_PROVIDER_PREFIX = "terraform"
+#: A run's `providers = { http = http.live }` routes the module's `http` to
+#: the `live` configuration; the pin wants that configuration mocked too.
+_PROVIDERS_ATTRIBUTE = "providers"
+_JSON_PROVIDERS_KEY = "providers"
+_ALIAS_SEPARATOR = "."
 _MODULE_BLOCK = "module"
 #: A test file's `run "x" { module { source = "./…" } }`, whose module's
 #: providers the file has to mock too; in JSON, `run.<name>.module.source`.
@@ -156,7 +171,17 @@ def _recipe(makefile: str, target: str) -> str:
 
 
 def _recipe_body(makefile: str, target: str) -> str:
-    return _recipe(makefile, target).split("\n", 1)[1]
+    """The recipe's lines below the target line, less commented-out ones
+    and the continuation lines a commented line's trailing backslash
+    carries with it."""
+    kept = []
+    continuing_comment = False
+    for line in _recipe(makefile, target).split("\n")[1:]:
+        if continuing_comment or _RECIPE_COMMENT.match(line):
+            continuing_comment = line.rstrip().endswith(_LINE_CONTINUATION)
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 # ─── Reading HCL ─────────────────────────────────────────────────────────────
@@ -286,6 +311,22 @@ def _blocks(tokens: list, name: str, labels: int) -> list:
     return blocks
 
 
+def _headers_at_any_depth(tokens: list, name: str, labels: int) -> list:
+    """The labels of every `name "label"… {` header, whatever encloses it:
+    a `check` block's scoped data source implies its provider like a
+    top-level one."""
+    found = []
+    for index, token in enumerate(tokens):
+        if (
+            token == (_WORD, name)
+            and index + 1 + labels < len(tokens)
+            and all(tokens[index + 1 + n][0] == _STR for n in range(labels))
+            and tokens[index + 1 + labels][0] == _OPEN
+        ):
+            found.append([tokens[index + 1 + n][1] for n in range(labels)])
+    return found
+
+
 def _nested_blocks(body: list, name: str) -> list:
     """Bodies of `name {` blocks directly inside a body (no labels)."""
     flat = [token for token, _depth in body]
@@ -315,8 +356,9 @@ def _providers_in(text: str) -> set:
                 name for name, (kind, _value) in _attributes(block).items() if kind in (_OPEN, _STR)
             )
     for block_name, labels in _IMPLYING_BLOCKS:
-        for found, _body in _blocks(tokens, block_name, labels):
+        for found in _headers_at_any_depth(tokens, block_name, labels):
             providers.add(found[0].split(_TYPE_PREFIX_SEPARATOR)[0])
+    providers.discard(_BUILTIN_PROVIDER_PREFIX)
     return providers
 
 
@@ -358,25 +400,72 @@ def _needed_providers(root: pathlib.Path, seen=None) -> list:
     return sorted(providers)
 
 
+def _json_bodies(value) -> list:
+    """The bodies of a labelled JSON block: `{"a": body}` or `[{"a": body}]`,
+    each body itself one object or a list of them."""
+    entries = value.values() if isinstance(value, dict) else []
+    if isinstance(value, list):
+        entries = [body for element in value if isinstance(element, dict) for body in element.values()]
+    bodies = []
+    for entry in entries:
+        bodies.extend(entry if isinstance(entry, list) else [entry])
+    return [body for body in bodies if isinstance(body, dict)]
+
+
+def _json_unlabelled(value) -> list:
+    """An unlabelled JSON block: one object or a list of them."""
+    entries = value if isinstance(value, list) else [value]
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _json_runs(text: str) -> list:
+    return _json_bodies(json.loads(text).get(_JSON_RUN_KEY, {})) if text.strip() else []
+
+
 def _run_module_sources(text: str, name: str) -> list:
     """Local module sources a test file's run blocks load, relative to the root."""
     if name.endswith(_TEST_FILE_JSON_SUFFIX):
-        runs = json.loads(text).get(_JSON_RUN_KEY, {}) if text.strip() else {}
-        runs = runs.values() if isinstance(runs, dict) else runs if isinstance(runs, list) else []
-        modules = [run.get(_JSON_MODULE_KEY) for run in runs if isinstance(run, dict)]
-        modules = [m for m in modules if isinstance(m, dict)]
+        sources = [
+            module.get(_JSON_SOURCE_KEY)
+            for run in _json_runs(text)
+            for module in _json_unlabelled(run.get(_JSON_MODULE_KEY, []))
+        ]
     else:
-        modules = [
-            _attributes(block)
+        sources = [
+            _attributes(block).get(_SOURCE_ATTRIBUTE, (None, None))[1]
             for _labels, body in _blocks(_tokens(text), _RUN_BLOCK, 1)
             for block in _nested_blocks(body, _MODULE_BLOCK)
+            if _attributes(block).get(_SOURCE_ATTRIBUTE, ("",))[0] == _STR
         ]
-        modules = [{_JSON_SOURCE_KEY: m[_SOURCE_ATTRIBUTE][1]} for m in modules if m.get(_SOURCE_ATTRIBUTE, ("",))[0] == _STR]
-    return [
-        m[_JSON_SOURCE_KEY]
-        for m in modules
-        if isinstance(m.get(_JSON_SOURCE_KEY), str) and m[_JSON_SOURCE_KEY].startswith(_LOCAL_SOURCE_PREFIXES)
-    ]
+    return [source for source in sources if isinstance(source, str) and source.startswith(_LOCAL_SOURCE_PREFIXES)]
+
+
+def _run_provider_routes(text: str, name: str) -> list:
+    """Every `provider.alias` a run's `providers` map hands the module."""
+    routes = []
+    if name.endswith(_TEST_FILE_JSON_SUFFIX):
+        for run in _json_runs(text):
+            mapping = run.get(_JSON_PROVIDERS_KEY, {})
+            routes.extend(v for v in mapping.values() if isinstance(v, str)) if isinstance(mapping, dict) else None
+        return routes
+    for _labels, body in _blocks(_tokens(text), _RUN_BLOCK, 1):
+        flat = [token for token, _depth in body]
+        for index, (token, depth) in enumerate(body):
+            if depth == 1 and token == (_WORD, _PROVIDERS_ATTRIBUTE) and index + 2 < len(body) and body[index + 1][0][0] == _EQUALS and body[index + 2][0][0] == _OPEN:
+                entries = [t for t, d in _body(flat, index + 2) if d == 1]
+                position = 0
+                while position + 2 < len(entries):
+                    if entries[position][0] == _WORD and entries[position + 1][0] == _EQUALS and entries[position + 2][0] == _WORD:
+                        route = entries[position + 2][1]
+                        if position + 4 < len(entries) and entries[position + 3] == (_OTHER, _ALIAS_SEPARATOR) and entries[position + 4][0] == _WORD:
+                            route += _ALIAS_SEPARATOR + entries[position + 4][1]
+                            position += 5
+                        else:
+                            position += 3
+                        routes.append(route)
+                    else:
+                        position += 1
+    return routes
 
 
 def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
@@ -389,29 +478,33 @@ def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
     return sorted(providers)
 
 
-def _mocked_in_hcl(text: str) -> set:
-    return {
-        labels[0]
-        for labels, body in _blocks(_tokens(text), _MOCK_PROVIDER_BLOCK, 1)
-        if _ALIAS_ATTRIBUTE not in _attributes(body)
-    }
+def _mock_configurations_in_hcl(text: str) -> set:
+    """Each `mock_provider` block as `name` or `name.alias`."""
+    configurations = set()
+    for labels, body in _blocks(_tokens(text), _MOCK_PROVIDER_BLOCK, 1):
+        alias = _attributes(body).get(_ALIAS_ATTRIBUTE)
+        configurations.add(labels[0] if alias is None else f"{labels[0]}{_ALIAS_SEPARATOR}{alias[1]}")
+    return configurations
 
 
-def _mocked_in_json(text: str) -> set:
+def _mock_configurations_in_json(text: str) -> set:
     mocks = json.loads(text).get(_MOCK_PROVIDER_BLOCK, {}) if text.strip() else {}
-    if not isinstance(mocks, dict):
-        return set()
-    mocked = set()
-    for name, entries in mocks.items():
-        entries = entries if isinstance(entries, list) else [entries]
-        if any(isinstance(entry, dict) and _ALIAS_ATTRIBUTE not in entry for entry in entries):
-            mocked.add(name)
-    return mocked
+    configurations = set()
+    for name, entries in (mocks.items() if isinstance(mocks, dict) else []):
+        for entry in _json_unlabelled(entries):
+            alias = entry.get(_ALIAS_ATTRIBUTE)
+            configurations.add(name if alias is None else f"{name}{_ALIAS_SEPARATOR}{alias}")
+    return configurations
 
 
 def _unmocked(text: str, providers, name: str = _TEST_FILE_SUFFIXES[0]) -> list:
-    mocked = _mocked_in_json(text) if name.endswith(_TEST_FILE_JSON_SUFFIX) else _mocked_in_hcl(text)
-    return [provider for provider in providers if provider not in mocked]
+    """Providers with no default mock, then every configuration a run's
+    `providers` map routes to that no mock block declares."""
+    is_json = name.endswith(_TEST_FILE_JSON_SUFFIX)
+    mocked = _mock_configurations_in_json(text) if is_json else _mock_configurations_in_hcl(text)
+    missing = [provider for provider in providers if provider not in mocked]
+    missing.extend(route for route in _run_provider_routes(text, name) if route not in mocked and route not in missing)
+    return missing
 
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):
@@ -496,11 +589,14 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertEqual(_declared_providers(self.root), ["google", "google-beta", "helm", "null", "random"])
 
     def test_an_undeclared_resource_data_or_provider_block_implies_its_provider(self):
+        # A check block's scoped data source counts too; the builtin
+        # terraform provider (terraform_data) never does.
         (self.root / "main.tf").write_text(
             'data "http" "x" {\n  url = "https://x"\n}\nresource "google_project_iam_member" "y" {}\n'
-            'provider "tls" {}\nlocals {\n  z = 1\n}\n'
+            'provider "tls" {}\nlocals {\n  z = 1\n}\nresource "terraform_data" "t" {}\n'
+            'check "health" {\n  data "dns_a_record_set" "probe" {\n    host = "x"\n  }\n  assert {\n    condition     = true\n    error_message = "x"\n  }\n}\n'
         )
-        self.assertEqual(_declared_providers(self.root), ["google", "http", "tls"])
+        self.assertEqual(_declared_providers(self.root), ["dns", "google", "http", "tls"])
 
     def test_a_root_declaring_nothing_reads_as_no_providers(self):
         (self.root / "main.tf").write_text("locals {\n  a = {\n    b = {}\n  }\n}\n")
@@ -559,12 +655,31 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         plain.write_text('mock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n')
         as_json = root / _TESTS_DIR / "c.tftest.json"
         as_json.write_text('{"mock_provider": {"google": {}}, "run": {"seed": {"module": {"source": "./tests/setup"}}}}')
+        # The array forms HCL-JSON admits: a list of {label: body} runs, and
+        # a list of module objects.
+        as_array = root / _TESTS_DIR / "d.tftest.json"
+        as_array.write_text('{"mock_provider": {"google": {}}, "run": [{"seed": {"module": [{"source": "./tests/setup"}]}}]}')
         self.assertEqual(_needed_providers(root), ["google"])
         self.assertEqual(_needed_by_test_file(root, hcl), ["google", "http"])
         self.assertEqual(_needed_by_test_file(root, plain), ["google"])
         self.assertEqual(_needed_by_test_file(root, as_json), ["google", "http"])
+        self.assertEqual(_needed_by_test_file(root, as_array), ["google", "http"])
         self.assertEqual(_unmocked(hcl.read_text(), _needed_by_test_file(root, hcl)), ["http"])
         self.assertEqual(_unmocked(as_json.read_text(), _needed_by_test_file(root, as_json), as_json.name), ["http"])
+        self.assertEqual(_unmocked(as_array.read_text(), _needed_by_test_file(root, as_array), as_array.name), ["http"])
+
+    def test_a_run_routing_a_provider_to_a_live_configuration_is_reported(self):
+        text = (
+            'mock_provider "google" {}\nmock_provider "http" {}\nprovider "http" {\n  alias = "live"\n}\n'
+            'run "x" {\n  providers = {\n    google = google\n    http   = http.live\n  }\n  command = plan\n}\n'
+        )
+        self.assertEqual(_unmocked(text, ["google", "http"]), ["http.live"])
+        mocked_alias = text.replace('provider "http" {\n  alias = "live"\n}', 'mock_provider "http" {\n  alias = "live"\n}')
+        self.assertEqual(_unmocked(mocked_alias, ["google", "http"]), [])
+        as_json = '{"mock_provider": {"google": {}, "http": [{}, {"alias": "live"}]}, "run": {"x": {"providers": {"http": "http.live"}}}}'
+        self.assertEqual(_unmocked(as_json, ["google", "http"], "x.tftest.json"), [])
+        routed_live = '{"mock_provider": {"google": {}, "http": {}}, "run": {"x": {"providers": {"http": "http.live"}}}}'
+        self.assertEqual(_unmocked(routed_live, ["google", "http"], "x.tftest.json"), ["http.live"])
 
     def test_a_mock_in_a_comment_does_not_count(self):
         text = '# mock_provider "http" {}\nmock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n'
@@ -638,6 +753,19 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         makefile = "x: ## run terraform test\n\tterraform init\n\ntf: ## nothing\n\tterraform test\n"
         self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "x"))
         self.assertIn(_TEST_COMMAND, _recipe_body(makefile, "tf"))
+
+    def test_a_commented_out_recipe_line_does_not_count(self):
+        # make's column-0 comment, the shell's comment after the tab, and a
+        # backslash continuation carried by either.
+        makefile = (
+            "v: ## verify\n\t@echo a\n#\t$(MAKE) --no-print-directory terraform-test\n\t#@echo terraform test\n\n"
+            "t: ## t\n#\t@for dir in x; do \\\n\t  terraform test; \\\n\tdone\n\t@echo done\n"
+        )
+        self.assertNotIn("terraform-test", _recipe_body(makefile, "v"))
+        self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "v"))
+        self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "t"))
+        self.assertIn("@echo done", _recipe_body(makefile, "t"))
+        self.assertIn(_VERIFY_LINE, _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET))
 
 
 if __name__ == "__main__":
