@@ -1520,9 +1520,10 @@ validated_rc_tags_at_commit() {
 # took a merge after the release's push landed: nothing to move), or `absent`. A
 # branch anywhere else is an error naming both commits, and so is a remote that
 # cannot be read. In CI the remote is what is read: a local branch the remote
-# lacks is the leftover of a rejected push and reads as `absent`; off CI the
-# local branch stands in for it. Read-only; ensure_ga_release_refs reads it
-# before anything is pushed.
+# lacks is a leftover (a dry run's, or a killed run's) and reads as `absent`,
+# and a local branch that has moved on from the remote's line is an error; off
+# CI the local branch stands in for the remote. Read-only; ensure_ga_release_refs
+# reads it before anything is pushed.
 # Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
 release_branch_placement() {
   local version="${1:-}"
@@ -1572,19 +1573,42 @@ release_branch_placement() {
   local local_sha
   local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
 
+  # Whether a local copy of the line, in CI, is one this run may move: at the
+  # release commit or its candidate, a stamp of this version (what a dry run or a
+  # run killed before its push leaves), or behind the remote's head. Anything else
+  # holds work the remote never took, which no run may drop from the branch.
+  local_is_leftover() {
+    local sha="$1" remote="$2"
+    [ "${sha}" = "${target_full_sha}" ] && return 0
+    [ -n "${candidate_full_sha}" ] && [ "${sha}" = "${candidate_full_sha}" ] && return 0
+    [ "$(git log -1 --format=%s "${sha}" 2>/dev/null)" = "${RELEASE_STAMP_SUBJECT_PREFIX} ${version}" ] && return 0
+    [ -n "${remote}" ] && git merge-base --is-ancestor "${sha}" "${remote}" 2>/dev/null && return 0
+    return 1
+  }
+
   if is_ci_pipeline; then
     local remote_sha
     remote_sha="$(release_branch_remote_commit "${branch_ref}")" || return 1
+    # In CI the remote decides, and a local branch is a leftover or a mistake: a
+    # fresh checkout has no local release/ branch at all. A leftover (a dry run's,
+    # or a killed run's, or a rejected push's before the take-back existed) is
+    # moved, since reading it would refuse the re-run once the candidate has moved
+    # on; a branch that has moved on from the remote's line is refused before
+    # anything is moved.
+    local placement
     if [ -n "${remote_sha}" ]; then
-      classify "${remote_sha}" "remote" "on $(get_target_repo)"
-      return
+      placement="$(classify "${remote_sha}" "remote" "on $(get_target_repo)")" || return 1
     fi
-    # In CI the remote decides. A local branch the remote lacks is what a rejected
-    # atomic push leaves in the checkout that ran it (a fresh checkout has no local
-    # release/ branch at all), and reading it would refuse the re-run once the
-    # candidate has moved on; it is recreated at the release commit instead.
+    if [ -n "${local_sha}" ] && ! local_is_leftover "${local_sha}" "${remote_sha}"; then
+      echo "❌ ERROR: Release line '${branch}' in this checkout is at ${local_sha}: not the release commit, its candidate, a stamp of ${version}, or behind $(get_target_repo)'s line, so it holds work the remote never took. Move it aside (git branch -m) and re-run; nothing has been pushed." >&2
+      return 1
+    fi
+    if [ -n "${remote_sha}" ]; then
+      echo "${placement}"
+      return 0
+    fi
     if [ -n "${local_sha}" ]; then
-      echo "ℹ️ Release line '${branch}' exists only in this checkout, at ${local_sha:0:7}: left behind by a push that did not land. Recreating it at release commit ${target_full_sha:0:7}." >&2
+      echo "ℹ️ Release line '${branch}' exists only in this checkout, at ${local_sha:0:7}: left behind by a run that did not push. Recreating it at release commit ${target_full_sha:0:7}." >&2
     fi
     echo "absent"
     return 0

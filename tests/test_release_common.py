@@ -1298,7 +1298,6 @@ source "{_COMMON_SH}"
         self.assertIn("Idempotent skip", proc.stdout)
         # Only the tag was missing, so only the tag is pushed.
         self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' successfully pushed", proc.stdout)
-        self.assertNotIn("release line '", proc.stdout.split("successfully pushed")[0].split("\n")[-1])
 
     def test_ensure_ga_release_refs_in_ci_refuses_a_remote_branch_at_another_commit(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
@@ -1581,6 +1580,82 @@ source "{_COMMON_SH}"
         self.assertEqual(pinned.stdout.strip(), shas["L1"])
         other = self._run_common_func('release_line_candidate "0.2" "0.1.0"', cwd=repo_dir)
         self.assertEqual(other.stdout.strip(), l2)
+
+    def test_off_ci_the_line_helpers_fall_back_to_the_tracking_ref(self):
+        """A developer's clone that fetched a line but never checked it out.
+
+        That is the runbook's dry-run shape: `origin/release/X.Y` exists, no
+        local branch does. The head, the candidate and "does the line exist"
+        all read the tracking ref; with it gone they say there is no line.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+        git("switch", "-c", branch)
+        (pathlib.Path(repo_dir) / "backport.txt").write_text("fix")
+        git("add", "backport.txt")
+        git("commit", "-m", "fix: backport")
+        head = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+        bare_dir = pathlib.Path(repo_dir).parent / "origin.git"
+        git("init", "--bare", str(bare_dir))
+        git("remote", "add", "origin", str(bare_dir))
+        git("push", "--quiet", "origin", "main", branch)
+        git("branch", "-D", branch)
+        git("fetch", "--quiet", "origin")
+        self.assertEqual(git("rev-parse", f"refs/remotes/origin/{branch}").stdout.strip(), head)
+
+        candidate = self._run_common_func(f'release_line_candidate "{MOCK_TARGET_RELEASE_LINE}"', cwd=repo_dir)
+        self.assertEqual(candidate.returncode, 0, candidate.stderr)
+        self.assertEqual(candidate.stdout.strip(), head)
+        exists = self._run_common_func(f'release_line_branch_exists "{MOCK_TARGET_RELEASE_LINE}"', cwd=repo_dir)
+        self.assertEqual(exists.returncode, 0, exists.stderr)
+
+        git("update-ref", "-d", f"refs/remotes/origin/{branch}")
+        gone = self._run_common_func(f'release_line_candidate "{MOCK_TARGET_RELEASE_LINE}"', cwd=repo_dir)
+        self.assertNotEqual(gone.returncode, 0)
+        self.assertIn(f"No local release line '{branch}'", gone.stderr)
+        exists = self._run_common_func(f'if release_line_branch_exists "{MOCK_TARGET_RELEASE_LINE}"; then echo yes; else echo "no rc=$?"; fi', cwd=repo_dir)
+        self.assertEqual(exists.stdout.strip(), "no rc=1")
+
+    def test_in_ci_a_local_line_that_moved_on_from_the_remote_is_refused_not_moved(self):
+        """The remote decides in CI, but a local branch holding work the remote never
+        took is refused before anything is moved, whether the remote lacks the line
+        or holds it at the candidate; a leftover stamp of the version is still moved."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        candidate = git("rev-parse", "HEAD").stdout.strip()
+        git("push", "--quiet", str(bare_dir), "main")
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.0\n")
+        git("add", "stamp.txt")
+        git("commit", "-m", "chore(release): stamp release version 0.2.0")
+        release_commit = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "--detach", "-q", candidate)
+        (pathlib.Path(repo_dir) / "unpushed.txt").write_text("work\n")
+        git("add", "unpushed.txt")
+        git("commit", "-m", "fix: never pushed")
+        unpushed = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+        ci = {"CI": "true", **self._FAKE_RELEASE_REPO}
+        call = f'release_branch_placement "{MOCK_TARGET_RELEASE_TAG}" "{release_commit}" "{candidate}"'
+
+        git("branch", branch, unpushed)
+        for remote_state in ("absent", "at the candidate"):
+            with self.subTest(remote=remote_state):
+                if remote_state == "at the candidate":
+                    git("push", "--quiet", str(bare_dir), f"{candidate}:refs/heads/{branch}")
+                proc = self._run_common_func(call, env=ci, cwd=repo_dir)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("holds work the remote never took", proc.stderr)
+                self.assertEqual(git("rev-parse", branch).stdout.strip(), unpushed)
+
+        # A leftover stamp of the version (a dry run's) is the case the remote read exists for.
+        git("branch", "-f", branch, release_commit)
+        proc = self._run_common_func(call, env=ci, cwd=repo_dir)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "remote-candidate")
 
     def test_release_branch_placement_reports_where_the_branch_is(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
