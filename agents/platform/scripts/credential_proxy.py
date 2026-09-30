@@ -39,7 +39,7 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, TextIO
 
 import api_policy
 import command_policy
@@ -397,6 +397,9 @@ RULE_EXECUTABLE_ALLOWLIST = "executable.allowlist"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
+LOG_LEVEL_ENV = "LOG_LEVEL"
+DEFAULT_LOG_LEVEL = "INFO"
+EXIT_STARTUP_FAILURE = 1
 MICROSECONDS_PER_MILLISECOND = 1000
 
 
@@ -1104,9 +1107,9 @@ class ServiceAccountAuthenticator:
         try:
             # Inside the try: a missing or unreadable ca.crt raises
             # FileNotFoundError here, and an OSError escaping this method is
-            # not an AuthenticationError — it would reach
-            # socketserver.handle_error as a traceback and a dropped
-            # connection, where the caller deserves a 401.
+            # not an AuthenticationError — the handler's read guard would end
+            # the request as a dropped connection with no 401, where the
+            # caller deserves one.
             context = ssl.create_default_context(cafile=self.ca_file or None)
             with urllib.request.urlopen(
                 request, timeout=self.timeout_seconds, context=context
@@ -7415,12 +7418,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-if __name__ == "__main__":
-    # One JSON object per line, on stdout: the audit trail is this container's
-    # primary output, and a SIEM behind Cloud Logging reads its fields rather
-    # than parsing them out of text (JsonLineFormatter). The GKE log agent
-    # reads stdout and stderr alike, so the stream changes nothing for it.
-    json_handler = logging.StreamHandler(sys.stdout)
+def configure_logging(stream: TextIO = sys.stdout) -> None:
+    """One JSON object per line on `stream`, at the level LOG_LEVEL names.
+
+    The audit trail is this container's primary output, and a SIEM behind Cloud
+    Logging reads its fields rather than parsing them out of text
+    (JsonLineFormatter). The GKE log agent reads stdout and stderr alike, so
+    the stream changes nothing for it. A LOG_LEVEL that names no level logs at
+    INFO with a record saying so, rather than leaving a traceback out of
+    basicConfig before any handler exists.
+    """
+    requested = os.getenv(LOG_LEVEL_ENV, DEFAULT_LOG_LEVEL).strip().upper() or DEFAULT_LOG_LEVEL
+    level = requested if isinstance(logging.getLevelName(requested), int) else DEFAULT_LOG_LEVEL
+    json_handler = logging.StreamHandler(stream)
     json_handler.setFormatter(JsonLineFormatter())
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), handlers=[json_handler])
-    serve(parse_args())
+    logging.basicConfig(level=level, handlers=[json_handler], force=True)
+    if level != requested:
+        LOGGER.warning("%s=%r names no log level; logging at %s", LOG_LEVEL_ENV, requested, level)
+
+
+def main(stream: TextIO = sys.stdout) -> int:
+    """Serve, and log a refusal to start as one record.
+
+    Every refusal `serve` makes before it opens a listener -- an unsupported
+    role or authentication mode, a listener reachable off the Pod with no
+    authenticator, a failed bootstrap command -- would otherwise leave the
+    process through the interpreter's default hook as a plain-text traceback
+    on the same container log the JSON records go to, on every restart of a
+    crash-looping broker. Caught here, it is one ERROR record with the
+    traceback inside it, and the exit status still says the start failed.
+    """
+    configure_logging(stream)
+    try:
+        serve(parse_args())
+    except Exception as exc:
+        LOGGER.exception("credential proxy failed to start type=%s", type(exc).__name__)
+        return EXIT_STARTUP_FAILURE
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

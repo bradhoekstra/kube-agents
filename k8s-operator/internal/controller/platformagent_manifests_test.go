@@ -2437,6 +2437,10 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 // order and before the record modifier stamps the record. The regex is checked
 // against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
 // translated to Go's, since the two engines agree on everything else in it.
+// Those lines are frozen here: the test holds the regex to the format as
+// sampled and cannot notice a Hermes release that changes it. That check is a
+// live one after an agent image change (jsonPayload.event_type in Logs
+// Explorer; the observability page says so).
 func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
 	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},

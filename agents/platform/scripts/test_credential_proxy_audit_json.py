@@ -7,13 +7,17 @@ schema's fields as fields, and never the command's arguments.
 Run: python3 -m unittest test_credential_proxy_audit_json -v
 """
 
+import argparse
 import contextlib
 import io
 import json
 import logging
+import os
 import re
 import socket
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -21,6 +25,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 import credential_proxy
 import scoped_sa_pool
@@ -492,8 +497,6 @@ class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
         self.assertEqual(len(self.emitted), len(records))
 
     def test_the_request_line_cannot_start_a_second_record(self):
-        import socket
-
         connection = socket.create_connection(("127.0.0.1", self.port))
         self.addCleanup(connection.close)
         connection.sendall(
@@ -515,3 +518,61 @@ class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StartupRefusalIsJsonTest(unittest.TestCase):
+    """A refusal to start is one ERROR record on the JSON log with the traceback
+    inside it and a non-zero exit, not the interpreter's plain-text traceback."""
+
+    def setUp(self):
+        root = logging.getLogger()
+        self.addCleanup(root.setLevel, root.level)
+        self.addCleanup(setattr, root, "handlers", list(root.handlers))
+
+    @staticmethod
+    def _records(text):
+        return [json.loads(line) for line in text.splitlines() if line]
+
+    def test_a_refusal_to_start_is_one_error_record(self):
+        buffer = io.StringIO()
+        refusal = RuntimeError("unsupported CREDENTIAL_PROXY_ROLE 'bogus'")
+        with mock.patch.object(credential_proxy, "parse_args", return_value=argparse.Namespace()), \
+                mock.patch.object(credential_proxy, "serve", side_effect=refusal), \
+                mock.patch.dict(os.environ, {"LOG_LEVEL": "INFO"}):
+            status = credential_proxy.main(stream=buffer)
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, status)
+        records = self._records(buffer.getvalue())
+        self.assertEqual(1, len(records), records)
+        self.assertEqual(
+            ("ERROR", "credential proxy failed to start type=RuntimeError"),
+            (records[0]["severity"], records[0]["message"]),
+        )
+        self.assertIn("CREDENTIAL_PROXY_ROLE", records[0]["exception"])
+
+    def test_an_unrecognised_log_level_logs_at_info_and_says_so(self):
+        buffer = io.StringIO()
+        with mock.patch.object(credential_proxy, "parse_args", return_value=argparse.Namespace()), \
+                mock.patch.object(credential_proxy, "serve", return_value=None), \
+                mock.patch.dict(os.environ, {"LOG_LEVEL": "loud"}):
+            status = credential_proxy.main(stream=buffer)
+        self.assertEqual(0, status)
+        self.assertEqual(logging.INFO, logging.getLogger().level)
+        records = self._records(buffer.getvalue())
+        self.assertEqual(["WARNING"], [r["severity"] for r in records], records)
+        self.assertIn("LOG_LEVEL='LOUD' names no log level", records[0]["message"])
+
+    def test_the_script_writes_the_refusal_as_json_and_nothing_on_stderr(self):
+        # The real entry point in a fresh interpreter: the interpreter's own
+        # hook is what would print the traceback, and no in-process test
+        # reaches it.
+        completed = subprocess.run(
+            [sys.executable, credential_proxy.__file__],
+            env={**os.environ, "CREDENTIAL_PROXY_ROLE": "bogus"},
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        self.assertEqual(credential_proxy.EXIT_STARTUP_FAILURE, completed.returncode, completed.stderr)
+        self.assertEqual("", completed.stderr)
+        records = self._records(completed.stdout)
+        self.assertTrue(records, completed.stdout)
+        self.assertEqual("credential proxy failed to start type=RuntimeError", records[-1]["message"])
+        self.assertIn("'bogus'", records[-1]["exception"])
