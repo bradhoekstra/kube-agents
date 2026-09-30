@@ -373,6 +373,7 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # The by-number form lowers the count on the selector leg only: an explicit
         # project the reconcile drops by its number is counted, and the message says so
         # and names the remedy rather than promising the entry lowers the count.
+        self.assertIn("by ID for an entry in scope.projects or any selector member", self.main_tf)
         self.assertIn("is dropped by the reconcile but counted here", self.main_tf)
         self.assertIn("drop it from scope.projects", self.main_tf)
         # Containers are not in the count: their members are unknown at plan

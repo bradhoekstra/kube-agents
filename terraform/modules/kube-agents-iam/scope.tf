@@ -200,10 +200,12 @@ locals {
   # selectors existed, so a plan that declares none is not refused for it and
   # the reconcile reads a hundred-and-first over-cap as it did. Counted as the
   # reconcile counts, once
-  # each and less an exact exclude entry: by ID on the scope.projects leg, by
-  # number on the selector leg, where the resolver has already left an excluded
-  # number out without naming it. A project both in scope.projects and monitored
-  # by a declared Metrics Scope that is excluded by its number is therefore
+  # each and less an exact exclude entry: by ID on both legs (a monitored
+  # project excluded by ID keeps its grant but leaves the set, so it leaves the
+  # count), and by number on the selector leg as well, where the resolver has
+  # already left an excluded number out without naming it. A project both in
+  # scope.projects and monitored by a declared Metrics Scope that is excluded
+  # by its number alone is therefore
   # counted here although the reconcile, which names it with the explicit
   # grant, drops it: the plan cannot tie a number to an entry without the read
   # the exclusion exists to avoid, so the count is a bound, over by exactly
