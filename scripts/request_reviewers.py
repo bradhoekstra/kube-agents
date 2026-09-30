@@ -145,14 +145,25 @@ def validate_config(config):
     """Refuse a config using a feature this port does not implement, or a
     robot_accounts entry that is not a list of bare GitHub logins."""
     robots = (config.get("options") or {}).get(ROBOT_ACCOUNTS_OPTION)
-    if robots is not None and (
-        not isinstance(robots, list)
-        or not all(is_github_login(login) for login in robots)
-    ):
-        raise ValueError(
-            f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of bare GitHub logins "
-            f"(letters, digits and single hyphens, as GitHub shows them), got {robots!r}"
-        )
+    if robots is not None:
+        if not isinstance(robots, list):
+            raise ValueError(f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of GitHub logins, got {robots!r}")
+        for login in robots:
+            # yaml.safe_load reads an unquoted all-digit login as an int and
+            # `yes`, `no`, `on`, `off`, `true` or `false` as a bool; both are
+            # valid logins once quoted, and `007` would not survive str() of
+            # the int, so the remedy is named rather than guessed at.
+            if not isinstance(login, str):
+                raise ValueError(
+                    f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} was read by YAML as "
+                    f"{type(login).__name__}, not text: quote a login that is all digits or a "
+                    "YAML word such as yes, no, on or off"
+                )
+            if not is_github_login(login):
+                raise ValueError(
+                    f"options.{ROBOT_ACCOUNTS_OPTION} entry {login!r} is not a bare GitHub login "
+                    "(letters, digits and single hyphens, as GitHub shows them)"
+                )
     for name, is_used in UNSUPPORTED_CONFIG.items():
         if is_used(config):
             raise ValueError(

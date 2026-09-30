@@ -24,6 +24,8 @@ import re
 import sys
 import tempfile
 import unittest
+
+import yaml
 from pathlib import Path
 from unittest import mock
 
@@ -262,6 +264,22 @@ class ConfigValidationTest(unittest.TestCase):
                 rr.validate_config({"options": {"robot_accounts": bad}})
         self.assertEqual(rr.robot_accounts({"options": {"robot_accounts": ["Kyber775"]}}), {"kyber775"})
         self.assertEqual(rr.robot_accounts({}), frozenset())
+
+    def test_a_yaml_coerced_login_is_refused_with_the_remedy(self):
+        # An unquoted all-digit login arrives as an int and an unquoted YAML
+        # word as a bool; both are valid logins once quoted, so the message
+        # says to quote rather than calling a valid login malformed.
+        for entry in ("12345", "no", "on", "true"):
+            with self.subTest(entry=entry):
+                config = yaml.safe_load(f"options:\n  robot_accounts:\n    - {entry}\n")
+                with self.assertRaises(ValueError) as caught:
+                    rr.validate_config(config)
+                self.assertIn("quote", str(caught.exception))
+                self.assertNotIn("not a bare GitHub login", str(caught.exception))
+                quoted = yaml.safe_load(f'options:\n  robot_accounts:\n    - "{entry}"\n')
+                rr.validate_config(quoted)
+        # Quoting keeps what the operator typed: `007` is a login, `7` is not it.
+        self.assertEqual(rr.robot_accounts(yaml.safe_load('options:\n  robot_accounts:\n    - "007"\n')), {"007"})
 
 
 class SelectionTest(unittest.TestCase):

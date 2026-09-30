@@ -56,5 +56,8 @@ options:
   # request a human. A review request outstanding to one of them is not a
   # reviewer already asked, either. Bare logins, as GitHub shows them: the
   # comparison is exact, and the script refuses any other shape at load.
+  # Quote a login that is all digits or a YAML word such as yes, no, on or
+  # off, or YAML reads it as a number or a boolean and the script refuses it
+  # by name.
   robot_accounts:
     - kyber775
