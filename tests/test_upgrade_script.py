@@ -367,6 +367,16 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertIn("run its own ./upgrade.sh", piped.stdout + piped.stderr)
             self.assertNotIn("git fetch", piped.stdout + piped.stderr)
 
+    def _run_fixture_upgrade_func(self, repo_path, func_call):
+        """Source the fixture's own stamped copy of this branch's upgrade.sh and call a
+        function, so script_checkout_dir names the fixture."""
+        text = _UPGRADE_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+        (repo_path / "upgrade.sh").write_text(text)
+        return subprocess.run(
+            ["bash", "-c", f"KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; {func_call}"],
+            cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+        )
+
     def _run_fixture_upgrade_main(self, repo_path, args):
         """Source the fixture's own stamped copy of this branch's upgrade.sh and run main:
         the load-time flag, the drop's wiring and the exit arms, as an operator's run."""
@@ -399,6 +409,15 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertNotIn("release line 0.2 at", explicit.stdout)
             self.assertNotIn("--image-tag is required", explicit.stdout + explicit.stderr)
             self.assertIn(past_the_block, explicit.stdout + explicit.stderr)
+
+            # Asked for the release by name from the backport, with the checkout's own script
+            # running: refused, and told what the checkout is rather than that it is unrelated.
+            named = self._run_fixture_upgrade_func(repo_path, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(named.returncode, 0)
+            self.assertIn("Source/image version mismatch", named.stdout + named.stderr)
+            self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
+            self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
+            self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
 
             plan = self._run_fixture_upgrade_main(repo_path, "--non-interactive --plan")
             self.assertIn("release line 0.2 at", plan.stdout)

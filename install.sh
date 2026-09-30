@@ -1073,24 +1073,31 @@ baked_version_of_tree() {
 # fetch mends. Printed only for a tree whose own install.sh carries the
 # version; the caller checks that.
 release_line_recognition_hint() {
-  local repo_dir="${1:-.}" head_commit remedies="" script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" line="${BAKED_RELEASE_VERSION%.*}"
   head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
-  if ! git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" >/dev/null 2>&1; then
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -z "$tag_commit" ]; then
     remedies="fetch the tags (git fetch --tags)"
   fi
   if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
     remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
   fi
+  local script_path="${BASH_SOURCE[0]:-}"
   if [ -n "$script_path" ] && [ -f "$script_path" ]; then
     script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
   fi
   local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
-  if [ -n "$remedies" ]; then
+  if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release install.sh, or one run from another directory: only the
+    # checkout's own install.sh recognises a release-line checkout, so that comes
+    # first, with whatever fetch it would also need.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the install.sh running is not this checkout's. If it is a checkout of a release line, run its own ./install.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ -n "$remedies" ]; then
     print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
-  elif [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
-    # A piped release installer, or one run from another directory: only the
-    # checkout's own install.sh recognises a release-line checkout.
-    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the install.sh running is not this checkout's. If it is a checkout of a release line, run its own ./install.sh, which recognises that, or ${own_images}."
+  elif [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    # Recognisable, and asked for the release by name anyway (--image-tag with
+    # the baked version): the checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release, or drop --image-tag to default to this commit's own images."
   else
     # Tag present, history complete, the checkout's own script running: HEAD
     # simply does not descend from the release (a cherry-picked or rebased
@@ -1780,8 +1787,9 @@ verify_local_source_ref() {
       print_warning "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
     else
       print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
-      # The tag is here and HEAD is not it: a line checkout the predicate could
-      # not walk (a shallow clone), or an unrelated commit. Same gate as above.
+      # The tag is here and HEAD is not it: a line checkout asked for the release
+      # by name (--image-tag with the baked version), one the predicate could not
+      # walk (a shallow clone), or an unrelated commit. Same gate as above.
       if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
         [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
         release_line_recognition_hint "$repo_dir"

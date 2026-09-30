@@ -1488,6 +1488,15 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertIn("verified", resolved.stdout)
             self.assertNotIn("mismatch", resolved.stdout + resolved.stderr)
 
+            # Asked for the release by name from the backport: refused, and told what the
+            # checkout is rather than that it is unrelated.
+            named = self._run_fixture_install_func(repo_path, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(named.returncode, 0)
+            self.assertIn("mismatch", named.stdout + named.stderr)
+            self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
+            self.assertIn("drop --image-tag", named.stdout + named.stderr)
+            self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
+
             git("switch", "-q", "--detach", stamp)
             at_stamp = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
             self.assertEqual(at_stamp.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
@@ -1535,9 +1544,16 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertIn("is not this checkout's", piped.stdout + piped.stderr)
             self.assertIn("run its own ./install.sh", piped.stdout + piped.stderr)
             self.assertNotIn("git fetch", piped.stdout + piped.stderr)
-            # Standing in a checkout that lacks the tag, the piped installer's refusal
-            # does not tell the operator their checkout's scripts carry the release.
+            # Tagless but stamped: the piped installer still leads with "run the checkout's
+            # own install.sh", naming the fetch that would also be needed, rather than a
+            # fetch alone that leaves the piped copy unable to recognise the checkout.
             git("tag", "-d", "0.2.0")
+            tagless = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("run its own ./install.sh", tagless.stdout + tagless.stderr)
+            self.assertIn("once you fetch the tags (git fetch --tags)", tagless.stdout + tagless.stderr)
+            # Standing in a checkout that lacks the tag and the stamp, the piped installer's
+            # refusal does not tell the operator their checkout's scripts carry the release.
             (repo_path / "install.sh").write_text(_INSTALL_SH.read_text())
             refused = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
             self.assertNotEqual(refused.returncode, 0)
