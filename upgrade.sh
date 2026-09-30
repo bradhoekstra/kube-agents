@@ -95,9 +95,6 @@ IMAGE_TAG_DEFAULTED_FROM_BAKED="false"
 if [ -z "${IMAGE_TAG:-}" ] && [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
   IMAGE_TAG_DEFAULTED_FROM_BAKED="true"
 fi
-# Set when that default was taken back, so the "--image-tag is required" exits
-# below can say why rather than that the script carries no baked version.
-BAKED_DEFAULT_DROPPED="false"
 TEMP_REPO_DIR=""
 # Set when this run detached the install's own checkout onto the target
 # release. Everything that can still refuse the upgrade — the configuration
@@ -843,7 +840,14 @@ drop_baked_default_on_a_line_checkout_past_it() {
   fi
   print_info "This checkout is release line ${BAKED_RELEASE_VERSION%.*} at ${head_commit:0:7}, ${count} commit(s) past release ${BAKED_RELEASE_VERSION}, whose version its scripts still carry. Its images are built per commit and not released, so ${BAKED_RELEASE_VERSION} is not this run's default: ${remedy}"
   PARAM_IMAGE_TAG=""
-  BAKED_DEFAULT_DROPPED="true"
+}
+
+# Whether main's tag block is looking at the default the function above took
+# back: the baked version was the default and the tag is now empty, which
+# nothing else produces. The "--image-tag is required" exit reads it to say why
+# rather than that the script carries no baked version.
+baked_default_was_dropped() {
+  [ "$IMAGE_TAG_DEFAULTED_FROM_BAKED" = "true" ] && [ -z "$PARAM_IMAGE_TAG" ]
 }
 
 # The two refusals that do not need a ref to make sense: an unversioned source
@@ -952,7 +956,12 @@ verify_local_source_ref() {
   local expected_commit current_commit
   if ! expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
-    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+    # Only when the tree's own scripts carry the version (the line
+    # checkout_is_past_baked_release draws): a piped release upgrade.sh
+    # standing in some other checkout that lacks the tag is not a line checkout
+    # to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
       print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but the checkout does not hold its tag. If it is a checkout of a release line, fetch the tags (git fetch --tags) so the release it descends from can be recognised, or pass --image-tag with this commit's full SHA."
     fi
     return 1
@@ -1415,7 +1424,7 @@ main() {
   elif [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
     print_info "No --image-tag given; the plan will use the tag this install is already running."
   elif [ -z "$PARAM_IMAGE_TAG" ]; then
-    if [ "$BAKED_DEFAULT_DROPPED" = "true" ] && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! { [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; }; }; then
+    if baked_default_was_dropped && { [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! { [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; }; }; then
       print_error "--image-tag is required from a release-line checkout past its release; pass this commit's full SHA (above) or a validated release tag."
       exit 1
     fi

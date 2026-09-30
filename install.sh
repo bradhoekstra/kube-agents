@@ -1076,14 +1076,16 @@ default_image_tag() {
   # 1. Baked release version takes precedence (for curl | bash from official release URLs),
   #    except in a checkout of a release line that has moved past that release: there the
   #    baked version is the previous release's, and the checkout defaults the way a main
-  #    checkout does, to its own HEAD (step 4), whose images a merge onto the line built.
+  #    checkout does, to its own HEAD, whose images a merge onto the line built. Returned
+  #    here rather than through step 4, so a directory that happens to be named
+  #    kube-agents-<X.Y.Z> (step 3) cannot hand the release back.
   if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
     if checkout_is_past_baked_release "$repo_dir"; then
-      :
-    else
-      echo "$BAKED_RELEASE_VERSION"
+      git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo ""
       return 0
     fi
+    echo "$BAKED_RELEASE_VERSION"
+    return 0
   fi
   # Only a kube-agents checkout may supply the default. Without this guard,
   # running the curl | bash one-liner from inside any unrelated Git repository
@@ -1716,7 +1718,12 @@ verify_local_source_ref() {
       return 0
     fi
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
-    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+    # Only when the checkout's own install.sh carries the version, the line
+    # checkout_is_past_baked_release draws: the baked version belongs to the
+    # running script, and a release's piped installer standing in some other
+    # checkout that lacks the tag is not a line checkout to be told to fetch.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      grep -qE "^BAKED_RELEASE_VERSION=\"?${BAKED_RELEASE_VERSION//./\\.}\"?\$" "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null; then
       print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but the checkout does not hold its tag. If it is a checkout of a release line, fetch the tags (git fetch --tags) so the release it descends from can be recognised, or pass --image-tag with this commit's full SHA."
     fi
     print_info "Pass --allow-unverified-source to provision anyway."

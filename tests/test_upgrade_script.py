@@ -320,7 +320,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
             probe = (
                 'BAKED_RELEASE_VERSION="0.2.0"; PARAM_IMAGE_TAG="0.2.0"; IMAGE_TAG_DEFAULTED_FROM_BAKED="{defaulted}"; '
-                'drop_baked_default_on_a_line_checkout_past_it "{repo}"; echo "tag=[$PARAM_IMAGE_TAG] dropped=$BAKED_DEFAULT_DROPPED"'
+                'drop_baked_default_on_a_line_checkout_past_it "{repo}"; echo "tag=[$PARAM_IMAGE_TAG] dropped=$(baked_default_was_dropped && echo true || echo false)"'
             )
 
             past = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
@@ -339,7 +339,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
                     parsed = self._run_upgrade_func(
                         'BAKED_RELEASE_VERSION="0.2.0"; PARAM_IMAGE_TAG="0.2.0"; IMAGE_TAG_DEFAULTED_FROM_BAKED="true"; '
                         f'parse_args {form.format(sha=backport)}; drop_baked_default_on_a_line_checkout_past_it "{repo_path}"; '
-                        'echo "tag=[$PARAM_IMAGE_TAG] dropped=$BAKED_DEFAULT_DROPPED"',
+                        'echo "tag=[$PARAM_IMAGE_TAG] dropped=$(baked_default_was_dropped && echo true || echo false)"',
                         cwd=repo_path,
                     )
                     self.assertEqual(parsed.returncode, 0, parsed.stderr)
@@ -411,6 +411,13 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("does not hold its tag", proc.stdout + proc.stderr)
             self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            # A tree whose own scripts do not carry the version is not told to fetch:
+            # the running script's release is not this checkout's.
+            (repo_path / "upgrade.sh").write_text('BAKED_RELEASE_VERSION=""\n')
+            other = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(other.returncode, 0)
+            self.assertIn("is not present in the current checkout", other.stdout + other.stderr)
+            self.assertNotIn("does not hold its tag", other.stdout + other.stderr)
 
     def test_script_checkout_dir_names_the_checkout_the_script_runs_from(self):
         """Empty for a body sourced from no file in a checkout; the checkout when upgrade.sh

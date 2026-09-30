@@ -1500,6 +1500,20 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertNotEqual(off.returncode, 0)
             self.assertIn("mismatch", off.stdout + off.stderr)
 
+    def test_a_line_checkout_in_a_release_named_directory_still_defaults_to_its_head(self):
+        """The archive-directory rule (step 3) must not hand the release back once the
+        checkout is recognised as a line past it: a clone named kube-agents-0.2.0, the
+        name the rollback page uses, later moved onto the line, defaults to HEAD."""
+        with tempfile.TemporaryDirectory(prefix="release-line-named-") as temp_dir:
+            named = pathlib.Path(temp_dir) / "kube-agents-0.2.0"
+            named.mkdir()
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(named)
+            proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+
     def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
         """The baked version belongs to the running script. A release's install.sh that is
         not the checkout's own file (piped, or run from another directory) keeps its release
@@ -1510,6 +1524,14 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             proc = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; default_image_tag "."; default_image_tag_label "."', cwd=repo_path)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+            # Standing in a checkout that lacks the tag, the piped installer's refusal
+            # does not tell the operator their checkout's scripts carry the release.
+            git("tag", "-d", "0.2.0")
+            (repo_path / "install.sh").write_text(_INSTALL_SH.read_text())
+            refused = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(refused.returncode, 0)
+            self.assertIn("is not present in the current checkout", refused.stdout + refused.stderr)
+            self.assertNotIn("does not hold its tag", refused.stdout + refused.stderr)
 
     def test_a_line_checkout_without_the_release_tag_is_refused_and_told_to_fetch_it(self):
         """Without the tag the shape cannot be recognised, so the baked default and the
