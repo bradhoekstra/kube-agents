@@ -1055,12 +1055,38 @@ cluster_mode_label() {
 # keeps its release as the default wherever it runs, whether standing in some
 # other checkout or resolving its sources to a HOME clone that has moved onto
 # a line, and verify_local_source_ref then fetches or refuses as before.
+# The release a tree's own install.sh is stamped with, read the way
+# upgrade.sh's release_version_of_source_tree reads it (quotes and whitespace
+# stripped), so the two front doors agree on which trees carry a version.
+# Empty for the plain repository content.
+baked_version_of_tree() {
+  local repo_dir="${1:-.}"
+  grep -m1 -E '^BAKED_RELEASE_VERSION=' "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null | cut -d'=' -f2- | tr -d '"'"'"'[:space:]' || echo ""
+}
+
+# What stands between such a tree and being recognised, for the refusals that
+# follow: the release's tag not fetched, or a shallow history the ancestry walk
+# cannot cross (a `--depth 1` clone of the line, which `git fetch --tags` alone
+# does not mend). Printed only for a tree whose own install.sh carries the
+# version; the caller checks that.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit remedies=""
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  if ! git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" >/dev/null 2>&1; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies:-fetch the tags (git fetch --tags)} so the release it descends from can be recognised, or pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images."
+}
+
 checkout_is_past_baked_release() {
   local repo_dir="${1:-.}" tag_commit head_commit script_path="${BASH_SOURCE[0]:-}"
   [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
   [ -n "$script_path" ] && [ -f "$script_path" ] || return 1
   [ "$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
-  grep -qE "^BAKED_RELEASE_VERSION=\"?${BAKED_RELEASE_VERSION//./\\.}\"?\$" "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null || return 1
+  [ "$(baked_version_of_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
   tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
   head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
   [ "$tag_commit" != "$head_commit" ] || return 1
@@ -1723,8 +1749,8 @@ verify_local_source_ref() {
     # running script, and a release's piped installer standing in some other
     # checkout that lacks the tag is not a line checkout to be told to fetch.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
-      grep -qE "^BAKED_RELEASE_VERSION=\"?${BAKED_RELEASE_VERSION//./\\.}\"?\$" "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null; then
-      print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but the checkout does not hold its tag. If it is a checkout of a release line, fetch the tags (git fetch --tags) so the release it descends from can be recognised, or pass --image-tag with this commit's full SHA."
+      [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
     fi
     print_info "Pass --allow-unverified-source to provision anyway."
     return 1
@@ -1736,6 +1762,12 @@ verify_local_source_ref() {
       print_warning "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
     else
       print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+      # The tag is here and HEAD is not it: a line checkout the predicate could
+      # not walk (a shallow clone), or an unrelated commit. Same gate as above.
+      if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+        [ "$(baked_version_of_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+        release_line_recognition_hint "$repo_dir"
+      fi
       print_info "Pass --allow-unverified-source to provision anyway."
       return 1
     fi

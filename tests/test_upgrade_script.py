@@ -409,15 +409,28 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             git("tag", "-d", "0.2.0")
             proc = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("does not hold its tag", proc.stdout + proc.stderr)
             self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            self.assertNotIn("--unshallow", proc.stdout + proc.stderr)
+            self.assertIn(f"--image-tag {backport}", proc.stdout + proc.stderr)
+            # A shallow clone of the line with the tag fetched: the mismatch names the
+            # shallow history, which `git fetch --tags` alone did not mend.
+            shallow = pathlib.Path(temp_dir) / "shallow"
+            git("tag", "0.2.0", stamp)
+            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "release/0.2", f"file://{repo_path}", str(shallow)], check=True)
+            subprocess.run(["git", "fetch", "-q", "--tags", "origin"], cwd=str(shallow), check=True)
+            mismatch = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{shallow}" "0.2.0"', cwd=shallow)
+            self.assertNotEqual(mismatch.returncode, 0)
+            self.assertIn("Source/image version mismatch", mismatch.stdout + mismatch.stderr)
+            self.assertIn("git fetch --unshallow", mismatch.stdout + mismatch.stderr)
             # A tree whose own scripts do not carry the version is not told to fetch:
             # the running script's release is not this checkout's.
+            git("tag", "-d", "0.2.0")
             (repo_path / "upgrade.sh").write_text('BAKED_RELEASE_VERSION=""\n')
             other = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
             self.assertNotEqual(other.returncode, 0)
             self.assertIn("is not present in the current checkout", other.stdout + other.stderr)
-            self.assertNotIn("does not hold its tag", other.stdout + other.stderr)
+            self.assertNotIn("release line", other.stdout + other.stderr)
+            self.assertNotIn("git fetch --tags", other.stdout + other.stderr)
 
     def test_script_checkout_dir_names_the_checkout_the_script_runs_from(self):
         """Empty for a body sourced from no file in a checkout; the checkout when upgrade.sh

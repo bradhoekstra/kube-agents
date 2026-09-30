@@ -787,6 +787,23 @@ checkout_is_past_baked_release() {
   git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
 }
 
+# What stands between a line checkout and being recognised, for the refusals in
+# verify_local_source_ref: the release's tag not fetched, or a shallow history
+# the ancestry walk cannot cross (a `--depth 1` clone of the line, which
+# `git fetch --tags` alone does not mend). Printed only for a tree whose own
+# scripts carry the version; the caller checks that. Same text as install.sh's.
+release_line_recognition_hint() {
+  local repo_dir="${1:-.}" head_commit remedies=""
+  head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
+  if ! git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" >/dev/null 2>&1; then
+    remedies="fetch the tags (git fetch --tags)"
+  fi
+  if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
+  fi
+  print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies:-fetch the tags (git fetch --tags)} so the release it descends from can be recognised, or pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images."
+}
+
 # The directory this script runs from, when that is a kube-agents checkout;
 # empty under `curl … | bash`, where no file names one. acquire_upgrade_sources
 # and the release-line check in main both read it.
@@ -962,13 +979,19 @@ verify_local_source_ref() {
     # to be told to fetch.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
       [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
-      print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but the checkout does not hold its tag. If it is a checkout of a release line, fetch the tags (git fetch --tags) so the release it descends from can be recognised, or pass --image-tag with this commit's full SHA."
+      release_line_recognition_hint "$repo_dir"
     fi
     return 1
   fi
   current_commit="$(git -C "$repo_dir" rev-parse HEAD)"
   if [ "$current_commit" != "$expected_commit" ]; then
     print_error "Source/image version mismatch: checkout is ${current_commit}, requested ref resolves to ${expected_commit}."
+    # The tag is here and HEAD is not it: a line checkout the predicate could
+    # not walk (a shallow clone), or an unrelated commit. Same gate as above.
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ] &&
+      [ "$(release_version_of_source_tree "$repo_dir")" = "${BAKED_RELEASE_VERSION}" ]; then
+      release_line_recognition_hint "$repo_dir"
+    fi
     return 1
   fi
   # Whose '0.6.0' is this? For sources this run fetched, the answer is settled:

@@ -1531,7 +1531,8 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             refused = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
             self.assertNotEqual(refused.returncode, 0)
             self.assertIn("is not present in the current checkout", refused.stdout + refused.stderr)
-            self.assertNotIn("does not hold its tag", refused.stdout + refused.stderr)
+            self.assertNotIn("release line", refused.stdout + refused.stderr)
+            self.assertNotIn("git fetch --tags", refused.stdout + refused.stderr)
 
     def test_a_line_checkout_without_the_release_tag_is_refused_and_told_to_fetch_it(self):
         """Without the tag the shape cannot be recognised, so the baked default and the
@@ -1544,8 +1545,54 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             )
             self.assertEqual(proc.stdout.strip().splitlines()[0], "0.2.0")
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("does not hold its tag", proc.stdout + proc.stderr)
             self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+            self.assertNotIn("--unshallow", proc.stdout + proc.stderr)
+            self.assertIn(f"--image-tag {backport}", proc.stdout + proc.stderr)
+
+    def test_a_shallow_line_clone_is_told_to_unshallow_and_is_recognised_once_it_does(self):
+        """`git fetch --tags` alone does not mend a --depth 1 clone of the line: the tag
+        arrives but HEAD's parents stay behind the graft, so the ancestry walk fails and
+        the run lands in the mismatch refusal. That refusal names the shallow history;
+        after `git fetch --unshallow` the checkout is recognised."""
+        with tempfile.TemporaryDirectory(prefix="release-line-shallow-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            shallow = pathlib.Path(temp_dir) / "shallow"
+            subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "release/0.2", f"file://{repo_path}", str(shallow)], check=True)
+            sgit = lambda *args: subprocess.run(["git", *args], cwd=str(shallow), check=True, capture_output=True, text=True).stdout.strip()
+            probe = 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+
+            tagless = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagless.returncode, 0)
+            self.assertIn("git fetch --tags", tagless.stdout + tagless.stderr)
+            self.assertIn("git fetch --unshallow", tagless.stdout + tagless.stderr)
+
+            sgit("fetch", "-q", "--tags", "origin")
+            self.assertEqual(sgit("rev-parse", "--is-shallow-repository"), "true")
+            tagged = self._run_fixture_install_func(shallow, probe)
+            self.assertNotEqual(tagged.returncode, 0)
+            self.assertIn("Source/image version mismatch", tagged.stdout + tagged.stderr)
+            self.assertIn("git fetch --unshallow", tagged.stdout + tagged.stderr)
+            self.assertNotIn("git fetch --tags", tagged.stdout + tagged.stderr)
+
+            sgit("fetch", "-q", "--unshallow", "origin")
+            deep = self._run_fixture_install_func(shallow, 'default_image_tag "."; verify_local_source_ref "." "$(default_image_tag ".")" && echo verified')
+            self.assertEqual(deep.returncode, 0, deep.stdout + deep.stderr)
+            self.assertEqual(deep.stdout.strip().splitlines()[0], backport)
+            self.assertIn("verified", deep.stdout)
+
+    def test_the_stamp_line_is_read_with_the_same_grammar_as_upgrade_sh(self):
+        """release_version_of_source_tree strips quotes and whitespace; install.sh reads the
+        tree's stamp the same way, so one tree is a line checkout to both front doors."""
+        for spelling in ("BAKED_RELEASE_VERSION='0.2.0'", 'BAKED_RELEASE_VERSION="0.2.0" ', "BAKED_RELEASE_VERSION=0.2.0"):
+            with self.subTest(spelling=spelling), tempfile.TemporaryDirectory(prefix="release-line-grammar-") as temp_dir:
+                repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+                text = (repo_path / "install.sh").read_text().replace('BAKED_RELEASE_VERSION="0.2.0"', spelling, 1)
+                (repo_path / "install.sh").write_text(text)
+                git("commit", "-q", "-am", "chore: respell the stamp")
+                head = git("rev-parse", "HEAD")
+                proc = self._run_fixture_install_func(repo_path, 'default_image_tag "."')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip(), head)
 
     def test_default_image_tag_resolves_semver_when_multiple_tags_present(self):
         """Verifies default_image_tag prefers numeric SemVer tag over rc_*_validated tags on the same commit."""
