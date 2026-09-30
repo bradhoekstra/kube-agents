@@ -797,13 +797,19 @@ checkout_is_past_baked_release() {
 # own scripts carry the version; the caller checks that. Same text as
 # install.sh's.
 release_line_recognition_hint() {
-  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" line="${BAKED_RELEASE_VERSION%.*}"
+  local repo_dir="${1:-.}" head_commit tag_commit remedies="" script_dir="" descends="false" line="${BAKED_RELEASE_VERSION%.*}"
   head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
   tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null || echo "")"
+  if [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
+    descends="true"
+  fi
+  # The fetches the predicate's walk would need, and only those: no tag, or a
+  # shallow history the walk could not cross. A shallow clone deep enough to
+  # hold the release needs nothing fetched.
   if [ -z "$tag_commit" ]; then
     remedies="fetch the tags (git fetch --tags)"
   fi
-  if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+  if [ "$descends" != "true" ] && [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
     remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
   fi
   script_dir="$(script_checkout_dir)"
@@ -814,12 +820,13 @@ release_line_recognition_hint() {
     # checkout's own upgrade.sh recognises a release-line checkout, so that comes
     # first, with whatever fetch it would also need.
     print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the upgrade.sh running is not this checkout's. If it is a checkout of a release line, run its own ./upgrade.sh, which recognises that${remedies:+ once you ${remedies}}, or ${own_images}."
+  elif [ "$descends" = "true" ]; then
+    # Recognisable, and asked for the release by name anyway (--image-tag, or
+    # IMAGE_TAG in the shell or install.env, naming the baked version): the
+    # checkout is the line past it, not the release.
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; or ${own_images}."
   elif [ -n "$remedies" ]; then
     print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
-  elif [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
-    # Recognisable, and asked for the release by name anyway (--image-tag with
-    # the baked version): the checkout is the line past it, not the release.
-    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
   else
     # Tag present, history complete, the checkout's own script running: HEAD
     # simply does not descend from the release (a cherry-picked or rebased

@@ -1494,7 +1494,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertNotEqual(named.returncode, 0)
             self.assertIn("mismatch", named.stdout + named.stderr)
             self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
-            self.assertIn("without --image-tag to default to this commit's own images", named.stdout + named.stderr)
+            self.assertIn("with no --image-tag and IMAGE_TAG unset", named.stdout + named.stderr)
             self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
             self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
 
@@ -1550,7 +1550,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertEqual(lines[0], backport)
             self.assertIn("release line 0.2 checkout", lines[1])
             self.assertIn("verified", proc.stdout)
-            self.assertNotIn("drop --image-tag", proc.stdout + proc.stderr)
+            self.assertNotIn("--image-tag and IMAGE_TAG unset", proc.stdout + proc.stderr)
 
     def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
         """The baked version belongs to the running script. A release's install.sh that is
@@ -1631,6 +1631,19 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertEqual(deep.returncode, 0, deep.stdout + deep.stderr)
             self.assertEqual(deep.stdout.strip().splitlines()[0], backport)
             self.assertIn("verified", deep.stdout)
+
+            # A shallow clone deep enough to hold the release is recognised, and asked
+            # for the release by name it is told what it is, not to unshallow.
+            enough = pathlib.Path(temp_dir) / "deep-enough"
+            subprocess.run(["git", "clone", "-q", "--depth", "2", "--branch", "release/0.2", f"file://{repo_path}", str(enough)], check=True)
+            subprocess.run(["git", "fetch", "-q", "--tags", "origin"], cwd=str(enough), check=True)
+            self.assertEqual(subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=str(enough), capture_output=True, text=True).stdout.strip(), "true")
+            recognised = self._run_fixture_install_func(enough, 'default_image_tag "."')
+            self.assertEqual(recognised.stdout.strip(), backport)
+            by_name = self._run_fixture_install_func(enough, 'verify_local_source_ref "." "0.2.0"')
+            self.assertNotEqual(by_name.returncode, 0)
+            self.assertIn("release line 0.2 at", by_name.stdout + by_name.stderr)
+            self.assertNotIn("--unshallow", by_name.stdout + by_name.stderr)
 
     def test_the_stamp_line_is_read_with_the_same_grammar_as_upgrade_sh(self):
         """release_version_of_source_tree strips quotes and whitespace; install.sh reads the
