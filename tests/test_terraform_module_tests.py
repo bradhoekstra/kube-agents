@@ -6,33 +6,40 @@ and the `validate` job in validate.yml runs the target; a suite that neither
 reaches is a set of cases that passes by never running, the trap AGENTS.md
 "Where Tests Go" names for `PYTHON_TEST_DIRS`. And a suite that mocks one
 provider but not another would reach a real API from CI on the first read
-nobody overrode. This pins the loop, the step, `make verify` running the
-target (its help line says it runs everything a pull request must pass
-offline), that no test file anywhere in the repository sits where the loop
-does not look (Terraform roots live under bench/tf and k8s-operator/testing
-too), and an unaliased `mock_provider` block for every provider a root needs:
-what it declares in `required_providers` in any of its `.tf` files (a
-composition declares them in providers.tf, a module in versions.tf; the block
-form and the version-only shorthand both count), what its `resource`, `data`
-and `provider` blocks imply (Terraform loads `hashicorp/<prefix>` for an
-undeclared type prefix with no warning), what every local module it calls
-declares, since Terraform hands a child a default provider the root never
-named, and what a module a `run` block loads from the test file itself
-declares; a run whose `providers` map routes a provider to a configuration
-no `mock_provider` block declares is reported too, and the builtin
-`terraform` provider is never demanded. HCL is read through a small tokenizer that skips comments,
-strings, heredocs and template interpolation, so none of those can pass for
-syntax; a `.tftest.json` is parsed; the `.tf` side is read as HCL only, and a
-root or called module carrying a `*.tf.json` fails the pin loudly rather than
-being read half-way. The helpers that make those judgements have cases of
-their own below, on fixtures, so the pin is known to fire on the shapes it
-exists for. tests/test_shellcheck_gate_wiring.py pins a workflow step the
-same way.
+nobody overrode.
+
+The Makefile side is read the way make reads it, not as text: the target is
+run against a fake `terraform` on PATH, once green and once with one suite
+failing, to see that every directory runs and a failure fails the target;
+`make -n verify` shows whether `verify` reaches it; the recipes make actually
+resolved (its `-p` database, duplicates and includes settled) are checked for
+the loop glob, for the exact `verify` line, and for make's `-` ignore-errors
+prefix; and a failing recipe fed through `--eval` shows whether anything, in
+the Makefile or a file it includes, makes make ignore errors. The workflow side
+pins the step: the command alone in its `run:`, no `if:` or
+`continue-on-error` or `working-directory` at step or job level, a fail-fast
+shell, no MAKEFLAGS ignoring errors in any `env:`, no `paths` filter on the
+trigger.
+
+The mock side demands an unaliased `mock_provider` block for every provider a
+root needs: what it declares in `required_providers` in any of its `.tf`
+files (block form or version-only shorthand), what its `resource`, `data`,
+`ephemeral`, `action` and `provider` blocks imply or route to with a
+`provider =` meta-argument, what every local module it calls declares, and
+what a module a `run` block loads declares; a run whose `providers` map routes
+to a configuration no mock declares is reported too, and the builtin
+`terraform` provider is never demanded. HCL is read through a small tokenizer
+that skips comments, strings, heredocs and template interpolation; a
+`.tftest.json` is parsed; a root carrying a `*.tf.json` fails loudly rather
+than being read half-way. The helpers have fixture cases of their own below.
+tests/test_shellcheck_gate_wiring.py pins a workflow step the same way.
 """
 
 import json
+import os
 import pathlib
 import re
+import stat
 import sys
 import tempfile
 import unittest
@@ -40,8 +47,10 @@ import unittest
 import yaml
 
 try:
+    from tests._run_make import run_make
     from tests.test_shellcheck_gate_wiring import _JOB_ID, _WORKFLOW, _run_lines
 except ImportError:  # run from inside tests/
+    from _run_make import run_make
     from test_shellcheck_gate_wiring import _JOB_ID, _WORKFLOW, _run_lines
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -49,7 +58,6 @@ _TERRAFORM_DIR = _REPO_ROOT / "terraform"
 #: The directories the loop reaches: the modules and the compositions, the
 #: same set the validate job's init-and-validate loop covers.
 _SUITE_PARENTS = (_TERRAFORM_DIR / "modules", _TERRAFORM_DIR / "examples")
-_MAKEFILE = _REPO_ROOT / "Makefile"
 
 #: Directories a repository walk never reads, the set the Python test
 #: discovery guard keeps for the same walk: provider downloads, the docs
@@ -70,6 +78,10 @@ _CONTINUE_ON_ERROR = "continue-on-error"
 _IF = "if"
 _ENV = "env"
 _RUN, _SHELL, _DEFAULTS = "run", "shell", "defaults"
+#: Where the command runs: the repository root, whose Makefile the pins
+#: read, and nothing else.
+_WORKING_DIRECTORY = "working-directory"
+_REPOSITORY_ROOT_DIRECTORIES = (None, ".", "./")
 #: The shells whose default template fails fast; a template of one's own
 #: (`bash {0}`) or another shell is not read as one.
 _FAIL_FAST_SHELLS = (None, "bash", "sh")
@@ -80,55 +92,44 @@ _MAKEFLAGS_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS")
 _IGNORE_ERRORS_LONG = "--ignore-errors"
 _IGNORE_ERRORS_LETTER = "i"
 _TRIGGER, _PULL_REQUEST_TRIGGER, _PATH_FILTERS = "on", "pull_request", ("paths", "paths-ignore")
-#: The Makefile's own ways of ignoring a failing recipe line: the special
-#: target, or an assignment to MAKEFLAGS in any spelling (`override`,
-#: `export`, `::=`, `+=`, no spaces) whose value ignores errors.
-_IGNORE_TARGET = re.compile(r"(?m)^\.IGNORE\b")
-_MAKEFLAGS_ASSIGNMENT = re.compile(
-    r"(?m)^\s*(?:(?:override|export|unexport)\s+)*(?:GNU)?MAKEFLAGS\s*(?:::?|\+|\?|!)?=(.*)$"
-)
-#: A recipe line's prefix cluster; `-` in it tells make to ignore that
-#: line's status, which no line of a gating recipe may carry.
-_RECIPE_PREFIX = re.compile(r"^\t([@+-]*)")
-_IGNORE_LINE_PREFIX = "-"
-
-#: The recipe line that lists the target in `make help`, and the loop that
-#: reaches every module rather than naming the ones that had tests when it
-#: was written. The command is looked for in the recipe's body, below the
-#: target line, since the help text names it too.
-_RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
-#: A recipe line make or the shell ignores: `#` first on a line that does
-#: not start with a tab is make's, and its trailing backslash carries the
-#: next line with it; `#` after the tab, at any indent and after the `@`,
-#: `-` and `+` prefixes make strips, is the shell's, which ends at the
-#: newline whatever the line ends with.
-_MAKE_COMMENT = re.compile(r"^ *#")
-_SHELL_COMMENT = re.compile(r"^\t[ \t]*[@+-]*[ \t]*#")
+#: How make is asked: its database (`-p`) with a trivial target so nothing
+#: else runs, a dry run of `verify` (recursive `$(MAKE)` lines execute under
+#: `-n`, so the target's own recipe shows if `verify` reaches it), and a
+#: failing recipe fed through `--eval`, which exits 0 only when errors are
+#: ignored from the Makefile or a file it includes.
+_MAKE_TIMEOUT_SECONDS = 120
+_PROBE_TARGET = "__terraform_test_probe"
+_DATABASE_ARGS = ("-pn", f"--eval={_PROBE_TARGET}: ;@:", _PROBE_TARGET)
+_FAILING_TARGET = "__terraform_test_failing_recipe"
+_FAILING_RECIPE_ARGS = (f"--eval={_FAILING_TARGET}: ;@false", _FAILING_TARGET)
+_DATABASE_COMMENT = "#"
 _LINE_CONTINUATION = "\\"
-#: The rule line itself, at the start of a line, so a mention of the
-#: target elsewhere (`pre-verify:`, a comment) is not read as the rule; the
-#: recipe then runs to the first line that is neither a tab line, blank,
-#: nor a comment, which is where make ends it.
-_RULE_LINE = "^{target}:"
-_RECIPE_LINE_CONTINUES = re.compile(r"^(\t|\s*$|\s*#)")
 #: The shell loop skips a name beginning with a dot, so such a directory
 #: is never a suite the loop runs, whatever it holds.
 _HIDDEN_PREFIX = "."
+#: The loop that reaches every module rather than naming the ones that had
+#: tests when it was written.
 _LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
-_TEST_COMMAND = "terraform test"
-#: The command as a command word, after the shell's quoted strings are
-#: removed (an `echo "… terraform test"` is not a run), and the shape that
-#: records rather than swallows its failure.
-_SHELL_STRING = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'')
-_TEST_INVOCATION = re.compile(r"(?:^\s*|[;&|(]\s*)terraform test(?=\s|\)|$)", re.MULTILINE)
-_FAILURE_RECORDED = f'{_TEST_COMMAND}) || failed="$$failed $$dir"'
-_FAILURE_EXITS = "exit 1"
 _VERIFY_TARGET = "verify"
-_VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
-#: The whole recipe line, in the recipe's own `@echo "==> …"; command`
-#: shape or bare: make's `@` and `+` prefixes are fine, its `-` (ignore
-#: errors) is not, and nothing may follow the command (`|| true`).
-_VERIFY_LINE_EXACT = re.compile(rf'^\t[@+]*(?:echo "[^"]*"; *)?\$\(MAKE\) --no-print-directory {_TARGET}\s*$', re.MULTILINE)
+_TEST_COMMAND = "terraform test"
+#: The whole logical recipe line, in the recipe's own `@echo "==> …";
+#: command` shape or bare: make's `@` and `+` prefixes are fine, its `-`
+#: (ignore errors) is not, and nothing may precede or follow the command.
+_VERIFY_LINE_EXACT = re.compile(rf'^\t[ \t@+]*(?:echo "[^"]*"; *)?\$\(MAKE\) --no-print-directory {_TARGET}\s*$')
+#: A recipe line's prefix cluster, blanks interleaved as make allows; `-`
+#: in it tells make to ignore that line's status.
+_RECIPE_PREFIX = re.compile(r"^\t([@+ \t-]*)")
+_IGNORE_LINE_PREFIX = "-"
+#: The fake terraform the target is run against, and what it records.
+_FAKE_TERRAFORM = """#!/bin/sh
+printf '%s %s\\n' "$(basename "$PWD")" "$1" >> "$TERRAFORM_FAKE_LOG"
+if [ "$1" = test ] && [ "$(basename "$PWD")" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
+  echo "Failure! 1 failed."; exit 1
+fi
+exit 0
+"""
+_FAKE_LOG_VARIABLE, _FAKE_FAIL_VARIABLE = "TERRAFORM_FAKE_LOG", "TERRAFORM_FAKE_FAIL_IN"
+_FAILING_DIRECTORIES_LINE = "Failing Terraform test directories:"
 
 #: The HCL the pin reads, and the spelling it refuses.
 _TF_FILE_GLOB = "*.tf"
@@ -225,41 +226,69 @@ def _unreached_test_files(repo_root: pathlib.Path, parents) -> list:
     return sorted(everywhere - reached)
 
 
-def _recipe(makefile: str, target: str) -> str:
-    rule = re.search(_RULE_LINE.format(target=re.escape(target)), makefile, re.MULTILINE)
-    if rule is None:
-        raise AssertionError(f"the Makefile has no `{target}:` rule")
-    lines = makefile[rule.start():].split("\n")
-    kept = [lines[0]]
-    for line in lines[1:]:
-        if not _RECIPE_LINE_CONTINUES.match(line):
+def _make(*args, extra_env=None):
+    return run_make(list(args), timeout=_MAKE_TIMEOUT_SECONDS, extra_env=extra_env)
+
+
+def _database() -> str:
+    return _make(*_DATABASE_ARGS).stdout
+
+
+def _resolved_recipe(database: str, target: str) -> list:
+    """The recipe make resolved for `target`, from its database: the last
+    definition wins and included files are read, as make does. Physical
+    lines a trailing backslash continues are joined into the logical line
+    the shell receives."""
+    lines = database.split("\n")
+    try:
+        start = lines.index(f"{target}:")
+    except ValueError:
+        raise AssertionError(f"make's database has no `{target}:` target") from None
+    physical = []
+    for line in lines[start + 1:]:
+        if line.startswith(_DATABASE_COMMENT):
+            continue
+        if not line.startswith("\t"):
             break
-        kept.append(line)
-    return "\n".join(kept)
+        physical.append(line)
+    logical = []
+    for line in physical:
+        if logical and logical[-1].rstrip().endswith(_LINE_CONTINUATION):
+            logical[-1] = logical[-1].rstrip()[:-1] + line.lstrip()
+        else:
+            logical.append(line)
+    return logical
 
 
-def _ignored_recipe_lines(recipe_body: str) -> list:
+def _ignored_recipe_lines(logical_lines: list) -> list:
     """Recipe lines whose prefix cluster carries `-`, make's ignore-errors."""
     return [
-        line for line in recipe_body.split("\n")
+        line for line in logical_lines
         if (prefix := _RECIPE_PREFIX.match(line)) is not None and _IGNORE_LINE_PREFIX in prefix.group(1)
     ]
 
 
-def _recipe_body(makefile: str, target: str) -> str:
-    """The recipe's lines below the target line, less commented-out ones
-    and the continuation lines a commented line's trailing backslash
-    carries with it."""
-    kept = []
-    continuing_make_comment = False
-    for line in _recipe(makefile, target).split("\n")[1:]:
-        if continuing_make_comment or _MAKE_COMMENT.match(line):
-            continuing_make_comment = line.rstrip().endswith(_LINE_CONTINUATION)
-            continue
-        if _SHELL_COMMENT.match(line):
-            continue
-        kept.append(line)
-    return "\n".join(kept)
+def _run_target_against_fake_terraform(fail_in: str = "") -> tuple:
+    """`make terraform-test` with a fake `terraform` first on PATH that
+    records each call's directory and subcommand, failing `test` in
+    `fail_in`; returns (exit code, stdout, recorded calls)."""
+    with tempfile.TemporaryDirectory() as scratch:
+        scratch = pathlib.Path(scratch)
+        fake = scratch / "terraform"
+        fake.write_text(_FAKE_TERRAFORM)
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        log = scratch / "calls.log"
+        log.touch()
+        result = _make(
+            _TARGET,
+            extra_env={
+                "PATH": f"{scratch}{os.pathsep}{os.environ.get('PATH', '')}",
+                _FAKE_LOG_VARIABLE: str(log),
+                _FAKE_FAIL_VARIABLE: fail_in,
+            },
+        )
+        calls = [tuple(line.split(" ", 1)) for line in log.read_text().splitlines()]
+    return result.returncode, result.stdout, calls
 
 
 # ─── Reading HCL ─────────────────────────────────────────────────────────────
@@ -571,12 +600,6 @@ def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
     return sorted(providers)
 
 
-def _test_invocations(recipe_body: str) -> list:
-    """Where the recipe runs `terraform test` as a command, quoted strings
-    removed so an echo of the words is not one."""
-    return _TEST_INVOCATION.findall(_SHELL_STRING.sub('""', recipe_body))
-
-
 def _flags_ignore_errors(value: str) -> bool:
     """Whether a MAKEFLAGS value carries -i, as make reads it."""
     for word in str(value).split():
@@ -596,19 +619,20 @@ def _ignores_make_errors(scope: dict) -> bool:
     )
 
 
-def _makefile_ignores_errors(makefile: str) -> bool:
-    return bool(_IGNORE_TARGET.search(makefile)) or any(
-        _flags_ignore_errors(value) for value in _MAKEFLAGS_ASSIGNMENT.findall(makefile)
-    )
+def _run_setting(scope: dict, key: str):
+    """A `run:` setting on a step, or under `defaults.run` of a job or
+    workflow."""
+    if _DEFAULTS in scope:
+        return ((scope.get(_DEFAULTS) or {}).get(_RUN) or {}).get(key)
+    return scope.get(key)
 
 
 def _shell_defect(scope: dict) -> bool:
-    """A shell whose template is not the fail-fast default, on a step or
-    under `defaults.run` of a job or workflow."""
-    shell = scope.get(_SHELL) if _RUN in scope or _SHELL in scope and _DEFAULTS not in scope else None
-    if _DEFAULTS in scope:
-        shell = ((scope.get(_DEFAULTS) or {}).get(_RUN) or {}).get(_SHELL)
-    return shell not in _FAIL_FAST_SHELLS
+    return _run_setting(scope, _SHELL) not in _FAIL_FAST_SHELLS
+
+
+def _working_directory_defect(scope: dict) -> bool:
+    return _run_setting(scope, _WORKING_DIRECTORY) not in _REPOSITORY_ROOT_DIRECTORIES
 
 
 def _gate_defects(job: dict, workflow: dict = None) -> list:
@@ -625,6 +649,8 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
             defects.append(f"the step's run body is more than `{_GATE_COMMAND}` alone; a line before it can set MAKEFLAGS, one after it can hide its status")
         if _shell_defect(step):
             defects.append("the step names a shell whose template is not fail-fast")
+        if _working_directory_defect(step):
+            defects.append(f"the step sets `{_WORKING_DIRECTORY}`, so `{_GATE_COMMAND}` would read another Makefile")
         if _IF in step:
             defects.append("the step carries an `if:`")
         if step.get(_CONTINUE_ON_ERROR):
@@ -633,6 +659,8 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
             defects.append("the step's env tells make to ignore errors")
     if _shell_defect(job):
         defects.append("the job's default shell is not fail-fast")
+    if _working_directory_defect(job):
+        defects.append(f"the job's default `{_WORKING_DIRECTORY}` is not the repository root")
     if _IF in job:
         defects.append("the job carries an `if:`")
     if job.get(_CONTINUE_ON_ERROR):
@@ -644,6 +672,8 @@ def _gate_defects(job: dict, workflow: dict = None) -> list:
             defects.append("the workflow's env tells make to ignore errors")
         if _shell_defect(workflow):
             defects.append("the workflow's default shell is not fail-fast")
+        if _working_directory_defect(workflow):
+            defects.append(f"the workflow's default `{_WORKING_DIRECTORY}` is not the repository root")
         trigger = (workflow.get(_TRIGGER) or workflow.get(True) or {}).get(_PULL_REQUEST_TRIGGER) or {}
         if isinstance(trigger, dict) and any(key in trigger for key in _PATH_FILTERS):
             defects.append("the pull_request trigger carries a paths filter")
@@ -689,31 +719,49 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             f"these test files are not in, or beside, a {_TESTS_DIR}/ directory under {[p.name for p in _SUITE_PARENTS]}, the only places `{_GATE_COMMAND}` runs `{_TEST_COMMAND}`, so they never run",
         )
 
-    def test_the_makefile_target_reaches_every_module(self):
-        makefile = _MAKEFILE.read_text()
-        self.assertRegex(
-            makefile,
-            _RECIPE_LINE,
-            f"the Makefile has no `{_TARGET}:` recipe with a `## description`; `make help` is the only place a contributor finds it",
-        )
-        body = _recipe_body(makefile, _TARGET)
-        self.assertIn(
-            _LOOP_GLOB,
-            body,
-            f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs",
-        )
-        self.assertTrue(_test_invocations(body), f"`{_TARGET}`'s recipe does not run `{_TEST_COMMAND}` as a command (an echo of the words is not a run)")
-        self.assertIn(_FAILURE_RECORDED, body, f"`{_TARGET}` must record a failing suite (`{_FAILURE_RECORDED}`) rather than swallow it")
-        self.assertIn(_FAILURE_EXITS, body, f"`{_TARGET}` must exit non-zero once a suite has failed")
-        self.assertEqual(_ignored_recipe_lines(body), [], f"a `-` prefix on a `{_TARGET}` recipe line tells make to ignore its status, so the target would exit 0 on a failing suite")
+    def test_the_target_runs_every_suite_and_fails_when_one_fails(self):
+        # Behaviour, not text: the real target against a fake terraform.
+        suites = sorted(root.name for root in _suites())
+        code, out, calls = _run_target_against_fake_terraform()
+        self.assertEqual(code, 0, f"`make {_TARGET}` failed with every suite green:\n{out}")
+        self.assertEqual(sorted({d for d, sub in calls if sub == "test"}), suites, f"`{_TEST_COMMAND}` did not run in every suite directory: {calls}")
+        failing = suites[0]
+        code, out, calls = _run_target_against_fake_terraform(fail_in=failing)
+        self.assertNotEqual(code, 0, f"`make {_TARGET}` exited 0 with the {failing} suite failing:\n{out}")
+        self.assertEqual(sorted({d for d, sub in calls if sub == "test"}), suites, f"a failing suite stopped the others from running: {calls}")
+        self.assertIn(_FAILING_DIRECTORIES_LINE, out, f"the failing directory is not named at the end:\n{out}")
+        self.assertIn(failing, out.split(_FAILING_DIRECTORIES_LINE, 1)[1])
 
-    def test_make_verify_runs_the_target(self):
-        body = _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET)
-        self.assertEqual(_ignored_recipe_lines(body), [], f"a `-` prefix on a `{_VERIFY_TARGET}` recipe line tells make to ignore its status")
-        self.assertRegex(
-            body,
-            _VERIFY_LINE_EXACT,
-            f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them, on a line of its own with no `-` prefix and nothing appended that would swallow its exit status",
+    def test_the_resolved_recipes_carry_the_loop_and_no_ignored_line(self):
+        database = _database()
+        recipe = _resolved_recipe(database, _TARGET)
+        self.assertTrue(
+            any(_LOOP_GLOB in line for line in recipe),
+            f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs; make resolved:\n" + "\n".join(recipe),
+        )
+        self.assertEqual(_ignored_recipe_lines(recipe), [], f"a `-` prefix on a `{_TARGET}` recipe line tells make to ignore its status, so the target would exit 0 on a failing suite")
+        verify = _resolved_recipe(database, _VERIFY_TARGET)
+        self.assertEqual(_ignored_recipe_lines(verify), [], f"a `-` prefix on a `{_VERIFY_TARGET}` recipe line tells make to ignore its status")
+        self.assertEqual(
+            len([line for line in verify if _VERIFY_LINE_EXACT.match(line)]),
+            1,
+            f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them, on a logical line of its own with no `-` prefix and nothing before or after that would skip it or swallow its exit status; make resolved:\n" + "\n".join(verify),
+        )
+
+    def test_make_verify_reaches_the_target(self):
+        dry_run = _make("-n", _VERIFY_TARGET)
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+        self.assertIn(_LOOP_GLOB, dry_run.stdout, f"`make -n {_VERIFY_TARGET}` never reached `{_TARGET}`'s recipe (recursive make lines run under -n, so it prints when reached)")
+
+    def test_make_help_lists_the_target(self):
+        self.assertIn(_TARGET, _make("help").stdout, f"`make help` does not list `{_TARGET}`; its recipe line lost its `## description`")
+
+    def test_nothing_makes_make_ignore_a_failing_recipe(self):
+        probe = _make(*_FAILING_RECIPE_ARGS)
+        self.assertNotEqual(
+            probe.returncode,
+            0,
+            "a recipe that runs `false` exited 0: a `.IGNORE` target or MAKEFLAGS carrying -i, in the Makefile or a file it includes, would report a failing suite as ignored",
         )
 
     def test_the_validate_job_runs_the_target_unconditionally(self):
@@ -722,12 +770,6 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             _gate_defects(workflow["jobs"][_JOB_ID], workflow),
             [],
             f"the `{_JOB_ID}` job in validate.yml must run `{_GATE_COMMAND}` in exactly one step, with no `if:` or `{_CONTINUE_ON_ERROR}` on the step or the job, no MAKEFLAGS ignoring errors at any level, and no paths filter on the trigger",
-        )
-
-    def test_the_makefile_does_not_ignore_recipe_errors(self):
-        self.assertFalse(
-            _makefile_ignores_errors(_MAKEFILE.read_text()),
-            "a `.IGNORE` target or a MAKEFLAGS assignment carrying -i would report a failing suite as ignored and exit 0",
         )
 
     def test_every_test_file_mocks_every_provider_its_root_needs(self):
@@ -954,63 +996,27 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         (repo / "terraform" / "modules").mkdir(parents=True)
         self.assertEqual(_unreached_test_files(repo, parents), [stray / "a.tftest.hcl"])
 
-    def test_the_recipe_body_is_what_is_read_not_the_help_line(self):
-        makefile = "x: ## run terraform test\n\tterraform init\n\ntf: ## nothing\n\tterraform test\n"
-        self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "x"))
-        self.assertIn(_TEST_COMMAND, _recipe_body(makefile, "tf"))
-
-    def test_a_commented_out_recipe_line_does_not_count(self):
-        # make's column-0 comment, the shell's comment after the tab, and a
-        # backslash continuation carried by either.
-        makefile = (
-            "v: ## verify\n\t@echo a\n#\t$(MAKE) --no-print-directory terraform-test\n\t#@echo terraform test\n\n"
-            "t: ## t\n#\t@for dir in x; do \\\n\t  terraform test; \\\n\tdone\n\t@echo done\n"
+    def test_a_resolved_recipe_is_the_last_definition_with_logical_lines(self):
+        database = (
+            "verify:\n#  recipe to execute (from 'Makefile', line 8):\n\t@true || \\\n\t$(MAKE) --no-print-directory terraform-test\n\t@echo done\n\n"
+            "other:\n\t@echo x\n"
         )
-        self.assertNotIn("terraform-test", _recipe_body(makefile, "v"))
-        self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "v"))
-        self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "t"))
-        self.assertIn("@echo done", _recipe_body(makefile, "t"))
-        self.assertIn(_VERIFY_LINE, _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET))
-        # An indented shell comment inside a loop body is dropped; a shell
-        # comment's trailing backslash carries nothing, so the line after it
-        # still counts.
-        indented = "t: ## t\n\t@for dir in x; do \\\n\t    # (cd $$dir && terraform test) || failed=1; \\\n\t  done\n"
-        self.assertNotIn(_TEST_COMMAND, _recipe_body(indented, "t"))
-        carried = "v: ## v\n\t#@echo x \\\n\t$(MAKE) --no-print-directory terraform-test\n"
-        self.assertIn(_VERIFY_LINE, _recipe_body(carried, "v"))
-        # The prefixes make strips before the shell sees the line, and a
-        # make comment indented with spaces rather than a tab.
-        for prefix in ("@#", "-#", "+#", "@ #", "@-#"):
-            with self.subTest(prefix=prefix):
-                silenced = f"v: ## v\n\t{prefix}echo x; $(MAKE) --no-print-directory terraform-test\n\t@echo done\n"
-                self.assertNotIn(_VERIFY_LINE, _recipe_body(silenced, "v"))
-                self.assertIn("@echo done", _recipe_body(silenced, "v"))
-        spaced = "v: ## v\n   # $(MAKE) --no-print-directory terraform-test\n\t@echo done\n"
-        self.assertNotIn(_VERIFY_LINE, _recipe_body(spaced, "v"))
-
-    def test_a_recipe_ends_where_make_ends_it(self):
-        # A blank line or a comment inside a recipe does not end it; the
-        # next rule does, with or without a blank line before it.
-        makefile = (
-            "verify: ## v\n\t@echo a\n\n# still the recipe\n\t$(MAKE) --no-print-directory terraform-test\n"
-            "other: ## o\n\t@echo other\n"
-        )
-        body = _recipe_body(makefile, "verify")
-        self.assertRegex(body, _VERIFY_LINE_EXACT)
-        self.assertNotIn("other", body)
-        adjacent = "verify: ## v\n\t@echo a\nother: ## o\n\t$(MAKE) --no-print-directory terraform-test\n"
-        self.assertNotRegex(_recipe_body(adjacent, "verify"), _VERIFY_LINE_EXACT)
-
-    def test_an_echo_of_the_words_is_not_a_run_and_a_swallowed_failure_is_not_a_gate(self):
-        self.assertEqual(_test_invocations('\t@echo "skipping terraform test in $$dir"\n'), [])
-        self.assertTrue(_test_invocations('\t(cd "$$dir" && terraform init && terraform test) || failed="$$failed $$dir"\n'))
-        self.assertTrue(_test_invocations("\tterraform test\n"))
-        for line in ("\t-$(MAKE) --no-print-directory terraform-test", "\t$(MAKE) --no-print-directory terraform-test || true", "\t$(MAKE) --no-print-directory terraform-test; true"):
+        recipe = _resolved_recipe(database, "verify")
+        self.assertEqual(recipe, ["\t@true || $(MAKE) --no-print-directory terraform-test", "\t@echo done"])
+        self.assertEqual([line for line in recipe if _VERIFY_LINE_EXACT.match(line)], [])
+        good = _resolved_recipe('verify:\n\t@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test\n\n', "verify")
+        self.assertTrue(_VERIFY_LINE_EXACT.match(good[0]))
+        for line in ("\t-$(MAKE) --no-print-directory terraform-test", "\t$(MAKE) --no-print-directory terraform-test || true", "\t$(MAKE) --no-print-directory terraform-test; true", '\t@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test || true'):
             with self.subTest(line=line):
-                self.assertNotRegex(line + "\n", _VERIFY_LINE_EXACT)
-        self.assertRegex("\t@$(MAKE) --no-print-directory terraform-test\n", _VERIFY_LINE_EXACT)
-        self.assertRegex('\t@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test\n', _VERIFY_LINE_EXACT)
-        self.assertNotRegex('\t@echo "==> terraform test"; $(MAKE) --no-print-directory terraform-test || true\n', _VERIFY_LINE_EXACT)
+                self.assertIsNone(_VERIFY_LINE_EXACT.match(line))
+        with self.assertRaises(AssertionError):
+            _resolved_recipe("other:\n\t@echo x\n", "verify")
+
+    def test_a_prefix_with_blanks_still_carries_the_ignore_flag(self):
+        for line in ('\t-@failed=""; for dir in x; do \\', '\t -@failed=""; for dir in x; do', '\t@ -failed=""; for dir in x; do'):
+            with self.subTest(line=line):
+                self.assertEqual(_ignored_recipe_lines([line]), [line])
+        self.assertEqual(_ignored_recipe_lines(['\t@failed=""; for dir in x; do', "\t  terraform test; \\"]), [])
 
     def test_a_gate_step_that_cannot_fail_the_job_is_a_defect(self):
         good = {"steps": [{"name": "x", "run": "make terraform-test"}]}
@@ -1038,24 +1044,18 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertTrue(_gate_defects(good, {"defaults": {"run": {"shell": "bash {0}"}}}))
         self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "shell": "bash"}]}), [])
         self.assertEqual(_gate_defects(good, {"defaults": {"run": {"shell": "bash"}}}), [])
-        for text in (".IGNORE:\n", "MAKEFLAGS += -i\n", "MAKEFLAGS := -j2 --ignore-errors\n", "GNUMAKEFLAGS = -i\n",
-                     "MAKEFLAGS=-i\n", "MAKEFLAGS+=-i\n", "override MAKEFLAGS += -i\n", "export MAKEFLAGS := -i\n", "MAKEFLAGS ::= -i\n", "MAKEFLAGS += i\n"):
-            with self.subTest(text=text):
-                self.assertTrue(_makefile_ignores_errors(text))
-        self.assertFalse(_makefile_ignores_errors("MAKEFLAGS += --no-print-directory\n# -i is never set\nexport MAKEFLAGS := -k\n"))
-        self.assertEqual(_ignored_recipe_lines('\t-@failed=""; for dir in x; do \\\n\t  terraform test; \\\n\tdone\n'), ['\t-@failed=""; for dir in x; do \\'])
-        self.assertEqual(_ignored_recipe_lines('\t@failed=""; for dir in x; do \\\n\t  terraform test; \\\n\tdone\n'), [])
-        self.assertNotIn(_FAILURE_RECORDED, '(cd "$$dir" && terraform test) || failed=""; \\')
+        # The command runs at the repository root, whose Makefile is read.
+        self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "working-directory": "k8s-operator"}]}))
+        self.assertTrue(_gate_defects({"defaults": {"run": {"working-directory": "k8s-operator"}}, "steps": [{"run": "make terraform-test"}]}))
+        self.assertTrue(_gate_defects(good, {"defaults": {"run": {"working-directory": "bench"}}}))
+        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "working-directory": "."}]}), [])
+        for value in ("-i", "--ignore-errors", "-ki", "-j2 -i", "i", "ki", "k i"):
+            with self.subTest(value=value):
+                self.assertTrue(_flags_ignore_errors(value))
+        for value in ("-k", "-j2 --output-sync", "k IGNORE=i", "--no-print-directory", ""):
+            with self.subTest(value=value):
+                self.assertFalse(_flags_ignore_errors(value))
 
-    def test_the_rule_is_found_by_its_own_line_not_a_mention(self):
-        makefile = (
-            "# run `make verify:` first\npre-verify: ## p\n\t@echo pre\n\n"
-            "verify: ## v\n\t$(MAKE) --no-print-directory terraform-test\n\nother: ## o\n\t@echo verify:\n"
-        )
-        self.assertIn(_VERIFY_LINE, _recipe_body(makefile, "verify"))
-        self.assertNotIn("pre", _recipe_body(makefile, "verify"))
-        with self.assertRaises(AssertionError):
-            _recipe("x: ## x\n\t@echo\n", "verify")
 
 
 if __name__ == "__main__":
