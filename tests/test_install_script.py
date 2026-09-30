@@ -1419,6 +1419,112 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             f"Expected valid 40-character SHA or SemVer tag, got: {proc.stdout.strip()}",
         )
 
+    def _release_line_checkout(self, temp_dir):
+        """A kube-agents checkout shaped like a release line: this branch's install.sh
+        stamped 0.2.0 and tagged on A, a backport B on top of it, and an unrelated
+        commit U, carrying the same stamped script, that descends from neither."""
+        repo_path = pathlib.Path(temp_dir)
+        git = lambda *args: subprocess.run(["git", *args], cwd=str(repo_path), check=True, capture_output=True, text=True).stdout.strip()
+
+        def stamped_tree():
+            (repo_path / "scripts" / "installer").mkdir(parents=True, exist_ok=True)
+            (repo_path / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            text = _INSTALL_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
+            (repo_path / "install.sh").write_text(text)
+
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        git("config", "commit.gpgsign", "false")
+        stamped_tree()
+        git("add", ".")
+        git("commit", "-q", "-m", "chore(release): stamp release version 0.2.0")
+        stamp = git("rev-parse", "HEAD")
+        git("tag", "0.2.0", stamp)
+        git("switch", "-q", "-c", "release/0.2")
+        (repo_path / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-q", "-m", "fix: backport")
+        backport = git("rev-parse", "HEAD")
+        git("switch", "-q", "--orphan", "elsewhere")
+        stamped_tree()
+        (repo_path / "other.txt").write_text("x\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "chore: unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("switch", "-q", "release/0.2")
+        return repo_path, git, stamp, backport, unrelated
+
+    def _run_fixture_install_func(self, repo_path, func_call):
+        """Source the fixture's own stamped install.sh, so BASH_SOURCE names it: the
+        checkout's script is the one running, as when an operator runs ./install.sh."""
+        setup = f"KUBE_AGENTS_SOURCE_ONLY=true source ./install.sh\n{func_call}\n"
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        return _run_installer_bash(setup, get_isolated_test_env(overrides=overrides), cwd=repo_path)
+
+    def test_a_release_line_checkout_past_its_stamp_defaults_to_its_own_head(self):
+        """The backport carries the previous release's baked version, but it is not that
+        release: run from it, install.sh defaults the way a main checkout does, to its
+        own HEAD, whose images the merge onto the line built, and verification passes on
+        that tag. The stamp's own commit still defaults to the release, and an unrelated
+        commit with the baked version still defaults to it and is refused as a source
+        mismatch."""
+        with tempfile.TemporaryDirectory(prefix="release-line-checkout-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+
+            past = self._run_fixture_install_func(repo_path, 'default_image_tag "."; echo "label=$(default_image_tag_label ".")"')
+            self.assertEqual(past.returncode, 0, past.stderr)
+            lines = past.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("1 commit(s) past release 0.2.0", lines[1])
+
+            resolved = self._run_fixture_install_func(
+                repo_path,
+                'tag=""; resolve_effective_image_tag tag "." "" && echo "tag=$tag" && verify_local_source_ref "." "$tag" && echo "verified"',
+            )
+            self.assertEqual(resolved.returncode, 0, resolved.stdout + resolved.stderr)
+            self.assertIn(f"tag={backport}", resolved.stdout)
+            self.assertIn("verified", resolved.stdout)
+            self.assertNotIn("mismatch", resolved.stdout + resolved.stderr)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_fixture_install_func(repo_path, 'default_image_tag "."; default_image_tag_label "."')
+            self.assertEqual(at_stamp.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+
+            git("switch", "-q", "--detach", unrelated)
+            off = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(off.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(off.returncode, 0)
+            self.assertIn("mismatch", off.stdout + off.stderr)
+
+    def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
+        """The baked version belongs to the running script. A release's install.sh that is
+        not the checkout's own file (piped, or run from another directory) keeps its release
+        as the default even when the checkout it resolves its sources to is a line past that
+        release, and the source check then fetches or refuses as before."""
+        with tempfile.TemporaryDirectory(prefix="release-line-piped-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            proc = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; default_image_tag "."; default_image_tag_label "."', cwd=repo_path)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+
+    def test_a_line_checkout_without_the_release_tag_is_refused_and_told_to_fetch_it(self):
+        """Without the tag the shape cannot be recognised, so the baked default and the
+        refusal stand; the refusal says why and what to do."""
+        with tempfile.TemporaryDirectory(prefix="release-line-tagless-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            git("tag", "-d", "0.2.0")
+            proc = self._run_fixture_install_func(
+                repo_path, 'default_image_tag "."; tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "." "$tag"'
+            )
+            self.assertEqual(proc.stdout.strip().splitlines()[0], "0.2.0")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("does not hold its tag", proc.stdout + proc.stderr)
+            self.assertIn("git fetch --tags", proc.stdout + proc.stderr)
+
     def test_default_image_tag_resolves_semver_when_multiple_tags_present(self):
         """Verifies default_image_tag prefers numeric SemVer tag over rc_*_validated tags on the same commit."""
         temp_dir, repo_dir, git = create_mock_git_repo()

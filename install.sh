@@ -1038,16 +1038,52 @@ cluster_mode_label() {
   esac
 }
 
+# A release-line checkout between stamps. A patch is stamped as a child of the
+# line's head, so every backport that lands on release/<X.Y> after a release
+# descends from a stamped commit and carries its BAKED_RELEASE_VERSION, which is
+# the previous release's. True when this is a Git checkout whose HEAD descends
+# from the baked release's commit without being it: unreleased development on
+# the line, whose images are built per commit, so the release's tag is not the
+# tag to default to. Exactly the tag's commit is the release checkout, and a
+# HEAD that is neither is left to verify_local_source_ref, which refuses the
+# mismatch as before. A tag the checkout does not hold reads as "not past": the
+# release's own commit is on the line's history, so a clone of the line brings
+# the tag with it, and a checkout that lacks it is not one of these (the
+# refusal that follows says to fetch the tags). And only when the script that
+# is running is that checkout's own install.sh, carrying the same version: the
+# baked version belongs to the running script, so a release's piped installer
+# keeps its release as the default wherever it runs, whether standing in some
+# other checkout or resolving its sources to a HOME clone that has moved onto
+# a line, and verify_local_source_ref then fetches or refuses as before.
+checkout_is_past_baked_release() {
+  local repo_dir="${1:-.}" tag_commit head_commit script_path="${BASH_SOURCE[0]:-}"
+  [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
+  [ -n "$script_path" ] && [ -f "$script_path" ] || return 1
+  [ "$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
+  grep -qE "^BAKED_RELEASE_VERSION=\"?${BAKED_RELEASE_VERSION//./\\.}\"?\$" "${repo_dir}/${KUBE_AGENTS_CLONE_MARKER}" 2>/dev/null || return 1
+  tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
+  head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
+  [ "$tag_commit" != "$head_commit" ] || return 1
+  git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null
+}
+
 # The image tag doubles as the source ref that verify_local_source_ref checks the
 # checkout against. When downloaded as an official release via curl | bash, the baked
 # release tag takes precedence. In local Git checkouts, an exact SemVer release tag or
 # HEAD commit SHA is used as the default.
 default_image_tag() {
   local repo_dir="${1:-.}"
-  # 1. Baked release version takes precedence (for curl | bash from official release URLs)
+  # 1. Baked release version takes precedence (for curl | bash from official release URLs),
+  #    except in a checkout of a release line that has moved past that release: there the
+  #    baked version is the previous release's, and the checkout defaults the way a main
+  #    checkout does, to its own HEAD (step 4), whose images a merge onto the line built.
   if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
-    echo "$BAKED_RELEASE_VERSION"
-    return 0
+    if checkout_is_past_baked_release "$repo_dir"; then
+      :
+    else
+      echo "$BAKED_RELEASE_VERSION"
+      return 0
+    fi
   fi
   # Only a kube-agents checkout may supply the default. Without this guard,
   # running the curl | bash one-liner from inside any unrelated Git repository
@@ -1086,6 +1122,12 @@ default_image_tag_label() {
 
   if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "$tag" = "$BAKED_RELEASE_VERSION" ]; then
     printf 'official release %s' "$tag"
+  elif checkout_is_past_baked_release "$repo_dir"; then
+    # Say what the checkout is, since its scripts still name the previous release.
+    printf 'release line %s checkout %s, %s commit(s) past release %s' \
+      "${BAKED_RELEASE_VERSION%.*}" "${tag:0:7}" \
+      "$(git -C "$repo_dir" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")" \
+      "$BAKED_RELEASE_VERSION"
   elif [ "$tag" = "$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")" ]; then
     printf 'release tag %s' "$tag"
   elif [[ "$(basename "$(cd "$repo_dir" 2>/dev/null && pwd || echo "$repo_dir")")" =~ ^kube-agents-${tag}$ ]]; then
@@ -1674,6 +1716,9 @@ verify_local_source_ref() {
       return 0
     fi
     print_error "The requested image/source ref '$expected_ref' is not present in the current checkout. Check out that exact revision first."
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but the checkout does not hold its tag. If it is a checkout of a release line, fetch the tags (git fetch --tags) so the release it descends from can be recognised, or pass --image-tag with this commit's full SHA."
+    fi
     print_info "Pass --allow-unverified-source to provision anyway."
     return 1
   fi

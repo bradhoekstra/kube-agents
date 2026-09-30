@@ -281,6 +281,100 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("dirty checkout", proc.stdout)
 
+    def _release_line_checkout(self, temp_dir):
+        """A kube-agents checkout shaped like a release line: release 0.2.0 stamped on A,
+        a backport B on it, and an unrelated commit U descending from neither."""
+        repo_path = pathlib.Path(temp_dir)
+        git = lambda *args: subprocess.run(["git", *args], cwd=str(repo_path), check=True, capture_output=True, text=True).stdout.strip()
+        git("init", "-q", "-b", "main")
+        git("config", "user.name", "Test")
+        git("config", "user.email", "test@example.com")
+        git("config", "commit.gpgsign", "false")
+        (repo_path / "scripts" / "installer").mkdir(parents=True)
+        (repo_path / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+        (repo_path / "upgrade.sh").write_text('BAKED_RELEASE_VERSION="0.2.0"\n')
+        git("add", ".")
+        git("commit", "-q", "-m", "chore(release): stamp release version 0.2.0")
+        stamp = git("rev-parse", "HEAD")
+        git("tag", "0.2.0", stamp)
+        git("switch", "-q", "-c", "release/0.2")
+        (repo_path / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-q", "-m", "fix: backport")
+        backport = git("rev-parse", "HEAD")
+        git("switch", "-q", "--orphan", "elsewhere")
+        (repo_path / "other.txt").write_text("x\n")
+        git("add", "-A")
+        git("commit", "-q", "-m", "chore: unrelated")
+        unrelated = git("rev-parse", "HEAD")
+        git("switch", "-q", "release/0.2")
+        return repo_path, git, stamp, backport, unrelated
+
+    def test_a_release_line_checkout_past_its_stamp_takes_the_baked_default_back(self):
+        """The backport's upgrade.sh carries the previous release's baked version. A run
+        from it asks for --image-tag, naming the line and the commit's own SHA, rather
+        than upgrading to the previous release's images under the backport's engine; an
+        explicit tag is not a default and stays. The stamp's own commit and an unrelated
+        commit keep the baked default, and the unrelated one is refused downstream."""
+        with tempfile.TemporaryDirectory(prefix="release-line-upgrade-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            probe = (
+                'BAKED_RELEASE_VERSION="0.2.0"; PARAM_IMAGE_TAG="0.2.0"; IMAGE_TAG_DEFAULTED_FROM_BAKED="{defaulted}"; '
+                'drop_baked_default_on_a_line_checkout_past_it "{repo}"; echo "tag=[$PARAM_IMAGE_TAG] dropped=$BAKED_DEFAULT_DROPPED"'
+            )
+
+            past = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
+            self.assertEqual(past.returncode, 0, past.stderr)
+            self.assertIn("tag=[] dropped=true", past.stdout)
+            self.assertIn("release line 0.2 at " + backport[:7], past.stdout)
+            self.assertIn("1 commit(s) past release 0.2.0", past.stdout)
+            self.assertIn(f"--image-tag {backport}", past.stdout)
+
+            explicit = self._run_upgrade_func(probe.format(defaulted="false", repo=repo_path), cwd=repo_path)
+            self.assertIn("tag=[0.2.0] dropped=false", explicit.stdout, "an explicit --image-tag is not a default")
+            # Through parse_args, which is what clears the flag: the flag is computed at
+            # load, before the flags are read, and --image-tag has to undo it.
+            for form in ("--image-tag {sha}", "--image-tag={sha}"):
+                with self.subTest(form=form):
+                    parsed = self._run_upgrade_func(
+                        'BAKED_RELEASE_VERSION="0.2.0"; PARAM_IMAGE_TAG="0.2.0"; IMAGE_TAG_DEFAULTED_FROM_BAKED="true"; '
+                        f'parse_args {form.format(sha=backport)}; drop_baked_default_on_a_line_checkout_past_it "{repo_path}"; '
+                        'echo "tag=[$PARAM_IMAGE_TAG] dropped=$BAKED_DEFAULT_DROPPED"',
+                        cwd=repo_path,
+                    )
+                    self.assertEqual(parsed.returncode, 0, parsed.stderr)
+                    self.assertIn(f"tag=[{backport}] dropped=false", parsed.stdout)
+
+            git("switch", "-q", "--detach", stamp)
+            at_stamp = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
+            self.assertIn("tag=[0.2.0]", at_stamp.stdout)
+            self.assertNotIn("release line", at_stamp.stdout)
+
+            git("switch", "-q", "--detach", unrelated)
+            off = self._run_upgrade_func(probe.format(defaulted="true", repo=repo_path), cwd=repo_path)
+            self.assertIn("tag=[0.2.0]", off.stdout)
+            refused = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(refused.returncode, 0)
+
+    def test_script_checkout_dir_names_the_checkout_the_script_runs_from(self):
+        """Empty for a body sourced from no file in a checkout; the checkout when upgrade.sh
+        is run from one. The marker, not the directory name, is what makes it a checkout."""
+        with tempfile.TemporaryDirectory(prefix="script-checkout-dir-") as temp_dir:
+            repo_path, _, _, _, _ = self._release_line_checkout(temp_dir)
+            shutil.copy(_UPGRADE_SH, repo_path / "upgrade.sh")
+            proc = subprocess.run(
+                ["bash", "-c", 'KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; script_checkout_dir'],
+                cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(pathlib.Path(proc.stdout.strip()).resolve(), repo_path.resolve())
+            (repo_path / "scripts" / "installer" / "installer_common.sh").unlink()
+            proc = subprocess.run(
+                ["bash", "-c", 'KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; script_checkout_dir'],
+                cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
+            )
+            self.assertEqual(proc.stdout.strip(), "")
+
     def test_a_plan_previews_a_dirty_checkout_instead_of_refusing_it(self):
         """--plan says it changes nothing, so a stray edit is something to report, not refuse.
 
