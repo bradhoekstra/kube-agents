@@ -10,18 +10,19 @@ nobody overrode. This pins the loop, the step, `make verify` running the
 target (its help line says it runs everything a pull request must pass
 offline), that no test file anywhere in the repository sits where the loop
 does not look (Terraform roots live under bench/tf and k8s-operator/testing
-too), and a `mock_provider` block, as a block and not a mention in a comment,
-for every provider a root needs: what it declares in `required_providers` in
-any of its `.tf` files (a composition declares them in providers.tf, a module
-in versions.tf) and what every local module it calls declares, since
-Terraform hands a child a default provider the root never named. Both test
-file spellings Terraform loads count: a `.tftest.hcl` is read with comments
-stripped, a `.tftest.json` is parsed. The `.tf` side is read as HCL only;
-a root or called module carrying a `*.tf.json` fails the pin loudly rather
-than being read half-way. The helpers that make those judgements have cases
-of their own below, on fixtures, so the pin is known to fire on the shapes
-it exists for. tests/test_shellcheck_gate_wiring.py pins a workflow step
-the same way.
+too), and an unaliased `mock_provider` block for every provider a root needs:
+what it declares in `required_providers` in any of its `.tf` files (a
+composition declares them in providers.tf, a module in versions.tf; the block
+form and the version-only shorthand both count) and what every local module
+it calls declares, since Terraform hands a child a default provider the root
+never named. HCL is read through a small tokenizer that skips comments,
+strings, heredocs and template interpolation, so none of those can pass for
+syntax; a `.tftest.json` is parsed; the `.tf` side is read as HCL only, and a
+root or called module carrying a `*.tf.json` fails the pin loudly rather than
+being read half-way. The helpers that make those judgements have cases of
+their own below, on fixtures, so the pin is known to fire on the shapes it
+exists for. tests/test_shellcheck_gate_wiring.py pins a workflow step the
+same way.
 """
 
 import json
@@ -57,42 +58,48 @@ _GATE_COMMAND = f"make {_TARGET}"
 
 #: The recipe line that lists the target in `make help`, and the loop that
 #: reaches every module rather than naming the ones that had tests when it
-#: was written.
+#: was written. The command is looked for in the recipe's body, below the
+#: target line, since the help text names it too.
 _RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
 _LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
 _TEST_COMMAND = "terraform test"
 _VERIFY_TARGET = "verify"
 _VERIFY_LINE = f"$(MAKE) --no-print-directory {_TARGET}"
 
-#: Where a root declares its providers, and the entries inside that block
-#: (`google-beta` included, hence the hyphen). The block is cut at its own
-#: closing brace, so a `kubernetes = {` inside a later `provider "helm"`
-#: block is not read as a provider.
+#: The HCL the pin reads, and the spelling it refuses.
 _TF_FILE_GLOB = "*.tf"
-#: Terraform also loads this spelling; the pin does not read it, and says so.
 _TF_JSON_GLOB = "*.tf.json"
-#: HCL comments and quoted strings, removed before a block is scanned so a
-#: brace or a `mock_provider` line inside either is not read as syntax.
-_HCL_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
-_HCL_LINE_COMMENT = re.compile(r"(?m)(#|//).*$")
-_HCL_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
-_STRING_PLACEHOLDER = '""'
-_REQUIRED_PROVIDERS_OPEN = re.compile(r"^\s*required_providers\s*\{", re.MULTILINE)
-_REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+)\s*=\s*\{", re.MULTILINE)
-#: A module block calling a local directory, whose providers the root needs
-#: too: Terraform gives such a child a default provider the root never
-#: declared (full-install never declares `http`; the scope resolver it calls
-#: requires it).
-_LOCAL_MODULE_SOURCE = re.compile(r'^\s*source\s*=\s*"(\.\.?/[^"]*)"', re.MULTILINE)
-#: The block a test file needs per provider: at line start, so the literal
-#: surviving only in a comment (`# mock_provider "http" {}`) does not count.
-_MOCK_PROVIDER = r'^\s*mock_provider "{provider}"\s*\{{'
-#: Both spellings Terraform loads from tests/; the JSON form carries its
-#: mocks under this key.
+#: Tokenizer pieces: an identifier (`google-beta` included, hence the
+#: hyphen), a heredoc opener, the comment and block characters.
+_IDENT = re.compile(r"[A-Za-z_][\w-]*")
+_HEREDOC_OPEN = re.compile(r"<<-?(\w+)\r?\n")
+_LINE_COMMENT_OPENERS = ("#", "//")
+_BLOCK_COMMENT_OPEN, _BLOCK_COMMENT_CLOSE = "/*", "*/"
+_TEMPLATE_OPENERS = ("${", "%{")
+_WHITESPACE = " \t\r\n"
+#: Token kinds.
+_STR, _WORD, _OPEN, _CLOSE, _EQUALS, _OTHER = "str", "word", "{", "}", "=", "other"
+#: The blocks read: providers inside `required_providers { … }` as `name = {`
+#: or the pre-0.13 `name = "version"`; a `module "x" { source = "../…" }`
+#: whose providers the root needs too, since Terraform gives such a child a
+#: default provider the root never declared (full-install never declares
+#: `http`; the scope resolver it calls requires it); and a test file's
+#: `mock_provider "name" { … }`, which mocks the default provider only when
+#: it carries no `alias`.
+_REQUIRED_PROVIDERS_BLOCK = "required_providers"
+_MODULE_BLOCK = "module"
+_SOURCE_ATTRIBUTE = "source"
+_LOCAL_SOURCE_PREFIXES = ("./", "../")
+_MOCK_PROVIDER_BLOCK = "mock_provider"
+_ALIAS_ATTRIBUTE = "alias"
+#: Both spellings Terraform loads from a suite; the JSON form carries its
+#: mocks under this key, one object or a list of them per provider.
 _TEST_FILE_SUFFIXES = (".tftest.hcl", ".tftest.json")
 _TEST_FILE_JSON_SUFFIX = ".tftest.json"
-_JSON_MOCK_PROVIDER_KEY = "mock_provider"
 _TESTS_DIR = "tests"
+
+
+# ─── Where test files are, and which the loop runs ───────────────────────────
 
 
 def _is_test_file(path: pathlib.Path) -> bool:
@@ -100,8 +107,13 @@ def _is_test_file(path: pathlib.Path) -> bool:
 
 
 def _suite_files(root: pathlib.Path) -> list:
+    """The test files `terraform test` loads when the loop runs it in `root`:
+    those in tests/ and those beside it. The loop runs only where tests/
+    exists, so a root-level file with no tests/ beside it runs nowhere."""
     tests_dir = root / _TESTS_DIR
-    return sorted(p for p in tests_dir.iterdir() if _is_test_file(p)) if tests_dir.is_dir() else []
+    if not tests_dir.is_dir():
+        return []
+    return sorted(p for directory in (root, tests_dir) for p in directory.iterdir() if _is_test_file(p))
 
 
 def _suites(parents=_SUITE_PARENTS) -> dict:
@@ -128,31 +140,178 @@ def _unreached_test_files(repo_root: pathlib.Path, parents) -> list:
 
 def _recipe(makefile: str, target: str) -> str:
     recipe = makefile[makefile.index(f"{target}:"):]
-    return recipe[: recipe.index("\n\n")]
+    end = recipe.find("\n\n")
+    return recipe if end < 0 else recipe[:end]
 
 
-def _without_comments(text: str) -> str:
-    """HCL with its comments removed, line structure kept."""
-    text = _HCL_BLOCK_COMMENT.sub(lambda m: "\n" * m.group(0).count("\n"), text)
-    return _HCL_LINE_COMMENT.sub("", text)
+def _recipe_body(makefile: str, target: str) -> str:
+    return _recipe(makefile, target).split("\n", 1)[1]
 
 
-def _without_comments_and_strings(text: str) -> str:
-    return _HCL_STRING.sub(_STRING_PLACEHOLDER, _without_comments(text))
+# ─── Reading HCL ─────────────────────────────────────────────────────────────
 
 
-def _block(text: str, start: int) -> str:
-    """The text from the `{` at `start` to its matching `}`; the caller has
-    already stripped comments and strings, so every brace is syntax."""
-    depth = 0
-    for index in range(start, len(text)):
-        if text[index] == "{":
+def _string_end(text: str, start: int) -> int:
+    """Index after the quote closing the string opened at `start`, escapes
+    and `${ … }` / `%{ … }` templates (which may hold quotes) skipped."""
+    index = start + 1
+    while index < len(text):
+        char = text[index]
+        if char == "\\":
+            index += 2
+        elif char == '"':
+            return index + 1
+        elif text[index : index + 2] in _TEMPLATE_OPENERS:
+            index = _template_end(text, index + 2)
+        else:
+            index += 1
+    return len(text)
+
+
+def _template_end(text: str, start: int) -> int:
+    depth = 1
+    index = start
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            index = _string_end(text, index)
+            continue
+        if char == "{":
             depth += 1
-        elif text[index] == "}":
+        elif char == "}":
             depth -= 1
             if depth == 0:
-                return text[start : index + 1]
-    return text[start:]
+                return index + 1
+        index += 1
+    return len(text)
+
+
+def _heredoc_end(text: str, start: int, marker: str) -> int:
+    index = start
+    while index < len(text):
+        line_end = text.find("\n", index)
+        line_end = len(text) if line_end < 0 else line_end
+        if text[index:line_end].strip() == marker:
+            return line_end
+        index = line_end + 1
+    return len(text)
+
+
+def _tokens(text: str) -> list:
+    """HCL as (kind, value) pairs, comments dropped, strings and heredocs
+    each one token, so nothing inside them reads as syntax."""
+    tokens = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        pair = text[index : index + 2]
+        if char in _WHITESPACE:
+            index += 1
+        elif char == _LINE_COMMENT_OPENERS[0] or pair == _LINE_COMMENT_OPENERS[1]:
+            line_end = text.find("\n", index)
+            index = len(text) if line_end < 0 else line_end
+        elif pair == _BLOCK_COMMENT_OPEN:
+            close = text.find(_BLOCK_COMMENT_CLOSE, index + 2)
+            index = len(text) if close < 0 else close + 2
+        elif char == '"':
+            end = _string_end(text, index)
+            tokens.append((_STR, text[index + 1 : end - 1]))
+            index = end
+        elif (heredoc := _HEREDOC_OPEN.match(text, index)) is not None:
+            end = _heredoc_end(text, heredoc.end(), heredoc.group(1))
+            tokens.append((_STR, text[heredoc.end() : end]))
+            index = end
+        elif char in (_OPEN, _CLOSE, _EQUALS):
+            tokens.append((char, char))
+            index += 1
+        elif (word := _IDENT.match(text, index)) is not None:
+            tokens.append((_WORD, word.group(0)))
+            index = word.end()
+        else:
+            tokens.append((_OTHER, char))
+            index += 1
+    return tokens
+
+
+def _body(tokens: list, open_index: int) -> list:
+    """The tokens between the brace at `open_index` and its match, each with
+    its depth relative to that block (1 = directly inside); a nested block's
+    own braces sit at the depth that encloses them."""
+    body = []
+    depth = 0
+    for token in tokens[open_index:]:
+        if token[0] == _OPEN:
+            if depth > 0:
+                body.append((token, depth))
+            depth += 1
+        elif token[0] == _CLOSE:
+            depth -= 1
+            if depth == 0:
+                return body
+            body.append((token, depth))
+        else:
+            body.append((token, depth))
+    return body
+
+
+def _blocks(tokens: list, name: str, labels: int) -> list:
+    """Each block `name "label"… {` at the top level, as (labels, body)."""
+    blocks = []
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token[0] == _OPEN:
+            depth += 1
+        elif token[0] == _CLOSE:
+            depth -= 1
+        elif (
+            depth == 0
+            and token == (_WORD, name)
+            and all(tokens[index + 1 + n][0] == _STR for n in range(labels) if index + 1 + n < len(tokens))
+            and index + 1 + labels < len(tokens)
+            and tokens[index + 1 + labels][0] == _OPEN
+        ):
+            found = [tokens[index + 1 + n][1] for n in range(labels)]
+            blocks.append((found, _body(tokens, index + 1 + labels)))
+    return blocks
+
+
+def _nested_blocks(body: list, name: str) -> list:
+    """Bodies of `name {` blocks directly inside a body (no labels)."""
+    flat = [token for token, _depth in body]
+    nested = []
+    for index, (token, depth) in enumerate(body):
+        if depth == 1 and token == (_WORD, name) and index + 1 < len(body) and body[index + 1][0][0] == _OPEN:
+            nested.append(_body(flat, index + 1))
+    return nested
+
+
+def _attributes(body: list) -> dict:
+    """`name = value` pairs directly inside a body: the value's kind and text."""
+    tokens = [token for token, depth in body if depth == 1]
+    attributes = {}
+    for index in range(len(tokens) - 2):
+        if tokens[index][0] == _WORD and tokens[index + 1][0] == _EQUALS:
+            attributes[tokens[index][1]] = tokens[index + 2]
+    return attributes
+
+
+def _providers_in(text: str) -> set:
+    providers = set()
+    for _labels, body in _blocks(_tokens(text), "terraform", 0):
+        for block in _nested_blocks(body, _REQUIRED_PROVIDERS_BLOCK):
+            providers.update(
+                name for name, (kind, _value) in _attributes(block).items() if kind in (_OPEN, _STR)
+            )
+    return providers
+
+
+def _local_module_sources_in(text: str) -> list:
+    sources = []
+    for _labels, body in _blocks(_tokens(text), _MODULE_BLOCK, 1):
+        source = _attributes(body).get(_SOURCE_ATTRIBUTE)
+        if source is not None and source[0] == _STR and source[1].startswith(_LOCAL_SOURCE_PREFIXES):
+            sources.append(source[1])
+    return sources
 
 
 def _declared_providers(root: pathlib.Path) -> list:
@@ -164,9 +323,7 @@ def _declared_providers(root: pathlib.Path) -> list:
         )
     providers = set()
     for tf_file in sorted(root.glob(_TF_FILE_GLOB)):
-        text = _without_comments_and_strings(tf_file.read_text())
-        for match in _REQUIRED_PROVIDERS_OPEN.finditer(text):
-            providers.update(_REQUIRED_PROVIDER.findall(_block(text, match.end() - 1)))
+        providers.update(_providers_in(tf_file.read_text()))
     return sorted(providers)
 
 
@@ -179,28 +336,36 @@ def _needed_providers(root: pathlib.Path, seen=None) -> list:
     seen.add(root)
     providers = set(_declared_providers(root))
     for tf_file in sorted(root.glob(_TF_FILE_GLOB)):
-        for source in _LOCAL_MODULE_SOURCE.findall(_without_comments(tf_file.read_text())):
+        for source in _local_module_sources_in(tf_file.read_text()):
             child = (root / source).resolve()
             if child.is_dir():
                 providers.update(_needed_providers(child, seen))
     return sorted(providers)
 
 
+def _mocked_in_hcl(text: str) -> set:
+    return {
+        labels[0]
+        for labels, body in _blocks(_tokens(text), _MOCK_PROVIDER_BLOCK, 1)
+        if _ALIAS_ATTRIBUTE not in _attributes(body)
+    }
+
+
 def _mocked_in_json(text: str) -> set:
-    mocks = json.loads(text).get(_JSON_MOCK_PROVIDER_KEY, {}) if text.strip() else {}
-    return set(mocks) if isinstance(mocks, dict) else set()
+    mocks = json.loads(text).get(_MOCK_PROVIDER_BLOCK, {}) if text.strip() else {}
+    if not isinstance(mocks, dict):
+        return set()
+    mocked = set()
+    for name, entries in mocks.items():
+        entries = entries if isinstance(entries, list) else [entries]
+        if any(isinstance(entry, dict) and _ALIAS_ATTRIBUTE not in entry for entry in entries):
+            mocked.add(name)
+    return mocked
 
 
 def _unmocked(text: str, providers, name: str = _TEST_FILE_SUFFIXES[0]) -> list:
-    if name.endswith(_TEST_FILE_JSON_SUFFIX):
-        mocked = _mocked_in_json(text)
-        return [provider for provider in providers if provider not in mocked]
-    text = _without_comments(text)
-    return [
-        provider
-        for provider in providers
-        if not re.search(_MOCK_PROVIDER.format(provider=provider), text, re.MULTILINE)
-    ]
+    mocked = _mocked_in_json(text) if name.endswith(_TEST_FILE_JSON_SUFFIX) else _mocked_in_hcl(text)
+    return [provider for provider in providers if provider not in mocked]
 
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):
@@ -211,7 +376,7 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         self.assertEqual(
             _unreached_test_files(_REPO_ROOT, _SUITE_PARENTS),
             [],
-            f"these test files are outside {_TESTS_DIR}/ under {[p.name for p in _SUITE_PARENTS]}, so `{_GATE_COMMAND}` never runs them",
+            f"these test files are not in, or beside, a {_TESTS_DIR}/ directory under {[p.name for p in _SUITE_PARENTS]}, the only places `{_GATE_COMMAND}` runs `{_TEST_COMMAND}`, so they never run",
         )
 
     def test_the_makefile_target_reaches_every_module(self):
@@ -221,18 +386,18 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
             _RECIPE_LINE,
             f"the Makefile has no `{_TARGET}:` recipe with a `## description`; `make help` is the only place a contributor finds it",
         )
-        recipe = _recipe(makefile, _TARGET)
+        body = _recipe_body(makefile, _TARGET)
         self.assertIn(
             _LOOP_GLOB,
-            recipe,
+            body,
             f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs",
         )
-        self.assertIn(_TEST_COMMAND, recipe, f"`{_TARGET}` does not run `{_TEST_COMMAND}`")
+        self.assertIn(_TEST_COMMAND, body, f"`{_TARGET}`'s recipe does not run `{_TEST_COMMAND}`")
 
     def test_make_verify_runs_the_target(self):
         self.assertIn(
             _VERIFY_LINE,
-            _recipe(_MAKEFILE.read_text(), _VERIFY_TARGET),
+            _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET),
             f"`make {_VERIFY_TARGET}` says it runs everything a pull request must pass offline; `{_TARGET}` is one of them",
         )
 
@@ -254,12 +419,12 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
                     self.assertEqual(
                         _unmocked(path.read_text(), providers, path.name),
                         [],
-                        f"{path.relative_to(_REPO_ROOT)} does not mock every provider its root needs ({providers}); a read the file forgets to override would reach a real API from CI",
+                        f"{path.relative_to(_REPO_ROOT)} has no unaliased mock_provider for every provider its root needs ({providers}); a read the file forgets to override would reach a real API from CI",
                     )
 
 
 class TerraformModuleTestsHelpersTest(unittest.TestCase):
-    """The three judgements above, on the shapes they exist to catch."""
+    """The judgements above, on the shapes they exist to catch."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -269,26 +434,45 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_providers_are_read_from_any_tf_file_and_only_inside_the_block(self):
-        # A composition's shape: providers.tf, no versions.tf, and a
-        # `kubernetes = {` attribute inside a provider block after it.
+        # A composition's shape: a provider configured before the terraform
+        # block, with a URL (`//`) and a template holding quotes in its
+        # strings; providers.tf, no versions.tf; a `kubernetes = {` attribute
+        # inside a provider block after it; the version-only shorthand.
         (self.root / "providers.tf").write_text(
+            'provider "helm" {\n  kubernetes = {\n    host  = "https://x.example/#frag"\n'
+            '    token = "${var.a == "b" ? "c" : "d"} /* not a comment */"\n  }\n}\n\n'
             "terraform {\n  required_providers {\n    google = {\n      source = \"hashicorp/google\"\n    }\n"
-            "    google-beta = {\n      source = \"hashicorp/google-beta\"\n    }\n  }\n}\n\n"
-            "provider \"helm\" {\n  kubernetes = {\n    host = \"x\"\n  }\n}\n"
+            "    google-beta = {\n      source = \"hashicorp/google-beta\"\n    }\n"
+            '    random = ">= 3.5"\n  }\n}\n'
         )
         (self.root / "main.tf").write_text("resource \"null_resource\" \"x\" {}\n")
-        self.assertEqual(_declared_providers(self.root), ["google", "google-beta"])
+        self.assertEqual(_declared_providers(self.root), ["google", "google-beta", "random"])
 
     def test_a_root_declaring_nothing_reads_as_no_providers(self):
         (self.root / "main.tf").write_text("locals {\n  a = {\n    b = {}\n  }\n}\n")
         self.assertEqual(_declared_providers(self.root), [])
+
+    def test_a_brace_or_comment_opener_in_a_comment_string_or_heredoc_is_not_syntax(self):
+        (self.root / "versions.tf").write_text(
+            "terraform {\n  required_providers {\n    # the {google} entry below }\n    google = {\n"
+            "      source  = \"hashicorp/google\"\n      version = \"} // not a comment\"\n    }\n    /* } */\n"
+            "    http = {\n      source = \"hashicorp/http\"\n    }\n  }\n}\n\n"
+            'variable "v" {\n  description = <<-EOT\n    A "quote and a } and a # and https://x\n  EOT\n}\n'
+            'variable "w" {\n  default = "{"\n}\n'
+        )
+        self.assertEqual(_declared_providers(self.root), ["google", "http"])
+
+    def test_a_root_with_a_tf_json_file_is_refused_not_half_read(self):
+        (self.root / "versions.tf.json").write_text('{"terraform": {"required_providers": {"http": {}}}}')
+        with self.assertRaises(AssertionError):
+            _declared_providers(self.root)
 
     def test_a_called_local_module_adds_the_providers_it_declares(self):
         # A composition that declares google and calls a module requiring
         # http, with no providers map: the child gets a default http provider,
         # so the composition's tests must mock it too. The root file wins for
         # the declared set, the union for the needed set; a module calling
-        # itself does not recurse forever.
+        # itself does not recurse forever; a remote source is ignored.
         composition = self.root / "examples" / "c"
         module = self.root / "modules" / "m"
         for directory in (composition, module):
@@ -307,21 +491,6 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertEqual(_declared_providers(composition), ["google"])
         self.assertEqual(_needed_providers(composition), ["google", "http"])
 
-    def test_a_json_test_file_counts_as_a_test_file(self):
-        parents = (self.root / "terraform" / "modules",)
-        suite = self.root / "terraform" / "modules" / "m" / "tests"
-        suite.mkdir(parents=True)
-        (suite / "a.tftest.hcl").write_text("")
-        (suite / "b.tftest.json").write_text("{}")
-        (suite / "notes.md").write_text("")
-        stray = self.root / "terraform" / "modules" / "m" / "b.tftest.json"
-        stray.write_text("{}")
-        self.assertEqual(
-            [p.name for p in _suites(parents)[self.root / "terraform" / "modules" / "m"]],
-            ["a.tftest.hcl", "b.tftest.json"],
-        )
-        self.assertEqual(_unreached_test_files(self.root, parents), [stray])
-
     def test_a_mock_in_a_comment_does_not_count(self):
         text = '# mock_provider "http" {}\nmock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n'
         self.assertEqual(_unmocked(text, ["google", "http"]), ["http"])
@@ -330,28 +499,40 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         slashed = '// mock_provider "http" {}\nmock_provider "google" {}\n'
         self.assertEqual(_unmocked(slashed, ["google", "http"]), ["http"])
 
-    def test_a_json_test_file_is_read_as_json(self):
-        text = '{"mock_provider": {"google": {}, "http": {}}, "run": {"x": {"command": "plan"}}}'
-        self.assertEqual(_unmocked(text, ["google", "http"], "b.tftest.json"), [])
-        self.assertEqual(_unmocked('{"run": {"x": {}}}', ["google"], "b.tftest.json"), ["google"])
-        self.assertEqual(_unmocked("", ["google"], "b.tftest.json"), ["google"])
-
-    def test_a_brace_in_a_comment_or_string_does_not_end_the_block(self):
-        (self.root / "versions.tf").write_text(
-            "terraform {\n  required_providers {\n    # the {google} entry below }\n    google = {\n"
-            "      source  = \"hashicorp/google\"\n      version = \"}\"\n    }\n    /* } */\n"
-            "    http = {\n      source = \"hashicorp/http\"\n    }\n  }\n}\n"
-        )
-        self.assertEqual(_declared_providers(self.root), ["google", "http"])
-
-    def test_a_root_with_a_tf_json_file_is_refused_not_half_read(self):
-        (self.root / "versions.tf.json").write_text('{"terraform": {"required_providers": {"http": {}}}}')
-        with self.assertRaises(AssertionError):
-            _declared_providers(self.root)
+    def test_an_aliased_mock_does_not_mock_the_default_provider(self):
+        text = 'mock_provider "google" {\n  alias = "offline"\n}\nmock_provider "http" {\n}\n'
+        self.assertEqual(_unmocked(text, ["google", "http"]), ["google"])
+        both = 'mock_provider "google" {\n  alias = "offline"\n}\nmock_provider "google" {}\n'
+        self.assertEqual(_unmocked(both, ["google"]), [])
 
     def test_an_indented_mock_block_counts(self):
         text = '  mock_provider "google-beta" {\n  }\n'
         self.assertEqual(_unmocked(text, ["google-beta"]), [])
+
+    def test_a_json_test_file_is_read_as_json(self):
+        text = '{"mock_provider": {"google": {}, "http": [{"alias": "x"}, {}]}, "run": {"x": {"command": "plan"}}}'
+        self.assertEqual(_unmocked(text, ["google", "http"], "b.tftest.json"), [])
+        aliased = '{"mock_provider": {"google": {"alias": "x"}}}'
+        self.assertEqual(_unmocked(aliased, ["google"], "b.tftest.json"), ["google"])
+        self.assertEqual(_unmocked('{"run": {"x": {}}}', ["google"], "b.tftest.json"), ["google"])
+        self.assertEqual(_unmocked("", ["google"], "b.tftest.json"), ["google"])
+
+    def test_a_test_file_beside_tests_runs_and_one_without_tests_does_not(self):
+        parents = (self.root / "terraform" / "modules",)
+        with_tests = self.root / "terraform" / "modules" / "m"
+        (with_tests / _TESTS_DIR).mkdir(parents=True)
+        (with_tests / _TESTS_DIR / "a.tftest.hcl").write_text("")
+        (with_tests / _TESTS_DIR / "b.tftest.json").write_text("{}")
+        (with_tests / _TESTS_DIR / "notes.md").write_text("")
+        (with_tests / "c.tftest.hcl").write_text("")
+        without_tests = self.root / "terraform" / "modules" / "n"
+        without_tests.mkdir()
+        (without_tests / "d.tftest.hcl").write_text("")
+        self.assertEqual(
+            [p.name for p in _suites(parents)[with_tests]],
+            ["c.tftest.hcl", "a.tftest.hcl", "b.tftest.json"],
+        )
+        self.assertEqual(_unreached_test_files(self.root, parents), [without_tests / "d.tftest.hcl"])
 
     def test_a_test_file_outside_the_reached_set_is_reported(self):
         parents = (self.root / "terraform" / "modules",)
@@ -377,6 +558,11 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         (stray / "a.tftest.hcl").write_text("")
         (repo / "terraform" / "modules").mkdir(parents=True)
         self.assertEqual(_unreached_test_files(repo, parents), [stray / "a.tftest.hcl"])
+
+    def test_the_recipe_body_is_what_is_read_not_the_help_line(self):
+        makefile = "x: ## run terraform test\n\tterraform init\n\ntf: ## nothing\n\tterraform test\n"
+        self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "x"))
+        self.assertIn(_TEST_COMMAND, _recipe_body(makefile, "tf"))
 
 
 if __name__ == "__main__":
