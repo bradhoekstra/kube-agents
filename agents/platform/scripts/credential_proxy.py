@@ -35,7 +35,6 @@ import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -400,7 +399,10 @@ RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
 LOG_LEVEL_ENV = "LOG_LEVEL"
 DEFAULT_LOG_LEVEL = "INFO"
 EXIT_STARTUP_FAILURE = 1
-MICROSECONDS_PER_MILLISECOND = 1000
+# The record time as Cloud Logging and every log backend parse it without a
+# format string: UTC to the millisecond, `Z` suffix; formatTime's two halves.
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
+LOG_MSEC_FORMAT = "%s.%03dZ"
 
 
 def is_valid_repository(repository: Any) -> bool:
@@ -1315,6 +1317,17 @@ class AgentAPIProxyHandler(BaseHTTPRequestHandler):
     upstream_port = 8642
     max_request_bytes = 10 * 1024 * 1024
     protocol_version = "HTTP/1.1"
+
+    def handle_one_request(self) -> None:
+        # The guard the credentialed and metrics handlers carry: a peer that
+        # resets while its request line is read, or while a 401 is on its
+        # way, is a debug line and a closed connection, not a handler fault
+        # for the server's error hook to log with a traceback.
+        try:
+            super().handle_one_request()
+        except OSError as exc:
+            self.close_connection = True
+            LOGGER.debug("api request not answered type=%s", type(exc).__name__)
 
     def do_GET(self) -> None:  # noqa: N802
         self._proxy()
@@ -5380,12 +5393,6 @@ def _tool_labels(argv: list[str]) -> tuple[str, str]:
     return tool, LABEL_OTHER
 
 
-def _iso_utc(created: float) -> str:
-    """A log record's time in UTC to the millisecond with a Z suffix."""
-    moment = datetime.fromtimestamp(created, tz=timezone.utc)
-    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // MICROSECONDS_PER_MILLISECOND:03d}Z"
-
-
 class JsonLineFormatter(logging.Formatter):
     """One JSON object per record, on one line, for Cloud Logging and a SIEM behind it.
 
@@ -5398,10 +5405,14 @@ class JsonLineFormatter(logging.Formatter):
     trail depends on holds by construction rather than by sanitising each site.
     """
 
+    converter = time.gmtime
+    default_time_format = LOG_TIME_FORMAT
+    default_msec_format = LOG_MSEC_FORMAT
+
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {
             LOG_SEVERITY_KEY: record.levelname,
-            LOG_TIMESTAMP_KEY: _iso_utc(record.created),
+            LOG_TIMESTAMP_KEY: self.formatTime(record),
             LOG_LOGGER_KEY: record.name,
             LOG_MESSAGE_KEY: record.getMessage(),
         }
@@ -5959,10 +5970,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         # audited under the same two labels, and a refused executable is
         # counted as `other` rather than under its own name.
         tool_label, subcommand_label = _tool_labels(argv)
-        # 512 rather than the default 64: this value comes from the
-        # TokenReview, not from the request, and a truncated identity is
-        # an audit line that names the wrong ServiceAccount.
-        principal_label = _sanitize_for_logging(principal.describe(), max_length=512)
+        # PRINCIPAL_LOG_LENGTH rather than the default 64: this value comes
+        # from the TokenReview, not from the request, and a truncated identity
+        # is an audit line that names the wrong ServiceAccount.
+        principal_label = _sanitize_for_logging(principal.describe(), max_length=PRINCIPAL_LOG_LENGTH)
 
         def audit(status: str, **fields: Any) -> dict[str, Any]:
             return {AUDIT_EXTRA_KEY: _tool_audit(status, request_id, principal_label, tool_label, subcommand_label, **fields)}

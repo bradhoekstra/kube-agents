@@ -406,19 +406,41 @@ class ListenerFaultsAreJsonTest(_BrokerWithJsonLog):
         )
         self.assertIn("handler bug", faults[0]["exception"])
 
+    @staticmethod
+    def _reset_mid_request(port, partial_request_line):
+        # A reset rather than a close: the read in progress fails instead of
+        # ending with a short line, which is the case the guards are for.
+        peer = socket.create_connection(("127.0.0.1", port))
+        peer.sendall(partial_request_line)  # the rest never comes
+        peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        peer.close()
+
     def test_a_peer_that_resets_mid_request_is_a_debug_line(self):
         credential_proxy.LOGGER.setLevel(logging.DEBUG)
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
-            peer = socket.create_connection(("127.0.0.1", self.server.server_port))
-            peer.sendall(b"POST /v1/ex")  # part of a request line; the rest never comes
-            # A reset rather than a close: the read in progress fails instead of
-            # ending with a short line, which is the case the guard is for.
-            peer.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-            peer.close()
+            self._reset_mid_request(self.server.server_port, b"POST /v1/ex")
             self._wait_for_line("request not answered")
         self.assertEqual("", stderr.getvalue())
         self.assertIn("request not answered type=ConnectionResetError", [r["message"] for r in self.records()])
+
+    def test_a_reset_on_the_api_proxy_listener_is_a_debug_line_too(self):
+        # The third handler in the process, on the listener the Service
+        # targets in the combined role: its server has the error hook too, so
+        # without its own guard a client reset would be logged as a fault.
+        credential_proxy.LOGGER.setLevel(logging.DEBUG)
+        proxy = credential_proxy.ThreadingTCPHTTPServer(("127.0.0.1", 0), credential_proxy.AgentAPIProxyHandler)
+        threading.Thread(target=proxy.serve_forever, daemon=True).start()
+        self.addCleanup(proxy.server_close)
+        self.addCleanup(proxy.shutdown)
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self._reset_mid_request(proxy.server_port, b"GET /hea")
+            self._wait_for_line("api request not answered")
+        self.assertEqual("", stderr.getvalue())
+        records = self.records()
+        self.assertIn("api request not answered type=ConnectionResetError", [r["message"] for r in records])
+        self.assertEqual([], [r["message"] for r in records if r["severity"] == "ERROR"])
 
 
 class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
@@ -516,9 +538,6 @@ class HostileInputUnderTheJsonFormatterTest(unittest.TestCase):
         self.assertTrue(any("someone-else" in line for line in lines), "the request line is still logged, inside its record")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class StartupRefusalIsJsonTest(unittest.TestCase):
     """A refusal to start is one ERROR record on the JSON log with the traceback
@@ -576,3 +595,7 @@ class StartupRefusalIsJsonTest(unittest.TestCase):
         self.assertTrue(records, completed.stdout)
         self.assertEqual("credential proxy failed to start type=RuntimeError", records[-1]["message"])
         self.assertIn("'bogus'", records[-1]["exception"])
+
+
+if __name__ == "__main__":
+    unittest.main()

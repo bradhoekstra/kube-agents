@@ -2439,8 +2439,9 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 // translated to Go's, since the two engines agree on everything else in it.
 // Those lines are frozen here: the test holds the regex to the format as
 // sampled and cannot notice a Hermes release that changes it. That check is a
-// live one after an agent image change (jsonPayload.event_type in Logs
-// Explorer; the observability page says so).
+// live one after an agent image change: jsonPayload.audit_event in Logs
+// Explorer, a key the broker's own records do not carry, as the observability
+// page says.
 func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
 	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
