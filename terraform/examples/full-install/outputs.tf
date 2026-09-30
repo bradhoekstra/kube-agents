@@ -156,7 +156,7 @@ output "scope_selector_members" {
 }
 
 output "scope_bound_projects" {
-  description = "Every project beyond project_id the IAM module bound scope_roles in: the explicit projects, the selectors' members less an exact exclude entry, and each Metrics Scope scoping project."
+  description = "Every project beyond project_id the IAM module bound scope_roles in: the explicit projects, the selectors' members less a Shared VPC service project an exclude entry names by ID (a monitored project excluded by number is never resolved, and one excluded by ID keeps its grant), and each Metrics Scope scoping project."
   value       = module.kube_agents_iam.scope_bound_projects
 }
 

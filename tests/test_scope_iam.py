@@ -573,9 +573,15 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         # (design §4); one that names a folder or organisation needs it on.
         self.assertIn('scope_apis = length(var.scope.folders) + length(var.scope.organizations) > 0 ? [\n    "cloudasset.googleapis.com",\n  ] : []',
                       self.main_tf)
-        self.assertIn("required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis))",
+        self.assertIn("required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis, local.selector_apis))",
                       self.main_tf)
         self.assertNotIn('"cloudasset.googleapis.com"', re.search(r"base_apis = \[(.*?)\]", self.main_tf, re.DOTALL).group(1))
+        # The Compute API, which the resolver's getXpnResources read and the reconcile's host
+        # lookup use, is enabled when a Shared VPC host is declared, so the composition owns
+        # every API the selectors' reads use, as the installer's pre-enablement assumes.
+        self.assertIn('selector_apis = length(var.scope.shared_vpc_hosts) > 0 ? [\n    "compute.googleapis.com",\n  ] : []', self.main_tf)
+        self.assertIn("local.scope_apis, local.selector_apis))", self.main_tf)
+        self.assertNotIn('"compute.googleapis.com"', re.search(r"base_apis = \[(.*?)\]", self.main_tf, re.DOTALL).group(1))
 
 
 if __name__ == "__main__":

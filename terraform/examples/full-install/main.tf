@@ -29,6 +29,16 @@ locals {
   scope_apis = length(var.scope.folders) + length(var.scope.organizations) > 0 ? [
     "cloudasset.googleapis.com",
   ] : []
+  # Only when a Shared VPC host is declared: the resolver's getXpnResources read
+  # at plan time and the reconcile's lookup of the host's service projects use
+  # the Compute API in project_id (a Metrics Scope's reads use the Monitoring
+  # and Resource Manager APIs, in base_apis). A project that hosts a GKE
+  # cluster has it on already; naming it here is what makes the composition own
+  # every API the selectors' reads use, as the installer's pre-enablement and
+  # the documents say it does.
+  selector_apis = length(var.scope.shared_vpc_hosts) > 0 ? [
+    "compute.googleapis.com",
+  ] : []
 
   use_vertex     = var.model_provider == "vertex_ai"
   vertex_project = var.vertex_project_id != "" ? var.vertex_project_id : var.project_id
@@ -53,7 +63,7 @@ locals {
   github_org        = length(local.github_repo_parts) == 2 ? local.github_repo_parts[0] : ""
   github_repo_name  = length(local.github_repo_parts) == 2 ? local.github_repo_parts[1] : ""
 
-  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis))
+  required_apis = toset(concat(local.base_apis, local.pubsub_apis, local.chat_apis, local.scope_apis, local.selector_apis))
 
   # The agent's GCP IAM permission-set bundle, kept verbatim so the two install
   # paths hand the agent the same authority. Kubernetes RBAC is read-only
