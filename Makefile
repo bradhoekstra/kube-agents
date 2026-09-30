@@ -647,7 +647,7 @@ tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for 
 # (tests/test_scope_iam.py pins the text; these pin the behaviour). A module
 # without tests/ is skipped, and a new module's tests/ is reached with no
 # edit here; tests/test_terraform_module_tests.py pins the loop and the step.
-terraform-test: ## Run each terraform/modules/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform).
+terraform-test: ## Run each terraform/modules/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
 	@set -e; for dir in terraform/modules/*/; do \
 	  if [ -d "$$dir/tests" ]; then \
 	    echo "Testing $$dir..."; \

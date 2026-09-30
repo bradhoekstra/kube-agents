@@ -1,7 +1,10 @@
 # What the two selectors resolve to, from the documents the APIs answer.
 # Every read is overridden, and both providers are mocked so a read this
 # file forgets to override fails on a mocked answer rather than reaching the
-# network.
+# network. Conditions read the module's locals and outputs, never a
+# data.http instance: its request_headers carry the provider token, so the
+# value is marked sensitive and a failing assertion that references it
+# crashes Terraform's diagnostic renderer instead of printing the message.
 
 mock_provider "google" {}
 mock_provider "http" {}
@@ -25,8 +28,8 @@ run "no_selector_makes_no_read" {
     error_message = "with no selector declared, nothing resolves: ${jsonencode(output.members)}"
   }
   assert {
-    condition     = length(data.google_client_config.scope_resolver) == 0 && length(data.http.scope_shared_vpc_host) == 0 && length(data.http.scope_metrics_scope) == 0
-    error_message = "with no selector declared, no token is fetched and no read is made"
+    condition     = !local.scope_resolves_selectors && length(local.scope_monitored_numbers) == 0
+    error_message = "with no selector declared, the gate every read and the token fetch hang on is closed, and there is no number to name"
   }
 }
 
@@ -71,8 +74,8 @@ run "each_selector_resolves_to_its_members" {
     error_message = "every member here is an ID the scope can carry: ${jsonencode(output.uncarriable_members)}"
   }
   assert {
-    condition     = toset(keys(data.http.scope_monitored_project)) == toset(["100000000001", "100000000002"])
-    error_message = "one naming read per monitored number: ${jsonencode(keys(data.http.scope_monitored_project))}"
+    condition     = local.scope_monitored_numbers == toset(["100000000001", "100000000002"])
+    error_message = "one naming read per monitored number: ${jsonencode(local.scope_monitored_numbers)}"
   }
 }
 

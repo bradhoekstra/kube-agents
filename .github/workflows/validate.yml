@@ -502,8 +502,8 @@ jobs:
       # The scope modules carry `terraform test` suites under tests/, run
       # against mocked providers, so a plan-time rule (a precondition, a
       # postcondition on a read, the bindings a declaration plans) is
-      # exercised rather than grepped for. Reuses the modules the loop above
-      # initialised; tests/test_terraform_module_tests.py pins this step.
+      # exercised rather than grepped for. Reuses the provider cache the loop
+      # above warmed; tests/test_terraform_module_tests.py pins this step.
       - name: Run Terraform module tests
         run: make terraform-test
 

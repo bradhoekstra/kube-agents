@@ -50,8 +50,8 @@ run "a_legacy_id_member_is_left_out_and_warned" {
     error_message = "uncarriable: ${jsonencode(output.uncarriable_members)}"
   }
   assert {
-    condition     = length(data.http.scope_monitored_project) == 1
-    error_message = "a member the API named by an ID has no number to name"
+    condition     = length(local.scope_monitored_numbers) == 1
+    error_message = "a member the API named by an ID has no number to name: ${jsonencode(local.scope_monitored_numbers)}"
   }
 
   expect_failures = [check.selector_members_the_scope_can_carry]

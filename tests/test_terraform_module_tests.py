@@ -17,13 +17,18 @@ import unittest
 
 import yaml
 
+try:
+    from tests.test_shellcheck_gate_wiring import _JOB_ID, _run_lines
+except ImportError:  # run from inside tests/
+    from test_shellcheck_gate_wiring import _JOB_ID, _run_lines
+
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MODULES_DIR = _REPO_ROOT / "terraform" / "modules"
 _MAKEFILE = _REPO_ROOT / "Makefile"
 _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "validate.yml"
 
-#: The job on main's required-status-checks list; the step gates only there.
-_JOB_ID = "validate"
+#: `_JOB_ID` and `_run_lines` are the shellcheck wiring test's: the same job
+#: on main's required-status-checks list, read the same way.
 _TARGET = "terraform-test"
 _GATE_COMMAND = f"make {_TARGET}"
 
@@ -34,8 +39,9 @@ _RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
 _LOOP_GLOB = "for dir in terraform/modules/*/; do"
 _TEST_COMMAND = "terraform test"
 
-#: A provider a module declares, and the block a test file needs for it.
-_REQUIRED_PROVIDER = re.compile(r"^\s*(\w+) = \{\s*$", re.MULTILINE)
+#: A provider a module declares (`google-beta` included, hence the hyphen),
+#: and the block a test file needs for it.
+_REQUIRED_PROVIDER = re.compile(r"^\s*([\w-]+) = \{\s*$", re.MULTILINE)
 _MOCK_PROVIDER = 'mock_provider "{provider}"'
 _TEST_FILE_GLOB = "tests/*.tftest.hcl"
 _VERSIONS_FILE = "versions.tf"
@@ -53,10 +59,6 @@ def _declared_providers(module: pathlib.Path) -> list:
     text = (module / _VERSIONS_FILE).read_text()
     block = text[text.index("required_providers"):]
     return _REQUIRED_PROVIDER.findall(block)
-
-
-def _run_lines(step: dict) -> list:
-    return [line.strip() for line in str(step.get("run", "")).splitlines()]
 
 
 class TerraformModuleTestsWiringTest(unittest.TestCase):

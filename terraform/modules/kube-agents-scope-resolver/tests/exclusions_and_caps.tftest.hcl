@@ -38,8 +38,8 @@ run "one_past_the_cap_less_an_exact_exclude_fits" {
   }
 
   assert {
-    condition     = !contains(keys(data.http.scope_monitored_project), "100000000001") && length(data.http.scope_monitored_project) == 100
-    error_message = "an excluded number is not named; the other hundred are: ${jsonencode(keys(data.http.scope_monitored_project))}"
+    condition     = !contains(local.scope_monitored_numbers, "100000000001") && length(local.scope_monitored_numbers) == 100
+    error_message = "an excluded number is not named; the other hundred are: ${jsonencode(local.scope_monitored_numbers)}"
   }
   assert {
     condition     = length(output.members["sharedVpcHosts/host-proj-1"]) == 101 && contains(output.members["sharedVpcHosts/host-proj-1"], "svc-proj-0001")

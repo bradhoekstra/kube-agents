@@ -67,4 +67,5 @@ case reaches an API: what each selector resolves to from the documents the APIs 
 answers the postconditions refuse (a read the identity cannot make, a document that is not the one
 read, a second page, a selector past the per-selector cap), and what an exclude entry or a legacy
 ID leaves out. `make terraform-test` runs them, as the `validate` workflow does on every pull
-request.
+request; `mock_provider` needs Terraform 1.7 or newer, above the floor the module declares for an
+install.

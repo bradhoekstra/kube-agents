@@ -1,8 +1,11 @@
 # Which projects the scope binds, and with what: the allowlist intersected
 # with project_roles in each project a declaration reaches, the scoping
 # project and a lookup-only host included, and nothing in the management
-# project, which carries project_roles already. The provider is mocked, so a
-# plan here binds nothing anywhere.
+# project, which carries project_roles already. The role set itself is read
+# from local.scope_roles rather than spelled out, so a role added to the
+# allowlist and the default list together changes nothing here; the
+# repository's tests/test_scope_iam.py pins the allowlist's contents. The
+# provider is mocked, so a plan here binds nothing anywhere.
 
 mock_provider "google" {}
 
@@ -18,15 +21,8 @@ run "an_explicit_project_carries_the_intersected_allowlist" {
   }
 
   assert {
-    condition = toset(keys(google_project_iam_member.scope_roles)) == toset([
-      "team-alpha/roles/container.clusterViewer",
-      "team-alpha/roles/container.viewer",
-      "team-alpha/roles/compute.viewer",
-      "team-alpha/roles/monitoring.viewer",
-      "team-alpha/roles/logging.viewer",
-      "team-alpha/roles/iam.securityReviewer",
-    ])
-    error_message = "the six read roles in team-alpha and nothing in the management project: ${jsonencode(keys(google_project_iam_member.scope_roles))}"
+    condition     = length(local.scope_roles) > 0 && toset(keys(google_project_iam_member.scope_roles)) == toset([for role in local.scope_roles : "team-alpha/${role}"])
+    error_message = "every allowlist role in team-alpha and nothing in the management project: ${jsonencode(keys(google_project_iam_member.scope_roles))}"
   }
 }
 
@@ -48,7 +44,7 @@ run "a_custom_role_set_is_intersected_with_the_allowlist" {
     error_message = "bindings: ${jsonencode(keys(google_project_iam_member.scope_roles))}"
   }
   assert {
-    condition     = contains(keys(google_project_iam_member.agent_roles), "roles/container.admin") || anytrue([for key in keys(google_project_iam_member.agent_roles) : strcontains(key, "roles/container.admin")])
+    condition     = contains(keys(google_project_iam_member.agent_roles), "roles/container.admin")
     error_message = "roles/container.admin is still granted in the management project: ${jsonencode(keys(google_project_iam_member.agent_roles))}"
   }
 }
@@ -75,8 +71,8 @@ run "a_metrics_scope_binds_its_members_and_its_scoping_project_however_excluded"
     error_message = "bound projects: ${jsonencode(distinct([for binding in values(google_project_iam_member.scope_roles) : binding.project]))}"
   }
   assert {
-    condition     = length(google_project_iam_member.scope_roles) == 12
-    error_message = "six roles in each of two projects, ${length(google_project_iam_member.scope_roles)} bindings planned"
+    condition     = length(google_project_iam_member.scope_roles) == 2 * length(local.scope_roles)
+    error_message = "the allowlist in each of two projects, ${length(google_project_iam_member.scope_roles)} bindings planned"
   }
 }
 
@@ -113,15 +109,7 @@ run "a_shared_vpc_host_binds_its_service_projects_and_itself_for_the_lookup" {
   }
 
   assert {
-    condition = toset(keys(google_project_iam_member.scope_roles)) == toset([
-      "svc-proj-2/roles/container.clusterViewer",
-      "svc-proj-2/roles/container.viewer",
-      "svc-proj-2/roles/compute.viewer",
-      "svc-proj-2/roles/monitoring.viewer",
-      "svc-proj-2/roles/logging.viewer",
-      "svc-proj-2/roles/iam.securityReviewer",
-      "host-proj-1/roles/compute.viewer",
-    ])
+    condition     = toset(keys(google_project_iam_member.scope_roles)) == setunion(toset([for role in local.scope_roles : "svc-proj-2/${role}"]), toset(["host-proj-1/roles/compute.viewer"]))
     error_message = "bindings: ${jsonencode(keys(google_project_iam_member.scope_roles))}"
   }
 }
@@ -140,7 +128,7 @@ run "a_host_in_scope_projects_carries_the_allowlist_once" {
   }
 
   assert {
-    condition     = length(google_project_iam_member.scope_roles) == 6 && alltrue([for binding in values(google_project_iam_member.scope_roles) : binding.project == "host-proj-1"])
+    condition     = length(google_project_iam_member.scope_roles) == length(local.scope_roles) && alltrue([for binding in values(google_project_iam_member.scope_roles) : binding.project == "host-proj-1"])
     error_message = "bindings: ${jsonencode(keys(google_project_iam_member.scope_roles))}"
   }
   assert {
@@ -200,7 +188,7 @@ run "a_project_named_twice_is_bound_once" {
   }
 
   assert {
-    condition     = length(google_project_iam_member.scope_roles) == 12
+    condition     = length(google_project_iam_member.scope_roles) == 2 * length(local.scope_roles)
     error_message = "${length(google_project_iam_member.scope_roles)} bindings planned for two projects"
   }
 }
@@ -215,11 +203,11 @@ run "a_folder_carries_the_allowlist_plus_cloudasset_viewer" {
   }
 
   assert {
-    condition     = length(google_folder_iam_member.scope_roles) == 7 && contains(keys(google_folder_iam_member.scope_roles), "123456789012/roles/cloudasset.viewer")
+    condition     = length(google_folder_iam_member.scope_roles) == length(local.scope_roles) + 1 && contains(keys(google_folder_iam_member.scope_roles), "123456789012/roles/cloudasset.viewer")
     error_message = "folder bindings: ${jsonencode(keys(google_folder_iam_member.scope_roles))}"
   }
   assert {
-    condition     = length(google_organization_iam_member.scope_roles) == 7 && contains(keys(google_organization_iam_member.scope_roles), "987654321098/roles/cloudasset.viewer")
+    condition     = length(google_organization_iam_member.scope_roles) == length(local.scope_roles) + 1 && contains(keys(google_organization_iam_member.scope_roles), "987654321098/roles/cloudasset.viewer")
     error_message = "organization bindings: ${jsonencode(keys(google_organization_iam_member.scope_roles))}"
   }
   assert {

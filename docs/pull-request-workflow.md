@@ -220,6 +220,12 @@ the source the flagged line was reached from; the after run reports none. Quote 
 **Testing**. The pack `--download` resolves can differ from the one the hosted analysis ran, so the
 code-scanning tab on the merged head is still the final check.
 
+**Terraform modules.** If you change a module under `terraform/modules/` that has a `tests/`
+directory, run `make terraform-test`. It runs each such module's `terraform test` suite against
+mocked providers, so it needs no credentials and reaches no API, but it needs Terraform 1.7 or
+newer for `mock_provider`, above the 1.5 floor the modules and the installer declare; the
+`validate` job runs it on the version it pins. `make verify` below does not include it.
+
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
 and test, the Python suites, the conformance suite. The per-area targets it wraps, for a faster
 loop while you work:

@@ -4,7 +4,7 @@
 mechanics behind it — the full set of homes, what runs each one, and the traps that make a
 misplaced test look fine.
 
-## The twelve homes
+## The homes
 
 | What you are testing                                                                       | Where it goes                                                                                | What runs it                                                                                                                                                                                                                                                                                                                                                                                                                                                  | On a pull request                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -138,8 +138,10 @@ the individual targets to run when you have touched a given area.
 
 Per-tier detail lives with each tier: [`bench/cuj/README.md`](../bench/cuj/README.md) for adding a
 journey, [`tests/integration/README.md`](../tests/integration/README.md) for the seam tier,
-[`tests/e2e/README.md`](../tests/e2e/README.md) for the release gate, and
-[`bench/README.md`](../bench/README.md) for running the evals that already exist.
+[`tests/e2e/README.md`](../tests/e2e/README.md) for the release gate,
+[`bench/README.md`](../bench/README.md) for running the evals that already exist, and each Terraform
+module's README (`terraform/modules/kube-agents-iam/README.md`,
+`terraform/modules/kube-agents-scope-resolver/README.md`) for what its `terraform test` suite covers.
 
 For an eval case, [`bench-case-format.md`](designs/bench-case-format.md) is the contract and this
 page does not restate it. It rules on what a `task.yaml` must carry — the `id`, the mandatory
