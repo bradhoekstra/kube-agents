@@ -271,7 +271,7 @@ project's enabled APIs and enables whichever of the ones the declared selectors 
 gcloud's active account, like the KMS enablement beside it: nothing is called when they are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
 warning, since the plan reports a disabled API with the same command as its remedy. The
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
-with the command while one of the three is off (a dry run enables nothing, and its plan would
+with the command while an API a declared selector reads is off (a dry run enables nothing, and its plan would
 otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
 because an existing install has them on. The reconcile lists at most 100 projects of the resolved
 set, the management project included, so a declaration whose management project, `SCOPE_PROJECTS`
