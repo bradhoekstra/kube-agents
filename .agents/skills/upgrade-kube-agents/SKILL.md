@@ -94,8 +94,8 @@ default, and there the flag is the only way to name a revision.
 Two flags change what the run targets, and both read differently depending on whether the copy of
 the script carries a baked version. A release copy's version is in place before any flag is parsed,
 with one exception: `upgrade.sh` in a checkout of a release line (`release/<X.Y>`) that has moved
-past its latest release, with that release's tag fetched, carries the release's version but is not
-the release, so run from there it drops the baked default, says which line and commit it is on, and
+past its latest release, with that release's tag and full history fetched, carries the release's
+version but is not the release, so run from there it drops the baked default, says which line and commit it is on, and
 behaves as a copy with no baked version below (asks for `--image-tag`, accepts `--keep-image-tag`,
 plans at the installed tag):
 

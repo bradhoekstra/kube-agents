@@ -1499,6 +1499,10 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertEqual(off.stdout.strip().splitlines()[0], "0.2.0")
             self.assertNotEqual(off.returncode, 0)
             self.assertIn("mismatch", off.stdout + off.stderr)
+            # Tag present, history complete, own script running: no fetch would change
+            # the answer, and the hint does not name one.
+            self.assertIn("neither that release's commit nor a descendant of it", off.stdout + off.stderr)
+            self.assertNotIn("git fetch", off.stdout + off.stderr)
 
     def test_a_line_checkout_in_a_release_named_directory_still_defaults_to_its_head(self):
         """The archive-directory rule (step 3) must not hand the release back once the
@@ -1524,6 +1528,13 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             proc = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; default_image_tag "."; default_image_tag_label "."', cwd=repo_path)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip().splitlines(), ["0.2.0", "official release 0.2.0"])
+            # The refusal that follows says the running script is not this checkout's,
+            # not to fetch anything: the tags are here.
+            piped = self._run_install_func('BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "." "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(piped.returncode, 0)
+            self.assertIn("is not this checkout's", piped.stdout + piped.stderr)
+            self.assertIn("run its own ./install.sh", piped.stdout + piped.stderr)
+            self.assertNotIn("git fetch", piped.stdout + piped.stderr)
             # Standing in a checkout that lacks the tag, the piped installer's refusal
             # does not tell the operator their checkout's scripts carry the release.
             git("tag", "-d", "0.2.0")

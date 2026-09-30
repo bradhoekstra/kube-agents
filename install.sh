@@ -1065,12 +1065,15 @@ baked_version_of_tree() {
 }
 
 # What stands between such a tree and being recognised, for the refusals that
-# follow: the release's tag not fetched, or a shallow history the ancestry walk
-# cannot cross (a `--depth 1` clone of the line, which `git fetch --tags` alone
-# does not mend). Printed only for a tree whose own install.sh carries the
+# follow, mirroring checkout_is_past_baked_release's conditions: the release's
+# tag not fetched, or a shallow history the ancestry walk cannot cross (a
+# `--depth 1` clone of the line, which `git fetch --tags` alone does not mend);
+# else a running install.sh that is not the tree's own (piped, or run from
+# elsewhere); else a HEAD that does not descend from the release, which no
+# fetch mends. Printed only for a tree whose own install.sh carries the
 # version; the caller checks that.
 release_line_recognition_hint() {
-  local repo_dir="${1:-.}" head_commit remedies=""
+  local repo_dir="${1:-.}" head_commit remedies="" script_path="${BASH_SOURCE[0]:-}" script_dir=""
   head_commit="$(git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo "")"
   if ! git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" >/dev/null 2>&1; then
     remedies="fetch the tags (git fetch --tags)"
@@ -1078,7 +1081,22 @@ release_line_recognition_hint() {
   if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
     remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
   fi
-  print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies:-fetch the tags (git fetch --tags)} so the release it descends from can be recognised, or pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images."
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
+  fi
+  local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
+  if [ -n "$remedies" ]; then
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit. If it is a checkout of a release line, ${remedies} so the release it descends from can be recognised, or ${own_images}."
+  elif [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
+    # A piped release installer, or one run from another directory: only the
+    # checkout's own install.sh recognises a release-line checkout.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but it is not that release's commit, and the install.sh running is not this checkout's. If it is a checkout of a release line, run its own ./install.sh, which recognises that, or ${own_images}."
+  else
+    # Tag present, history complete, the checkout's own script running: HEAD
+    # simply does not descend from the release (a cherry-picked or rebased
+    # stamp). No fetch changes that.
+    print_info "This checkout's scripts carry release ${BAKED_RELEASE_VERSION} but ${head_commit:0:7} is neither that release's commit nor a descendant of it, so it is not a release-line checkout past it. Check out tag ${BAKED_RELEASE_VERSION} for the release, or ${own_images}."
+  fi
 }
 
 checkout_is_past_baked_release() {

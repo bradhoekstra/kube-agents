@@ -355,6 +355,17 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             self.assertIn("tag=[0.2.0]", off.stdout)
             refused = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
             self.assertNotEqual(refused.returncode, 0)
+            # The orphan tree carries no stamped script, so no recognition hint at all.
+            self.assertNotIn("release line", refused.stdout + refused.stderr)
+            self.assertNotIn("git fetch", refused.stdout + refused.stderr)
+
+            # On the line, with the tag present, the repository's upgrade.sh is the one
+            # running rather than the fixture's own: the hint names that, not a fetch.
+            git("switch", "-q", "release/0.2")
+            piped = self._run_upgrade_func(f'BAKED_RELEASE_VERSION="0.2.0"; verify_local_source_ref "{repo_path}" "0.2.0"', cwd=repo_path)
+            self.assertNotEqual(piped.returncode, 0)
+            self.assertIn("run its own ./upgrade.sh", piped.stdout + piped.stderr)
+            self.assertNotIn("git fetch", piped.stdout + piped.stderr)
 
     def _run_fixture_upgrade_main(self, repo_path, args):
         """Source the fixture's own stamped copy of this branch's upgrade.sh and run main:
