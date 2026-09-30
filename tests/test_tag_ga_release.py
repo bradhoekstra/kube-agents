@@ -590,7 +590,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             self.assertEqual(git("rev-parse", f"{s1}^1").stdout.strip(), l1)
             self.assertEqual(remote(f"refs/heads/{branch}"), s1)
             self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), s0)
-            self.assertTrue(git("merge-base", "--is-ancestor", s0, s1))
+            self.assertEqual(git("merge-base", "--is-ancestor", s0, s1).returncode, 0)
             self.assertIn(f"Git tag '{MOCK_LINE_PATCH_RELEASE_TAG}' and release line '{branch}' successfully pushed", patch.stdout)
             install = git("show", f"{MOCK_LINE_PATCH_RELEASE_TAG}:install.sh").stdout
             self.assertIn(f'BAKED_RELEASE_VERSION="{MOCK_LINE_PATCH_RELEASE_TAG}"', install)
@@ -687,6 +687,102 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             tag_commit = remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}")
             self.assertEqual(git("rev-parse", f"{tag_commit}^1", cwd=rerun_dir).stdout.strip(), main_commit)
             self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
+        finally:
+            temp_dir.cleanup()
+
+    def _rejected_first_release(self):
+        """A first release whose atomic push the remote rejected, left in the checkout that ran it.
+
+        Returns what the same-checkout re-run tests need: the leftover local tag
+        and line are both at the stamp, and the remote has neither.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        self._populate_valid_release_files(repo_dir)
+        git("add", ".")
+        git("commit", "-m", "feat: populate release files")
+        main_commit = git("rev-parse", "HEAD").stdout.strip()
+        bare_dir = self._bare_origin_for(git, repo_dir)
+        git("push", "--quiet", "origin", "main")
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+        reject_marker = self._install_release_branch_rejecting_hook(git, bare_dir)
+
+        def remote(ref):
+            return git("--git-dir", str(bare_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}").stdout.strip()
+
+        reject_marker.touch()
+        first = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertNotEqual(first.returncode, 0)
+        self.assertIn("rejected by the test hook", first.stderr)
+        reject_marker.unlink()
+        leftover = git("rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip()
+        self.assertEqual(git("rev-parse", f"refs/heads/{branch}").stdout.strip(), leftover)
+        self.assertEqual(git("--git-dir", str(bare_dir), "tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
+        self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", branch).stdout.strip(), "")
+        return repo_dir, git, main_commit, branch, leftover, remote
+
+    def test_a_rejected_push_is_finished_from_the_same_checkout_with_both_refs(self):
+        """The leftover local tag is not proof the remote has it.
+
+        Whether the tag is still to be pushed is read from the remote: a re-run in
+        the checkout the rejected push left its tag in pushes the tag with the
+        line, where a local read would have pushed the line alone and left the
+        remote in the state the atomic push exists to rule out.
+        """
+        repo_dir, git, main_commit, branch, leftover, remote = self._rejected_first_release()
+        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("Reusing existing release commit", rerun.stderr)
+        self.assertNotIn("Idempotent skip", rerun.stdout)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", rerun.stdout)
+        self.assertEqual(remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}"), leftover)
+        self.assertEqual(remote(f"refs/heads/{branch}"), leftover)
+
+        third = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertIn("Nothing to push", third.stdout)
+
+    def test_a_rejected_push_re_run_from_the_same_checkout_stamps_from_the_new_candidate(self):
+        """The leftover tag does not pin a candidate that has moved on.
+
+        The remote lacks the tag, so the local one is recreated at the new stamp
+        rather than refused as "already exists but points to" the old one, which
+        is what lets the re-run stamp from the new head as the runbook says.
+        """
+        repo_dir, git, main_commit, branch, leftover, remote = self._rejected_first_release()
+        (pathlib.Path(repo_dir) / "later.txt").write_text("fix")
+        git("add", "later.txt")
+        git("commit", "-m", "fix: landed after the rejected push")
+        new_candidate = git("rev-parse", "HEAD").stdout.strip()
+        git("push", "--quiet", "origin", "main")
+
+        rerun = self._run_script([MOCK_TARGET_RELEASE_TAG, new_candidate], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("exists only in this checkout", rerun.stdout)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", rerun.stdout)
+        tag_commit = remote(f"refs/tags/{MOCK_TARGET_RELEASE_TAG}")
+        self.assertNotEqual(tag_commit, leftover)
+        self.assertEqual(git("rev-parse", f"{tag_commit}^1").stdout.strip(), new_candidate)
+        self.assertEqual(remote(f"refs/heads/{branch}"), tag_commit)
+
+    def test_a_tag_the_remote_holds_elsewhere_is_refused_by_the_remote_read(self):
+        """A remote tag at another commit is the collision, whatever this checkout holds."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            self._populate_valid_release_files(repo_dir)
+            git("add", ".")
+            git("commit", "-m", "feat: populate release files")
+            main_commit = git("rev-parse", "HEAD").stdout.strip()
+            bare_dir = self._bare_origin_for(git, repo_dir)
+            git("push", "--quiet", "origin", "main")
+            first = git("rev-list", "--max-parents=0", "HEAD").stdout.strip().splitlines()[0]
+            git("--git-dir", str(bare_dir), "tag", MOCK_TARGET_RELEASE_TAG, first)
+
+            proc = self._run_script([MOCK_TARGET_RELEASE_TAG, main_commit], env={"CI": "true", **self._FAKE_RELEASE_REPO}, cwd=repo_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn(f"Tag '{MOCK_TARGET_RELEASE_TAG}' already exists", proc.stderr)
+            self.assertIn(f"points to commit {first}", proc.stderr)
+            self.assertEqual(git("--git-dir", str(bare_dir), "branch", "--list", f"release/{MOCK_TARGET_RELEASE_LINE}").stdout.strip(), "")
         finally:
             temp_dir.cleanup()
 

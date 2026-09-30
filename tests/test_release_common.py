@@ -1558,10 +1558,13 @@ source "{_COMMON_SH}"
         self.assertEqual(absent.returncode, 0, absent.stderr)
         self.assertEqual(absent.stdout.strip(), "absent")
 
+        # In CI a local branch the remote lacks is the leftover of a rejected push,
+        # and reads as absent, with a note; the remote is the only read.
         git("branch", branch, head)
-        local = self._run_common_func(call, env=ci, cwd=repo_dir)
-        self.assertEqual(local.returncode, 0, local.stderr)
-        self.assertEqual(local.stdout.strip(), "local")
+        leftover = self._run_common_func(call, env=ci, cwd=repo_dir)
+        self.assertEqual(leftover.returncode, 0, leftover.stderr)
+        self.assertEqual(leftover.stdout.strip(), "absent")
+        self.assertIn("exists only in this checkout", leftover.stderr)
 
         git("push", str(bare_dir), f"{head}:refs/heads/{branch}")
         remote = self._run_common_func(call, env=ci, cwd=repo_dir)

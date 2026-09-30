@@ -1331,6 +1331,34 @@ release_branch_for_line() {
 # than an empty answer: in CI the remote is the truth about the branch, and a
 # guess of "absent" would let a plain push fast-forward a branch that exists.
 # Arguments: $1 = branch ref (refs/heads/...)
+# Prints the commit a tag points at on the release repository (peeled, so an
+# annotated tag reads as its commit), empty when the remote has no such tag,
+# and fails when the remote cannot be read.
+# Arguments: $1 = tag name
+release_tag_remote_commit() {
+  local tag="${1:-}"
+
+  if [ -z "${tag}" ]; then
+    echo "❌ ERROR: a tag name is required for release_tag_remote_commit." >&2
+    return 1
+  fi
+
+  local remote_url
+  remote_url="$(release_repo_url)"
+
+  local listing
+  if ! listing="$(git ls-remote --tags "${remote_url}" "refs/tags/${tag}" "refs/tags/${tag}^{}" 2>&1)"; then
+    echo "❌ ERROR: Could not read tags of ${remote_url}: ${listing}" >&2
+    return 1
+  fi
+  # The peeled line (`^{}`) is the commit; the plain line is the tag object for an
+  # annotated tag and the commit itself for a lightweight one.
+  local peeled plain
+  peeled="$(awk -v ref="refs/tags/${tag}^{}" '$2 == ref { print $1 }' <<<"${listing}")"
+  plain="$(awk -v ref="refs/tags/${tag}" '$2 == ref { print $1 }' <<<"${listing}")"
+  echo "${peeled:-${plain}}"
+}
+
 release_branch_remote_commit() {
   local branch_ref="${1:-}"
 
@@ -1473,8 +1501,10 @@ validated_rc_tags_at_commit() {
 # (already beyond the release commit, which is where a re-run finds a line that
 # took a merge after the release's push landed: nothing to move), or `absent`. A
 # branch anywhere else is an error naming both commits, and so is a remote that
-# cannot be read. Read-only; ensure_ga_release_refs reads it before anything is
-# pushed.
+# cannot be read. In CI the remote is what is read: a local branch the remote
+# lacks is the leftover of a rejected push and reads as `absent`; off CI the
+# local branch stands in for it. Read-only; ensure_ga_release_refs reads it
+# before anything is pushed.
 # Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
 release_branch_placement() {
   local version="${1:-}"
@@ -1521,6 +1551,9 @@ release_branch_placement() {
     return 1
   }
 
+  local local_sha
+  local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
+
   if is_ci_pipeline; then
     local remote_sha
     remote_sha="$(release_branch_remote_commit "${branch_ref}")" || return 1
@@ -1528,10 +1561,17 @@ release_branch_placement() {
       classify "${remote_sha}" "remote" "on $(get_target_repo)"
       return
     fi
+    # In CI the remote decides. A local branch the remote lacks is what a rejected
+    # atomic push leaves in the checkout that ran it (a fresh checkout has no local
+    # release/ branch at all), and reading it would refuse the re-run once the
+    # candidate has moved on; it is recreated at the release commit instead.
+    if [ -n "${local_sha}" ]; then
+      echo "ℹ️ Release line '${branch}' exists only in this checkout, at ${local_sha:0:7}: left behind by a push that did not land. Recreating it at release commit ${target_full_sha:0:7}." >&2
+    fi
+    echo "absent"
+    return 0
   fi
 
-  local local_sha
-  local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
   if [ -n "${local_sha}" ]; then
     classify "${local_sha}" "local" "locally"
     return
@@ -1549,7 +1589,9 @@ set_release_branch_locally() {
   local placement="${1:-}" branch="${2:-}" branch_ref="${3:-}" target_full_sha="${4:-}"
   case "${placement}" in
     absent)
-      git branch "${branch}" "${target_full_sha}"
+      # --force for the leftover release_branch_placement reads as absent in CI;
+      # git still refuses to move a branch that is checked out.
+      git branch --force "${branch}" "${target_full_sha}"
       ;;
     local | remote | local-past | remote-past) ;;
     remote-candidate | local-candidate)
@@ -1581,8 +1623,9 @@ set_release_branch_locally() {
 # like one that failed at image promotion, reusing the tagged commit, and a
 # line that took a merge in between is already past the release commit and is
 # left where it is. A tag or a line already on the remote at the release commit
-# is skipped, and whichever is missing is pushed alone. Off CI both are set
-# locally and neither is pushed.
+# is skipped, and whichever is missing is pushed alone; "already there" is read
+# from the remote, so a re-run in the checkout a rejected push left its tag in
+# pushes the tag too. Off CI both are set locally and neither is pushed.
 # Arguments: $1 = version, $2 = release commit, $3 = candidate commit
 ensure_ga_release_refs() {
   local version="${1:-}"
@@ -1610,6 +1653,29 @@ ensure_ga_release_refs() {
   local tag_ref="refs/tags/${version}" refspecs=() push_tag="false" push_line="false"
   local existing_tag_sha
   existing_tag_sha="$(git rev-parse --verify --quiet "${tag_ref}^{commit}" 2>/dev/null || true)"
+
+  # In CI the remote decides whether the tag is still to be pushed, not this
+  # checkout: a rejected atomic push leaves the local tag behind (nothing takes it
+  # back, and release_fetch_tags does not prune), and a re-run in the same checkout
+  # that read the local tag as "already there" would push the line alone, which is
+  # the state the atomic push exists to rule out. A local tag the remote lacks is
+  # that leftover, and is recreated at the release commit, which after a merge on
+  # the line is a new stamp. Off CI nothing is pushed and the local tag is what a
+  # dry run inspects, so there the local read stands.
+  if is_ci_pipeline; then
+    local remote_tag_sha
+    remote_tag_sha="$(release_tag_remote_commit "${version}")" || return 1
+    if [ -n "${remote_tag_sha}" ] && [ "${remote_tag_sha}" != "${target_full_sha}" ]; then
+      echo "❌ ERROR: Tag '${version}' already exists on $(get_target_repo) but points to commit ${remote_tag_sha}, not target SHA ${target_full_sha}!" >&2
+      return 1
+    fi
+    if [ -z "${remote_tag_sha}" ] && [ -n "${existing_tag_sha}" ]; then
+      echo "ℹ️ Git tag '${version}' exists only in this checkout, at ${existing_tag_sha:0:7}: left behind by a push that did not land. Recreating it at release commit ${target_full_sha:0:7}."
+      git tag -d "${version}" >/dev/null
+      existing_tag_sha=""
+    fi
+  fi
+
   if [ -n "${existing_tag_sha}" ]; then
     if [ "${existing_tag_sha}" != "${target_full_sha}" ]; then
       echo "❌ ERROR: Tag '${version}' already exists but points to commit ${existing_tag_sha}, not target SHA ${target_full_sha}!" >&2
