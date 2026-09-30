@@ -252,10 +252,12 @@ class ConfigValidationTest(unittest.TestCase):
         # Both comparisons the list feeds are exact against GitHub's `login`,
         # so a decorated or mistyped entry would pass a non-empty check and
         # then match nothing, silently: the shape is what is validated.
-        for good in (["kyber775"], ["a"], ["k-y-b-3"], ["A" * 39]):
+        for good in (["kyber775"], ["a"], ["k-y-b-3"], ["A" * 39], ["a" + "-b" * 19]):
             rr.validate_config({"options": {"robot_accounts": good}})
         rr.validate_config({"options": {}})
-        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7], ["@kyber775"], ["kyber775 "], ["kyber775[bot]"], ["-kyber"], ["kyber-"], ["ky--ber"], ["A" * 40]):
+        # The hyphenated lengths matter: a pattern that counts repetitions rather
+        # than characters lets `a-b-b-…` run to 77 characters.
+        for bad in ("kyber775", [{"login": "kyber775"}], [""], [7], ["@kyber775"], ["kyber775 "], ["kyber775[bot]"], ["-kyber"], ["kyber-"], ["ky--ber"], ["A" * 40], ["a" + "-b" * 20], ["a" + "-b" * 38]):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 rr.validate_config({"options": {"robot_accounts": bad}})
         self.assertEqual(rr.robot_accounts({"options": {"robot_accounts": ["Kyber775"]}}), {"kyber775"})

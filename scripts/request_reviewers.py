@@ -75,12 +75,14 @@ APPROVED_STATE = "APPROVED"
 # life of the pull request and the check-run path would never request a human.
 # A review request outstanding to one of them is not a reviewer already asked.
 ROBOT_ACCOUNTS_OPTION = "robot_accounts"
-# The shape of a GitHub login: up to 39 characters, alphanumeric or single
-# hyphens, neither first nor last. Both comparisons the robot list feeds are
-# exact against the `login` field GitHub returns, so an entry written any
+# The shape of a GitHub login, checked as two rules so each reads as what it
+# is: at most this many characters, and letters, digits and single hyphens
+# with a hyphen neither first nor last. Both comparisons the robot list feeds
+# are exact against the `login` field GitHub returns, so an entry written any
 # other way (`@kyber775`, `kyber775[bot]`, a trailing space) would pass a
 # non-empty check and then match nothing, silently: the validator refuses it.
-GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}")
+GITHUB_LOGIN_MAX_LENGTH = 39
+GITHUB_LOGIN_RE = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*")
 
 # Prow's OWNERS files, read from the checkout the workflow runs in -- the
 # default branch, which is also where Prow reads them. `approvers:` covers the
@@ -145,7 +147,7 @@ def validate_config(config):
     robots = (config.get("options") or {}).get(ROBOT_ACCOUNTS_OPTION)
     if robots is not None and (
         not isinstance(robots, list)
-        or not all(isinstance(login, str) and GITHUB_LOGIN_RE.fullmatch(login) for login in robots)
+        or not all(is_github_login(login) for login in robots)
     ):
         raise ValueError(
             f"options.{ROBOT_ACCOUNTS_OPTION} must be a list of bare GitHub logins "
@@ -160,6 +162,11 @@ def validate_config(config):
 
     for pattern in (config.get("files") or {}):
         glob_to_regex(pattern)
+
+
+def is_github_login(login):
+    """Whether `login` could be a GitHub login: the length as a length, the grammar as a pattern."""
+    return isinstance(login, str) and len(login) <= GITHUB_LOGIN_MAX_LENGTH and GITHUB_LOGIN_RE.fullmatch(login) is not None
 
 
 def robot_accounts(config):
