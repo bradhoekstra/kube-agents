@@ -1441,6 +1441,54 @@ source "{_COMMON_SH}"
         self.assertIn("Dry-run", local.stdout)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), release_commit)
 
+    def test_a_local_line_that_cannot_be_moved_fails_the_run_instead_of_reading_as_moved(self):
+        """The fast-forward is a compare-and-swap, and its failure has to be the run's.
+
+        The ref is held by another writer (a lock file, which is what a concurrent
+        move leaves and what git refuses on) between the placement read and the
+        swap. Before, the swap's failure fell through to the success line and the
+        run went on to push a line that was not at the release commit; now the
+        run stops, says why, takes the tag back, and leaves the line where it was.
+        The absent arm's create is held to the same rule.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        candidate = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+        git("branch", branch, candidate)
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
+        git("add", "stamp.txt")
+        git("commit", "-m", "chore(release): stamp release version 0.2.1")
+        release_commit = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+        lock = pathlib.Path(repo_dir) / ".git" / "refs" / "heads" / "release" / f"{MOCK_TARGET_RELEASE_LINE}.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("")
+
+        proc = self._run_common_func(
+            f'ensure_ga_release_refs "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Could not fast-forward release line", proc.stderr)
+        self.assertNotIn("fast-forwards to release commit", proc.stdout)
+        self.assertIn("taken back from this checkout", proc.stderr)
+        self.assertEqual(git("rev-parse", branch).stdout.strip(), candidate)
+        self.assertEqual(git("tag", "-l", MOCK_LINE_PATCH_RELEASE_TAG).stdout.strip(), "")
+
+        lock.unlink()
+        git("branch", "-D", branch)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("")
+        absent = self._run_common_func(
+            f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"',
+            cwd=repo_dir,
+        )
+        self.assertNotEqual(absent.returncode, 0)
+        self.assertIn("Could not set release line", absent.stderr)
+        self.assertEqual(git("branch", "--list", branch).stdout.strip(), "")
+        self.assertEqual(git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
+
     def test_ensure_ga_release_refs_refuses_to_move_the_checked_out_line(self):
         """update-ref on HEAD's branch would leave the worktree behind at the candidate."""
         temp_dir, repo_dir, git = create_mock_git_repo()

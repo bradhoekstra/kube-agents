@@ -1633,7 +1633,10 @@ set_release_branch_locally() {
     absent)
       # --force for the leftover release_branch_placement reads as absent in CI;
       # git still refuses to move a branch that is checked out.
-      git branch --force "${branch}" "${target_full_sha}"
+      if ! git branch --force "${branch}" "${target_full_sha}"; then
+        echo "❌ ERROR: Could not set release line '${branch}' to release commit ${target_full_sha:0:7} in this checkout; nothing has been pushed." >&2
+        return 1
+      fi
       ;;
     local | remote | local-past | remote-past) ;;
     remote-candidate | local-candidate)
@@ -1641,12 +1644,20 @@ set_release_branch_locally() {
         echo "❌ ERROR: Release line '${branch}' is checked out here; switch to another branch before releasing from it." >&2
         return 1
       fi
+      # A compare-and-swap against the value read here, and a failure is a
+      # failure: the ref moved between the read and the swap, or something else
+      # holds it, and a run that read that as done would push a line that is
+      # not at the release commit.
       local local_sha
       local_sha="$(git rev-parse --verify --quiet "${branch_ref}" 2>/dev/null || true)"
       if [ -n "${local_sha}" ]; then
-        git update-ref "${branch_ref}" "${target_full_sha}" "${local_sha}"
-      else
-        git branch "${branch}" "${target_full_sha}"
+        if ! git update-ref "${branch_ref}" "${target_full_sha}" "${local_sha}"; then
+          echo "❌ ERROR: Could not fast-forward release line '${branch}' from ${local_sha:0:7} to release commit ${target_full_sha:0:7} in this checkout: the ref moved or is held. Nothing has been pushed; re-run." >&2
+          return 1
+        fi
+      elif ! git branch "${branch}" "${target_full_sha}"; then
+        echo "❌ ERROR: Could not create release line '${branch}' at release commit ${target_full_sha:0:7} in this checkout; nothing has been pushed." >&2
+        return 1
       fi
       echo "➡️ Release line '${branch}' fast-forwards to release commit ${target_full_sha:0:7}."
       ;;
