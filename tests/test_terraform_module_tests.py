@@ -66,10 +66,12 @@ _GATE_COMMAND = f"make {_TARGET}"
 #: was written. The command is looked for in the recipe's body, below the
 #: target line, since the help text names it too.
 _RECIPE_LINE = re.compile(rf"^{_TARGET}: ## \S", re.MULTILINE)
-#: A recipe line make or the shell ignores: `#` at column 0 is make's, `#`
-#: after the tab is the shell's, and a trailing backslash carries either
-#: onto the next line.
-_RECIPE_COMMENT = re.compile(r"^\t*#")
+#: A recipe line make or the shell ignores: `#` at column 0 is make's, and
+#: its trailing backslash carries the next line with it; `#` after the tab,
+#: at any indent, is the shell's, which ends at the newline whatever the
+#: line ends with.
+_MAKE_COMMENT = re.compile(r"^#")
+_SHELL_COMMENT = re.compile(r"^\t[ \t]*#")
 _LINE_CONTINUATION = "\\"
 _LOOP_GLOB = "for dir in terraform/modules/*/ terraform/examples/*/; do"
 _TEST_COMMAND = "terraform test"
@@ -175,10 +177,12 @@ def _recipe_body(makefile: str, target: str) -> str:
     and the continuation lines a commented line's trailing backslash
     carries with it."""
     kept = []
-    continuing_comment = False
+    continuing_make_comment = False
     for line in _recipe(makefile, target).split("\n")[1:]:
-        if continuing_comment or _RECIPE_COMMENT.match(line):
-            continuing_comment = line.rstrip().endswith(_LINE_CONTINUATION)
+        if continuing_make_comment or _MAKE_COMMENT.match(line):
+            continuing_make_comment = line.rstrip().endswith(_LINE_CONTINUATION)
+            continue
+        if _SHELL_COMMENT.match(line):
             continue
         kept.append(line)
     return "\n".join(kept)
@@ -766,6 +770,13 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertNotIn(_TEST_COMMAND, _recipe_body(makefile, "t"))
         self.assertIn("@echo done", _recipe_body(makefile, "t"))
         self.assertIn(_VERIFY_LINE, _recipe_body(_MAKEFILE.read_text(), _VERIFY_TARGET))
+        # An indented shell comment inside a loop body is dropped; a shell
+        # comment's trailing backslash carries nothing, so the line after it
+        # still counts.
+        indented = "t: ## t\n\t@for dir in x; do \\\n\t    # (cd $$dir && terraform test) || failed=1; \\\n\t  done\n"
+        self.assertNotIn(_TEST_COMMAND, _recipe_body(indented, "t"))
+        carried = "v: ## v\n\t#@echo x \\\n\t$(MAKE) --no-print-directory terraform-test\n"
+        self.assertIn(_VERIFY_LINE, _recipe_body(carried, "v"))
 
 
 if __name__ == "__main__":
