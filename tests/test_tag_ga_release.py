@@ -534,7 +534,7 @@ class TagGAReleaseScriptTest(unittest.TestCase):
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn(f"Release line '{branch}' already exists on", proc.stderr)
-            self.assertNotIn("CREATING AND PUSHING GA RELEASE GIT TAG", proc.stdout)
+            # The placement is read before the tag is created, locally or remotely.
             self.assertEqual(git("tag", "-l", MOCK_TARGET_RELEASE_TAG).stdout.strip(), "")
             self.assertEqual(git("--git-dir", str(bare_dir), "tag", "-l").stdout.strip(), "")
             remote_branch = git("--git-dir", str(bare_dir), "rev-parse", f"refs/heads/{branch}").stdout.strip()

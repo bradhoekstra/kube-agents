@@ -68,7 +68,7 @@ if [ -n "${RELEASE_LINE}" ]; then
     echo "❌ ERROR: Version '${TARGET_VERSION}' is not on release line ${RELEASE_LINE}." >&2
     exit 1
   fi
-  RC_CANDIDATE_COMMIT="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_COMMIT_INPUT}")" || exit 1
+  RC_CANDIDATE_COMMIT="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_COMMIT_INPUT}" "${TARGET_VERSION}")" || exit 1
   echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${RC_CANDIDATE_COMMIT:0:7}"
 elif [ -n "${TARGET_COMMIT_INPUT}" ] && [ "${TARGET_COMMIT_INPUT}" != "null" ]; then
   if ! RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${TARGET_COMMIT_INPUT}^{commit}" 2>/dev/null)"; then

@@ -1116,7 +1116,7 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
-    # ─── ensure_release_branch ───────────────────────────────────────────────
+    # ─── ensure_ga_release_refs ───────────────────────────────────────────────
     # The GA release commit is pushed to its release line `release/<X.Y>` alongside
     # its tag, so it belongs to a branch on the repository rather than to the tag alone. The
     # contract is ensure_git_tag's, and these pin the two halves of it: the
@@ -1156,32 +1156,32 @@ source "{_COMMON_SH}"
                 proc = self._run_common_func(f'release_branch_for_line "{bad}"')
                 self.assertNotEqual(proc.returncode, 0)
 
-    def test_ensure_release_branch_requires_version_and_commit(self):
-        for call in ("ensure_release_branch", f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}"'):
+    def test_ensure_ga_release_refs_requires_version_and_commit(self):
+        for call in ("ensure_ga_release_refs", f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}"'):
             with self.subTest(call=call):
                 proc = self._run_common_func(call)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("version and release commit are required", proc.stderr)
 
-    def test_ensure_release_branch_off_ci_creates_locally_and_skips_the_push(self):
+    def test_ensure_ga_release_refs_off_ci_creates_locally_and_skips_the_push(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
         head = git("rev-parse", "HEAD").stdout.strip()
         branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
 
-        proc = self._run_common_func(f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"', cwd=repo_dir)
+        proc = self._run_common_func(f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"', cwd=repo_dir)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn(f"Dry-run: Release line '{branch}' set locally", proc.stdout)
+        self.assertIn(f"Dry-run: Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' set locally", proc.stdout)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), head)
         # The caller's checkout is not moved onto the new branch.
         self.assertEqual(git("symbolic-ref", "--short", "HEAD").stdout.strip(), "main")
 
-        again = self._run_common_func(f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"', cwd=repo_dir)
+        again = self._run_common_func(f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"', cwd=repo_dir)
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("Dry-run", again.stdout)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), head)
 
-    def test_ensure_release_branch_refuses_to_move_a_local_branch(self):
+    def test_ensure_ga_release_refs_refuses_to_move_a_local_branch(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
         first = git("rev-parse", "HEAD").stdout.strip()
@@ -1192,12 +1192,12 @@ source "{_COMMON_SH}"
         git("commit", "-m", "feat: next")
         second = git("rev-parse", "HEAD").stdout.strip()
 
-        proc = self._run_common_func(f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{second}"', cwd=repo_dir)
+        proc = self._run_common_func(f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{second}"', cwd=repo_dir)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn(f"Release line '{branch}' already exists locally but points to commit {first}", proc.stderr)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), first)
 
-    def test_ensure_release_branch_in_ci_pushes_to_the_release_repository(self):
+    def test_ensure_ga_release_refs_in_ci_pushes_to_the_release_repository(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
         bare_dir = self._bare_remote_for(git, repo_dir)
@@ -1205,15 +1205,16 @@ source "{_COMMON_SH}"
         branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+            f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
             env={"CI": "true", **self._FAKE_RELEASE_REPO},
             cwd=repo_dir,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn(f"Release line '{branch}' successfully pushed", proc.stdout)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", proc.stdout)
         self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), head)
+        self.assertEqual(git("--git-dir", str(bare_dir), "rev-parse", f"refs/tags/{MOCK_TARGET_RELEASE_TAG}^{{commit}}").stdout.strip(), head)
 
-    def test_ensure_release_branch_in_ci_skips_when_the_remote_already_has_it(self):
+    def test_ensure_ga_release_refs_in_ci_skips_when_the_remote_already_has_it(self):
         """A re-run of the release job must find its first attempt's branch on the remote.
 
         The local checkout has no such branch — a fresh checkout never does — so
@@ -1228,15 +1229,18 @@ source "{_COMMON_SH}"
         self.assertEqual(git("branch", "--list", branch).stdout.strip(), "")
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+            f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
             env={"CI": "true", **self._FAKE_RELEASE_REPO},
             cwd=repo_dir,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"Release line '{branch}' already exists on", proc.stdout)
         self.assertIn("Idempotent skip", proc.stdout)
-        self.assertNotIn("successfully pushed", proc.stdout)
+        # Only the tag was missing, so only the tag is pushed.
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' successfully pushed", proc.stdout)
+        self.assertNotIn("release line '", proc.stdout.split("successfully pushed")[0].split("\n")[-1])
 
-    def test_ensure_release_branch_in_ci_refuses_a_remote_branch_at_another_commit(self):
+    def test_ensure_ga_release_refs_in_ci_refuses_a_remote_branch_at_another_commit(self):
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
         bare_dir = self._bare_remote_for(git, repo_dir)
@@ -1249,7 +1253,7 @@ source "{_COMMON_SH}"
         second = git("rev-parse", "HEAD").stdout.strip()
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{second}"',
+            f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{second}"',
             env={"CI": "true", **self._FAKE_RELEASE_REPO},
             cwd=repo_dir,
         )
@@ -1259,7 +1263,7 @@ source "{_COMMON_SH}"
         # The remote was not force-pushed over.
         self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), first)
 
-    def test_ensure_release_branch_in_ci_fails_closed_when_the_remote_cannot_be_read(self):
+    def test_ensure_ga_release_refs_in_ci_fails_closed_when_the_remote_cannot_be_read(self):
         """An unreadable remote is an error, not "no branch".
 
         `origin` holds the branch at an ancestor of the target, which a plain
@@ -1287,7 +1291,7 @@ source "{_COMMON_SH}"
         second = git("rev-parse", "HEAD").stdout.strip()
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{second}"',
+            f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{second}"',
             env={"CI": "true", **self._FAKE_RELEASE_REPO},
             cwd=repo_dir,
         )
@@ -1296,7 +1300,7 @@ source "{_COMMON_SH}"
         self.assertNotIn("successfully pushed", proc.stdout)
         self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), first)
 
-    def test_ensure_release_branch_in_ci_ignores_a_branch_whose_name_merely_ends_in_the_ref(self):
+    def test_ensure_ga_release_refs_in_ci_ignores_a_branch_whose_name_merely_ends_in_the_ref(self):
         """ls-remote's pattern is tail-matched; the lookup must match the whole ref.
 
         A stray `x/refs/heads/release/<v>` on the remote would otherwise read as
@@ -1315,15 +1319,15 @@ source "{_COMMON_SH}"
         git("switch", "main")
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
+            f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{head}"',
             env={"CI": "true", **self._FAKE_RELEASE_REPO},
             cwd=repo_dir,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn(f"Release line '{branch}' successfully pushed", proc.stdout)
+        self.assertIn(f"Git tag '{MOCK_TARGET_RELEASE_TAG}' and release line '{branch}' successfully pushed", proc.stdout)
         self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), head)
 
-    def test_ensure_release_branch_fast_forwards_a_line_at_the_candidate(self):
+    def test_ensure_ga_release_refs_fast_forwards_a_line_at_the_candidate(self):
         """A patch's stamped commit is a child of the line head; the line moves to it.
 
         In CI the remote holds the line at the candidate; the checkout has no
@@ -1350,7 +1354,7 @@ source "{_COMMON_SH}"
         self.assertEqual(placement.stdout.strip(), "remote-candidate")
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
+            f'ensure_ga_release_refs "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
             env={"CI": "true", **self._FAKE_RELEASE_REPO},
             cwd=repo_dir,
         )
@@ -1371,14 +1375,14 @@ source "{_COMMON_SH}"
         # Off CI: a local line at the candidate moves too, and nothing is pushed.
         git("branch", "-f", branch, candidate)
         local = self._run_common_func(
-            f'ensure_release_branch "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
+            f'ensure_ga_release_refs "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
             cwd=repo_dir,
         )
         self.assertEqual(local.returncode, 0, local.stderr)
         self.assertIn("Dry-run", local.stdout)
         self.assertEqual(git("rev-parse", branch).stdout.strip(), release_commit)
 
-    def test_ensure_release_branch_refuses_to_move_the_checked_out_line(self):
+    def test_ensure_ga_release_refs_refuses_to_move_the_checked_out_line(self):
         """update-ref on HEAD's branch would leave the worktree behind at the candidate."""
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
@@ -1392,7 +1396,7 @@ source "{_COMMON_SH}"
         git("switch", branch)
 
         proc = self._run_common_func(
-            f'ensure_release_branch "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
+            f'ensure_ga_release_refs "{MOCK_LINE_PATCH_RELEASE_TAG}" "{release_commit}" "{candidate}"',
             cwd=repo_dir,
         )
         self.assertNotEqual(proc.returncode, 0)
@@ -1448,6 +1452,71 @@ source "{_COMMON_SH}"
         git("config", f"url.{unreachable}.insteadOf", f"https://github.com/{self._FAKE_RELEASE_REPO['GH_ORG']}/{self._FAKE_RELEASE_REPO['GH_REPO']}.git")
         broken = self._run_common_func('if release_line_branch_exists "0.2"; then echo rc=0; else echo "rc=$?"; fi', env=ci, cwd=repo_dir)
         self.assertIn("rc=2", broken.stdout)
+
+    def test_a_line_already_past_the_release_commit_is_left_alone(self):
+        """A re-run after the push, with a merge landed on the line since: nothing to move.
+
+        The remote holds the tag at the release commit and the line one commit
+        beyond it. Placement says `remote-past`; the run pushes nothing and
+        continues, which is what lets a release that died at image promotion
+        finish. A line at an unrelated commit is still refused.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        bare_dir = self._bare_remote_for(git, repo_dir)
+        candidate = git("rev-parse", "HEAD").stdout.strip()
+        branch = f"release/{MOCK_TARGET_RELEASE_LINE}"
+        ci = {"CI": "true", **self._FAKE_RELEASE_REPO}
+        first = self._run_common_func(f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"', env=ci, cwd=repo_dir)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        git("switch", "-c", "backport", candidate)
+        (pathlib.Path(repo_dir) / "backport.txt").write_text("fix\n")
+        git("add", "backport.txt")
+        git("commit", "-m", "fix: backport")
+        moved = git("rev-parse", "HEAD").stdout.strip()
+        git("push", "--quiet", str(bare_dir), f"HEAD:refs/heads/{branch}")
+        git("switch", "main")
+
+        placement = self._run_common_func(f'release_branch_placement "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"', env=ci, cwd=repo_dir)
+        self.assertEqual(placement.returncode, 0, placement.stderr)
+        self.assertEqual(placement.stdout.strip(), "remote-past")
+        rerun = self._run_common_func(f'ensure_ga_release_refs "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"', env=ci, cwd=repo_dir)
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        self.assertIn("already past release commit", rerun.stdout)
+        self.assertNotIn("successfully pushed", rerun.stdout)
+        self.assertEqual(self._remote_branch_sha(git, bare_dir, branch), moved)
+
+        git("branch", "-f", branch, moved)
+        local = self._run_common_func(f'release_branch_placement "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"', cwd=repo_dir)
+        self.assertEqual(local.stdout.strip(), "local-past")
+
+        # An unrelated history: an orphan commit that descends from nothing here.
+        git("switch", "--orphan", "elsewhere")
+        (pathlib.Path(repo_dir) / "else.txt").write_text("x\n")
+        git("add", "else.txt")
+        git("commit", "-m", "chore: unrelated")
+        git("push", "--quiet", "--force", str(bare_dir), f"HEAD:refs/heads/{branch}")
+        git("switch", "main")
+        refused = self._run_common_func(f'release_branch_placement "{MOCK_TARGET_RELEASE_TAG}" "{candidate}"', env=ci, cwd=repo_dir)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("already exists on", refused.stderr)
+
+    def test_release_line_candidate_with_a_version_resumes_that_release(self):
+        """A version pins the line's candidate to what that release was cut from, whatever merged since."""
+        repo_dir, git, shas = self._lined_graph()
+        git("switch", "release/0.2")
+        (pathlib.Path(repo_dir) / "l2.txt").write_text("fix\n")
+        git("add", "l2.txt")
+        git("commit", "-m", "fix: landed after 0.2.1 was cut")
+        l2 = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+        plain = self._run_common_func('release_line_candidate "0.2"', cwd=repo_dir)
+        self.assertEqual(plain.stdout.strip(), l2)
+        pinned = self._run_common_func('release_line_candidate "0.2" "0.2.1"', cwd=repo_dir)
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+        self.assertEqual(pinned.stdout.strip(), shas["L1"])
+        other = self._run_common_func('release_line_candidate "0.2" "0.1.0"', cwd=repo_dir)
+        self.assertEqual(other.stdout.strip(), l2)
 
     def test_release_branch_placement_reports_where_the_branch_is(self):
         temp_dir, repo_dir, git = create_mock_git_repo()

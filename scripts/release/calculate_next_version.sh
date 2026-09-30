@@ -39,7 +39,7 @@ if [ -n "${RELEASE_LINE}" ]; then
   # contradiction to refuse, not a preference to honour: the branch step can
   # only fast-forward from the head, and the line's protection vouches for the
   # head alone.
-  LINE_CANDIDATE="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_REF_PARAM}")" || exit 1
+  LINE_CANDIDATE="$(release_line_resolve_candidate "${RELEASE_LINE}" "${TARGET_REF_PARAM}" "${EXPLICIT_RELEASE_VERSION}")" || exit 1
   TARGET_REF_PARAM="${LINE_CANDIDATE}"
   echo "ℹ️ Release line ${RELEASE_LINE}: candidate is the line's own ${LINE_CANDIDATE:0:7}" >&2
 elif [ -z "${TARGET_REF_PARAM}" ] || [ "${TARGET_REF_PARAM}" = "null" ]; then
@@ -81,6 +81,13 @@ else
   BASE_TIP=""
   if [ -z "${RELEASE_LINE}" ]; then
     BASE_TIP="$(release_main_tip)" || exit 1
+    # A release from main is cut from main: a release-line commit named here
+    # would be stamped as a release main never sees as its base, and every later
+    # main release would collide with it. Its own dispatch is release_line.
+    if [ -n "${BASE_TIP}" ] && ! git merge-base --is-ancestor "${RC_CANDIDATE_COMMIT}" "${BASE_TIP}" 2>/dev/null; then
+      echo "❌ ERROR: Target commit ${RC_CANDIDATE_COMMIT:0:7} is not on ${RELEASE_MAIN_BRANCH}; a commit on a release line is released with release_line, not target_commit." >&2
+      exit 1
+    fi
   fi
   LATEST_GA_TAG="$(get_base_ga_tag_for_commit "${RC_CANDIDATE_COMMIT}" "" "${BASE_TIP}")" || exit 1
 fi

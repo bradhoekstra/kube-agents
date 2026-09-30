@@ -1397,10 +1397,25 @@ release_line_branch_exists() {
 # from. That is what makes an idle line, or a re-run after its tag was pushed,
 # resolve to the same candidate as the run that released it, and so land in the
 # eligibility check's idempotent path rather than as a new release of nothing.
-# Arguments: $1 = line (X.Y)
+#
+# A version names a release to resume instead: when its tag exists on the line
+# (a stamped commit whose parent is in the head's history), the candidate is
+# that parent, whatever has merged since. That is the pin for a line release
+# that died after its push and whose line moved on before the re-run — on main
+# the same pin is target_commit — so the re-run finishes that release rather
+# than cutting the next patch from the new head and leaving a tag with nothing
+# published behind it.
+# Arguments: $1 = line (X.Y), $2 = version to resume (optional)
 release_line_candidate() {
-  local line="${1:-}" head tag
+  local line="${1:-}" version="${2:-}" head tag tag_commit
   head="$(release_line_head "${line}")" || return 1
+  if [ -n "${version}" ] && tag_commit="$(git rev-parse --verify --quiet "refs/tags/${version}^{commit}" 2>/dev/null)"; then
+    if ga_tag_is_stamped "${version}" "${tag_commit}" &&
+      git merge-base --is-ancestor "${tag_commit}^1" "${head}" 2>/dev/null; then
+      git rev-parse --verify "${tag_commit}^1"
+      return 0
+    fi
+  fi
   while IFS= read -r tag; do
     [ -n "${tag}" ] || continue
     if ga_tag_is_stamped "${tag}" "${head}"; then
@@ -1416,10 +1431,11 @@ release_line_candidate() {
 # so the two cannot disagree about which commit a line releases: the branch
 # step can only fast-forward from the head, and the line's branch protection,
 # once it exists, vouches for the head alone.
-# Arguments: $1 = line (X.Y), $2 = commit-ish named by the caller (optional)
+# Arguments: $1 = line (X.Y), $2 = commit-ish named by the caller (optional),
+#            $3 = version to resume (optional; see release_line_candidate)
 release_line_resolve_candidate() {
-  local line="${1:-}" named="${2:-}" candidate named_sha
-  candidate="$(release_line_candidate "${line}")" || return 1
+  local line="${1:-}" named="${2:-}" version="${3:-}" candidate named_sha
+  candidate="$(release_line_candidate "${line}" "${version}")" || return 1
   if [ -n "${named}" ] && [ "${named}" != "null" ]; then
     named_sha="$(git rev-parse --verify "${named}^{commit}" 2>/dev/null || echo "")"
     if [ "${named_sha}" != "${candidate}" ]; then
@@ -1443,10 +1459,12 @@ validated_rc_tags_at_commit() {
 # candidate it was stamped from: prints `remote` or `local` (at the release
 # commit, on the release repository or in this checkout only), `remote-candidate`
 # or `local-candidate` (at the candidate, which is the stamped commit's parent,
-# so the branch has a fast-forward ahead of it), or `absent`. A branch anywhere
-# else is an error naming both commits, and so is a remote that cannot be read.
-# Read-only, so tag_ga_release.sh runs it before the tag goes out and
-# ensure_release_branch runs it again before pushing.
+# so the branch has a fast-forward ahead of it), `remote-past` or `local-past`
+# (already beyond the release commit, which is where a re-run finds a line that
+# took a merge after the release's push landed: nothing to move), or `absent`. A
+# branch anywhere else is an error naming both commits, and so is a remote that
+# cannot be read. Read-only; ensure_ga_release_refs reads it before anything is
+# pushed.
 # Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
 release_branch_placement() {
   local version="${1:-}"
@@ -1469,17 +1487,28 @@ release_branch_placement() {
     candidate_full_sha="$(git rev-parse --verify "${candidate}^{commit}" 2>/dev/null || echo "${candidate}")"
   fi
 
-  # Names what a branch at `sha` is, or fails naming where it is instead.
+  # Names what a branch at `sha` is, or fails naming where it is instead. A
+  # commit the checkout does not hold yet is fetched first, so the ancestry
+  # test can read it.
   classify() {
     local sha="$1" where="$2" whose="$3"
     if [ "${sha}" = "${target_full_sha}" ]; then
       echo "${where}"
-    elif [ -n "${candidate_full_sha}" ] && [ "${sha}" = "${candidate_full_sha}" ]; then
-      echo "${where}-candidate"
-    else
-      echo "❌ ERROR: Release line '${branch}' already exists ${whose} but points to commit ${sha}, not the release commit ${target_full_sha}${candidate_full_sha:+ or its candidate ${candidate_full_sha}}!" >&2
-      return 1
+      return 0
     fi
+    if [ -n "${candidate_full_sha}" ] && [ "${sha}" = "${candidate_full_sha}" ]; then
+      echo "${where}-candidate"
+      return 0
+    fi
+    if ! git rev-parse --verify --quiet "${sha}^{commit}" >/dev/null 2>&1; then
+      git fetch "$(release_repo_url)" "${branch_ref}" >/dev/null 2>&1 || true
+    fi
+    if git merge-base --is-ancestor "${target_full_sha}" "${sha}" 2>/dev/null; then
+      echo "${where}-past"
+      return 0
+    fi
+    echo "❌ ERROR: Release line '${branch}' already exists ${whose} but points to commit ${sha}, not the release commit ${target_full_sha}${candidate_full_sha:+ or its candidate ${candidate_full_sha}}!" >&2
+    return 1
   }
 
   if is_ci_pipeline; then
@@ -1512,7 +1541,7 @@ set_release_branch_locally() {
     absent)
       git branch "${branch}" "${target_full_sha}"
       ;;
-    local | remote) ;;
+    local | remote | local-past | remote-past) ;;
     remote-candidate | local-candidate)
       if [ "$(git symbolic-ref -q --short HEAD 2>/dev/null || true)" = "${branch}" ]; then
         echo "❌ ERROR: Release line '${branch}' is checked out here; switch to another branch before releasing from it." >&2
@@ -1534,60 +1563,16 @@ set_release_branch_locally() {
   esac
 }
 
-# Ensures a version's release line exists at the release commit and, in CI, is
-# on the remote. The standalone form; tag_ga_release.sh pushes the line together
-# with the tag through ensure_ga_release_refs. A line already at the commit is an idempotent skip; one at the
-# candidate — the stamped commit's parent — is fast-forwarded; anywhere else is
-# an error; nothing is ever force-pushed. Off CI the branch is created or moved
-# locally and the push is skipped.
-# Arguments: $1 = version, $2 = release commit, $3 = candidate commit (optional)
-ensure_release_branch() {
-  local version="${1:-}"
-  local release_commit="${2:-}"
-  local candidate="${3:-}"
-
-  if [ -z "${version}" ] || [ -z "${release_commit}" ]; then
-    echo "❌ ERROR: version and release commit are required for ensure_release_branch." >&2
-    return 1
-  fi
-
-  local placement
-  placement="$(release_branch_placement "${version}" "${release_commit}" "${candidate}")" || return 1
-
-  local line branch branch_ref
-  line="$(release_line_for_version "${version}")" || return 1
-  branch="$(release_branch_for_line "${line}")" || return 1
-  branch_ref="${GIT_BRANCH_REF_PREFIX}${branch}"
-
-  local target_full_sha
-  target_full_sha="$(git rev-parse --verify "${release_commit}^{commit}" 2>/dev/null || echo "${release_commit}")"
-
-  if [ "${placement}" = "remote" ]; then
-    echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
-    return 0
-  fi
-  set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}" || return 1
-
-  # Safety Guard: Remote push executes exclusively inside CI
-  if ! is_ci_pipeline; then
-    echo "⚠️ [Local Execution] Dry-run: Release line '${branch}' set locally. Remote push skipped (runs only in CI)."
-    return 0
-  fi
-
-  # A plain push: a fast-forward is accepted, a non-fast-forward refused, and
-  # the placement check above has already read the remote, so the only way to
-  # reach it with the branch elsewhere is a push that landed between the two.
-  release_push_ref "${branch_ref}:${branch_ref}" "Release line '${branch}'"
-}
-
 # The GA rung: the tag and the release line, pushed in one atomic push so that
 # neither can exist on the remote without the other. That is what makes the run
 # repeatable whatever happens around it: a merge that lands on the line between
 # the placement check and the push rejects both refs, nothing is published, and
 # the re-run stamps from the new head; a run that dies after the push re-runs
-# like one that failed at image promotion, reusing the tagged commit. A tag or
-# a line already on the remote at the release commit is skipped, and whichever
-# is missing is pushed alone. Off CI both are set locally and neither is pushed.
+# like one that failed at image promotion, reusing the tagged commit, and a
+# line that took a merge in between is already past the release commit and is
+# left where it is. A tag or a line already on the remote at the release commit
+# is skipped, and whichever is missing is pushed alone. Off CI both are set
+# locally and neither is pushed.
 # Arguments: $1 = version, $2 = release commit, $3 = candidate commit
 ensure_ga_release_refs() {
   local version="${1:-}"
@@ -1628,13 +1613,23 @@ ensure_ga_release_refs() {
     push_tag="true"
   fi
 
-  if [ "${placement}" = "remote" ]; then
-    echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
-  else
-    set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}" || return 1
-    refspecs+=("${branch_ref}:${branch_ref}")
-    push_line="true"
-  fi
+  case "${placement}" in
+    remote)
+      echo "✅ Release line '${branch}' already exists on $(get_target_repo) at release commit ${target_full_sha}. Idempotent skip."
+      ;;
+    remote-past)
+      echo "✅ Release line '${branch}' on $(get_target_repo) is already past release commit ${target_full_sha:0:7}; nothing to move."
+      ;;
+    *)
+      set_release_branch_locally "${placement}" "${branch}" "${branch_ref}" "${target_full_sha}" || return 1
+      if [ "${placement}" = "local-past" ]; then
+        echo "✅ Local release line '${branch}' is already past release commit ${target_full_sha:0:7}; nothing to move."
+      else
+        refspecs+=("${branch_ref}:${branch_ref}")
+        push_line="true"
+      fi
+      ;;
+  esac
 
   # Safety Guard: Remote push executes exclusively inside CI
   if ! is_ci_pipeline; then

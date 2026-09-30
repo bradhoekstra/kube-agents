@@ -688,6 +688,40 @@ class CalculateNextVersionTest(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("release it from release/0.2", refused.stderr)
 
+    def test_a_line_release_that_died_after_its_push_is_resumed_by_naming_its_version(self):
+        """After 0.2.1's push a backport lands; a plain re-dispatch computes 0.2.2, the pin finishes 0.2.1."""
+        repo_dir, git, shas = self._line_repo()
+        git("switch", "release/0.2")
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
+        git("add", "stamp.txt")
+        git("commit", "-m", f"{self._STAMP} 0.2.1")
+        git("tag", "-a", "0.2.1", "-m", "release 0.2.1")
+        (pathlib.Path(repo_dir) / "l2.txt").write_text("fix\n")
+        git("add", "l2.txt")
+        git("commit", "-m", "fix: landed after the push")
+        l2 = git("rev-parse", "HEAD").stdout.strip()
+        git("switch", "main")
+
+        plain = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2"})
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(plain.stdout.strip(), "0.2.2")
+        self.assertEqual(self._outputs(repo_dir)["rc_candidate_commit"], l2)
+
+        pinned = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "EXPLICIT_RELEASE_VERSION": "0.2.1"})
+        self.assertEqual(pinned.returncode, 0, pinned.stderr)
+        self.assertEqual(pinned.stdout.strip(), "0.2.1")
+        outputs = self._outputs(repo_dir)
+        self.assertEqual(outputs["rc_candidate_commit"], shas["L1"])
+        self.assertEqual(outputs["bump_type"], "manual")
+
+    def test_a_target_commit_off_main_is_refused_without_a_release_line(self):
+        """A release-line commit named as main's target would stamp a release main never sees as its base."""
+        repo_dir, git, shas = self._line_repo()
+        proc = self._run_line(repo_dir, env={"TARGET_COMMIT": shas["L1"]})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("is not on main", proc.stderr)
+        self.assertIn("release_line", proc.stderr)
+
     def test_a_release_cut_by_hand_from_a_later_main_commit_still_supersedes_an_older_candidate(self):
         """The emergency-leftover shape: main's base is qualified against main's head."""
         repo_dir, git, shas = self._line_repo()

@@ -704,6 +704,32 @@ exit {docker_exit}
                 self.assertIn("has NOT passed the RC validation", proc.stderr)
                 self.assertIn("rc-release-pipeline.yml", proc.stderr)
 
+    def test_a_line_release_resumes_from_its_stamp_parent_after_the_line_moved(self):
+        """RELEASE_VERSION names a tag on the line: the candidate is what it was cut from, and Scenario A resumes."""
+        repo_dir, git, bin_dir, _, head = self._line_repo()
+        # The original release's gate, as the RC pipeline left it on the head it released.
+        git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
+        git("switch", "release/0.2")
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1")
+        git("add", "stamp.txt")
+        git("commit", "-m", "chore(release): stamp release version 0.2.1")
+        git("tag", "-a", "0.2.1", "-m", "release 0.2.1")
+        (pathlib.Path(repo_dir) / "l2.txt").write_text("fix")
+        git("add", "l2.txt")
+        git("commit", "-m", "fix: landed after the push")
+        git("switch", "main")
+        create_mock_gh_binary(bin_dir, existing_releases=[])
+        gh_out = pathlib.Path(repo_dir) / "gh_out.txt"
+        gh_out.write_text("")
+        proc = self._run_verify_script(
+            repo_dir,
+            env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2", "GH_TOKEN": "mock-token", "GITHUB_OUTPUT": str(gh_out)},
+            bin_dir=bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"candidate is the line's own {head[:7]}", proc.stdout)
+        self.assertIn("resuming=true", gh_out.read_text())
+
     def test_a_line_refuses_a_version_off_the_line_and_a_candidate_that_is_not_its_head(self):
         repo_dir, git, bin_dir, base_commit, head = self._line_repo()
         git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)

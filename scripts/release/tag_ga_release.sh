@@ -25,20 +25,17 @@ RC_CANDIDATE_COMMIT_SHA="$(git -C "${REPO_ROOT}" rev-parse --verify "${RC_CANDID
 
 RELEASE_COMMIT="$(create_stamped_release_commit "${RELEASE_VERSION}" "${RC_CANDIDATE_COMMIT_SHA}" "${REPO_ROOT}")"
 
-# Where the release line is, read before anything is pushed: a line at any
-# commit but the release commit or its candidate stops the run here, with
-# nothing pushed.
-release_branch_placement "${RELEASE_VERSION}" "${RELEASE_COMMIT}" "${RC_CANDIDATE_COMMIT_SHA}" >/dev/null
-
 RELEASE_LINE_BRANCH="$(release_branch_for_line "$(release_line_for_version "${RELEASE_VERSION}")")"
 
 # The banner is printed here rather than by tag_commit.sh: the GA rung pushes
 # two refs, the tag and its release line, and it pushes them atomically through
 # ensure_ga_release_refs so that neither can exist on the remote without the
-# other. A minor creates `release/X.Y` because the line is absent; a patch
-# fast-forwards it because it is at the candidate; a merge that lands on the
-# line meanwhile rejects the whole push, and the re-run stamps from the new
-# head. This script keeps what is genuinely its own — the pure-SemVer gate, the
+# other, and it reads where the line is before anything is pushed: a line at
+# any commit but the release commit, its candidate, or beyond it stops the run
+# with nothing pushed. The line's first release creates `release/X.Y` because
+# the line is absent; a later patch fast-forwards it because it is at the
+# candidate; a merge that lands on the line meanwhile rejects the whole push,
+# and the re-run stamps from the new head. This script keeps what is genuinely its own — the pure-SemVer gate, the
 # swapped-argument handling, the stamping — and the shared helpers keep the
 # idempotency contract every rung of the ladder has.
 echo "======================================================================"
