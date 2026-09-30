@@ -444,10 +444,12 @@ line; a patch is validated by the RC pipeline and released by hand.
    `upstream/release/<X.Y>`, open a pull request whose base is `release/<X.Y>` with a `fix:`
    title, and let Tide merge it (a `feat:` or a breaking change is refused at release time). The
    merge builds the commit's SHA-tagged images. Tide reads the target branch's protection, and
-   the lines need the same required contexts as `main` plus a restriction on who may push them;
-   that is a repository setting, not a file in this tree, and no `release/` branch carries one
-   yet — it has to exist before the first backport merges, with the release bot as a bypass actor,
-   since the tagger pushes a freshly stamped commit, which has had no checks run, to the line. A checkout of a line between stamps
+   the lines carry `main`'s: a `release/*` branch protection rule with the same required
+   contexts and conversation resolution, and a ruleset that lets only Tide and the release bot
+   create, push or delete a line — the bot because the tagger pushes a freshly stamped commit,
+   which has had no checks run. Both are repository settings, not files in this tree; if a
+   backport pull request shows no required checks or merges without them, that is where to
+   look. A checkout of a line between stamps
    carries the previous release's `BAKED_RELEASE_VERSION`, so `install.sh` from a backport
    checkout refuses rather than asks for a version: pass `--image-tag <sha>` of the backport's
    images, as for any `main` commit.
