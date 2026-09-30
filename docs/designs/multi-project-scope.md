@@ -134,7 +134,7 @@ Rules:
   explicitly appears once. An excluded project is dropped whether it was reached through a list or a
   container.
 - **`exclude.projects` entries are project IDs or shell-style globs.** A glob (`*-sandbox`) is
-  matched against the resolved project ID with `fnmatch`, after every selector has contributed.
+  matched against the resolved project ID with `fnmatch`, after every selector has contributed, and never against a project number, the handle a Metrics Scope names a monitored project by, which an entry matches by equality alone, as the install path's exact filter does.
   Globs are deterministic, so §5's byte-identical snapshot rule holds. An entry, ID or glob, that
   matches the management project, by ID or by the number a Metrics Scope named it by, does not exclude it, by the rule above; the run keeps the project, logs the
   match, and records the first such entry under the snapshot's `ignoredExcludes` (§5), because a silently ignored

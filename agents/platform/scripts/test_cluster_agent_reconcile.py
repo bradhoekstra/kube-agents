@@ -2601,6 +2601,36 @@ class ScopeTest(HomesMixin):
                 self.assertEqual("reaches no route that names the project by ID" in logs, said, naming)
                 self.assertNotIn("prune", logs)
 
+    def test_a_glob_never_matches_a_project_number(self):
+        # `*[0-9]*` is written against IDs, to keep numbered sandboxes out. Now that a number
+        # matches on every route, a glob that happens to match twelve digits would drop every
+        # monitored project once a run had named it, and retire its profiles, while the install
+        # path (an exact filter) kept the binding. A number matches an entry by equality alone,
+        # tied to an ID or keyed bare, on the explicit route, the selector route and the retire hold.
+        ids = {"cluster-a": _identity("team-a", "prod")}
+        declaration = {"projects": ["team-a"], "metricsScopes": ["mon-proj"], "exclude": {"projects": ["*[0-9]*"]}}
+        self._write_previous([{"id": self.MGMT, "via": ["management"], "state": rec.STATE_IN_SCOPE},
+                              {"id": "team-a", "via": ["explicit", self.SCOPE], "state": rec.STATE_IN_SCOPE, rec.NUMBER_KEY: "461802785698"}],
+                             containers=[{"id": self.SCOPE, "outcome": rec.OUTCOME_OK, "projects": 1}])
+        report, created, deleted = self._run(declaration, {self.MGMT: [], "team-a": [("team-a", "prod", "us-central1")],
+                                                           "team1-dev": [("team1-dev", "x", "us-central1")]},
+                                             profiles=["cluster-a"], identities=ids,
+                                             selectors={self.SCOPE: (["461802785698", "222"], rec.OUTCOME_OK)},
+                                             numbers={"461802785698": ("team-a", rec.OUTCOME_OK), "222": ("team1-dev", rec.OUTCOME_OK)})
+        self.assertEqual((report["projects"].get("team-a"), report["retiring"], deleted), (rec.OUTCOME_OK, [], []))
+        self.assertIn("cluster-a", report["kept"])
+        self.assertNotIn("team1-dev", report["projects"])  # the glob still matches the ID it was written for
+        self.assertEqual(created, [])
+        self.assertEqual(self._snapshot()["ignoredExcludes"], [])
+        # A bare-number key is a number too: the glob leaves the unnamed member, and its hold, alone.
+        with mock.patch.object(rec, "log") as logged:
+            report, _, _ = self._run({"metricsScopes": ["mon-proj"], "exclude": {"projects": ["*3*"]}}, {self.MGMT: []},
+                                     selectors={self.SCOPE: (["333"], rec.OUTCOME_OK)}, numbers={"333": (None, rec.OUTCOME_DENIED)})
+        self.assertEqual(report["projects"].get("333"), rec.OUTCOME_DENIED)
+        self.assertIn("prune is held", " ".join(str(c) for c in logged.call_args_list))
+        self.assertEqual(rec._excluded_by("333", ["*3*"]), None)
+        self.assertEqual(rec._excluded_by("333", ["333"]), "333")
+
     def test_an_entry_naming_the_management_projects_number_is_ignored_and_recorded(self):
         # The scope monitors the management project too, and the operator's number entry
         # names it: ignored like an entry that names its ID, and recorded the same way, on the

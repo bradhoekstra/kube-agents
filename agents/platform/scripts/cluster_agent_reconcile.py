@@ -452,7 +452,17 @@ def _previous_declaration(previous: dict | None) -> dict | None:
 
 
 def _excluded_by(project: str, patterns: list[str]) -> str | None:
-    """The first `exclude.projects` entry that matches, an ID or a shell-style glob."""
+    """The first `exclude.projects` entry that matches: an ID or a shell-style glob for a project ID,
+    the entry itself for a project number.
+
+    A glob is written against IDs (design §3) and is never matched against a number, the handle a
+    Metrics Scope names a monitored project by: `*[0-9]*` written to keep numbered sandboxes out
+    would otherwise drop every monitored project once a run had named it, while the install path,
+    which withholds a grant on an exact entry alone, kept its binding. A project ID starts with a
+    letter, so an all-digit value is a number, bare-number key or tied number alike.
+    """
+    if project.isdigit():
+        return project if project in patterns else None
     for pattern in patterns:
         if fnmatch.fnmatchcase(project, pattern):
             return pattern
