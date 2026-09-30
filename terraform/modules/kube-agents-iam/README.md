@@ -49,7 +49,7 @@ lists and gets clusters (`roles/container.clusterViewer` or `roles/container.vie
 travels in the object so the composition renders the CR from the same value, and a project named
 in `projects` is bound even when an exclude entry removes it from the resolved set, so drop it
 from `projects` instead. The one exception is a project a selector resolved to (below), which has
-no list to be dropped from: an exclude entry that names it exactly withholds its grant. A folder or organisation (`folders`, `organizations`: numeric IDs)
+no list to be dropped from: an exclude entry that names a Shared VPC service project by ID, or a monitored project by its number, withholds its grant, while a monitored project excluded by ID keeps it, since the reconcile names it with that grant before the entry can match. A folder or organisation (`folders`, `organizations`: numeric IDs)
 gets the same intersected allowlist plus `roles/cloudasset.viewer`, bound on the container
 itself (`google_folder_iam_member`, `google_organization_iam_member`), so every project beneath
 it inherits the grant, including one created after the apply, and the reconcile can search the

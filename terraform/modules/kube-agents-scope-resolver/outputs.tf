@@ -5,8 +5,10 @@ output "members" {
     metricsScopes/<scope>), so this output and the `containers` array of
     fleet_scope.json can be read side by side. A monitored project an
     exclude_projects entry names by number is neither named nor listed here;
-    a member an entry names by ID is listed, and it is the kube-agents-iam
-    module that withholds its grant.
+    a member an entry names by ID is listed, and the kube-agents-iam module
+    withholds its grant when it is a Shared VPC service project and keeps it
+    when it is a monitored project, whose naming call the reconcile makes with
+    that grant before the entry can match.
   EOT
   value       = local.scope_selector_members
 }

@@ -68,8 +68,9 @@ variable "exclude_projects" {
     under that number is neither named nor listed, and the reconcile matches
     the number on every row a scope named by it, so the member leaves the set
     whether or not a run had named it before. IDs and globs are the caller's to
-    apply (kube-agents-iam withholds the grant of a member an entry names by
-    ID; the reconcile evaluates globs).
+    apply (kube-agents-iam withholds the grant of a Shared VPC service project
+    an entry names by ID and keeps a monitored project's, which the reconcile's
+    naming call needs; the reconcile evaluates globs).
   EOT
   type        = list(string)
   nullable    = false
