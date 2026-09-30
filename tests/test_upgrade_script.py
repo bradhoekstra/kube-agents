@@ -378,14 +378,9 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
         )
 
     def _run_fixture_upgrade_main(self, repo_path, args):
-        """Source the fixture's own stamped copy of this branch's upgrade.sh and run main:
-        the load-time flag, the drop's wiring and the exit arms, as an operator's run."""
-        text = _UPGRADE_SH.read_text().replace('BAKED_RELEASE_VERSION=""', 'BAKED_RELEASE_VERSION="0.2.0"', 1)
-        (repo_path / "upgrade.sh").write_text(text)
-        return subprocess.run(
-            ["bash", "-c", f"KUBE_AGENTS_SOURCE_ONLY=true source ./upgrade.sh; main {args}"],
-            cwd=str(repo_path), capture_output=True, text=True, env=get_isolated_test_env(),
-        )
+        """main from the fixture's own stamped copy: the load-time flag, the drop's wiring
+        and the exit arms, as an operator's run."""
+        return self._run_fixture_upgrade_func(repo_path, f"main {args}")
 
     def test_main_from_a_release_line_checkout_past_its_stamp_asks_for_the_tag(self):
         """The composed path: the stamped copy computes the baked default at load, main

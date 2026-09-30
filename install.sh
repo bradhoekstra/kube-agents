@@ -1055,6 +1055,22 @@ cluster_mode_label() {
 # keeps its release as the default wherever it runs, whether standing in some
 # other checkout or resolving its sources to a HOME clone that has moved onto
 # a line, and verify_local_source_ref then fetches or refuses as before.
+# The directory this script runs from, when that is a kube-agents checkout;
+# empty under `curl … | bash`, where no file names one (BASH_SOURCE is then
+# empty, `main`, or the interpreter's path, none of which is a file in a
+# checkout). What acquire_source_repo prefers as the sources, so the
+# release-line reads below judge the same tree it will install from, whatever
+# the working directory is.
+script_checkout_dir() {
+  local script_path="${BASH_SOURCE[0]:-}" script_dir=""
+  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
+    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
+  fi
+  if [ -n "$script_dir" ] && [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
+    printf '%s' "$script_dir"
+  fi
+}
+
 # The release a tree's own install.sh is stamped with, read the way
 # upgrade.sh's release_version_of_source_tree reads it (quotes and whitespace
 # stripped), so the two front doors agree on which trees carry a version.
@@ -1082,10 +1098,7 @@ release_line_recognition_hint() {
   if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
     remedies="${remedies:+${remedies} and }fetch the history this shallow clone lacks (git fetch --unshallow)"
   fi
-  local script_path="${BASH_SOURCE[0]:-}"
-  if [ -n "$script_path" ] && [ -f "$script_path" ]; then
-    script_dir="$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)"
-  fi
+  script_dir="$(script_checkout_dir)"
   local own_images="pass --image-tag ${head_commit:-<full commit SHA>} for this commit's own images"
   if [ "$script_dir" != "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ]; then
     # A piped release install.sh, or one run from another directory: only the
@@ -1097,7 +1110,7 @@ release_line_recognition_hint() {
   elif [ -n "$tag_commit" ] && git -C "$repo_dir" merge-base --is-ancestor "$tag_commit" "$head_commit" 2>/dev/null; then
     # Recognisable, and asked for the release by name anyway (--image-tag with
     # the baked version): the checkout is the line past it, not the release.
-    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release, or drop --image-tag to default to this commit's own images."
+    print_info "This checkout is release line ${line} at ${head_commit:0:7}, $(git -C "$repo_dir" rev-list --count "${tag_commit}..HEAD" 2>/dev/null || echo "?") commit(s) past release ${BAKED_RELEASE_VERSION}, not that release. Check out tag ${BAKED_RELEASE_VERSION} for the release; run this checkout's ./install.sh without --image-tag to default to this commit's own images, or ${own_images}."
   else
     # Tag present, history complete, the checkout's own script running: HEAD
     # simply does not descend from the release (a cherry-picked or rebased
@@ -1107,10 +1120,10 @@ release_line_recognition_hint() {
 }
 
 checkout_is_past_baked_release() {
-  local repo_dir="${1:-.}" tag_commit head_commit script_path="${BASH_SOURCE[0]:-}"
+  local repo_dir="${1:-.}" tag_commit head_commit own_dir
   [ -n "${BAKED_RELEASE_VERSION:-}" ] || return 1
-  [ -n "$script_path" ] && [ -f "$script_path" ] || return 1
-  [ "$(cd "$(dirname "$script_path")" 2>/dev/null && pwd -P)" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
+  own_dir="$(script_checkout_dir)"
+  [ -n "$own_dir" ] && [ "$own_dir" = "$(cd "$repo_dir" 2>/dev/null && pwd -P)" ] || return 1
   [ "$(baked_version_of_tree "$repo_dir")" = "$BAKED_RELEASE_VERSION" ] || return 1
   tag_commit="$(git -C "$repo_dir" rev-parse --verify --quiet "refs/tags/${BAKED_RELEASE_VERSION}^{commit}" 2>/dev/null)" || return 1
   head_commit="$(git -C "$repo_dir" rev-parse --verify --quiet HEAD 2>/dev/null)" || return 1
@@ -1130,9 +1143,14 @@ default_image_tag() {
   #    checkout does, to its own HEAD, whose images a merge onto the line built. Returned
   #    here rather than through step 4, so a directory that happens to be named
   #    kube-agents-<X.Y.Z> (step 3) cannot hand the release back.
+  #    Judged on the script's own checkout, which is what acquire_source_repo
+  #    installs from, so running one checkout's install.sh from inside another
+  #    resolves the same way as running it from its own directory.
   if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
-    if checkout_is_past_baked_release "$repo_dir"; then
-      git -C "$repo_dir" rev-parse HEAD 2>/dev/null || echo ""
+    local own_dir
+    own_dir="$(script_checkout_dir)"
+    if [ -n "$own_dir" ] && checkout_is_past_baked_release "$own_dir"; then
+      git -C "$own_dir" rev-parse HEAD 2>/dev/null || echo ""
       return 0
     fi
     echo "$BAKED_RELEASE_VERSION"
@@ -1175,11 +1193,11 @@ default_image_tag_label() {
 
   if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "$tag" = "$BAKED_RELEASE_VERSION" ]; then
     printf 'official release %s' "$tag"
-  elif checkout_is_past_baked_release "$repo_dir"; then
+  elif [ -n "$(script_checkout_dir)" ] && checkout_is_past_baked_release "$(script_checkout_dir)"; then
     # Say what the checkout is, since its scripts still name the previous release.
     printf 'release line %s checkout %s, %s commit(s) past release %s' \
       "${BAKED_RELEASE_VERSION%.*}" "${tag:0:7}" \
-      "$(git -C "$repo_dir" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")" \
+      "$(git -C "$(script_checkout_dir)" rev-list --count "refs/tags/${BAKED_RELEASE_VERSION}..HEAD" 2>/dev/null || echo "?")" \
       "$BAKED_RELEASE_VERSION"
   elif [ "$tag" = "$(git -C "$repo_dir" describe --tags --exact-match --match="[0-9]*" 2>/dev/null || echo "")" ]; then
     printf 'release tag %s' "$tag"

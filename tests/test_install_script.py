@@ -1494,7 +1494,8 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             self.assertNotEqual(named.returncode, 0)
             self.assertIn("mismatch", named.stdout + named.stderr)
             self.assertIn(f"release line 0.2 at {backport[:7]}, 1 commit(s) past release 0.2.0", named.stdout + named.stderr)
-            self.assertIn("drop --image-tag", named.stdout + named.stderr)
+            self.assertIn("without --image-tag to default to this commit's own images", named.stdout + named.stderr)
+            self.assertIn(f"--image-tag {backport}", named.stdout + named.stderr)
             self.assertNotIn("neither that release's commit", named.stdout + named.stderr)
 
             git("switch", "-q", "--detach", stamp)
@@ -1526,6 +1527,30 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             lines = proc.stdout.strip().splitlines()
             self.assertEqual(lines[0], backport)
             self.assertIn("release line 0.2 checkout", lines[1])
+
+    def test_a_line_checkouts_install_sh_run_from_inside_another_checkout_still_defaults_to_its_head(self):
+        """The release-line read judges the script's own checkout, which is the tree
+        acquire_source_repo installs from, not the working directory: one checkout's
+        install.sh invoked by path from inside another kube-agents checkout resolves
+        as it would from its own directory, and the source check passes on that tag."""
+        with tempfile.TemporaryDirectory(prefix="release-line-elsewhere-") as temp_dir:
+            repo_path, git, stamp, backport, unrelated = self._release_line_checkout(temp_dir)
+            other = pathlib.Path(temp_dir) / "other-checkout"
+            (other / "scripts" / "installer").mkdir(parents=True)
+            (other / "scripts" / "installer" / "installer_common.sh").write_text("# marker\n")
+            (other / "install.sh").write_text(_INSTALL_SH.read_text())
+            setup = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{repo_path}/install.sh"\n'
+                'default_image_tag "."; echo "label=$(default_image_tag_label ".")"; '
+                f'tag=""; resolve_effective_image_tag tag "." "" && verify_local_source_ref "{repo_path}" "$tag" && echo verified\n'
+            )
+            proc = _run_installer_bash(setup, get_isolated_test_env(overrides={"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}), cwd=other)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            lines = proc.stdout.strip().splitlines()
+            self.assertEqual(lines[0], backport)
+            self.assertIn("release line 0.2 checkout", lines[1])
+            self.assertIn("verified", proc.stdout)
+            self.assertNotIn("drop --image-tag", proc.stdout + proc.stderr)
 
     def test_a_piped_release_installer_keeps_its_release_whatever_checkout_it_resolves_to(self):
         """The baked version belongs to the running script. A release's install.sh that is
