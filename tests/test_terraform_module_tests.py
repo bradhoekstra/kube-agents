@@ -62,9 +62,18 @@ from test_test_discovery import IGNORED_NAMES as _WALK_EXCLUDED_PARTS  # noqa: E
 #: the same job on main's required-status-checks list, read the same way.
 _TARGET = "terraform-test"
 _GATE_COMMAND = f"make {_TARGET}"
-#: What lets a gate step or job run red without failing the check.
+#: What lets a gate step or job run red without failing the check, or not
+#: run at all while the check reads as satisfied: `continue-on-error` and
+#: an `if:` at step or job level, make's ignore-errors flag reaching it
+#: through the environment at any level, a `paths` filter on the trigger.
 _CONTINUE_ON_ERROR = "continue-on-error"
 _IF = "if"
+_ENV = "env"
+_MAKEFLAGS_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS")
+_IGNORE_ERRORS_FLAG = re.compile(r"(^|\s)-\w*i|--ignore-errors")
+_TRIGGER, _PULL_REQUEST_TRIGGER, _PATH_FILTERS = "on", "pull_request", ("paths", "paths-ignore")
+#: The Makefile's own ways of ignoring a failing recipe line.
+_MAKEFILE_IGNORES_ERRORS = re.compile(r"(?m)^\.IGNORE\b|^\s*(?:GNU)?MAKEFLAGS\s*[:+?]?=.*(?:(?:^|\s)-\w*i\b|--ignore-errors)")
 
 #: The recipe line that lists the target in `make help`, and the loop that
 #: reaches every module rather than naming the ones that had tests when it
@@ -139,6 +148,8 @@ _BUILTIN_PROVIDER_PREFIX = "terraform"
 _PROVIDERS_ATTRIBUTE = "providers"
 _JSON_PROVIDERS_KEY = "providers"
 _ALIAS_SEPARATOR = "."
+#: HCL's object constructor admits `key: value` beside `key = value`.
+_OBJECT_SEPARATOR = ":"
 _MODULE_BLOCK = "module"
 #: A test file's `run "x" { module { source = "./…" } }`, whose module's
 #: providers the file has to mock too; in JSON, `run.<name>.module.source`.
@@ -506,7 +517,7 @@ def _run_provider_routes(text: str, name: str) -> list:
                 entries = [t for t, d in _body(flat, index + 2) if d == 1]
                 position = 0
                 while position + 2 < len(entries):
-                    if entries[position][0] == _WORD and entries[position + 1][0] == _EQUALS and entries[position + 2][0] == _WORD:
+                    if entries[position][0] == _WORD and entries[position + 1] in ((_EQUALS, _EQUALS), (_OTHER, _OBJECT_SEPARATOR)) and entries[position + 2][0] == _WORD:
                         route = entries[position + 2][1]
                         if position + 4 < len(entries) and entries[position + 3] == (_OTHER, _ALIAS_SEPARATOR) and entries[position + 4][0] == _WORD:
                             route += _ALIAS_SEPARATOR + entries[position + 4][1]
@@ -535,9 +546,18 @@ def _test_invocations(recipe_body: str) -> list:
     return _TEST_INVOCATION.findall(_SHELL_STRING.sub('""', recipe_body))
 
 
-def _gate_defects(job: dict) -> list:
+def _ignores_make_errors(scope: dict) -> bool:
+    env = scope.get(_ENV) or {}
+    return isinstance(env, dict) and any(
+        _IGNORE_ERRORS_FLAG.search(str(env.get(variable, ""))) for variable in _MAKEFLAGS_VARIABLES
+    )
+
+
+def _gate_defects(job: dict, workflow: dict = None) -> list:
     """Why the job would not gate on `make terraform-test`: no such step,
-    more than one, an `if:`, or `continue-on-error` on the step or the job."""
+    more than one, an `if:` or `continue-on-error` on the step or the job,
+    make's ignore-errors flag in the env at any level, or a paths filter on
+    the pull_request trigger."""
     defects = []
     steps = [s for s in job.get("steps", []) if _GATE_COMMAND in _run_lines(s)]
     if len(steps) != 1:
@@ -547,8 +567,20 @@ def _gate_defects(job: dict) -> list:
             defects.append("the step carries an `if:`")
         if step.get(_CONTINUE_ON_ERROR):
             defects.append(f"the step carries `{_CONTINUE_ON_ERROR}`")
+        if _ignores_make_errors(step):
+            defects.append("the step's env tells make to ignore errors")
+    if _IF in job:
+        defects.append("the job carries an `if:`")
     if job.get(_CONTINUE_ON_ERROR):
         defects.append(f"the job carries `{_CONTINUE_ON_ERROR}`")
+    if _ignores_make_errors(job):
+        defects.append("the job's env tells make to ignore errors")
+    if workflow is not None:
+        if _ignores_make_errors(workflow):
+            defects.append("the workflow's env tells make to ignore errors")
+        trigger = (workflow.get(_TRIGGER) or workflow.get(True) or {}).get(_PULL_REQUEST_TRIGGER) or {}
+        if isinstance(trigger, dict) and any(key in trigger for key in _PATH_FILTERS):
+            defects.append("the pull_request trigger carries a paths filter")
     return defects
 
 
@@ -616,11 +648,18 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         )
 
     def test_the_validate_job_runs_the_target_unconditionally(self):
-        job = yaml.safe_load(_WORKFLOW.read_text())["jobs"][_JOB_ID]
+        workflow = yaml.safe_load(_WORKFLOW.read_text())
         self.assertEqual(
-            _gate_defects(job),
+            _gate_defects(workflow["jobs"][_JOB_ID], workflow),
             [],
-            f"the `{_JOB_ID}` job in validate.yml must run `{_GATE_COMMAND}` in exactly one step, with no `if:` and no `{_CONTINUE_ON_ERROR}` on the step or the job",
+            f"the `{_JOB_ID}` job in validate.yml must run `{_GATE_COMMAND}` in exactly one step, with no `if:` or `{_CONTINUE_ON_ERROR}` on the step or the job, no MAKEFLAGS ignoring errors at any level, and no paths filter on the trigger",
+        )
+
+    def test_the_makefile_does_not_ignore_recipe_errors(self):
+        self.assertNotRegex(
+            _MAKEFILE.read_text(),
+            _MAKEFILE_IGNORES_ERRORS,
+            "a `.IGNORE` target or a MAKEFLAGS assignment carrying -i would report a failing suite as ignored and exit 0",
         )
 
     def test_every_test_file_mocks_every_provider_its_root_needs(self):
@@ -756,6 +795,8 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             'run "x" {\n  providers = {\n    google = google\n    http   = http.live\n  }\n  command = plan\n}\n'
         )
         self.assertEqual(_unmocked(text, ["google", "http"]), ["http.live"])
+        colon_form = text.replace("google = google", "google: google").replace("http   = http.live", "http: http.live")
+        self.assertEqual(_unmocked(colon_form, ["google", "http"]), ["http.live"])
         mocked_alias = text.replace('provider "http" {\n  alias = "live"\n}', 'mock_provider "http" {\n  alias = "live"\n}')
         self.assertEqual(_unmocked(mocked_alias, ["google", "http"]), [])
         as_json = '{"mock_provider": {"google": {}, "http": [{}, {"alias": "live"}]}, "run": {"x": {"providers": {"http": "http.live"}}}}'
@@ -898,10 +939,24 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
     def test_a_gate_step_that_cannot_fail_the_job_is_a_defect(self):
         good = {"steps": [{"name": "x", "run": "make terraform-test"}]}
         self.assertEqual(_gate_defects(good), [])
+        self.assertEqual(_gate_defects(good, {"on": {"pull_request": {"types": ["opened"]}}, "env": {"CI": "1"}}), [])
         self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "continue-on-error": True}]}))
         self.assertTrue(_gate_defects({"continue-on-error": True, "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "if": "false"}]}))
+        self.assertTrue(_gate_defects({"if": "github.actor != 'dependabot[bot]'", "steps": [{"run": "make terraform-test"}]}))
         self.assertTrue(_gate_defects({"steps": [{"run": "echo make terraform-test"}]}))
+        for env in ({"MAKEFLAGS": "-i"}, {"MAKEFLAGS": "--ignore-errors"}, {"GNUMAKEFLAGS": "-ki"}, {"MAKEFLAGS": "-j2 -i"}):
+            with self.subTest(env=env):
+                self.assertTrue(_gate_defects({"steps": [{"run": "make terraform-test", "env": env}]}))
+                self.assertTrue(_gate_defects({"env": env, "steps": [{"run": "make terraform-test"}]}))
+                self.assertTrue(_gate_defects(good, {"env": env}))
+        self.assertEqual(_gate_defects({"steps": [{"run": "make terraform-test", "env": {"MAKEFLAGS": "-j2 --output-sync"}}]}), [])
+        self.assertTrue(_gate_defects(good, {"on": {"pull_request": {"paths": ["terraform/**"]}}}))
+        self.assertTrue(_gate_defects(good, {True: {"pull_request": {"paths-ignore": ["docs/**"]}}}))
+        for text in (".IGNORE:\n", "MAKEFLAGS += -i\n", "MAKEFLAGS := -j2 --ignore-errors\n", "GNUMAKEFLAGS = -i\n"):
+            with self.subTest(text=text):
+                self.assertRegex(text, _MAKEFILE_IGNORES_ERRORS)
+        self.assertNotRegex("MAKEFLAGS += --no-print-directory\n# -i is never set\n", _MAKEFILE_IGNORES_ERRORS)
 
     def test_the_rule_is_found_by_its_own_line_not_a_mention(self):
         makefile = (
