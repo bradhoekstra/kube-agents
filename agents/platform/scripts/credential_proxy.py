@@ -275,10 +275,10 @@ API_RELAY_DOT_SEGMENTS = frozenset({"", ".", ".."})
 # Longer than the default 64 because an API path is caller text that has to be
 # readable in the audit line; the same 256 the exec route gives a `cwd`.
 API_RELAY_PATH_LOG_LENGTH = 256
-# The width a principal is logged at. The value comes from the TokenReview,
-# not from the request, and a ServiceAccount username truncated at the default
-# 64 loses exactly its discriminating part; the exec route's audit line uses
-# the same 512 as a literal.
+# The width a principal is logged at, on the exec route's audit records and
+# the relay's lines alike. The value comes from the TokenReview, not from the
+# request, and a ServiceAccount username truncated at the default 64 loses
+# exactly its discriminating part.
 PRINCIPAL_LOG_LENGTH = 512
 MILLISECONDS_PER_SECOND = 1000
 
@@ -5194,9 +5194,10 @@ def _sanitize_for_logging(s: str, max_length: int = 64) -> str:
     # accept, so a text-formatting handler raises UnicodeEncodeError, logging
     # prints "--- Logging error ---" to stderr and drops the record - while
     # the request it was supposed to describe carries on and succeeds. The
-    # deployed JsonLineFormatter escapes the surrogate and keeps the record
-    # (test_credential_proxy_audit_json holds that); the strip is what keeps
-    # the property under a text formatter a test or a local run installs.
+    # deployed JsonLineFormatter escapes a lone surrogate and keeps the record
+    # (FormatterTest in test_credential_proxy_audit_json hands it one); the
+    # strip is what keeps the property under a text formatter a test or a
+    # local run installs.
     # Verified against a byte-encoding handler; a StringIO one does not
     # reproduce it, which is why the unit tests below write through a real
     # UTF-8 encoder.

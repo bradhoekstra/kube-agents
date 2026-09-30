@@ -95,6 +95,15 @@ class FormatterTest(unittest.TestCase):
         self.assertEqual(payload["severity"], "ERROR")
         self.assertIn("ValueError: boom", payload["exception"])
 
+    def test_a_lone_surrogate_is_escaped_and_the_line_still_encodes(self):
+        # What the sanitiser's comment relies on: json.dumps writes the
+        # surrogate as an escape, so the line encodes to UTF-8 and the record
+        # is kept where a text formatter would drop it.
+        line = self._format(self._record("id=%s", "\ud800"))
+        self.assertIn("\\ud800", line)
+        line.encode("utf-8")
+        self.assertEqual(json.loads(line)["message"], "id=\ud800")
+
     def test_a_value_json_cannot_encode_is_rendered_as_text(self):
         line = self._format(self._record("m", audit={"when": Path("/x")}))
         self.assertEqual(json.loads(line)["when"], "/x")
