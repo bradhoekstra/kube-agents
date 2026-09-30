@@ -22,9 +22,11 @@ from tests.testing.release import (
     MOCK_COMMIT_MSG_FEAT,
     MOCK_COMMIT_MSG_FIX,
     MOCK_INITIAL_VERSION,
+    MOCK_LINE_PATCH_RELEASE_TAG,
     MOCK_NONEXISTENT_REF,
     MOCK_NONEXISTENT_TAG,
     MOCK_RC_VALIDATED_TAG,
+    MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
 )
 
@@ -547,7 +549,7 @@ class CalculateNextVersionTest(unittest.TestCase):
         git("add", "stamp.txt")
         git("commit", "-m", f"{self._STAMP} 0.2.0")
         git("tag", "-a", "0.2.0", "-m", "release 0.2.0")
-        git("switch", "-c", "release/0.2")
+        git("switch", "-c", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (repo / "l1.txt").write_text("fix\n")
         git("add", "l1.txt")
         git("commit", "-m", "fix: backport")
@@ -568,9 +570,9 @@ class CalculateNextVersionTest(unittest.TestCase):
 
     def test_a_release_line_bumps_patch_from_its_own_base(self):
         repo_dir, git, shas = self._line_repo()
-        proc = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2"})
+        proc = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "0.2.1")
+        self.assertEqual(proc.stdout.strip(), MOCK_LINE_PATCH_RELEASE_TAG)
         outputs = self._outputs(repo_dir)
         self.assertEqual(outputs["bump_type"], "patch")
         self.assertEqual(outputs["previous_version"], "0.2.0")
@@ -580,12 +582,12 @@ class CalculateNextVersionTest(unittest.TestCase):
         for subject, phrase in (("feat: not a fix", "carries a feature"), ("fix!: breaks", "carries a breaking change")):
             with self.subTest(subject=subject):
                 repo_dir, git, _ = self._line_repo()
-                git("switch", "release/0.2")
+                git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
                 (pathlib.Path(repo_dir) / "more.txt").write_text(subject)
                 git("add", "more.txt")
                 git("commit", "-m", subject)
                 git("switch", "main")
-                proc = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2"})
+                proc = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE})
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn(phrase, proc.stderr)
                 self.assertIn("explicit_release_version", proc.stderr)
@@ -604,34 +606,34 @@ class CalculateNextVersionTest(unittest.TestCase):
         git("tag", "-a", "0.3.0", "-m", "release 0.3.0")
         git("switch", "main")
 
-        ok = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "EXPLICIT_RELEASE_VERSION": "0.2.1"})
+        ok = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "EXPLICIT_RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG})
         self.assertEqual(ok.returncode, 0, ok.stderr)
-        self.assertEqual(ok.stdout.strip(), "0.2.1")
-        off = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "EXPLICIT_RELEASE_VERSION": "0.3.5"})
+        self.assertEqual(ok.stdout.strip(), MOCK_LINE_PATCH_RELEASE_TAG)
+        off = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "EXPLICIT_RELEASE_VERSION": "0.3.5"})
         self.assertNotEqual(off.returncode, 0)
         self.assertIn("is not on release line 0.2", off.stderr)
 
     def test_an_idle_line_reports_no_changes(self):
         repo_dir, git, shas = self._line_repo()
-        git("switch", "release/0.2")
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
         git("add", "stamp.txt")
         git("commit", "-m", f"{self._STAMP} 0.2.1")
-        git("tag", "-a", "0.2.1", "-m", "release 0.2.1")
+        git("tag", "-a", MOCK_LINE_PATCH_RELEASE_TAG, "-m", f"release {MOCK_LINE_PATCH_RELEASE_TAG}")
         git("switch", "main")
-        proc = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2"})
+        proc = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         outputs = self._outputs(repo_dir)
         self.assertEqual(outputs["has_changes"], "false")
-        self.assertEqual(outputs["release_version"], "0.2.1")
+        self.assertEqual(outputs["release_version"], MOCK_LINE_PATCH_RELEASE_TAG)
         self.assertEqual(outputs["rc_candidate_commit"], shas["L1"])
 
     def test_a_target_commit_that_is_not_the_line_head_is_refused(self):
         repo_dir, git, shas = self._line_repo()
-        proc = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "TARGET_COMMIT": shas["B"]})
+        proc = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "TARGET_COMMIT": shas["B"]})
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("resolves to its own head", proc.stderr)
-        same = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "TARGET_COMMIT": shas["L1"]})
+        same = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "TARGET_COMMIT": shas["L1"]})
         self.assertEqual(same.returncode, 0, same.stderr)
 
     def test_a_missing_line_or_a_malformed_one_is_refused(self):
@@ -646,11 +648,11 @@ class CalculateNextVersionTest(unittest.TestCase):
     def test_main_ignores_a_line_release_and_bumps_minor_once_the_line_has_a_branch(self):
         """After 0.2.1 on release/0.2, main's base is still 0.2.0 and a fix-only week is 0.3.0."""
         repo_dir, git, shas = self._line_repo()
-        git("switch", "release/0.2")
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
         git("add", "stamp.txt")
         git("commit", "-m", f"{self._STAMP} 0.2.1")
-        git("tag", "-a", "0.2.1", "-m", "release 0.2.1")
+        git("tag", "-a", MOCK_LINE_PATCH_RELEASE_TAG, "-m", f"release {MOCK_LINE_PATCH_RELEASE_TAG}")
         git("switch", "main")
         (pathlib.Path(repo_dir) / "c.txt").write_text("c\n")
         git("add", "c.txt")
@@ -684,32 +686,32 @@ class CalculateNextVersionTest(unittest.TestCase):
         outputs = self._outputs(repo_dir)
         self.assertEqual(outputs["bump_type"], "manual")
         # A different patch on that line from main is still refused.
-        refused = self._run_line(repo_dir, env={"EXPLICIT_RELEASE_VERSION": "0.2.1", "TARGET_COMMIT": shas["B"]})
+        refused = self._run_line(repo_dir, env={"EXPLICIT_RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "TARGET_COMMIT": shas["B"]})
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("release it from release/0.2", refused.stderr)
 
     def test_a_line_release_that_died_after_its_push_is_resumed_by_naming_its_version(self):
         """After 0.2.1's push a backport lands; a plain re-dispatch computes 0.2.2, the pin finishes 0.2.1."""
         repo_dir, git, shas = self._line_repo()
-        git("switch", "release/0.2")
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
         git("add", "stamp.txt")
         git("commit", "-m", f"{self._STAMP} 0.2.1")
-        git("tag", "-a", "0.2.1", "-m", "release 0.2.1")
+        git("tag", "-a", MOCK_LINE_PATCH_RELEASE_TAG, "-m", f"release {MOCK_LINE_PATCH_RELEASE_TAG}")
         (pathlib.Path(repo_dir) / "l2.txt").write_text("fix\n")
         git("add", "l2.txt")
         git("commit", "-m", "fix: landed after the push")
         l2 = git("rev-parse", "HEAD").stdout.strip()
         git("switch", "main")
 
-        plain = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2"})
+        plain = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE})
         self.assertEqual(plain.returncode, 0, plain.stderr)
         self.assertEqual(plain.stdout.strip(), "0.2.2")
         self.assertEqual(self._outputs(repo_dir)["rc_candidate_commit"], l2)
 
-        pinned = self._run_line(repo_dir, env={"RELEASE_LINE": "0.2", "EXPLICIT_RELEASE_VERSION": "0.2.1"})
+        pinned = self._run_line(repo_dir, env={"RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "EXPLICIT_RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG})
         self.assertEqual(pinned.returncode, 0, pinned.stderr)
-        self.assertEqual(pinned.stdout.strip(), "0.2.1")
+        self.assertEqual(pinned.stdout.strip(), MOCK_LINE_PATCH_RELEASE_TAG)
         outputs = self._outputs(repo_dir)
         self.assertEqual(outputs["rc_candidate_commit"], shas["L1"])
         self.assertEqual(outputs["bump_type"], "manual")
@@ -737,14 +739,14 @@ class CalculateNextVersionTest(unittest.TestCase):
         (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1\n")
         git("add", "stamp.txt")
         git("commit", "-m", f"{self._STAMP} 0.2.1")
-        git("tag", "-a", "0.2.1", "-m", "emergency 0.2.1")
+        git("tag", "-a", MOCK_LINE_PATCH_RELEASE_TAG, "-m", f"emergency {MOCK_LINE_PATCH_RELEASE_TAG}")
         git("switch", "main")
 
         proc = self._run_line(repo_dir, env={"TARGET_COMMIT": c})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         outputs = self._outputs(repo_dir)
         self.assertEqual(outputs["has_changes"], "false")
-        self.assertEqual(outputs["release_version"], "0.2.1")
+        self.assertEqual(outputs["release_version"], MOCK_LINE_PATCH_RELEASE_TAG)
 
 if __name__ == "__main__":
     unittest.main()

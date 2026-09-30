@@ -18,6 +18,8 @@ from tests.testing.release import (
     MOCK_NONEXISTENT_REF,
     MOCK_HANDMADE_STAGING_TAG,
     MOCK_LATEST_STAGING_TAG,
+    MOCK_LINE_PATCH_RELEASE_TAG,
+    MOCK_TARGET_RELEASE_LINE,
     MOCK_TARGET_RELEASE_TAG,
     create_mock_gh_binary,
 )
@@ -672,7 +674,7 @@ exit {docker_exit}
     def _line_repo(self):
         temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
         self.addCleanup(temp_dir.cleanup)
-        git("switch", "-c", "release/0.2")
+        git("switch", "-c", f"release/{MOCK_TARGET_RELEASE_LINE}")
         (pathlib.Path(repo_dir) / "backport.txt").write_text("fix")
         git("add", "backport.txt")
         git("commit", "-m", "fix: backport")
@@ -684,7 +686,7 @@ exit {docker_exit}
         repo_dir, git, bin_dir, _, head = self._line_repo()
         git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
         proc = self._run_verify_script(
-            repo_dir, env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+            repo_dir, env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("candidate is the line's own", proc.stdout)
@@ -698,22 +700,31 @@ exit {docker_exit}
                 repo_dir, git, bin_dir, _, head = self._line_repo()
                 git("tag", "-a", tag, "-m", "not the line's gate", head)
                 proc = self._run_verify_script(
-                    repo_dir, env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+                    repo_dir, env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
                 )
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("has NOT passed the RC validation", proc.stderr)
                 self.assertIn("rc-release-pipeline.yml", proc.stderr)
+                self.assertIn("rc_tag empty", proc.stderr)
+                if tag.startswith("rc_"):
+                    # A hand-named marker is named, with why it does not count: the operator
+                    # who dispatched with rc_tag filled in otherwise reads "not validated"
+                    # on a commit they watched the pipeline validate.
+                    self.assertIn(f"It carries {tag} ", proc.stderr)
+                    self.assertIn("hand-named rc_tag", proc.stderr)
+                else:
+                    self.assertNotIn("It carries", proc.stderr)
 
     def test_a_line_release_resumes_from_its_stamp_parent_after_the_line_moved(self):
         """RELEASE_VERSION names a tag on the line: the candidate is what it was cut from, and Scenario A resumes."""
         repo_dir, git, bin_dir, _, head = self._line_repo()
         # The original release's gate, as the RC pipeline left it on the head it released.
         git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
-        git("switch", "release/0.2")
-        (pathlib.Path(repo_dir) / "stamp.txt").write_text("0.2.1")
+        git("switch", f"release/{MOCK_TARGET_RELEASE_LINE}")
+        (pathlib.Path(repo_dir) / "stamp.txt").write_text(MOCK_LINE_PATCH_RELEASE_TAG)
         git("add", "stamp.txt")
-        git("commit", "-m", "chore(release): stamp release version 0.2.1")
-        git("tag", "-a", "0.2.1", "-m", "release 0.2.1")
+        git("commit", "-m", f"chore(release): stamp release version {MOCK_LINE_PATCH_RELEASE_TAG}")
+        git("tag", "-a", MOCK_LINE_PATCH_RELEASE_TAG, "-m", f"release {MOCK_LINE_PATCH_RELEASE_TAG}")
         (pathlib.Path(repo_dir) / "l2.txt").write_text("fix")
         git("add", "l2.txt")
         git("commit", "-m", "fix: landed after the push")
@@ -723,7 +734,7 @@ exit {docker_exit}
         gh_out.write_text("")
         proc = self._run_verify_script(
             repo_dir,
-            env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2", "GH_TOKEN": "mock-token", "GITHUB_OUTPUT": str(gh_out)},
+            env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "GH_TOKEN": "mock-token", "GITHUB_OUTPUT": str(gh_out)},
             bin_dir=bin_dir,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -734,13 +745,13 @@ exit {docker_exit}
         repo_dir, git, bin_dir, base_commit, head = self._line_repo()
         git("tag", "-a", "rc_2609290000_1234567_validated", "-m", "validated", head)
         off = self._run_verify_script(
-            repo_dir, env={"RELEASE_VERSION": "0.3.1", "RELEASE_LINE": "0.2"}, bin_dir=bin_dir
+            repo_dir, env={"RELEASE_VERSION": "0.3.1", "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE}, bin_dir=bin_dir
         )
         self.assertNotEqual(off.returncode, 0)
         self.assertIn("is not on release line 0.2", off.stderr)
         other = self._run_verify_script(
             repo_dir,
-            env={"RELEASE_VERSION": "0.2.1", "RELEASE_LINE": "0.2", "RC_CANDIDATE_COMMIT": base_commit},
+            env={"RELEASE_VERSION": MOCK_LINE_PATCH_RELEASE_TAG, "RELEASE_LINE": MOCK_TARGET_RELEASE_LINE, "RC_CANDIDATE_COMMIT": base_commit},
             bin_dir=bin_dir,
         )
         self.assertNotEqual(other.returncode, 0)

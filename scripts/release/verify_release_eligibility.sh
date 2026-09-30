@@ -12,7 +12,9 @@
 #
 # A release line (RELEASE_LINE=X.Y) has the other gate: rc_*_validated on the line's head, earned
 # by dispatching rc-release-pipeline.yml against it. The nightly matrix and the eval nominate main
-# commits only, so a line never carries a staging_ tag, and its candidate is the head alone.
+# commits only, so a line never carries a staging_ tag. Its candidate is the line's own, as
+# release_line_resolve_candidate reads it: the head; the commit a head that is itself a stamped
+# release was cut from; or, with a version named, the commit that version's stamp was cut from.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -193,7 +195,11 @@ if [ -n "${RELEASE_LINE}" ]; then
   if [ -z "${VALIDATED_TAGS}" ]; then
     echo "❌ BLOCKED: Release line ${RELEASE_LINE}'s candidate ${RC_CANDIDATE_COMMIT} has NOT passed the RC validation!" >&2
     echo "   No 'rc_<ts>_<sha>_validated' tag from the RC pipeline points to this commit." >&2
-    echo "   Dispatch '.github/workflows/rc-release-pipeline.yml' with commit_sha=${RC_CANDIDATE_COMMIT} and wait for it to tag the commit validated." >&2
+    OTHER_MARKERS="$(git tag --points-at "${RC_CANDIDATE_COMMIT}" "rc_*_validated" 2>/dev/null | tr '\n' ' ' || true)"
+    if [ -n "${OTHER_MARKERS}" ]; then
+      echo "   It carries ${OTHER_MARKERS}- not that shape, so earned under a hand-named rc_tag dispatch input or placed by hand; neither counts here." >&2
+    fi
+    echo "   Dispatch '.github/workflows/rc-release-pipeline.yml' with commit_sha=${RC_CANDIDATE_COMMIT} and rc_tag empty (it reuses only its own rc_<ts>_<sha> tag and mints one otherwise), and wait for it to tag the commit validated." >&2
     exit 1
   fi
   FIRST_VAL_TAG="$(head -n 1 <<<"${VALIDATED_TAGS}")"

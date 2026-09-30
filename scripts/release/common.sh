@@ -725,18 +725,24 @@ check_commit_images_exist() {
   return 0
 }
 
-# Finds an existing rc_* tag for a commit SHA (excluding *_validated tags)
+# Finds the RC pipeline's own rc_<ts>_<sha> tag on a commit, for resolve_rc_tag.sh to
+# reuse; empty when there is none. Shape-matched (RC_TAG_SHAPE_REGEX), not the rc_*
+# glob: a hand-named `rc_tag` dispatch input earns `<name>_validated`, which a release
+# line's gate does not read (validated_rc_tags_at_commit), and reusing that name on
+# the next dispatch would re-earn the same refused marker. A re-dispatch with the
+# input empty mints the pipeline's name beside the hand-named tag instead, and the
+# gate clears.
 get_existing_rc_tag() {
-  local sha="$1"
-  git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -v '_validated$' | head -n 1 || echo ""
+  local sha="$1" tags
+  tags="$(git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -E "${RC_TAG_SHAPE_REGEX}" || true)"
+  head -n 1 <<<"${tags}"
 }
 
-# Checks if a commit SHA has already been attempted in a previous RC run (rc_* tag exists)
+# Checks if a commit SHA has already been attempted in a previous RC run: any
+# unvalidated rc_* tag, hand-named included, since a hand dispatch is an attempt too.
 is_commit_already_attempted() {
   local sha="$1"
-  local rc_tag
-  rc_tag=$(get_existing_rc_tag "${sha}")
-  [ -n "${rc_tag}" ]
+  [ -n "$(git tag --points-at "${sha}" "rc_*" 2>/dev/null | grep -v '_validated$' || true)" ]
 }
 
 # Checks if a commit SHA carries the RC pipeline's validation marker (rc_*_validated).
@@ -925,6 +931,10 @@ export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
 # reason the staging gate reads STAGING_TAG_SHAPE_REGEX rather than its prefix —
 # a hand-typed `rc_hotfix_validated` must not read as "the RC suite passed here".
 export RC_VALIDATED_TAG_SHAPE_REGEX='^rc_[0-9]{10}_[0-9a-f]{7}_validated$'
+# The RC pipeline's own candidate tag, `rc_<ts>_<sha>`, as resolve_rc_tag.sh mints
+# it when the dispatch names none; the marker above is this name with `_validated`
+# appended, so only a candidate tagged in this shape can earn the line's gate.
+export RC_TAG_SHAPE_REGEX='^rc_[0-9]{10}_[0-9a-f]{7}$'
 
 # Finds the newest shape-valid staging promotion tag on main. Empty output
 # means nothing has been promoted to staging.
