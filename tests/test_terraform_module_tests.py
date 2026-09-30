@@ -13,9 +13,12 @@ does not look (Terraform roots live under bench/tf and k8s-operator/testing
 too), and an unaliased `mock_provider` block for every provider a root needs:
 what it declares in `required_providers` in any of its `.tf` files (a
 composition declares them in providers.tf, a module in versions.tf; the block
-form and the version-only shorthand both count) and what every local module
-it calls declares, since Terraform hands a child a default provider the root
-never named. HCL is read through a small tokenizer that skips comments,
+form and the version-only shorthand both count), what its `resource`, `data`
+and `provider` blocks imply (Terraform loads `hashicorp/<prefix>` for an
+undeclared type prefix with no warning), what every local module it calls
+declares, since Terraform hands a child a default provider the root never
+named, and what a module a `run` block loads from the test file itself
+declares. HCL is read through a small tokenizer that skips comments,
 strings, heredocs and template interpolation, so none of those can pass for
 syntax; a `.tftest.json` is parsed; the `.tf` side is read as HCL only, and a
 root or called module carrying a `*.tf.json` fails the pin loudly rather than
@@ -87,7 +90,15 @@ _STR, _WORD, _OPEN, _CLOSE, _EQUALS, _OTHER = "str", "word", "{", "}", "=", "oth
 #: `mock_provider "name" { … }`, which mocks the default provider only when
 #: it carries no `alias`.
 _REQUIRED_PROVIDERS_BLOCK = "required_providers"
+#: Blocks whose type prefix implies a provider the root loads whether or
+#: not it is declared: `resource "google_x"`, `data "http"`, `provider "tls"`.
+_IMPLYING_BLOCKS = (("resource", 2), ("data", 2), ("provider", 1))
+_TYPE_PREFIX_SEPARATOR = "_"
 _MODULE_BLOCK = "module"
+#: A test file's `run "x" { module { source = "./…" } }`, whose module's
+#: providers the file has to mock too; in JSON, `run.<name>.module.source`.
+_RUN_BLOCK = "run"
+_JSON_RUN_KEY, _JSON_MODULE_KEY, _JSON_SOURCE_KEY = "run", "module", "source"
 _SOURCE_ATTRIBUTE = "source"
 _LOCAL_SOURCE_PREFIXES = ("./", "../")
 _MOCK_PROVIDER_BLOCK = "mock_provider"
@@ -296,12 +307,16 @@ def _attributes(body: list) -> dict:
 
 
 def _providers_in(text: str) -> set:
+    tokens = _tokens(text)
     providers = set()
-    for _labels, body in _blocks(_tokens(text), "terraform", 0):
+    for _labels, body in _blocks(tokens, "terraform", 0):
         for block in _nested_blocks(body, _REQUIRED_PROVIDERS_BLOCK):
             providers.update(
                 name for name, (kind, _value) in _attributes(block).items() if kind in (_OPEN, _STR)
             )
+    for block_name, labels in _IMPLYING_BLOCKS:
+        for found, _body in _blocks(tokens, block_name, labels):
+            providers.add(found[0].split(_TYPE_PREFIX_SEPARATOR)[0])
     return providers
 
 
@@ -340,6 +355,37 @@ def _needed_providers(root: pathlib.Path, seen=None) -> list:
             child = (root / source).resolve()
             if child.is_dir():
                 providers.update(_needed_providers(child, seen))
+    return sorted(providers)
+
+
+def _run_module_sources(text: str, name: str) -> list:
+    """Local module sources a test file's run blocks load, relative to the root."""
+    if name.endswith(_TEST_FILE_JSON_SUFFIX):
+        runs = json.loads(text).get(_JSON_RUN_KEY, {}) if text.strip() else {}
+        runs = runs.values() if isinstance(runs, dict) else runs if isinstance(runs, list) else []
+        modules = [run.get(_JSON_MODULE_KEY) for run in runs if isinstance(run, dict)]
+        modules = [m for m in modules if isinstance(m, dict)]
+    else:
+        modules = [
+            _attributes(block)
+            for _labels, body in _blocks(_tokens(text), _RUN_BLOCK, 1)
+            for block in _nested_blocks(body, _MODULE_BLOCK)
+        ]
+        modules = [{_JSON_SOURCE_KEY: m[_SOURCE_ATTRIBUTE][1]} for m in modules if m.get(_SOURCE_ATTRIBUTE, ("",))[0] == _STR]
+    return [
+        m[_JSON_SOURCE_KEY]
+        for m in modules
+        if isinstance(m.get(_JSON_SOURCE_KEY), str) and m[_JSON_SOURCE_KEY].startswith(_LOCAL_SOURCE_PREFIXES)
+    ]
+
+
+def _needed_by_test_file(root: pathlib.Path, path: pathlib.Path) -> list:
+    """What the root needs, plus what the modules this file's runs load need."""
+    providers = set(_needed_providers(root))
+    for source in _run_module_sources(path.read_text(), path.name):
+        child = (root / source).resolve()
+        if child.is_dir():
+            providers.update(_needed_providers(child))
     return sorted(providers)
 
 
@@ -412,14 +458,14 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
 
     def test_every_test_file_mocks_every_provider_its_root_needs(self):
         for root, files in _suites().items():
-            providers = _needed_providers(root)
-            self.assertTrue(providers, f"{root.name} needs no provider in any {_TF_FILE_GLOB}, its own or a called module's")
+            self.assertTrue(_needed_providers(root), f"{root.name} needs no provider in any {_TF_FILE_GLOB}, its own or a called module's")
             for path in files:
+                providers = _needed_by_test_file(root, path)
                 with self.subTest(root=root.name, file=path.name):
                     self.assertEqual(
                         _unmocked(path.read_text(), providers, path.name),
                         [],
-                        f"{path.relative_to(_REPO_ROOT)} has no unaliased mock_provider for every provider its root needs ({providers}); a read the file forgets to override would reach a real API from CI",
+                        f"{path.relative_to(_REPO_ROOT)} has no unaliased mock_provider for every provider its root, or a module its runs load, needs ({providers}); a read the file forgets to override would reach a real API from CI",
                     )
 
 
@@ -435,9 +481,10 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
 
     def test_providers_are_read_from_any_tf_file_and_only_inside_the_block(self):
         # A composition's shape: a provider configured before the terraform
-        # block, with a URL (`//`) and a template holding quotes in its
-        # strings; providers.tf, no versions.tf; a `kubernetes = {` attribute
-        # inside a provider block after it; the version-only shorthand.
+        # block (which implies `helm`), with a URL (`//`) and a template
+        # holding quotes in its strings; providers.tf, no versions.tf; a
+        # `kubernetes = {` attribute inside a provider block after it; the
+        # version-only shorthand; a resource implying `null`.
         (self.root / "providers.tf").write_text(
             'provider "helm" {\n  kubernetes = {\n    host  = "https://x.example/#frag"\n'
             '    token = "${var.a == "b" ? "c" : "d"} /* not a comment */"\n  }\n}\n\n'
@@ -446,7 +493,14 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
             '    random = ">= 3.5"\n  }\n}\n'
         )
         (self.root / "main.tf").write_text("resource \"null_resource\" \"x\" {}\n")
-        self.assertEqual(_declared_providers(self.root), ["google", "google-beta", "random"])
+        self.assertEqual(_declared_providers(self.root), ["google", "google-beta", "helm", "null", "random"])
+
+    def test_an_undeclared_resource_data_or_provider_block_implies_its_provider(self):
+        (self.root / "main.tf").write_text(
+            'data "http" "x" {\n  url = "https://x"\n}\nresource "google_project_iam_member" "y" {}\n'
+            'provider "tls" {}\nlocals {\n  z = 1\n}\n'
+        )
+        self.assertEqual(_declared_providers(self.root), ["google", "http", "tls"])
 
     def test_a_root_declaring_nothing_reads_as_no_providers(self):
         (self.root / "main.tf").write_text("locals {\n  a = {\n    b = {}\n  }\n}\n")
@@ -490,6 +544,27 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         (module / "main.tf").write_text('module "self" {\n  source = "./"\n}\n')
         self.assertEqual(_declared_providers(composition), ["google"])
         self.assertEqual(_needed_providers(composition), ["google", "http"])
+
+    def test_a_module_a_run_block_loads_adds_its_providers_for_that_file(self):
+        root = self.root / "terraform" / "modules" / "m"
+        setup = root / _TESTS_DIR / "setup"
+        setup.mkdir(parents=True)
+        (root / "versions.tf").write_text(
+            "terraform {\n  required_providers {\n    google = {\n      source = \"hashicorp/google\"\n    }\n  }\n}\n"
+        )
+        (setup / "main.tf").write_text('data "http" "seed" {\n  url = "https://x"\n}\n')
+        hcl = root / _TESTS_DIR / "a.tftest.hcl"
+        hcl.write_text('mock_provider "google" {}\n\nrun "seed" {\n  module {\n    source = "./tests/setup"\n  }\n}\n')
+        plain = root / _TESTS_DIR / "b.tftest.hcl"
+        plain.write_text('mock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n')
+        as_json = root / _TESTS_DIR / "c.tftest.json"
+        as_json.write_text('{"mock_provider": {"google": {}}, "run": {"seed": {"module": {"source": "./tests/setup"}}}}')
+        self.assertEqual(_needed_providers(root), ["google"])
+        self.assertEqual(_needed_by_test_file(root, hcl), ["google", "http"])
+        self.assertEqual(_needed_by_test_file(root, plain), ["google"])
+        self.assertEqual(_needed_by_test_file(root, as_json), ["google", "http"])
+        self.assertEqual(_unmocked(hcl.read_text(), _needed_by_test_file(root, hcl)), ["http"])
+        self.assertEqual(_unmocked(as_json.read_text(), _needed_by_test_file(root, as_json), as_json.name), ["http"])
 
     def test_a_mock_in_a_comment_does_not_count(self):
         text = '# mock_provider "http" {}\nmock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n'
