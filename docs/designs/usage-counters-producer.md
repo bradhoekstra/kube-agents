@@ -194,8 +194,11 @@ each pod it scraped:
   this one sends, the two rules above without the start time: the difference when the sample
   is not below the last one, the whole sample for a new pod UID, and a refusal that advances
   the baseline, as above, when the sample fell, so an in-place restart of such a listener
-  costs one interval and not the rest of the pod's life. The stricter rule applies from the first body that carries the gauge, and the
-  upgrade order makes that gap routine, as the failure section says;
+  costs one interval and not the rest of the pod's life. The stricter rule applies from the first
+  body that carries the gauge, and the upgrade order makes that gap routine, as the failure
+  section says; a body without the gauge for a pod whose entry already records a start time is
+  not the listener's, since a listener does not lose the gauge inside one pod, and is refused
+  with the baseline advanced, as above;
 - in every adding branch, at most `usageDeltaCeiling` per pod per counter per poll, a named
   bound sized to what a listener could plausibly count in one interval rather than in a pod's
   lifetime, and the same one ceiling whatever the gap since the pod was last counted: the
@@ -213,8 +216,8 @@ each pod it scraped:
   than 200, a body over the size ceiling or one `expfmt` could not parse, or a sample that is
   negative or not finite. Only then is the baseline entry kept; a body that parsed and was
   refused advances it, as the branches above say, which is the line between a scrape that said
-  nothing and one that said something the poller will not count. On its
-  return, the difference across the gap is added when no other pod of the same kind was counted
+  nothing and one that said something the poller will not count. When a missed pod answers
+  again, the difference across the gap is added when no other pod of the same kind was counted
   during the gap, which is every case for the broker's one pod and for a single gateway pod;
   when another gateway pod was counted meanwhile, the returning pod's baseline is reset to its
   sample and nothing is added, because the largest-delta rule below would otherwise count the
@@ -439,24 +442,27 @@ them.
 
 ## Testing
 
-Unit tests, beside the poller: the accumulator across the cases the resets section lists (a
-known pod moving, a new pod UID, a later start time, a pod missing this poll and back in the
-next, with and without a second gateway pod counted in between), the per-poll ceiling on the
-difference branch and on the whole-sample branch alike, asserting the poll after as well as
-the poll itself (a forged later start time with a large sample adds nothing and advances the
-baseline; an honest burst past the ceiling costs that interval and the next poll's delta is
-the new interval alone; a never-seen pod above the ceiling is recorded and the next poll counts
-from it; a gap of several polls gets one ceiling and the excess is lost once), a body without a start time read
-under the rule without it (difference, new pod, and a fall that advances the baseline), a quiet
-poll writing no ConfigMap, the baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
-log line), the largest-delta rule across two gateway pods and
-its agreement with the sum for one, the start-time rule (a restart that overtakes its last sample inside one
-interval), a body over the size ceiling, a 3xx answer, and a sample that is negative or not finite
-(each a failed scrape for that pod and nothing more), a body with a start time earlier than the
-recorded one and one whose sample fell under an unchanged start time (refused, baseline kept),
-a ConfigMap whose recorded CR UID is not the CR's or whose values fail the read-back bounds,
-including a total above the `int64` headroom and one below the status (treated as absent), the series selection (the `status` values summed and the three excluded; the
-injected series and not the observed one), and the port-by-name lookup when
+Unit tests, beside the poller, one per branch of the resets section as it stands, each asserting
+the poll after as well as the poll itself: the difference branch (a known pod, the recorded
+start time, a sample not below the last); the whole-sample branch (a new pod UID; a later start
+time), including a never-seen pod above the ceiling, which is recorded and adds nothing, and a
+forged later start time with a large sample, which adds nothing and advances the baseline; the
+two refused shapes (a start time earlier than the recorded one; a fall under an unchanged start
+time), refused with the baseline advanced to the body's sample and start time, nothing added,
+and the next poll counting from it; the rule without the gauge (the difference, a new pod, a
+fall that advances the baseline, and a body without the gauge after a start time was recorded,
+refused the same way); the per-poll ceiling on both adding branches (an honest burst past it
+costs that interval and the next poll's delta is the new interval alone; a gap of several polls
+gets one ceiling and the excess is lost once); the scrapes that produce no body (a connection
+that failed, a 3xx answer, a body over the size ceiling, one `expfmt` cannot parse, a sample
+that is negative or not finite), each keeping the baseline and nothing more; a pod missing this
+poll and back in the next, with and without a second gateway pod counted in between; the
+largest-delta rule across two gateway pods and its agreement with the sum for one; the
+baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
+or whose values fail the read-back bounds, including a total above the `int64` headroom and one
+below the status (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
+case (no gateway scrape, no log line); the series selection (the `status` values summed and the
+three excluded; the injected series and not the observed one); and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
 
