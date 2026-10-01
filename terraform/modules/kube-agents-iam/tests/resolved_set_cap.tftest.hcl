@@ -166,3 +166,51 @@ run "a_container_is_not_counted" {
     error_message = "the count is ${length(local.scope_listed_projects)}, not 100"
   }
 }
+
+# The cap is the declaration's: scope.max_projects (spec.scope.maxProjects)
+# replaces the default, so three explicit projects beside a selector fit a
+# cap of 4 and are refused under 3; the count itself does not move.
+run "a_declared_cap_is_the_one_the_plan_counts_against" {
+  command = plan
+
+  variables {
+    scope = {
+      projects       = ["team-a", "team-b"]
+      metrics_scopes = ["scoping-proj1"]
+      max_projects   = 4
+    }
+    scope_selector_members = { "metricsScopes/scoping-proj1" = ["scoping-proj1"] }
+  }
+
+  assert {
+    condition     = length(local.scope_listed_projects) == 4 && local.scope_resolved_set_cap == 4
+    error_message = "the count is ${length(local.scope_listed_projects)} against a cap of ${local.scope_resolved_set_cap}"
+  }
+}
+
+run "a_declared_cap_below_the_count_is_refused" {
+  command = plan
+
+  variables {
+    scope = {
+      projects       = ["team-a", "team-b"]
+      metrics_scopes = ["scoping-proj1"]
+      max_projects   = 3
+    }
+    scope_selector_members = { "metricsScopes/scoping-proj1" = ["scoping-proj1"] }
+  }
+
+  expect_failures = [google_service_account.agent]
+}
+
+# The CRD's bounds, held at the variable: zero, a fraction and a value past
+# 5000 are refused before any read.
+run "a_cap_outside_the_crds_bounds_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a"], max_projects = 0 }
+  }
+
+  expect_failures = [var.scope]
+}

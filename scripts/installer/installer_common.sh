@@ -909,8 +909,29 @@ hcl_csv_list() {
 # require_scope_container_ids, and the patterns, caps and repeats the CRD
 # enforces are the module variable's validations, which fail the plan before
 # any binding.
+# SCOPE_MAX_PROJECTS is empty (the default cap) or a whole number within the
+# bounds the CRD puts on spec.scope.maxProjects, or the run stops before a
+# file is written and names the key and the bounds: the module's validation
+# would otherwise name neither. $1 the value.
+readonly SCOPE_MAX_PROJECTS_MIN=1
+readonly SCOPE_MAX_PROJECTS_MAX=5000
+# The CRD's default, which the comparison reads an absent key as.
+readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+require_scope_max_projects() {
+  local value="${1:-}"
+  [ -n "$value" ] || return 0
+  if [[ "$value" =~ ^[0-9]+$ ]] && [ "$((10#$value))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$value))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
+    return 0
+  fi
+  print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (100), in install.env."
+  return 1
+}
+
+# $8, the cap, is written only when set: unset, the module's and the CRD's
+# default (100) apply, and a tfvars that names no cap keeps reading the default
+# an operator never chose.
 hcl_scope_block() {
-  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}"
+  local projects="${1:-}" folders="${2:-}" organizations="${3:-}" shared_vpc_hosts="${4:-}" metrics_scopes="${5:-}" exclude_projects="${6:-}" exclude_clusters="${7:-}" max_projects="${8:-}"
   local clusters="[" first=true entry project location cluster had_noglob=false
   local IFS=$', \t\n'
   case "$-" in *f*) had_noglob=true ;; esac
@@ -924,9 +945,13 @@ hcl_scope_block() {
   done
   $had_noglob || set +f
   clusters+="]"
-  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
+  printf 'scope = {\n  projects         = %s\n  folders          = %s\n  organizations    = %s\n  shared_vpc_hosts = %s\n  metrics_scopes   = %s\n' \
     "$(hcl_csv_list "$projects")" "$(hcl_csv_list "$folders")" "$(hcl_csv_list "$organizations")" \
-    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")" \
+    "$(hcl_csv_list "$shared_vpc_hosts")" "$(hcl_csv_list "$metrics_scopes")"
+  if [ -n "$max_projects" ]; then
+    printf '  max_projects     = %s\n' "$max_projects"
+  fi
+  printf '  exclude = {\n    projects = %s\n    clusters = %s\n  }\n}\n' \
     "$(hcl_csv_list "$exclude_projects")" "$clusters"
 }
 
@@ -1068,7 +1093,8 @@ print(max(served) if served else "")
 import json, re, sys
 cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
-keys = sys.argv[3:10]
+keys = sys.argv[3:11]
+default_cap = int(sys.argv[11])
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
@@ -1085,6 +1111,7 @@ def normalise(scope):
         "organizations": sorted(set(scope.get("organizations") or [])),
         "sharedVpcHosts": sorted(set(scope.get("sharedVpcHosts") or [])),
         "metricsScopes": sorted(set(scope.get("metricsScopes") or [])),
+        "maxProjects": int(scope.get("maxProjects") or default_cap),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
     }
 
@@ -1115,6 +1142,7 @@ declared = normalise({
     "organizations": split(keys[2]),
     "sharedVpcHosts": split(keys[3]),
     "metricsScopes": split(keys[4]),
+    "maxProjects": int(keys[7]) if keys[7].strip() else default_cap,
     "exclude": {
         "projects": split(keys[5]),
         "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[6])],
@@ -1132,7 +1160,9 @@ print("SCOPE_SHARED_VPC_HOSTS=" + json.dumps(" ".join(live["sharedVpcHosts"])))
 print("SCOPE_METRICS_SCOPES=" + json.dumps(" ".join(live["metricsScopes"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" 2>"$err_file")"; then
+if live["maxProjects"] != default_cap:
+    print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"])))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -2792,6 +2822,7 @@ write_tfvars_from_state() {
   # terraform with a message naming neither the key nor the entry.
   require_scope_cluster_triples "${SCOPE_EXCLUDE_CLUSTERS:-}" || return 1
   require_scope_container_ids "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" || return 1
+  require_scope_max_projects "${SCOPE_MAX_PROJECTS:-}" || return 1
 
   local old_umask
   old_umask="$(umask)"
@@ -2876,7 +2907,7 @@ write_tfvars_from_state() {
     echo "# emptied list is the declaration that drops what it named."
     hcl_scope_block "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" \
       "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" \
-      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}"
+      "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}"
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"

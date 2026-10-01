@@ -892,6 +892,9 @@ platformAgent:
   #     organizations: []           # numeric IDs; wide, prefer folders
   #     sharedVpcHosts: [shared-vpc-host]  # host project IDs; every attached service project
   #     metricsScopes: []           # scoping project IDs; every project the scope monitors
+  #     maxProjects: 100            # the most projects the reconcile lists per run, the
+  #                                 # management project included; a project past it reads
+  #                                 # over-cap. Renders only when set here (CRD default 100)
   #     exclude:
   #       projects: ["*-sandbox"]     # project IDs or shell-style globs
   #       clusters:                   # one cluster, by the full triple

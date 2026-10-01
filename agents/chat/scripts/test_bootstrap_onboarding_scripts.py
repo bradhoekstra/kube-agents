@@ -911,6 +911,35 @@ class ScanGateTest(unittest.TestCase):
             self.assertFalse(bootstrap_scan_gate.ensure_cluster_agents(self.d))
         self.assertEqual(bootstrap_scan_gate._reconcile_attempts(self.d), 1)
 
+    def test_the_reconcile_ceiling_follows_the_declared_cap(self):
+        # The ceiling is the reconcile's own listing budget for spec.scope.maxProjects plus
+        # the settle time, read through the reconcile's functions; without a declaration to
+        # read it is the constant, which is the default cap's value.
+        import cluster_agent_reconcile as rec
+        seen: dict = {}
+
+        def fake_run(cmd, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(rec.SCOPE_FILE_ENV, None)
+            self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+            scope = self.d / "scope.json"
+            scope.write_text('{"present": true, "projects": [], "maxProjects": 500}')
+            os.environ[rec.SCOPE_FILE_ENV] = str(scope)
+            expected = int(rec._list_budget_seconds(500)) + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS
+            self.assertGreater(expected, bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+            self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), expected)
+            with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
+                    mock.patch.object(Path, "exists", lambda self: True):
+                bootstrap_scan_gate.ensure_cluster_agents(self.d)
+            self.assertEqual(seen["timeout"], expected)
+            scope.write_text('{"present": true, "projects": [], "maxProjects": 100}')
+            self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+            self.assertEqual(int(rec._list_budget_seconds(rec.RESOLVED_SET_CAP)) + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS,
+                             bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+
     def test_a_successful_reconcile_clears_the_attempt_count(self):
         (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text("3")
 

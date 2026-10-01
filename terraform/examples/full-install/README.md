@@ -574,7 +574,7 @@ composition enables them in the apply, per selector, so `install.sh` enables whi
 selectors read is off before an apply that carries one; a 403 that names a disabled
 API is reported with that remedy, and one that refuses the identity the consumer project
 (`USER_PROJECT_DENIED`) with the `serviceusage.services.use` it needs there. The reconcile lists at
-most 100 projects of the resolved set, the management project included, so a declaration whose
+most `scope.max_projects` projects of the resolved set (100 by default; `spec.scope.maxProjects` on the CR), the management project included, so a declaration whose
 management project, `projects` and selector members together exceed that (once each, less an exact
 `exclude.projects` entry; a project both in `projects` and excluded by its number stays counted, so drop
 it from `projects`) is refused at plan rather than bound in full while a selector is declared

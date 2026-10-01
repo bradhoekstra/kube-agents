@@ -187,8 +187,9 @@ locals {
     [for scope in local.scope_metrics_scopes : scope if scope != var.project_id],
   ))
 
-  # What the reconcile lists of the resolved set: at most RESOLVED_SET_CAP
-  # projects (cluster_agent_reconcile.py; design §3), the management project
+  # What the reconcile lists of the resolved set: at most the declared cap
+  # (spec.scope.maxProjects, scope.max_projects here, the reconcile's
+  # RESOLVED_SET_CAP as its default; design §3), the management project
   # included, in a fixed order -- the management project, scope.projects, the
   # selectors' members, then the containers' -- and a project past the cap
   # reads `over-cap` with nothing created under it. The first three groups are
@@ -215,7 +216,7 @@ locals {
   # refused here and wants its entries named exactly. Containers are not counted: their members
   # are unknown here, they come last in the order, and their binding is one on
   # the container rather than one per member.
-  scope_resolved_set_cap = 100
+  scope_resolved_set_cap = var.scope.max_projects
 
   scope_listed_projects = setunion(
     toset([var.project_id]),

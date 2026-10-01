@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+import time
 from datetime import datetime, timezone
 import os
 import shutil
@@ -1274,6 +1275,86 @@ class ScopeTest(HomesMixin):
         # member the index no longer places under the still-declared folder, is kept instead.
         self.assertEqual(report["retiring"], ["p2"])
         self.assertEqual(rows["team-a"]["state"], rec.STATE_IN_SCOPE)
+
+    def test_the_cap_is_the_declarations_max_projects(self):
+        # spec.scope.maxProjects, rendered into the declaration, replaces the fixed constant:
+        # the management project and two explicit projects fit a cap of 3, the rest read
+        # over-cap, and the snapshot records the cap in force beside the declaration.
+        scope = {"projects": ["alpha", "beta", "gamma", "delta"], rec.SCOPE_MAX_PROJECTS_KEY: 3}
+        listings = {p: [(p, "c", "us-central1")] for p in [self.MGMT, "alpha", "beta", "gamma", "delta"]}
+        report, created, _ = self._run(scope, listings)
+        self.assertEqual(sorted(p for p, _c, _l in created), sorted([self.MGMT, "alpha", "beta"]))
+        self.assertEqual(report["projects"]["gamma"], rec.OUTCOME_OVER_CAP)
+        self.assertEqual(report["projects"]["delta"], rec.OUTCOME_OVER_CAP)
+        self.assertEqual(report["maxProjects"], 3)
+        snap = self._snapshot()
+        self.assertEqual(snap[rec.SCOPE_MAX_PROJECTS_KEY], 3)
+        self.assertEqual(snap["declared"][rec.SCOPE_MAX_PROJECTS_KEY], 3)
+
+    def test_a_declaration_without_a_cap_or_with_a_bad_one_reads_the_default(self):
+        # A render from an operator that predates the field carries no key; a value that is
+        # not a positive integer (a string, zero, a boolean) is not a cap either. Both read
+        # as the default, never as no cap.
+        listings = {self.MGMT: []}
+        for declared in ({}, {rec.SCOPE_MAX_PROJECTS_KEY: "lots"}, {rec.SCOPE_MAX_PROJECTS_KEY: 0},
+                         {rec.SCOPE_MAX_PROJECTS_KEY: True}, {rec.SCOPE_MAX_PROJECTS_KEY: -5}):
+            with self.subTest(declared=declared):
+                report, _, _ = self._run(declared, listings)
+                self.assertEqual(report["maxProjects"], rec.RESOLVED_SET_CAP)
+                self.assertEqual(self._snapshot()[rec.SCOPE_MAX_PROJECTS_KEY], rec.RESOLVED_SET_CAP)
+
+    def test_the_workers_and_the_budget_scale_with_the_cap(self):
+        # Workers first, up to their ceiling, then the budget: a cap of 200 lists with twice
+        # the workers in the same budget; past 400 the workers are capped and the budget
+        # grows a round at a time.
+        per_default = rec.LIST_WORKERS
+        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
+        self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
+        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
+        self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        budget = rec.LIST_BUDGET_SECONDS
+        self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), budget)
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 3 * budget)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 2 * rec.PRUNE_BUDGET_SECONDS)
+
+    def test_prune_describes_run_in_parallel_under_their_own_budget(self):
+        # Three profiles, one whose describe stalls past the prune budget: the stalled one
+        # reads inconclusive and is kept, the other two are judged, and the run does not
+        # wait out the stall (the walk used to be sequential at 30 s per stalled cluster).
+        ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b"),
+               "cluster-c": _identity(self.MGMT, "c")}
+
+        def exists(project, cluster, location):
+            if cluster == "a":
+                time.sleep(0.6)
+            return True if cluster != "c" else False
+
+        listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
+        started = time.monotonic()
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
+            report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 0.55, "the run waited out a stalled describe")
+        self.assertEqual(report["skipped_error"], ["cluster-a"])
+        self.assertEqual(report["kept"], ["cluster-b"])
+        self.assertEqual(deleted, ["cluster-c"])
+
+    def test_an_excluded_cluster_is_pruned_without_a_describe(self):
+        calls: list = []
+
+        def exists(project, cluster, location):
+            calls.append(cluster)
+            return True
+
+        ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b")}
+        scope = {"exclude": {"projects": [], "clusters": [{"projectId": self.MGMT, "location": "us-central1", "clusterName": "a"}]}}
+        report, _, deleted = self._run(scope, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertEqual(deleted, ["cluster-a"])
+        self.assertEqual(calls, ["b"])
 
     def test_a_project_that_moved_into_an_over_cap_folder_is_kept_not_retired(self):
         # x was reached through F1; it moves to F2, whose membership crosses the cap. The run

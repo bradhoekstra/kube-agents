@@ -287,7 +287,7 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # exactly (by ID for a service project, by number for a monitored
         # project), so the exclusion the message offers as a remedy lowers the
         # count it is tested against.
-        self.assertIn("scope_selector_member_cap       = 100", self.resolver_tf)
+        self.assertIn("scope_selector_member_cap       = var.member_cap", self.resolver_tf)
         self.assertIn('try(resource.type, "") == local.scope_xpn_resource_type_project && !contains(var.exclude_projects, try(resource.id, ""))])) <= local.scope_selector_member_cap', host)
         self.assertIn('if !contains(var.exclude_projects, try(regex(local.scope_monitored_project_name_pattern, row.name)["project"], ""))])) <= local.scope_selector_member_cap', scope)
         self.assertNotIn("length(try(jsondecode(self.response_body).monitoredProjects, [])) <= local.scope_selector_member_cap", scope)
@@ -360,8 +360,17 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         reconcile = (_REPO_ROOT / "agents" / "platform" / "scripts" / "cluster_agent_reconcile.py").read_text()
         cap = re.search(r"^RESOLVED_SET_CAP = (\d+)$", reconcile, re.MULTILINE)
         self.assertIsNotNone(cap, "cluster_agent_reconcile.py has no RESOLVED_SET_CAP")
-        self.assertIn(f"scope_resolved_set_cap = {cap.group(1)}", self.scope_tf)
-        self.assertIn(f"scope_selector_member_cap       = {cap.group(1)}", self.resolver_tf)
+        # The cap is the declaration's (scope.max_projects, spec.scope.maxProjects); its
+        # default in both modules is the reconcile's constant, so an install that declares
+        # none is planned against the number the reconcile lists.
+        self.assertIn("scope_resolved_set_cap = var.scope.max_projects", self.scope_tf)
+        iam_variables = (_REPO_ROOT / "terraform" / "modules" / "kube-agents-iam" / "variables.tf").read_text()
+        self.assertIn(f"max_projects     = optional(number, {cap.group(1)})", iam_variables)
+        self.assertIn("scope_selector_member_cap       = var.member_cap", self.resolver_tf)
+        resolver_variables = (_REPO_ROOT / "terraform" / "modules" / "kube-agents-scope-resolver" / "variables.tf").read_text()
+        member_cap = re.search(r'variable "member_cap" \{.*?default     = (\d+)', resolver_variables, re.DOTALL)
+        self.assertIsNotNone(member_cap, "the resolver has no member_cap variable with a default")
+        self.assertEqual(member_cap.group(1), cap.group(1))
         self.assertIn("toset([var.project_id]),", self.scope_tf)
         self.assertIn("toset([for project in var.scope.projects : project if !contains(var.scope.exclude.projects, project)]),", self.scope_tf)
         self.assertIn("for project in flatten([for name in local.scope_selector_names : lookup(var.scope_selector_members, name, [])]) : project\n      if !contains(var.scope.exclude.projects, project)\n", self.scope_tf)
@@ -419,6 +428,7 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
                      "organizations    = optional(list(string), [])",
                      "shared_vpc_hosts = optional(list(string), [])",
                      "metrics_scopes   = optional(list(string), [])",
+                     "max_projects     = optional(number, 100)",
                      "clusters = optional(list(object({",
                      "nullable = false",
                      "default  = {}"):
@@ -503,7 +513,8 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
                      "folders          = optional(list(string), [])",
                      "organizations    = optional(list(string), [])",
                      "shared_vpc_hosts = optional(list(string), [])",
-                     "metrics_scopes   = optional(list(string), [])"):
+                     "metrics_scopes   = optional(list(string), [])",
+                     "max_projects     = optional(number, 100)"):
             with self.subTest(line=line):
                 self.assertIn(line, variable)
         self.assertIn("nullable = false", variable)
@@ -530,7 +541,8 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         # module output or a local derived from either makes an input unknown
         # on a first install, and the for_each keyed on it fails the plan.
         inputs = re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.MULTILINE)
-        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project"})
+        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project", "member_cap"})
+        self.assertIn(("member_cap", "var.scope.max_projects"), inputs)
         for key, value in inputs:
             if key != "source":
                 with self.subTest(input=key):
@@ -548,6 +560,7 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertIn("organizations  = var.scope.organizations", body)
         self.assertIn("sharedVpcHosts = var.scope.shared_vpc_hosts", body)
         self.assertIn("metricsScopes  = var.scope.metrics_scopes", body)
+        self.assertIn("maxProjects    = var.scope.max_projects", body)
         self.assertIn("projects = var.scope.exclude.projects", body)
         for key in ("projectId   = cluster.project_id",
                     "location    = cluster.location",

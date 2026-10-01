@@ -232,9 +232,9 @@ which used to replace the Secret and restart every pod holding it.
 ### Projects, folders, organisations and selectors in scope
 
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
-`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` are the
-`PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from the
-same value: the generator renders them as the composition's `scope` object, the IAM module binds
+`SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS`
+are the `PlatformAgent`'s `spec.scope`, declared once and reaching both halves of the install from
+the same value: the generator renders them as the composition's `scope` object, the IAM module binds
 the read roles in every project named, the read roles plus `roles/cloudasset.viewer` on every
 folder and organisation named, and the read roles in every project a Shared VPC host or Metrics
 Scope resolves to, and the chart renders the same object into the CR. The lists are space- or
@@ -298,8 +298,13 @@ and the Day-2 menu read the keys from `install.env` alone (`load_install_env` dr
 inherited from the shell, as it does `NAMESPACE`, and `install.sh` does the same once an
 `install.env` exists); `install.sh` also takes the `--scope-*` flags, and on a first install
 the environment, and records them, and an empty `--scope-*=` is refused. A malformed
-`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` entry stops every front door but
-`uninstall.sh`, retags included, until the line is fixed; there is no bypass.
+`SCOPE_EXCLUDE_CLUSTERS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS` or `SCOPE_MAX_PROJECTS` entry stops every front door but
+`uninstall.sh`, retags included, until the line is fixed; there is no bypass. `SCOPE_MAX_PROJECTS` is
+`spec.scope.maxProjects`, the most projects the reconcile lists per run (1 to 5000): empty, the
+default, leaves the CRD's 100 in force and writes no `max_projects` into the scope block; a value
+is rendered into the block, refused at plan time when the explicit projects and selector members
+exceed it, and read by the live-scope check as part of the declaration, so a cap set on the CR by
+hand is reported like any hand edit until the key records it.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the

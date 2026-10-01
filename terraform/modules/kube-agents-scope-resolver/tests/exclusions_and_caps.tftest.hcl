@@ -104,3 +104,68 @@ run "an_id_entry_does_not_lower_a_metrics_scope_count" {
 
   expect_failures = [data.http.scope_metrics_scope]
 }
+
+# The per-selector cap is the declared one, handed in as member_cap: three
+# monitored projects fit a cap of 3 and are refused under 2.
+run "the_per_selector_cap_is_the_declared_cap" {
+  command = plan
+
+  variables {
+    shared_vpc_hosts = []
+    exclude_projects = []
+    member_cap       = 3
+  }
+
+  override_data {
+    target = data.http.scope_metrics_scope["scoping-proj1"]
+    values = {
+      status_code   = 200
+      response_body = jsonencode({ monitoredProjects = [for i in range(3) : { name = "locations/global/metricsScopes/scoping-proj1/projects/${100000000001 + i}" }] })
+    }
+  }
+  override_data {
+    target = data.http.scope_monitored_project
+    values = { status_code = 200, response_body = jsonencode({ projectId = "named-project" }) }
+  }
+
+  assert {
+    condition     = length(local.scope_monitored_numbers) == 3
+    error_message = "three monitored projects fit a cap of three"
+  }
+}
+
+run "a_selector_past_the_declared_cap_is_refused" {
+  command = plan
+
+  variables {
+    shared_vpc_hosts = []
+    exclude_projects = []
+    member_cap       = 2
+  }
+
+  override_data {
+    target = data.http.scope_metrics_scope["scoping-proj1"]
+    values = {
+      status_code   = 200
+      response_body = jsonencode({ monitoredProjects = [for i in range(3) : { name = "locations/global/metricsScopes/scoping-proj1/projects/${100000000001 + i}" }] })
+    }
+  }
+  override_data {
+    target = data.http.scope_monitored_project
+    values = { status_code = 200, response_body = jsonencode({ projectId = "named-project" }) }
+  }
+
+  expect_failures = [data.http.scope_metrics_scope]
+}
+
+run "a_member_cap_outside_the_crds_bounds_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    shared_vpc_hosts = []
+    metrics_scopes   = []
+    member_cap       = 5001
+  }
+
+  expect_failures = [var.member_cap]
+}
