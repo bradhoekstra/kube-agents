@@ -25,6 +25,7 @@ REQUEST_ATTEMPTS = 3
 REQUEST_RETRY_SECONDS = 5
 REQUEST_RETRY_CEILING = 60
 PER_PAGE = 100
+REQUEST_TIMEOUT_SECONDS = 30
 
 
 def log(message: str) -> None:
@@ -69,7 +70,14 @@ class GitHubAPI:
         self.opener = opener
         self.sleep = sleep
 
-    def request(self, method: str, path: str, payload=None, tolerate=()):
+    def request(
+        self,
+        method: str,
+        path: str,
+        payload=None,
+        tolerate=(),
+        timeout: float = REQUEST_TIMEOUT_SECONDS,
+    ):
         """One API call, retried on the failures that are worth retrying.
 
         A dropped write is the failure this whole client exists to prevent — so
@@ -77,7 +85,8 @@ class GitHubAPI:
         attempts, honouring `Retry-After` when GitHub sends one. A 403 that is
         really a missing permission is not retried. `tolerate` names status
         codes the caller has a meaning for; they come back as None instead of
-        raising.
+        raising. `timeout` bounds each attempt, so a connection GitHub accepts
+        and never answers cannot hold a maintenance script open for good.
         """
         body = None if payload is None else json.dumps(payload).encode()
         for attempt in range(1, REQUEST_ATTEMPTS + 1):
