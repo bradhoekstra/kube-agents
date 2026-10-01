@@ -34,7 +34,7 @@ next apply is every member's bindings revoked. A selector that resolves to more 
 (the declared `spec.scope.maxProjects`, 100 by default), less the members an `exclude_projects`
 entry names exactly, is refused too; a Shared VPC host with more than 500 service projects, one page
 of the Compute API's answer, is refused whatever `member_cap` is, since the plan cannot follow a second
-page. The reconcile lists at most that many projects of the whole resolved set, the management project included, and reads the
+page. The reconcile lists at most `member_cap` projects of the whole resolved set, the management project included, and reads the
 rest `over-cap` with nothing created under them, so a single selector past it cannot fit whatever
 else is declared, and refusing it at its read spares the naming reads, one per monitored project;
 the cap on the whole set, the management project, `scope.projects` and every selector's members
