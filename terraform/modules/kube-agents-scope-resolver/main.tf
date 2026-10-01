@@ -44,9 +44,10 @@ locals {
   scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"
   scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"
   scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"
-  # getXpnResources is paged; one page of the API's maximum holds five times
-  # the cap the CRD puts on any scope list, so a second page is refused rather
-  # than followed, which HCL cannot do.
+  # getXpnResources is paged at the API's maximum of 500, and HCL cannot
+  # follow a second page, so a host with more service projects than one page
+  # holds is refused whatever cap is declared: the bound on a host at plan
+  # time is the smaller of member_cap and this page.
   scope_xpn_page_size = 500
   # The most projects one selector may resolve to. The reconcile lists at
   # most the declared cap (spec.scope.maxProjects; RESOLVED_SET_CAP, 100, in
@@ -160,7 +161,7 @@ data "http" "scope_shared_vpc_host" {
     }
     postcondition {
       condition     = !can(jsondecode(self.response_body).nextPageToken)
-      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_xpn_page_size} attached service projects, more than one page of the Compute API's answer holds and far past the scope cap; declare the service projects wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
+      error_message = "shared_vpc_hosts: ${each.key} has more than ${local.scope_xpn_page_size} attached service projects, more than one page of the Compute API's answer holds, and the plan cannot follow a second page whatever spec.scope.maxProjects declares; declare the service projects wanted in the scope's projects, or a folder that holds them, instead. Nothing was applied."
     }
   }
 }

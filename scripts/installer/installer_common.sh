@@ -1027,7 +1027,8 @@ require_scope_cluster_triples() {
 #      holds the served one, and the retry must not read that as a hand edit;
 #   K  the scope the SCOPE_* keys declare now.
 #
-# Refused when L is present and non-empty, L != R and L != K: the CR carries a
+# Refused when L is present and non-empty (a list, an exclusion, or a cap off
+# the CRD's default), L != R and L != K: the CR carries a
 # declaration the installer did not write and the keys do not reproduce. Every
 # other case passes -- nothing live to protect; L == R, the installer wrote it
 # and the keys are the new declaration, emptying it included; L == K, the
@@ -1127,9 +1128,12 @@ def normalise(scope):
     }
 
 def is_empty(scope):
+    # Nothing live to protect: no list, no exclusion, and the cap at the default
+    # the CRD sets, which is what the apply renders for a key left unset.
     return not (scope["projects"] or scope["folders"] or scope["organizations"]
                 or scope["sharedVpcHosts"] or scope["metricsScopes"]
-                or scope["exclude"]["projects"] or scope["exclude"]["clusters"])
+                or scope["exclude"]["projects"] or scope["exclude"]["clusters"]
+                or scope["maxProjects"] != default_cap)
 
 items = json.loads(cr_text).get("items") or []
 if len(items) > 1:

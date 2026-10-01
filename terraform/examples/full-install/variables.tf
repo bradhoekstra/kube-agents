@@ -202,8 +202,9 @@ variable "scope" {
     most projects the reconcile lists per run (100 by default): the module
     refuses a plan whose explicit projects and selector members exceed it
     (while a selector is declared or the cap is below its default), the
-    resolver refuses a single selector past it, and the chart renders it on
-    the CR, all from this one value.
+    resolver refuses a single selector past it (and a Shared VPC host past
+    500 service projects, one page of the Compute API's answer, whatever the
+    cap), and the chart renders it on the CR, all from this one value.
   EOT
   type = object({
     projects         = optional(list(string), [])

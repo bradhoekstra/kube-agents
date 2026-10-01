@@ -3057,6 +3057,18 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         })
         self._assert_rc(proc, 0)
 
+    def test_a_cap_alone_on_a_scope_less_cr_is_a_hand_edit(self):
+        # A CR whose only hand edit is the cap is not "nothing live to protect": the apply
+        # would render the default over it. It is refused with the key among the lines
+        # until the key records it; the default alone is still an empty declaration.
+        capped_only = '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"scope":{"maxProjects":250}}}]}'
+        proc = self._run(capped_only, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS=""', proc.stdout)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS="250"', proc.stdout)
+        self._assert_rc(self._run(capped_only, "norelease", keys={"SCOPE_MAX_PROJECTS": "250"}), 0)
+        self._assert_rc(self._run(capped_only.replace("250", "100"), "norelease"), 0)
+
     def test_a_cap_set_on_the_cr_by_hand_is_a_hand_edit_until_the_key_records_it(self):
         # The cap is part of the declaration: a CR whose maxProjects differs from
         # what the record and the keys say is refused, with the key among the

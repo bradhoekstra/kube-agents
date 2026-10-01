@@ -84,7 +84,8 @@ variable "member_cap" {
     scope.max_projects), since a single selector past it cannot fit whatever
     else the scope declares, and refusing it at the read spares the naming
     reads the whole-set check would otherwise wait for. The reconcile's
-    default, 100, when not given.
+    default, 100, when not given. A Shared VPC host is also bounded by one
+    page of the Compute API's answer, 500 service projects, whatever this is.
   EOT
   type        = number
   nullable    = false

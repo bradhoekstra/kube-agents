@@ -32,7 +32,9 @@ module reads (a JSON object of the documented shape; a list, a string or `null` 
 refused as well) is refused rather than read as an empty selector, since an empty selector on the
 next apply is every member's bindings revoked. A selector that resolves to more than `member_cap` projects
 (the declared `spec.scope.maxProjects`, 100 by default), less the members an `exclude_projects`
-entry names exactly, is refused too. The reconcile lists at most that many projects of the whole resolved set, the management project included, and reads the
+entry names exactly, is refused too; a Shared VPC host with more than 500 service projects, one page
+of the Compute API's answer, is refused whatever `member_cap` is, since the plan cannot follow a second
+page. The reconcile lists at most that many projects of the whole resolved set, the management project included, and reads the
 rest `over-cap` with nothing created under them, so a single selector past it cannot fit whatever
 else is declared, and refusing it at its read spares the naming reads, one per monitored project;
 the cap on the whole set, the management project, `scope.projects` and every selector's members

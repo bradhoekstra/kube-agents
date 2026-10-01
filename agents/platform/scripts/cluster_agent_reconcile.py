@@ -1332,7 +1332,8 @@ def _scaffold_gaps(home: Path) -> list[str]:
     ``create_profile`` stamps ``cluster_identity`` into ``config.yaml`` (step 2b)
     before it fetches the kubeconfig (step 3) and writes ``USER.md`` (step 4). A
     process killed in that window -- the bootstrap gate runs this script under a
-    240s timeout, and Python SIGKILLs on expiry -- leaves a home that reads as fully
+    ceiling (RECONCILE_TIMEOUT_SECONDS at the floor, more with a declared cap and
+    profiles on the volume), and Python SIGKILLs on expiry -- leaves a home that reads as fully
     managed: CREATE finds its identity tuple and skips the cluster, PRUNE keeps it
     because the cluster still exists, and the half-scaffolded profile survives with
     no credentials for the life of the volume. Treating it as absent re-runs the
