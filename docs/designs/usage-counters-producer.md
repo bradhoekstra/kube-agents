@@ -42,9 +42,9 @@ These are the facts the design rests on.
 | The gateway pod's containers share one network namespace, `spec.deployment.sidecars` renders any container a CR author names into that pod, and the watcher holds 9095 only while its process runs: when the port is taken it logs an ALERT and runs on without a listener. The manager runs under a 128Mi memory limit in both install paths.                                                                                                                                                                            | `platformagent_manifests.go`, `common_types.go`, `cmd/k8s-event-watcher/main.go`, `config/manager/manager.yaml`, `charts/kube-agents/values.yaml`                                                                               |
 | The operator's ClusterRole lists pods and manages ConfigMaps, cluster-wide grants the poller uses in the agent's namespace; it patches the status subresource of other kinds already (`Status().Patch` on `AgentPlugin`).                                                                                                                                                                                                                                                                                                 | `config/rbac/role.yaml`, `platformagent_controller.go`                                                                                                                                                                          |
 | The controller `Owns` ConfigMaps with no predicate: a write to any ConfigMap whose controller owner is the CR re-enqueues the CR. The `PlatformAgent` watch itself carries no predicate either, so every status write re-enqueues the CR.                                                                                                                                                                                                                                                                                 | `platformagent_controller.go` (`SetupWithManager`)                                                                                                                                                                              |
-| Neither listener exports `process_start_time_seconds`: the watcher registers its counters on a registry of its own with no process collector, and the broker renders its exposition by hand.                                                                                                                                                                                                                                                                                                                              | `cmd/k8s-event-watcher/metrics.go`, `credential_proxy.py`                                                                                                                                                                       |
+| Neither listener exports `process_start_time_seconds`: the watcher registers its counters on a registry of its own with no process collector, and the broker renders its exposition by hand. The Go client's process collector would not do as the source: it derives the start time on every scrape from `/proc/stat`'s `btime`, which moves by a second when the node's wall clock is stepped against its monotonic clock, so an unchanged process would read as restarted.                                             | `cmd/k8s-event-watcher/metrics.go`, `credential_proxy.py`                                                                                                                                                                       |
 | On an upgrade the operator moves before the harness, `--upgrade-mode=operator` moves it alone, and the harness and broker images can be pinned behind it (`spec.deployment.image`, `CREDENTIAL_PROXY_IMAGE`, the chart's tag), so the poller will meet listeners from the previous release on every ordinary upgrade.                                                                                                                                                                                                     | the site's upgrade page, `manifest_helpers.go` (`resolveAgentImage`), `platformagent_manifests.go`                                                                                                                              |
-| Kubernetes' default `edit` and `admin` ClusterRoles grant write on ConfigMaps and nothing on `platformagents` or their status; the agent's own ClusterRole holds get, list and watch on ConfigMaps. The one namespace ConfigMap the operator reads back today, `<name>-gitops-state`, names its trusted writer and validates its content on every read. The manager has no HTTP client of its own; the module's clients belong to the watcher and the drift detector binaries.                                            | `platformagent_manifests.go` (the agent's role), `platformagent_controller.go` (`parseManagedRepos`), `charts/kube-agents/values.yaml`                                                                                          |
+| Kubernetes' default `edit` and `admin` ClusterRoles grant write on ConfigMaps and nothing on `platformagents` or their status; the agent's own ClusterRole holds get, list and watch on ConfigMaps. A namespace ConfigMap the operator reads back today, `<name>-gitops-state`, names its trusted writer and validates its content on every read; the minter's is another. The manager has no HTTP client of its own; the module's clients belong to the watcher and the drift detector binaries.                         | `platformagent_manifests.go` (the agent's role), `platformagent_controller.go` (`parseManagedRepos`), `charts/kube-agents/values.yaml`                                                                                          |
 | `github.com/prometheus/common`, which holds the text-format parser (`expfmt`), is already in the operator's module graph as an indirect dependency; `google.golang.org/api` is a direct one.                                                                                                                                                                                                                                                                                                                              | `k8s-operator/go.mod`                                                                                                                                                                                                           |
 | The Ready writer gates its `Status().Update` on `status.usage.activeInterfaces` and keeps a per-CR record, `prunedUsageStatus`, of a served CRD that drops `status.usage`; it re-probes every `usageStatusReprobeInterval` (5 minutes).                                                                                                                                                                                                                                                                                   | `platformagent_controller.go` (`noteUsageStatusEcho`, `usageStatusPruned`)                                                                                                                                                      |
 | The RBAC self-check is a manager `Runnable` on its own ticker, added in `main.go`, with `NeedLeaderElection` false because it is about the pod's own permissions.                                                                                                                                                                                                                                                                                                                                                         | `rbac_selfcheck.go`                                                                                                                                                                                                             |
@@ -124,14 +124,18 @@ The largest delta is an estimate when replicas disagree: a replica that started 
 has seen fewer events than one that was up throughout, and the largest is the closest to the
 number of distinct events. During a rollout, when old and new pods overlap, the per-pod reset
 handling below runs first, so a new pod's whole sample competes with an old pod's difference
-and the larger wins, which is still the better estimate of the two. A pod missed in one poll
-and back in the next does not compete with its gap delta while another pod was counted, as the
-resets section says. With that, the rule has one way of over-counting left: informer skew that straddles a poll boundary, one replica ahead at one poll and
-the other catching up by the next, counts the catch-up twice, because the maximum carries no
-memory of which replica supplied it. That is the one over-count this document tolerates, on a
-layout that is opt-in and in a series that carries no replica attribution; the fix, if it
-ever matters, is a watcher that counts only on the leader, not a smarter maximum. The broker
-runs one pod, so its series needs no such rule.
+and the larger wins, which is still the better estimate of the two. A replica whose entry is behind
+its sibling's marker when it next advances is reset without adding, as the resets section
+says, and that rule reads the stored markers alone, so it holds across a leader change. It
+makes the layout under-count rather than over-count: informer skew that straddles a poll
+boundary, one replica ahead at one poll and the other catching up by the next, drops the
+catch-up instead of counting it twice, and a replica's events its sibling did not inject, a
+sibling whose daemon dropped them on its daily ceiling or whose dedup snapshot was kept while
+this one's was lost, are lost whenever this replica was quiet for a poll in which the sibling
+moved. That is the error this document tolerates, on a layout that is opt-in and in a series
+that carries no replica attribution; the fix, if it ever matters, is a watcher that counts only
+on the leader, not a smarter maximum. The broker runs one pod, so its series needs no such
+rule.
 
 ## Reach: how the operator gets to the endpoints
 
@@ -201,35 +205,40 @@ each pod it scraped:
   with the baseline advanced, as above;
 - in every adding branch, at most `usageDeltaCeiling` per pod per counter per poll, a named
   bound sized to what a listener could plausibly count in one interval rather than in a pod's
-  lifetime, and the same one ceiling whatever the gap since the pod was last counted: the
-  excess after an operator outage of several intervals is lost once, which is the under-count
-  this document prefers, and an allowance scaled to the gap would be one the stored marker
+  lifetime, and the same one ceiling whatever the gap since the pod was last counted: a gap's
+  delta past one ceiling, after an operator outage of several intervals, is refused whole, the
+  baseline advanced and that gap's count lost once, which is the under-count this document
+  prefers, and an allowance scaled to the gap would be one the stored marker
   cannot compute, because a quiet poll does not move it, so after an idle stretch one body
   could claim the whole stretch's allowance at once. A body whose addition would exceed the
   ceiling is refused and, because it parsed, advances the baseline to the sample it carried and
   adds nothing: an
   honest burst past the ceiling, which the sizing makes rare, costs that interval's count and
   nothing after it, and a pod the ConfigMap has never seen is always recorded, whatever its
-  sample, so the first poll after an upgrade records a long-lived broker's lifetime count as its
-  baseline rather than refusing it on every poll until the pod restarts;
+  sample, rather than refused on every poll until it restarts;
 - nothing, when the scrape produced no body to read: a connection that failed, a status other
   than 200, a body over the size ceiling or one `expfmt` could not parse, or a sample that is
   negative or not finite. Only then is the baseline entry kept; a body that parsed and was
   refused advances it, as the branches above say, which is the line between a scrape that said
-  nothing and one that said something the poller will not count. When a missed pod answers
-  again, the difference across the gap is added when no other pod of the same kind was counted
-  during the gap, which is every case for the broker's one pod and for a single gateway pod;
-  when another gateway pod was counted meanwhile, the returning pod's baseline is reset to its
-  sample and nothing is added, because the largest-delta rule below would otherwise count the
-  gap a second time. The poll recorded against each pod's sample is what tells the two cases
-  apart.
+  nothing and one that said something the poller will not count. The document records no
+  "missed", only the marker, and a quiet pod and a missed one look the same in it; so the rule
+  that keeps a gap from being counted twice reads the markers alone, on every poll: a gateway
+  pod whose entry is behind another gateway pod's marker when it next advances is reset to its
+  sample and adds nothing, because the largest-delta rule below would otherwise count what the
+  sibling already supplied. The broker's one pod, and a single gateway pod, have no sibling and
+  always add the difference across a gap. The error this leaves is an under-count, named in the
+  sources section: a replica's events that its sibling did not inject are lost whenever it was
+  quiet, or missed, for a poll in which the sibling moved.
 
 Entries for pods that no longer exist are dropped when the baseline is next written; their
 counts are already in the totals.
 
-The start time is why both listeners gain `process_start_time_seconds`, the Go process
-collector on the watcher's registry and one gauge line in the broker's exposition, sampled
-beside the counters. A sample that fell is not the only sign of a restart: a process that
+The start time is why both listeners gain `process_start_time_seconds`, as a gauge each
+captures once when its process starts, `time.Now()` at `main` and nothing re-derived after, so
+it is constant for the life of the process by construction; the Go client's process collector
+is not used for it, because it recomputes the value from the kernel's boot time on every
+scrape and a stepped wall clock moves that by a second, which the rule below would read as a
+restart in one direction and a forgery in the other. A sample that fell is not the only sign of a restart: a process that
 restarts and overtakes its last sample inside one interval reads as a plain increase, and
 without the start time the counts it made up to its last sample would be lost, an under-count
 bounded by that sample per restart, silent, and most likely on exactly the busy install where
@@ -277,13 +286,19 @@ restart would see every pod as new and add its whole sample again, counting ever
 event since those pods started a second time; the totals, kept in memory, would start from zero
 and the status would fall back. With the ConfigMap, an operator restart loses nothing.
 
-When the ConfigMap is absent but the status already carries counters, something removed the
-state after the counters had been written. The poll then seeds the totals from the status,
-records every pod's current sample as its baseline, and adds nothing: it under-counts whatever
-happened between the last written poll and this one, once, rather than over-counting everything
-the pods have ever done. On a fresh install both are absent, and the first poll records every pod's sample as its
-baseline and adds it only where it is within the ceiling, which is right: nothing before it was
-counted, and a pod older than the poller is not a burst to count.
+A poll that finds no ConfigMap has one rule, whatever the status says: it records every pod's
+current sample as its baseline and adds nothing, and it seeds the totals from the status when
+the status carries counters. When the status carries them, something removed the state after
+the counters had been written, and the poll under-counts whatever happened between the last
+written poll and this one, once, rather than over-counting everything the pods have ever done.
+On a fresh install, or the first poll after the upgrade that brings the poller, the status
+carries nothing and the counters start at zero from this poll: a pod older than the poller has
+a history the counters never saw, and whether it fits the ceiling says nothing about whether
+it should be counted. The whole-sample branch therefore applies only to a pod UID that appears
+after the ConfigMap exists, where "a new pod starts from zero" is true, and `lastActiveTime`
+is first stamped by a poll in which something ran. What a fresh install loses is the count
+between each pod's start and the first poll after it, the under-count this document prefers
+everywhere else.
 
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
@@ -444,8 +459,9 @@ them.
 
 Unit tests, beside the poller, one per branch of the resets section as it stands, each asserting
 the poll after as well as the poll itself: the difference branch (a known pod, the recorded
-start time, a sample not below the last); the whole-sample branch (a new pod UID; a later start
-time), including a never-seen pod above the ceiling, which is recorded and adds nothing, and a
+start time, a sample not below the last); the whole-sample branch (a pod UID that appears after the ConfigMap exists; a later start
+time), including such a pod above the ceiling, which is recorded and adds nothing, and the
+first poll with no ConfigMap, which records every pod and adds nothing whatever the samples, and a
 forged later start time with a large sample, which adds nothing and advances the baseline; the
 two refused shapes (a start time earlier than the recorded one; a fall under an unchanged start
 time), refused with the baseline advanced to the body's sample and start time, nothing added,
@@ -453,7 +469,8 @@ and the next poll counting from it; the rule without the gauge (the difference, 
 fall that advances the baseline, and a body without the gauge after a start time was recorded,
 refused the same way); the per-poll ceiling on both adding branches (an honest burst past it
 costs that interval and the next poll's delta is the new interval alone; a gap of several polls
-gets one ceiling and the excess is lost once); the scrapes that produce no body (a connection
+whose delta passes one ceiling is refused whole, the baseline advanced, that gap's count lost
+once); the scrapes that produce no body (a connection
 that failed, a 3xx answer, a body over the size ceiling, one `expfmt` cannot parse, a sample
 that is negative or not finite), each keeping the baseline and nothing more; a pod missing this
 poll and back in the next, with and without a second gateway pod counted in between; the
