@@ -113,7 +113,8 @@ the counter only ever rises. And it moves with routine cluster churn, scheduling
 warnings, on every watched cluster, so `lastActiveTime` would never rest and would stop meaning
 what the schema says. The injected series sits behind the dedup cache, whose snapshot persists
 on the data volume, so a restart re-injects nothing already triaged; when a snapshot is lost the
-replay is injected again, and the counter counts that, because it happened. The field's
+replay is injected again, and the counter counts that up to the per-poll ceiling the resets
+section sets, because it happened, and no further. The field's
 description changes from "ingested and evaluated" to say "accepted for triage", and the observed
 volume stays where it is, in Prometheus.
 
@@ -181,21 +182,32 @@ each pod it scraped:
 - the whole sample, when the pod UID is new (a new pod starts from zero, so everything it has
   counted is new), or the body's start time is present and later than the recorded one (the
   process restarted inside the same pod);
-- nothing, as a failed scrape for that pod, when the body carries a start time earlier than
-  the recorded one, or shows the sample falling under an unchanged start time: a counter cannot
-  fall inside one process, so each of those is a body that is not the listener's, and the pod's
-  baseline is kept;
+- nothing, when the body carries a start time earlier than the recorded one, or shows the
+  sample falling under an unchanged start time: a counter cannot fall inside one process, so
+  each of those is a body that is not the listener's. The body is refused, and because it
+  parsed, the baseline advances to the sample and start time it carried: a refusal that kept
+  the baseline would be repeated on every poll until the pod restarted, since the next body
+  would carry the same fall;
 - for a body that carries no start time, which is what every listener from a release before
   this one sends, the two rules above without the start time: the difference when the sample
-  is not below the last one, the whole sample for a new pod UID, and a failed scrape when the
-  sample fell. The stricter rule applies from the first body that carries the gauge, and the
+  is not below the last one, the whole sample for a new pod UID, and a refusal that advances
+  the baseline, as above, when the sample fell, so an in-place restart of such a listener
+  costs one interval and not the rest of the pod's life. The stricter rule applies from the first body that carries the gauge, and the
   upgrade order makes that gap routine, as the failure section says;
 - in every adding branch, at most `usageDeltaCeiling` per pod per counter per poll, a named
   bound sized to what a listener could plausibly count in one interval rather than in a pod's
-  lifetime. A body whose addition would exceed it is a failed scrape for that pod: nothing is
-  added and the baseline is kept, so an honest burst past the ceiling, which the sizing makes
-  rare, costs the interval's count and nothing after it;
-- nothing, when the pod could not be scraped this poll; its baseline entry is kept. On its
+  lifetime; across a gap of several polls the allowance is the ceiling times the polls missed,
+  which the marker below counts. A body whose addition would exceed the allowance is refused
+  and, because it parsed, advances the baseline to the sample it carried and adds nothing: an
+  honest burst past the ceiling, which the sizing makes rare, costs that interval's count and
+  nothing after it, and a pod the ConfigMap has never seen is always recorded, whatever its
+  sample, so the first poll after an upgrade records a long-lived broker's lifetime count as its
+  baseline rather than refusing it on every poll until the pod restarts;
+- nothing, when the scrape produced no body to read: a connection that failed, a status other
+  than 200, a body over the size ceiling or one `expfmt` could not parse, or a sample that is
+  negative or not finite. Only then is the baseline entry kept; a body that parsed and was
+  refused advances it, as the branches above say, which is the line between a scrape that said
+  nothing and one that said something the poller will not count. On its
   return, the difference across the gap is added when no other pod of the same kind was counted
   during the gap, which is every case for the broker's one pod and for a single gateway pod;
   when another gateway pod was counted meanwhile, the returning pod's baseline is reset to its
@@ -229,7 +241,10 @@ section rather than designed away, because closing it means authenticating the l
 The totals and the baseline live together in a ConfigMap, `<name>-usage-counters`, in the CR's
 namespace, holding one JSON document: the running total per counter, the time of the last poll
 that moved a total, and per pod UID the pod's name for a reader, its last sample per counter,
-its last start time, and the poll at which that sample was taken. The ConfigMap is the source of truth the
+its last start time, and the poll at which its entry was last added, advanced or reset, which
+is not the poll it was last read at: a quiet poll changes nothing in the document, so a quiet
+install writes nothing, and the marker still tells the missed-pod rule whether another pod was
+counted during a gap. The ConfigMap is the source of truth the
 accumulator reads at the start of every poll; the status is written from it, never the other
 way round, so a cache that hands the poller a stale CR can never pull a total backwards. It
 carries an owner reference to the CR, without the controller flag, so it is collected with the
@@ -258,7 +273,8 @@ state after the counters had been written. The poll then seeds the totals from t
 records every pod's current sample as its baseline, and adds nothing: it under-counts whatever
 happened between the last written poll and this one, once, rather than over-counting everything
 the pods have ever done. On a fresh install both are absent, and the first poll adds every pod's
-whole sample, which is right: nothing before it was counted.
+whole sample up to the ceiling and records the rest as baseline, which is right: nothing before
+it was counted, and a pod older than the poller is not a burst to count.
 
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
@@ -357,6 +373,16 @@ which the collector's scrape does not do either. The scrape is therefore not the
 alternatives section refuses, a workload describing its own activity: it is a reader of counts
 the workload can withhold or nudge, never write.
 
+One more residual sits in the peer selector. The chart renders the CR into the operator's
+namespace, and above one replica the agent's Role holds `get` and `patch` on every pod there,
+because RBAC cannot say "only your own pod"; so on an HA chart install anything running as the
+agent's ServiceAccount can put the operator's label on a pod of its choosing, the sandbox
+included, and that pod is then admitted to both metrics ports. What it gains is the two
+listeners' counters, which the agent container already reads over its own pod's loopback, and
+the same grant already lets it swap a sibling's image, so the selector argument above holds in
+full on the single-replica default and in substance above it; the pages the implementation
+rewrites say so rather than "nothing else".
+
 The ConfigMap has writers the pod does not: whoever holds ConfigMap write in the CR's
 namespace, which Kubernetes' default `edit` and `admin` roles grant while granting nothing on
 the CR's status. Such a principal can raise a counter within the bounds by editing the
@@ -391,8 +417,9 @@ is the power to reach any port of any pod, and on a cluster that applies policy 
 traffic the proxy's own source would need admitting. Broader than the problem.
 
 **Letting the agent write its own counters.** The security reference lists the agent
-ServiceAccount's write grants, leader-election leases and, at more than one replica, its own
-pod's labels, and the status is not among them. The operator is the only writer, and a workload
+ServiceAccount's write grants, leader-election leases and, at more than one replica, `get` and
+`patch` on the pods of its namespace, so the leader can label itself, and the status is not
+among them. The operator is the only writer, and a workload
 with cluster privileges describing its own activity is not a grant to add.
 
 **Keeping the baseline, or the totals, in memory.** Simpler, and wrong on every operator
@@ -409,10 +436,13 @@ them.
 Unit tests, beside the poller: the accumulator across the cases the resets section lists (a
 known pod moving, a new pod UID, a later start time, a pod missing this poll and back in the
 next, with and without a second gateway pod counted in between), the per-poll ceiling on the
-difference branch and on the whole-sample branch alike (a forged later start time with a large
-sample adds at most the ceiling; an honest burst past it is a failed scrape that costs one
-interval), a body without a start time read under the rule without it (difference, new pod,
-and a fall refused), the baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
+difference branch and on the whole-sample branch alike, asserting the poll after as well as
+the poll itself (a forged later start time with a large sample adds nothing and advances the
+baseline; an honest burst past the ceiling costs that interval and the next poll's delta is
+the new interval alone; a never-seen pod above the ceiling is recorded and the next poll counts
+from it; a gap of several polls gets the scaled allowance), a body without a start time read
+under the rule without it (difference, new pod, and a fall that advances the baseline), a quiet
+poll writing no ConfigMap, the baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
 log line), the largest-delta rule across two gateway pods and
 its agreement with the sum for one, the start-time rule (a restart that overtakes its last sample inside one
 interval), a body over the size ceiling, a 3xx answer, and a sample that is negative or not finite
