@@ -125,8 +125,9 @@ has seen fewer events than one that was up throughout, and the largest is the cl
 number of distinct events. During a rollout, when old and new pods overlap, the per-pod reset
 handling below runs first, so a new pod's whole sample competes with an old pod's difference
 and the larger wins, which is still the better estimate of the two. A replica whose entry is behind
-its sibling's marker when it next advances is reset without adding, as the resets section
-says, and that rule reads the stored markers alone, so it holds across a leader change. It
+its sibling's marker when it next advances is reset without adding and takes the sibling's
+marker, as the resets section says, so one straddle does not cost the next lone advance, and
+that rule reads the stored markers alone, so it holds across a leader change. It
 makes the layout under-count rather than over-count: informer skew that straddles a poll
 boundary, one replica ahead at one poll and the other catching up by the next, drops the
 catch-up instead of counting it twice, and a replica's events its sibling did not inject, a
@@ -185,7 +186,8 @@ each pod it scraped:
 
 - the difference from the pod's last sample, when the pod UID is known, the body's start time
   is the recorded one, and the sample is not below the last one;
-- the whole sample, when the pod UID is new (a new pod starts from zero, so everything it has
+- the whole sample, when the pod UID is new, which means created after the document was first
+  recorded and not merely absent from it (a new pod starts from zero, so everything it has
   counted is new), or the body's start time is present and later than the recorded one (the
   process restarted inside the same pod);
 - nothing, when the body carries a start time earlier than the recorded one, or shows the
@@ -225,7 +227,10 @@ each pod it scraped:
   that keeps a gap from being counted twice reads the markers alone, on every poll: a gateway
   pod whose entry is behind another gateway pod's marker when it next advances is reset to its
   sample and adds nothing, because the largest-delta rule below would otherwise count what the
-  sibling already supplied. The broker's one pod, and a single gateway pod, have no sibling and
+  sibling already supplied. The reset sets its marker to the sibling's, not to the current
+  poll: set to the current poll, each reset would leave the sibling behind in turn, and every
+  lone advance by either replica would be reset until both advanced together, losing whole
+  bursts that neither counted; only an add moves a marker past a sibling's. The broker's one pod, and a single gateway pod, have no sibling and
   always add the difference across a gap. The error this leaves is an under-count, named in the
   sources section: a replica's events that its sibling did not inject are lost whenever it was
   quiet, or missed, for a poll in which the sibling moved.
@@ -257,12 +262,12 @@ one ceiling per poll from a workload a CR author put in the pod, is stated in th
 section rather than designed away, because closing it means authenticating the listeners.
 
 The totals and the baseline live together in a ConfigMap, `<name>-usage-counters`, in the CR's
-namespace, holding one JSON document: the running total per counter, the time of the last poll
-that moved a total, and per pod UID the pod's name for a reader, its last sample per counter,
-its last start time, and the poll at which its entry was last added, advanced or reset, which
-is not the poll it was last read at: a quiet poll changes nothing in the document, so a quiet
-install writes nothing, and the marker still tells the missed-pod rule whether another pod was
-counted during a gap. The ConfigMap is the source of truth the
+namespace, holding one JSON document: the time the document was first recorded, the running total per
+counter, the time of the last poll that moved a total, and per pod UID the pod's name for a reader, its last sample per counter,
+its last start time, and the poll at which its entry was last added or advanced, or the
+sibling's marker it was last reset against, which is not the poll it was last read at: a quiet
+poll changes nothing in the document, so a quiet install writes nothing, and the marker still
+tells the missed-pod rule whether another pod was counted during a gap. The ConfigMap is the source of truth the
 accumulator reads at the start of every poll; the status is written from it, never the other
 way round, so a cache that hands the poller a stale CR can never pull a total backwards. It
 carries an owner reference to the CR, without the controller flag, so it is collected with the
@@ -294,8 +299,12 @@ written poll and this one, once, rather than over-counting everything the pods h
 On a fresh install, or the first poll after the upgrade that brings the poller, the status
 carries nothing and the counters start at zero from this poll: a pod older than the poller has
 a history the counters never saw, and whether it fits the ceiling says nothing about whether
-it should be counted. The whole-sample branch therefore applies only to a pod UID that appears
-after the ConfigMap exists, where "a new pod starts from zero" is true, and `lastActiveTime`
+it should be counted. The whole-sample branch therefore applies only to a pod created after the document was
+first recorded, where "a new pod starts from zero" is true: the document carries the time it
+was first recorded, which the overwrite paths carry forward, and a pod's `creationTimestamp`
+from the list in step 1 is compared with it. Absence from the document is not newness: a pod
+the first poll could not scrape, or that one of the two policies kept out while the other
+already admitted the operator, is recorded on its next scrape and adds nothing. `lastActiveTime`
 is first stamped by a poll in which something ran. What a fresh install loses is the count
 between each pod's start and the first poll after it, the under-count this document prefers
 everywhere else.
@@ -459,9 +468,11 @@ them.
 
 Unit tests, beside the poller, one per branch of the resets section as it stands, each asserting
 the poll after as well as the poll itself: the difference branch (a known pod, the recorded
-start time, a sample not below the last); the whole-sample branch (a pod UID that appears after the ConfigMap exists; a later start
-time), including such a pod above the ceiling, which is recorded and adds nothing, and the
-first poll with no ConfigMap, which records every pod and adds nothing whatever the samples, and a
+start time, a sample not below the last); the whole-sample branch (a pod created after the document was first recorded; a later start
+time), including such a pod above the ceiling, which is recorded and adds nothing, the first
+poll with no ConfigMap, which records every pod and adds nothing whatever the samples, and a
+pod that first poll could not scrape, created before the document, recorded on its next scrape
+and adding nothing, and a
 forged later start time with a large sample, which adds nothing and advances the baseline; the
 two refused shapes (a start time earlier than the recorded one; a fall under an unchanged start
 time), refused with the baseline advanced to the body's sample and start time, nothing added,
@@ -473,7 +484,8 @@ whose delta passes one ceiling is refused whole, the baseline advanced, that gap
 once); the scrapes that produce no body (a connection
 that failed, a 3xx answer, a body over the size ceiling, one `expfmt` cannot parse, a sample
 that is negative or not finite), each keeping the baseline and nothing more; a pod missing this
-poll and back in the next, with and without a second gateway pod counted in between; the
+poll and back in the next, with and without a second gateway pod counted in between, asserting
+that the reset pod takes the sibling's marker and the sibling's next lone advance is counted; the
 largest-delta rule across two gateway pods and its agreement with the sum for one; the
 baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom and one
