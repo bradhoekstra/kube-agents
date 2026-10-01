@@ -30,10 +30,12 @@ def read_setting(key: str, path: Path = DEFAULT_PATH) -> str | None:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
+        if line.startswith("export "):
+            line = line[len("export ") :].lstrip()
         name, separator, value = line.partition("=")
         if not separator or name != key:
             continue
-        return value
+        return value.split(" #", 1)[0].rstrip()
     return None
 
 
@@ -51,7 +53,7 @@ def main(argv: list[str]) -> int:
     value = read_setting(key)
     if value is None:
         log(f"{key} is not set in install.env; install.sh will prompt for it on the next run")
-        return 0
+        return 1
     if is_stale():
         log(f"install.env is older than {MAX_AGE_SECONDS // 3600} hours; its {key} has been ignored")
     print(value)
