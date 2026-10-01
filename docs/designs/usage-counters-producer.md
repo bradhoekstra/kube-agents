@@ -89,10 +89,11 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    ConfigMap, copying its totals and that time as `lastActiveTime`. The order, ConfigMap first,
    is deliberate; the resets section says why.
 
-Nothing in `Reconcile`'s behaviour changes: the reconcile loop keeps writing `activeInterfaces`
+Nothing in `Reconcile`'s accounting changes: the reconcile loop keeps writing `activeInterfaces`
 through the Ready writer as it does today, the poller never touches that field, and the Ready
-writer never computes a counter. The one piece of code the two share is the echo check in the
-served-CRD section, generalised so that both writers call it.
+writer never computes a counter. What the loop renders does change, by the two policy rules and
+the `POD_NAMESPACE` input the Reach section owns, and the one piece of code the two writers
+share is the echo check in the served-CRD section, generalised so that both call it.
 
 ## Counter sources
 
@@ -113,8 +114,9 @@ the counter only ever rises. And it moves with routine cluster churn, scheduling
 warnings, on every watched cluster, so `lastActiveTime` would never rest and would stop meaning
 what the schema says. The injected series sits behind the dedup cache, whose snapshot persists
 on the data volume, so a restart re-injects nothing already triaged; when a snapshot is lost the
-replay is injected again, and the counter counts that up to the per-poll ceiling the resets
-section sets, because it happened, and no further. The field's
+replay is injected again, and the counter counts that when it fits within the per-poll ceiling the resets section
+sets; a replay larger than the ceiling is not counted for that interval, and the counter
+resumes from the sample it carried. The field's
 description changes from "ingested and evaluated" to say "accepted for triage", and the observed
 volume stays where it is, in Prometheus.
 
@@ -196,9 +198,13 @@ each pod it scraped:
   upgrade order makes that gap routine, as the failure section says;
 - in every adding branch, at most `usageDeltaCeiling` per pod per counter per poll, a named
   bound sized to what a listener could plausibly count in one interval rather than in a pod's
-  lifetime; across a gap of several polls the allowance is the ceiling times the polls missed,
-  which the marker below counts. A body whose addition would exceed the allowance is refused
-  and, because it parsed, advances the baseline to the sample it carried and adds nothing: an
+  lifetime, and the same one ceiling whatever the gap since the pod was last counted: the
+  excess after an operator outage of several intervals is lost once, which is the under-count
+  this document prefers, and an allowance scaled to the gap would be one the stored marker
+  cannot compute, because a quiet poll does not move it, so after an idle stretch one body
+  could claim the whole stretch's allowance at once. A body whose addition would exceed the
+  ceiling is refused and, because it parsed, advances the baseline to the sample it carried and
+  adds nothing: an
   honest burst past the ceiling, which the sizing makes rare, costs that interval's count and
   nothing after it, and a pod the ConfigMap has never seen is always recorded, whatever its
   sample, so the first poll after an upgrade records a long-lived broker's lifetime count as its
@@ -272,9 +278,9 @@ When the ConfigMap is absent but the status already carries counters, something 
 state after the counters had been written. The poll then seeds the totals from the status,
 records every pod's current sample as its baseline, and adds nothing: it under-counts whatever
 happened between the last written poll and this one, once, rather than over-counting everything
-the pods have ever done. On a fresh install both are absent, and the first poll adds every pod's
-whole sample up to the ceiling and records the rest as baseline, which is right: nothing before
-it was counted, and a pod older than the poller is not a burst to count.
+the pods have ever done. On a fresh install both are absent, and the first poll records every pod's sample as its
+baseline and adds it only where it is within the ceiling, which is right: nothing before it was
+counted, and a pod older than the poller is not a burst to count.
 
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
@@ -440,7 +446,7 @@ difference branch and on the whole-sample branch alike, asserting the poll after
 the poll itself (a forged later start time with a large sample adds nothing and advances the
 baseline; an honest burst past the ceiling costs that interval and the next poll's delta is
 the new interval alone; a never-seen pod above the ceiling is recorded and the next poll counts
-from it; a gap of several polls gets the scaled allowance), a body without a start time read
+from it; a gap of several polls gets one ceiling and the excess is lost once), a body without a start time read
 under the rule without it (difference, new pod, and a fall that advances the baseline), a quiet
 poll writing no ConfigMap, the baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
 log line), the largest-delta rule across two gateway pods and
