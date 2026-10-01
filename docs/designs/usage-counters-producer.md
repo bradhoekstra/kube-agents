@@ -34,6 +34,7 @@ These are the facts the design rests on.
 | The operator's pod carries `app.kubernetes.io/name: kube-agents-operator` in both install paths: the chart's `operatorSelectorLabels` and the kustomize manager manifest.                                                                                                                                                                                                                                                                                                                                                 | `_helpers.tpl`, `config/manager/manager.yaml`; live: the running operator pod                                                                                                                                                   |
 | The operator reads its own namespace from the ServiceAccount namespace file and its own Pod through the API reader to discover its image, in a branch the chart's `OPERATOR_IMAGE` skips, and keeps neither; the policy renderers are pure functions of the CR and the start-up flags, and the golden tests render them with no pod around. For its own callout the operator already renders a Downward-API `POD_NAMESPACE` on a container it manages.                                                                    | `cmd/main.go`, `platformagent_a2a_callout.go`, `internal/testing`                                                                                                                                                               |
 | The gateway Deployment has one replica by default; `spec.deployment.availability.replicas` renders more, with a leader-election wrapper that points the Service at one pod, and the HA fixture renders three. Every gateway pod runs the sidecar and its watcher; nothing gates the watcher on leadership. The broker Deployment has one replica and rolls with `Recreate`.                                                                                                                                               | the golden manifests, `start-services.sh`; live: both at 1                                                                                                                                                                      |
+| `spec.harness.eventWatcher.enabled=false` makes the entrypoint start no watcher, while the container port and the collector's rule render regardless, so nothing listens on `event-metrics`; the reconciler resolves the switch through `eventWatcherEnabled` for the `EventWatcher` condition.                                                                                                                                                                                                                           | `deploy/shared/start-services.sh`, `platformagent_manifests.go`, `platformagent_controller.go`                                                                                                                                  |
 | The entrypoint supervises the watcher in a retry loop and restarts it in place after any exit, in the same container and pod, so the watcher's counters reset more often than its pod does.                                                                                                                                                                                                                                                                                                                               | `deploy/shared/start-services.sh`                                                                                                                                                                                               |
 | `k8s_event_watcher_events_seen_total` increments on every delivery the informer makes, before the reason filter: that includes the initial list, which replays every Event still inside the API server's retention, and the redeliveries of watch-connection rotations. `k8s_event_watcher_events_injected_total` increments once an event has passed the filter and the dedup cache, has been handed to the agent, and was neither graded informational nor dropped on the daily ceiling by the daemon that received it. | `cmd/k8s-event-watcher/main.go` (`Dispatch`), `watcher.go`, the watcher's README ("Replay Shielding", "On-Disk Snapshots")                                                                                                      |
 | The dedup caches are snapshotted to the data volume, under `event-watcher/` in the agent's home (`/opt/data` unless `spec.harness.hermes.agentHome` moves it), every thirty seconds and at shutdown, and restored at start, so a restart re-offers nothing already triaged; a lost or unreadable snapshot costs one replay of the retained Events.                                                                                                                                                                        | the watcher's README; `platformagent_manifests.go` (the sidecar writes its snapshots to the shared volume)                                                                                                                      |
@@ -56,7 +57,10 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
 
 1. lists the pods the two policies select, in the CR's namespace: `app: <name>-gateway` for the
    gateway, and for the broker the two labels `credentialProxySelector` returns,
-   `app: <name>-credential-proxy` and `kubeagents.x-k8s.io/component: credential-proxy`;
+   `app: <name>-credential-proxy` and `kubeagents.x-k8s.io/component: credential-proxy`. When
+   `eventWatcherEnabled` is false for the CR, the gateway pods are left out: the entrypoint
+   starts no watcher, so nothing listens on `event-metrics`, and a refused connection there
+   would be the install's choice, not a failure;
 2. for each running pod, finds the container port by name, `event-metrics` on the gateway pod
    and `cred-metrics` on the broker pod, looking through `initContainers` as well as
    `containers` because the sidecar is a native one, and reads `/metrics` at the pod IP and that port, joined with
@@ -67,10 +71,10 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
 4. folds the samples into the totals through the per-pod baseline described below. Totals and
    baseline live together in one ConfigMap, which is the accumulator's source of truth; the
    status is a projection of it;
-5. writes the ConfigMap when a total or the baseline changed, then patches `status.usage` when
-   the status is behind the ConfigMap's totals, with `lastActiveTime` set to the time of the
-   poll that last moved a total. The order, ConfigMap first, is deliberate; the resets section
-   says why.
+5. writes the ConfigMap when a total or the baseline changed, recording with the totals the
+   time of the poll that moved them, then patches `status.usage` when the status is behind the
+   ConfigMap, copying its totals and that time as `lastActiveTime`. The order, ConfigMap first,
+   is deliberate; the resets section says why.
 
 Nothing in `Reconcile`'s behaviour changes: the reconcile loop keeps writing `activeInterfaces`
 through the Ready writer as it does today, the poller never touches that field, and the Ready
@@ -104,8 +108,9 @@ The largest delta is an estimate when replicas disagree: a replica that started 
 has seen fewer events than one that was up throughout, and the largest is the closest to the
 number of distinct events. During a rollout, when old and new pods overlap, the per-pod reset
 handling below runs first, so a new pod's whole sample competes with an old pod's difference
-and the larger wins, which is still the better estimate of the two. The rule has one way of
-over-counting: informer skew that straddles a poll boundary, one replica ahead at one poll and
+and the larger wins, which is still the better estimate of the two. A pod missed in one poll
+and back in the next does not compete with its gap delta while another pod was counted, as the
+resets section says. With that, the rule has one way of over-counting left: informer skew that straddles a poll boundary, one replica ahead at one poll and
 the other catching up by the next, counts the catch-up twice, because the maximum carries no
 memory of which replica supplied it. That is the one over-count this document tolerates, on a
 layout that is opt-in and in a series that carries no replica attribution; the fix, if it
@@ -162,8 +167,13 @@ each pod it scraped:
 - the whole sample, when the pod UID is new (a new pod starts from zero, so everything it has
   counted is new), the sample is below the last one, or the process's start time changed (the
   process restarted inside the same pod);
-- nothing, when the pod could not be scraped this poll; its baseline entry is kept, so the next
-  successful poll adds the difference across the gap.
+- nothing, when the pod could not be scraped this poll; its baseline entry is kept. On its
+  return, the difference across the gap is added when no other pod of the same kind was counted
+  during the gap, which is every case for the broker's one pod and for a single gateway pod;
+  when another gateway pod was counted meanwhile, the returning pod's baseline is reset to its
+  sample and nothing is added, because the largest-delta rule below would otherwise count the
+  gap a second time. The poll recorded against each pod's sample is what tells the two cases
+  apart.
 
 Entries for pods that no longer exist are dropped when the baseline is next written; their
 counts are already in the totals.
@@ -178,8 +188,9 @@ the watcher's supervisor restarts it under load. With the start time the reset i
 the sample did.
 
 The totals and the baseline live together in a ConfigMap, `<name>-usage-counters`, in the CR's
-namespace, holding one JSON document: the running total per counter, and per pod UID the pod's
-name for a reader and its last sample per counter. The ConfigMap is the source of truth the
+namespace, holding one JSON document: the running total per counter, the time of the last poll
+that moved a total, and per pod UID the pod's name for a reader, its last sample per counter,
+its last start time, and the poll at which that sample was taken. The ConfigMap is the source of truth the
 accumulator reads at the start of every poll; the status is written from it, never the other
 way round, so a cache that hands the poller a stale CR can never pull a total backwards. It
 carries an owner reference to the CR, without the controller flag, so it is collected with the
@@ -201,7 +212,10 @@ whole sample, which is right: nothing before it was counted.
 
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
-status is behind the ConfigMap, not only when this poll moved a total. The other order would
+status is behind the ConfigMap, not only when this poll moved a total; the repair stamps the
+time the ConfigMap recorded, not its own, so `lastActiveTime` says when the counters last moved
+rather than when the status caught up. That time is in the ConfigMap for this reason: in the
+poller's memory alone it would die with the process that took it. The other order would
 leave the totals behind the status after a crash, and the next poll would add the interval's
 deltas a second time. Under-counting until the next poll is the error this document prefers
 everywhere; an over-count is permanent.
@@ -231,7 +245,8 @@ fresh, probing again after the interval. The poller consults the same record and
 status patch while it is fresh, so an operator running ahead of its CRD costs one probe per
 interval in total, not one per writer. The ConfigMap is still written on every poll that moved
 a total, so nothing is lost during the skew: when the CRD is applied, the next patch carries the
-totals accumulated since the operator was upgraded, not since the last interval. After its own
+totals accumulated since the operator was upgraded, not since the last interval, and the time
+the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
 The echo check moves from a function that knows about `activeInterfaces` to one that takes the
@@ -239,8 +254,10 @@ fields a writer expects to see, and both writers call it.
 
 ## Failure behaviour
 
-The schema has no field for an error, by design: static enums and integer counts only. A
-scrape that fails leaves the pod's baseline untouched and the totals where they were. The
+The schema has no field for an error, by design: static enums and integer counts only. An
+install that switched the watcher off is not a failure: the poller reads the same switch the
+reconciler does, scrapes no gateway pod while it is off, and records nothing. A scrape that
+fails leaves the pod's baseline untouched and the totals where they were. The
 operator log carries one line when an endpoint first fails and one when it recovers, naming
 the pod and the error type, never the body. The visible symptom of a standing failure, a
 NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener that moved, is
@@ -312,8 +329,10 @@ them.
 ## Testing
 
 Unit tests, beside the poller: the accumulator across the four cases the resets section lists
-(a known pod moving, a new pod UID, a sample below the last one, a pod missing this poll), the
-baseline-absent-with-counters-present case, the largest-delta rule across two gateway pods and
+(a known pod moving, a new pod UID, a sample below the last one, a pod missing this poll and
+back in the next, with and without a second gateway pod counted in between), the
+baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
+log line), the largest-delta rule across two gateway pods and
 its agreement with the sum for one, the start-time rule (a restart that overtakes its last sample inside one
 interval), the series selection (the `status` values summed and the three excluded; the
 injected series and not the observed one), and the port-by-name lookup when
@@ -324,7 +343,8 @@ An envtest, beside the existing `usage_status_envtest_test.go`: a `PlatformAgent
 this release's CRD receives one patch per poll in which a stub source moves and none in which
 it does not; a ConfigMap written with the non-controller owner reference enqueues no reconcile;
 a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
-repaired by the next poll without the totals moving; under the CRD without `status.usage`, the
+repaired by the next poll without the totals moving and with `lastActiveTime` set to the time
+the ConfigMap recorded, not the repair's; under the CRD without `status.usage`, the
 poller writes the status once per `usageStatusReprobeInterval`, shares the pruning record with
 the Ready writer, and keeps the ConfigMap current throughout.
 
