@@ -883,10 +883,19 @@ class ScopeTest(HomesMixin):
         retiring = next(p for p in self._snapshot()["projects"] if p["id"] == "gone")
         self.assertEqual((retiring["state"], retiring["clusters"]), (rec.STATE_RETIRING, 1))
         os.environ.pop(rec.SCOPE_FILE_ENV, None)
+        described: list = []
+
+        def exists(project, cluster, location, timeout=None):
+            described.append(cluster)
+            return True
+
         report, _, deleted = self._run({"projects": []}, {self.MGMT: []},
-                                       profiles=["cluster-g"], identities=gone_profile)
+                                       profiles=["cluster-g"], identities=gone_profile, exists=exists)
         self.assertEqual(deleted, ["cluster-g"])
         self.assertEqual([p for p in self._snapshot()["projects"] if p["id"] == "gone"], [])
+        # The scope prune is on the strength of the declaration; the profile's cluster is
+        # not described (its project has usually lost the read roles by now).
+        self.assertEqual(described, [])
 
     def test_a_profile_the_scope_never_produced_is_kept_and_listed_unmanaged(self):
         # Condition (3) fails: no previous snapshot names the project.

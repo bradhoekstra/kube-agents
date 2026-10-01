@@ -904,10 +904,11 @@ hcl_csv_list() {
   printf '%s]' "$out"
 }
 
-# The seven SCOPE_* keys as the composition's `scope` object: `projects`,
+# The eight SCOPE_* keys as the composition's `scope` object: `projects`,
 # `folders`, `organizations`, `shared_vpc_hosts`, `metrics_scopes` and
 # `exclude.projects` are lists like every other list key, `exclude.clusters`
-# is one project/location/cluster triple per entry. Always a full block, empty
+# is one project/location/cluster triple per entry, `max_projects` is the cap,
+# written only when SCOPE_MAX_PROJECTS is set. Always a full block, empty
 # lists included -- the reconcile reads an emptied projects list as the
 # declaration that drops projects, a container or selector leaving the list as
 # the declaration that retires its members, and a missing block as no
@@ -919,12 +920,18 @@ hcl_csv_list() {
 # SCOPE_MAX_PROJECTS is empty (the default cap) or a whole number within the
 # bounds the CRD puts on spec.scope.maxProjects, or the run stops before a
 # file is written and names the key and the bounds: the module's validation
-# would otherwise name neither. $1 the value.
+# would otherwise name neither. The digit count is checked before the
+# arithmetic: bash's base#digits wraps at 2^64 without a word, so a twenty-digit
+# value could otherwise read as one inside the bounds. $1 the value.
 require_scope_max_projects() {
-  local value="${1:-}"
+  local value="${1:-}" digits
   [ -n "$value" ] || return 0
-  if [[ "$value" =~ ^[0-9]+$ ]] && [ "$((10#$value))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$value))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
-    return 0
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    digits="$(printf '%s' "$value" | sed 's/^0*//')"
+    [ -n "$digits" ] || digits=0
+    if [ "${#digits}" -le "${#SCOPE_MAX_PROJECTS_MAX}" ] && [ "$((10#$digits))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$digits))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
+      return 0
+    fi
   fi
   print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
   return 1
@@ -1026,8 +1033,9 @@ require_scope_cluster_triples() {
 # and the keys are the new declaration, emptying it included; L == K, the
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
 # L, R and K are the projects, folders, organisations, Shared VPC hosts,
-# Metrics Scopes and exclusions: every list the chart renders, since a list it
-# renders is one the apply replaces.
+# Metrics Scopes and exclusions, every list the chart renders, since a list it
+# renders is one the apply replaces, and the cap, which the apply sets the same
+# way (a CR at the CRD's default reads as the key unset).
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1163,8 +1171,9 @@ print("SCOPE_SHARED_VPC_HOSTS=" + json.dumps(" ".join(live["sharedVpcHosts"])))
 print("SCOPE_METRICS_SCOPES=" + json.dumps(" ".join(live["metricsScopes"])))
 print("SCOPE_EXCLUDE_PROJECTS=" + json.dumps(" ".join(live["exclude"]["projects"])))
 print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live["exclude"]["clusters"])))
-if live["maxProjects"] != default_cap:
-    print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"])))
+# Always among the lines: when the cap is why the compare refused, the key the
+# operator has to change may be one they must blank, not set.
+print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"]) if live["maxProjects"] != default_cap else ""))
 ' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?

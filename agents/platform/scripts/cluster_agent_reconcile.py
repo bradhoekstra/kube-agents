@@ -1741,7 +1741,10 @@ def reconcile(dry_run: bool = False) -> dict:
     # Every profile that will reach the liveness check is described now, `workers` at a
     # time under PRUNE's budget, and the loop below reads the answers in profile order, so
     # the log and the report are as they were when the walk was sequential. A policy prune
-    # (an excluded cluster) needs no describe and gets none; a describe still pending at
+    # (an excluded cluster) and a scope prune (a retiring project on a clean run) need no
+    # describe and get none, as the sequential walk gave them none: the latter's project
+    # has usually lost its read roles, so the describe would be a 403 logged as unknown
+    # beside the "left the scope" line for the same profile. A describe still pending at
     # the deadline reads inconclusive, which keeps the profile. Each describe's timeout is
     # the budget left, as a listing's is, so no worker outlives the deadline by more than
     # the grace the bounded map allows; it is not DESCRIBE_TIMEOUT_SECONDS, because under
@@ -1752,6 +1755,8 @@ def reconcile(dry_run: bool = False) -> dict:
         if identities[name] is not None
         and (identities[name]["project"], identities[name]["cluster"], identities[name]["location"]) not in excluded_triples
         and identities[name]["cluster"] not in EXTRA_EXCLUDE
+        and not (identities[name]["project"] not in resolved_ids
+                 and lookups_clean and identities[name]["project"] in previously_retiring)
     ]
     prune_budget = _prune_budget_seconds(cap, len(to_describe))
     described = _bounded_map(

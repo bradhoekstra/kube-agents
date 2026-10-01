@@ -26,6 +26,7 @@ import contextlib
 import errno
 import io
 import os
+import shutil
 import re
 import shlex
 import subprocess
@@ -935,6 +936,17 @@ class ScanGateTest(unittest.TestCase):
                     mock.patch.object(Path, "exists", lambda self: True):
                 bootstrap_scan_gate.ensure_cluster_agents(self.d)
             self.assertEqual(seen["timeout"], expected)
+            # The profiles on the volume feed the prune budget: 200 of them at the default
+            # cap lift the ceiling past the constant by the describes they cost.
+            on_volume = self.d / "profiles"
+            for i in range(200):
+                (on_volume / f"cluster-{i}").mkdir(parents=True)
+            scope.write_text('{"present": true, "projects": [], "maxProjects": 100}')
+            with mock.patch.object(cluster_agent_profile, "PROFILES_BASE", on_volume):
+                with_profiles = int(rec._list_budget_seconds(100) + rec._prune_budget_seconds(100, 200)) + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS
+                self.assertGreater(with_profiles, bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+                self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), with_profiles)
+            shutil.rmtree(on_volume)
             scope.write_text('{"present": true, "projects": [], "maxProjects": 100}')
             self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
             self.assertEqual(int(rec._list_budget_seconds(rec.RESOLVED_SET_CAP) + rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 0))

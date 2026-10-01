@@ -142,8 +142,8 @@ RECONCILE_ATTEMPTS_MARKER = ".bootstrap_reconcile_attempts"
 # its snapshot after, and the settle time covers the creates. A declared
 # `spec.scope.maxProjects` scales the listing budget and the profiles on the volume the
 # prune's, so `_reconcile_timeout_seconds` reads both the way the reconcile does and adds
-# the settle time; this constant is the floor, and the ceiling when the declaration cannot
-# be read.
+# the settle time; this constant is the floor, and the ceiling when there is no declaration
+# to read (the scope file's variable unset) or the reconcile cannot be imported.
 RECONCILE_TIMEOUT_SECONDS = 240
 RECONCILE_SETTLE_SECONDS = 30
 # `cluster_agent_reconcile.EXIT_ALREADY_RUNNING`. Mutual exclusion lives in that

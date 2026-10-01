@@ -2835,7 +2835,7 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
             self.assertFalse(dest.exists())
 
     def test_a_cap_outside_the_crds_bounds_stops_the_run_naming_the_key(self):
-        for bad in ("0", "abc", "5001", "2.5", "-3", " 12"):
+        for bad in ("0", "abc", "5001", "2.5", "-3", " 12", "18446744073709551716"):
             with self.subTest(bad=bad):
                 proc = subprocess.run(
                     ["bash", "-c",
@@ -2845,7 +2845,7 @@ class ScopeKeysReachTheTfvarsTest(unittest.TestCase):
                 )
                 self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
                 self.assertIn(f"SCOPE_MAX_PROJECTS='{bad}' is not a whole number from 1 to 5000", proc.stdout)
-        for good in ("", "1", "250", "5000"):
+        for good in ("", "1", "250", "5000", "0250"):
             with self.subTest(good=good):
                 proc = subprocess.run(
                     ["bash", "-c",
@@ -3076,7 +3076,17 @@ class PreApplyScopeCheckTest(unittest.TestCase):
         self._assert_rc(self._run(defaulted, record), 0)
         proc = self._run(defaulted, "norelease")
         self._assert_rc(proc, 1)
-        self.assertNotIn("SCOPE_MAX_PROJECTS", proc.stdout)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
+        # The key is among the lines even when the live cap is the default, because it
+        # may be the one key the operator has to blank: a record and keys at 250 beside
+        # a CR the API server re-defaulted refuse on the cap alone, and the lines the
+        # refusal prints must not reproduce the install.env that was refused.
+        recorded_at_250 = record.replace('"projects":["p2-project","p3-project"],', '"projects":["p2-project","p3-project"],"maxProjects":250,')
+        proc = self._run(defaulted, recorded_at_250, keys={"SCOPE_PROJECTS": "p2-project p3-project",
+                                                           "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1",
+                                                           "SCOPE_MAX_PROJECTS": "250"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
 
     def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
         # L == R: the record shows the installer rendered it; the keys are the

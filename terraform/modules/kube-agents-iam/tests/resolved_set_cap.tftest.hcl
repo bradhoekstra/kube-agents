@@ -206,12 +206,32 @@ run "a_declared_cap_below_the_count_is_refused" {
 }
 
 # The CRD's bounds, held at the variable: zero, a fraction and a value past
-# 5000 are refused before any read.
-run "a_cap_outside_the_crds_bounds_is_refused_at_the_variable" {
+# 5000 are refused before any read, one run each.
+run "a_cap_of_zero_is_refused_at_the_variable" {
   command = plan
 
   variables {
     scope = { projects = ["team-a"], max_projects = 0 }
+  }
+
+  expect_failures = [var.scope]
+}
+
+run "a_fractional_cap_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a"], max_projects = 1.5 }
+  }
+
+  expect_failures = [var.scope]
+}
+
+run "a_cap_past_the_crds_maximum_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a"], max_projects = 5001 }
   }
 
   expect_failures = [var.scope]
