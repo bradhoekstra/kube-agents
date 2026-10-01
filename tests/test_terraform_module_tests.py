@@ -136,7 +136,7 @@ _IGNORE_LINE_PREFIX = "-"
 #: subcommand.
 _FAKE_TERRAFORM = """#!/bin/sh
 printf '%s %s\\n' "$(pwd -P)" "$1" >> "$TERRAFORM_FAKE_LOG"
-if [ "$1" = version ]; then echo "Terraform v${TERRAFORM_FAKE_VERSION:-1.15.8}"; exit 0; fi
+if [ "$1" = version ]; then echo "${TERRAFORM_FAKE_VERSION_LINE:-Terraform v${TERRAFORM_FAKE_VERSION:-1.15.8}}"; exit 0; fi
 if [ "$1" = test ] && [ "$(pwd -P)" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
   echo "Failure! 1 failed."; exit 1
 fi
@@ -146,6 +146,8 @@ _FAKE_LOG_VARIABLE, _FAKE_FAIL_VARIABLE, _FAKE_VERSION_VARIABLE = "TERRAFORM_FAK
 #: The floor the target names, the Makefile's own constant.
 _MIN_VERSION_VARIABLE = "TERRAFORM_TEST_MIN_VERSION"
 _TOO_OLD_MESSAGE = "is too old"
+_UNREADABLE_VERSION_MESSAGE = "could not read a Terraform version"
+_FAKE_VERSION_LINE_VARIABLE = "TERRAFORM_FAKE_VERSION_LINE"
 _FAILING_DIRECTORIES_LINE = "Failing Terraform test directories:"
 
 #: The HCL the pin reads, and the spelling it refuses.
@@ -296,7 +298,7 @@ def _ignored_recipe_lines(logical_lines: list) -> list:
     ]
 
 
-def _run_target_against_fake_terraform(fail_in: str = "", version: str = "") -> tuple:
+def _run_target_against_fake_terraform(fail_in: str = "", version: str = "", version_line: str = "") -> tuple:
     """`make terraform-test` with a fake `terraform` first on PATH that
     records each call's directory and subcommand, failing `test` in
     `fail_in`; returns (exit code, stdout, recorded calls)."""
@@ -314,6 +316,7 @@ def _run_target_against_fake_terraform(fail_in: str = "", version: str = "") -> 
                 _FAKE_LOG_VARIABLE: str(log),
                 _FAKE_FAIL_VARIABLE: fail_in,
                 _FAKE_VERSION_VARIABLE: version,
+                _FAKE_VERSION_LINE_VARIABLE: version_line,
             },
         )
         # The subcommand never holds a space; the directory may, so split
@@ -770,6 +773,13 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         self.assertEqual([sub for _d, sub in calls if sub == "test"], [], "no suite may run under a terraform below the floor")
         code, out, _calls = _run_target_against_fake_terraform(version=floor)
         self.assertEqual(code, 0, f"a terraform at the floor must run the suites:\n{out}")
+        # A shim or another binary answering `version` with something else
+        # is named as such, not as an old Terraform.
+        code, out, calls = _run_target_against_fake_terraform(version_line="OpenTofu v1.9.0")
+        self.assertNotEqual(code, 0)
+        self.assertIn(_UNREADABLE_VERSION_MESSAGE, out, out)
+        self.assertNotIn(_TOO_OLD_MESSAGE, out)
+        self.assertEqual([sub for _d, sub in calls if sub == "test"], [])
 
     def test_the_resolved_recipes_carry_the_loop_and_no_ignored_line(self):
         database = _database()

@@ -661,6 +661,9 @@ TERRAFORM_TEST_MIN_VERSION := 1.7.0
 terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.7 for mock_provider).
 	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
+	if [ -z "$$version" ]; then \
+	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
+	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
 	  echo "terraform-test: terraform $$version is too old; mock_provider needs >= $(TERRAFORM_TEST_MIN_VERSION) (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
