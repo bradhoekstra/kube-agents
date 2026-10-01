@@ -176,7 +176,8 @@ and drops the custom roles; `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATI
 `SCOPE_SHARED_VPC_HOSTS` or `SCOPE_METRICS_SCOPES` absent
 renders an empty list for it in the scope block, which revokes the read roles in every project,
 folder, organisation or selector member it named and retires those projects' Cluster Agent profiles over the
-reconcile's next two clean runs.
+reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
+returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared).
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -284,9 +285,7 @@ because an existing install has them on. The reconcile lists at most `SCOPE_MAX_
 set, the management project included, so a declaration whose management project, `SCOPE_PROJECTS`
 and selector members together exceed that (once each, less an exact `SCOPE_EXCLUDE_PROJECTS` entry; a
 project both in `SCOPE_PROJECTS` and excluded by its number stays counted, so drop it from `SCOPE_PROJECTS`)
-is refused at plan rather than bound in full while a selector is declared (without one the count is
-the CRD's own, and a plan that declares none is not refused for it), and a single selector past it is
-refused at its read.
+is refused at plan rather than bound in full while a selector is declared or the cap is below its default (without a selector and at the default the count is the CRD's own, and such a plan is not refused for it), and a single selector past it is refused at its read.
 
 The block is written on every run, empty lists included: an emptied `projects` list is the
 declaration that drops projects, and a missing block would declare nothing, so removing a

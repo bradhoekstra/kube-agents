@@ -928,7 +928,7 @@ class ScanGateTest(unittest.TestCase):
             scope = self.d / "scope.json"
             scope.write_text('{"present": true, "projects": [], "maxProjects": 500}')
             os.environ[rec.SCOPE_FILE_ENV] = str(scope)
-            expected = int(rec._list_budget_seconds(500)) + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS
+            expected = int(rec._list_budget_seconds(500) + rec._prune_budget_seconds(500, 0)) + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS
             self.assertGreater(expected, bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
             self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), expected)
             with mock.patch.object(bootstrap_scan_gate.subprocess, "run", fake_run), \
@@ -937,8 +937,8 @@ class ScanGateTest(unittest.TestCase):
             self.assertEqual(seen["timeout"], expected)
             scope.write_text('{"present": true, "projects": [], "maxProjects": 100}')
             self.assertEqual(bootstrap_scan_gate._reconcile_timeout_seconds(), bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
-            self.assertEqual(int(rec._list_budget_seconds(rec.RESOLVED_SET_CAP)) + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS,
-                             bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
+            self.assertEqual(int(rec._list_budget_seconds(rec.RESOLVED_SET_CAP) + rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 0))
+                             + bootstrap_scan_gate.RECONCILE_SETTLE_SECONDS, bootstrap_scan_gate.RECONCILE_TIMEOUT_SECONDS)
 
     def test_a_successful_reconcile_clears_the_attempt_count(self):
         (self.d / bootstrap_scan_gate.RECONCILE_ATTEMPTS_MARKER).write_text("3")

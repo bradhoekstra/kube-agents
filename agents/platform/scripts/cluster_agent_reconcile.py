@@ -152,8 +152,9 @@ _api_disabled_this_run: set[str] = set()
 # containers resolve `workers` at a time, then the explicit projects `workers` at a time,
 # and a lookup still running when the listing budget is spent reads unreachable; both are
 # sized from the declared cap below (LIST_WORKERS and LIST_BUDGET_SECONDS at the default). The
-# bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the budget
-# for the declared cap plus its settle time, 240s at the default cap) and kills it on expiry
+# bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the listing
+# and prune budgets for the declared cap and the profiles on the volume, plus its settle
+# time; 240s at the default cap with few profiles) and kills it on expiry
 # with nothing written; two hanging projects listed in turn at LIST_TIMEOUT_SECONDS each
 # would already overrun it. Creates still run in the fixed order.
 # Sized for the default cap: the workers and the budget scale with the declared cap
@@ -171,8 +172,12 @@ LIST_GRACE_SECONDS = 5
 # PRUNE's per-profile `describe` runs under the same bounded map as the listing, with a
 # budget of its own, instead of a sequential walk at DESCRIBE_TIMEOUT_SECONDS each: at 200
 # profiles the walk was minutes of every hourly tick and a stalled project 30 s per
-# cluster in it. A describe still pending at the deadline reads inconclusive (kept).
+# cluster in it. The budget is the larger of a floor scaled like the listing's and an
+# allowance per round of describes (the profiles divided among the workers), so a fleet of
+# many clusters per project is not cut short at the same lexically-last profiles every
+# tick; a describe still pending at the deadline reads inconclusive (kept) and is logged.
 PRUNE_BUDGET_SECONDS = 60
+PRUNE_SECONDS_PER_ROUND = 10
 # How many unlisted projects the chat notification names before it counts the rest: a
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
@@ -231,9 +236,13 @@ def _list_budget_seconds(cap: int) -> float:
     return LIST_BUDGET_SECONDS * max(1, -(-rounds // rounds_at_default))
 
 
-def _prune_budget_seconds(cap: int) -> float:
-    """PRUNE's describe budget, scaled the way the listing budget is."""
-    return PRUNE_BUDGET_SECONDS * (_list_budget_seconds(cap) / LIST_BUDGET_SECONDS)
+def _prune_budget_seconds(cap: int, profiles: int = 0) -> float:
+    """PRUNE's describe budget: the floor scaled the way the listing budget is, or the
+    rounds of describes the profiles need at the cap's workers times the allowance per
+    round, whichever is larger."""
+    scaled = PRUNE_BUDGET_SECONDS * (_list_budget_seconds(cap) / LIST_BUDGET_SECONDS)
+    rounds = -(-profiles // _list_workers(cap))
+    return max(scaled, rounds * PRUNE_SECONDS_PER_ROUND)
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-RECONCILE] {msg}", file=sys.stderr)
@@ -1741,7 +1750,7 @@ def reconcile(dry_run: bool = False) -> dict:
         and (identities[name]["project"], identities[name]["cluster"], identities[name]["location"]) not in excluded_triples
         and identities[name]["cluster"] not in EXTRA_EXCLUDE
     ]
-    prune_budget = _prune_budget_seconds(cap)
+    prune_budget = _prune_budget_seconds(cap, len(to_describe))
     described = _bounded_map(
         lambda name, timeout: (_cluster_exists(**identities[name], timeout=min(timeout, DESCRIBE_TIMEOUT_SECONDS)), ""),
         to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,

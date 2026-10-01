@@ -169,3 +169,31 @@ run "a_member_cap_outside_the_crds_bounds_is_refused_at_the_variable" {
 
   expect_failures = [var.member_cap]
 }
+
+# Raised above the default, a selector of more than a hundred members fits.
+run "a_member_cap_above_the_default_admits_a_larger_selector" {
+  command = plan
+
+  variables {
+    shared_vpc_hosts = []
+    exclude_projects = []
+    member_cap       = 150
+  }
+
+  override_data {
+    target = data.http.scope_metrics_scope["scoping-proj1"]
+    values = {
+      status_code   = 200
+      response_body = jsonencode({ monitoredProjects = [for i in range(120) : { name = "locations/global/metricsScopes/scoping-proj1/projects/${100000000001 + i}" }] })
+    }
+  }
+  override_data {
+    target = data.http.scope_monitored_project
+    values = { status_code = 200, response_body = jsonencode({ projectId = "named-project" }) }
+  }
+
+  assert {
+    condition     = length(local.scope_monitored_numbers) == 120
+    error_message = "a hundred and twenty monitored projects fit a cap of a hundred and fifty"
+  }
+}

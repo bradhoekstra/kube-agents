@@ -2904,7 +2904,7 @@ write_tfvars_from_state() {
     echo "# The projects, folders, organisations, Shared VPC hosts and Metrics Scopes"
     echo "# beyond project_id whose GKE clusters get a Cluster Agent, and what to leave"
     echo "# unmanaged (SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS,"
-    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_EXCLUDE_PROJECTS,"
+    echo "# SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS,"
     echo "# SCOPE_EXCLUDE_CLUSTERS in install.env). Always written, so this file states"
     echo "# the declaration the composition renders either way, empty lists included; an"
     echo "# emptied list is the declaration that drops what it named."

@@ -578,9 +578,7 @@ API is reported with that remedy, and one that refuses the identity the consumer
 most `scope.max_projects` projects of the resolved set (100 by default; `spec.scope.maxProjects` on the CR), the management project included, so a declaration whose
 management project, `projects` and selector members together exceed that (once each, less an exact
 `exclude.projects` entry; a project both in `projects` and excluded by its number stays counted, so drop
-it from `projects`) is refused at plan rather than bound in full while a selector is declared
-(without one the count is the CRD's own, and a plan that declares none is not refused for it), and a
-single selector past it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
+it from `projects`) is refused at plan rather than bound in full while a selector is declared or the cap is below its default (without a selector and at the default the count is the CRD's own, and such a plan is not refused for it), and a single selector past it is refused at its read. A project that is not a Shared VPC host resolves to no members, as it does
 at runtime. An exclude entry that names a Shared VPC service project by ID, or a monitored project
 by number, keeps it out of the bindings, the one place `exclude` reaches IAM, because a selector's
 member has no list to be dropped from; a monitored project excluded by ID keeps its grant, which the

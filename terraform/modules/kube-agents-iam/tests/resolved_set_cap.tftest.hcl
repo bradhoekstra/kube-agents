@@ -1,8 +1,10 @@
 # The whole-set cap: the management project, scope.projects and every
 # selector's members, once each and less an exact exclude entry, may not
-# exceed what the reconcile lists (RESOLVED_SET_CAP), and the precondition
-# holds only while a selector is declared. tests/test_scope_iam.py pins the
-# number to the reconcile's; these cases pin how it is counted.
+# exceed what the reconcile lists (the declared scope.max_projects, the
+# reconcile's RESOLVED_SET_CAP as its default), and the precondition holds
+# while a selector is declared or the cap is below its default.
+# tests/test_scope_iam.py pins the default to the reconcile's; these cases pin
+# how it is counted and which caps bind.
 
 mock_provider "google" {}
 
@@ -239,5 +241,27 @@ run "the_default_cap_without_a_selector_still_admits_the_crds_hundred" {
   assert {
     condition     = length(local.scope_listed_projects) == 101
     error_message = "the count is ${length(local.scope_listed_projects)}, not 101"
+  }
+}
+
+# The direction the cap exists for: raised above the default, a count the default
+# would refuse fits. 1 + 100 + 50 = 151 under a cap of 200.
+run "a_cap_above_the_default_admits_what_fits_it" {
+  command = plan
+
+  variables {
+    scope = {
+      projects       = [for i in range(100) : format("team-%03d", i)]
+      metrics_scopes = ["scoping-proj1"]
+      max_projects   = 200
+    }
+    scope_selector_members = {
+      "metricsScopes/scoping-proj1" = concat(["scoping-proj1"], [for i in range(49) : format("monitored-proj-%04d", i + 1)])
+    }
+  }
+
+  assert {
+    condition     = length(local.scope_listed_projects) == 151 && local.scope_resolved_set_cap == 200
+    error_message = "the count is ${length(local.scope_listed_projects)} against a cap of ${local.scope_resolved_set_cap}"
   }
 }
