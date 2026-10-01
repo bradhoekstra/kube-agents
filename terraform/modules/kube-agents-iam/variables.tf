@@ -157,8 +157,11 @@ variable "scope" {
     `max_projects` is the resolved-set cap, spec.scope.maxProjects: the most
     projects the reconcile lists per run, the management project included,
     100 by default; a declaration whose explicit projects and selector
-    members alone exceed it is refused at plan time (main.tf), and the chart
-    renders the same value on the CR.
+    members alone exceed it is refused at plan time (main.tf) while a
+    selector is declared or the cap is below its default (the CRD's hundred
+    explicit projects with no selector, at the default, was admitted before
+    the cap existed and still is), and the chart renders the same value on
+    the CR.
 
     Empty, the default, binds nothing and the reconcile lists project_id alone.
   EOT

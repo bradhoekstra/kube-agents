@@ -521,7 +521,8 @@ takes project IDs or shell-style globs, `exclude.clusters` the full `project_id`
 `cluster_name` triple; neither changes IAM, except that an entry naming a Shared VPC service project
 by ID, or a monitored project by number, withholds its grant (below). Through the installer the value comes from
 `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_SHARED_VPC_HOSTS`,
-`SCOPE_METRICS_SCOPES`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
+`SCOPE_METRICS_SCOPES`, `SCOPE_MAX_PROJECTS`,
+`SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` in `install.env`
 ([`scripts/installer/README.md`](../../../scripts/installer/README.md), which also says how to
 forget the bindings of a project that became unreachable). If the running `PlatformAgent` already
 declares `spec.scope` by hand, copy it into `scope` before the first apply of a composition that

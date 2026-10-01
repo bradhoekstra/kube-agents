@@ -81,6 +81,13 @@ unset _gke_dns_endpoint_helper
 # Request timeout for kubectl probes against live clusters in the installer.
 readonly KUBECTL_PROBE_REQUEST_TIMEOUT="10s"
 
+# ─── Scope cap ─────────────────────────────────────
+# The bounds the PlatformAgent puts on spec.scope.maxProjects (SCOPE_MAX_PROJECTS),
+# and its default, which the live-scope check reads an absent key as.
+readonly SCOPE_MAX_PROJECTS_MIN=1
+readonly SCOPE_MAX_PROJECTS_MAX=5000
+readonly SCOPE_MAX_PROJECTS_DEFAULT=100
+
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -510,7 +517,7 @@ load_install_env() {
   # and the Day-2 menu the file is the only way in. A value inherited from the
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
-  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -913,17 +920,13 @@ hcl_csv_list() {
 # bounds the CRD puts on spec.scope.maxProjects, or the run stops before a
 # file is written and names the key and the bounds: the module's validation
 # would otherwise name neither. $1 the value.
-readonly SCOPE_MAX_PROJECTS_MIN=1
-readonly SCOPE_MAX_PROJECTS_MAX=5000
-# The CRD's default, which the comparison reads an absent key as.
-readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 require_scope_max_projects() {
   local value="${1:-}"
   [ -n "$value" ] || return 0
   if [[ "$value" =~ ^[0-9]+$ ]] && [ "$((10#$value))" -ge "$SCOPE_MAX_PROJECTS_MIN" ] && [ "$((10#$value))" -le "$SCOPE_MAX_PROJECTS_MAX" ]; then
     return 0
   fi
-  print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (100), in install.env."
+  print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
   return 1
 }
 

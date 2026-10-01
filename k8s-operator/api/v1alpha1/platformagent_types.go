@@ -145,7 +145,8 @@ type ScopeSpec struct {
 	// of itself over-cap. The MaxItems=100 cap on each declared list is unchanged: a
 	// hand-written list past a hundred entries is the shape folders exist for. The
 	// install's Terraform refuses a plan whose explicit projects and selector
-	// members exceed it, and renders the same value here from its scope input.
+	// members exceed it (while a selector is declared or the cap is below its
+	// default), and renders the same value here from its scope input.
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=5000
 	// +kubebuilder:default=100

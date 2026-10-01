@@ -56,7 +56,8 @@ told so rather than getting the host bound and its members not.
 ## Inputs and output
 
 `shared_vpc_hosts` and `metrics_scopes` are project IDs, with the CRD's pattern; `exclude_projects`
-is the scope's exclude list. `members` maps each selector's snapshot name (`sharedVpcHosts/<host>`,
+is the scope's exclude list; `member_cap` is the declared resolved-set cap (`spec.scope.maxProjects`,
+100 by default), past which a single selector is refused. `members` maps each selector's snapshot name (`sharedVpcHosts/<host>`,
 `metricsScopes/<scope>`) to the sorted project IDs it reaches, the shape `kube-agents-iam` takes and
 the one the reconcile's `fleet_scope.json` `containers` array can be read beside.
 

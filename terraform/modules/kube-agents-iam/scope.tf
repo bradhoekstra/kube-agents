@@ -196,10 +196,12 @@ locals {
   # known here at plan time, so a declaration they alone carry past the cap is
   # refused (main.tf) rather than bound, while a selector is declared: the
   # read roles in the members past it would be reach the agent never uses.
-  # Without a selector the count is scope.projects and the management project,
-  # which the CRD's own list cap bounds and this module admitted before the
-  # selectors existed, so a plan that declares none is not refused for it and
-  # the reconcile reads a hundred-and-first over-cap as it did. Counted as the
+  # Without a selector and at the default cap the count is scope.projects and the
+  # management project, which the CRD's own list cap bounds and this module admitted
+  # before the selectors existed, so such a plan is not refused for it and the
+  # reconcile reads a hundred-and-first over-cap as it did; a cap declared below the
+  # default is the operator's own number, and the precondition holds against it
+  # whether or not a selector is declared. Counted as the
   # reconcile counts, once
   # each and less an exact exclude entry: by ID on both legs (a monitored
   # project excluded by ID keeps its grant but leaves the set, so it leaves the
@@ -217,6 +219,11 @@ locals {
   # are unknown here, they come last in the order, and their binding is one on
   # the container rather than one per member.
   scope_resolved_set_cap = var.scope.max_projects
+  # The cap's default (the reconcile's RESOLVED_SET_CAP, the variable's default): the one
+  # declaration the whole-set precondition admitted before the cap was declarable, the
+  # CRD's hundred explicit projects with no selector, is admitted at this value alone;
+  # a cap declared below it holds the precondition with or without a selector.
+  scope_default_cap = 100
 
   scope_listed_projects = setunion(
     toset([var.project_id]),

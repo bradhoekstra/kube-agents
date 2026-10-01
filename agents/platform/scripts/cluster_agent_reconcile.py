@@ -149,8 +149,9 @@ _denied_this_run: set[str] = set()
 # Same, for a member whose GKE API answered disabled on a per-cluster call (also a 403).
 _api_disabled_this_run: set[str] = set()
 # The listing phase is bounded: the management project lists first and alone, then the
-# containers resolve LIST_WORKERS at a time, then the explicit projects LIST_WORKERS at a
-# time, and a lookup still running when LIST_BUDGET_SECONDS is spent reads unreachable. The
+# containers resolve `workers` at a time, then the explicit projects `workers` at a time,
+# and a lookup still running when the listing budget is spent reads unreachable; both are
+# sized from the declared cap below (LIST_WORKERS and LIST_BUDGET_SECONDS at the default). The
 # bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the budget
 # for the declared cap plus its settle time, 240s at the default cap) and kills it on expiry
 # with nothing written; two hanging projects listed in turn at LIST_TIMEOUT_SECONDS each
@@ -160,7 +161,10 @@ _api_disabled_this_run: set[str] = set()
 # projects keeps the same margin per project, workers first and the budget only once
 # the workers reach their ceiling; the bootstrap gate's ceiling follows the budget.
 LIST_WORKERS = 8
-LIST_WORKERS_MAX = 32
+# Every lookup is a gcloud process in the sandbox over ssh, and no install has measured
+# the sandbox at more than eight at once (#1913 is to): twice that covers the estate
+# behind #1354 and holds the ceiling until the measurement says otherwise.
+LIST_WORKERS_MAX = 16
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
 LIST_GRACE_SECONDS = 5
@@ -300,7 +304,8 @@ def _classify_list_failure(stderr: str) -> str:
 
 
 def _bounded_map(lookup, keys: list[str], deadline: float, what: str,
-                 workers: int = LIST_WORKERS, budget_seconds: float = LIST_BUDGET_SECONDS) -> dict:
+                 workers: int = LIST_WORKERS, budget_seconds: float = LIST_BUDGET_SECONDS,
+                 consequence: str = "skipping create for it this run") -> dict:
     """Run `lookup(key, timeout=...)` for every key, `workers` at a time, within the deadline.
 
     Each worker's own timeout is cut to the budget left when it starts, so no thread
@@ -325,7 +330,7 @@ def _bounded_map(lookup, keys: list[str], deadline: float, what: str,
             results[key] = future.result()
         else:
             log(f"{what} {key} did not finish within the run's {budget_seconds:g}s budget "
-                f"({OUTCOME_UNREACHABLE}; skipping create for it this run).")
+                f"({OUTCOME_UNREACHABLE}; {consequence}).")
             results[key] = (None, OUTCOME_UNREACHABLE)
     pool.shutdown(wait=False, cancel_futures=True)
     return results
@@ -351,7 +356,7 @@ def _resolve_groups(groups: list[str], deadline: float, workers: int = LIST_WORK
 
 def _list_projects(projects: list[str], deadline: float, workers: int = LIST_WORKERS,
                    budget_seconds: float = LIST_BUDGET_SECONDS) -> dict[str, tuple[list | None, str]]:
-    """List every explicit project within the run's listing budget, LIST_WORKERS at a time.
+    """List every explicit project within the run's listing budget, `workers` at a time.
 
     The caller lists the management project first and on its own, at the start of the
     budget, before calling this: its listing decides `create_pass_ran`, and when it
@@ -1231,7 +1236,7 @@ def _previously_resolved(previous: dict | None) -> set[str]:
     }
 
 
-def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
+def _cluster_exists(project: str, cluster: str, location: str, timeout: float = DESCRIBE_TIMEOUT_SECONDS) -> bool | None:
     """Return True if the GKE cluster exists, False if it definitively does not, None if unknown.
 
     Mirrors platform_mcp_server.verify_gke_cluster's classification: a NotFound/404 is the *only*
@@ -1243,7 +1248,7 @@ def _cluster_exists(project: str, cluster: str, location: str) -> bool | None:
         f"--location={location}", f"--project={project}", "--format=json(status, id)",
     ]
     try:
-        sandbox_exec.run(cmd, check=True, timeout=DESCRIBE_TIMEOUT_SECONDS)
+        sandbox_exec.run(cmd, check=True, timeout=timeout)
         return True
     except subprocess.CalledProcessError as e:
         stderr = e.stderr or ""
@@ -1426,7 +1431,7 @@ def reconcile(dry_run: bool = False) -> dict:
     # project that merely changed from one the scope dropped, and nothing is created under
     # a project this tick could not confirm is still the pod's own.
     carried_management = _previous_management(previous) if not management else None
-    # One budget for the whole listing phase (LIST_BUDGET_SECONDS): the management project
+    # One budget for the whole listing phase (_list_budget_seconds for the cap): the management project
     # lists first, at the start of it, so its listing, the one that decides whether the
     # roster is reconciled, is never cut short by a slow container; then the containers and
     # selectors together, one call each, and the naming of the monitored projects a Metrics
@@ -1727,9 +1732,9 @@ def reconcile(dry_run: bool = False) -> dict:
     # time under PRUNE's budget, and the loop below reads the answers in profile order, so
     # the log and the report are as they were when the walk was sequential. A policy prune
     # (an excluded cluster) needs no describe and gets none; a describe still pending at
-    # the deadline reads inconclusive, which keeps the profile. Each describe keeps its
-    # own DESCRIBE_TIMEOUT_SECONDS (the fakes in the tests key on the identity alone), so
-    # a worker can outlive the deadline by at most that long.
+    # the deadline reads inconclusive, which keeps the profile. Each describe's timeout is
+    # cut to the budget left, as a listing's is, so no worker outlives the deadline by
+    # more than the grace the bounded map allows.
     to_describe = [
         name for name in profiles
         if identities[name] is not None
@@ -1738,8 +1743,9 @@ def reconcile(dry_run: bool = False) -> dict:
     ]
     prune_budget = _prune_budget_seconds(cap)
     described = _bounded_map(
-        lambda name, timeout: (_cluster_exists(**identities[name]), ""),
+        lambda name, timeout: (_cluster_exists(**identities[name], timeout=min(timeout, DESCRIBE_TIMEOUT_SECONDS)), ""),
         to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
+        consequence="inconclusive; the profile is kept",
     )
     for name in profiles:
         identity = identities[name]

@@ -280,7 +280,7 @@ warning, since the plan reports a disabled API with the same command as its reme
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
 with the command while an API a declared selector reads is off (a dry run enables nothing, and its plan would
 otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
-because an existing install has them on. The reconcile lists at most 100 projects of the resolved
+because an existing install has them on. The reconcile lists at most `SCOPE_MAX_PROJECTS` projects (100 by default) of the resolved
 set, the management project included, so a declaration whose management project, `SCOPE_PROJECTS`
 and selector members together exceed that (once each, less an exact `SCOPE_EXCLUDE_PROJECTS` entry; a
 project both in `SCOPE_PROJECTS` and excluded by its number stays counted, so drop it from `SCOPE_PROJECTS`)
@@ -303,7 +303,8 @@ the environment, and records them, and an empty `--scope-*=` is refused. A malfo
 `spec.scope.maxProjects`, the most projects the reconcile lists per run (1 to 5000): empty, the
 default, leaves the CRD's 100 in force and writes no `max_projects` into the scope block; a value
 is rendered into the block, refused at plan time when the explicit projects and selector members
-exceed it, and read by the live-scope check as part of the declaration, so a cap set on the CR by
+exceed it (while a selector is declared or the cap is below its default), and read by the live-scope
+check as part of the declaration, so a cap set on the CR by
 hand is reported like any hand edit until the key records it.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own

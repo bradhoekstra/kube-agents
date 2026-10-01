@@ -151,9 +151,14 @@ class ReconcileTest(HomesMixin):
 
 
 def _name_for(identity_kwargs, identities):
-    """Reverse-map an identity dict back to its profile name for the existence stub."""
+    """Reverse-map an identity dict back to its profile name for the existence stub.
+
+    The prune's describe passes a `timeout` the identity does not carry; it is not
+    part of the identity.
+    """
+    identity = {k: v for k, v in identity_kwargs.items() if k != "timeout"}
     for name, ident in identities.items():
-        if ident == identity_kwargs:
+        if ident == identity:
             return name
     raise KeyError(identity_kwargs)
 
@@ -1311,15 +1316,16 @@ class ScopeTest(HomesMixin):
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
         self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
+        self.assertEqual(2 * per_default, rec.LIST_WORKERS_MAX, "the ceiling is twice the default until #1913 measures the sandbox")
         self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         budget = rec.LIST_BUDGET_SECONDS
         self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
         self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 2 * budget)
-        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 3 * budget)
-        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 2 * rec.PRUNE_BUDGET_SECONDS)
+        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 2 * budget)
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
+        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
 
     def test_prune_describes_run_in_parallel_under_their_own_budget(self):
         # Three profiles, one whose describe stalls past the prune budget: the stalled one
@@ -1328,7 +1334,7 @@ class ScopeTest(HomesMixin):
         ids = {"cluster-a": _identity(self.MGMT, "a"), "cluster-b": _identity(self.MGMT, "b"),
                "cluster-c": _identity(self.MGMT, "c")}
 
-        def exists(project, cluster, location):
+        def exists(project, cluster, location, timeout=None):
             if cluster == "a":
                 time.sleep(0.6)
             return True if cluster != "c" else False
@@ -1346,7 +1352,7 @@ class ScopeTest(HomesMixin):
     def test_an_excluded_cluster_is_pruned_without_a_describe(self):
         calls: list = []
 
-        def exists(project, cluster, location):
+        def exists(project, cluster, location, timeout=None):
             calls.append(cluster)
             return True
 
@@ -1402,7 +1408,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1"), ("team-a", "dev", "us-central1")]}
         probes: list[tuple] = []
 
-        def describe(project, cluster, location):
+        def describe(project, cluster, location, timeout=None):
             probes.append((project, cluster))
             rec._denied_this_run.add(project)
             return None
@@ -1818,7 +1824,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1")], "team-b": [("team-b", "old", "us-central1")],
                    "team-c": [("team-c", "live", "us-central1")]}
 
-        def probe(project, cluster, location):
+        def probe(project, cluster, location, timeout=None):
             if project == "team-a":
                 rec._denied_this_run.add(project)
                 return None
@@ -1892,7 +1898,7 @@ class ScopeTest(HomesMixin):
         members = {"team-a": [("team-a", "prod", "us-central1")]}
         ids = {"cluster-a": _identity("team-a", "prod")}
 
-        def describe(project, cluster, location):
+        def describe(project, cluster, location, timeout=None):
             rec._denied_this_run.add(project)
             return None
         report, _, _ = self._run({"folders": ["123456789012"]}, {self.MGMT: []}, profiles=["cluster-a"], identities=ids,
@@ -2256,7 +2262,7 @@ class ScopeTest(HomesMixin):
     def _recording_exists(self):
         calls: list = []
 
-        def exists(project, cluster, location):
+        def exists(project, cluster, location, timeout=None):
             calls.append((project, cluster, location))
             return True
         return exists, calls

@@ -914,7 +914,7 @@ main() {
   # Blanking the two selectors also means the destroy makes none of the
   # plan-time lookups, so a host or scope this identity can no longer read
   # cannot refuse the teardown either.
-  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
+  export SCOPE_PROJECTS="" SCOPE_FOLDERS="" SCOPE_ORGANIZATIONS="" SCOPE_SHARED_VPC_HOSTS="" SCOPE_METRICS_SCOPES="" SCOPE_MAX_PROJECTS="" SCOPE_EXCLUDE_PROJECTS="" SCOPE_EXCLUDE_CLUSTERS=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

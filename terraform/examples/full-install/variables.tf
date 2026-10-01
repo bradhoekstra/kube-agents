@@ -200,9 +200,10 @@ variable "scope" {
     planning identity cannot make fails the plan with the selector named,
     before anything is applied. `max_projects` is spec.scope.maxProjects, the
     most projects the reconcile lists per run (100 by default): the module
-    refuses a plan whose explicit projects and selector members exceed it,
-    the resolver refuses a single selector past it, and the chart renders it
-    on the CR, all from this one value.
+    refuses a plan whose explicit projects and selector members exceed it
+    (while a selector is declared or the cap is below its default), the
+    resolver refuses a single selector past it, and the chart renders it on
+    the CR, all from this one value.
   EOT
   type = object({
     projects         = optional(list(string), [])

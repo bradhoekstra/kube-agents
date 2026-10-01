@@ -214,3 +214,30 @@ run "a_cap_outside_the_crds_bounds_is_refused_at_the_variable" {
 
   expect_failures = [var.scope]
 }
+
+# A cap below the default holds the precondition even without a selector: the
+# admission the plan kept for the CRD's hundred explicit projects is for the
+# default cap alone, and four projects under a declared cap of two would
+# otherwise bind roles the reconcile never uses.
+run "a_declared_cap_below_the_default_holds_without_a_selector" {
+  command = plan
+
+  variables {
+    scope = { projects = ["team-a", "team-b", "team-c", "team-d"], max_projects = 2 }
+  }
+
+  expect_failures = [google_service_account.agent]
+}
+
+run "the_default_cap_without_a_selector_still_admits_the_crds_hundred" {
+  command = plan
+
+  variables {
+    scope = { projects = [for i in range(100) : format("team-%03d", i)], max_projects = 100 }
+  }
+
+  assert {
+    condition     = length(local.scope_listed_projects) == 101
+    error_message = "the count is ${length(local.scope_listed_projects)}, not 101"
+  }
+}

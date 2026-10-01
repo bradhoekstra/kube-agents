@@ -673,13 +673,13 @@ class InstallerCommonTest(unittest.TestCase):
             env_file = pathlib.Path(tmp) / "install.env"
             env_file.write_text("PROJECT_ID=p\n")
             stray = {"SCOPE_PROJECTS": "stray-project", "SCOPE_EXCLUDE_PROJECTS": "*-stray",
-                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c"}
-            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset}"'
+                     "SCOPE_EXCLUDE_CLUSTERS": "s/l/c", "SCOPE_MAX_PROJECTS": "250"}
+            probe = 'echo "P=${SCOPE_PROJECTS:-unset} X=${SCOPE_EXCLUDE_PROJECTS:-unset} C=${SCOPE_EXCLUDE_CLUSTERS:-unset} M=${SCOPE_MAX_PROJECTS:-unset}"'
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
-            self.assertIn("P=unset X=unset C=unset", proc.stdout, proc.stderr)
-            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\n")
+            self.assertIn("P=unset X=unset C=unset M=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPE_PROJECTS=from-the-file\nSCOPE_MAX_PROJECTS=300\n")
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
-            self.assertIn("P=from-the-file X=unset C=unset", proc.stdout, proc.stderr)
+            self.assertIn("P=from-the-file X=unset C=unset M=300", proc.stdout, proc.stderr)
 
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(

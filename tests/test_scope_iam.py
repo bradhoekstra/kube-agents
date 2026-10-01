@@ -11,6 +11,7 @@ terraform/modules/*/tests/ (`make terraform-test`), against mocked providers.
 Run: python3 -m unittest discover -s tests -p 'test_scope_iam.py' -v
 """
 
+import json
 import pathlib
 import re
 import unittest
@@ -378,7 +379,8 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         # the CRD's hundred explicit projects and no selector planned before this
         # precondition existed, and a plan that declares no selector must not
         # start refusing it.
-        self.assertIn("condition     = length(local.scope_selector_names) == 0 || length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
+        self.assertIn("condition     = (length(local.scope_selector_names) == 0 && var.scope.max_projects == local.scope_default_cap) || length(local.scope_listed_projects) <= local.scope_resolved_set_cap", self.main_tf)
+        self.assertIn(f"scope_default_cap = {cap.group(1)}", self.scope_tf)
         self.assertIn("A glob is applied by the reconcile alone", self.main_tf)
         # The by-number form lowers the count on the selector leg only: an explicit
         # project the reconcile drops by its number is counted, and the message says so
@@ -498,6 +500,40 @@ class ScopeVariableMirrorsTheCrdTest(unittest.TestCase):
                      'length(distinct([for c in var.scope.exclude.clusters : "${c.project_id}/${c.location}/${c.cluster_name}"])) == length(var.scope.exclude.clusters)'):
             with self.subTest(rule=rule[:50]):
                 self.assertIn(rule, self.variable)
+
+
+class ScopeCapBoundsMirrorTheCrdTest(unittest.TestCase):
+    """spec.scope.maxProjects's bounds and default are written in six places; the CRD is
+    the source, and each copy is read against it so a bound moved on the CRD alone reds."""
+
+    def setUp(self):
+        crd = yaml.safe_load((_REPO_ROOT / "charts" / "kube-agents" / "crds" / "kubeagents.x-k8s.io_platformagents.yaml").read_text())
+        scope = crd["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]["properties"]["scope"]["properties"]
+        self.minimum, self.maximum, self.default = scope["maxProjects"]["minimum"], scope["maxProjects"]["maximum"], scope["maxProjects"]["default"]
+
+    def test_the_chart_schema_carries_the_crds_bounds(self):
+        schema = json.loads((_REPO_ROOT / "charts" / "kube-agents" / "values.schema.json").read_text())
+        cap = schema["properties"]["platformAgent"]["properties"]["scope"]["properties"]["maxProjects"]
+        self.assertEqual((cap["minimum"], cap["maximum"]), (self.minimum, self.maximum))
+
+    def test_both_modules_validate_the_crds_bounds_and_default_to_its_default(self):
+        iam = (_MODULE / "variables.tf").read_text()
+        resolver = (_REPO_ROOT / "terraform" / "modules" / "kube-agents-scope-resolver" / "variables.tf").read_text()
+        self.assertIn(f"var.scope.max_projects >= {self.minimum} && var.scope.max_projects <= {self.maximum}", iam)
+        self.assertIn(f"max_projects     = optional(number, {self.default})", iam)
+        self.assertIn(f"var.member_cap >= {self.minimum} && var.member_cap <= {self.maximum}", resolver)
+        self.assertIn(f"default     = {self.default}", resolver[resolver.index('variable "member_cap"'):])
+
+    def test_the_installer_the_operator_and_the_reconcile_carry_the_same_numbers(self):
+        common = (_REPO_ROOT / "scripts" / "installer" / "installer_common.sh").read_text()
+        self.assertIn(f"readonly SCOPE_MAX_PROJECTS_MIN={self.minimum}\n", common)
+        self.assertIn(f"readonly SCOPE_MAX_PROJECTS_MAX={self.maximum}\n", common)
+        self.assertIn(f"readonly SCOPE_MAX_PROJECTS_DEFAULT={self.default}\n", common)
+        self.assertIn(f"{self.minimum} to {self.maximum}, {self.default} when", (_REPO_ROOT / "install.sh").read_text())
+        self.assertIn(f"const defaultScopeMaxProjects int32 = {self.default}",
+                      (_REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go").read_text())
+        reconcile = (_REPO_ROOT / "agents" / "platform" / "scripts" / "cluster_agent_reconcile.py").read_text()
+        self.assertIn(f"RESOLVED_SET_CAP = {self.default}\n", reconcile)
 
 
 class ScopeReachesBothHalvesTest(unittest.TestCase):
