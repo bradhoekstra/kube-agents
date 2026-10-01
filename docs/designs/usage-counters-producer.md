@@ -43,6 +43,7 @@ These are the facts the design rests on.
 | The operator's ClusterRole lists pods and manages ConfigMaps, cluster-wide grants the poller uses in the agent's namespace; it patches the status subresource of other kinds already (`Status().Patch` on `AgentPlugin`).                                                                                                                                                                                                                                                                                                 | `config/rbac/role.yaml`, `platformagent_controller.go`                                                                                                                                                                          |
 | The controller `Owns` ConfigMaps with no predicate: a write to any ConfigMap whose controller owner is the CR re-enqueues the CR. The `PlatformAgent` watch itself carries no predicate either, so every status write re-enqueues the CR.                                                                                                                                                                                                                                                                                 | `platformagent_controller.go` (`SetupWithManager`)                                                                                                                                                                              |
 | Neither listener exports `process_start_time_seconds`: the watcher registers its counters on a registry of its own with no process collector, and the broker renders its exposition by hand.                                                                                                                                                                                                                                                                                                                              | `cmd/k8s-event-watcher/metrics.go`, `credential_proxy.py`                                                                                                                                                                       |
+| Kubernetes' default `edit` and `admin` ClusterRoles grant write on ConfigMaps and nothing on `platformagents` or their status; the agent's own ClusterRole holds get, list and watch on ConfigMaps. The one namespace ConfigMap the operator reads back today, `<name>-gitops-state`, names its trusted writer and validates its content on every read. The manager has no HTTP client of its own; the module's clients belong to the watcher and the drift detector binaries.                                            | `platformagent_manifests.go` (the agent's role), `platformagent_controller.go` (`parseManagedRepos`), `charts/kube-agents/values.yaml`                                                                                          |
 | `github.com/prometheus/common`, which holds the text-format parser (`expfmt`), is already in the operator's module graph as an indirect dependency; `google.golang.org/api` is a direct one.                                                                                                                                                                                                                                                                                                                              | `k8s-operator/go.mod`                                                                                                                                                                                                           |
 | The Ready writer gates its `Status().Update` on `status.usage.activeInterfaces` and keeps a per-CR record, `prunedUsageStatus`, of a served CRD that drops `status.usage`; it re-probes every `usageStatusReprobeInterval` (5 minutes).                                                                                                                                                                                                                                                                                   | `platformagent_controller.go` (`noteUsageStatusEcho`, `usageStatusPruned`)                                                                                                                                                      |
 | The RBAC self-check is a manager `Runnable` on its own ticker, added in `main.go`, with `NeedLeaderElection` false because it is about the pod's own permissions.                                                                                                                                                                                                                                                                                                                                                         | `rbac_selfcheck.go`                                                                                                                                                                                                             |
@@ -69,7 +70,10 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    an `io.LimitReader` of `usageScrapeMaxBytes`, a named ceiling comfortably above the two
    expositions' size, and a body that reaches it is a failed scrape: the port is held by a
    listener in a pod that runs other containers, so what answers is input, not the operator's
-   own data; Selecting the port by its name means a renumbering in the manifests
+   own data. The client follows no redirect (`CheckRedirect` returns
+   `http.ErrUseLastResponse`) and any status other than 200 is a failed scrape, so a body on
+   the port cannot send the operator's GET, made from a network position the pod's own egress
+   policy does not have, anywhere else; Selecting the port by its name means a renumbering in the manifests
    moves the scrape with it;
 3. parses the exposition with `expfmt`, sums the series it wants over every label set (the next
    section says which), and takes one sample per pod per counter. A sample that is negative,
@@ -171,11 +175,15 @@ would fall back to zero on every one of those. The poller therefore keeps, per C
 the last sample it took from each pod, keyed by pod UID, per counter. On a poll it adds, for
 each pod it scraped:
 
-- the difference from the pod's last sample, when the pod UID is known and the sample is not
-  below the last one;
+- the difference from the pod's last sample, when the pod UID is known, the body's start time
+  is the recorded one, and the sample is not below the last one;
 - the whole sample, when the pod UID is new (a new pod starts from zero, so everything it has
-  counted is new), the sample is below the last one, or the process's start time changed (the
+  counted is new), or the body's start time is present and later than the recorded one (the
   process restarted inside the same pod);
+- nothing, as a failed scrape for that pod, when the body carries no start time, carries one
+  earlier than the recorded one, or shows the sample falling under an unchanged start time: a
+  counter cannot fall inside one process, so each of those is a body that is not the
+  listener's, and the pod's baseline is kept;
 - nothing, when the pod could not be scraped this poll; its baseline entry is kept. On its
   return, the difference across the gap is added when no other pod of the same kind was counted
   during the gap, which is every case for the broker's one pod and for a single gateway pod;
@@ -194,7 +202,14 @@ restarts and overtakes its last sample inside one interval reads as a plain incr
 without the start time the counts it made up to its last sample would be lost, an under-count
 bounded by that sample per restart, silent, and most likely on exactly the busy install where
 the watcher's supervisor restarts it under load. With the start time the reset is seen whatever
-the sample did.
+the sample did, and the rule demands positive evidence of one. The alternative, reading any
+sample below the last as a reset, is a door: a body answering on the port between the
+watcher's restarts could hand the poller a small sample, have it kept as the new baseline, and
+have the real listener's next sample added whole on top, the pod's lifetime count a second time
+per take-and-release cycle, all of it within the sample ceiling. Under the rule as written the
+most a forged later start time earns is a refusal of the real listener's bodies until the pod
+restarts, the denial this document already accepts; a forged earlier one, a missing one, or a
+falling counter is refused on sight.
 
 The totals and the baseline live together in a ConfigMap, `<name>-usage-counters`, in the CR's
 namespace, holding one JSON document: the running total per counter, the time of the last poll
@@ -210,7 +225,10 @@ with the CR's. A mismatch is treated as absent and overwritten: it is what a CR 
 re-applied under the same name sees while the collector has not yet removed the old ConfigMap,
 or was kept from removing it, and without the check the new CR would inherit a predecessor's
 totals, through the status patch that fires whenever the status is behind. A name is not
-ownership; the finalizer applies the same rule to the data volume. It is written only in a poll in
+ownership; the finalizer applies the same rule to the data volume. What the poller reads back
+passes the same bounds as a scraped sample before it is used: every total and sample
+non-negative, finite and below the ceiling, and no total below the status it projects to; a
+document that fails them is treated as absent, and the seed-from-status path runs. It is written only in a poll in
 which a total or the baseline changed, so a quiet install writes nothing.
 
 In memory alone the baseline would be lost with the operator, and the first poll after a
@@ -312,6 +330,15 @@ one body can do to a total; neither makes the body more trusted. This is what ke
 from becoming the grant the alternatives section refuses: a workload in the pod can refuse the
 operator a count, and can never hand it one the operator keeps.
 
+The ConfigMap has writers the pod does not: whoever holds ConfigMap write in the CR's
+namespace, which Kubernetes' default `edit` and `admin` roles grant while granting nothing on
+the CR's status. Such a principal can raise a counter within the bounds by editing the
+document, and the design accepts that trust, as the gitops-state ConfigMap accepts its
+administrator's: the counters are an activity summary, not the audit record, which is the log;
+the bounds turn a careless edit or a restore into a refused document rather than a crash or an
+absurd field; and the agent's own ServiceAccount holds get, list and watch on ConfigMaps, so
+the workload keeps no door through it either.
+
 ## Alternatives not taken
 
 **Counting observed events rather than accepted ones.** `k8s_event_watcher_events_seen_total`
@@ -358,9 +385,11 @@ back in the next, with and without a second gateway pod counted in between), the
 baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
 log line), the largest-delta rule across two gateway pods and
 its agreement with the sum for one, the start-time rule (a restart that overtakes its last sample inside one
-interval), a body over the size ceiling and a sample that is negative, not finite or above the
-sample ceiling (each a failed scrape for that pod and nothing more), a ConfigMap whose recorded
-CR UID is not the CR's (treated as absent), the series selection (the `status` values summed and the three excluded; the
+interval), a body over the size ceiling, a 3xx answer, and a sample that is negative, not finite or
+above the sample ceiling (each a failed scrape for that pod and nothing more), a body without a
+start time, one with a start time earlier than the recorded one, and one whose sample fell under
+an unchanged start time (refused, baseline kept), a ConfigMap whose recorded CR UID is not the
+CR's or whose values fail the bounds (treated as absent), the series selection (the `status` values summed and the three excluded; the
 injected series and not the observed one), and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
