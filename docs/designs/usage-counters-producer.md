@@ -302,7 +302,8 @@ over any window, which makes resets someone else's problem and needs no NetworkP
 It was not taken because the operator's ServiceAccount carries no Google identity, so it would
 need a Workload Identity binding and `roles/monitoring.viewer` in the IAM module and the chart,
 it would tie a core status field to GKE and to a collector an install may switch off, and it
-would add the collector's ingestion lag to a counter that is otherwise seconds behind. The
+would add the collector's ingestion lag on top of the poll interval, which is already the
+counter's lag. The
 poller's source is an interface with the pod scraper as its one implementation, so a
 deployment that cannot admit operator-to-pod traffic can gain this source later without
 changing the accumulation or the writer.
