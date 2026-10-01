@@ -1326,9 +1326,10 @@ class ScopeTest(HomesMixin):
         self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
         self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
         self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
-        # The prune's budget follows the profiles too: 120 profiles at eight workers are
-        # fifteen rounds, and the allowance per round beats the floor.
-        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 120), 15 * rec.PRUNE_SECONDS_PER_ROUND)
+        # The prune's budget follows the profiles too, per describe rather than per round
+        # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
+        # sequential walk's time whatever the worker count, and eight stay on the floor.
+        self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 120), 120 * rec.PRUNE_SECONDS_PER_DESCRIBE)
         self.assertEqual(rec._prune_budget_seconds(rec.RESOLVED_SET_CAP, 8), rec.PRUNE_BUDGET_SECONDS)
 
     def test_each_describe_takes_the_budget_left_not_its_full_timeout(self):
@@ -1342,10 +1343,17 @@ class ScopeTest(HomesMixin):
             return True
 
         ids = {f"cluster-{i}": _identity(self.MGMT, f"c{i}") for i in range(3)}
-        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 2), mock.patch.object(rec, "PRUNE_SECONDS_PER_ROUND", 1):
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.5):
             self._run({}, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
         self.assertEqual(len(seen), 3)
         self.assertTrue(all(t is not None and 0 < t <= 2 for t in seen), seen)
+        # And it is the budget left, not DESCRIBE_TIMEOUT_SECONDS: under the pool a
+        # describe waits for the sandbox CPU its pool-mates hold, and the 30 s cut read 44
+        # of 120 live clusters as unknown on a two-CPU sandbox at eight workers.
+        seen.clear()
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 50), mock.patch.object(rec, "DESCRIBE_TIMEOUT_SECONDS", 1):
+            self._run({}, {self.MGMT: []}, profiles=list(ids), identities=ids, exists=exists)
+        self.assertTrue(all(t is not None and 1 < t <= 50 for t in seen), seen)
         with mock.patch.object(rec.sandbox_exec, "run") as run:
             rec._cluster_exists("p", "c", "us-central1", timeout=7)
         self.assertEqual(run.call_args.kwargs["timeout"], 7)
@@ -1365,7 +1373,7 @@ class ScopeTest(HomesMixin):
 
         listings = {self.MGMT: [(self.MGMT, "b", "us-central1")]}
         started = time.monotonic()
-        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_ROUND", 0.1), \
+        with mock.patch.object(rec, "PRUNE_BUDGET_SECONDS", 0.2), mock.patch.object(rec, "PRUNE_SECONDS_PER_DESCRIBE", 0.05), \
                 mock.patch.object(rec, "LIST_GRACE_SECONDS", 0.05):
             report, _, deleted = self._run({}, listings, profiles=list(ids), identities=ids, exists=exists)
         elapsed = time.monotonic() - started

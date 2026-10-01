@@ -627,7 +627,10 @@ into a second project the tester controls.
    cap a declared value (`spec.scope.maxProjects`, default 100) with the listing workers and budget
    scaled to it and the bootstrap gate's ceiling following the budget, and runs PRUNE's per-profile
    `describe` under the same bounded parallel map as the listing, because at 200 clusters a
-   sequential walk was minutes of every hourly tick; the snapshot records the cap in force
+   sequential walk was minutes of every hourly tick; its budget is sized per describe rather
+   than per round of workers, because the describes share the sandbox's CPU (a round of eight
+   took as long as eight in a row on a two-CPU sandbox), so the map finishes early where it can
+   and never cuts the walk short where it cannot; the snapshot records the cap in force
    (`maxProjects`). A second follow-up moves the pool to per-project accounts (§6).
 3. **Shared VPC and Metrics Scope selectors.** `sharedVpcHosts` from the Compute API and
    `metricsScopes` from the Monitoring API (§3), each resolving to explicit projects with a

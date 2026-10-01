@@ -173,11 +173,14 @@ LIST_GRACE_SECONDS = 5
 # budget of its own, instead of a sequential walk at DESCRIBE_TIMEOUT_SECONDS each: at 200
 # profiles the walk was minutes of every hourly tick and a stalled project 30 s per
 # cluster in it. The budget is the larger of a floor scaled like the listing's and an
-# allowance per round of describes (the profiles divided among the workers), so a fleet of
-# many clusters per project is not cut short at the same lexically-last profiles every
-# tick; a describe still pending at the deadline reads inconclusive (kept) and is logged.
+# allowance per describe, the cost of one in a sequential walk: the describes run in the
+# sandbox and share its CPU, so the workers shorten a run only as far as that CPU allows
+# (on a two-CPU sandbox a round of eight took as long as eight describes in a row), and a
+# budget sized per describe is one the parallel map can only finish early, never one that
+# cuts a fleet short at the same lexically-last profiles every tick. A describe still
+# pending at the deadline reads inconclusive (kept) and is logged.
 PRUNE_BUDGET_SECONDS = 60
-PRUNE_SECONDS_PER_ROUND = 10
+PRUNE_SECONDS_PER_DESCRIBE = 3
 # How many unlisted projects the chat notification names before it counts the rest: a
 # container can resolve to thousands of projects, a chat message has a size ceiling, and
 # a message the platform drops for its size takes the created/pruned summary with it.
@@ -238,11 +241,9 @@ def _list_budget_seconds(cap: int) -> float:
 
 def _prune_budget_seconds(cap: int, profiles: int = 0) -> float:
     """PRUNE's describe budget: the floor scaled the way the listing budget is, or the
-    rounds of describes the profiles need at the cap's workers times the allowance per
-    round, whichever is larger."""
+    profiles times the allowance per describe, whichever is larger."""
     scaled = PRUNE_BUDGET_SECONDS * (_list_budget_seconds(cap) / LIST_BUDGET_SECONDS)
-    rounds = -(-profiles // _list_workers(cap))
-    return max(scaled, rounds * PRUNE_SECONDS_PER_ROUND)
+    return max(scaled, profiles * PRUNE_SECONDS_PER_DESCRIBE)
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-RECONCILE] {msg}", file=sys.stderr)
@@ -1742,8 +1743,10 @@ def reconcile(dry_run: bool = False) -> dict:
     # the log and the report are as they were when the walk was sequential. A policy prune
     # (an excluded cluster) needs no describe and gets none; a describe still pending at
     # the deadline reads inconclusive, which keeps the profile. Each describe's timeout is
-    # cut to the budget left, as a listing's is, so no worker outlives the deadline by
-    # more than the grace the bounded map allows.
+    # the budget left, as a listing's is, so no worker outlives the deadline by more than
+    # the grace the bounded map allows; it is not DESCRIBE_TIMEOUT_SECONDS, because under
+    # the pool a describe also waits for the sandbox CPU its pool-mates hold, and at eight
+    # workers a 30 s cut read a third of a live fleet as unknown.
     to_describe = [
         name for name in profiles
         if identities[name] is not None
@@ -1752,7 +1755,7 @@ def reconcile(dry_run: bool = False) -> dict:
     ]
     prune_budget = _prune_budget_seconds(cap, len(to_describe))
     described = _bounded_map(
-        lambda name, timeout: (_cluster_exists(**identities[name], timeout=min(timeout, DESCRIBE_TIMEOUT_SECONDS)), ""),
+        lambda name, timeout: (_cluster_exists(**identities[name], timeout=timeout), ""),
         to_describe, time.monotonic() + prune_budget, "describing the cluster of", workers, prune_budget,
         consequence="inconclusive; the profile is kept",
     )
