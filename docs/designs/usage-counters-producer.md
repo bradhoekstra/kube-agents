@@ -39,6 +39,7 @@ These are the facts the design rests on.
 | `k8s_event_watcher_events_seen_total` increments on every delivery the informer makes, before the reason filter: that includes the initial list, which replays every Event still inside the API server's retention, and the redeliveries of watch-connection rotations. `k8s_event_watcher_events_injected_total` increments once an event has passed the filter and the dedup cache, has been handed to the agent, and was neither graded informational nor dropped on the daily ceiling by the daemon that received it. | `cmd/k8s-event-watcher/main.go` (`Dispatch`), `watcher.go`, the watcher's README ("Replay Shielding", "On-Disk Snapshots")                                                                                                      |
 | The dedup caches are snapshotted to the data volume, under `event-watcher/` in the agent's home (`/opt/data` unless `spec.harness.hermes.agentHome` moves it), every thirty seconds and at shutdown, and restored at start, so a restart re-offers nothing already triaged; a lost or unreadable snapshot costs one replay of the retained Events.                                                                                                                                                                        | the watcher's README; `platformagent_manifests.go` (the sidecar writes its snapshots to the shared volume)                                                                                                                      |
 | The watcher's `k8s_event_watcher_session_creates_total{…,outcome}` records `outcome` as `ok` or `error`. The broker's series is `kubeagents_tool_invocations_total{tool,subcommand,status}` with `status` one of `success`, `error`, `blocked`, `busy`, `abandoned`; `abandoned` is recorded both for a running command killed when its caller left and for a caller that left the queue before the command started.                                                                                                      | `cmd/k8s-event-watcher/main.go`, `credential_proxy.py`                                                                                                                                                                          |
+| The gateway pod's containers share one network namespace, `spec.deployment.sidecars` renders any container a CR author names into that pod, and the watcher holds 9095 only while its process runs: when the port is taken it logs an ALERT and runs on without a listener. The manager runs under a 128Mi memory limit in both install paths.                                                                                                                                                                            | `platformagent_manifests.go`, `common_types.go`, `cmd/k8s-event-watcher/main.go`, `config/manager/manager.yaml`, `charts/kube-agents/values.yaml`                                                                               |
 | The operator's ClusterRole lists pods and manages ConfigMaps, cluster-wide grants the poller uses in the agent's namespace; it patches the status subresource of other kinds already (`Status().Patch` on `AgentPlugin`).                                                                                                                                                                                                                                                                                                 | `config/rbac/role.yaml`, `platformagent_controller.go`                                                                                                                                                                          |
 | The controller `Owns` ConfigMaps with no predicate: a write to any ConfigMap whose controller owner is the CR re-enqueues the CR. The `PlatformAgent` watch itself carries no predicate either, so every status write re-enqueues the CR.                                                                                                                                                                                                                                                                                 | `platformagent_controller.go` (`SetupWithManager`)                                                                                                                                                                              |
 | Neither listener exports `process_start_time_seconds`: the watcher registers its counters on a registry of its own with no process collector, and the broker renders its exposition by hand.                                                                                                                                                                                                                                                                                                                              | `cmd/k8s-event-watcher/metrics.go`, `credential_proxy.py`                                                                                                                                                                       |
@@ -64,10 +65,17 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
 2. for each running pod, finds the container port by name, `event-metrics` on the gateway pod
    and `cred-metrics` on the broker pod, looking through `initContainers` as well as
    `containers` because the sidecar is a native one, and reads `/metrics` at the pod IP and that port, joined with
-   `net.JoinHostPort` so an IPv6 pod IP works, with a short deadline. Selecting the port by its name means a renumbering in the manifests
+   `net.JoinHostPort` so an IPv6 pod IP works, with a short deadline. The body is read through
+   an `io.LimitReader` of `usageScrapeMaxBytes`, a named ceiling comfortably above the two
+   expositions' size, and a body that reaches it is a failed scrape: the port is held by a
+   listener in a pod that runs other containers, so what answers is input, not the operator's
+   own data; Selecting the port by its name means a renumbering in the manifests
    moves the scrape with it;
 3. parses the exposition with `expfmt`, sums the series it wants over every label set (the next
-   section says which), and takes one sample per pod per counter;
+   section says which), and takes one sample per pod per counter. A sample that is negative,
+   not finite, or above `usageSampleCeiling`, a named bound no honest counter reaches in the
+   life of a pod, is a failed scrape for that pod: it contributes nothing, and the log line names
+   the pod and the bound;
 4. folds the samples into the totals through the per-pod baseline described below. Totals and
    baseline live together in one ConfigMap, which is the accumulator's source of truth; the
    status is a projection of it;
@@ -87,7 +95,7 @@ served-CRD section, generalised so that both writers call it.
 | --------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `toolExecutionsTotal` | `kubeagents_tool_invocations_total`, broker pod              | Sum over `tool` and `subcommand`, over `status` in `success` and `error`: the commands the broker ran to an exit. `blocked` and `busy` are refusals that never ran. `abandoned` is left out because the series cannot say whether the command had started: the broker records it for a command killed mid-run and for a caller that left the queue before the start. `error` also covers a rejected request and a broker fault, so the count is the broker's view of "ran", a little wide. |
 | `eventsIngestedTotal` | `k8s_event_watcher_events_injected_total`, every gateway pod | Within a pod, sum over every label: cluster, project, location, reason and namespace. Across gateway pods, the largest per-pod delta in the poll rather than the sum: each replica's watcher works the same event stream, so the sum would count an event once per replica. With one pod the two are the same.                                                                                                                                                                             |
-| `lastActiveTime`      | derived                                                      | The time of the last poll in which any total moved: a command ran, or an event was accepted for triage. The field's documented meaning is the most recent interaction or event triage; until `sessionsTotal` lands, a chat turn that runs no brokered command does not move it, and the CRD description says so.                                                                                                                                                                           |
+| `lastActiveTime`      | derived                                                      | The time of the last poll in which any total moved: a command ran, or an event was accepted for triage. The field's documented meaning is the most recent interaction or event triage; until `sessionsTotal` lands, a chat turn that runs no brokered command does not move it, and the CRD description the implementation ships says so.                                                                                                                                                  |
 
 `eventsIngestedTotal` counts the events the watcher accepted for triage, past its reason filter
 and its dedup window and not turned away by the daemon, not the events it observed. The observed series,
@@ -138,7 +146,8 @@ section says how that shows.
 
 The rule is narrower than the obvious alternative of admitting the agent's namespace, which
 would open both listeners to the shell sandbox and to anything else that lands in the
-namespace. The listeners serve counters with closed label vocabularies, so that would leak
+namespace. The listeners serve counters whose labels are tool, subcommand and status names on the
+broker's side and cluster, project, location, namespace and reason names on the watcher's,
 nothing secret, but the broker's metrics listener was admitted past the broker's own
 reachable-off-pod refusal on the argument that it serves counters to a collector; a pod
 selector keeps that argument true.
@@ -195,7 +204,13 @@ accumulator reads at the start of every poll; the status is written from it, nev
 way round, so a cache that hands the poller a stale CR can never pull a total backwards. It
 carries an owner reference to the CR, without the controller flag, so it is collected with the
 CR but does not re-enqueue it: the controller `Owns` ConfigMaps with no predicate, and a
-controller-owned one would cost a reconcile on every write. It is written only in a poll in
+controller-owned one would cost a reconcile on every write. The document also records the UID
+of the CR it was accumulated for, and the poller compares it, and the owner reference's UID,
+with the CR's. A mismatch is treated as absent and overwritten: it is what a CR deleted and
+re-applied under the same name sees while the collector has not yet removed the old ConfigMap,
+or was kept from removing it, and without the check the new CR would inherit a predecessor's
+totals, through the status patch that fires whenever the status is behind. A name is not
+ownership; the finalizer applies the same rule to the data volume. It is written only in a poll in
 which a total or the baseline changed, so a quiet install writes nothing.
 
 In memory alone the baseline would be lost with the operator, and the first poll after a
@@ -257,7 +272,8 @@ fields a writer expects to see, and both writers call it.
 The schema has no field for an error, by design: static enums and integer counts only. An
 install that switched the watcher off is not a failure: the poller reads the same switch the
 reconciler does, scrapes no gateway pod while it is off, and records nothing. A scrape that
-fails leaves the pod's baseline untouched and the totals where they were. The
+fails, which includes a body over the size ceiling and a sample outside its bounds, leaves the
+pod's baseline untouched and the totals where they were. The
 operator log carries one line when an endpoint first fails and one when it recovers, naming
 the pod and the error type, never the body. The visible symptom of a standing failure, a
 NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener that moved, is
@@ -287,7 +303,14 @@ the operator's pods on the two metrics ports and nothing else; the collector's r
 unchanged. No new RBAC: pods are listed and ConfigMaps managed with verbs the ClusterRole
 already grants, and the status subresource is already the operator's to write. No credential
 of any kind is involved; both listeners are unauthenticated by design, as they are for the
-collector.
+collector, and for the same reason the operator treats what it reads as untrusted. The gateway
+pod shares its network namespace across the agent container, the sidecar and any container
+`spec.deployment.sidecars` adds, and the watcher's port is free whenever its process is down, so
+a body on either port can come from something other than the two listeners. The size ceiling
+bounds the operator's memory per poll under its 128Mi limit, and the sample ceiling bounds what
+one body can do to a total; neither makes the body more trusted. This is what keeps the scrape
+from becoming the grant the alternatives section refuses: a workload in the pod can refuse the
+operator a count, and can never hand it one the operator keeps.
 
 ## Alternatives not taken
 
@@ -335,7 +358,9 @@ back in the next, with and without a second gateway pod counted in between), the
 baseline-absent-with-counters-present case, the disabled-watcher case (no gateway scrape, no
 log line), the largest-delta rule across two gateway pods and
 its agreement with the sum for one, the start-time rule (a restart that overtakes its last sample inside one
-interval), the series selection (the `status` values summed and the three excluded; the
+interval), a body over the size ceiling and a sample that is negative, not finite or above the
+sample ceiling (each a failed scrape for that pod and nothing more), a ConfigMap whose recorded
+CR UID is not the CR's (treated as absent), the series selection (the `status` values summed and the three excluded; the
 injected series and not the observed one), and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
