@@ -5937,10 +5937,10 @@ class ProxyMetrics:
 class MetricsHandler(BaseHTTPRequestHandler):
     """The metrics-only listener: GET /metrics, and nothing else.
 
-    Unauthenticated, like /healthz on the credentialed listener, because the
-    scraper is the managed-Prometheus collector, which holds no caller token;
-    the operator's NetworkPolicy on this pod is what bounds who reaches the
-    port. It serves the registry the credentialed handler writes and holds no
+    Unauthenticated, like /healthz on the credentialed listener, because its
+    readers, the managed-Prometheus collector and the operator's usage
+    poller, hold no caller token; the operator's NetworkPolicy on this pod is
+    what bounds who reaches the port. It serves the registry the credentialed handler writes and holds no
     route, credential or policy of its own, which is why it may bind a TCP
     port the credential runtime otherwise refuses to (see serve). Bounded
     because it shares the process with that handler: MetricsServer admits

@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -712,5 +713,59 @@ func TestUsagePoller_StreaksSurviveAnotherCRsPoll(t *testing.T) {
 		if !found {
 			t.Errorf("no event names pod %s: %v", pod, events)
 		}
+	}
+}
+
+// A status counter outside the document's bounds, which only a hand patch
+// produces, is neither the seed nor the floor: the document is seeded from
+// zero once and left alone, instead of being refused and re-seeded on every
+// poll; the next move projects the real total over the absurd one.
+func TestUsagePoller_AnAbsurdStatusTotalIsNeitherSeedNorFloor(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Status.Usage.ToolExecutionsTotal = usageTotalCeiling + 1
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.poll(5)
+	if doc := h.document(); doc.Totals[usageCounterToolExecutions] != 0 || !doc.FirstRecorded.Time.Equal(usageClock(5)) {
+		t.Fatalf("seeded from the absurd status: %+v", doc)
+	}
+	h.poll(10)
+	if h.cmWrites != 1 {
+		t.Fatalf("%d ConfigMap writes across two quiet polls, want 1: the document was re-seeded", h.cmWrites)
+	}
+	h.stub.set(brokerAddr(), 15, nil)
+	h.poll(15)
+	if doc := h.document(); doc.Totals[usageCounterToolExecutions] != 5 || !doc.FirstRecorded.Time.Equal(usageClock(5)) {
+		t.Fatalf("after the move: %+v, want 5 counted from the first document", doc)
+	}
+	if status := h.status(); status.ToolExecutionsTotal != 5 || status.LastActiveTime == nil {
+		t.Fatalf("status after the move: %+v, want the real total projected over the absurd one", status)
+	}
+}
+
+// A poll cut short by a cancelled context records no failure: no streak, no
+// log line, no Warning event.
+func TestUsagePoller_ACancelledPollRecordsNoFailure(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+	h.stub.fail(brokerAddr(), usageScrapeKindConnect)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.clock = usageClock(5)
+	if err := h.p.pollAgent(ctx, agent, map[string]bool{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pollAgent on a cancelled context returned %v, want context.Canceled", err)
+	}
+	if len(h.p.streaks) != 0 {
+		t.Fatalf("a cancelled poll recorded %d streak(s)", len(h.p.streaks))
+	}
+	h.p.pollAgent(ctx, agent, map[string]bool{}) //nolint:errcheck // the second cancelled poll must still record nothing
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a cancelled poll recorded an event: %s", ev)
+	default:
 	}
 }

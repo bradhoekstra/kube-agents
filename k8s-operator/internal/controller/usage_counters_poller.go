@@ -17,6 +17,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -95,7 +96,6 @@ type UsageCounterPoller struct {
 
 type usageScrapeStreak struct {
 	count int
-	kind  string
 }
 
 // usageTarget is a running pod whose listener the poll reads.
@@ -179,6 +179,11 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	for _, target := range targets {
 		reading, err := p.source.Scrape(ctx, target.addr, target.counter)
 		if err != nil {
+			if ctx.Err() != nil {
+				// A poll cut short by shutdown or a leader change is not a
+				// listener failure; the next leader polls afresh.
+				return ctx.Err()
+			}
 			p.noteScrapeFailure(log, cached, target, err)
 			continue
 		}
@@ -207,8 +212,8 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	}
 	seed := usageSeed{
 		Totals: map[string]int64{
-			usageCounterToolExecutions: agent.Status.Usage.ToolExecutionsTotal,
-			usageCounterEventsIngested: agent.Status.Usage.EventsIngestedTotal,
+			usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
+			usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
 		},
 		LastMoved: agent.Status.Usage.LastActiveTime,
 	}
@@ -368,8 +373,8 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 		return "no totals or no pods"
 	}
 	floors := map[string]int64{
-		usageCounterToolExecutions: agent.Status.Usage.ToolExecutionsTotal,
-		usageCounterEventsIngested: agent.Status.Usage.EventsIngestedTotal,
+		usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
+		usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
 	}
 	for counter, floor := range floors {
 		total, ok := doc.Totals[counter]
@@ -392,6 +397,18 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 		}
 	}
 	return ""
+}
+
+// usageStatusFloor is a status counter as the document's seed and as the
+// floor a stored total may not fall under. A value outside the document's own
+// bounds, which the operator never writes, is neither: taken as a floor it
+// would make every document invalid, and taken as a seed it would be written
+// into one that the next poll refuses, re-seeding the CR on every poll.
+func usageStatusFloor(value int64) int64 {
+	if value < 0 || value > usageTotalCeiling {
+		return 0
+	}
+	return value
 }
 
 // writeDocument writes doc to the CR's ConfigMap, creating it with a
@@ -470,7 +487,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 // so that the symptom, a lastActiveTime that stops advancing, has its cause
 // beside it in `kubectl describe`.
 func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1alpha1.PlatformAgent, target usageTarget, err error) {
-	kind := usageErrorKind(err)
 	p.mu.Lock()
 	streak := p.streaks[target.uid]
 	if streak == nil {
@@ -478,13 +494,15 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1al
 		p.streaks[target.uid] = streak
 	}
 	streak.count++
-	streak.kind = kind
 	count := streak.count
 	p.mu.Unlock()
 
-	detail := kind
-	if kind == usageScrapeKindConnect || kind == usageScrapeKindStatus || kind == usageScrapeKindRead {
-		detail = err.Error()
+	// The kind, and for a status kind the HTTP code: usageScrapeError's text
+	// is a closed vocabulary, never a byte the peer sent.
+	detail := usageErrorKind(err)
+	var scrape *usageScrapeError
+	if errors.As(err, &scrape) {
+		detail = scrape.Error()
 	}
 	if count == 1 {
 		log.Info("a metrics listener could not be read; its pod's baseline and the totals are unchanged until it recovers",

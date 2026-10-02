@@ -422,6 +422,10 @@ func TestFoldUsage_AMissingScrapeKeepsTheBaseline(t *testing.T) {
 	if res.Changed || res.Moved || res.Document.Pods[foldPodBroker].Sample != 100 {
 		t.Fatalf("a poll with no body changed the document: changed=%v moved=%v entry=%+v", res.Changed, res.Moved, res.Document.Pods[foldPodBroker])
 	}
+	// Readable again: the whole gap since the kept baseline is added.
+	runFoldSteps(t, res.Document, usageCounterToolExecutions, []foldStep{
+		{minute: 10, scraped: []usageScrapedPod{scrapedPod(foldPodBroker, usageCounterToolExecutions, first.Add(-time.Hour), 107, ptr.To(1.0))}, want: 7, moved: true},
+	})
 }
 
 // A quiet poll writes nothing: unchanged samples under an unchanged start time
@@ -453,6 +457,10 @@ func TestFoldUsage_DepartedPodsAreDropped(t *testing.T) {
 	if !res.Changed || res.Document.Pods[foldPodB] != nil || res.Document.Totals[usageCounterEventsIngested] != 40 {
 		t.Fatalf("departed pod: changed=%v pods=%v totals=%v", res.Changed, res.Document.Pods, res.Document.Totals)
 	}
+	// With no sibling left, A's next lone advance is counted.
+	runFoldSteps(t, res.Document, usageCounterEventsIngested, []foldStep{
+		{minute: 10, scraped: []usageScrapedPod{scrapedPod(foldPodA, usageCounterEventsIngested, first.Add(-time.Hour), 45, ptr.To(1.0))}, want: 45, moved: true},
+	})
 }
 
 // Two gateway replicas: the largest delta in a poll, not the sum, and its
@@ -587,6 +595,13 @@ func TestFoldUsage_ALaggingReplicaThatRestartedIsResetNotTakenWhole(t *testing.T
 	if b := doc.Pods[foldPodB]; b.Sample != 30 || *b.StartTime != 2 || !b.Marker.Time.Equal(foldClock(5)) {
 		t.Fatalf("B after the reset: %+v", b)
 	}
+	// Level with A now: B's next lone advance from its new process is counted.
+	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 15, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 33, ptr.To(2.0)),
+		}, want: 3, moved: true},
+	})
 }
 
 // During a rollout a new pod's whole sample competes with the old pod's
@@ -632,9 +647,10 @@ func TestAddUsageTotal_RefusesPastTheCeiling(t *testing.T) {
 	}
 }
 
-// A replica reset against its sibling's marker by a body without the gauge
-// keeps its recorded start time, so the listener's next body, carrying the
-// gauge and an unchanged sample, adds nothing rather than its whole sample.
+// A replica reset against its sibling's marker by an advancing body without
+// the gauge keeps its recorded start time, so the listener's next body,
+// carrying the gauge and an unchanged sample, adds nothing rather than its
+// whole sample.
 func TestFoldUsage_AResetByAGaugelessBodyKeepsTheStartTime(t *testing.T) {
 	first := foldClock(0)
 	created := first.Add(-time.Hour)
@@ -644,20 +660,64 @@ func TestFoldUsage_AResetByAGaugelessBodyKeepsTheStartTime(t *testing.T) {
 	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
 		{minute: 10, scraped: []usageScrapedPod{
 			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
-			scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, nil),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 102, nil),
 		}, want: 0},
 	})
-	if b := doc.Pods[foldPodB]; b.StartTime == nil || *b.StartTime != 1 || !b.Marker.Time.Equal(foldClock(5)) {
+	if b := doc.Pods[foldPodB]; b.Sample != 102 || b.StartTime == nil || *b.StartTime != 1 || !b.Marker.Time.Equal(foldClock(5)) {
 		t.Fatalf("B after the reset: %+v, want the start time kept and A's marker", b)
 	}
 	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
 		{minute: 15, scraped: []usageScrapedPod{
 			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
-			scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 102, ptr.To(1.0)),
 		}, want: 0},
 		{minute: 20, scraped: []usageScrapedPod{
 			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
-			scrapedPod(foldPodB, usageCounterEventsIngested, created, 103, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 105, ptr.To(1.0)),
 		}, want: 3, moved: true},
+	})
+}
+
+// The reset fires when the behind replica next advances, not on a quiet body:
+// a replica that trails its sibling on the same events by more than one
+// interval keeps its old marker through the quiet poll, so its catch-up is
+// reset rather than counted on top of what the sibling supplied, and the
+// quiet poll writes nothing.
+func TestFoldUsage_AQuietBehindReplicaIsNotResetUntilItAdvances(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	doc := foldDoc(first,
+		foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first),
+		foldEntry(foldPodB, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 108, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+		}, want: 8, moved: true},
+	})
+	// The quiet poll: B is behind A's marker and unchanged; nothing moves.
+	res := foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodA, usageCounterEventsIngested, created, 108, ptr.To(1.0)),
+		scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+	}, foldClock(10))
+	if res.Changed || res.Moved || !res.Document.Pods[foldPodB].Marker.Time.Equal(first) {
+		t.Fatalf("the quiet poll touched B: changed=%v moved=%v B=%+v", res.Changed, res.Moved, res.Document.Pods[foldPodB])
+	}
+	// The catch-up: the same eight events, reset rather than counted.
+	doc = runFoldSteps(t, res.Document, usageCounterEventsIngested, []foldStep{
+		{minute: 15, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 108, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 108, ptr.To(1.0)),
+		}, want: 8},
+	})
+	if b := doc.Pods[foldPodB]; b.Sample != 108 || !b.Marker.Time.Equal(foldClock(5)) {
+		t.Fatalf("B after the catch-up: %+v, want sample 108 and A's marker", b)
+	}
+	// Level again: the next lone advance by either is counted.
+	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 20, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 108, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 110, ptr.To(1.0)),
+		}, want: 10, moved: true},
 	})
 }

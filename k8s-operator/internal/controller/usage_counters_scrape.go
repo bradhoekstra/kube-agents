@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"syscall"
 	"time"
 
 	dto "github.com/prometheus/client_model/go"
@@ -63,18 +64,25 @@ const (
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
 	processStartTimeSeries = "process_start_time_seconds"
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
-	// that mean a command ran to an exit are in toolInvocationsCountedStatuses:
-	// blocked and busy never ran, and abandoned cannot say whether the
-	// command had started.
+	// toolInvocationsCountedStatuses sums are the broker's success and error:
+	// the commands it ran and the requests it rejected or failed on before
+	// running. blocked and busy are refusals, and abandoned cannot say
+	// whether the command had started.
 	toolInvocationsStatusLabel = "status"
 
-	// The kinds a failed scrape is logged as. Never the body.
-	usageScrapeKindConnect = "connect"
-	usageScrapeKindStatus  = "status"
-	usageScrapeKindRead    = "read"
-	usageScrapeKindLine    = "line too long"
-	usageScrapeKindParse   = "unparsable line"
-	usageScrapeKindSample  = "sample out of range"
+	// The kinds a failed scrape is logged as: a closed vocabulary, never a
+	// byte the peer sent. The connection kinds are classified from the
+	// dial error rather than copied from it, because net/http's own error
+	// text quotes the status line and header lines it could not parse.
+	usageScrapeKindConnect     = "connect"
+	usageScrapeKindRefused     = "connection refused"
+	usageScrapeKindTimeout     = "timeout"
+	usageScrapeKindUnreachable = "unreachable"
+	usageScrapeKindStatus      = "status"
+	usageScrapeKindRead        = "read"
+	usageScrapeKindLine        = "line too long"
+	usageScrapeKindParse       = "unparsable line"
+	usageScrapeKindSample      = "sample out of range"
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
@@ -99,21 +107,37 @@ type usageReading struct {
 }
 
 // usageScrapeError is a scrape that produced no body to count, with a kind the
-// log can name. Err carries detail only for the kinds that cannot contain the
-// body: the connection and the status line.
+// log and the CR's event can name. Status is the HTTP status the listener
+// answered, for usageScrapeKindStatus: an integer of ours, never the peer's
+// text. Nothing the peer sent reaches Error().
 type usageScrapeError struct {
-	Kind string
-	Err  error
+	Kind   string
+	Status int
 }
 
 func (e *usageScrapeError) Error() string {
-	if e.Err != nil {
-		return e.Kind + ": " + e.Err.Error()
+	if e.Status != 0 {
+		return fmt.Sprintf("%s: HTTP %d", e.Kind, e.Status)
 	}
 	return e.Kind
 }
 
-func (e *usageScrapeError) Unwrap() error { return e.Err }
+// usageConnectKind classifies a client.Do error into the connection kinds:
+// what a reader of the event needs (refused, timed out, unreachable) without
+// the text net/http builds from the bytes it read.
+func usageConnectKind(err error) string {
+	var netErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+		return usageScrapeKindTimeout
+	}
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return usageScrapeKindRefused
+	}
+	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
+		return usageScrapeKindUnreachable
+	}
+	return usageScrapeKindConnect
+}
 
 // usageSource reads a listener. The pod scraper is its one implementation; a
 // test supplies a stub, and a deployment that cannot admit operator-to-pod
@@ -152,15 +176,15 @@ func newPodUsageSource() *podUsageSource {
 func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usageReading, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
 	if err != nil {
-		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect, Err: err}
+		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
 	resp, err := s.client.Do(req)
 	if err != nil {
-		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect, Err: err}
+		return usageReading{}, &usageScrapeError{Kind: usageConnectKind(err)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindStatus, Err: fmt.Errorf("HTTP %d", resp.StatusCode)}
+		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindStatus, Status: resp.StatusCode}
 	}
 	return foldUsageBody(resp.Body, counter)
 }
@@ -207,7 +231,8 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 		if errors.Is(err, bufio.ErrTooLong) {
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
 		}
-		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead, Err: err}
+		// The body's read error can quote a trailer line; the kind is enough.
+		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead}
 	}
 	if sum >= float64(math.MaxInt64) {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
@@ -229,18 +254,12 @@ func usageLineName(line string) string {
 }
 
 // usageSampleValue is the sample of a metric parsed from a single line, which
-// expfmt types as untyped; the typed forms are read too in case a body
-// carries the TYPE line beside it.
+// expfmt types as untyped: the line is parsed alone, never with its TYPE line.
 func usageSampleValue(metric *dto.Metric) (float64, bool) {
-	switch {
-	case metric.Untyped != nil:
-		return metric.Untyped.GetValue(), true
-	case metric.Counter != nil:
-		return metric.Counter.GetValue(), true
-	case metric.Gauge != nil:
-		return metric.Gauge.GetValue(), true
+	if metric.Untyped == nil {
+		return 0, false
 	}
-	return 0, false
+	return metric.Untyped.GetValue(), true
 }
 
 func usageLabelValue(metric *dto.Metric, name string) string {
