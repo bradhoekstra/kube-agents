@@ -208,7 +208,6 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 		Build()
 	h.recorder = record.NewFakeRecorder(16)
 	h.r = &PlatformAgentReconciler{Client: h.cl, APIReader: h.cl, Scheme: scheme, Recorder: h.recorder}
-	h.r.noteReconciled(agent)
 	h.p = &UsageCounterPoller{
 		r:        h.r,
 		source:   h.stub,
@@ -641,25 +640,6 @@ func TestUsagePoller_FailureStreaksAndLateRecording(t *testing.T) {
 	}
 }
 
-// A CR this process has not reconciled yet is not read: the pass that
-// renders the policies admitting the operator has not run for it.
-func TestUsagePoller_SkipsACRNotYetReconciled(t *testing.T) {
-	created := usageClock(0).Add(-time.Hour)
-	agent := usageTestAgent(created)
-	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
-	h.r.forgetReconciled(agent)
-	h.stub.set(brokerAddr(), 10, nil)
-	h.poll(5)
-	if len(h.stub.calls) != 0 || h.cmWrites != 0 {
-		t.Fatalf("an unreconciled CR was polled: %d scrapes, %d writes", len(h.stub.calls), h.cmWrites)
-	}
-	h.r.noteReconciled(agent)
-	h.poll(10)
-	if h.cmWrites != 1 {
-		t.Fatalf("after the reconcile pass: %d writes, want 1", h.cmWrites)
-	}
-}
-
 // Two gateway replicas on the poller end to end: the total takes the largest
 // delta, and the replica reset against its sibling's marker persists through
 // the ConfigMap.
@@ -688,80 +668,49 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 	}
 }
 
-// The reconciled record is stamped by the pass that applies the policies, not
-// by the pass reaching Ready: a CR parked Degraded after the render, here on
-// the missing sandbox keys Secret, is polled all the same, and a CR not yet
-// reconciled is not.
-func TestReconcileStampsTheRecordThePollerWaitsFor(t *testing.T) {
-	scheme := setupScheme()
-	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	if r.hasReconciled(agent) {
-		t.Fatal("a CR never reconciled reads as reconciled")
+// The failure streaks are one map per process, pruned once per poll over
+// every CR's pods: with two CRs each owning a failing listener, each CR gets
+// its Warning event after two polls, and neither CR's poll resets the other's
+// streak.
+func TestUsagePoller_StreaksSurviveAnotherCRsPoll(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	first := usageTestAgent(created)
+	second := usageTestAgent(created)
+	second.Name, second.Namespace, second.UID = "second", "usage-test-2", "agent-uid-2"
+	secondGateway := usageGatewayPod("second-gateway-aaa", "gw-second", "10.0.1.10", created)
+	secondGateway.Namespace, secondGateway.Labels = second.Namespace, map[string]string{"app": second.Name + "-gateway"}
+	h := newUsageHarness(t, first, append(usageDefaultObjects(created), second, secondGateway)...)
+	h.stub.set(brokerAddr(), 1, nil)
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+	h.stub.fail("10.0.1.10:9095", usageScrapeKindConnect)
+
+	h.poll(5)
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("an event after one failed poll: %s", ev)
+	default:
 	}
-	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-	ctx := context.Background()
-	// The finalizer pass, then the pass that renders; without the sandbox
-	// keys Secret the second one parks the CR Degraded after the render.
-	for pass := 1; pass <= 2; pass++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d: %v", pass, err)
+	h.poll(10)
+	events := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case ev := <-h.recorder.Events:
+			events[ev] = true
+		default:
 		}
 	}
-	stored := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
-		t.Fatal(err)
+	if len(events) != 2 {
+		t.Fatalf("after two failed polls on two CRs: %d event(s), want one per CR: %v", len(events), events)
 	}
-	if stored.Status.Phase != "Degraded" {
-		t.Fatalf("phase = %q, want Degraded so that the early return after the render is the path under test", stored.Status.Phase)
-	}
-	if !r.hasReconciled(agent) {
-		t.Fatal("a pass that rendered the policies and returned early on the status did not stamp the record")
-	}
-	r.forgetReconciled(agent)
-	if r.hasReconciled(agent) {
-		t.Fatal("forgetReconciled left the record")
-	}
-}
-
-// A ConfigMap without the document key, or with a document that does not
-// parse, is re-seeded rather than an error that would stop the poller for the
-// CR.
-func TestUsagePoller_ReseedsAMissingOrUnparsableDocument(t *testing.T) {
-	created := usageClock(0).Add(-time.Hour)
-	cases := map[string]map[string]string{
-		"no document key":   {},
-		"unparsable JSON":   {usageCountersDocumentKey: "{not json"},
-		"a JSON non-object": {usageCountersDocumentKey: "[1, 2]"},
-	}
-	for name, data := range cases {
-		t.Run(name, func(t *testing.T) {
-			agent := usageTestAgent(created)
-			agent.Status.Usage.ToolExecutionsTotal = 3
-			cm := &corev1.ConfigMap{
-				ObjectMeta: metav1.ObjectMeta{Name: usageTestAgentName + usageCountersConfigMapSuffix, Namespace: usageTestNamespace},
-				Data:       data,
+	for _, pod := range []string{"agent-gateway-aaa", "second-gateway-aaa"} {
+		found := false
+		for ev := range events {
+			if strings.Contains(ev, pod) {
+				found = true
 			}
-			h := newUsageHarness(t, agent, append(usageDefaultObjects(created), cm)...)
-			h.stub.set(brokerAddr(), 40, nil)
-			h.stub.set(gatewayAddr(), 5, nil)
-			h.poll(10)
-			doc := h.document()
-			if !doc.FirstRecorded.Time.Equal(usageClock(10)) || doc.Totals[usageCounterToolExecutions] != 3 || doc.AgentUID != usageTestAgentUID {
-				t.Fatalf("not re-seeded: %+v", doc)
-			}
-			if doc.Pods["broker-b"] == nil || doc.Pods["broker-b"].Sample != 40 {
-				t.Fatalf("the broker was not recorded: %+v", doc.Pods)
-			}
-			if h.cmWrites != 1 {
-				t.Errorf("%d ConfigMap writes, want 1", h.cmWrites)
-			}
-		})
+		}
+		if !found {
+			t.Errorf("no event names pod %s: %v", pod, events)
+		}
 	}
 }

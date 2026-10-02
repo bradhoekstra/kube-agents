@@ -244,7 +244,12 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		// new process replayed are the ones the sibling supplied.
 		if usageAggregationFor(s.Counter) == usageAggregateMax {
 			if latest, ok := latestSiblingMarker(doc, markers, s.UID, s.Counter); ok && entry.Marker.Before(&latest) {
-				entry.Sample, entry.StartTime, entry.Marker = s.Sample, s.StartTime, latest
+				// The recorded start time stays when the body carries none,
+				// as every other baseline advance keeps it: a reset that
+				// dropped it would hand the next gauge-bearing body the
+				// whole-sample branch.
+				advanceUsageBaseline(entry, s.Sample, s.StartTime)
+				entry.Marker = latest
 				changed = true
 				continue
 			}

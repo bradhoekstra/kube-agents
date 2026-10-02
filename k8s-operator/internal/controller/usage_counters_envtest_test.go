@@ -88,7 +88,6 @@ func newUsageEnvtestHarness(t *testing.T, cfg *rest.Config, scheme *runtime.Sche
 	h.runningPod(usageBrokerPod("broker", "", usageTestBrokerIP, time.Time{}))
 
 	h.r = &PlatformAgentReconciler{Client: h.cl, APIReader: h.cl, Scheme: scheme}
-	h.r.noteReconciled(h.agent)
 	h.p = &UsageCounterPoller{
 		r:        h.r,
 		source:   h.stub,

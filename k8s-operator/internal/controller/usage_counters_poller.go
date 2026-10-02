@@ -42,8 +42,9 @@ const (
 	// already uses for the RBAC re-probe and the pruned-status re-probe, on
 	// the same reasoning that one status write per interval is a cost nobody
 	// notices. The first poll runs one interval after the manager elects this
-	// replica, after the reconcile pass that renders the policies admitting
-	// the operator.
+	// replica, by which time the initial reconcile pass has rendered the
+	// policies admitting the operator; a CR it reaches before that costs one
+	// failed poll, under the streak that records no event.
 	usageCountersPollInterval = 5 * time.Minute
 	// usageCountersConfigMapSuffix names the ConfigMap that holds the
 	// document, in the CR's namespace: <name>-usage-counters.
@@ -137,10 +138,9 @@ func (p *UsageCounterPoller) Start(ctx context.Context) error {
 // one operator replica advances them.
 func (p *UsageCounterPoller) NeedLeaderElection() bool { return true }
 
-// pollOnce runs one poll over every PlatformAgent this process has reconciled
-// since it started. A CR not yet reconciled is skipped rather than scraped:
-// the pass that renders the policies admitting the operator has not run for
-// it, so a refused connection there would be the gap, not a failure.
+// pollOnce runs one poll over every PlatformAgent, then drops the failure
+// streaks of pods that no CR listed, once over all of them: the streak map is
+// per process, not per CR.
 func (p *UsageCounterPoller) pollOnce(ctx context.Context) {
 	log := logf.FromContext(ctx).WithName(usagePollerLogName)
 	var list agentv1alpha1.PlatformAgentList
@@ -150,20 +150,20 @@ func (p *UsageCounterPoller) pollOnce(ctx context.Context) {
 		}
 		return
 	}
+	seen := map[string]bool{}
 	for i := range list.Items {
 		agent := &list.Items[i]
-		if !p.r.hasReconciled(agent) {
-			continue
-		}
-		if err := p.pollAgent(ctx, agent); err != nil && ctx.Err() == nil {
+		if err := p.pollAgent(ctx, agent, seen); err != nil && ctx.Err() == nil {
 			log.Error(err, "usage counters poll failed; the totals are where they were", "platformagent", client.ObjectKeyFromObject(agent).String())
 		}
 	}
+	p.forgetDepartedStreaks(seen)
 }
 
 // pollAgent is one poll of one CR: scrape, fold, write the ConfigMap when the
-// document changed, then project the status when it is behind.
-func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha1.PlatformAgent) error {
+// document changed, then project the status when it is behind. Every pod the
+// CR's selectors list is added to seen, for the streak pruning in pollOnce.
+func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha1.PlatformAgent, seen map[string]bool) error {
 	key := client.ObjectKeyFromObject(cached)
 	log := logf.FromContext(ctx).WithName(usagePollerLogName).WithValues("platformagent", key.String())
 	now := p.now().Truncate(usageDocumentPrecision)
@@ -171,6 +171,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	targets, live, err := p.targets(ctx, cached)
 	if err != nil {
 		return err
+	}
+	for uid := range live {
+		seen[uid] = true
 	}
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	for _, target := range targets {
@@ -189,7 +192,6 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			StartTime: reading.StartTime,
 		})
 	}
-	p.forgetDepartedStreaks(live)
 
 	// Live reads, not the cache: the ConfigMap is the source of truth and the
 	// status its projection, and a cache that handed back either as it was
@@ -508,13 +510,15 @@ func (p *UsageCounterPoller) noteScrapeRecovery(log logr.Logger, target usageTar
 	}
 }
 
-// forgetDepartedStreaks drops the streaks of pods that no longer exist, so the
-// map does not keep an entry per departed pod for the life of the process.
-func (p *UsageCounterPoller) forgetDepartedStreaks(live map[string]bool) {
+// forgetDepartedStreaks drops the streaks of pods outside seen, the pods every
+// CR listed in this poll, so the map does not keep an entry per departed pod
+// for the life of the process. A CR whose pods could not be listed this poll
+// loses its streaks, which costs one more first-failure line, not a count.
+func (p *UsageCounterPoller) forgetDepartedStreaks(seen map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for uid := range p.streaks {
-		if !live[string(uid)] {
+		if !seen[string(uid)] {
 			delete(p.streaks, uid)
 		}
 	}

@@ -1,6 +1,6 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** implemented. The poller shipped in the pull request that followed this document; the facts table below records the tree as it was read on 2026-10-01, before it.
+**Status:** implemented. The facts table below is the tree as read on 2026-10-01, before the poller; the sections after it describe what ships.
 
 ## Summary
 
@@ -54,8 +54,8 @@ These are the facts the design rests on.
 
 A `UsageCounterPoller`, a manager `Runnable` beside the RBAC self-check, with
 `NeedLeaderElection` returning true: the counters are per cluster, so exactly one operator
-replica advances them. After the manager's first reconcile pass over the CRs, so that the
-rules that admit the operator have been rendered before the first scrape, and then every
+replica advances them. One interval after the leader's election, by which time the first
+reconcile pass has rendered the rules that admit the operator, and then every
 `usageCountersPollInterval` (five minutes, the
 interval the controller already uses for the RBAC re-probe and the pruned-status re-probe, on
 the same reasoning: one status write per interval is a cost nobody notices) it lists the
@@ -166,7 +166,7 @@ flags alone. Both install paths therefore set a Downward-API `POD_NAMESPACE` on 
 container, the pattern the operator already renders for its own callout; `main.go` reads it once
 and hands it to the reconciler beside the other render inputs, and the golden tests fix it to a
 constant so the rendered policies stay deterministic. When it is unset, as under `make run` off
-the cluster, the rule is omitted and one start-up line says so; nothing off the cluster could
+the cluster, the rule is omitted, one start-up line says so and the poller is not started; nothing off the cluster could
 reach a pod IP in any case. The label is the one both install paths put on its pod. A
 deployment that relabels the operator pod breaks the scrape and nothing else; the failure
 section says how that shows.
@@ -382,16 +382,18 @@ totals accumulated since the operator was upgraded, not since the last interval,
 the last of them moved. After its own
 patch the poller reads the echo the same way `noteUsageStatusEcho` does: counters it wrote that
 come back absent mean the pruning, recorded in the shared map; counters that come back clear it.
-The echo check moves from a function that knows about `activeInterfaces` to one that takes the
-fields a writer expects to see, and both writers call it.
+The echo check moves from a function that knows about `activeInterfaces` to one that takes
+whether the fields a writer wrote came back, and both writers call it.
 
 ## Failure behaviour
 
 The schema has no field for an error, by design: static enums and integer counts only. An
 install that switched the watcher off is not a failure: the poller reads the same switch the
 reconciler does, scrapes no gateway pod while it is off, and records nothing. The first poll after a start
-waits for the reconcile pass that renders the rules admitting the operator, and a streak
-shorter than two polls records no event, so an upgrade leaves no Warning on a healthy CR.
+runs one interval after election, after the initial reconcile pass has rendered the rules
+admitting the operator; a CR the poll reaches before its rules are applied costs one failed
+poll, and a streak shorter than two polls records no event, so an upgrade leaves no Warning on a
+healthy CR.
 Listeners from a release before this one are not a failure either: the operator moves before the harness on an
 upgrade, and an install can pin the harness image behind the operator, so the first polls after
 an upgrade land on listeners that send no start time; the resets section reads them under the
@@ -504,6 +506,8 @@ them.
 
 ## Testing
 
+What shipped beside the poller, kept as the record of what each test is for.
+
 Unit tests, beside the poller, one per branch of the resets section as it stands, each asserting
 the poll after as well as the poll itself: the difference branch (a known pod, the recorded
 start time, a sample not below the last); the whole-sample branch (a pod created after the document was first recorded; a later start
@@ -559,6 +563,8 @@ produces no status write; and the two policies show the new rule with the operat
 only peer added.
 
 ## Documents the implementation changes
+
+Each of these landed with the poller; the list is the record of where the facts moved.
 
 - The CRD reference's `status.usage` rows for the two counters and `lastActiveTime`, from
   "declared; nothing writes it yet" to what they count and how often they move, including that

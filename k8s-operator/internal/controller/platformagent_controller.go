@@ -359,13 +359,6 @@ type PlatformAgentReconciler struct {
 	// under `make run` off the cluster, renders no such rule.
 	OperatorNamespace string
 
-	// reconciledOnce records the CRs this process has reconciled to the end
-	// of a pass since it started, keyed by ObjectKey. The usage counters
-	// poller reads a CR's listeners only once the pass that renders the
-	// policies admitting the operator has run for it; cleared when the CR is
-	// deleted.
-	reconciledOnce sync.Map
-
 	// otelEndpoint caches the discovered OpenTelemetry collector, cluster-wide — there
 	// is one collector per cluster, not one per agent. Unlike the ImageVolume
 	// capability this expires (otelDiscoveryTTL): a Service can appear or move at any
@@ -752,12 +745,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Both policies admitting the operator on the metrics ports are applied by
-	// here, the broker's with its pod above and the gateway's just now, which
-	// is what the usage counters poller waits for before it reads this CR's
-	// listeners. Stamped here rather than at the end of the pass: the status
-	// branches below return early on a CR that runs all the same.
-	r.noteReconciled(instance)
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1027,7 +1014,6 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 
 		// Resource is deleted. Safe to remove finalizer and update.
 		r.forgetUsageStatus(agent)
-		r.forgetReconciled(agent)
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -3630,21 +3616,6 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 // map does not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
-}
-
-// noteReconciled records that this process has reconciled agent to the end of
-// a pass; hasReconciled reads it, forgetReconciled drops it with the CR.
-func (r *PlatformAgentReconciler) noteReconciled(agent *agentv1alpha1.PlatformAgent) {
-	r.reconciledOnce.Store(client.ObjectKeyFromObject(agent), struct{}{})
-}
-
-func (r *PlatformAgentReconciler) hasReconciled(agent *agentv1alpha1.PlatformAgent) bool {
-	_, ok := r.reconciledOnce.Load(client.ObjectKeyFromObject(agent))
-	return ok
-}
-
-func (r *PlatformAgentReconciler) forgetReconciled(agent *agentv1alpha1.PlatformAgent) {
-	r.reconciledOnce.Delete(client.ObjectKeyFromObject(agent))
 }
 
 // hostPathDroppedConditionCurrent reports whether the VolumesDropped condition
