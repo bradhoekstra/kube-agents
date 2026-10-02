@@ -75,11 +75,14 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    ever raised a warning times the reasons, per family, for the life of the process, so a
    ceiling on the body would be a bound sized against no population, and `expfmt`
    materialises every family of whatever it is handed. The reader scans the body line by
-   line, keeps only the lines of the two families the design wants, bounded at
-   `usageScrapeMaxLineBytes` per line and `usageScrapeMaxSeries` lines per family, and parses
-   that subset; a line or a family past its bound is a failed scrape, and every other line is
-   skipped unread, so the operator's memory per poll is bounded by what it keeps and not by
-   what the listener serves. The port is held by a listener in a pod that runs other
+   line and keeps none of it: a line of the two families the design wants, or of the start-time
+   gauge, is parsed on its own with `expfmt` and its sample folded into the running per-pod
+   sum as it is read, and every other line is skipped unread. The one bound is
+   `usageScrapeMaxLineBytes` per line, and a line past it is a failed scrape; a bound on the
+   number of lines would be a bound on the kept family's cardinality, which is the product the
+   sentence above says cannot be sized, and a fleet that crossed it would freeze the counter
+   until the watcher restarted. Memory per poll is one line whatever the fleet's cardinality,
+   so no honest fleet size is a failed scrape. The port is held by a listener in a pod that runs other
    containers, so what answers is input, not the operator's own data. The client follows no redirect (`CheckRedirect` returns
    `http.ErrUseLastResponse`), runs on a transport with no proxy, since a pod-network scrape
    never has one and the Go default would send the GET to an `HTTP_PROXY` the operator's
@@ -87,7 +90,7 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    the port cannot send the operator's GET, made from a network position the pod's own egress
    policy does not have, anywhere else. Selecting the port by its name means a renumbering in
    the manifests moves the scrape with it;
-3. parses the kept lines with `expfmt`, sums the series it wants over every label set (the next
+3. sums the series it wants over every label set as the lines are folded (the next
    section says which), and takes one sample per pod per counter. A sample that is negative or
    not finite is a failed scrape for that pod: it contributes nothing, and the log line names the
    pod. What a body may add to a total in one poll is bounded in the resets section, and that
@@ -233,8 +236,8 @@ each pod it scraped:
   nothing after it, and a pod the ConfigMap has never seen is always recorded, whatever its
   sample, rather than refused on every poll until it restarts;
 - nothing, when the scrape produced no body to read: a connection that failed, a status other
-  than 200, a line or a family past its bound, kept lines `expfmt` could not parse, or a sample
-  that is negative or not finite. Only then is the baseline entry kept; a body that parsed and was
+  than 200, a line past its bound or one of the wanted families `expfmt` could not parse, or a
+  sample that is negative or not finite. Only then is the baseline entry kept; a body that parsed and was
   refused advances it, as the branches above say, which is the line between a scrape that said
   nothing and one that said something the poller will not count. The document records no
   "missed", only the marker, and a quiet pod and a missed one look the same in it; so the rule
@@ -394,8 +397,8 @@ upgrade, and an install can pin the harness image behind the operator, so the fi
 an upgrade land on listeners that send no start time; the resets section reads them under the
 rule without it, bounded all the same, rather than refusing them, and the stricter rule applies
 from the first body that carries the gauge. A scrape that
-fails, which includes a line or a family past its bound and a sample outside its bounds, leaves
-the pod's baseline untouched and the totals where they were. The
+fails, which includes a line past its bound and a sample outside its bounds, leaves the pod's
+baseline untouched and the totals where they were. The
 operator log carries one line when an endpoint first fails and one when it recovers, naming
 the pod and the error type, never the body. The visible symptom of a standing failure, a
 NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener that moved, a
@@ -429,8 +432,8 @@ of any kind is involved; both listeners are unauthenticated by design, as they a
 collector, and for the same reason the operator treats what it reads as untrusted. The gateway
 pod shares its network namespace across the agent container, the sidecar and any container
 `spec.deployment.sidecars` adds, and the watcher's port is free whenever its process is down, so
-a body on either port can come from something other than the two listeners. The per-line and
-per-family bounds keep the operator's memory per poll under its 128Mi limit whatever the
+a body on either port can come from something other than the two listeners. Folding each line as
+it is read keeps the operator's memory per poll at one line, under its 128Mi limit whatever the
 fleet's exposition grows to, and the per-poll ceiling bounds what one body can do to a total; neither makes the body more trusted. What is left is stated
 rather than hidden: a workload in the pod can refuse the operator a count, can raise one by at
 most `usageDeltaCeiling` per poll for as long as it holds the port, and can never set one. At
@@ -518,9 +521,10 @@ refused the same way); the per-poll ceiling on both adding branches (an honest b
 costs that interval and the next poll's delta is the new interval alone; a gap of several polls
 whose delta passes one ceiling is refused whole, the baseline advanced, that gap's count lost
 once); the scrapes that produce no body (a connection
-that failed, a 3xx answer, a line past its bound, a family past its series bound, kept lines
-`expfmt` cannot parse, a sample that is negative or not finite), each keeping the baseline and
-nothing more, and a fleet-sized body of other families skipped unread within the memory bound; a pod missing this
+that failed, a 3xx answer, a line past its bound, a wanted line `expfmt` cannot parse, a sample
+that is negative or not finite), each keeping the baseline and nothing more; a fleet-sized body
+of the wanted family and of other families alike, summed correctly within a memory bound of one
+line; a pod missing this
 poll and back in the next, with and without a second gateway pod counted in between, asserting
 that the reset pod takes the sibling's marker and the sibling's next lone advance is counted;
 a partial straddle, both replicas moving by different amounts and the lagger catching up alone
