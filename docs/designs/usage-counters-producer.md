@@ -264,9 +264,11 @@ each pod it scraped:
   sources section: a replica's events that its sibling did not inject are lost whenever it was
   quiet, or missed, for a poll in which the sibling moved; and a replica reset in a poll in
   which its sibling was taken keeps the sibling's marker as it was read, one poll behind, until
-  it advances in a poll the sibling does not, so its events in a poll the sibling was missed or
-  terminating are lost too. A reset that took the sibling's marker after the poll would close
-  that loss and open an over-count instead, a replica trailing its sibling by one poll having
+  it advances in a poll the sibling does not, so its events in a poll the sibling was missed are
+  lost too. A terminating pod is never read again, so it is not live: its entry is dropped and
+  its marker suppresses no sibling, which is what keeps a rollout from losing the new replica's
+  intervals. A reset that took the sibling's marker after the poll would close the missed-sibling
+  loss as well and open an over-count instead, a replica trailing its sibling by one poll having
   its catch-up counted whenever the sibling is quiet, and the under-count is the one preferred.
 
 Entries for pods that no longer exist are dropped when the baseline is next written; their
