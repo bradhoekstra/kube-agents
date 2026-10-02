@@ -721,10 +721,13 @@ the operator, on the leader and off the reconcile path: every five minutes it re
 broker's and the event watcher's metrics listeners over the pod network, folds the two series into
 totals it keeps with their per-pod baseline in the `<name>-usage-counters` ConfigMap, so the counters
 stay monotonic across pod, process and operator restarts, and patches the status only when it is
-behind. They under-count rather than over-count: a listener that cannot be read, a burst past the
-per-poll ceiling, or an operator outage costs the interval's count once. A `lastActiveTime` that stops
-advancing while commands plainly run is the symptom of a listener the operator cannot reach; the CR's
-events name the pod. The other three counters stay absent until a series exists for each.
+behind. They under-count rather than over-count: a listener that cannot be read keeps its baseline
+and its backlog is added when it is read again, but a backlog past the per-poll ceiling, an honest
+burst past it, or what a process counted after its last read and before it restarted, is lost once.
+A `lastActiveTime` that stops advancing while commands plainly run is the symptom of a listener the
+operator cannot reach; the CR's events name the pod. The other three counters stay absent until a
+series exists for each
+([what lands them](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md#what-stays-unwritten-and-what-lands-it)).
 
 `usage.activeInterfaces` is `dashboard` unless `harness.hermes.dashboardEnabled` is `false`, plus
 `googlechat`, `slack` and `teams` for each `integration` entry with `enabled: true`. It is resolved
@@ -735,8 +738,12 @@ write; the operator notices from the write's echo, stops treating the missing fi
 five minutes at a time, and lands it once this release's CRD is applied: within five minutes on a
 quiet install, at once when the Ready status update next writes for any other reason. The other
 status writers carry the field through as they read it, so a pass that ends `Degraded` lands
-nothing new. The counters and `usage.lastActiveTime` are declared in the schema and absent from
-every status until something writes them.
+nothing new. `usage.sessionsTotal`, `usage.remediationsProposedTotal` and
+`usage.remediationsAppliedTotal` are declared in the schema and absent from every status until a
+series exists for each. The two counters the operator does write, and `usage.lastActiveTime`, land
+through the poller above, which consults the same five-minute record: under a served CRD that
+predates `status.usage` they accumulate in the `<name>-usage-counters` ConfigMap and land with the
+first patch after this release's CRD is applied.
 
 These condition types appear in `conditions`; only `Ready` is always present:
 

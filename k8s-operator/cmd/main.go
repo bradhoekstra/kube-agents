@@ -277,8 +277,10 @@ func main() {
 
 	// The namespace this pod runs in, for the NetworkPolicy rule that admits
 	// the operator to the gateway's and broker's metrics ports. Both install
-	// paths set it from the Downward API; off the cluster it is unset, the
-	// rule is not rendered, and the usage counters stay where they are.
+	// paths set it from the Downward API; off the cluster, under `make run`,
+	// it is unset, the rule is not rendered, and the poller is not started:
+	// no pod IP is reachable from there, and a poller that ran anyway would
+	// record a Warning on every CR blaming a NetworkPolicy for the gap.
 	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
 	if operatorNamespace == "" {
 		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
@@ -304,9 +306,11 @@ func main() {
 	// status.usage's counters, read from the agent pods' metrics listeners on
 	// the leader, off the reconcile path; see
 	// internal/controller/usage_counters_poller.go.
-	if err := mgr.Add(controller.NewUsageCounterPoller(reconciler)); err != nil {
-		setupLog.Error(err, "Failed to add the usage counters poller to the manager")
-		os.Exit(1)
+	if operatorNamespace != "" {
+		if err := mgr.Add(controller.NewUsageCounterPoller(reconciler)); err != nil {
+			setupLog.Error(err, "Failed to add the usage counters poller to the manager")
+			os.Exit(1)
+		}
 	}
 
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
