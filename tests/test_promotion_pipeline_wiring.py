@@ -854,7 +854,7 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
         next major that drops it would break every mint at once. The permissions
         guard above matches either key so that a step reintroduced with `app-id` is
         still checked; this is the test that says it must not be reintroduced."""
-        for path in sorted(_WORKFLOWS.glob("*.yml")):
+        for path in sorted(p for glob in ("*.yml", "*.yaml") for p in _WORKFLOWS.glob(glob)):
             with self.subTest(workflow=path.name):
                 doc = _doc(path)
                 offenders = [
