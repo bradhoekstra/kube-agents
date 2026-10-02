@@ -547,12 +547,13 @@ the ConfigMap's document and returns the next document, so none of these needs a
 
 An envtest, beside the existing `usage_status_envtest_test.go`: a `PlatformAgent` served by
 this release's CRD receives one patch per poll in which a stub source moves and none in which
-it does not; a ConfigMap written with the non-controller owner reference enqueues no reconcile;
-a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
+it does not; a status left behind the ConfigMap (the crash between the two writes, staged by hand) is
 repaired by the next poll without the totals moving and with `lastActiveTime` set to the time
 the ConfigMap recorded, not the repair's; under the CRD without `status.usage`, the
-poller writes the status once per `usageStatusReprobeInterval`, shares the pruning record with
-the Ready writer, and keeps the ConfigMap current throughout.
+poller writes the status once while the pruning record is fresh and once more when it has
+expired, shares that record with the Ready writer, and keeps the ConfigMap current throughout.
+That a ConfigMap written with the non-controller owner reference enqueues no reconcile is a
+unit test against the owner handler `Owns` uses, which needs no API server.
 
 A live check, which is the acceptance criterion: on an install built from the branch,
 `toolExecutionsTotal` rises after commands run from the sandbox and `eventsIngestedTotal` after

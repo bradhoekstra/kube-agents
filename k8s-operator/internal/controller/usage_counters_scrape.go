@@ -298,11 +298,19 @@ func usageLabelValue(metric *dto.Metric, name string) string {
 
 // usageScrapeDetail is what a failed scrape is logged and recorded as: the
 // scrape error's closed vocabulary, or usageScrapeKindOther for an error of
-// another type.
+// another type. usageScrapeKindOf is the kind alone.
 func usageScrapeDetail(err error) string {
 	var scrape *usageScrapeError
 	if errors.As(err, &scrape) {
 		return scrape.Error()
+	}
+	return usageScrapeKindOther
+}
+
+func usageScrapeKindOf(err error) string {
+	var scrape *usageScrapeError
+	if errors.As(err, &scrape) {
+		return scrape.Kind
 	}
 	return usageScrapeKindOther
 }

@@ -138,12 +138,12 @@ type usageSeed struct {
 	LastMoved *metav1.Time
 }
 
-// usageFoldResult is a poll's outcome: the document to keep, whether it
-// differs from the one read, and whether a total advanced.
+// usageFoldResult is a poll's outcome: the document to keep and whether it
+// differs from the one read. Whether a total advanced is the document's
+// LastMoved, stamped with the poll that moved it.
 type usageFoldResult struct {
 	Document *usageDocument
 	Changed  bool
-	Moved    bool
 }
 
 // usageCandidate is a pod whose body adds under the rules, waiting on the
@@ -219,6 +219,17 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			entry = &usagePodEntry{Name: s.Name, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[s.UID] = entry
 			changed = true
+			// A new replica whose live sibling was counted after it started
+			// is the one pod the whole-sample rule does not fit: the sibling
+			// supplied the events this pod injected in the meantime. It is
+			// recorded at its sample with the sibling's marker and adds
+			// nothing, as a known replica behind its sibling would be.
+			if usageAggregationFor(s.Counter) == usageAggregateMax {
+				if latest, ok := latestSiblingMarker(doc, markers, s.UID, s.Counter); ok && latest.Time.After(s.Created) {
+					entry.Marker = latest
+					continue
+				}
+			}
 			if s.Created.After(doc.FirstRecorded.Time) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
@@ -318,7 +329,7 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		doc.LastMoved = &stamp
 		changed = true
 	}
-	return usageFoldResult{Document: doc, Changed: changed, Moved: moved}
+	return usageFoldResult{Document: doc, Changed: changed}
 }
 
 // usageBodyAdvanced reports whether a body says anything the entry does not:
