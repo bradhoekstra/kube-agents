@@ -58,7 +58,7 @@ import (
 // credentialProxyContainerName is the broker container, the one that opens the
 // credentialed and the metrics-only listeners; the usage counters poller reads
 // the metrics port off this container and no other.
-const credentialProxyContainerName = "envoy-credential-proxy"
+const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
 
 const (
 	// Where the federated token and the ADC config derived from it live. Both
