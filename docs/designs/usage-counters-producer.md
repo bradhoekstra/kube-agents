@@ -1,12 +1,12 @@
 # Producing the PlatformAgent Usage Counters
 
-**Status:** design; the poller is not implemented yet.
+**Status:** implemented. The poller shipped in the pull request that followed this document; the facts table below records the tree as it was read on 2026-10-01, before it.
 
 ## Summary
 
 `PlatformAgent.status.usage` declares cumulative counters, `sessionsTotal`, `eventsIngestedTotal`,
 `toolExecutionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal`, and a
-`lastActiveTime`, and nothing writes them. The schema shipped that way on purpose: the agent's
+`lastActiveTime`, and until the poller this document describes nothing wrote them. The schema shipped that way on purpose: the agent's
 ServiceAccount holds no write verb on the status, and the operator, which does, saw no session,
 event or tool call. Two of the counters now have an in-cluster source. The credential broker
 serves `kubeagents_tool_invocations_total` on its metrics-only listener, and the event watcher
@@ -154,13 +154,13 @@ rule.
 
 ## Reach: how the operator gets to the endpoints
 
-The scrape is a direct read of the pod IP, and today the two policies admit the metrics ports
-from the collector's namespace alone. The implementation adds one ingress rule to each policy,
+The scrape is a direct read of the pod IP, and before the poller the two policies admitted the
+metrics ports from the collector's namespace alone. The implementation adds one ingress rule to each policy,
 the same shape as the collector's rule beside it: the operator's namespace by its
 `kubernetes.io/metadata.name` label, and within it pods with
 `app.kubernetes.io/name: kube-agents-operator`, on the metrics port only. The operator renders
-these policies, so it can write the rule once it is told its own namespace, which today it is
-not: the namespace-file read in `main.go` serves image discovery, runs only when the chart has
+these policies, so it can write the rule once it is told its own namespace, which until the
+poller it was not: the namespace-file read in `main.go` serves image discovery, runs only when the chart has
 not set `OPERATOR_IMAGE`, and keeps nothing, and the renderers take the CR and the start-up
 flags alone. Both install paths therefore set a Downward-API `POD_NAMESPACE` on the manager
 container, the pattern the operator already renders for its own callout; `main.go` reads it once
@@ -179,8 +179,8 @@ nothing secret, but the broker's metrics listener was admitted past the broker's
 reachable-off-pod refusal on the argument that it serves counters to a collector; a pod
 selector keeps that argument true.
 
-Two documents state the current peer set as a security property rather than as a description:
-`docs/security-requirements.md` and `docs/credential-isolation-design.md` both say the broker
+Two documents stated the pre-poller peer set as a security property rather than as a description:
+`docs/security-requirements.md` and `docs/credential-isolation-design.md` both said the broker
 opens 8766 to the collector's namespace and to no other peer. The rule here adds one peer, and
 the implementation rewrites those sentences to say so, with the pod selector as the reason the
 property holds in substance: the listener reaches the collector and the operator, both readers
@@ -448,8 +448,9 @@ namespace, and above one replica the agent's Role holds `get` and `patch` on eve
 because RBAC cannot say "only your own pod"; so on an HA chart install anything running as the
 agent's ServiceAccount can put the operator's label on a pod of its choosing, the sandbox
 included, and that pod is then admitted to both metrics ports. What it gains is the two
-listeners' counters, which the agent container already reads over its own pod's loopback, and
-the same grant already lets it swap a sibling's image, so the selector argument above holds in
+listeners' counters: the watcher's, which the agent container already reaches over its own pod's
+loopback, and the broker's, to which it has no route today, integers under closed label
+vocabularies; and the same grant already lets it swap a sibling's image, so the selector argument above holds in
 full on the single-replica default and in substance above it; the pages the implementation
 rewrites say so rather than "nothing else".
 
