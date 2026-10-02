@@ -687,3 +687,45 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 		t.Fatalf("the reset replica did not take the sibling's marker: %+v", doc.Pods["gw-b"])
 	}
 }
+
+// The reconciled record is stamped by the pass that applies the policies, not
+// by the pass reaching Ready: a CR parked Degraded after the render, here on
+// the missing sandbox keys Secret, is polled all the same, and a CR not yet
+// reconciled is not.
+func TestReconcileStampsTheRecordThePollerWaitsFor(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	if r.hasReconciled(agent) {
+		t.Fatal("a CR never reconciled reads as reconciled")
+	}
+	req := reconcile.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+	// The finalizer pass, then the pass that renders; without the sandbox
+	// keys Secret the second one parks the CR Degraded after the render.
+	for pass := 1; pass <= 2; pass++ {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", pass, err)
+		}
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status.Phase != "Degraded" {
+		t.Fatalf("phase = %q, want Degraded so that the early return after the render is the path under test", stored.Status.Phase)
+	}
+	if !r.hasReconciled(agent) {
+		t.Fatal("a pass that rendered the policies and returned early on the status did not stamp the record")
+	}
+	r.forgetReconciled(agent)
+	if r.hasReconciled(agent) {
+		t.Fatal("forgetReconciled left the record")
+	}
+}

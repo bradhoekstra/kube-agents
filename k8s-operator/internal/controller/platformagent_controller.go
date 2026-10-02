@@ -806,6 +806,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
+	// Both policies admitting the operator on the metrics ports are applied by
+	// here, the broker's with its pod above and the gateway's just now, which
+	// is what the usage counters poller waits for before it reads this CR's
+	// listeners. Stamped here rather than at the end of the pass: the status
+	// branches below return early on a CR that runs all the same.
+	r.noteReconciled(instance)
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -932,11 +938,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
 	// which triggers no reconcile of its own, so poll while the condition
 	// stands rather than leave it until an unrelated event (rbac_selfcheck.go).
-	// Every object the pass renders, the policies admitting the operator on
-	// the metrics ports included, has been applied by here, which is what the
-	// usage counters poller waits for before it reads this CR's listeners.
-	r.noteReconciled(instance)
-
 	if rbacDegraded {
 		return ctrl.Result{RequeueAfter: rbacReprobeInterval}, nil
 	}

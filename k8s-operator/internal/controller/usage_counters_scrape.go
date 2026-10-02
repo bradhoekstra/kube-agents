@@ -49,7 +49,13 @@ const (
 	// usageScrapeLineBuffer is the scanner's initial buffer, grown up to the
 	// line bound as needed.
 	usageScrapeLineBuffer = 4 * 1024
-	usageMetricsPath      = "/metrics"
+	// usageScrapeMaxHeaderBytes bounds the response headers the transport
+	// buffers before the body is read, for the same reason the body is read
+	// a line at a time: what answers on the port is input, and Go's default
+	// would hold ten mebibytes of headers from it.
+	usageScrapeMaxHeaderBytes = 16 * 1024
+	usageMetricsPath          = "/metrics"
+	usageScrapeScheme         = "http://"
 
 	// The series the poller reads, and the gauge both listeners export so that
 	// a restart is seen whatever the sample did.
@@ -69,6 +75,9 @@ const (
 	usageScrapeKindLine    = "line too long"
 	usageScrapeKindParse   = "unparsable line"
 	usageScrapeKindSample  = "sample out of range"
+	// usageScrapeKindOther is the kind for an error that is not a
+	// usageScrapeError, which the pod source never returns and a stub might.
+	usageScrapeKindOther = "error"
 )
 
 var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
@@ -123,9 +132,10 @@ func newPodUsageSource() *podUsageSource {
 		// No proxy: a pod-network scrape never has one, and the default
 		// transport would send the GET to an HTTP_PROXY the operator's
 		// environment sets.
-		Proxy:             nil,
-		DialContext:       (&net.Dialer{Timeout: usageScrapeTimeout}).DialContext,
-		DisableKeepAlives: true,
+		Proxy:                  nil,
+		DialContext:            (&net.Dialer{Timeout: usageScrapeTimeout}).DialContext,
+		DisableKeepAlives:      true,
+		MaxResponseHeaderBytes: usageScrapeMaxHeaderBytes,
 	}
 	return &podUsageSource{client: &http.Client{
 		Timeout:   usageScrapeTimeout,
@@ -140,7 +150,7 @@ func newPodUsageSource() *podUsageSource {
 // Scrape GETs the listener at addr and folds the body for counter. Any status
 // other than 200 is a failed scrape.
 func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usageReading, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+usageMetricsPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageScrapeScheme+addr+usageMetricsPath, nil)
 	if err != nil {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect, Err: err}
 	}
@@ -248,5 +258,5 @@ func usageErrorKind(err error) string {
 	if errors.As(err, &scrape) {
 		return scrape.Kind
 	}
-	return "error"
+	return usageScrapeKindOther
 }

@@ -168,12 +168,10 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		})
 	}
 	t.Run("a connection that failed", func(t *testing.T) {
-		addr := serveBody(t, http.StatusOK, "")
-		// Close the server so the port refuses.
-		srvAddr := addr
+		// Port 1 has no listener, so the connection is refused.
 		_, err := newPodUsageSource().Scrape(context.Background(), "127.0.0.1:1", usageCounterEventsIngested)
 		if err == nil || scrapeKind(t, err) != usageScrapeKindConnect {
-			t.Errorf("a refused connection: %v, want kind %q (server was %s)", err, usageScrapeKindConnect, srvAddr)
+			t.Errorf("a refused connection: %v, want kind %q", err, usageScrapeKindConnect)
 		}
 	})
 }
