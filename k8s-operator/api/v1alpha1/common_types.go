@@ -1821,10 +1821,11 @@ type AgentUsageStatus struct {
 	EventsIngestedTotal int64 `json:"eventsIngestedTotal,omitempty"`
 
 	// ToolExecutionsTotal is the cumulative count of CLI and diagnostic tool
-	// invocations the credential broker ran to an exit, successful or not.
+	// invocations the credential broker ran, successful or not, plus requests
+	// it rejected or failed on before running: its success and error outcomes.
 	// Read from the broker's kubeagents_tool_invocations_total every five
-	// minutes and kept monotonic the same way; refused and abandoned commands
-	// are not counted.
+	// minutes and kept monotonic the same way; commands refused by policy,
+	// busy and abandoned are not counted.
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 

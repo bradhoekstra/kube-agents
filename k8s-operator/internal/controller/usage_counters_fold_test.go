@@ -631,3 +631,33 @@ func TestAddUsageTotal_RefusesPastTheCeiling(t *testing.T) {
 		t.Fatal("a zero delta counted as an add")
 	}
 }
+
+// A replica reset against its sibling's marker by a body without the gauge
+// keeps its recorded start time, so the listener's next body, carrying the
+// gauge and an unchanged sample, adds nothing rather than its whole sample.
+func TestFoldUsage_AResetByAGaugelessBodyKeepsTheStartTime(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	doc := foldDoc(first,
+		foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), foldClock(5)),
+		foldEntry(foldPodB, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, nil),
+		}, want: 0},
+	})
+	if b := doc.Pods[foldPodB]; b.StartTime == nil || *b.StartTime != 1 || !b.Marker.Time.Equal(foldClock(5)) {
+		t.Fatalf("B after the reset: %+v, want the start time kept and A's marker", b)
+	}
+	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 15, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+		}, want: 0},
+		{minute: 20, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, 103, ptr.To(1.0)),
+		}, want: 3, moved: true},
+	})
+}
