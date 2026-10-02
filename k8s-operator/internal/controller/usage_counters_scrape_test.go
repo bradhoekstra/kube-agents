@@ -151,7 +151,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		body   string
 		kind   string
 	}{
-		{"a redirect", http.StatusFound, "", usageScrapeKindStatus},
+		{"a 302 answer, which the client does not follow (TestPodUsageSource_DoesNotFollowRedirects covers the guard)", http.StatusFound, "", usageScrapeKindStatus},
 		{"a server error", http.StatusInternalServerError, "", usageScrapeKindStatus},
 		{"a line past the bound", http.StatusOK, longLine, usageScrapeKindLine},
 		{"a wanted line that does not parse", http.StatusOK, eventsInjectedSeries + `{cluster="c"} not-a-number` + "\n", usageScrapeKindParse},

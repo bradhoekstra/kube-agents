@@ -83,10 +83,9 @@ const (
 // objects it writes: the ConfigMap that holds the document, first, and the
 // status, after it and only when it is behind.
 type UsageCounterPoller struct {
-	r        *PlatformAgentReconciler
-	source   usageSource
-	interval time.Duration
-	now      func() time.Time
+	r      *PlatformAgentReconciler
+	source usageSource
+	now    func() time.Time
 
 	// streaks is the in-memory failure record per pod, for the one log line
 	// when a listener first fails, the one when it recovers, and the Warning
@@ -114,18 +113,17 @@ type usageTarget struct {
 // the pods' listeners over the pod network.
 func NewUsageCounterPoller(r *PlatformAgentReconciler) *UsageCounterPoller {
 	return &UsageCounterPoller{
-		r:        r,
-		source:   newPodUsageSource(),
-		interval: usageCountersPollInterval,
-		now:      time.Now,
-		streaks:  map[types.UID]*usageScrapeStreak{},
+		r:       r,
+		source:  newPodUsageSource(),
+		now:     time.Now,
+		streaks: map[types.UID]*usageScrapeStreak{},
 	}
 }
 
 // Start polls every interval until ctx is cancelled. It satisfies
 // manager.Runnable; main.go adds the poller to the manager.
 func (p *UsageCounterPoller) Start(ctx context.Context) error {
-	ticker := time.NewTicker(p.interval)
+	ticker := time.NewTicker(usageCountersPollInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -239,13 +237,14 @@ func (p *UsageCounterPoller) reader() client.Reader {
 // install's choice.
 func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]usageTarget, map[string]bool, error) {
 	groups := []struct {
-		selector map[string]string
-		counter  string
-		port     string
-		read     bool
+		selector  map[string]string
+		counter   string
+		container string
+		port      string
+		read      bool
 	}{
-		{gatewayPodSelector(agent), usageCounterEventsIngested, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
-		{credentialProxySelector(agent), usageCounterToolExecutions, credentialProxyMetricsPortName, true},
+		{gatewayPodSelector(agent), usageCounterEventsIngested, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
+		{credentialProxySelector(agent), usageCounterToolExecutions, credentialProxyContainerName, credentialProxyMetricsPortName, true},
 	}
 	live := map[string]bool{}
 	var targets []usageTarget
@@ -260,7 +259,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 			if !group.read || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !pod.DeletionTimestamp.IsZero() {
 				continue
 			}
-			port, ok := usagePodPort(pod, group.port)
+			port, ok := usagePodPort(pod, group.container, group.port)
 			if !ok {
 				continue
 			}
@@ -282,22 +281,30 @@ func gatewayPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
 	return map[string]string{"app": agent.Name + gatewayAppSuffix}
 }
 
-// usagePodPort finds the container port named name on pod, looking through
-// the init containers as well as the containers because the watcher's sidecar
-// is a native one, an initContainers entry with restartPolicy Always.
-func usagePodPort(pod *corev1.Pod, name string) (int32, bool) {
-	for _, container := range pod.Spec.InitContainers {
-		for _, port := range container.Ports {
-			if port.Name == name {
-				return port.ContainerPort, true
-			}
+// usagePodPort finds the port named name on the container named container,
+// looking through the init containers as well as the containers because the
+// watcher's sidecar is a native one, an initContainers entry with
+// restartPolicy Always. The container is matched too: a CR's own init
+// container or sidecar may name a port the same, and the port a CR author
+// declares is not the listener's.
+func usagePodPort(pod *corev1.Pod, container, name string) (int32, bool) {
+	for _, candidate := range pod.Spec.InitContainers {
+		if candidate.Name == container {
+			return containerPortNamed(candidate, name)
 		}
 	}
-	for _, container := range pod.Spec.Containers {
-		for _, port := range container.Ports {
-			if port.Name == name {
-				return port.ContainerPort, true
-			}
+	for _, candidate := range pod.Spec.Containers {
+		if candidate.Name == container {
+			return containerPortNamed(candidate, name)
+		}
+	}
+	return 0, false
+}
+
+func containerPortNamed(container corev1.Container, name string) (int32, bool) {
+	for _, port := range container.Ports {
+		if port.Name == name {
+			return port.ContainerPort, true
 		}
 	}
 	return 0, false
@@ -431,12 +438,7 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 	if existing != nil {
 		cm = existing.DeepCopy()
 	}
-	if cm.Labels == nil {
-		cm.Labels = map[string]string{}
-	}
-	for k, v := range commonLabels(agent) {
-		cm.Labels[k] = v
-	}
+	withCommonLabels(cm, agent)
 	if err := controllerutil.SetOwnerReference(agent, cm, p.r.Scheme); err != nil {
 		return fmt.Errorf("setting the owner reference on the usage counters ConfigMap: %w", err)
 	}

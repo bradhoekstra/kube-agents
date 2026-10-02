@@ -790,11 +790,73 @@ func TestFoldUsage_ANewReplicaReadLateIsRecordedWithoutAdding(t *testing.T) {
 	if c := doc.Pods[foldPodB]; c == nil || c.Sample != 12 || !c.Marker.Time.Equal(foldClock(5)) {
 		t.Fatalf("C after its first read: %+v, want recorded at 12 with A's marker from poll 5", c)
 	}
-	// From here both replicas tie and both markers move.
-	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+	// C took A's marker as read (5) while A moved to 10, so C is one behind:
+	// in the next poll both advance, C is reset against A's 10 and A alone is
+	// taken; C levels in a poll in which it advances and A does not. The
+	// design's resets section names this as the under-count it prefers.
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
 		{minute: 15, scraped: []usageScrapedPod{
 			scrapedPod(foldPodA, usageCounterEventsIngested, created, 118, ptr.To(1.0)),
 			scrapedPod(foldPodB, usageCounterEventsIngested, foldClock(3), 15, ptr.To(9.0)),
 		}, want: 18, moved: true},
 	})
+	if a, c := doc.Pods[foldPodA], doc.Pods[foldPodB]; !a.Marker.Time.Equal(foldClock(15)) || !c.Marker.Time.Equal(foldClock(10)) {
+		t.Fatalf("after poll 15: A %v C %v, want A taken (15) and C reset to A's as-read marker (10)", a.Marker, c.Marker)
+	}
+	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		// C advances alone: reset once more, level with A from here.
+		{minute: 20, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 118, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, foldClock(3), 17, ptr.To(9.0)),
+		}, want: 18},
+		{minute: 25, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 118, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, foldClock(3), 20, ptr.To(9.0)),
+		}, want: 21, moved: true},
+	})
+}
+
+// Three replicas: a replica behind the newest sibling marker is reset against
+// the latest marker, not the first the map yields, and takes that marker;
+// one level with the latest is counted.
+func TestFoldUsage_ThreeReplicasResetAgainstTheLatestMarker(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	const podC = "gateway-c"
+	for round := 0; round < 5; round++ { // map order varies; the answer must not
+		doc := foldDoc(first,
+			foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), foldClock(10)),
+			foldEntry(foldPodB, usageCounterEventsIngested, 100, ptr.To(1.0), foldClock(5)),
+			foldEntry(podC, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+		doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+			// C advances alone: behind both, reset against A's 10.
+			{minute: 15, scraped: []usageScrapedPod{
+				scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+				scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+				scrapedPod(podC, usageCounterEventsIngested, created, 104, ptr.To(1.0)),
+			}, want: 0},
+		})
+		if c := doc.Pods[podC]; !c.Marker.Time.Equal(foldClock(10)) || c.Sample != 104 {
+			t.Fatalf("round %d: C after the reset: %+v, want A's marker (10) and sample 104", round, c)
+		}
+		// B, behind A's 10 and ahead of C's old marker, is reset against the latest too.
+		doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+			{minute: 20, scraped: []usageScrapedPod{
+				scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+				scrapedPod(foldPodB, usageCounterEventsIngested, created, 103, ptr.To(1.0)),
+				scrapedPod(podC, usageCounterEventsIngested, created, 104, ptr.To(1.0)),
+			}, want: 0},
+		})
+		if b := doc.Pods[foldPodB]; !b.Marker.Time.Equal(foldClock(10)) {
+			t.Fatalf("round %d: B after the reset: %+v, want A's marker (10)", round, b)
+		}
+		// All level: a lone advance is counted.
+		runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+			{minute: 25, scraped: []usageScrapedPod{
+				scrapedPod(foldPodA, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
+				scrapedPod(foldPodB, usageCounterEventsIngested, created, 103, ptr.To(1.0)),
+				scrapedPod(podC, usageCounterEventsIngested, created, 106, ptr.To(1.0)),
+			}, want: 2, moved: true},
+		})
+	}
 }
