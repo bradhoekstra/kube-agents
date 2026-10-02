@@ -156,7 +156,8 @@ type usageCandidate struct {
 }
 
 // foldUsage folds one poll's samples into doc under the design's resets rules
-// and returns the next document. A nil doc is a poll with no usable document:
+// and returns the next document. doc, when not nil, has passed
+// usageDocumentInvalid, so its maps exist. A nil doc is a poll with no usable document:
 // every scraped pod is recorded at its sample, nothing is added, and the totals
 // come from seed. live is every pod that exists, scraped or not; entries for
 // pods outside it are dropped, their counts already in the totals. now is the
@@ -192,14 +193,6 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 	}
 
 	changed := false
-	if doc.Totals == nil {
-		doc.Totals = map[string]int64{}
-		changed = true
-	}
-	if doc.Pods == nil {
-		doc.Pods = map[string]*usagePodEntry{}
-		changed = true
-	}
 	for uid := range doc.Pods {
 		if !live[uid] {
 			delete(doc.Pods, uid)
@@ -237,12 +230,15 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		}
 
 		// A replica behind a live sibling's marker was quiet, or missed, for
-		// a poll in which the sibling was counted, so what it now presents is
-		// what the sibling already supplied: reset to its body, take the
-		// sibling's marker, add nothing. Before either adding branch, so a
-		// restart with a later start time is reset too, since the events its
-		// new process replayed are the ones the sibling supplied.
-		if usageAggregationFor(s.Counter) == usageAggregateMax {
+		// a poll in which the sibling was counted, so what it presents when
+		// it next advances is what the sibling already supplied: reset to its
+		// body, take the sibling's marker, add nothing. Before either adding
+		// branch, so a restart with a later start time is reset too, since the
+		// events its new process replayed are the ones the sibling supplied.
+		// Only when it advances: a quiet body neither moves the marker nor
+		// writes the document, so the entry still reads as behind when the
+		// catch-up arrives.
+		if usageAggregationFor(s.Counter) == usageAggregateMax && usageBodyAdvanced(entry, s) {
 			if latest, ok := latestSiblingMarker(doc, markers, s.UID, s.Counter); ok && entry.Marker.Before(&latest) {
 				// The recorded start time stays when the body carries none,
 				// as every other baseline advance keeps it: a reset that
@@ -314,6 +310,17 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		changed = true
 	}
 	return usageFoldResult{Document: doc, Changed: changed, Moved: moved}
+}
+
+// usageBodyAdvanced reports whether a body says anything the entry does not:
+// a different sample, or a start time the entry does not record. A body
+// without the gauge against a recorded start time is quiet when its sample is
+// unchanged.
+func usageBodyAdvanced(entry *usagePodEntry, s usageScrapedPod) bool {
+	if s.Sample != entry.Sample {
+		return true
+	}
+	return s.StartTime != nil && (entry.StartTime == nil || *s.StartTime != *entry.StartTime)
 }
 
 // usageBranch classifies a known pod's body against its entry: the delta it

@@ -1,7 +1,8 @@
 """The series the usage counters poller reads are the ones the two listeners export.
 
 The operator sums the credential broker's tool-invocation counter over its
-success and error outcomes and the event watcher's injected-event counter, and
+success and error outcomes (the commands it ran and the requests it rejected or
+failed on before running) and the event watcher's injected-event counter, and
 reads process_start_time_seconds from both. Each name and label value is a
 constant on the producer's side and a second copy on the operator's, and a
 rename on either side would freeze a status counter silently: the scrape would
@@ -52,7 +53,7 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(name, _py_const("PROCESS_START_TIME_METRIC"))
         self.assertEqual(name, _go_const(_WATCHER_METRICS_GO, "processStartTimeMetric"))
 
-    def test_the_counted_outcomes_are_the_brokers_ran_to_an_exit_values(self):
+    def test_the_counted_outcomes_are_the_brokers_success_and_error(self):
         source = _SCRAPE_GO.read_text()
         match = re.search(r"toolInvocationsCountedStatuses\s*=\s*map\[string\]bool\{([^}]*)\}", source)
         self.assertIsNotNone(match, "toolInvocationsCountedStatuses not found")

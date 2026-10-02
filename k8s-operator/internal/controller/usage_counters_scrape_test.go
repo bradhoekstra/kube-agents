@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -168,10 +169,38 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		})
 	}
 	t.Run("a connection that failed", func(t *testing.T) {
-		// Port 1 has no listener, so the connection is refused.
+		// Port 1 has no listener, so the connection is refused, and the kind
+		// says so without quoting anything a peer sent.
 		_, err := newPodUsageSource().Scrape(context.Background(), "127.0.0.1:1", usageCounterEventsIngested)
-		if err == nil || scrapeKind(t, err) != usageScrapeKindConnect {
-			t.Errorf("a refused connection: %v, want kind %q", err, usageScrapeKindConnect)
+		if err == nil || scrapeKind(t, err) != usageScrapeKindRefused {
+			t.Errorf("a refused connection: %v, want kind %q", err, usageScrapeKindRefused)
+		}
+		if err != nil && strings.Contains(err.Error(), "127.0.0.1") {
+			t.Errorf("the error text carries the address: %q", err.Error())
+		}
+	})
+	t.Run("a peer that is not HTTP", func(t *testing.T) {
+		// What answers on the port is input: the error kind names no byte of
+		// the junk status line.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_, _ = conn.Write([]byte("JUNK SECRET-STATUS-LINE\r\n\r\n"))
+			conn.Close()
+		}()
+		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageCounterEventsIngested)
+		if err == nil {
+			t.Fatal("a non-HTTP peer scraped successfully")
+		}
+		if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "JUNK") {
+			t.Errorf("the error text carries the peer's bytes: %q", err.Error())
 		}
 	})
 }
@@ -220,18 +249,32 @@ func TestPodUsageSource_SkipsOtherLinesUnread(t *testing.T) {
 	}
 }
 
-// The client runs on a transport with no proxy: an HTTP_PROXY in the
-// operator's environment does not take the GET.
-func TestPodUsageSource_IgnoresAProxyEnvironment(t *testing.T) {
-	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
-	t.Setenv("http_proxy", "http://127.0.0.1:1")
-	addr := serveBody(t, http.StatusOK, eventsInjectedSeries+" 9\n")
-	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
-	if err != nil {
-		t.Fatalf("Scrape under HTTP_PROXY: %v", err)
+// The transport is built by hand: no proxy function at all, so an HTTP_PROXY
+// in the operator's environment cannot take a pod-network GET; bounded
+// response headers; and a client that stops at the first redirect. Asserted
+// on the transport rather than through a scrape under HTTP_PROXY, because a
+// test server is loopback and Go never proxies loopback, so that scrape
+// would pass with the guard removed.
+func TestPodUsageSource_TransportUsesNoProxyAndBoundsHeaders(t *testing.T) {
+	source := newPodUsageSource()
+	transport, ok := source.client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("the client's transport is a %T, want *http.Transport", source.client.Transport)
 	}
-	if reading.Sample != 9 {
-		t.Errorf("sample = %d, want 9", reading.Sample)
+	if transport.Proxy != nil {
+		t.Error("the transport has a proxy function; a pod-network scrape must have none")
+	}
+	if transport.MaxResponseHeaderBytes != usageScrapeMaxHeaderBytes {
+		t.Errorf("MaxResponseHeaderBytes = %d, want %d", transport.MaxResponseHeaderBytes, usageScrapeMaxHeaderBytes)
+	}
+	if source.client.CheckRedirect == nil {
+		t.Fatal("the client follows redirects")
+	}
+	if err := source.client.CheckRedirect(nil, nil); !errors.Is(err, http.ErrUseLastResponse) {
+		t.Errorf("CheckRedirect = %v, want ErrUseLastResponse", err)
+	}
+	if source.client.Timeout != usageScrapeTimeout {
+		t.Errorf("client timeout = %v, want %v", source.client.Timeout, usageScrapeTimeout)
 	}
 }
 
