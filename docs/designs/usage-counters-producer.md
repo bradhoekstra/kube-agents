@@ -202,8 +202,11 @@ each pod it scraped:
   is the recorded one, and the sample is not below the last one;
 - the whole sample, when the pod UID is new, which means created after the document was first
   recorded and not merely absent from it (a new pod starts from zero, so everything it has
-  counted is new), or the body's start time is present and later than the recorded one (the
-  process restarted inside the same pod);
+  counted is new), unless a live gateway sibling's marker is later than the pod's creation,
+  in which case the sibling supplied the events this pod injected in the meantime and the pod
+  is recorded at its sample with the sibling's marker, adding nothing, as a known replica behind
+  its sibling would be; or the body's start time is present and later than the recorded one
+  (the process restarted inside the same pod);
 - nothing, when the body carries a start time earlier than the recorded one, or shows the
   sample falling under an unchanged start time: a counter cannot fall inside one process, so
   each of those is a body that is not the listener's. The body is refused, and because it
@@ -259,7 +262,12 @@ each pod it scraped:
   counted on top of what the total already took from its sibling. The broker's one pod, and a single gateway pod, have no sibling and
   always add the difference across a gap. The error this leaves is an under-count, named in the
   sources section: a replica's events that its sibling did not inject are lost whenever it was
-  quiet, or missed, for a poll in which the sibling moved.
+  quiet, or missed, for a poll in which the sibling moved; and a replica reset in a poll in
+  which its sibling was taken keeps the sibling's marker as it was read, one poll behind, until
+  it advances in a poll the sibling does not, so its events in a poll the sibling was missed or
+  terminating are lost too. A reset that took the sibling's marker after the poll would close
+  that loss and open an over-count instead, a replica trailing its sibling by one poll having
+  its catch-up counted whenever the sibling is quiet, and the under-count is the one preferred.
 
 Entries for pods that no longer exist are dropped when the baseline is next written; their
 counts are already in the totals.

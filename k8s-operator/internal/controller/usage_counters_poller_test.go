@@ -210,11 +210,10 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 	h.recorder = record.NewFakeRecorder(16)
 	h.r = &PlatformAgentReconciler{Client: h.cl, APIReader: h.cl, Scheme: scheme, Recorder: h.recorder}
 	h.p = &UsageCounterPoller{
-		r:        h.r,
-		source:   h.stub,
-		interval: usageCountersPollInterval,
-		now:      func() time.Time { return h.clock },
-		streaks:  map[types.UID]*usageScrapeStreak{},
+		r:       h.r,
+		source:  h.stub,
+		now:     func() time.Time { return h.clock },
+		streaks: map[types.UID]*usageScrapeStreak{},
 	}
 	return h
 }
@@ -340,15 +339,25 @@ func TestUsagePoller_FirstPollRecordsThenCountsFromTheBaseline(t *testing.T) {
 	}
 }
 
-// The port is found by name on the native sidecar among several containers;
-// a pod without the port, or not running, is not a target.
+// The port is found by name on the listener's own container, the native
+// sidecar among several containers; a pod without the port on that
+// container, or not running, is not a target, and a CR's own init container
+// that names the same port first is not the listener.
 func TestUsagePoller_FindsThePortByNameOnTheSidecar(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	pending := usageGatewayPod("agent-gateway-pending", "gw-pending", "10.0.0.99", created)
 	pending.Status.Phase = corev1.PodPending
 	noPort := usageGatewayPod("agent-gateway-noport", "gw-noport", "10.0.0.98", created)
 	noPort.Spec.InitContainers[1].Ports = nil
-	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), pending, noPort)...)
+	objects := usageDefaultObjects(created)
+	gateway := objects[0].(*corev1.Pod)
+	// A CR author's init container, placed first as the render places them,
+	// naming the watcher's port on another number.
+	gateway.Spec.InitContainers = append([]corev1.Container{{
+		Name:  "authors-own",
+		Ports: []corev1.ContainerPort{{Name: eventWatcherMetricsPortName, ContainerPort: 9999}},
+	}}, gateway.Spec.InitContainers...)
+	h := newUsageHarness(t, usageTestAgent(created), append(objects, pending, noPort)...)
 	targets, live, err := h.p.targets(context.Background(), usageTestAgent(created))
 	if err != nil {
 		t.Fatal(err)

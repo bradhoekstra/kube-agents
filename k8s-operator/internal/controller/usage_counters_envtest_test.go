@@ -89,11 +89,10 @@ func newUsageEnvtestHarness(t *testing.T, cfg *rest.Config, scheme *runtime.Sche
 
 	h.r = &PlatformAgentReconciler{Client: h.cl, APIReader: h.cl, Scheme: scheme}
 	h.p = &UsageCounterPoller{
-		r:        h.r,
-		source:   h.stub,
-		interval: usageCountersPollInterval,
-		now:      func() time.Time { return h.clock },
-		streaks:  map[types.UID]*usageScrapeStreak{},
+		r:       h.r,
+		source:  h.stub,
+		now:     func() time.Time { return h.clock },
+		streaks: map[types.UID]*usageScrapeStreak{},
 	}
 	return h
 }
