@@ -18,6 +18,7 @@ import (
 	"testing"
 
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -77,5 +78,21 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	// The builder itself is unchanged: no operator rule, whatever the caller knows.
 	if n := len(operatorPeerRules(buildCredentialProxyNetworkPolicy(agent))); n != 0 {
 		t.Errorf("buildCredentialProxyNetworkPolicy renders %d operator rule(s), want 0", n)
+	}
+	// What the reconcile applies is the builder's policy plus exactly that one
+	// rule, so the tests that guard the broker's boundary through the builder
+	// still describe the applied policy up to the operator peer.
+	built := buildCredentialProxyNetworkPolicy(agent)
+	applied := credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace)
+	if len(applied.Spec.Ingress) != len(built.Spec.Ingress)+1 {
+		t.Fatalf("the applied broker policy has %d ingress rules, the builder's %d; want exactly one more", len(applied.Spec.Ingress), len(built.Spec.Ingress))
+	}
+	for i := range built.Spec.Ingress {
+		if !equality.Semantic.DeepEqual(built.Spec.Ingress[i], applied.Spec.Ingress[i]) {
+			t.Errorf("ingress rule %d differs between the builder's policy and the applied one", i)
+		}
+	}
+	if !equality.Semantic.DeepEqual(built.Spec.PodSelector, applied.Spec.PodSelector) || !equality.Semantic.DeepEqual(built.Spec.PolicyTypes, applied.Spec.PolicyTypes) {
+		t.Error("the applied broker policy differs from the builder's beyond the appended rule")
 	}
 }

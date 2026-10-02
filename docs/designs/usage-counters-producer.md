@@ -252,10 +252,11 @@ each pod it scraped:
   marker is reset whether its body is an advance or a restart with a later start time, recorded
   at its new sample and start time, taking the sibling's marker and adding nothing, because the
   events its new process replayed are the ones the sibling already supplied. In a poll where
-  both replicas moved, the one whose delta the total took moves its marker; the other's
-  baseline moves to its sample, so its delta is not re-presented, but its marker stays, so its
-  later catch-up is reset rather than counted on top of what the total already took from its
-  sibling. The broker's one pod, and a single gateway pod, have no sibling and
+  both replicas moved, the one whose delta the total took moves its marker, and so does a
+  replica whose delta equalled it, since both injected the same events and neither has a
+  catch-up pending; a replica whose delta was smaller moves its baseline to its sample, so its
+  delta is not re-presented, but its marker stays, so its later catch-up is reset rather than
+  counted on top of what the total already took from its sibling. The broker's one pod, and a single gateway pod, have no sibling and
   always add the difference across a gap. The error this leaves is an under-count, named in the
   sources section: a replica's events that its sibling did not inject are lost whenever it was
   quiet, or missed, for a poll in which the sibling moved.

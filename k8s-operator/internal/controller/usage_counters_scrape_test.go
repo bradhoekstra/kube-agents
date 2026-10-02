@@ -23,6 +23,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // scrapeTestFleetClusters and scrapeTestFleetNamespaces size the fleet-sized
@@ -33,6 +34,9 @@ const (
 	scrapeTestFleetClusters   = 40
 	scrapeTestFleetNamespaces = 30
 	scrapeTestStartTime       = 1759400000.25
+	// scrapeTestStallTimeout is the client timeout the stalled-body case
+	// shortens the scrape to, so the test does not wait the real one.
+	scrapeTestStallTimeout = 300 * time.Millisecond
 )
 
 var scrapeTestReasons = []string{"BackOff", "Failed", "Unhealthy", "FailedScheduling", "OOMKilling"}
@@ -151,6 +155,7 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		{"a server error", http.StatusInternalServerError, "", usageScrapeKindStatus},
 		{"a line past the bound", http.StatusOK, longLine, usageScrapeKindLine},
 		{"a wanted line that does not parse", http.StatusOK, eventsInjectedSeries + `{cluster="c"} not-a-number` + "\n", usageScrapeKindParse},
+		{"a bare wanted name with no value", http.StatusOK, eventsInjectedSeries + "\n", usageScrapeKindParse},
 		{"a negative sample", http.StatusOK, eventsInjectedSeries + `{cluster="c"} -3` + "\n", usageScrapeKindSample},
 		{"a NaN sample", http.StatusOK, eventsInjectedSeries + `{cluster="c"} NaN` + "\n", usageScrapeKindSample},
 		{"an infinite sample", http.StatusOK, eventsInjectedSeries + `{cluster="c"} +Inf` + "\n", usageScrapeKindSample},
@@ -202,6 +207,28 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		if strings.Contains(err.Error(), "SECRET") || strings.Contains(err.Error(), "JUNK") {
 			t.Errorf("the error text carries the peer's bytes: %q", err.Error())
 		}
+		if got := scrapeKind(t, err); got != usageScrapeKindMalformed {
+			t.Errorf("kind = %q, want %q: the connection succeeded and the peer answered junk", got, usageScrapeKindMalformed)
+		}
+	})
+	t.Run("a listener that stalls mid-body", func(t *testing.T) {
+		// Headers promptly, then nothing: the client's timeout fires on the
+		// body read, and the kind says timeout, not read.
+		release := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(eventsInjectedSeries + " 1\n"))
+			w.(http.Flusher).Flush()
+			<-release
+		}))
+		defer srv.Close()
+		defer close(release)
+		source := newPodUsageSource()
+		source.client.Timeout = scrapeTestStallTimeout
+		_, err := source.Scrape(context.Background(), strings.TrimPrefix(srv.URL, "http://"), usageCounterEventsIngested)
+		if err == nil || scrapeKind(t, err) != usageScrapeKindTimeout {
+			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindTimeout)
+		}
 	})
 }
 
@@ -237,6 +264,8 @@ func TestPodUsageSource_SkipsOtherLinesUnread(t *testing.T) {
 		eventsInjectedSeries + `{cluster="c",namespace="a"} 3`,
 		eventsInjectedSeries + "\t4",
 		eventsInjectedSeries + " 5",
+		"  " + eventsInjectedSeries + `{cluster="d"} 6`,
+		"\t" + eventsInjectedSeries + " 7",
 		"",
 	}, "\n")
 	addr := serveBody(t, http.StatusOK, body)
@@ -244,8 +273,8 @@ func TestPodUsageSource_SkipsOtherLinesUnread(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scrape: %v", err)
 	}
-	if reading.Sample != 12 {
-		t.Errorf("sample = %d, want 12", reading.Sample)
+	if reading.Sample != 25 {
+		t.Errorf("sample = %d, want 25: leading blanks are skipped as expfmt skips them", reading.Sample)
 	}
 }
 
@@ -282,10 +311,13 @@ func TestUsageLineName(t *testing.T) {
 	cases := map[string]string{
 		"":                   "",
 		"# HELP x y":         "",
+		"   # HELP x y":      "",
+		"  name 1":           "name",
+		"	name{a=\"b\"} 1":   "name",
 		`name{a="b"} 1`:      "name",
 		"name 1":             "name",
 		"name\t1":            "name",
-		"name_only_no_value": "",
+		"name_only_no_value": "name_only_no_value",
 		`kubeagents_tool_invocations_total{tool="kubectl"} 2`: "kubeagents_tool_invocations_total",
 	}
 	for line, want := range cases {
