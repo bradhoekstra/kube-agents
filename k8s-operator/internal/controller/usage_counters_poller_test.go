@@ -349,6 +349,8 @@ func TestUsagePoller_FindsThePortByNameOnTheSidecar(t *testing.T) {
 	pending.Status.Phase = corev1.PodPending
 	noPort := usageGatewayPod("agent-gateway-noport", "gw-noport", "10.0.0.98", created)
 	noPort.Spec.InitContainers[1].Ports = nil
+	terminating := usageGatewayPod("agent-gateway-terminating", "gw-terminating", "10.0.0.97", created)
+	terminating.Finalizers = []string{"usage-test/hold"}
 	objects := usageDefaultObjects(created)
 	gateway := objects[0].(*corev1.Pod)
 	// A CR author's init container, placed first as the render places them,
@@ -357,7 +359,11 @@ func TestUsagePoller_FindsThePortByNameOnTheSidecar(t *testing.T) {
 		Name:  "authors-own",
 		Ports: []corev1.ContainerPort{{Name: eventWatcherMetricsPortName, ContainerPort: 9999}},
 	}}, gateway.Spec.InitContainers...)
-	h := newUsageHarness(t, usageTestAgent(created), append(objects, pending, noPort)...)
+	h := newUsageHarness(t, usageTestAgent(created), append(objects, pending, noPort, terminating)...)
+	// The finalizer keeps the pod around with its deletionTimestamp set.
+	if err := h.cl.Delete(context.Background(), terminating); err != nil {
+		t.Fatal(err)
+	}
 	targets, live, err := h.p.targets(context.Background(), usageTestAgent(created))
 	if err != nil {
 		t.Fatal(err)
@@ -374,6 +380,9 @@ func TestUsagePoller_FindsThePortByNameOnTheSidecar(t *testing.T) {
 	}
 	if !live["gw-pending"] || !live["gw-noport"] || !live["gw-a"] || !live["broker-b"] {
 		t.Errorf("live = %v, want every pod that exists", live)
+	}
+	if live["gw-terminating"] {
+		t.Errorf("live = %v: a terminating pod, which is never read again, counts as live", live)
 	}
 }
 
@@ -845,5 +854,59 @@ func TestUsagePoller_EventGuidanceFollowsTheFailureClass(t *testing.T) {
 				t.Fatal("no event after two failed polls")
 			}
 		})
+	}
+}
+
+// A rollout on an HA gateway: the new replica is read late, so it is recorded
+// against the old pod's marker; when the old pod is terminating it is never
+// read again, so it leaves the live set and the new replica's advance is
+// counted rather than reset against a marker nothing will move again.
+func TestUsagePoller_ATerminatingSiblingSuppressesNoAdvance(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	old := usageGatewayPod("agent-gateway-old", "gw-old", usageTestGatewayIP, created)
+	old.Finalizers = []string{"usage-test/hold"}
+	fresh := usageGatewayPod("agent-gateway-new", "gw-new", usageTestGatewayB, usageClock(3))
+	broker := usageBrokerPod("agent-credential-proxy-bbb", "broker-b", usageTestBrokerIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), old, fresh, broker)
+	newAddr := usageTestGatewayB + ":9095"
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.fail(newAddr, usageScrapeKindRefused)
+	h.poll(0)
+	h.stub.set(gatewayAddr(), 110, ptr.To(1.0))
+	h.poll(5)
+	// The new replica's first read: recorded against the old pod's marker.
+	h.stub.set(gatewayAddr(), 115, ptr.To(1.0))
+	h.stub.set(newAddr, 12, ptr.To(9.0))
+	h.poll(10)
+	if status := h.status(); status.EventsIngestedTotal != 15 {
+		t.Fatalf("after the late read: %+v, want 15", status)
+	}
+	// The old pod is terminating: listed, not read, and no longer live.
+	ctx := context.Background()
+	if err := h.cl.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	h.stub.set(newAddr, 15, ptr.To(9.0))
+	h.poll(15)
+	if status := h.status(); status.EventsIngestedTotal != 18 {
+		t.Fatalf("with the old pod terminating: %+v, want 18: the new replica's advance was reset against a pod that is never read again", status)
+	}
+	doc := h.document()
+	if doc.Pods["gw-old"] != nil {
+		t.Fatalf("the terminating pod's entry was kept: %+v", doc.Pods)
+	}
+	// Gone for good: the new replica carries on alone.
+	stored := &corev1.Pod{}
+	if err := h.cl.Get(ctx, client.ObjectKeyFromObject(old), stored); err == nil {
+		stored.Finalizers = nil
+		if err := h.cl.Update(ctx, stored); err != nil {
+			t.Fatal(err)
+		}
+	}
+	h.stub.set(newAddr, 18, ptr.To(9.0))
+	h.poll(20)
+	if status := h.status(); status.EventsIngestedTotal != 21 {
+		t.Fatalf("after the old pod left: %+v, want 21", status)
 	}
 }

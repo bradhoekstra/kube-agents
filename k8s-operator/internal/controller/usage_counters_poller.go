@@ -230,8 +230,8 @@ func (p *UsageCounterPoller) reader() client.Reader {
 }
 
 // targets lists the pods the two policies select and returns the running ones
-// whose listener the poll reads, with every pod that exists, scraped or not,
-// in live. When the CR switches the watcher off the gateway pods stay live, so
+// whose listener the poll reads, with every pod that exists and is not
+// terminating, scraped or not, in live. When the CR switches the watcher off the gateway pods stay live, so
 // their entries persist, and are not read: the entrypoint starts no watcher,
 // so nothing listens on the port, and a refused connection there would be the
 // install's choice.
@@ -255,8 +255,16 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		}
 		for i := range pods.Items {
 			pod := &pods.Items[i]
+			if !pod.DeletionTimestamp.IsZero() {
+				// A terminating pod is never read again, so it is not live:
+				// its entry is dropped, with its streak, and its marker
+				// suppresses no sibling's advance during a rollout. What it
+				// counted after its last read is lost, as for any pod that
+				// leaves.
+				continue
+			}
 			live[string(pod.UID)] = true
-			if !group.read || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" || !pod.DeletionTimestamp.IsZero() {
+			if !group.read || pod.Status.Phase != corev1.PodRunning || pod.Status.PodIP == "" {
 				continue
 			}
 			port, ok := usagePodPort(pod, group.container, group.port)
