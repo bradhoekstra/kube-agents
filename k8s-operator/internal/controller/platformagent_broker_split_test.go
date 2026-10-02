@@ -376,7 +376,7 @@ func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
 
 	// The other half, so a fix that deleted the ingress rule instead would not
 	// pass by making both sides equally wrong.
-	broker := buildCredentialProxyNetworkPolicy(agent)
+	broker := buildCredentialProxyNetworkPolicy(agent, "")
 	var admitted bool
 	for _, rule := range broker.Spec.Ingress {
 		for _, peer := range rule.From {

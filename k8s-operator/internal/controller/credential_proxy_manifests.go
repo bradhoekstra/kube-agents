@@ -495,7 +495,7 @@ func buildCredentialProxyFederationVolume(agent *agentv1alpha1.PlatformAgent) []
 //
 // Inert on a cluster whose CNI does not implement NetworkPolicy. It is a control
 // where it is enforced and a statement of intent where it is not.
-func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
+func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent, operatorNamespace string) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	callers := []networkingv1.NetworkPolicyPeer{
 		{PodSelector: &metav1.LabelSelector{MatchLabels: shellSandboxSelector(agent)}},
@@ -533,6 +533,11 @@ func buildCredentialProxyNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *netw
 				},
 			},
 		},
+	}
+	// The operator's own pods on the same port, for the poller that reads the
+	// broker's counters into status.usage (usage_counters_poller.go).
+	if rule, ok := operatorMetricsIngressRule(operatorNamespace, credentialProxyMetricsPort); ok {
+		np.Spec.Ingress = append(np.Spec.Ingress, rule)
 	}
 	withCommonLabels(np, agent)
 	return np

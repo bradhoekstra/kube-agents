@@ -1428,7 +1428,7 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 	// peer from outside the namespace is the managed-Prometheus collector, and
 	// it is admitted to the metrics-only port alone.
 	agent := shellSandboxTestAgent()
-	np := buildCredentialProxyNetworkPolicy(agent)
+	np := buildCredentialProxyNetworkPolicy(agent, "")
 
 	if len(np.Spec.PolicyTypes) != 1 || np.Spec.PolicyTypes[0] != networkingv1.PolicyTypeIngress {
 		t.Fatalf("expected ingress-only, got %v — egress is #720's, but naming it here without rules would cut the proxy off from GKE and the token broker", np.Spec.PolicyTypes)
@@ -1514,7 +1514,7 @@ func TestCredentialProxyNetworkPolicySelectsItsOwnPod(t *testing.T) {
 	podLabels := deploy.Spec.Template.ObjectMeta.Labels
 
 	for name, selector := range map[string]map[string]string{
-		"NetworkPolicy.podSelector": buildCredentialProxyNetworkPolicy(agent).Spec.PodSelector.MatchLabels,
+		"NetworkPolicy.podSelector": buildCredentialProxyNetworkPolicy(agent, "").Spec.PodSelector.MatchLabels,
 		"Service.spec.selector":     buildCredentialProxyService(agent).Spec.Selector,
 		"Deployment.spec.selector":  deploy.Spec.Selector.MatchLabels,
 	} {
