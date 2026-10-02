@@ -862,7 +862,7 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                     for job_name, job in ((doc.get("jobs") or {}).items())
                     for step in (job.get("steps") or [])
                     if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
-                    and "app-id" in (step.get("with") or {})
+                    and any(str(key).lower() == "app-id" for key in (step.get("with") or {}))
                 ]
                 self.assertEqual(offenders, [], f"steps in {path.name} still mint with the deprecated app-id input")
 
