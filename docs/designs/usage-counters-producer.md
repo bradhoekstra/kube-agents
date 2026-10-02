@@ -72,7 +72,9 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    expositions' size, and a body that reaches it is a failed scrape: the port is held by a
    listener in a pod that runs other containers, so what answers is input, not the operator's
    own data. The client follows no redirect (`CheckRedirect` returns
-   `http.ErrUseLastResponse`) and any status other than 200 is a failed scrape, so a body on
+   `http.ErrUseLastResponse`), runs on a transport with no proxy, since a pod-network scrape
+   never has one and the Go default would send the GET to an `HTTP_PROXY` the operator's
+   environment sets, and any status other than 200 is a failed scrape, so a body on
    the port cannot send the operator's GET, made from a network position the pod's own egress
    policy does not have, anywhere else. Selecting the port by its name means a renumbering in
    the manifests moves the scrape with it;
@@ -204,7 +206,10 @@ each pod it scraped:
   body that carries the gauge, and the upgrade order makes that gap routine, as the failure
   section says; a body without the gauge for a pod whose entry already records a start time is
   not the listener's, since a listener does not lose the gauge inside one pod, and is refused
-  with the baseline advanced, as above;
+  with the baseline advanced, as above; and the first body that carries the gauge for an entry
+  that recorded none is a process that started, a container restarted in place onto a newer
+  image, so an absent recorded start time counts as earlier and the body takes the whole-sample
+  branch under the ceiling;
 - in every adding branch, at most `usageDeltaCeiling` per pod per counter per poll, a named
   bound sized to what a listener could plausibly count in one interval rather than in a pod's
   lifetime, and the same one ceiling whatever the gap since the pod was last counted: a gap's
@@ -230,7 +235,11 @@ each pod it scraped:
   sibling already supplied. The reset sets its marker to the sibling's, not to the current
   poll: set to the current poll, each reset would leave the sibling behind in turn, and every
   lone advance by either replica would be reset until both advanced together, losing whole
-  bursts that neither counted; only an add moves a marker past a sibling's. The broker's one pod, and a single gateway pod, have no sibling and
+  bursts that neither counted; only an add moves a marker past a sibling's. In a poll where
+  both replicas moved, the one whose delta the total took moves its marker; the other's
+  baseline moves to its sample, so its delta is not re-presented, but its marker stays, so its
+  later catch-up is reset rather than counted on top of what the total already took from its
+  sibling. The broker's one pod, and a single gateway pod, have no sibling and
   always add the difference across a gap. The error this leaves is an under-count, named in the
   sources section: a replica's events that its sibling did not inject are lost whenever it was
   quiet, or missed, for a poll in which the sibling moved.
@@ -264,7 +273,8 @@ section rather than designed away, because closing it means authenticating the l
 The totals and the baseline live together in a ConfigMap, `<name>-usage-counters`, in the CR's
 namespace, holding one JSON document: the time the document was first recorded, the running total per
 counter, the time of the last poll that moved a total, and per pod UID the pod's name for a reader, its last sample per counter,
-its last start time, and the poll at which its entry was last added or advanced, or the
+its last start time, and the poll at which its entry last supplied a delta the total took,
+which for the broker's one pod and a single gateway pod is every poll it advanced, or the
 sibling's marker it was last reset against, which is not the poll it was last read at: a quiet
 poll changes nothing in the document, so a quiet install writes nothing, and the marker still
 tells the missed-pod rule whether another pod was counted during a gap. The ConfigMap is the source of truth the
@@ -281,9 +291,12 @@ totals, through the status patch that fires whenever the status is behind. A nam
 ownership; the finalizer applies the same rule to the data volume. What the poller reads back
 is bounded before it is used, with a bound of its own for the totals, which honestly outgrow
 any per-pod or per-poll figure: every sample non-negative and finite, every total non-negative,
-finite and below the `int64` headroom the status field has, and no total below the status it
-projects to; a document that fails them is treated as absent, and the seed-from-status path
-runs. It is written only in a poll in
+finite and below the `int64` headroom the status field has, no total below the status it
+projects to, and the first-recorded time no later than the poll reading it and no earlier than
+the CR's own `creationTimestamp`, since a time in the future would quietly make every pod old
+and a time in the past would make a missed pod new; a document that fails any of them is
+treated as absent, and the seed-from-status path runs with this poll's time as the
+first-recorded time. It is written only in a poll in
 which a total or the baseline changed, so a quiet install writes nothing.
 
 In memory alone the baseline would be lost with the operator, and the first poll after a
@@ -301,8 +314,13 @@ carries nothing and the counters start at zero from this poll: a pod older than 
 a history the counters never saw, and whether it fits the ceiling says nothing about whether
 it should be counted. The whole-sample branch therefore applies only to a pod created after the document was
 first recorded, where "a new pod starts from zero" is true: the document carries the time it
-was first recorded, which the overwrite paths carry forward, and a pod's `creationTimestamp`
-from the list in step 1 is compared with it. Absence from the document is not newness: a pod
+was first recorded, and a pod's `creationTimestamp` from the list in step 1 is compared with
+it. Every poll that treats the document as absent, the first poll and each re-seed after a
+mismatch or a failed bound, records its own time there rather than carrying a predecessor's
+forward: "a new pod starts from zero and none of it was counted" holds only for pods created
+after the last point at which every pod was re-baselined, and a time carried forward would
+make a pod the re-seed could not scrape "new" on its next scrape, with its lifetime counted
+once more on top of totals that already hold it. Absence from the document is not newness: a pod
 the first poll could not scrape, or that one of the two policies kept out while the other
 already admitted the operator, is recorded on its next scrape and adds nothing. `lastActiveTime`
 is first stamped by a poll in which something ran. What a fresh install loses is the count
@@ -365,7 +383,8 @@ fails, which includes a body over the size ceiling and a sample outside its boun
 pod's baseline untouched and the totals where they were. The
 operator log carries one line when an endpoint first fails and one when it recovers, naming
 the pod and the error type, never the body. The visible symptom of a standing failure, a
-NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener that moved, is
+NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener that moved, a
+proxy environment on the operator pod that a client without the no-proxy transport would obey, is
 a `lastActiveTime` that stops advancing while commands are plainly running and events are
 plainly being triaged. A `kubectl describe`
 of the CR shows the operator's events; the implementation records one warning event per failure
@@ -472,7 +491,9 @@ start time, a sample not below the last); the whole-sample branch (a pod created
 time), including such a pod above the ceiling, which is recorded and adds nothing, the first
 poll with no ConfigMap, which records every pod and adds nothing whatever the samples, and a
 pod that first poll could not scrape, created before the document, recorded on its next scrape
-and adding nothing, and a
+and adding nothing, on the first poll and on a re-seed alike, the re-seed recording its own
+time as the first-recorded time; the first body carrying the gauge for an entry that recorded
+none, taking the whole-sample branch under the ceiling; and a
 forged later start time with a large sample, which adds nothing and advances the baseline; the
 two refused shapes (a start time earlier than the recorded one; a fall under an unchanged start
 time), refused with the baseline advanced to the body's sample and start time, nothing added,
@@ -485,11 +506,13 @@ once); the scrapes that produce no body (a connection
 that failed, a 3xx answer, a body over the size ceiling, one `expfmt` cannot parse, a sample
 that is negative or not finite), each keeping the baseline and nothing more; a pod missing this
 poll and back in the next, with and without a second gateway pod counted in between, asserting
-that the reset pod takes the sibling's marker and the sibling's next lone advance is counted; the
+that the reset pod takes the sibling's marker and the sibling's next lone advance is counted;
+a partial straddle, both replicas moving by different amounts and the lagger catching up alone
+the poll after, asserting the catch-up is reset and the total took the larger delta once; the
 largest-delta rule across two gateway pods and its agreement with the sum for one; the
 baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
-or whose values fail the read-back bounds, including a total above the `int64` headroom and one
-below the status (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
+or whose values fail the read-back bounds, including a total above the `int64` headroom, one
+below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
 case (no gateway scrape, no log line); the series selection (the `status` values summed and the
 three excluded; the injected series and not the observed one); and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
