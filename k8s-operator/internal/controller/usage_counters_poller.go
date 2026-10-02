@@ -61,6 +61,10 @@ const (
 	// usageScrapeFailingReason is the Warning event's reason.
 	usageScrapeFailingReason = "UsageScrapeFailing"
 	usagePollerLogName       = "usage-counters"
+	// The two sentences the Warning event can end with; usageScrapeGuidance
+	// picks one by the failure's class.
+	usageScrapeConnectGuidance  = "Check that the pod's NetworkPolicy admits the operator's pods on the metrics port and that the listener is up."
+	usageScrapeResponseGuidance = "The listener answered, but its response could not be used; check what is serving the metrics port in the pod."
 	// gatewayAppSuffix completes the gateway pods' app label, <name>-gateway,
 	// the selector the gateway policy and the Ready writer use.
 	gatewayAppSuffix = "-gateway"
@@ -507,10 +511,22 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1al
 	}
 	if count == usageScrapeFailureEventStreak {
 		p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason,
-			fmt.Sprintf("status.usage.%s is not advancing: the metrics listener of pod %s has failed %d polls in a row (%s). "+
-				"Check that the pod's NetworkPolicy admits the operator's pods on the metrics port and that the listener is up.",
-				target.counter, target.name, count, detail))
+			fmt.Sprintf("status.usage.%s is not advancing: the metrics listener of pod %s has failed %d polls in a row (%s). %s",
+				target.counter, target.name, count, detail, usageScrapeGuidance(err)))
 	}
+}
+
+// usageScrapeGuidance is the sentence the Warning event ends with, chosen by
+// what failed: a connection that never produced a response points at the
+// policy and the listener's liveness; a response the poller refused points at
+// what is serving the port, since the connection and the answer were the
+// peer's.
+func usageScrapeGuidance(err error) string {
+	switch usageScrapeKindOf(err) {
+	case usageScrapeKindConnect, usageScrapeKindRefused, usageScrapeKindUnreachable, usageScrapeKindTimeout:
+		return usageScrapeConnectGuidance
+	}
+	return usageScrapeResponseGuidance
 }
 
 // noteScrapeRecovery closes target's streak, if one was open, with one log

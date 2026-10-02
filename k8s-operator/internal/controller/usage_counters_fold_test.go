@@ -23,9 +23,10 @@ import (
 )
 
 // One test per branch of the design's resets section
-// (docs/designs/usage-counters-producer.md), each asserting the poll after as
-// well as the poll itself. The accumulator takes samples and the document and
-// returns the next document, so none of these needs a socket.
+// (docs/designs/usage-counters-producer.md), each asserting the poll itself
+// and, where the branch has a next poll to assert, the poll after. The
+// accumulator takes samples and the document and returns the next document,
+// so none of these needs a socket.
 
 const (
 	foldTestAgentUID = "agent-uid"
@@ -87,6 +88,12 @@ type foldStep struct {
 	moved   bool
 }
 
+// movedAt reports whether the poll at at moved a total: the document's
+// LastMoved is stamped with the poll that last did.
+func movedAt(res usageFoldResult, at time.Time) bool {
+	return res.Document.LastMoved != nil && res.Document.LastMoved.Time.Equal(at)
+}
+
 func runFoldSteps(t *testing.T, doc *usageDocument, counter string, steps []foldStep) *usageDocument {
 	t.Helper()
 	for i, step := range steps {
@@ -95,11 +102,8 @@ func runFoldSteps(t *testing.T, doc *usageDocument, counter string, steps []fold
 		if got := doc.Totals[counter]; got != step.want {
 			t.Fatalf("step %d (minute %d): %s = %d, want %d", i, step.minute, counter, got, step.want)
 		}
-		if res.Moved != step.moved {
-			t.Fatalf("step %d (minute %d): moved = %v, want %v", i, step.minute, res.Moved, step.moved)
-		}
-		if step.moved && (doc.LastMoved == nil || !doc.LastMoved.Time.Equal(foldClock(step.minute))) {
-			t.Fatalf("step %d: lastMoved = %v, want the poll's time %v", i, doc.LastMoved, foldClock(step.minute))
+		if moved := movedAt(res, foldClock(step.minute)); moved != step.moved {
+			t.Fatalf("step %d (minute %d): moved = %v (lastMoved %v), want %v", i, step.minute, moved, doc.LastMoved, step.moved)
 		}
 	}
 	return doc
@@ -112,8 +116,8 @@ func TestFoldUsage_FirstPollRecordsEveryPodAndAddsNothing(t *testing.T) {
 		scrapedPod(foldPodBroker, usageCounterToolExecutions, t0.Add(-time.Hour), 70, nil),
 	}, t0)
 	doc := res.Document
-	if !res.Changed || res.Moved {
-		t.Fatalf("first poll: changed=%v moved=%v, want changed and not moved", res.Changed, res.Moved)
+	if !res.Changed || movedAt(res, t0) {
+		t.Fatalf("first poll: changed=%v lastMoved=%v, want changed and not moved", res.Changed, res.Document.LastMoved)
 	}
 	if doc.Totals[usageCounterEventsIngested] != 0 || doc.Totals[usageCounterToolExecutions] != 0 || doc.LastMoved != nil {
 		t.Fatalf("first poll added: totals=%v lastMoved=%v", doc.Totals, doc.LastMoved)
@@ -129,8 +133,8 @@ func TestFoldUsage_FirstPollRecordsEveryPodAndAddsNothing(t *testing.T) {
 		scrapedPod(foldPodA, usageCounterEventsIngested, t0.Add(-time.Hour), 512, ptr.To(100.0)),
 		scrapedPod(foldPodBroker, usageCounterToolExecutions, t0.Add(-time.Hour), 73, nil),
 	}, foldClock(5))
-	if res.Document.Totals[usageCounterEventsIngested] != 12 || res.Document.Totals[usageCounterToolExecutions] != 3 || !res.Moved {
-		t.Fatalf("second poll: totals=%v moved=%v, want 12/3 and moved", res.Document.Totals, res.Moved)
+	if res.Document.Totals[usageCounterEventsIngested] != 12 || res.Document.Totals[usageCounterToolExecutions] != 3 || !movedAt(res, foldClock(5)) {
+		t.Fatalf("second poll: totals=%v lastMoved=%v, want 12/3 and moved", res.Document.Totals, res.Document.LastMoved)
 	}
 }
 
@@ -319,8 +323,8 @@ func TestFoldUsage_RefusedBodiesAdvanceTheBaseline(t *testing.T) {
 		res := foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
 			scrapedPod(foldPodA, usageCounterEventsIngested, created, 70, ptr.To(100.0)),
 		}, foldClock(5))
-		if res.Moved || !res.Changed || res.Document.Pods[foldPodA].Sample != 70 {
-			t.Fatalf("the fall: moved=%v changed=%v entry=%+v", res.Moved, res.Changed, res.Document.Pods[foldPodA])
+		if movedAt(res, foldClock(5)) || !res.Changed || res.Document.Pods[foldPodA].Sample != 70 {
+			t.Fatalf("the fall: lastMoved=%v changed=%v entry=%+v", res.Document.LastMoved, res.Changed, res.Document.Pods[foldPodA])
 		}
 		runFoldSteps(t, res.Document, usageCounterEventsIngested, []foldStep{
 			{minute: 10, scraped: []usageScrapedPod{scrapedPod(foldPodA, usageCounterEventsIngested, created, 75, ptr.To(100.0))}, want: 5, moved: true},
@@ -419,8 +423,8 @@ func TestFoldUsage_AMissingScrapeKeepsTheBaseline(t *testing.T) {
 	first := foldClock(0)
 	doc := foldDoc(first, foldEntry(foldPodBroker, usageCounterToolExecutions, 100, ptr.To(1.0), first))
 	res := foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), nil, foldClock(5))
-	if res.Changed || res.Moved || res.Document.Pods[foldPodBroker].Sample != 100 {
-		t.Fatalf("a poll with no body changed the document: changed=%v moved=%v entry=%+v", res.Changed, res.Moved, res.Document.Pods[foldPodBroker])
+	if res.Changed || movedAt(res, foldClock(5)) || res.Document.Pods[foldPodBroker].Sample != 100 {
+		t.Fatalf("a poll with no body changed the document: changed=%v lastMoved=%v entry=%+v", res.Changed, res.Document.LastMoved, res.Document.Pods[foldPodBroker])
 	}
 	// Readable again: the whole gap since the kept baseline is added.
 	runFoldSteps(t, res.Document, usageCounterToolExecutions, []foldStep{
@@ -440,8 +444,8 @@ func TestFoldUsage_AQuietPollChangesNothing(t *testing.T) {
 		scrapedPod(foldPodA, usageCounterEventsIngested, created, 40, ptr.To(1.0)),
 		scrapedPod(foldPodBroker, usageCounterToolExecutions, created, 100, nil),
 	}, foldClock(5))
-	if res.Changed || res.Moved {
-		t.Fatalf("a quiet poll reported changed=%v moved=%v", res.Changed, res.Moved)
+	if res.Changed || movedAt(res, foldClock(5)) {
+		t.Fatalf("a quiet poll reported changed=%v lastMoved=%v", res.Changed, res.Document.LastMoved)
 	}
 }
 
@@ -700,8 +704,8 @@ func TestFoldUsage_AQuietBehindReplicaIsNotResetUntilItAdvances(t *testing.T) {
 		scrapedPod(foldPodA, usageCounterEventsIngested, created, 108, ptr.To(1.0)),
 		scrapedPod(foldPodB, usageCounterEventsIngested, created, 100, ptr.To(1.0)),
 	}, foldClock(10))
-	if res.Changed || res.Moved || !res.Document.Pods[foldPodB].Marker.Time.Equal(first) {
-		t.Fatalf("the quiet poll touched B: changed=%v moved=%v B=%+v", res.Changed, res.Moved, res.Document.Pods[foldPodB])
+	if res.Changed || movedAt(res, foldClock(10)) || !res.Document.Pods[foldPodB].Marker.Time.Equal(first) {
+		t.Fatalf("the quiet poll touched B: changed=%v lastMoved=%v B=%+v", res.Changed, res.Document.LastMoved, res.Document.Pods[foldPodB])
 	}
 	// The catch-up: the same eight events, reset rather than counted.
 	doc = runFoldSteps(t, res.Document, usageCounterEventsIngested, []foldStep{
@@ -759,4 +763,38 @@ func TestFoldUsage_ATieLoserIsNotResetOnItsNextLoneAdvance(t *testing.T) {
 	}
 	// A partial straddle still leaves the lagger's marker behind, so its
 	// catch-up alone is reset (TestFoldUsage_APartialStraddleIsCountedOnce).
+}
+
+// A new replica Running and injecting but unreadable on the first poll after
+// it started, whose sibling was counted in that poll, is recorded at its
+// sample with the sibling's marker and adds nothing when first read: the
+// sibling supplied the events it injected in the meantime. Read in the poll
+// it started, its whole sample still competes with the old pod's difference
+// (TestFoldUsage_ANewReplicaCompetesWithTheOldOnesDifference).
+func TestFoldUsage_ANewReplicaReadLateIsRecordedWithoutAdding(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	doc := foldDoc(first, foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+	// Poll 5: C (created at minute 3) is live but unreadable; A is counted.
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 5, live: []string{foldPodB}, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 110, ptr.To(1.0)),
+		}, want: 10, moved: true},
+		// Poll 10: C readable at 12 (7 events A supplied at poll 5, then 5
+		// more that A also injected); A +5. The total takes 5, not 12.
+		{minute: 10, live: []string{foldPodB}, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 115, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, foldClock(3), 12, ptr.To(9.0)),
+		}, want: 15, moved: true},
+	})
+	if c := doc.Pods[foldPodB]; c == nil || c.Sample != 12 || !c.Marker.Time.Equal(foldClock(5)) {
+		t.Fatalf("C after its first read: %+v, want recorded at 12 with A's marker from poll 5", c)
+	}
+	// From here both replicas tie and both markers move.
+	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 15, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, 118, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, foldClock(3), 15, ptr.To(9.0)),
+		}, want: 18, moved: true},
+	})
 }

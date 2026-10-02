@@ -797,3 +797,44 @@ func TestUsagePoller_AFutureStatusTimeIsNotSeeded(t *testing.T) {
 		t.Fatalf("status after the move: %+v, want 5 and lastActiveTime at the poll", status)
 	}
 }
+
+// The Warning event's last sentence follows the failure's class: a connection
+// that never produced a response points at the policy and the listener's
+// liveness, a response the poller refused points at what is serving the port.
+func TestUsagePoller_EventGuidanceFollowsTheFailureClass(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	cases := map[string]struct {
+		kind string
+		want string
+	}{
+		"a refused connection":    {usageScrapeKindRefused, usageScrapeConnectGuidance},
+		"a timeout":               {usageScrapeKindTimeout, usageScrapeConnectGuidance},
+		"a line past the bound":   {usageScrapeKindLine, usageScrapeResponseGuidance},
+		"a malformed response":    {usageScrapeKindMalformed, usageScrapeResponseGuidance},
+		"a status other than 200": {usageScrapeKindStatus, usageScrapeResponseGuidance},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+			h.stub.set(brokerAddr(), 1, nil)
+			h.stub.fail(gatewayAddr(), tc.kind)
+			h.poll(5)
+			h.poll(10)
+			select {
+			case ev := <-h.recorder.Events:
+				if !strings.Contains(ev, tc.want) {
+					t.Fatalf("event = %q, want it to end with %q", ev, tc.want)
+				}
+				other := usageScrapeResponseGuidance
+				if tc.want == usageScrapeResponseGuidance {
+					other = usageScrapeConnectGuidance
+				}
+				if strings.Contains(ev, other) {
+					t.Fatalf("event = %q carries the other class's guidance too", ev)
+				}
+			default:
+				t.Fatal("no event after two failed polls")
+			}
+		})
+	}
+}
