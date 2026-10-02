@@ -721,3 +721,42 @@ func TestFoldUsage_AQuietBehindReplicaIsNotResetUntilItAdvances(t *testing.T) {
 		}, want: 10, moved: true},
 	})
 }
+
+// In the HA steady state both replicas inject the same events and tie on the
+// delta every poll. A candidate whose delta equalled the taken one moves its
+// marker too, since it has no catch-up pending; otherwise the tie-loser's
+// next lone advance, while the winner is terminating or unreadable, would be
+// reset and lost.
+func TestFoldUsage_ATieLoserIsNotResetOnItsNextLoneAdvance(t *testing.T) {
+	first := foldClock(0)
+	created := first.Add(-time.Hour)
+	doc := foldDoc(first,
+		foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first),
+		foldEntry(foldPodB, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+	both := func(a, b int64) []usageScrapedPod {
+		return []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, created, a, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, created, b, ptr.To(1.0)),
+		}
+	}
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 5, scraped: both(108, 108), want: 8, moved: true},
+		{minute: 10, scraped: both(113, 113), want: 13, moved: true},
+	})
+	if a, b := doc.Pods[foldPodA], doc.Pods[foldPodB]; !a.Marker.Time.Equal(foldClock(10)) || !b.Marker.Time.Equal(foldClock(10)) {
+		t.Fatalf("after two ties the markers differ: A %v B %v, want both at the last poll", a.Marker, b.Marker)
+	}
+	// The winner is terminating: listed, not scraped. B's lone advance counts.
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 15, scraped: []usageScrapedPod{scrapedPod(foldPodB, usageCounterEventsIngested, created, 119, ptr.To(1.0))}, want: 19, moved: true},
+	})
+	// The winner is gone; B carries on alone.
+	res := foldUsage(doc, foldTestAgentUID, usageSeed{}, map[string]bool{foldPodB: true}, []usageScrapedPod{
+		scrapedPod(foldPodB, usageCounterEventsIngested, created, 122, ptr.To(1.0)),
+	}, foldClock(20))
+	if res.Document.Totals[usageCounterEventsIngested] != 22 || res.Document.Pods[foldPodA] != nil {
+		t.Fatalf("after the winner left: totals=%v pods=%v, want 22 and A dropped", res.Document.Totals, res.Document.Pods)
+	}
+	// A partial straddle still leaves the lagger's marker behind, so its
+	// catch-up alone is reset (TestFoldUsage_APartialStraddleIsCountedOnce).
+}

@@ -276,19 +276,28 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		case usageAggregateMax:
 			// The largest delta, the first in name order on a tie. Every
 			// candidate's baseline moves to its sample, so a delta the total
-			// did not take is not re-presented; only the taken one moves its
-			// marker.
+			// did not take is not re-presented. The taken one moves its
+			// marker, and so does a candidate whose delta equalled it: both
+			// replicas injected the same events, so neither has a catch-up
+			// pending, and a marker left behind would reset the next lone
+			// advance of a replica whose baseline is current. A smaller
+			// delta keeps its marker, so its catch-up is reset rather than
+			// counted on top of what the total took.
 			best := -1
 			for i, c := range list {
 				if c.delta > 0 && (best < 0 || c.delta > list[best].delta) {
 					best = i
 				}
 			}
+			taken := false
+			if best >= 0 {
+				taken = addUsageTotal(doc, counter, list[best].delta)
+			}
 			for i, c := range list {
 				if advanceUsageBaseline(c.entry, c.sample, c.startTime) {
 					changed = true
 				}
-				if i == best && addUsageTotal(doc, counter, c.delta) {
+				if taken && (i == best || c.delta == list[best].delta) {
 					c.entry.Marker = stamp
 					moved = true
 				}
@@ -313,14 +322,10 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 }
 
 // usageBodyAdvanced reports whether a body says anything the entry does not:
-// a different sample, or a start time the entry does not record. A body
-// without the gauge against a recorded start time is quiet when its sample is
-// unchanged.
+// what advanceUsageBaseline would change, asked of a copy.
 func usageBodyAdvanced(entry *usagePodEntry, s usageScrapedPod) bool {
-	if s.Sample != entry.Sample {
-		return true
-	}
-	return s.StartTime != nil && (entry.StartTime == nil || *s.StartTime != *entry.StartTime)
+	probe := *entry
+	return advanceUsageBaseline(&probe, s.Sample, s.StartTime)
 }
 
 // usageBranch classifies a known pod's body against its entry: the delta it
@@ -390,14 +395,14 @@ func addUsageTotal(doc *usageDocument, counter string, delta int64) bool {
 	return true
 }
 
-// latestSiblingMarker is the latest marker among the other live pods feeding
-// counter, as the document read them, and whether there is one.
+// latestSiblingMarker is the latest marker among the other pods feeding
+// counter, as the document read them (markers holds the live entries only),
+// and whether there is one.
 func latestSiblingMarker(doc *usageDocument, markers map[string]metav1.Time, uid, counter string) (metav1.Time, bool) {
 	var latest metav1.Time
 	found := false
 	for other, marker := range markers {
-		entry, live := doc.Pods[other]
-		if other == uid || !live || entry.Counter != counter {
+		if other == uid || doc.Pods[other].Counter != counter {
 			continue
 		}
 		if !found || marker.After(latest.Time) {

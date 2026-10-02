@@ -17,7 +17,6 @@ package controller
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -210,14 +209,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if err != nil {
 		return err
 	}
-	seed := usageSeed{
-		Totals: map[string]int64{
-			usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
-			usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
-		},
-		LastMoved: agent.Status.Usage.LastActiveTime,
-	}
-	result := foldUsage(doc, string(agent.UID), seed, live, scraped, now)
+	result := foldUsage(doc, string(agent.UID), usageStatusSeed(agent, now), live, scraped, now)
 	if result.Changed {
 		if err := p.writeDocument(ctx, agent, existing, result.Document); err != nil {
 			return err
@@ -372,11 +364,7 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 	if doc.Totals == nil || doc.Pods == nil {
 		return "no totals or no pods"
 	}
-	floors := map[string]int64{
-		usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
-		usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
-	}
-	for counter, floor := range floors {
+	for counter, floor := range usageStatusSeed(agent, now).Totals {
 		total, ok := doc.Totals[counter]
 		if !ok || total < 0 || total > usageTotalCeiling {
 			return "a total is outside its bounds"
@@ -399,11 +387,24 @@ func usageDocumentInvalid(doc *usageDocument, cm *corev1.ConfigMap, agent *agent
 	return ""
 }
 
-// usageStatusFloor is a status counter as the document's seed and as the
-// floor a stored total may not fall under. A value outside the document's own
-// bounds, which the operator never writes, is neither: taken as a floor it
-// would make every document invalid, and taken as a seed it would be written
-// into one that the next poll refuses, re-seeding the CR on every poll.
+// usageStatusSeed is the status as the document's seed and as the floors a
+// stored document may not fall under, built in one place so the two cannot
+// drift apart: a value the read-back would refuse, a counter outside the
+// document's bounds or a time after now, which the operator never writes, is
+// neither seed nor floor. Taken as a floor it would make every document
+// invalid, and taken as a seed it would be written into one that the next
+// poll refuses, re-seeding the CR, and adding nothing, on every poll.
+func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSeed {
+	seed := usageSeed{Totals: map[string]int64{
+		usageCounterToolExecutions: usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
+		usageCounterEventsIngested: usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
+	}}
+	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
+		seed.LastMoved = last.DeepCopy()
+	}
+	return seed
+}
+
 func usageStatusFloor(value int64) int64 {
 	if value < 0 || value > usageTotalCeiling {
 		return 0
@@ -499,11 +500,7 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1al
 
 	// The kind, and for a status kind the HTTP code: usageScrapeError's text
 	// is a closed vocabulary, never a byte the peer sent.
-	detail := usageErrorKind(err)
-	var scrape *usageScrapeError
-	if errors.As(err, &scrape) {
-		detail = scrape.Error()
-	}
+	detail := usageScrapeDetail(err)
 	if count == 1 {
 		log.Info("a metrics listener could not be read; its pod's baseline and the totals are unchanged until it recovers",
 			"pod", target.name, "counter", target.counter, "error", detail)

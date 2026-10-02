@@ -78,6 +78,7 @@ const (
 	usageScrapeKindRefused     = "connection refused"
 	usageScrapeKindTimeout     = "timeout"
 	usageScrapeKindUnreachable = "unreachable"
+	usageScrapeKindMalformed   = "malformed response"
 	usageScrapeKindStatus      = "status"
 	usageScrapeKindRead        = "read"
 	usageScrapeKindLine        = "line too long"
@@ -86,6 +87,9 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+	// netOpDial is the Op a *net.OpError carries for a failure before the
+	// connection existed; after it, the error is the peer's doing.
+	netOpDial = "dial"
 )
 
 var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
@@ -122,12 +126,13 @@ func (e *usageScrapeError) Error() string {
 	return e.Kind
 }
 
-// usageConnectKind classifies a client.Do error into the connection kinds:
-// what a reader of the event needs (refused, timed out, unreachable) without
-// the text net/http builds from the bytes it read.
+// usageConnectKind classifies a client.Do error by what happened rather than
+// where it surfaced: a timeout, a dial that was refused, unreachable or failed
+// otherwise, and for anything after the connection existed, a response net/http
+// could not parse, so the event points the reader at the peer rather than at a
+// policy. Never the text net/http builds from the bytes it read.
 func usageConnectKind(err error) string {
-	var netErr net.Error
-	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+	if usageTimedOut(err) {
 		return usageScrapeKindTimeout
 	}
 	if errors.Is(err, syscall.ECONNREFUSED) {
@@ -136,7 +141,19 @@ func usageConnectKind(err error) string {
 	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
 		return usageScrapeKindUnreachable
 	}
-	return usageScrapeKindConnect
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == netOpDial {
+		return usageScrapeKindConnect
+	}
+	return usageScrapeKindMalformed
+}
+
+// usageTimedOut reports whether err is a deadline or a network timeout, which
+// the client's timeout raises before the connection and, as the body's read
+// error, after it.
+func usageTimedOut(err error) bool {
+	var netErr net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout())
 }
 
 // usageSource reads a listener. The pod scraper is its one implementation; a
@@ -231,6 +248,10 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 		if errors.Is(err, bufio.ErrTooLong) {
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
 		}
+		if usageTimedOut(err) {
+			// The client's timeout firing mid-body: a slow listener, not a broken one.
+			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindTimeout}
+		}
 		// The body's read error can quote a trailer line; the kind is enough.
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead}
 	}
@@ -240,15 +261,19 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 	return usageReading{Sample: int64(sum), StartTime: start}, nil
 }
 
-// usageLineName is the metric name a sample line starts with, or "" for a
-// comment, a blank line, or a line with no name.
+// usageLineName is the metric name a sample line starts with, read the way
+// expfmt reads it: leading blanks skipped, then everything up to the label
+// set or the value. "" for a comment or a blank line. A line with no
+// separator is returned whole, so a bare wanted name reaches expfmt and
+// fails there rather than being skipped as another family.
 func usageLineName(line string) string {
+	line = strings.TrimLeft(line, " \t")
 	if line == "" || line[0] == '#' {
 		return ""
 	}
 	end := strings.IndexAny(line, "{ \t")
 	if end < 0 {
-		return ""
+		return line
 	}
 	return line[:end]
 }
@@ -271,11 +296,13 @@ func usageLabelValue(metric *dto.Metric, name string) string {
 	return ""
 }
 
-// usageErrorKind is the kind a failed scrape is logged under.
-func usageErrorKind(err error) string {
+// usageScrapeDetail is what a failed scrape is logged and recorded as: the
+// scrape error's closed vocabulary, or usageScrapeKindOther for an error of
+// another type.
+func usageScrapeDetail(err error) string {
 	var scrape *usageScrapeError
 	if errors.As(err, &scrape) {
-		return scrape.Kind
+		return scrape.Error()
 	}
 	return usageScrapeKindOther
 }

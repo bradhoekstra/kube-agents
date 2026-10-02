@@ -769,3 +769,31 @@ func TestUsagePoller_ACancelledPollRecordsNoFailure(t *testing.T) {
 	default:
 	}
 }
+
+// A status lastActiveTime after the poll's clock, a hand patch or a
+// predecessor leader's faster clock, is not seeded: the document is written
+// once with no last-moved time and left alone, and the next move stamps its
+// own poll.
+func TestUsagePoller_AFutureStatusTimeIsNotSeeded(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	future := metav1.NewTime(usageClock(5).Add(time.Hour))
+	agent.Status.Usage.LastActiveTime = &future
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.poll(5)
+	if doc := h.document(); doc.LastMoved != nil {
+		t.Fatalf("the future time was seeded: %+v", doc)
+	}
+	h.poll(10)
+	if h.cmWrites != 1 {
+		t.Fatalf("%d ConfigMap writes across two quiet polls, want 1: the document was re-seeded", h.cmWrites)
+	}
+	h.stub.set(brokerAddr(), 15, nil)
+	h.poll(15)
+	status := h.status()
+	if status.ToolExecutionsTotal != 5 || status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(15)) {
+		t.Fatalf("status after the move: %+v, want 5 and lastActiveTime at the poll", status)
+	}
+}
