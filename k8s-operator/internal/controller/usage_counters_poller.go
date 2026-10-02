@@ -60,6 +60,9 @@ const (
 	// usageScrapeFailingReason is the Warning event's reason.
 	usageScrapeFailingReason = "UsageScrapeFailing"
 	usagePollerLogName       = "usage-counters"
+	// gatewayAppSuffix completes the gateway pods' app label, <name>-gateway,
+	// the selector the gateway policy and the Ready writer use.
+	gatewayAppSuffix = "-gateway"
 	// usageDocumentPrecision is the precision the document keeps its times
 	// at, metav1.Time's, and the one a poll's time is truncated to so that
 	// the markers in memory and on the ConfigMap compare alike.
@@ -238,7 +241,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		port     string
 		read     bool
 	}{
-		{map[string]string{"app": agent.Name + "-gateway"}, usageCounterEventsIngested, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
+		{gatewayPodSelector(agent), usageCounterEventsIngested, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
 		{credentialProxySelector(agent), usageCounterToolExecutions, credentialProxyMetricsPortName, true},
 	}
 	live := map[string]bool{}
@@ -268,6 +271,12 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		}
 	}
 	return targets, live, nil
+}
+
+// gatewayPodSelector selects the gateway pods, the ones the gateway policy
+// covers and the watcher's listener runs in.
+func gatewayPodSelector(agent *agentv1alpha1.PlatformAgent) map[string]string {
+	return map[string]string{"app": agent.Name + gatewayAppSuffix}
 }
 
 // usagePodPort finds the container port named name on pod, looking through

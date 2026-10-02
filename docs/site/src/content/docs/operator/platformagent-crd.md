@@ -725,7 +725,7 @@ behind. They under-count rather than over-count: a listener that cannot be read 
 and its backlog is added when it is read again, but a backlog past the per-poll ceiling, an honest
 burst past it, or what a process counted after its last read and before it restarted, is lost once.
 A `lastActiveTime` that stops advancing while commands plainly run is the symptom of a listener the
-operator cannot reach; the CR's events name the pod. The other three counters stay absent until a
+operator cannot reach; the CR's events name the pod. The counters the table above marks as unwritten stay absent until a
 series exists for each
 ([what lands them](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md#what-stays-unwritten-and-what-lands-it)).
 
