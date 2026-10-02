@@ -2274,7 +2274,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	objs := []client.Object{
 		buildCredentialProxyService(agent),
 		proxy,
-		buildCredentialProxyNetworkPolicy(agent, r.OperatorNamespace),
+		credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace),
 	}
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {

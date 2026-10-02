@@ -729,3 +729,39 @@ func TestReconcileStampsTheRecordThePollerWaitsFor(t *testing.T) {
 		t.Fatal("forgetReconciled left the record")
 	}
 }
+
+// A ConfigMap without the document key, or with a document that does not
+// parse, is re-seeded rather than an error that would stop the poller for the
+// CR.
+func TestUsagePoller_ReseedsAMissingOrUnparsableDocument(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	cases := map[string]map[string]string{
+		"no document key":   {},
+		"unparsable JSON":   {usageCountersDocumentKey: "{not json"},
+		"a JSON non-object": {usageCountersDocumentKey: "[1, 2]"},
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			agent := usageTestAgent(created)
+			agent.Status.Usage.ToolExecutionsTotal = 3
+			cm := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: usageTestAgentName + usageCountersConfigMapSuffix, Namespace: usageTestNamespace},
+				Data:       data,
+			}
+			h := newUsageHarness(t, agent, append(usageDefaultObjects(created), cm)...)
+			h.stub.set(brokerAddr(), 40, nil)
+			h.stub.set(gatewayAddr(), 5, nil)
+			h.poll(10)
+			doc := h.document()
+			if !doc.FirstRecorded.Time.Equal(usageClock(10)) || doc.Totals[usageCounterToolExecutions] != 3 || doc.AgentUID != usageTestAgentUID {
+				t.Fatalf("not re-seeded: %+v", doc)
+			}
+			if doc.Pods["broker-b"] == nil || doc.Pods["broker-b"].Sample != 40 {
+				t.Fatalf("the broker was not recorded: %+v", doc.Pods)
+			}
+			if h.cmWrites != 1 {
+				t.Errorf("%d ConfigMap writes, want 1", h.cmWrites)
+			}
+		})
+	}
+}
