@@ -1,20 +1,24 @@
 """Tests for the tool_call_audit plugin.
 
-Every assertion here is really the same one: whatever this plugin hands to
-`logger.info` is what ends up in Cloud Logging, so the emitted JSON is the
-artifact under test — not the arguments it was called with.
+Every assertion here is really the same one: whatever this plugin appends to
+the profile's audit file is what ends up in Cloud Logging, so the written JSON
+line is the artifact under test — not the arguments it was called with.
 """
 
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from common import audit_sink  # noqa: E402
 from common.redactor import SALT_ENV_VAR, AuditRedactor  # noqa: E402
 
 import audit  # noqa: E402
@@ -27,6 +31,14 @@ class AuditTestCase(unittest.TestCase):
     def setUp(self):
         self._previous_salt = os.environ.get(SALT_ENV_VAR)
         os.environ[SALT_ENV_VAR] = "test-salt"
+        # A profile home of its own per test, with no logs/ directory yet: the
+        # plugin has to bring it into being on the first record.
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {audit_sink.HERMES_HOME_ENV: str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.audit_file = self.home / "logs" / "audit.jsonl"
 
     def tearDown(self):
         if self._previous_salt is None:
@@ -34,12 +46,23 @@ class AuditTestCase(unittest.TestCase):
         else:
             os.environ[SALT_ENV_VAR] = self._previous_salt
 
+    def lines(self):
+        if not self.audit_file.exists():
+            return []
+        return self.audit_file.read_text(encoding="utf-8").splitlines()
+
     def emit(self, call, *args, **kwargs):
-        """Run a hook and return the single JSON record it logged."""
-        with self.assertLogs(audit.logger, level="INFO") as captured:
+        """Run a hook and return the single JSON record it appended to the audit file.
+
+        Nothing may reach the Hermes logger on the way: the record is not in
+        agent.log any more, and an error there would mean the write failed.
+        """
+        before = len(self.lines())
+        with self.assertNoLogs(audit.logger, level="INFO"):
             self.assertIsNone(call(*args, **kwargs))
-        self.assertEqual(len(captured.records), 1)
-        return json.loads(captured.records[0].getMessage())
+        lines = self.lines()
+        self.assertEqual(len(lines), before + 1)
+        return json.loads(lines[-1])
 
 
 class TestSerialize(AuditTestCase):
@@ -110,6 +133,21 @@ class TestToolCallHooks(AuditTestCase):
         self.assertEqual(record["audit_event"], "tool_call_end")
         self.assertEqual(record["duration_ms"], 12.5)
         self.assertNotIn(EMAIL, record["result"])
+
+    def test_tool_call_records_carry_the_session_hermes_names(self):
+        # Hermes passes session_id to both tool hooks beside task_id. The file
+        # has no Hermes line prefix to read a `[session]` tag from, so the
+        # record is where a reader (the Admin Console's cron attribution) gets
+        # it now; a call outside any session carries an empty one.
+        start = self.emit(
+            audit.log_pre_tool_call, tool_name="Bash", args={}, task_id="t-1",
+            session_id="cron_capacity_20260728_190038",
+        )
+        self.assertEqual(start["session_id"], "cron_capacity_20260728_190038")
+        end = self.emit(audit.log_post_tool_call, tool_name="Bash", result="ok", session_id="s-2")
+        self.assertEqual(end["session_id"], "s-2")
+        bare = self.emit(audit.log_pre_tool_call, tool_name="Bash", args={})
+        self.assertEqual(bare["session_id"], "")
 
     def test_approval_hooks_redact_the_command(self):
         for call, event in (
@@ -205,18 +243,18 @@ class TestEnvelope(AuditTestCase):
         self.assertEqual((end["event_type"], end["tool"], end["status"], end["duration_ms"]), ("tool_call_end", "Bash", "completed", 7))
 
     def test_every_record_is_one_line_of_json(self):
-        for call, kwargs in (
+        calls = (
             (audit.log_pre_tool_call, {"tool_name": "Bash", "args": {"command": "echo\nhi"}}),
             (audit.log_post_tool_call, {"tool_name": "Bash", "result": "a\nb"}),
             (audit.log_pre_approval_request, {"command": "rm -rf /\n", "description": "d"}),
             (audit.log_post_approval_response, {"command": "x", "choice": "deny"}),
-        ):
-            with self.subTest(call=call.__name__):
-                with self.assertLogs(audit.logger, level="INFO") as captured:
-                    call(**kwargs)
-                line = captured.records[0].getMessage()
-                self.assertNotIn("\n", line)
-                json.loads(line)
+        )
+        for call, kwargs in calls:
+            call(**kwargs)
+        raw = self.audit_file.read_text(encoding="utf-8")
+        self.assertEqual(raw.count("\n"), len(calls), "one newline-terminated line per record")
+        for line in raw.splitlines():
+            self.assertIsInstance(json.loads(line), dict)
 
     def test_approvals_and_dispatch_carry_a_status_or_a_principal(self):
         request = self.emit(audit.log_pre_approval_request, command="x", description="d")
@@ -228,6 +266,33 @@ class TestEnvelope(AuditTestCase):
         dispatch = self.emit(audit.log_pre_gateway_dispatch, event=event)
         self.assertEqual(dispatch["principal"], AuditRedactor.hmac_hash(EMAIL))
         self.assertEqual(dispatch["principal"], dispatch["user_id"])
+
+
+class TestAuditFile(AuditTestCase):
+    """The record goes to the profile's own file, not through Hermes' logger."""
+
+    def test_the_file_is_under_the_profile_home_and_its_directory_is_created(self):
+        self.assertFalse(self.audit_file.parent.exists())
+        self.emit(audit.log_pre_tool_call, tool_name="Bash", args={})
+        self.assertEqual(self.audit_file, self.home / "logs" / "audit.jsonl")
+        self.assertTrue(self.audit_file.is_file())
+
+    def test_the_hermes_logger_carries_the_record_only_when_the_file_cannot(self):
+        # logs/ is a file, so the audit file cannot be opened or created. The
+        # record is not dropped: it goes to agent.log as the tail of an ERROR
+        # line naming the path, where it still reaches Cloud Logging as text.
+        self.audit_file.parent.write_text("not a directory")
+        with self.assertLogs(audit.logger, level="ERROR") as captured:
+            audit.log_pre_tool_call(tool_name="Bash", args={"command": "ls"}, task_id="t-1")
+        line = captured.output[0]
+        self.assertIn(str(self.audit_file), line)
+        record = json.loads(line[line.rindex("record: ") + len("record: "):])
+        self.assertEqual((record["audit_event"], record["tool"]), ("tool_call_start", "Bash"))
+
+    def test_a_record_the_envelope_refuses_is_not_written(self):
+        with self.assertRaises(ValueError):
+            audit._emit("tool_call_start", {"severity": "DEBUG"})
+        self.assertFalse(self.audit_file.exists())
 
 
 if __name__ == "__main__":

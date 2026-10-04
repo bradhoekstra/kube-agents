@@ -1,4 +1,3 @@
-import json
 import logging
 import sys
 from pathlib import Path
@@ -12,6 +11,7 @@ _PLUGINS_DIR = str(Path(__file__).resolve().parents[2] / "plugins")
 if _PLUGINS_DIR not in sys.path:
     sys.path.insert(0, _PLUGINS_DIR)
 
+from common import audit_sink  # noqa: E402
 from common.audit_schema import envelope  # noqa: E402
 from common.redactor import AuditRedactor  # noqa: E402
 
@@ -50,7 +50,9 @@ def _emit(audit_event: str, context: Dict[str, Any]) -> None:
         record["iteration"] = ctx.get("iteration")
     if "tool_names" in ctx:
         record["tool_names"] = ctx.get("tool_names")
-    logger.info(json.dumps(record, default=str, sort_keys=True))
+    # One JSON object per line of the profile's audit file (common/audit_sink.py),
+    # which the fluent-bit sidecar tails as JSON.
+    audit_sink.emit(record, logger)
 
 
 async def handle(event_type: str, context: Dict[str, Any]) -> None:

@@ -2,19 +2,25 @@
 
 This hook sits on `agent:start` / `agent:end` / `agent:step`, so it sees the
 user's raw prompt and the agent's raw reply — the two places a credential
-pasted into chat is most likely to appear in a log.
+pasted into chat is most likely to appear in a log. What it appends to the
+profile's audit file is what ends up in Cloud Logging, so that line is the
+artifact under test.
 """
 
 import asyncio
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "plugins"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from common import audit_sink  # noqa: E402
 from common.redactor import SALT_ENV_VAR, AuditRedactor  # noqa: E402
 
 import handler  # noqa: E402
@@ -27,6 +33,14 @@ class HandlerTestCase(unittest.TestCase):
     def setUp(self):
         self._previous_salt = os.environ.get(SALT_ENV_VAR)
         os.environ[SALT_ENV_VAR] = "test-salt"
+        # A profile home of its own per test, with no logs/ directory yet: the
+        # hook has to bring it into being on the first record.
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {audit_sink.HERMES_HOME_ENV: str(self.home)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.audit_file = self.home / "logs" / "audit.jsonl"
 
     def tearDown(self):
         if self._previous_salt is None:
@@ -34,11 +48,23 @@ class HandlerTestCase(unittest.TestCase):
         else:
             os.environ[SALT_ENV_VAR] = self._previous_salt
 
+    def lines(self):
+        if not self.audit_file.exists():
+            return []
+        return self.audit_file.read_text(encoding="utf-8").splitlines()
+
     def emit(self, event_type, context):
-        with self.assertLogs(handler.logger, level="INFO") as captured:
+        """Run the hook and return the single record it appended to the audit file.
+
+        Nothing may reach the Hermes logger on the way: the record is not in
+        agent.log any more, and an error there would mean the write failed.
+        """
+        before = len(self.lines())
+        with self.assertNoLogs(handler.logger, level="INFO"):
             asyncio.run(handler.handle(event_type, context))
-        self.assertEqual(len(captured.records), 1)
-        return json.loads(captured.records[0].getMessage())
+        lines = self.lines()
+        self.assertEqual(len(lines), before + 1)
+        return json.loads(lines[-1])
 
 
 class TestEventRouting(HandlerTestCase):
@@ -54,9 +80,10 @@ class TestEventRouting(HandlerTestCase):
                 self.assertEqual(record["audit_event"], audit_event)
                 self.assertEqual(record["session_id"], "sess-1")
 
-    def test_an_unknown_event_type_logs_nothing(self):
+    def test_an_unknown_event_type_writes_nothing(self):
         with self.assertNoLogs(handler.logger, level="INFO"):
             asyncio.run(handler.handle("agent:something-new", {"session_id": "sess-1"}))
+        self.assertFalse(self.audit_file.exists())
 
     def test_a_missing_context_does_not_raise(self):
         record = self.emit("agent:start", None)
@@ -72,6 +99,7 @@ class TestEventRouting(HandlerTestCase):
             # Non-empty: an empty mapping is falsy and never reaches `.get`.
             asyncio.run(handler.handle("agent:start", Hostile(session_id="s")))
         self.assertIn("chat_message_audit", captured.output[0])
+        self.assertFalse(self.audit_file.exists(), "a refused record is not written")
 
 
 class TestRedaction(HandlerTestCase):
@@ -143,11 +171,35 @@ class TestEnvelope(HandlerTestCase):
         self.assertEqual(record["principal"], record["user_id"])
 
     def test_every_record_is_one_line_of_json(self):
-        with self.assertLogs(handler.logger, level="INFO") as captured:
-            asyncio.run(handler.handle("agent:end", {"response": "line one\nline two", "session_id": "s"}))
-        line = captured.records[0].getMessage()
-        self.assertNotIn("\n", line)
-        self.assertEqual(json.loads(line)["response"], "line one\nline two")
+        asyncio.run(handler.handle("agent:end", {"response": "line one\nline two", "session_id": "s"}))
+        asyncio.run(handler.handle("agent:start", {"message": "a\nb", "session_id": "s"}))
+        raw = self.audit_file.read_text(encoding="utf-8")
+        self.assertEqual(raw.count("\n"), 2, "one newline-terminated line per record")
+        first, second = raw.splitlines()
+        self.assertEqual(json.loads(first)["response"], "line one\nline two")
+        self.assertEqual(json.loads(second)["message"], "a\nb")
+
+
+class TestAuditFile(HandlerTestCase):
+    """The record goes to the profile's own file, not through Hermes' logger."""
+
+    def test_the_file_is_under_the_profile_home_and_its_directory_is_created(self):
+        self.assertFalse(self.audit_file.parent.exists())
+        self.emit("agent:start", {"session_id": "s"})
+        self.assertEqual(self.audit_file, self.home / "logs" / "audit.jsonl")
+        self.assertTrue(self.audit_file.is_file())
+
+    def test_the_hermes_logger_carries_the_record_only_when_the_file_cannot(self):
+        # logs/ is a file, so the audit file cannot be opened or created. The
+        # record is not dropped: it goes to agent.log as the tail of an ERROR
+        # line naming the path, where it still reaches Cloud Logging as text.
+        self.audit_file.parent.write_text("not a directory")
+        with self.assertLogs(handler.logger, level="ERROR") as captured:
+            asyncio.run(handler.handle("agent:end", {"session_id": "s", "response": "done"}))
+        line = captured.output[0]
+        self.assertIn(str(self.audit_file), line)
+        record = json.loads(line[line.rindex("record: ") + len("record: "):])
+        self.assertEqual((record["audit_event"], record["response"]), ("chat_message_end", "done"))
 
 
 if __name__ == "__main__":
