@@ -412,6 +412,73 @@ class TelemetryNormalizationTest(unittest.TestCase):
         self.assertEqual(event.agent_name, "gateway-runtime")
         self.assertEqual(event.details["collector_container"], "fluent-bit")
 
+    def test_normalizes_a_record_the_agent_printed_when_the_file_could_not_take_it(self):
+        # The fallback shape: the emitter printed the record to its stdout, so
+        # the GKE log agent shipped it from the agent container, not the
+        # sidecar. Same keys, no sidecar stamp, no line.
+        row = {
+            "insertId": "log-stdout",
+            "timestamp": "2026-07-28T19:07:04Z",
+            "logName": "projects/demo/logs/stdout",
+            "resource": {
+                "labels": {
+                    "cluster_name": "test-cluster-01",
+                    "namespace_name": "kubeagents-system",
+                    "container_name": "platform-agent",
+                }
+            },
+            "jsonPayload": {
+                "audit_event": "tool_call_end",
+                "event_type": "tool_call_end",
+                "severity": "INFO",
+                "timestamp": "2026-07-28T19:07:04.711Z",
+                "tool_name": "terminal",
+                "tool": "terminal",
+                "status": "completed",
+                "task_id": "task-1",
+                "session_id": "cron_capacity_20260728_190038",
+                "duration_ms": 711,
+                "result": '{"exit_code": 0}',
+            },
+        }
+
+        event = normalize_logging_row(row, "demo-project")
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.trigger_kind, TriggerKind.CRON)
+        self.assertEqual(event.session_id, "cron_capacity_20260728_190038")
+        self.assertEqual(event.interaction_id, "task-1")
+        self.assertEqual(event.status, "completed")
+        self.assertEqual(event.agent_name, "platform-agent")
+        self.assertNotIn("collector_container", event.details)
+
+    def test_a_bracket_group_in_a_text_prefix_does_not_shadow_the_records_session(self):
+        # A wrapped line whose prefix carries a bracket group that is not a
+        # session tag. The record's own session_id decides the attribution.
+        row = {
+            "insertId": "log-errno",
+            "timestamp": "2026-07-28T19:07:04Z",
+            "logName": "projects/demo/logs/stdout",
+            "resource": {"labels": {"container_name": "fluent-bit"}},
+            "jsonPayload": {
+                "log": (
+                    "2026-07-28 19:07:04,711 ERROR hermes.plugin.tool_call_audit: "
+                    "could not open /opt/data/logs/audit.jsonl ([Errno 28] No space left on device); "
+                    'record: {"audit_event":"tool_call_end","session_id":"cron_capacity_20260728_190038",'
+                    '"task_id":"task-1","tool_name":"terminal","status":"completed"}'
+                )
+            },
+        }
+
+        event = normalize_logging_row(row, "demo-project")
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.trigger_kind, TriggerKind.CRON)
+        self.assertEqual(event.attribution, AttributionLevel.INHERITED)
+        self.assertEqual(event.session_id, "cron_capacity_20260728_190038")
+
     def test_normalizes_wrapped_cron_tool_audit(self):
         row = {
             "insertId": "log-one",

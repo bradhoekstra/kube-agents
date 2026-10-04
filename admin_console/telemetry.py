@@ -234,9 +234,11 @@ def _logging_payload(row: dict[str, Any]) -> tuple[dict[str, Any], str]:
     line still under ``log``, which the fluent-bit sidecar in the gateway pod
     wrote while it lifted records out of ``agent.log``. Tailed: the keys as
     fields and no raw line at all, which the sidecar writes from the profile's
-    own audit file. The prefix carries Hermes' ``[session]`` tag, the only
-    attribution a cron job's tool call had before the record carried its
-    ``session_id`` itself, so it is read from the raw line wherever there is one.
+    own audit file, and which the agent container itself writes, as one JSON
+    line on its stdout, for a record the emitter could not write to that file.
+    The prefix carries Hermes' ``[session]`` tag, the only attribution a cron
+    job's tool call had before the record carried its ``session_id`` itself,
+    so it is read from the raw line wherever there is one.
     """
     direct = row.get("jsonPayload")
     candidate = ""
@@ -289,9 +291,10 @@ def normalize_logging_row(
     )
     context_match = _CONTEXT.search(prefix)
     context = context_match.group("context") if context_match else ""
-    # A record tailed from the audit file has no line prefix; the session it
-    # ran under is then a field of its own, and a cron session names itself.
-    trigger, attribution = _logging_trigger(payload, context or _first(payload, "session_id"))
+    # The record's own session first: a record tailed from the audit file has
+    # no line prefix, and a text line's prefix can carry a bracket group that
+    # is not a session tag (`[Errno 28]`). A cron session names itself.
+    trigger, attribution = _logging_trigger(payload, _first(payload, "session_id") or context)
     timestamp = _parse_time(
         payload.get("occurred_at"),
         _parse_time(row.get("timestamp"), datetime.now(UTC)),
