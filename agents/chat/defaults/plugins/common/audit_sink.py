@@ -19,28 +19,47 @@ pointing at its own profile — so the file follows the record to
 ``/opt/data/logs/`` for the front door and ``/opt/data/profiles/<name>/logs/``
 for a named profile, the same ``logs/`` Hermes routes its own ``agent.log``
 to. Outside a Hermes process (the unit tests) ``HERMES_HOME`` alone decides.
+A missing ``logs/`` is made the way Hermes makes its own, through
+``mkdir_under_hermes_home``, which refuses a named profile that is missing or
+tombstoned, so an emitter cannot bring a pruned profile's directory back.
 
-Every write opens the file itself, append-only, and closes it: the kernel
-orders appends from the gateway and its worker processes without a shared
-handle, and nothing is held open across a rotation. Rotation is the emitters'
-own: at the cap the file is renamed to ``.1`` (``.2``, ``.3``), the numbers
-Hermes uses for its ``agent.log``, so the volume holds a bounded trail and the
-sidecar, which keeps a rotated file open for its ``Rotate_Wait``, loses
-nothing it had already begun reading. Two processes reaching the cap together
-rotate twice; the second rename can move a file the sidecar had not yet
-opened, and its few records then stay on the volume in ``.1`` unshipped. That
-is the one window this design accepts, and no write is ever lost from the
-live file.
+Every write opens the file itself, append-only, and closes it, under an
+exclusive ``flock`` on ``audit.jsonl.lock`` beside it. The gateway and its
+worker processes share a profile's file and no handle, and the lock is what
+orders them through a rotation and the write that follows it: no two writers
+rotate at once, and a live file one of them has just created is never moved
+by another. Rotation is the emitters' own: at the cap the file is renamed to
+``.1`` (``.2``, ``.3``), the numbers Hermes uses for its ``agent.log``, so the
+volume holds a bounded trail. The sidecar keeps a rotated inode open for its
+``Rotate_Wait`` (30 s) and opens the new live file on its next refresh (5 s),
+so the one way a record goes unshipped is a sidecar more than 30 s behind the
+file at the moment it rotates.
+
+When the file cannot take a record — a full or read-only volume, a profile
+Hermes refuses to materialise — the record is printed to this process's
+stdout as the same one JSON line, and an ERROR naming the file and the error,
+carrying neither the record nor its keys, goes to Hermes' logger. What that
+stdout reaches depends on the process. From the gateway it is the container
+log, which the GKE log agent ships to Cloud Logging as ``jsonPayload`` under
+the agent container, so ``jsonPayload.audit_event:*`` and the Admin Console's
+field-form query still find the record. From a kanban worker it is the
+worker's captured stdout, the board's ``logs/<task>.log`` on the same volume,
+and not Cloud Logging; on a full volume that write fails too, and the record
+is gone with the ERROR as the only trace.
 """
 
+import fcntl
 import json
 import logging
 import os
-import threading
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 AUDIT_FILE_NAME = "audit.jsonl"
+# Appended to the audit file's name for the lock file beside it: outside both
+# globs the sidecar tails, `audit.jsonl` and `*.log`.
+AUDIT_LOCK_FILE_SUFFIX = ".lock"
 LOGS_DIR_NAME = "logs"
 HERMES_HOME_ENV = "HERMES_HOME"
 # What the agent image sets HERMES_HOME to, and the default every script in
@@ -57,10 +76,6 @@ AUDIT_FILE_MAX_BYTES = 5 * 1024 * 1024
 AUDIT_FILE_BACKUP_COUNT = 3
 _OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT
 _ENCODING = "utf-8"
-
-# Serialises rotation and the write that follows it within one process. Other
-# processes writing the same file are ordered by O_APPEND, not by this lock.
-_write_lock = threading.Lock()
 
 
 def hermes_home() -> Path:
@@ -82,6 +97,11 @@ def audit_file_path(home: Optional[Path] = None) -> Path:
     return (home or hermes_home()) / LOGS_DIR_NAME / AUDIT_FILE_NAME
 
 
+def lock_file_path(path: Path) -> Path:
+    """The lock file beside the audit file at ``path``."""
+    return path.with_name(path.name + AUDIT_LOCK_FILE_SUFFIX)
+
+
 def serialize(record: Dict[str, Any]) -> str:
     """One line: the object with sorted keys, every newline inside a value escaped."""
     return json.dumps(record, default=str, sort_keys=True)
@@ -90,11 +110,18 @@ def serialize(record: Dict[str, Any]) -> str:
 def append_line(line: str, path: Optional[Path] = None) -> Path:
     """Append ``line`` and a newline to the audit file, creating or rotating it as needed.
 
-    Returns the path written. Raises ``OSError`` when the file cannot be written.
+    Returns the path written. Raises when the file cannot be written: ``OSError``
+    from the volume, or Hermes' ``FileNotFoundError`` for a named profile it
+    refuses to materialise.
     """
     path = path or audit_file_path()
     data = (line + "\n").encode(_ENCODING)
-    with _write_lock:
+    # The lock file is opened first, so a missing logs/ is made here. flock is
+    # held by the open file description, so two threads of one process contend
+    # on it exactly as two processes do, and closing the descriptor releases it.
+    lock_fd = _open(lock_file_path(path))
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         _rotate_if_full(path, len(data))
         fd = _open(path)
         try:
@@ -103,22 +130,38 @@ def append_line(line: str, path: Optional[Path] = None) -> Path:
                 view = view[os.write(fd, view):]
         finally:
             os.close(fd)
+    finally:
+        os.close(lock_fd)
     return path
 
 
 def emit(record: Dict[str, Any], logger: logging.Logger) -> None:
-    """Append ``record`` to the audit file, or hand it to ``logger`` when the file cannot take it.
+    """Append ``record`` to the audit file, or print it to this process's stdout when the file cannot take it.
 
-    The fallback is one ERROR line naming the path and ending in the record, so
-    a file that cannot be written is visible in Hermes' ``agent.log`` and the
-    record still reaches Cloud Logging as text — the shape the Admin Console
-    reads as "wrapped" — instead of disappearing.
+    The stdout line is the same JSON object, so from the gateway process the
+    GKE log agent ships it to Cloud Logging as ``jsonPayload`` under the agent
+    container and ``jsonPayload.audit_event:*`` still finds it; from a kanban
+    worker it reaches the board's ``logs/<task>.log`` and not Cloud Logging.
+    The ERROR that accompanies it names the file and the error and carries
+    neither the record nor its keys, so the console's text-form query does
+    not count it and nothing ships twice.
     """
     line = serialize(record)
     try:
         append_line(line)
-    except OSError as exc:
-        logger.error("audit record not written to %s (%s); record: %s", audit_file_path(), exc, line)
+        return
+    except Exception as exc:
+        failure = exc
+    path = audit_file_path()
+    try:
+        print(line, file=sys.stdout, flush=True)
+    except Exception as stdout_failure:
+        logger.error(
+            "audit record not written to %s (%s) and not printed to stdout (%s); the record is lost",
+            path, failure, stdout_failure,
+        )
+        return
+    logger.error("audit record not written to %s (%s); printed to this process's stdout instead", path, failure)
 
 
 def _open(path: Path) -> int:
@@ -127,8 +170,23 @@ def _open(path: Path) -> int:
     except FileNotFoundError:
         # The first record of a profile can come before anything made its
         # logs/ directory; Hermes' own setup makes it later for agent.log.
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _make_directory(path.parent)
         return os.open(path, _OPEN_FLAGS, AUDIT_FILE_MODE)
+
+
+def _make_directory(directory: Path) -> None:
+    """Make ``directory`` the way Hermes would; plainly outside Hermes.
+
+    ``mkdir_under_hermes_home`` refuses a named profile home that is missing or
+    tombstoned, so a record emitted after a profile was pruned cannot bring its
+    directory back; its refusal propagates and the record takes the stdout path.
+    """
+    try:
+        from hermes_constants import mkdir_under_hermes_home
+    except ImportError:
+        directory.mkdir(parents=True, exist_ok=True)
+        return
+    mkdir_under_hermes_home(directory)
 
 
 def _rotated(path: Path, index: int) -> Path:
@@ -136,7 +194,10 @@ def _rotated(path: Path, index: int) -> Path:
 
 
 def _rotate_if_full(path: Path, incoming: int) -> None:
-    """Shift the backups and rename the live file aside when ``incoming`` bytes would pass the cap."""
+    """Shift the backups and rename the live file aside when ``incoming`` bytes would pass the cap.
+
+    Called with the lock held, so the size read here is the size written to.
+    """
     try:
         size = os.stat(path).st_size
     except FileNotFoundError:
@@ -150,6 +211,6 @@ def _rotate_if_full(path: Path, incoming: int) -> None:
                 os.replace(older, _rotated(path, index))
         os.replace(path, _rotated(path, 1))
     except OSError:
-        # Another process rotated first, or a backup could not be moved. The
-        # write goes ahead into whatever file is live rather than being lost.
+        # A backup that cannot be moved must not cost the record: the write
+        # goes ahead into whatever file is live.
         pass

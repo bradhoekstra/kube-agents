@@ -2518,10 +2518,22 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	for _, path := range []string{
 		"/opt/data/logs/agent.log",
 		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/logs/audit.jsonl.lock",
 		"/opt/data/profiles/platform/logs/agent.log",
 	} {
 		if fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
 			t.Errorf("the audit input reaches %s, which is not an audit file", path)
+		}
+	}
+	// Nor does Hermes' text input reach the audit file, its backups or the
+	// emitters' lock file beside it.
+	for _, path := range []string{
+		"/opt/data/logs/audit.jsonl",
+		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/logs/audit.jsonl.lock",
+	} {
+		if fluentBitPathMatches(t, "/opt/data/logs/*.log", path) {
+			t.Errorf("the agent.logs input reaches %s", path)
 		}
 	}
 
@@ -2591,6 +2603,10 @@ func TestFluentBitAuditFileNameMatchesTheEmitters(t *testing.T) {
 	for _, want := range []string{
 		fmt.Sprintf("AUDIT_FILE_NAME = %q", auditFileName),
 		`LOGS_DIR_NAME = "logs"`,
+		// The lock file beside the audit file has to stay outside both tail globs
+		// above, which the negative cases in TestFluentBitTailsTheAuditFileAsJSON
+		// check against this suffix.
+		`AUDIT_LOCK_FILE_SUFFIX = ".lock"`,
 	} {
 		if !strings.Contains(string(raw), want) {
 			t.Errorf("%s does not declare %s; the sidecar would tail a file the emitters never write", path, want)

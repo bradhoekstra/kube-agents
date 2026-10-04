@@ -8,11 +8,14 @@ artifact under test.
 """
 
 import asyncio
+import contextlib
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -60,8 +63,10 @@ class HandlerTestCase(unittest.TestCase):
         agent.log any more, and an error there would mean the write failed.
         """
         before = len(self.lines())
-        with self.assertNoLogs(handler.logger, level="INFO"):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), self.assertNoLogs(handler.logger, level="INFO"):
             asyncio.run(handler.handle(event_type, context))
+        self.assertEqual(printed.getvalue(), "", "the stdout fallback fired on a writable file")
         lines = self.lines()
         self.assertEqual(len(lines), before + 1)
         return json.loads(lines[-1])
@@ -189,17 +194,37 @@ class TestAuditFile(HandlerTestCase):
         self.assertEqual(self.audit_file, self.home / "logs" / "audit.jsonl")
         self.assertTrue(self.audit_file.is_file())
 
-    def test_the_hermes_logger_carries_the_record_only_when_the_file_cannot(self):
+    def test_the_record_goes_to_stdout_when_the_file_cannot_take_it(self):
         # logs/ is a file, so the audit file cannot be opened or created. The
-        # record is not dropped: it goes to agent.log as the tail of an ERROR
-        # line naming the path, where it still reaches Cloud Logging as text.
+        # record is not dropped: it is printed to this process's stdout as the
+        # same JSON line (the container log, from the gateway), and the ERROR
+        # that goes to agent.log names the path and nothing of the record.
         self.audit_file.parent.write_text("not a directory")
-        with self.assertLogs(handler.logger, level="ERROR") as captured:
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), self.assertLogs(handler.logger, level="ERROR") as captured:
             asyncio.run(handler.handle("agent:end", {"session_id": "s", "response": "done"}))
-        line = captured.output[0]
-        self.assertIn(str(self.audit_file), line)
-        record = json.loads(line[line.rindex("record: ") + len("record: "):])
+        record = json.loads(printed.getvalue())
         self.assertEqual((record["audit_event"], record["response"]), ("chat_message_end", "done"))
+        notice = captured.output[0]
+        self.assertIn(str(self.audit_file), notice)
+        self.assertNotIn("audit_event", notice)
+        self.assertNotIn("done", notice)
+
+    def test_the_write_leaves_the_event_loop(self):
+        # The hook runs on the gateway's loop; the file write must not.
+        loop_thread = threading.current_thread()
+        writer_threads = []
+        real_emit = audit_sink.emit
+
+        def record_thread(record, logger):
+            writer_threads.append(threading.current_thread())
+            return real_emit(record, logger)
+
+        with mock.patch.object(audit_sink, "emit", side_effect=record_thread):
+            asyncio.run(handler.handle("agent:start", {"session_id": "s"}))
+        self.assertEqual(len(writer_threads), 1)
+        self.assertIsNot(writer_threads[0], loop_thread)
+        self.assertEqual(len(self.lines()), 1)
 
 
 if __name__ == "__main__":

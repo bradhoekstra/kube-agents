@@ -5,6 +5,8 @@ the profile's audit file is what ends up in Cloud Logging, so the written JSON
 line is the artifact under test — not the arguments it was called with.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -58,8 +60,10 @@ class AuditTestCase(unittest.TestCase):
         agent.log any more, and an error there would mean the write failed.
         """
         before = len(self.lines())
-        with self.assertNoLogs(audit.logger, level="INFO"):
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), self.assertNoLogs(audit.logger, level="INFO"):
             self.assertIsNone(call(*args, **kwargs))
+        self.assertEqual(printed.getvalue(), "", "the stdout fallback fired on a writable file")
         lines = self.lines()
         self.assertEqual(len(lines), before + 1)
         return json.loads(lines[-1])
@@ -277,17 +281,21 @@ class TestAuditFile(AuditTestCase):
         self.assertEqual(self.audit_file, self.home / "logs" / "audit.jsonl")
         self.assertTrue(self.audit_file.is_file())
 
-    def test_the_hermes_logger_carries_the_record_only_when_the_file_cannot(self):
+    def test_the_record_goes_to_stdout_when_the_file_cannot_take_it(self):
         # logs/ is a file, so the audit file cannot be opened or created. The
-        # record is not dropped: it goes to agent.log as the tail of an ERROR
-        # line naming the path, where it still reaches Cloud Logging as text.
+        # record is not dropped: it is printed to this process's stdout as the
+        # same JSON line (the container log, from the gateway), and the ERROR
+        # that goes to agent.log names the path and nothing of the record.
         self.audit_file.parent.write_text("not a directory")
-        with self.assertLogs(audit.logger, level="ERROR") as captured:
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed), self.assertLogs(audit.logger, level="ERROR") as captured:
             audit.log_pre_tool_call(tool_name="Bash", args={"command": "ls"}, task_id="t-1")
-        line = captured.output[0]
-        self.assertIn(str(self.audit_file), line)
-        record = json.loads(line[line.rindex("record: ") + len("record: "):])
+        record = json.loads(printed.getvalue())
         self.assertEqual((record["audit_event"], record["tool"]), ("tool_call_start", "Bash"))
+        notice = captured.output[0]
+        self.assertIn(str(self.audit_file), notice)
+        self.assertNotIn("audit_event", notice)
+        self.assertNotIn("Bash", notice)
 
     def test_a_record_the_envelope_refuses_is_not_written(self):
         with self.assertRaises(ValueError):

@@ -1,5 +1,10 @@
-"""The audit file: where it is, one object per line, created on demand, rotated at the cap."""
+"""The audit file: where it is, one object per line, created on demand, locked, rotated at the cap,
+and where a record goes when the file cannot take it."""
 
+import contextlib
+import fcntl
+import fnmatch
+import io
 import json
 import logging
 import os
@@ -7,6 +12,8 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -17,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from common import audit_sink  # noqa: E402
 
 LOGGER = logging.getLogger("test.audit_sink")
+# The two globs the sidecar tails, as basenames (buildFluentBitConfigMap).
+SIDECAR_GLOBS = ("audit.jsonl", "*.log")
 
 
 class SinkTestCase(unittest.TestCase):
@@ -30,12 +39,16 @@ class SinkTestCase(unittest.TestCase):
         # These tests do not run inside Hermes; nothing may answer for it.
         self.addCleanup(self._restore_hermes_constants, sys.modules.pop("hermes_constants", None))
         self.path = self.home / "logs" / "audit.jsonl"
+        self.lock = self.home / "logs" / "audit.jsonl.lock"
 
     @staticmethod
     def _restore_hermes_constants(module):
         sys.modules.pop("hermes_constants", None)
         if module is not None:
             sys.modules["hermes_constants"] = module
+
+    def fake_hermes(self, **attributes):
+        sys.modules["hermes_constants"] = types.SimpleNamespace(**attributes)
 
     def lines(self):
         return self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
@@ -47,19 +60,20 @@ class TestWhereTheFileIs(SinkTestCase):
         self.assertEqual(audit_sink.audit_file_path(), self.path)
         self.assertEqual(audit_sink.audit_file_path(Path("/opt/data/profiles/platform")),
                          Path("/opt/data/profiles/platform/logs/audit.jsonl"))
+        self.assertEqual(audit_sink.lock_file_path(self.path), self.lock)
 
     def test_hermes_names_the_home_when_the_process_is_hermes(self):
         # Inside Hermes, get_hermes_home() carries the profile the gateway is
         # serving a turn for, which HERMES_HOME alone does not.
         served = self.home / "profiles" / "platform"
-        sys.modules["hermes_constants"] = types.SimpleNamespace(get_hermes_home=lambda: served)
+        self.fake_hermes(get_hermes_home=lambda: served)
         self.assertEqual(audit_sink.audit_file_path(), served / "logs" / "audit.jsonl")
 
     def test_a_failing_hermes_lookup_falls_back_to_the_environment(self):
         def broken():
             raise RuntimeError("no profile")
 
-        sys.modules["hermes_constants"] = types.SimpleNamespace(get_hermes_home=broken)
+        self.fake_hermes(get_hermes_home=broken)
         self.assertEqual(audit_sink.audit_file_path(), self.path)
 
     def test_without_either_the_image_default_applies(self):
@@ -81,30 +95,107 @@ class TestAppending(SinkTestCase):
         self.assertEqual(json.loads(first), {"a": "x\ny", "b": 1})
         self.assertEqual(json.loads(second), {"audit_event": "e"})
 
-    def test_the_file_is_owner_writable_and_group_readable_only(self):
+    def test_the_files_are_owner_writable_and_group_readable_only(self):
         previous = os.umask(0o002)
         self.addCleanup(os.umask, previous)
         audit_sink.append_line("{}")
-        self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode), 0o640)
+        for path in (self.path, self.lock):
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o640, path)
+
+    def test_the_lock_file_sits_beside_the_audit_file_outside_the_sidecar_globs(self):
+        audit_sink.append_line("{}")
+        self.assertTrue(self.lock.is_file())
+        for pattern in SIDECAR_GLOBS:
+            self.assertFalse(fnmatch.fnmatch(self.lock.name, pattern), pattern)
+        self.assertTrue(fnmatch.fnmatch(self.path.name, SIDECAR_GLOBS[0]))
+
+    def test_a_write_waits_for_the_lock_another_writer_holds(self):
+        # Another process mid-rotation: it holds the lock, and this write has
+        # to wait for it rather than race it.
+        self.path.parent.mkdir(parents=True)
+        holder = os.open(self.lock, os.O_WRONLY | os.O_CREAT, 0o640)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        writer = threading.Thread(target=audit_sink.append_line, args=("{}",))
+        writer.start()
+        time.sleep(0.2)
+        self.assertEqual(self.lines(), [], "the write went ahead while another writer held the lock")
+        fcntl.flock(holder, fcntl.LOCK_UN)
+        writer.join(timeout=5)
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(self.lines(), ["{}"])
+
+    def test_hermes_makes_the_directory_when_the_process_is_hermes(self):
+        made = []
+
+        def mkdir_under_hermes_home(directory):
+            made.append(Path(directory))
+            Path(directory).mkdir(parents=True, exist_ok=True)
+            return Path(directory)
+
+        self.fake_hermes(get_hermes_home=lambda: self.home, mkdir_under_hermes_home=mkdir_under_hermes_home)
+        audit_sink.append_line("{}")
+        self.assertEqual(made, [self.path.parent])
+        self.assertEqual(self.lines(), ["{}"])
 
     def test_an_unencodable_value_is_rendered_not_refused(self):
         line = audit_sink.serialize({"obj": object()})
         self.assertIn("<object object at", json.loads(line)["obj"])
 
-    def test_emit_writes_the_record_and_nothing_to_the_logger(self):
+
+class TestEmit(SinkTestCase):
+
+    def emit(self, record):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            audit_sink.emit(record, LOGGER)
+        return out.getvalue()
+
+    def test_the_record_goes_to_the_file_and_nowhere_else(self):
         with self.assertNoLogs(LOGGER, level="INFO"):
-            audit_sink.emit({"audit_event": "x", "n": 1}, LOGGER)
+            printed = self.emit({"audit_event": "x", "n": 1})
+        self.assertEqual(printed, "")
         self.assertEqual([json.loads(line) for line in self.lines()], [{"audit_event": "x", "n": 1}])
 
-    def test_emit_hands_the_record_to_the_logger_when_the_file_cannot_be_written(self):
+    def test_a_record_the_file_cannot_take_is_printed_to_stdout(self):
         self.home.joinpath("logs").write_text("not a directory")
         with self.assertLogs(LOGGER, level="ERROR") as captured:
+            printed = self.emit({"audit_event": "x", "tool": "Bash"})
+        # The record, whole, as the one line stdout receives.
+        self.assertEqual(printed, '{"audit_event": "x", "tool": "Bash"}\n')
+        # The notice names the file and the error and nothing of the record,
+        # so the console's text-form query does not count it.
+        notice = captured.output[0]
+        self.assertIn(str(self.path), notice)
+        self.assertIn("Not a directory", notice)
+        self.assertNotIn("audit_event", notice)
+        self.assertNotIn("Bash", notice)
+
+    def test_a_directory_hermes_refuses_sends_the_record_to_stdout(self):
+        # What mkdir_under_hermes_home raises for a missing or tombstoned
+        # named profile (hermes_constants.assert_named_profile_home_live).
+        def refuse(directory):
+            raise FileNotFoundError(f"Named profile home does not exist: {directory}")
+
+        self.fake_hermes(get_hermes_home=lambda: self.home, mkdir_under_hermes_home=refuse)
+        with self.assertLogs(LOGGER, level="ERROR") as captured:
+            printed = self.emit({"audit_event": "x"})
+        self.assertEqual(printed, '{"audit_event": "x"}\n')
+        self.assertIn("Named profile home does not exist", captured.output[0])
+        self.assertNotIn("audit_event", captured.output[0])
+        self.assertFalse(self.path.parent.exists(), "the sink made the directory Hermes refused")
+
+    def test_a_record_lost_to_both_is_said_so(self):
+        self.home.joinpath("logs").write_text("not a directory")
+
+        class Refusing(io.StringIO):
+            def write(self, text):
+                raise OSError("stdout is closed")
+
+        with contextlib.redirect_stdout(Refusing()), self.assertLogs(LOGGER, level="ERROR") as captured:
             audit_sink.emit({"audit_event": "x"}, LOGGER)
-        line = captured.output[0]
-        self.assertIn(str(self.path), line)
-        # The record is the tail of the line, which is the shape the Admin
-        # Console's wrapped-record reader expects.
-        self.assertTrue(line.endswith('record: {"audit_event": "x"}'), line)
+        self.assertIn("the record is lost", captured.output[0])
+        self.assertNotIn("audit_event", captured.output[0])
 
 
 class TestRotation(SinkTestCase):
@@ -140,9 +231,9 @@ class TestRotation(SinkTestCase):
         self.assertEqual(self.lines(), ["y" * 100])
         self.assertFalse(self.rotated(1).exists())
 
-    def test_a_rotation_lost_to_another_writer_does_not_lose_the_record(self):
+    def test_a_backup_that_cannot_be_moved_does_not_cost_the_record(self):
         audit_sink.append_line(self.LINE)
-        with mock.patch.object(audit_sink.os, "replace", side_effect=FileNotFoundError("gone")):
+        with mock.patch.object(audit_sink.os, "replace", side_effect=PermissionError("read-only")):
             audit_sink.append_line(self.LINE + "2")
         self.assertEqual(self.lines(), [self.LINE, self.LINE + "2"])
 
