@@ -66,6 +66,8 @@ class HandlerTestCase(unittest.TestCase):
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), self.assertNoLogs(handler.logger, level="INFO"):
             asyncio.run(handler.handle(event_type, context))
+            # The hook runs on a loop, so the sink wrote on its writer thread.
+            audit_sink.flush(timeout=5)
         self.assertEqual(printed.getvalue(), "", "the stdout fallback fired on a writable file")
         lines = self.lines()
         self.assertEqual(len(lines), before + 1)
@@ -88,6 +90,7 @@ class TestEventRouting(HandlerTestCase):
     def test_an_unknown_event_type_writes_nothing(self):
         with self.assertNoLogs(handler.logger, level="INFO"):
             asyncio.run(handler.handle("agent:something-new", {"session_id": "sess-1"}))
+            audit_sink.flush(timeout=5)
         self.assertFalse(self.audit_file.exists())
 
     def test_a_missing_context_does_not_raise(self):
@@ -178,6 +181,7 @@ class TestEnvelope(HandlerTestCase):
     def test_every_record_is_one_line_of_json(self):
         asyncio.run(handler.handle("agent:end", {"response": "line one\nline two", "session_id": "s"}))
         asyncio.run(handler.handle("agent:start", {"message": "a\nb", "session_id": "s"}))
+        audit_sink.flush(timeout=5)
         raw = self.audit_file.read_text(encoding="utf-8")
         self.assertEqual(raw.count("\n"), 2, "one newline-terminated line per record")
         first, second = raw.splitlines()
@@ -203,6 +207,7 @@ class TestAuditFile(HandlerTestCase):
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed), self.assertLogs(handler.logger, level="ERROR") as captured:
             asyncio.run(handler.handle("agent:end", {"session_id": "s", "response": "done"}))
+            audit_sink.flush(timeout=5)
         record = json.loads(printed.getvalue())
         self.assertEqual((record["audit_event"], record["response"]), ("chat_message_end", "done"))
         notice = captured.output[0]
@@ -214,14 +219,15 @@ class TestAuditFile(HandlerTestCase):
         # The hook runs on the gateway's loop; the file write must not.
         loop_thread = threading.current_thread()
         writer_threads = []
-        real_emit = audit_sink.emit
+        real_append = audit_sink.append_line
 
-        def record_thread(record, logger):
+        def record_thread(line, path=None):
             writer_threads.append(threading.current_thread())
-            return real_emit(record, logger)
+            return real_append(line, path)
 
-        with mock.patch.object(audit_sink, "emit", side_effect=record_thread):
+        with mock.patch.object(audit_sink, "append_line", side_effect=record_thread):
             asyncio.run(handler.handle("agent:start", {"session_id": "s"}))
+            audit_sink.flush(timeout=5)
         self.assertEqual(len(writer_threads), 1)
         self.assertIsNot(writer_threads[0], loop_thread)
         self.assertEqual(len(self.lines()), 1)

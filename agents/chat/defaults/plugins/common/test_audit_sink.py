@@ -1,7 +1,10 @@
 """The audit file: where it is, one object per line, created on demand, locked, rotated at the cap,
-and where a record goes when the file cannot take it."""
+written off an event loop, redacted by Hermes when present, and where a record goes when the file
+cannot take it."""
 
+import asyncio
 import contextlib
+import errno
 import fcntl
 import fnmatch
 import io
@@ -26,6 +29,11 @@ from common import audit_sink  # noqa: E402
 LOGGER = logging.getLogger("test.audit_sink")
 # The two globs the sidecar tails, as basenames (buildFluentBitConfigMap).
 SIDECAR_GLOBS = ("audit.jsonl", "*.log")
+# A token shape Hermes' redactor knows and AuditRedactor does not.
+GITLAB_TOKEN = "glpat-ABCDEFGHIJKLMNOPQRST"
+GITLAB_TOKEN_MASKED = "glpat-...QRST"
+# The modules the sink imports from a running Hermes.
+HERMES_MODULES = ("hermes_constants", "agent", "agent.redact")
 
 
 class SinkTestCase(unittest.TestCase):
@@ -37,21 +45,44 @@ class SinkTestCase(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
         # These tests do not run inside Hermes; nothing may answer for it.
-        self.addCleanup(self._restore_hermes_constants, sys.modules.pop("hermes_constants", None))
+        previous = {name: sys.modules.pop(name, None) for name in HERMES_MODULES}
+        self.addCleanup(self._restore_modules, previous)
         self.path = self.home / "logs" / "audit.jsonl"
         self.lock = self.home / "logs" / "audit.jsonl.lock"
 
     @staticmethod
-    def _restore_hermes_constants(module):
-        sys.modules.pop("hermes_constants", None)
-        if module is not None:
-            sys.modules["hermes_constants"] = module
+    def _restore_modules(previous):
+        for name, module in previous.items():
+            sys.modules.pop(name, None)
+            if module is not None:
+                sys.modules[name] = module
 
     def fake_hermes(self, **attributes):
         sys.modules["hermes_constants"] = types.SimpleNamespace(**attributes)
 
+    def fake_hermes_redactor(self):
+        """Hermes' agent.redact, masking GITLAB_TOKEN; returns the `force` flags it was called with."""
+        calls = []
+
+        def redact_sensitive_text(text, *, force=False, **_):
+            calls.append(force)
+            return text.replace(GITLAB_TOKEN, GITLAB_TOKEN_MASKED)
+
+        sys.modules["agent"] = types.ModuleType("agent")
+        redact = types.ModuleType("agent.redact")
+        redact.redact_sensitive_text = redact_sensitive_text
+        sys.modules["agent.redact"] = redact
+        return calls
+
     def lines(self):
         return self.path.read_text(encoding="utf-8").splitlines() if self.path.exists() else []
+
+    def emit(self, record):
+        """Emit inline and return what reached stdout."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(audit_sink.emit(record, LOGGER))
+        return out.getvalue()
 
 
 class TestWhereTheFileIs(SinkTestCase):
@@ -109,9 +140,9 @@ class TestAppending(SinkTestCase):
             self.assertFalse(fnmatch.fnmatch(self.lock.name, pattern), pattern)
         self.assertTrue(fnmatch.fnmatch(self.path.name, SIDECAR_GLOBS[0]))
 
-    def test_a_write_waits_for_the_lock_another_writer_holds(self):
-        # Another process mid-rotation: it holds the lock, and this write has
-        # to wait for it rather than race it.
+    def test_a_write_waits_for_a_lock_another_writer_releases_in_time(self):
+        # Another process mid-rotation: it holds the lock, and this write waits
+        # for it rather than racing it.
         self.path.parent.mkdir(parents=True)
         holder = os.open(self.lock, os.O_WRONLY | os.O_CREAT, 0o640)
         self.addCleanup(os.close, holder)
@@ -124,6 +155,36 @@ class TestAppending(SinkTestCase):
         writer.join(timeout=5)
         self.assertFalse(writer.is_alive())
         self.assertEqual(self.lines(), ["{}"])
+
+    def test_a_lock_held_past_the_wait_is_given_up_on(self):
+        self.path.parent.mkdir(parents=True)
+        holder = os.open(self.lock, os.O_WRONLY | os.O_CREAT, 0o640)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with mock.patch.object(audit_sink, "LOCK_WAIT_SECONDS", 0.2):
+            started = time.monotonic()
+            with self.assertRaises(TimeoutError):
+                audit_sink.append_line("{}")
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(self.lines(), [])
+
+    def test_a_write_that_fails_part_way_leaves_no_fragment(self):
+        audit_sink.append_line('{"n": 1}')
+        real_write = os.write
+        calls = []
+
+        def short_then_full(fd, data):
+            calls.append(len(data))
+            if len(calls) == 1:
+                return real_write(fd, bytes(data[:3]))
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+        with mock.patch.object(audit_sink.os, "write", side_effect=short_then_full):
+            with self.assertRaises(OSError):
+                audit_sink.append_line('{"n": 2}')
+        self.assertEqual(self.path.read_text(encoding="utf-8"), '{"n": 1}\n', "a fragment survived")
+        audit_sink.append_line('{"n": 3}')
+        self.assertEqual(self.lines(), ['{"n": 1}', '{"n": 3}'])
 
     def test_hermes_makes_the_directory_when_the_process_is_hermes(self):
         made = []
@@ -143,13 +204,29 @@ class TestAppending(SinkTestCase):
         self.assertIn("<object object at", json.loads(line)["obj"])
 
 
-class TestEmit(SinkTestCase):
+class TestRedaction(SinkTestCase):
 
-    def emit(self, record):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            audit_sink.emit(record, LOGGER)
-        return out.getvalue()
+    def test_outside_hermes_the_line_is_written_as_it_is(self):
+        # AuditRedactor is the emitters' layer over the fields; the sink adds
+        # Hermes' layer only when Hermes is there to provide it.
+        self.emit({"args": f"export GL={GITLAB_TOKEN}"})
+        self.assertIn(GITLAB_TOKEN, self.lines()[0])
+
+    def test_inside_hermes_the_line_passes_through_its_redactor_forced(self):
+        calls = self.fake_hermes_redactor()
+        self.emit({"args": f"export GL={GITLAB_TOKEN}"})
+        self.assertEqual(json.loads(self.lines()[0]), {"args": f"export GL={GITLAB_TOKEN_MASKED}"})
+        self.assertEqual(calls, [True], "security.redact_secrets: false must not reopen the trail")
+
+    def test_the_stdout_fallback_is_redacted_too(self):
+        self.fake_hermes_redactor()
+        self.home.joinpath("logs").write_text("not a directory")
+        with self.assertLogs(LOGGER, level="ERROR"):
+            printed = self.emit({"args": f"export GL={GITLAB_TOKEN}"})
+        self.assertEqual(json.loads(printed), {"args": f"export GL={GITLAB_TOKEN_MASKED}"})
+
+
+class TestEmit(SinkTestCase):
 
     def test_the_record_goes_to_the_file_and_nowhere_else(self):
         with self.assertNoLogs(LOGGER, level="INFO"):
@@ -170,6 +247,18 @@ class TestEmit(SinkTestCase):
         self.assertIn("Not a directory", notice)
         self.assertNotIn("audit_event", notice)
         self.assertNotIn("Bash", notice)
+
+    def test_a_lock_held_past_the_wait_sends_the_record_to_stdout(self):
+        self.path.parent.mkdir(parents=True)
+        holder = os.open(self.lock, os.O_WRONLY | os.O_CREAT, 0o640)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        with mock.patch.object(audit_sink, "LOCK_WAIT_SECONDS", 0.2):
+            with self.assertLogs(LOGGER, level="ERROR") as captured:
+                printed = self.emit({"audit_event": "x"})
+        self.assertEqual(printed, '{"audit_event": "x"}\n')
+        self.assertIn("another writer has held", captured.output[0])
+        self.assertEqual(self.lines(), [])
 
     def test_a_directory_hermes_refuses_sends_the_record_to_stdout(self):
         # What mkdir_under_hermes_home raises for a missing or tombstoned
@@ -196,6 +285,74 @@ class TestEmit(SinkTestCase):
             audit_sink.emit({"audit_event": "x"}, LOGGER)
         self.assertIn("the record is lost", captured.output[0])
         self.assertNotIn("audit_event", captured.output[0])
+
+
+class TestWriterThread(SinkTestCase):
+    """A caller on an event loop gets its write done on the writer thread, in order."""
+
+    def spy_on_writes(self):
+        threads = []
+        real = audit_sink.append_line
+
+        def spy(line, path=None):
+            threads.append(threading.current_thread())
+            return real(line, path)
+
+        patch = mock.patch.object(audit_sink, "append_line", side_effect=spy)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return threads
+
+    def test_a_call_on_an_event_loop_is_written_off_it_in_order(self):
+        threads = self.spy_on_writes()
+
+        async def on_loop():
+            for n in range(3):
+                self.assertIsNotNone(audit_sink.emit({"n": n}, LOGGER), "written inline on the loop")
+
+        asyncio.run(on_loop())
+        audit_sink.flush(timeout=5)
+        self.assertEqual([json.loads(line)["n"] for line in self.lines()], [0, 1, 2])
+        self.assertEqual(len(threads), 3)
+        for thread in threads:
+            self.assertIsNot(thread, threading.current_thread())
+            self.assertTrue(thread.name.startswith(audit_sink.WRITER_THREAD_NAME), thread.name)
+
+    def test_a_call_off_the_loop_is_written_inline(self):
+        threads = self.spy_on_writes()
+        self.assertIsNone(audit_sink.emit({"n": 1}, LOGGER))
+        self.assertEqual(threads, [threading.current_thread()])
+        self.assertEqual(len(self.lines()), 1)
+
+    def test_the_profile_is_resolved_on_the_calling_thread(self):
+        # The per-turn override is context-local to the loop thread; the writer
+        # thread would resolve the default home instead.
+        served = self.home / "profiles" / "platform"
+        caller = threading.current_thread()
+        self.fake_hermes(
+            get_hermes_home=lambda: served if threading.current_thread() is caller else self.home
+        )
+
+        async def on_loop():
+            audit_sink.emit({"n": 1}, LOGGER)
+
+        asyncio.run(on_loop())
+        audit_sink.flush(timeout=5)
+        self.assertTrue((served / "logs" / "audit.jsonl").is_file())
+        self.assertFalse(self.path.exists())
+
+    def test_the_stdout_fallback_works_from_the_writer_thread(self):
+        self.home.joinpath("logs").write_text("not a directory")
+        out = io.StringIO()
+
+        async def on_loop():
+            audit_sink.emit({"audit_event": "x"}, LOGGER)
+
+        with contextlib.redirect_stdout(out), self.assertLogs(LOGGER, level="ERROR") as captured:
+            asyncio.run(on_loop())
+            audit_sink.flush(timeout=5)
+        self.assertEqual(out.getvalue(), '{"audit_event": "x"}\n')
+        self.assertIn(str(self.path), captured.output[0])
 
 
 class TestRotation(SinkTestCase):

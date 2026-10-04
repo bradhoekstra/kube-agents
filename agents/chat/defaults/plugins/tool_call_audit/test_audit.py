@@ -5,6 +5,7 @@ the profile's audit file is what ends up in Cloud Logging, so the written JSON
 line is the artifact under test — not the arguments it was called with.
 """
 
+import asyncio
 import contextlib
 import io
 import json
@@ -12,6 +13,8 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -229,6 +232,27 @@ class TestGatewayDispatch(AuditTestCase):
         self.assertEqual(record["platform"], "")
         self.assertEqual(record["user_id"], "")
 
+    def test_a_dispatch_on_the_gateway_loop_is_written_off_it(self):
+        # Hermes calls pre_gateway_dispatch synchronously on the gateway's event
+        # loop; the sink has to see the loop and write on its own thread.
+        loop_thread = threading.current_thread()
+        writer_threads = []
+        real_append = audit_sink.append_line
+
+        def record_thread(line, path=None):
+            writer_threads.append(threading.current_thread())
+            return real_append(line, path)
+
+        async def dispatch():
+            audit.log_pre_gateway_dispatch(self._event(), None, self._Sessions())
+
+        with mock.patch.object(audit_sink, "append_line", side_effect=record_thread):
+            asyncio.run(dispatch())
+            audit_sink.flush(timeout=5)
+        self.assertEqual(len(writer_threads), 1)
+        self.assertIsNot(writer_threads[0], loop_thread)
+        self.assertEqual(json.loads(self.lines()[0])["audit_event"], "gateway_dispatch")
+
 
 class TestEnvelope(AuditTestCase):
     """Every record is self-describing: the schema's kind, severity and time, plus
@@ -301,6 +325,17 @@ class TestAuditFile(AuditTestCase):
         with self.assertRaises(ValueError):
             audit._emit("tool_call_start", {"severity": "DEBUG"})
         self.assertFalse(self.audit_file.exists())
+
+    def test_hermes_redaction_runs_over_the_line_after_the_plugins_own(self):
+        # A GitLab token: a shape AuditRedactor does not know and Hermes'
+        # redactor does. Inside Hermes the line passes through the latter too.
+        token = "glpat-ABCDEFGHIJKLMNOPQRST"
+        redact = types.ModuleType("agent.redact")
+        redact.redact_sensitive_text = lambda text, **_: text.replace(token, "glpat-...QRST")
+        with mock.patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.redact": redact}):
+            record = self.emit(audit.log_pre_tool_call, tool_name="Bash", args={"command": f"export GL={token}"})
+        self.assertNotIn(token, record["args"])
+        self.assertIn("glpat-...QRST", record["args"])
 
 
 if __name__ == "__main__":
