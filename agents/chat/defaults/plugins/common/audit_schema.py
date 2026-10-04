@@ -12,8 +12,8 @@ envelope adds:
 - ``audit_event``: the same value under the name the Admin Console's Logs
   Explorer queries and parser have read since the first record. Both stay until
   the console reads ``event_type``;
-- ``severity``: Cloud Logging's level name, so a lifted record is filed under
-  it rather than under the container stream's default;
+- ``severity``: Cloud Logging's level name, so a record is filed under it
+  rather than under the container stream's default;
 - ``timestamp``: the event time in UTC to the millisecond with a ``Z`` suffix,
   the one form every log backend parses without a format string.
 

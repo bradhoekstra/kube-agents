@@ -278,8 +278,8 @@ Activity Explorer keep their activity scope controls on the page. Chat History
 and Scheduled Cron have separate retained-history windows. The activity pages
 read:
 
-- structured application audit events from Cloud Logging, including Fluent Bit
-  wrapped JSON records; and
+- structured application audit events from Cloud Logging: the audit file the
+  fluent-bit sidecar tails, and the wrapped text form of a record; and
 - complete Hermes traces that contain the trusted `session.id` label.
 
 Chat History reads persisted user and assistant messages from every Hermes
@@ -314,8 +314,12 @@ continuation tokens only in the UI session; **Load more activity** appends the
 next pages without rereading earlier results. Logging uses 500-record pages, a
 60-second per-page timeout, and a shared 90-second load deadline. A later-page
 failure retains the earlier pages and is reported as partial data. Trace and
-each of Logging's two queries — one over records whose fields the fluent-bit
-sidecar lifted, one over the wrapped text form of a record it did not lift, so
+each of Logging's two queries — one over records whose keys arrive as
+`jsonPayload` fields of their own (the audit file the fluent-bit sidecar tails as
+JSON, the records it lifted out of `agent.log` before that file existed, and a
+record the agent container printed to its own stdout because the file could not
+take it), one over the wrapped text form, a line in `agent.log` ending in the
+object, which is how every record arrived before the sidecar lifted them, so
 neither reads the other's rows; a record both return is still merged by
 `insertId` and counted once — stop after ten pages; the UI asks
 the user to narrow the time window when a query reaches that ceiling. The
