@@ -305,7 +305,9 @@ never converts `k8s-watcher` into a generic Human or Event label. Aggregate
 delivery records remain available in Timeline and the ledger but do not inflate
 the flow. Fluent Bit is treated as a log collector, not an agent; when an audit
 payload has no profile identity, the ledger labels the source `gateway-runtime`
-and retains `fluent-bit` as collector evidence.
+when the sidecar shipped it and retains `fluent-bit` as collector evidence, and
+labels it with the agent container's own name, with no collector evidence, when
+the container printed the record to its stdout itself.
 Source errors and result-limit truncation are displayed rather than silently
 treated as a complete result. Both activity pages show one loading
 indicator while the initial snapshot, refresh, or next source pages are read.
