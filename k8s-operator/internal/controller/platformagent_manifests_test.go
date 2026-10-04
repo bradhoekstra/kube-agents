@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -2454,79 +2453,148 @@ func TestBuildFluentBitConfigMap(t *testing.T) {
 	}
 }
 
-// The audit lift: the sidecar recognises a tool_call_audit or chat_message_audit
-// line, captures its JSON object and decodes it into top-level fields, in that
-// order and before the record modifier stamps the record. The regex is checked
-// against a line Hermes actually wrote, with fluent-bit's `(?<name>` group syntax
-// translated to Go's, since the two engines agree on everything else in it.
-// Those lines are frozen here: the test holds the regex to the format as
-// sampled and cannot notice a Hermes release that changes it. That check is a
-// live one after an agent image change: jsonPayload.audit_event in Logs
-// Explorer, a key the broker's own records do not carry, as the observability
-// page says.
-func TestFluentBitLiftsAuditRecordsIntoFields(t *testing.T) {
+// The audit trail: the sidecar tails the file the two emitters write, as JSON,
+// with no regex over Hermes' log line anywhere in the configuration. The input
+// has to name every profile's file, so that turning an emitter on for a profile
+// needs no change here, and the json decoder has to be in parsers.conf, because
+// this mount replaces the sidecar's own parsers file and a built-in name would
+// not resolve. Hermes' own log keeps its text input exactly as it was.
+func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	cm := buildFluentBitConfigMap(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	})
 	fbConf := cm.Data["fluent-bit.conf"]
 	parsers := cm.Data["parsers.conf"]
 
-	order := []string{"Parser        gchat_event", "Parser        hermes_audit_line", "Key_Name      audit_json", "Parser        audit_json", "Name              record_modifier"}
-	last := -1
-	for _, needle := range order {
-		at := strings.Index(fbConf, needle)
-		if at < 0 {
-			t.Fatalf("fluent-bit.conf lacks %q", needle)
-		}
-		if at < last {
-			t.Errorf("%q is out of order in fluent-bit.conf; the lift has to capture before it decodes and decode before the record is stamped", needle)
-		}
-		last = at
+	inputs := fluentBitSections(fbConf, "[INPUT]")
+	if len(inputs) != 2 {
+		t.Fatalf("fluent-bit.conf has %d [INPUT] sections, want 2 (Hermes' logs and the audit file):\n%s", len(inputs), fbConf)
 	}
-	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
-		t.Errorf("parsers.conf lacks the json decoder the lift needs; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	var audit, logs string
+	for _, section := range inputs {
+		switch {
+		case strings.Contains(section, "Tag               agent.audit"):
+			audit = section
+		case strings.Contains(section, "Tag               agent.logs"):
+			logs = section
+		}
+	}
+	if audit == "" || logs == "" {
+		t.Fatalf("fluent-bit.conf lacks the agent.audit or the agent.logs input:\n%s", fbConf)
+	}
+	for _, want := range []string{
+		"Name              tail",
+		"Path              " + fluentBitAuditTailPath,
+		"Parser            audit_json",
+		"Path_Key          file_path",
+		"Read_from_Head    On",
+	} {
+		if !strings.Contains(audit, want) {
+			t.Errorf("the audit input lacks %q:\n%s", want, audit)
+		}
+	}
+	if strings.Contains(logs, "Parser") {
+		t.Errorf("the agent.logs input parses its lines; Hermes' log stays text:\n%s", logs)
+	}
+	if !strings.Contains(logs, "Path              /opt/data/logs/*.log") {
+		t.Errorf("the agent.logs input no longer reads the front door's logs:\n%s", logs)
+	}
+	dbs := regexp.MustCompile(`DB\s+(\S+)`).FindAllStringSubmatch(fbConf, -1)
+	if len(dbs) != 2 || dbs[0][1] == dbs[1][1] {
+		t.Errorf("the two tail inputs must keep their positions in two DB files, got %v", dbs)
 	}
 
-	var expr string
-	for _, line := range strings.Split(parsers, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "Regex   ^") {
-			expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "Regex"))
+	// The path reaches the front door's file and any named profile's, and
+	// nothing else: not Hermes' log, not a rotated backup.
+	for _, path := range []string{
+		"/opt/data/logs/audit.jsonl",
+		"/opt/data/profiles/platform/logs/audit.jsonl",
+		"/opt/data/profiles/cluster-prod-a/logs/audit.jsonl",
+	} {
+		if !fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
+			t.Errorf("the audit input does not reach %s", path)
 		}
 	}
-	if expr == "" {
-		t.Fatal("parsers.conf has no anchored Regex line for hermes_audit_line")
+	for _, path := range []string{
+		"/opt/data/logs/agent.log",
+		"/opt/data/logs/audit.jsonl.1",
+		"/opt/data/profiles/platform/logs/agent.log",
+	} {
+		if fluentBitPathMatches(t, fluentBitAuditTailPath, path) {
+			t.Errorf("the audit input reaches %s, which is not an audit file", path)
+		}
 	}
-	re := regexp.MustCompile(strings.ReplaceAll(expr, "(?<", "(?P<"))
-	const sample = `2026-09-28 15:45:43,391 INFO hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "duration_ms": 53, "result": "{\"ok\": true}", "task_id": "k8s-evt-a9c4f17a", "tool_name": "kanban_create"}`
-	match := re.FindStringSubmatch(sample)
-	if match == nil {
-		t.Fatalf("the audit regex does not match a line Hermes wrote: %q", sample)
+
+	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
+		t.Errorf("parsers.conf lacks the json decoder the audit input names; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
 	}
-	captured := match[re.SubexpIndex("audit_json")]
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(captured), &decoded); err != nil {
-		t.Fatalf("the capture is not the JSON object: %v (%q)", err, captured)
+	for name, data := range cm.Data {
+		for _, gone := range []string{"hermes_audit_line", "Key_Name      audit_json"} {
+			if strings.Contains(data, gone) {
+				t.Errorf("%s still carries %q; the regex lift is gone and the records are not in Hermes' log", name, gone)
+			}
+		}
 	}
-	if decoded["tool_name"] != "kanban_create" {
-		t.Errorf("decoded record = %v, want the plugin's fields", decoded)
+	for _, line := range strings.Split(parsers, "\n") {
+		if strings.Contains(line, "Regex") && strings.Contains(line, "audit") {
+			t.Errorf("parsers.conf has a regex over the audit records: %s", strings.TrimSpace(line))
+		}
 	}
-	if re.MatchString(`2026-09-28 15:45:43,376 WARNING tools.kanban_event_routing: kanban event routing: {"not": "an audit record"}`) {
-		t.Error("the audit regex matches a line from another logger; only the two audit emitters may be lifted")
+
+	// Both streams are stamped and shipped.
+	for _, section := range append(fluentBitSections(fbConf, "[FILTER]"), fluentBitSections(fbConf, "[OUTPUT]")...) {
+		if !strings.Contains(section, "record_modifier") && !strings.Contains(section, "Name              stdout") {
+			continue
+		}
+		if !strings.Contains(section, "Match             agent.*") {
+			t.Errorf("this section has to cover agent.logs and agent.audit alike:\n%s", section)
+		}
 	}
-	if !re.MatchString(`2026-09-28 15:45:43,391 INFO hermes.hook.chat_message_audit: {"audit_event": "chat_message_end"}`) {
-		t.Error("the audit regex does not match the chat_message_audit hook's lines")
+}
+
+// fluentBitSections returns every section of conf headed by header.
+func fluentBitSections(conf, header string) []string {
+	var sections []string
+	for _, block := range strings.Split(conf, "\n\n") {
+		if strings.HasPrefix(strings.TrimSpace(block), header) {
+			sections = append(sections, block)
+		}
 	}
-	// Hermes tags a record emitted on a thread holding a session context with
-	// ` [<session id>]` between the level and the logger name; the tools it
-	// runs inline on the turn thread log that way, and an unmatched line passes
-	// through the sidecar unlifted with no signal.
-	tagged := `2026-09-28 15:45:43,391 INFO [20260928_154543_50074bf0] hermes.plugin.tool_call_audit: {"audit_event": "tool_call_end", "tool_name": "clarify"}`
-	match = re.FindStringSubmatch(tagged)
-	if match == nil {
-		t.Fatalf("the audit regex does not match a session-tagged line: %q", tagged)
+	return sections
+}
+
+// fluentBitPathMatches reports whether a comma-separated fluent-bit tail Path
+// reaches path. The plugin globs each pattern the way a shell would, which is
+// what filepath.Match implements.
+func fluentBitPathMatches(t *testing.T, patterns, path string) bool {
+	t.Helper()
+	for _, pattern := range strings.Split(patterns, ",") {
+		ok, err := filepath.Match(pattern, path)
+		if err != nil {
+			t.Fatalf("bad tail pattern %q: %v", pattern, err)
+		}
+		if ok {
+			return true
+		}
 	}
-	if !strings.HasPrefix(match[re.SubexpIndex("audit_json")], `{"audit_event": "tool_call_end"`) {
-		t.Errorf("the capture on a tagged line is not the JSON object: %q", match[re.SubexpIndex("audit_json")])
+	return false
+}
+
+// The sidecar tails the file by the name the emitters write it under. The two
+// are in different languages, so this holds the Go constant to the Python one.
+func TestFluentBitAuditFileNameMatchesTheEmitters(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "agents", "chat", "defaults", "plugins", "common", "audit_sink.py")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	for _, want := range []string{
+		fmt.Sprintf("AUDIT_FILE_NAME = %q", auditFileName),
+		`LOGS_DIR_NAME = "logs"`,
+	} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("%s does not declare %s; the sidecar would tail a file the emitters never write", path, want)
+		}
 	}
 }
 
