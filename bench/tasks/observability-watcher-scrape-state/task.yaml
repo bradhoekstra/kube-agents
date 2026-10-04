@@ -1,0 +1,58 @@
+# A question about the agent's own observability: whether the event watcher's
+# Prometheus metrics are scraped on this install, how the scrape is configured
+# and what proves it is working. The answer comes from the kube-agents
+# observability skill, and the skill used to send the agent to the gateway
+# Deployment looking for scrape annotations the operator has never rendered,
+# so the agent reported "not scraped" on an install the managed collector was
+# scraping every 30s through the chart's `<name>-gateway-monitoring`
+# PodMonitoring. The skill now names the PodMonitoring, the listener (the
+# `agent-api-auth` container's `event-metrics` port, 9095) and the Cloud
+# Monitoring series that prove the scrape (`up{job="<name>-gateway-monitoring"}`
+# and `k8s_event_watcher_cluster_up`, with the watcher's own labels arriving as
+# `exported_cluster` and `exported_location`).
+#
+# Graded on the final answer alone: the four phrases below are the mechanism
+# and its proof, and an answer built on the Deployment's annotations names
+# none of them. The install under test has to carry the gateway PodMonitoring
+# for the question to have the answer the skill gives; the CI pool's chart
+# installs do, and a kustomize install needs it applied by hand before the run.
+# No `fixtures:`: the case reads the agent's own install, not the seeded
+# fleet. No `domains.yaml` row covers the agent's own observability, which is
+# why the case is a reviewed KNOWN_NO_DOMAIN entry in
+# scripts/validate_bench_cases.py rather than a slug.
+#
+# Expected cost bracket: ~100-300s, one delegation round trip and a handful of
+# reads of the agent's own namespace.
+id: observability-watcher-scrape-state
+name: The event watcher's metrics are scraped through the PodMonitoring
+prompt: >-
+  Are the event watcher's Prometheus metrics being scraped on this install?
+  Tell me how the scrape is configured, where the watcher's listener is, and
+  which series in Cloud Monitoring prove that the collector is scraping it.
+expected_output: >-
+  The scrape is configured by the PodMonitoring named after the agent with the
+  gateway-monitoring suffix, which targets the event watcher's listener on the
+  gateway pod's agent-api-auth container, port 9095 (event-metrics); the proof
+  that the collector is scraping it is in Cloud Monitoring, as up for that job
+  and k8s_event_watcher_cluster_up for each watched cluster, with the watcher's
+  own cluster and location labels arriving as exported_cluster and
+  exported_location. The answer does not rest on scrape annotations on the
+  gateway Deployment, which the operator does not render.
+infrastructure:
+  deployer: noop
+validated: false
+owner: bradhoekstra
+verification_spec:
+  # The final answer names the mechanism and its proof. `mode: assert` because
+  # the final message is immutable once the run ends; polling a failed phrase
+  # would only wait out the timeout.
+  - name: the-answer-names-the-podmonitoring-the-listener-and-the-proof
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases:
+        - "PodMonitoring"
+        - "gateway-monitoring"
+        - "9095"
+        - "k8s_event_watcher_cluster_up"

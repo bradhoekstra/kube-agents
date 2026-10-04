@@ -607,6 +607,7 @@
 # names the read-only or refused write. `deployer: noop`, no fixture,
 # `validated: false` until its first observed runs; the 200s default hint.
 ./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
+./tasks/observability-watcher-scrape-state/task.yaml
 
 # The stall watch's half of incident-triage: a Deployment gated on a readiness
 # condition nothing sets, handed to the Session KV daemon as a

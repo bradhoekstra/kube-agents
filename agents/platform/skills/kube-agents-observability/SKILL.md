@@ -70,10 +70,15 @@ To determine which users have interacted with the system via Google Chat in the 
   ```bash
   kubectl get pods -n gmp-system
   ```
-- Verify the agent deployment has correct annotations for Prometheus scraping:
+- The scrape of the agent's own metrics is configured by `PodMonitoring` resources, not by annotations on the Deployment; the operator renders no scrape annotations. Two exist, both rendered by the Helm chart where the cluster serves the `PodMonitoring` API (`platformAgent.podMonitoring`, `null` by default, forces them on or off):
+  - `<name>-gateway-monitoring` scrapes the event watcher, which listens in the gateway pod's `agent-api-auth` container on its `event-metrics` port (9095).
+  - `<name>-credential-proxy-monitoring` scrapes the credential broker, which serves its `kubeagents_*` series (`kubeagents_tool_invocations_total`, `kubeagents_tool_execution_duration_seconds`, `kubeagents_credential_proxy_requests_total`) on the broker pod's metrics-only `cred-metrics` port (8766).
   ```bash
-  kubectl get deployment <agent-deployment-name> -n kubeagents-system -o yaml
+  kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml
+  kubectl get podmonitoring <name>-credential-proxy-monitoring -n kubeagents-system -o yaml
   ```
+  A `PodMonitoring` that is absent means no scrape is configured, whatever the Deployment says.
+- The proof that the collector is scraping is in Cloud Monitoring, not in the cluster: `up{job="<name>-gateway-monitoring"}` at `1`, and `k8s_event_watcher_cluster_up` present for each watched cluster; for the broker, `up{job="<name>-credential-proxy-monitoring"}` and `kubeagents_tool_invocations_total`. The collector's own `cluster` and `location` labels take precedence, so the watcher's labels arrive as `exported_cluster` and `exported_location`; query those.
 
 ### 2. Inspect CPU and Memory Metrics
 

@@ -97,7 +97,9 @@ from the ledger: the watcher discards duplicates before the bridge hears about t
 (`dispatcher.Dispatch` returns on `dedupDuplicate`) and hardcodes `count` to `1` on the payload it
 does send, so a ratio over these rows would measure how many distinct incidents shared a key — 400
 duplicate `CrashLoopBackOff` events collapsing into three injects would report zero. The real figure
-is the `eventsDedupSuppress` Prometheus counter.
+is the watcher's `k8s_event_watcher_events_deduped_total` series, read in Cloud Monitoring where the
+managed collector scrapes it from the gateway pod's `agent-api-auth` sidecar; the watcher's own
+`cluster` and `location` labels arrive there as `exported_cluster` and `exported_location`.
 
 ### Which clusters a recap covers
 
