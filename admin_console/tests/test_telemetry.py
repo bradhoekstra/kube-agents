@@ -368,6 +368,50 @@ class TelemetryNormalizationTest(unittest.TestCase):
         self.assertEqual(event.agent_name, "gateway-runtime")
         self.assertEqual(event.details["collector_container"], "fluent-bit")
 
+    def test_normalizes_a_cron_tool_audit_tailed_from_the_audit_file(self):
+        # The row the sidecar writes from the profile's audit file: the record's
+        # keys as fields, no Hermes line at all, and the session as a field.
+        row = {
+            "insertId": "log-tailed",
+            "timestamp": "2026-07-28T19:07:04Z",
+            "logName": "projects/demo/logs/stdout",
+            "resource": {
+                "labels": {
+                    "cluster_name": "test-cluster-01",
+                    "namespace_name": "kubeagents-system",
+                    "container_name": "fluent-bit",
+                }
+            },
+            "jsonPayload": {
+                "file_path": "/opt/data/profiles/platform/logs/audit.jsonl",
+                "app": "agent",
+                "log_source": "agent-file",
+                "audit_event": "tool_call_end",
+                "event_type": "tool_call_end",
+                "severity": "INFO",
+                "timestamp": "2026-07-28T19:07:04.711Z",
+                "tool_name": "terminal",
+                "tool": "terminal",
+                "status": "completed",
+                "task_id": "task-1",
+                "session_id": "cron_capacity_20260728_190038",
+                "duration_ms": 711,
+                "result": '{"exit_code": 0}',
+            },
+        }
+
+        event = normalize_logging_row(row, "demo-project")
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.trigger_kind, TriggerKind.CRON)
+        self.assertEqual(event.attribution, AttributionLevel.INHERITED)
+        self.assertEqual(event.session_id, "cron_capacity_20260728_190038")
+        self.assertEqual(event.interaction_id, "task-1")
+        self.assertEqual(event.status, "completed")
+        self.assertEqual(event.agent_name, "gateway-runtime")
+        self.assertEqual(event.details["collector_container"], "fluent-bit")
+
     def test_normalizes_wrapped_cron_tool_audit(self):
         row = {
             "insertId": "log-one",
