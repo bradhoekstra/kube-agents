@@ -87,10 +87,12 @@ const (
 	// tails it at fluentBitAuditTailPath.
 	auditFileName = "audit.jsonl"
 	// fluentBitDataMount is where the fluent-bit sidecar mounts the agent's data
-	// volume, read-only. The agent container mounts the same claim at its HERMES_HOME,
-	// /opt/data by default, so this is the sidecar's view of the front door's logs/
-	// and of every named profile's.
-	fluentBitDataMount = "/opt/data"
+	// volume, read-only: the sidecar container's MountPath and the root of both tail
+	// paths, so the two cannot diverge. It is the path the agent mounts the same claim
+	// at by default (defaultAgentHome) and stays the sidecar's view of the volume root
+	// wherever a CR moves the agent's home: the files are at logs/ and
+	// profiles/<name>/logs/ relative to the claim either way.
+	fluentBitDataMount = defaultAgentHome
 	// fluentBitAuditTailPath is the Path of the sidecar's audit tail input: the front
 	// door's file, whose home is the volume root, and one per named profile under
 	// profiles/. Every profile's file is matched whether or not that profile emits
@@ -4938,7 +4940,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		VolumeMounts: []corev1.VolumeMount{
 			{
 				Name:      "platform-agent-data-vol",
-				MountPath: "/opt/data",
+				MountPath: fluentBitDataMount,
 				ReadOnly:  true,
 			},
 			{
@@ -5275,9 +5277,11 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 // prefix (timestamp, level, session tag, logger name). That prefix was Hermes'
 // to change — a bump that changed it would have left every record as text,
 // silently — and a logger writing untrusted text could have planted a line
-// shaped like a record. Tailing a file only the two emitters write, as JSON,
-// removes both: nothing here reads a Hermes log format, and a forged record
-// would have to come from the emitters' own json.dumps.
+// shaped like a record. Tailing a file of the emitters' own, as JSON, removes
+// both: nothing here reads a Hermes log format, and a log line cannot become a
+// record. What remains is a write to the file itself, which any process under
+// the agent's uid with a path to the profile's logs/ can make; that is the
+// volume's boundary, not this configuration's.
 //
 // The audit input matches every profile's file (fluentBitAuditTailPath), not
 // only the profiles that emit today. The agent.logs input is unchanged and still
@@ -5302,7 +5306,7 @@ func buildFluentBitConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigM
 [INPUT]
     Name              tail
     Tag               agent.logs
-    Path              /opt/data/logs/*.log
+    Path              ` + fluentBitDataMount + `/logs/*.log
     DB                /fluent-bit/state/fluent-bit.db
     Refresh_Interval  5
     Rotate_Wait       30
