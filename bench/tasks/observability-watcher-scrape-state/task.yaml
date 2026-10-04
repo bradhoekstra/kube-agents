@@ -16,8 +16,9 @@
 # log), because the four phrases are the skill's own vocabulary and an answer
 # composed from the skill without a read, or one that read nothing and said
 # "not scraped", would otherwise pass on them; and the final answer has to
-# name the mechanism and its proof, which an answer built on the Deployment's
-# annotations does not. The install under test has to carry the gateway PodMonitoring
+# name the mechanism and the port, which an answer built on the Deployment's
+# annotations does not; which proving series it cites is the judge's to
+# grade. The install under test has to carry the gateway PodMonitoring
 # for the question to have the answer the skill gives; the chart renders it
 # where the cluster serves the PodMonitoring API, and a kustomize install
 # needs it applied by hand before the run.
@@ -78,8 +79,10 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      # The proof is left to the route check and the judge: a correct answer
+      # may cite up{job=...} or k8s_event_watcher_cluster_up, and a phrase
+      # check cannot say "either", so it holds the mechanism and the port.
       required_phrases:
         - "PodMonitoring"
         - "gateway-monitoring"
         - "9095"
-        - "k8s_event_watcher_cluster_up"
