@@ -11,11 +11,16 @@
 # and `k8s_event_watcher_cluster_up`, with the watcher's own labels arriving as
 # `exported_cluster` and `exported_location`).
 #
-# Graded on the final answer alone: the four phrases below are the mechanism
-# and its proof, and an answer built on the Deployment's annotations names
-# none of them. The install under test has to carry the gateway PodMonitoring
-# for the question to have the answer the skill gives; the CI pool's chart
-# installs do, and a kustomize install needs it applied by hand before the run.
+# Graded on the route and the answer. The worker has to have read the
+# PodMonitoring off the install (a `kubectl get podmonitoring` in its terminal
+# log), because the four phrases are the skill's own vocabulary and an answer
+# composed from the skill without a read, or one that read nothing and said
+# "not scraped", would otherwise pass on them; and the final answer has to
+# name the mechanism and its proof, which an answer built on the Deployment's
+# annotations does not. The install under test has to carry the gateway PodMonitoring
+# for the question to have the answer the skill gives; the chart renders it
+# where the cluster serves the PodMonitoring API, and a kustomize install
+# needs it applied by hand before the run.
 # No `fixtures:`: the case reads the agent's own install, not the seeded
 # fleet. No `domains.yaml` row covers the agent's own observability, which is
 # why the case is a reviewed KNOWN_NO_DOMAIN entry in
@@ -43,6 +48,28 @@ infrastructure:
 validated: false
 owner: bradhoekstra
 verification_spec:
+  # The front door holds no infrastructure tools, so the question is answered
+  # by a delegated worker; worker_commands reads that worker's terminal log and
+  # returns an error, not a pass, when nothing was delegated, which this
+  # objective makes a stated failure rather than a surprise.
+  - name: the-question-was-delegated
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_create"]
+      # An errored kanban_create delegated nothing.
+      require_success: true
+  # The route: the worker read the PodMonitoring off the install. A match
+  # anywhere in a command, since the worker may chain it behind cd or pipe it
+  # into a reader; worker_commands reads the card log's one-line rendering.
+  - name: the-worker-read-the-podmonitoring
+    role: objective
+    mode: assert
+    check:
+      type: worker_commands
+      required_patterns:
+        - '\bkubectl\b[^\n|;&]*\bget\b[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
   # The final answer names the mechanism and its proof. `mode: assert` because
   # the final message is immutable once the run ends; polling a failed phrase
   # would only wait out the timeout.

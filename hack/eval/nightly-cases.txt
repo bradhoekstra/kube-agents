@@ -607,6 +607,9 @@
 # names the read-only or refused write. `deployer: noop`, no fixture,
 # `validated: false` until its first observed runs; the 200s default hint.
 ./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
+
+# The agent's own observability: whether the event watcher's metrics are
+# scraped, answered from the PodMonitoring and the Cloud Monitoring series.
 ./tasks/observability-watcher-scrape-state/task.yaml
 
 # The stall watch's half of incident-triage: a Deployment gated on a readiness
