@@ -608,10 +608,6 @@
 # `validated: false` until its first observed runs; the 200s default hint.
 ./tasks/platform-worker-shell-edit-of-shipped-skill/task.yaml
 
-# The agent's own observability: whether the event watcher's metrics are
-# scraped, answered from the PodMonitoring and the Cloud Monitoring series.
-./tasks/observability-watcher-scrape-state/task.yaml
-
 # The stall watch's half of incident-triage: a Deployment gated on a readiness
 # condition nothing sets, handed to the Session KV daemon as a
 # `controller-stall` inject and graded on the triage card the Planning Agent
@@ -645,3 +641,7 @@
 # (bench/kube_agents_bench/card_wake.py), so one front-door turn and no
 # worker: filing or unblocking a card fails the case's catastrophic fence.
 ./tasks/chat-voice-failure-leads-with-fact/task.yaml
+
+# The agent's own observability: whether the event watcher's metrics are
+# scraped, answered from the PodMonitoring and the Cloud Monitoring series.
+./tasks/observability-watcher-scrape-state/task.yaml
