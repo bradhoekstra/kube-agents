@@ -68,18 +68,25 @@ Every request that runs commands reserves `REQUEST_CHILD_MEMORY_RESERVE_BYTES`, 
 children when it is admitted, beside the slot it takes, and releases it with the slot. One size,
 not a size per executable, because every route can end up running the heavy case:
 
-| What a request can spawn                                                | Measured                                                                  |
-| ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
-| `gcloud`, directly or on a `kubectl`'s cold path                        | 101 to 102 MiB per process; 102 MiB per request across eight listings     |
-| `kubectl` with the auth plugin's `gcloud config config-helper` under it | 48 plus 71 MiB                                                            |
-| the forge credential helper, then `git`                                 | the helper is Python and runs `gcloud auth print-identity-token` and `gh` |
+| What a request can spawn                                                | Measured                                                                                                                                                                                |
+| ----------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gcloud`, directly or on a `kubectl`'s cold path                        | 101 to 102 MiB per process; 102 MiB per request across eight listings                                                                                                                   |
+| `kubectl` with the auth plugin's `gcloud config config-helper` under it | 48 plus 71 MiB                                                                                                                                                                          |
+| the forge credential helper, then `git`                                 | the helper is Python; the full refresh runs `gh` always and `gcloud auth print-identity-token` when federation is absent; the read-only mint runs at most that one `gcloud` and no `gh` |
 
-The last row is why there is no cheaper class for `git`: the vcs verbs and the forge refresh
-route reach `refresh_forge_credential`, and the content-workspace `open` and `commit` reach
-`mint_read_credential` for a context repository, and both run the same helper
-(`github_token_refresh.py`), which spawns a `gcloud` whenever a credential file is configured or
-the metadata server yields no token, and `gh` always. On `open` that helper runs before the
-clone; `push` runs no credential call. The reserve is sized for the
+The last row is why there is no cheaper class for `git`. The vcs verbs and the forge refresh
+route reach `refresh_forge_credential`, whose helper (`github_token_refresh.py`) always runs
+`gh auth login --with-token` and `gh auth setup-git` after its own Python, and runs
+`gcloud auth print-identity-token` only when it cannot get an identity token without one:
+federation is tried first and spawns nothing, so on a federated broker, where the operator sets
+the credential-file variables to the federation file it lays down, no `gcloud` runs; on an
+unfederated one it runs when a credential file is set or the metadata server yields no token.
+The content-workspace `open` and `commit` reach the same helper through `mint_read_credential`
+with its read-only flag, which prints a minted token and returns before any `gh`: at most that
+one `gcloud`, under the same conditions, and nothing else. Either way the vcs route can run a
+Python helper, a `gcloud` and a `gh` behind one `git`, which is what the single reserve has to
+hold; the mint path is lighter, and §2.1 below takes it out of the per-request budget on other
+grounds. The reserve is sized for the
 tree a request spawns, not for one process: `gcloud` starts short-lived `gcloud` children of its
 own, which is why the sampler saw twelve processes for eight requests, and the figure that
 matters is the 102 MiB per request the eight listings summed to. The margin to 128 MiB covers
@@ -89,8 +96,7 @@ confirms it against the trees as they actually run.
 One reservation per request, not per child, because a request's children run one after another:
 the exec route runs the command it was asked for, and on a `kubectl`'s cold path the
 `get-credentials` into the managed kubeconfig and the `describe` behind the DNS-endpoint decision
-before it; a vcs verb runs several `git`s back to back; a content-workspace `commit` runs its
-`checkout`, `add` and `commit` in sequence. `_execute` spawns under the reservation its thread
+before it; a vcs verb runs several `git`s back to back. `_execute` spawns under the reservation its thread
 holds, recorded the way the shared request deadline already is. A spawn on a thread holding none
 takes a transient reservation for the child's lifetime, with the same wait and the same refusal;
 no shipped route reaches that branch once every route reserves at its start, and it exists so a
@@ -111,30 +117,29 @@ Where each route reserves, and why there:
   concurrent refresh has made it unnecessary, and otherwise runs the helper under the
   reservation. A cache hit never waits for the budget, and the refresh lock is never held across
   a budget wait; a second refresher does hold a reservation while it waits for the lock, for the
-  seconds the running helper takes. Called from inside a vcs or content-workspace request, the
-  function runs under that request's reservation and takes none.
-- The content-workspace verbs that spawn (`open`, `grep`, `commit`, `push`) reserve after taking
-  the store's lock and before the verb's first spawn, which on `open` is the credential mint, not
-  the clone. After the lock, not before: a reservation taken before it would be held for as long
-  as the verb queues behind a clone or push, which the store says is minutes, by a verb running
-  nothing. Before the first spawn, so a refusal leaves no sequence half done. The verbs that spawn
-  nothing (`read`, `read_many`, `list`, `close`) reserve nothing. A slot-less request joins the
-  same arrival-order queue as a slot taker and leaves it when it holds its reservation.
-
-  This reverses a decision the store records: its rationale for taking no slot says a wait while
-  holding its lock would stall every verb behind it, reads included, for the whole of the wait.
-  That is what happens here, for up to the bound, and only when four reservations are already
-  held, which on an install that sweeps is the listing burst, seconds every half hour. The
-  alternative, reserving before the lock, costs the budget 128 MiB per verb queued behind a
-  clone for minutes, up to the store's eight open workspaces, which is a standing cost against a
-  rare stall. The store comment, and the two broker docstrings that say no lock is held while
-  waiting for admission and that the content workspace's git takes no slot, change with the
-  code (§2.6).
+  seconds the running helper takes. The route hands its connection to the wait, as the exec and
+  vcs routes hand theirs to the slot wait, so a caller that hangs up while queued is dropped
+  before the helper runs, and the route gains the handler for that drop (a log line and no
+  response, as the exec route has) beside the busy handler. Called from inside a vcs request,
+  the function runs under that request's reservation and takes none; from the content-workspace
+  `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
+- The content-workspace verbs take no reservation at all. The store serves one verb at a time
+  under its single lock, across every open workspace, so at most one of its process trees exists
+  at any moment, whatever the load; that is a fixed quantity, and the budget carries it as a
+  fixed term, `CONTENT_WORKSPACE_RESERVE_BYTES` (128 MiB, one request's worth), subtracted
+  alongside the resident reserve in §2.2. Nothing on the store's path waits for admission, so the
+  store's recorded reason for taking no slot (a wait while holding its lock would stall every
+  verb behind it, reads included) is left standing rather than reversed, and the two states in
+  which the budget is held for long, a listing burst and four long-running commands, cannot
+  stall a `read` or refuse a `publish`. The store's spawns stay uncounted individually but not
+  unbounded: the lock is the bound, and the reserve is its size. A slot-less request that does
+  reserve, which after this is the forge refresh route alone, joins the same arrival-order queue
+  as a slot taker and leaves it when it holds its reservation.
 
 - The cold path reserves nothing of its own: it runs under its `kubectl` request's reservation,
   so nothing waits for admission under `_kubeconfig_lock`.
 
-Two spawns stay outside the budget on purpose: the one-off bootstrap command at startup, which
+Besides the store's (§2.1), two spawns stay outside the budget on purpose: the one-off bootstrap command at startup, which
 runs before the broker serves, and the `git config` read of a repository alias, which is a few
 hundred kilobytes and over in milliseconds.
 
@@ -145,17 +150,19 @@ At startup the broker computes what the children may hold together:
 ```
 children_budget(now) = memory_limit
                      - BROKER_RESIDENT_RESERVE_BYTES           (192 MiB: broker + Envoy, measured 168)
+                     - CONTENT_WORKSPACE_RESERVE_BYTES         (128 MiB: the store's one tree at a time, §2.1)
                      - OUTPUT_COPIES_PER_COMMAND * max_output_bytes * slots_in_use
 ```
 
-The third term is the output each admitted request may hold, at the same six copies the sizing
+The last term is the output each admitted request may hold, at the same six copies the sizing
 test models, counted for the slots in use now rather than for the cap, so a broker with two
 requests in flight is not charged for eight. A request is admitted when a slot is free and the
 sum of live reservations plus its own fits `children_budget` with its slot counted.
 
 At the operator's defaults (1Gi limit, 8 MiB output cap) a request costs 128 MiB plus 48 MiB of
-output allowance, 176 MiB, against 832 MiB after the resident reserve: four requests that run
-commands are in flight at once, whatever order they arrive in, against eight today. The stall watch's eight
+output allowance, 176 MiB, against 704 MiB after the two fixed reserves: four requests that run
+commands are in flight at once (4 × 176 = 704), whatever order they arrive in, against eight
+today. The stall watch's eight
 parallel listings run in two waves. Over two hours on the install above, 414 `gcloud` requests
 took 2 s at the median, 18 s at the 95th percentile and 25 s at most, so the second wave waits one
 listing, within the 60-second bound with room to spare. A sixteen-wide reconciler burst, which a
@@ -185,9 +192,10 @@ hung up while queued is dropped before anything starts, and bounded by the same
 On the exec and vcs routes the exception is raised exactly where it is raised today, before any
 command has run and, on the vcs route, before the body is read, so each route's existing handler
 and the vcs route's body drain apply unchanged and answer `503 CREDENTIAL_PROXY_BUSY`. The
-content-workspace and forge refresh routes take no slot today and so have no handler; today a
-refusal would reach their generic branches and read as a workspace fault or a
-`FORGE_TOKEN_REFRESH_FAILED` 502. Both gain the same handler and the same 503. The sandbox shim, the `busy`
+forge refresh route takes no slot today and so has no handler; a refusal would reach its generic
+branch and read as a `FORGE_TOKEN_REFRESH_FAILED` 502. It gains the same handler and the same
+503, and the hang-up handler §2.1 names. The content-workspace route reserves nothing (§2.1) and
+needs neither. The sandbox shim, the `busy`
 metric status, the audit record and the site's troubleshooting entry then see the signal they see
 today, with a different sentence in it. A wait of a second or more logs, as a slot wait does:
 `request waited %dms for memory budget (%d MiB reserved of %d MiB)`.
@@ -235,21 +243,26 @@ env list, as it does the two caps: a CR that could set it would detach the budge
 `TestCredentialProxyOutputCapClearsTheLargestFleetDump` currently asserts
 `request + output_burst(all slots) <= limit`, with the container's 512Mi memory request as the
 resting term, upstream's statement of what the pod holds with nothing in flight. That line stays.
-It gains a second assertion in the broker's own terms, with the broker's 192 MiB resident reserve
-as the resting term, because that is the number the broker subtracts and so the budget the
-children see: with every slot in use and every one at its full output burst, the budget still
-admits at least two requests' reservations:
+It gains a second assertion in the broker's own terms, with the broker's fixed reserves as the
+resting term, because those are the numbers the broker subtracts and so the budget the children
+see. A slot in use is a request holding a reservation, so the slot count and the reservation
+count are one variable, not two, and the assertion is the admission rule itself at a floor:
+the budget admits at least two requests at once, each with its output allowance, so a listing
+phase still parallelises at all:
 
 ```
-resident_reserve + copies * output_cap * slots + 2 * request_reserve <= limit
+resident_reserve + workspace_reserve + 2 * (copies * output_cap + request_reserve) <= limit
 ```
 
-At the defaults that is 192 + 384 + 256 = 832 MiB against 1024. Two is the floor at which a
-listing phase still parallelises at all; the test is there so a future reduction of the limit or
-a raise of either cap has to argue with the number. The six output copies are a comment in the
+At the defaults that is 192 + 128 + 2 × 176 = 672 MiB against 1024. The test derives the count
+the rule admits from the rendered values, `floor((limit − reserves) / (copies × cap + reserve))`,
+four today, names it in its failure message, and fails below two, so a future reduction of the
+limit or a raise of either cap has to argue with the number it prints. The slot cap does not
+enter the rule except as an upper bound, and the test says so where a reader would otherwise
+expect it to. The six output copies are a comment in the
 broker and a constant only in the Go test today; the broker gains `OUTPUT_COPIES_PER_COMMAND`
-beside the new constants, and the resident reserve, the request reserve and the copies appear in the Go test as
-constants that name their Python counterparts, so a change to one side has a name to search for
+beside the new constants, and the two fixed reserves, the request reserve and the copies appear
+in the Go test as constants that name their Python counterparts, so a change to one side has a name to search for
 on the other.
 
 The test also asserts the memory-limit variable is rendered as a `resourceFieldRef` on the proxy
@@ -277,12 +290,13 @@ the slot message; the site's troubleshooting entry for the busy 503, which quote
 message and says eight long-running commands may hold slots, where four will hold the budget;
 the operator's three sizing comments, beside the Resources constants, beside the env block
 (which still names a 256Mi request) and in the sizing test, all of which say the children are
-outside the arithmetic; and the three locking statements §2.1 reverses or extends: `_execute`'s
-docstring (no lock is held while waiting for a slot), `request_slot`'s docstring (the content
-workspace's git takes no slot because the store's lock serialises it), and the store's own
-rationale for taking none. The docs map's identifier-sources table gains a row for the constants
-that have to agree between the broker and the Go test (the resident reserve, the per-request
-reserve and the output copies).
+outside the arithmetic; and the three locking statements §2.1 extends without reversing:
+`_execute`'s docstring (no lock is held while waiting for a slot, which now covers the budget
+too), `request_slot`'s docstring (the content workspace's git takes no slot because the store's
+lock serialises it, and no reservation for the same reason), and the store's own rationale,
+which gains the sentence that its lock is what sizes the budget's fixed term. The docs map's
+identifier-sources table gains a row for the constants that have to agree between the broker and
+the Go test (the two fixed reserves, the per-request reserve and the output copies).
 
 ## 3. Alternatives considered
 
@@ -316,13 +330,14 @@ Unit, in `agents/platform/scripts/test_credential_proxy.py`: the budget is deriv
 variable, from the cgroup file, and disabled when neither is readable or the file says `max`; a
 request waits when the sum would exceed the budget and is admitted when a reservation is
 released; the wait is in arrival order and drops a caller that hangs up while queued; a request
-still waiting at the bound raises `CommandSlotUnavailable` naming the budget, and the exec, vcs,
-content-workspace and forge refresh routes each answer it with the existing 503 body, the vcs
-route before reading its body; the output term is charged for slots in use, not the cap; a
+still waiting at the bound raises `CommandSlotUnavailable` naming the budget, and the exec, vcs
+and forge refresh routes each answer it with the existing 503 body, the vcs route before reading
+its body; the output term is charged for slots in use, not the cap; a
 `kubectl` request's cold-path `gcloud`s spawn under the request's reservation and take no second
-one; a content-workspace `open` reserves after the store lock and before the credential mint, a
-`commit` before its first spawn, and a `read` reserves nothing; a forge refresh that coalesces
-reserves nothing and one that runs the helper reserves before taking the refresh lock; a spawn on a thread with no reservation takes a transient one; the
+one; no content-workspace verb reserves and the store's fixed term is subtracted whether or not a
+workspace is open; a forge refresh that coalesces reserves nothing, one that runs the helper
+reserves before taking the refresh lock, and the route drops a caller that hangs up while queued
+and answers a refusal with the 503; a spawn on a thread with no reservation takes a transient one; the
 degenerate case admits and logs once; a reservation is released with its slot, including after a
 timed-out command and a caller hang-up; an executor constructed without a limit has no budget
 whatever the process's cgroup says.
