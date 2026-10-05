@@ -44,8 +44,8 @@ _JOB_NAME_ABSENT = "JOB_NAME: absent"
 
 _GSUTIL_STUB = """#!/usr/bin/env bash
 # gsutil stub: `ls` prints the fixture listing for the PR named in the glob
-# (GSUTIL_LS_DIR/<pr>.txt, else GSUTIL_LS_FILE, else it fails like a
-# no-match glob), `cat` serves "<build>.<file>" out of GSUTIL_OBJECT_DIR.
+# (GSUTIL_LS_DIR/<pr>.txt, else it fails like a no-match glob), `cat` serves
+# "<build>.<file>" out of GSUTIL_OBJECT_DIR.
 # Every call is appended to GSUTIL_CALL_LOG so a test can pin WHICH history
 # the script read -- reading another PR's (or another job's) records would
 # reuse a foreign verdict while every content assertion still passed.
@@ -58,8 +58,6 @@ case "${cmd}" in
     pr="$(printf '%s' "$1" | sed -n 's|.*/gke-labs_kube-agents/\\([0-9]*\\)/.*|\\1|p')"
     if [ -n "${GSUTIL_LS_DIR:-}" ] && [ -f "${GSUTIL_LS_DIR}/${pr}.txt" ]; then
       cat "${GSUTIL_LS_DIR}/${pr}.txt"
-    elif [ -n "${GSUTIL_LS_FILE:-}" ] && [ -f "${GSUTIL_LS_FILE}" ]; then
-      cat "${GSUTIL_LS_FILE}"
     else
       echo "CommandException: One or more URLs matched no objects." >&2
       exit 1
@@ -197,9 +195,7 @@ class RevalidationTest(unittest.TestCase):
                 )
         for head_sha, events in status_events.items():
             self._plant_statuses(head_sha, events)
-        ls_file = self.listings / f"{pr}.txt"
-        ls_file.write_text("\n".join(listing) + "\n")
-        return ls_file
+        (self.listings / f"{pr}.txt").write_text("\n".join(listing) + "\n")
 
     def _plant_statuses(self, head_sha, events):
         # Append-only, like GitHub's: two histories (a batch's two pulls)
@@ -208,7 +204,7 @@ class RevalidationTest(unittest.TestCase):
         existing = json.loads(path.read_text()) if path.exists() else []
         path.write_text(json.dumps(existing + events))
 
-    def _run(self, cur_head, cur_base, ls_file=None, env_overrides=None):
+    def _run(self, cur_head, cur_base, env_overrides=None):
         # The shipped script, copied into the fixture repo's hack/ so its own
         # BASH_SOURCE-derived repo_dir points at the fixture checkout, the
         # same way it points at the real one in the pod; sourced rather than
@@ -248,8 +244,6 @@ class RevalidationTest(unittest.TestCase):
             "GITHUB_STATUS_DIR": str(self.statuses),
             "BENCH_GITHUB_TOKEN": "",
         }
-        if ls_file is not None:
-            env["GSUTIL_LS_FILE"] = str(ls_file)
         if env_overrides:
             env.update(env_overrides)
         # A None value means the variable is absent from the child's
@@ -273,8 +267,8 @@ class RevalidationTest(unittest.TestCase):
     # ── the one path that skips ──────────────────────────────────────────────
 
     def test_green_history_plus_inert_deltas_reuses_the_verdict(self):
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         # Both delta file lists and the predicate are in the log.
@@ -286,8 +280,8 @@ class RevalidationTest(unittest.TestCase):
         """Humans grep build logs for this line (and future collector support
         needs a stable line to key on); the word REVALIDATED and the reused
         build id must appear together, and the Spyglass URL must follow."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertRegex(
             proc.stdout, r"Step 0: REVALIDATED against green build 200\b"
         )
@@ -301,8 +295,8 @@ class RevalidationTest(unittest.TestCase):
         """A wrong PR number, job name or bucket in the history path would
         reuse a FOREIGN verdict while every content assertion still passed;
         the URLs the script hands gsutil are the load-bearing part."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
-        self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c1, self.c3)])
+        self._run(cur_head=self.c4, cur_base=self.c2)
         calls = self.call_log.read_text().splitlines()
         prefix = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}"
         self.assertIn(f"ls {prefix}/*/finished.json", calls)
@@ -317,9 +311,9 @@ class RevalidationTest(unittest.TestCase):
         reads only its own history, and the today job's status attests
         nothing for it."""
         other_job = f"{_JOB}-next"
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(
-            cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides={"JOB_NAME": other_job}
+            cur_head=self.c4, cur_base=self.c2, env_overrides={"JOB_NAME": other_job}
         )
         calls = self.call_log.read_text().splitlines()
         own = f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{other_job}"
@@ -339,12 +333,12 @@ class RevalidationTest(unittest.TestCase):
         The probe line pins which one each subtest handed the script; without
         it the "unset" subtest was the "empty" one run twice, because `_run`
         seeds JOB_NAME="" and a None override used to change nothing."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         cases = (({"JOB_NAME": ""}, _JOB_NAME_SET), ({"JOB_NAME": None}, _JOB_NAME_ABSENT))
         for overrides, probe in cases:
             with self.subTest(overrides=overrides):
                 proc = self._run(
-                    cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides=overrides
+                    cur_head=self.c4, cur_base=self.c2, env_overrides=overrides
                 )
                 self.assertIn(probe, proc.stdout, proc.stdout + proc.stderr)
                 self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
@@ -353,8 +347,8 @@ class RevalidationTest(unittest.TestCase):
     def test_an_identical_base_is_trivially_inert(self):
         """An empty base delta means main's tree is byte-identical to the one
         the green verdict graded -- reuse is correct, not an edge case."""
-        ls = self._plant_history([("200", True, self.c2, self.c3)])
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c2, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertIn("trivially inert", proc.stdout)
 
@@ -364,8 +358,8 @@ class RevalidationTest(unittest.TestCase):
         """The retest Tide starts because main moved, serial or batch: the
         base delta c1..c5 touches code.py, which the inert rule would refuse,
         and the same-head rule does not look at it."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
-        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"Step 0: REVALIDATED against green build 200\b")
@@ -377,10 +371,10 @@ class RevalidationTest(unittest.TestCase):
         """A force-push back to an earlier head: the newest green (300) is at
         c5, and c5..c3 touches code.py, so the inert rule would run full;
         the older green at this very head (200) is the one to reuse."""
-        ls = self._plant_history(
+        self._plant_history(
             [("300", True, self.c1, self.c5), ("200", True, self.c1, self.c3)]
         )
-        proc = self._run(cur_head=self.c3, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c3, cur_base=self.c2)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
         self.assertIn("this head already passed", proc.stdout)
@@ -388,19 +382,21 @@ class RevalidationTest(unittest.TestCase):
     def test_the_same_head_rule_still_demands_the_attestation(self):
         """Same head or not, a GCS record with no Prow-posted success status
         on that head is the forged record, and runs full."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_history([("200", True, self.c1, self.c3)], attest=False)
         self._plant_statuses(self.c3, [])
-        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("refusing to trust the GCS record alone", proc.stdout)
 
     def test_a_red_at_this_head_newer_than_its_green_is_overridden(self):
-        """The newest GREEN wins, as for inert pushes: a later red at the same
-        head is flake or infrastructure by construction."""
-        ls = self._plant_history(
+        """The newest GREEN wins, as for inert pushes. For the same head that is
+        a rule, not a proof of flake: the script header says a same-head red
+        can also be the combination with a newer main, which the reuse does
+        not test."""
+        self._plant_history(
             [("300", False, self.c5, self.c3), ("200", True, self.c1, self.c3)]
         )
-        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
 
@@ -470,6 +466,28 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"PR #{_PR} holds a reusable verdict: green build 200", proc.stdout)
         self.assertNotIn("REVALIDATED", proc.stdout)
 
+    def test_a_batch_env_that_also_carries_pull_number_is_still_a_batch(self):
+        """JOB_TYPE decides. A PULL_NUMBER beside a batch's PULL_REFS (an
+        operator shell, never Prow) must not narrow the batch to that one
+        pull: the second pull has no history, so the batch runs full."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        env = self._batch_env([(_PR, self.c3), (_OTHER_PR, self.c4)], self.c5)
+        env.update({"PULL_NUMBER": _PR, "PULL_PULL_SHA": self.c3})
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides=env)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("batch of 2 pull requests", proc.stdout)
+        self.assertIn(f"no finished {_JOB} build for PR #{_OTHER_PR}", proc.stdout)
+        self.assertNotIn("REVALIDATED", proc.stdout)
+
+    def test_a_batch_job_without_pull_refs_is_a_full_run(self):
+        proc = self._run(
+            cur_head=self.c3,
+            cur_base=self.c5,
+            env_overrides={"PULL_NUMBER": _PR, "PULL_PULL_SHA": self.c3, "JOB_TYPE": "batch", "PULL_REFS": None},
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("a batch job with PULL_REFS or PULL_BASE_SHA unset", proc.stdout)
+
     def test_a_malformed_pull_refs_is_a_full_run(self):
         """A PULL_REFS whose entries are not <number>:<40-hex> is a full run
         before any SHA reaches gsutil or git -- a short SHA, a base alone, a
@@ -505,12 +523,12 @@ class RevalidationTest(unittest.TestCase):
         """started.json's repos value is the same Refs.String() shape as
         PULL_REFS, so a ":<ref>" third field there must not turn the head
         into "<sha>:<ref>" and fail the 40-hex check as a malformed SHA."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         (self.objects / "200.started.json").write_text(
             '{"repos": {"gke-labs/kube-agents": "main:%s,%s:%s:refs/heads/topic"}}'
             % (self.c1, _PR, self.c3)
         )
-        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertNotIn("malformed SHA", proc.stdout)
 
@@ -550,54 +568,54 @@ class RevalidationTest(unittest.TestCase):
     def test_the_newest_green_wins_and_the_sort_is_numeric(self):
         """Build 90 sorts after 1000 lexicographically; picking it here would
         compare against records whose deltas are NOT inert and run full."""
-        ls = self._plant_history(
+        self._plant_history(
             [
                 ("2000", False, self.c1, self.c3),  # newest, red: skipped over
                 ("1000", True, self.c1, self.c3),  # the build to reuse
                 ("90", True, self.c1, self.c1),  # lexicographic trap: head delta c1..c4 stays inert,
             ]
         )
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 1000\b")
 
     # ── every fall-through path runs full ────────────────────────────────────
 
     def test_no_history_is_a_full_run(self):
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=None)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("first run on this PR, or GCS unreadable", proc.stdout)
 
     def test_no_green_build_is_a_full_run(self):
-        ls = self._plant_history([("200", False, self.c1, self.c3)])
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", False, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("no green build", proc.stdout)
 
     def test_an_unparsable_finished_json_is_a_full_run(self):
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         (self.objects / "200.finished.json").write_text("not json at all")
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
 
     def test_a_started_json_without_the_shas_is_a_full_run(self):
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         (self.objects / "200.started.json").write_text('{"repos": {}}')
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("could not recover base/head SHAs", proc.stdout)
 
     def test_a_missing_started_json_is_a_full_run(self):
-        ls = self._plant_history([("200", True, None, None)])
+        self._plant_history([("200", True, None, None)])
         (self.objects / "200.finished.json").write_text('{"passed": true}')
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("no readable started.json", proc.stdout)
 
     def test_a_non_inert_file_in_the_head_delta_is_a_full_run(self):
         # prev_head c1 -> cur_head c5 touches code.py alongside inert files.
-        ls = self._plant_history([("200", True, self.c2, self.c1)])
-        proc = self._run(cur_head=self.c5, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c2, self.c1)])
+        proc = self._run(cur_head=self.c5, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("code.py", proc.stdout)
 
@@ -605,16 +623,16 @@ class RevalidationTest(unittest.TestCase):
         # Head side inert (c3 -> c4 adds docs/b.md); main moved c1 -> c5,
         # which touches code.py. Only a NEW head reaches the base-delta rule:
         # the same head is reused whatever main did, tested above.
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
-        proc = self._run(cur_head=self.c4, cur_base=self.c5, ls_file=ls)
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("code.py", proc.stdout)
 
     def test_the_inert_regex_is_root_anchored(self):
         """docs-evil.go must not ride the docs/ branch, a .md below the root
         is prompt content, and bench/OWNERS is not the root OWNERS file."""
-        ls = self._plant_history([("200", True, self.c2, self.c4)])
-        proc = self._run(cur_head=self.c6, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c2, self.c4)])
+        proc = self._run(cur_head=self.c6, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         for survivor in ("docs-evil.go", "sub/notes.md", "bench/OWNERS"):
             self.assertIn(survivor, proc.stdout)
@@ -624,8 +642,8 @@ class RevalidationTest(unittest.TestCase):
         rename detection on, the diff would list only the inert destination
         and the deletion would ride a reused green -- the --no-renames flag
         is what keeps the source path visible to the predicate."""
-        ls = self._plant_history([("200", True, self.c2, self.c6)])
-        proc = self._run(cur_head=self.c7, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c2, self.c6)])
+        proc = self._run(cur_head=self.c7, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("code.py", proc.stdout)
 
@@ -633,19 +651,19 @@ class RevalidationTest(unittest.TestCase):
         """The cross-PR forgery from kube-agents-bot's review: a fabricated
         finished.json/started.json pair under this PR's history path, with no
         Prow-posted success status behind it, must not be trusted."""
-        ls = self._plant_history([("9999999999999999999", True, self.c2, self.c4)], attest=False)
+        self._plant_history([("9999999999999999999", True, self.c2, self.c4)], attest=False)
         # GitHub answers 200 with an empty list for a commit that has no
         # status events; an unreadable statuses endpoint is a separate
         # fail-closed path with its own reason line.
         self._plant_statuses(self.c4, [])
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("refusing to trust the GCS record alone", proc.stdout)
 
     def test_a_status_for_a_different_build_does_not_attest_this_one(self):
         """A success status exists on the head, but its target URL names
         another build -- the forged record cannot borrow it."""
-        ls = self._plant_history([("200", True, self.c2, self.c4)], attest=False)
+        self._plant_history([("200", True, self.c2, self.c4)], attest=False)
         self._plant_statuses(
             self.c4,
             [
@@ -657,53 +675,52 @@ class RevalidationTest(unittest.TestCase):
                 {"context": _JOB, "state": "pending", "target_url": None},
             ],
         )
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("refusing to trust the GCS record alone", proc.stdout)
 
     def test_a_malformed_sha_is_a_full_run(self):
         """A forged started.json must not be able to hand git anything but a
         full-length commit id -- '--flag' smuggling dies here."""
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         (self.objects / "200.started.json").write_text(
             '{"repos": {"gke-labs/kube-agents": "main:%s,%s:--upload-pack=/tmp/evil"}}'
             % (self.c1, _PR)
         )
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("malformed SHA", proc.stdout)
 
     def test_disagreeing_finished_and_started_records_are_a_full_run(self):
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         (self.objects / "200.finished.json").write_text(
             '{"passed": true, "result": "SUCCESS", "revision": "%s"}' % self.c5
         )
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("does not match its started.json head", proc.stdout)
 
     def test_a_missing_git_object_is_a_full_run(self):
         ghost = "deadbeef" * 5
-        ls = self._plant_history([("200", True, self.c1, ghost)])
-        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self._plant_history([("200", True, self.c1, ghost)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("not in this checkout", proc.stdout)
 
     def test_the_escape_hatch_forces_a_full_run(self):
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(
             cur_head=self.c4,
             cur_base=self.c2,
-            ls_file=ls,
             env_overrides={"EVAL_SKIP_REVALIDATION": "1"},
         )
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("escape hatch", proc.stdout)
 
     def test_outside_a_decorated_presubmit_is_a_full_run(self):
-        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(
-            cur_head=self.c4, cur_base=self.c2, ls_file=ls, env_overrides={"PULL_NUMBER": ""}
+            cur_head=self.c4, cur_base=self.c2, env_overrides={"PULL_NUMBER": ""}
         )
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("not a decorated Prow presubmit", proc.stdout)

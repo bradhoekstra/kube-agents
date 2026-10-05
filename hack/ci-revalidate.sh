@@ -177,7 +177,10 @@ revalidate_one_pull() {
   # this head's. finished.json's revision is the head a build ran at, and is
   # held to started.json's below for whichever build is chosen.
   # One parse per candidate: it yields "passed <revision>" or nothing, and the
-  # chosen build's revision is kept for the started.json check below.
+  # chosen build's revision is kept for the started.json check below. The
+  # scan stops only at a same-head green, so every other path reads all of
+  # REVALIDATION_HISTORY_LIMIT finished.json records -- a second each, ahead
+  # of a run that then spends minutes (an inert reuse) or hours (the matrix).
   local build prev_green="" finished_revision="" candidate_parsed candidate_revision
   while read -r build; do
     [ -n "${build}" ] || continue
@@ -366,12 +369,17 @@ revalidate_against_green_history() {
     return 1
   fi
 
-  # The pulls to revalidate, one "<number> <head-sha>" per line. A serial
-  # presubmit names its one pull; a batch names its pulls in PULL_REFS.
+  # The pulls to revalidate, one "<number> <head-sha>" per line. JOB_TYPE
+  # decides which shape is read: a batch's pulls are PULL_REFS and nothing
+  # else, so a PULL_NUMBER beside them (not Prow's doing, but an operator
+  # shell's) cannot narrow a batch to one pull; a serial presubmit names its
+  # one pull in PULL_NUMBER and PULL_PULL_SHA.
   local pulls=""
-  if [ -n "${PULL_NUMBER:-}" ] && [ -n "${PULL_PULL_SHA:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
-    pulls="${PULL_NUMBER} ${PULL_PULL_SHA}"
-  elif [ "${JOB_TYPE:-}" = "${REVALIDATION_BATCH_JOB_TYPE}" ] && [ -n "${PULL_REFS:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
+  if [ "${JOB_TYPE:-}" = "${REVALIDATION_BATCH_JOB_TYPE}" ]; then
+    if [ -z "${PULL_REFS:-}" ] || [ -z "${PULL_BASE_SHA:-}" ]; then
+      echo "Step 0: full run: a batch job with PULL_REFS or PULL_BASE_SHA unset"
+      return 1
+    fi
     # The first entry must be the base, "<base_ref>:<PULL_BASE_SHA>" -- held
     # to that, not assumed, so a pull in that slot is refused rather than
     # dropped unread -- and every entry after it "<number>:<40-hex>[:<ref>]";
@@ -396,8 +404,10 @@ for entry in entries[1:]:
       return 1
     fi
     echo "Step 0: batch of $(printf '%s\n' "${pulls}" | wc -l | tr -d ' ') pull requests; every one must hold a reusable verdict"
+  elif [ -n "${PULL_NUMBER:-}" ] && [ -n "${PULL_PULL_SHA:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
+    pulls="${PULL_NUMBER} ${PULL_PULL_SHA}"
   else
-    echo "Step 0: full run: not a decorated Prow presubmit or batch (PULL_NUMBER, PULL_PULL_SHA or PULL_BASE_SHA unset, and no batch PULL_REFS)"
+    echo "Step 0: full run: not a decorated Prow presubmit or batch (PULL_NUMBER, PULL_PULL_SHA or PULL_BASE_SHA unset, and JOB_TYPE is not batch)"
     return 1
   fi
 
