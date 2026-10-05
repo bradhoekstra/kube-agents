@@ -88,6 +88,16 @@ readonly SCOPE_MAX_PROJECTS_MIN=1
 readonly SCOPE_MAX_PROJECTS_MAX=5000
 readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 
+# ─── Scoped service account pool ──────────────────────────────────────────────
+# SCOPED_SA_POOL_ENABLED arms the pool (the composition's scoped_pool_enabled,
+# spec.security.scopedServiceAccountPool.enabled on the CR); off by default,
+# because a pool member holds no IAM grant yet. SCOPED_SA_POOL_MAX_ACCOUNTS is
+# the share of the management project's service-account quota the pool may
+# fill (scoped_pool_max_accounts): GCP's default quota, the module's default.
+readonly SCOPED_SA_POOL_ENABLED_DEFAULT="false"
+readonly SCOPED_SA_POOL_MAX_ACCOUNTS_MIN=1
+readonly SCOPED_SA_POOL_MAX_ACCOUNTS_DEFAULT=100
+
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -952,6 +962,18 @@ require_scope_max_projects() {
     fi
   fi
   print_error "SCOPE_MAX_PROJECTS='${value}' is not a whole number from ${SCOPE_MAX_PROJECTS_MIN} to ${SCOPE_MAX_PROJECTS_MAX}, the bounds the PlatformAgent puts on spec.scope.maxProjects. Set one, or leave it empty for the default (${SCOPE_MAX_PROJECTS_DEFAULT}), in install.env."
+  return 1
+}
+
+# SCOPED_SA_POOL_MAX_ACCOUNTS is empty (the module's default) or a whole number
+# of at least one, or the run stops before a file is written and names the key:
+# the module's validation would name neither. No arithmetic, so no width to
+# overflow: the regex is the whole check. $1 the value.
+require_scoped_sa_pool_max_accounts() {
+  local value="${1:-}"
+  [ -n "$value" ] || return 0
+  [[ "$value" =~ ^0*[1-9][0-9]*$ ]] && return 0
+  print_error "SCOPED_SA_POOL_MAX_ACCOUNTS='${value}' is not a whole number of at least ${SCOPED_SA_POOL_MAX_ACCOUNTS_MIN}, the number of service accounts the scoped pool may create in the management project. Set one, or leave it empty for the default (${SCOPED_SA_POOL_MAX_ACCOUNTS_DEFAULT}), in install.env."
   return 1
 }
 
@@ -2937,6 +2959,17 @@ write_tfvars_from_state() {
       redaction_rules="$(hcl_redaction_rules "$LITELLM_REDACTION_RULES")" || return 1
     fi
   fi
+  # The scoped service account pool, for the same reason: a misspelt switch
+  # is refused rather than read as off, and a cap the module would refuse is
+  # named here with its key. The cap is checked whether or not the pool is
+  # armed, so turning the pool on later does not surface a line written long
+  # before.
+  local scoped_pool_enabled="${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}"
+  if ! is_bool_spelling "$scoped_pool_enabled"; then
+    print_error "SCOPED_SA_POOL_ENABLED='${scoped_pool_enabled}' is neither true nor false. Fix it in install.env."
+    return 1
+  fi
+  require_scoped_sa_pool_max_accounts "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" || return 1
 
   local old_umask
   old_umask="$(umask)"
@@ -3001,6 +3034,14 @@ write_tfvars_from_state() {
       echo "}"
     else
       echo "litellm_redaction = { enabled = false }"
+    fi
+    echo ""
+    echo "# The scoped service account pool (SCOPED_SA_POOL_ENABLED,"
+    echo "# SCOPED_SA_POOL_MAX_ACCOUNTS in install.env): one reader service account per"
+    echo "# project the plan lists in the scope block above, armed by this switch alone."
+    echo "scoped_pool_enabled      = $(hcl_bool "$scoped_pool_enabled")"
+    if [ -n "${SCOPED_SA_POOL_MAX_ACCOUNTS:-}" ]; then
+      echo "scoped_pool_max_accounts = ${SCOPED_SA_POOL_MAX_ACCOUNTS}"
     fi
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then

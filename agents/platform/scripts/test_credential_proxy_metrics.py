@@ -787,7 +787,7 @@ class FaultOutcomeTest(unittest.TestCase):
             return error.code, json.loads(error.read())
 
     def test_a_pool_refusal_counts_as_blocked(self):
-        status, body = self._post_with(scoped_sa_pool.PoolRefusal("no member covers the scope"))
+        status, body = self._post_with(scoped_sa_pool.PoolRefusal("no scoped service account is provisioned for project p (cluster projects/p/locations/l/clusters/c)"))
         self.assertEqual(403, status)
         self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"))
         families = _parse(CredentialProxyHandler.metrics.render())

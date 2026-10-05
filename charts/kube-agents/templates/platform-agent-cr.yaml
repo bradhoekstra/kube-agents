@@ -181,9 +181,26 @@ spec:
     serviceAccountAnnotations:
       {{- toYaml . | nindent 6 }}
     {{- end }}
-    {{- with .Values.platformAgent.security.scopedServiceAccounts }}
-    scopedServiceAccounts:
-      {{- toYaml . | nindent 6 }}
+    {{- /*
+      Rendered when the pool is armed or carries members, and omitted otherwise, so
+      the default values render the CR the operator reads as "no pool" rather than a
+      present block with the switch off. `enabled` is the arming rule on the CR; the
+      list alone arms nothing, which is why a populated list with the switch off is
+      still rendered: the mapping is declared, visible in the CR, and inert. Armed
+      with no members fails here, as the CRD's own rule would at apply, so the
+      message names the value rather than the CR field.
+    */}}
+    {{- $pool := .Values.platformAgent.security.scopedServiceAccountPool | default dict }}
+    {{- if and $pool.enabled (not $pool.serviceAccounts) }}
+    {{- fail "platformAgent.security.scopedServiceAccountPool.enabled requires at least one serviceAccounts entry; the broker refuses to start on an empty pool" }}
+    {{- end }}
+    {{- if or $pool.enabled $pool.serviceAccounts }}
+    scopedServiceAccountPool:
+      enabled: {{ $pool.enabled | default false }}
+      {{- with $pool.serviceAccounts }}
+      serviceAccounts:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
     {{- end }}
     {{- /*
       Both fields or neither. The operator reads a half-filled block as absent and

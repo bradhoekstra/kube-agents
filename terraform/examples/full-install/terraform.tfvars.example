@@ -202,6 +202,17 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #   }
 # }
 
+# The scoped service account pool: one reader service account per project the
+# plan can list in scope above (project_id, projects less an exact exclude,
+# selector members; not a folder's or organisation's members yet), created in
+# project_id and handed to the credential broker as its mapping. Off by
+# default and independent of scope: the members hold no IAM grant yet, so an
+# armed pool turns every cluster read into a Forbidden. max_accounts is the
+# share of project_id's service-account quota the pool may fill (GCP default
+# 100); a pool past it is refused at plan.
+# scoped_pool_enabled      = false
+# scoped_pool_max_accounts = 100
+
 # Optional scheduled backups of the release namespace. Off by default in both
 # install paths: Backup for GKE bills per backed-up pod and per GB of snapshot
 # storage, and the snapshots contain the agent's credentials Secret.

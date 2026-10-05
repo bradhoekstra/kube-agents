@@ -1064,6 +1064,84 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertIn(expected, dest.read_text())
 
+    # Empty reads as unset, so a developer's own exported value cannot stand in.
+    _SCOPED_POOL_UNSET = {
+        "SCOPED_SA_POOL_ENABLED": "",
+        "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
+    }
+
+    def test_tfvars_carry_the_scoped_sa_pool(self):
+        # The switch is always written, false by default, so the file states
+        # whether the pool is armed; the cap only when set, like the scope's.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for env, expected, absent in (
+                ({}, "scoped_pool_enabled      = false\n", "scoped_pool_max_accounts"),
+                ({"SCOPED_SA_POOL_ENABLED": "off", "SCOPED_SA_POOL_MAX_ACCOUNTS": "50"},
+                 "scoped_pool_enabled      = false\nscoped_pool_max_accounts = 50\n", None),
+                ({"SCOPED_SA_POOL_ENABLED": "yes", "SCOPED_SA_POOL_MAX_ACCOUNTS": "250"},
+                 "scoped_pool_enabled      = true\nscoped_pool_max_accounts = 250\n", None),
+                ({"SCOPED_SA_POOL_ENABLED": "true"},
+                 "scoped_pool_enabled      = true\n", "scoped_pool_max_accounts"),
+            ):
+                with self.subTest(env=env):
+                    proc = self._run(
+                        f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                        env={"API_SERVER_KEY": "k", **self._SCOPED_POOL_UNSET, **env},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=0", proc.stdout, proc.stderr)
+                    content = dest.read_text()
+                    self.assertIn(expected, content)
+                    if absent:
+                        self.assertNotIn(absent, content)
+
+    def test_tfvars_refuse_scoped_sa_pool_values_terraform_cannot_take(self):
+        # upgrade.sh regenerates from install.env without install.sh's checks,
+        # so the generator names the key and writes nothing; a misspelt switch
+        # is refused rather than read as off.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            for key, value, message in (
+                ("SCOPED_SA_POOL_ENABLED", "ture", "is neither true nor false"),
+                ("SCOPED_SA_POOL_ENABLED", "armed", "is neither true nor false"),
+                ("SCOPED_SA_POOL_MAX_ACCOUNTS", "0", "is not a whole number of at least 1"),
+                ("SCOPED_SA_POOL_MAX_ACCOUNTS", "lots", "is not a whole number of at least 1"),
+                ("SCOPED_SA_POOL_MAX_ACCOUNTS", "2.5", "is not a whole number of at least 1"),
+            ):
+                with self.subTest(key=key, value=value):
+                    proc = self._run(
+                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
+                        env={"API_SERVER_KEY": "k", **self._SCOPED_POOL_UNSET, key: value},
+                        describe_stub="printf '\\n'; exit 0",
+                    )
+                    self.assertIn("rc=1", proc.stdout, proc.stderr)
+                    self.assertIn(f"{key}='{value}'", proc.stderr + proc.stdout)
+                    self.assertIn(message, proc.stderr + proc.stdout)
+                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
+
+    def test_the_scoped_sa_pool_cap_is_a_whole_number_of_at_least_one(self):
+        for bad in ("0", "00", "abc", "2.5", "-3", " 12", "1e3"):
+            with self.subTest(bad=bad):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scoped_sa_pool_max_accounts {shlex.quote(bad)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn(f"SCOPED_SA_POOL_MAX_ACCOUNTS='{bad}' is not a whole number of at least 1", proc.stdout)
+                self.assertIn("default (100)", proc.stdout)
+        for good in ("", "1", "100", "0250", "5000"):
+            with self.subTest(good=good):
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     'print_error() { echo "ERROR: $*"; }; print_info() { :; }; print_warning() { :; }; print_success() { :; }\n'
+                     f'source "{_INSTALLER_COMMON}"\nrequire_scoped_sa_pool_max_accounts {shlex.quote(good)}; echo "rc=$?"'],
+                    capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+                )
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+
     def test_tfvars_escape_litellm_redaction_rules_for_hcl(self):
         # A regular expression may hold ${ or %{, which HCL reads as a
         # template, as well as backslashes and quotes.

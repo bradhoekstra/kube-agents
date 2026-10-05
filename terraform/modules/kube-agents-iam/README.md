@@ -24,12 +24,17 @@ the grant in your Terraform, where it is reviewed.
 
 ## The scoped service account pool
 
-`scoped_clusters` provisions one service account per named GKE cluster, plus
-`roles/iam.serviceAccountTokenCreator` for the agent bound on each member as a
-resource (never at project level). The members hold no IAM grant of their own
-as of 2026-08-12 — the IAM-Condition scoping they were designed around grants
-nothing for Kubernetes object operations — so the default is `[]` and should
-stay there until per-cluster RBAC lands. The site's
+`scoped_pool_enabled = true` provisions one service account per project the plan can list in
+`scope` (the host project, `scope.projects` less an exact `exclude.projects` entry, and each
+selector's members; a folder's or organisation's members are not listed at plan time yet), keyed
+on the bare project id and created in `project_id`, plus `roles/iam.serviceAccountTokenCreator`
+for the agent bound on each member as a resource (never at project level). Two clusters in one
+project share an account by design (`docs/designs/multi-project-scope.md` §6).
+`scoped_pool_max_accounts` (100, GCP's default service-account quota per project) caps how many
+the plan may create; a pool past it is refused at plan. The members hold no IAM grant of their
+own as of 2026-08-12 — the IAM-Condition scoping they were designed around grants nothing for
+Kubernetes object operations — so the default is `false` and should stay there until
+per-cluster RBAC lands. The site's
 [security-and-iam reference](../../../docs/site/src/content/docs/reference/security-and-iam.md)
 owns the topic, including how the mapping reaches the credential broker and
 what the pool does and does not bound.
