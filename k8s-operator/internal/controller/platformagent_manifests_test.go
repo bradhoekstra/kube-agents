@@ -2547,9 +2547,29 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 			}
 		}
 	}
-	for _, line := range strings.Split(parsers, "\n") {
-		if strings.Contains(line, "Regex") && strings.Contains(line, "audit") {
-			t.Errorf("parsers.conf has a regex over the audit records: %s", strings.TrimSpace(line))
+	// No regex lifts fields out of the audit records, under any name: the
+	// records are JSON, decoded by the json parser on the input, and the only
+	// regex is Hermes' own log line. Assert the class, not the one spelling a
+	// lift happened to use. Every parser FILTER reads Hermes' text log with
+	// gchat_event and reaches nothing else, and gchat_event is the only
+	// regex-format parser in parsers.conf.
+	for _, section := range fluentBitSections(fbConf, "[FILTER]") {
+		if fluentBitField(section, "Name") != "parser" {
+			continue
+		}
+		if match := fluentBitField(section, "Match"); match != "agent.logs" {
+			t.Errorf("a parser FILTER matches %q; a regex parser must not reach the audit records:\n%s", match, section)
+		}
+		if p := fluentBitField(section, "Parser"); p != "gchat_event" {
+			t.Errorf("a parser FILTER names parser %q, not gchat_event; the audit lift must not return:\n%s", p, section)
+		}
+	}
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if !strings.Contains(fluentBitField(section, "Format"), "regex") {
+			continue
+		}
+		if name := fluentBitField(section, "Name"); name != "gchat_event" {
+			t.Errorf("parsers.conf has a regex parser %q besides gchat_event; the audit records are JSON, not lifted:\n%s", name, section)
 		}
 	}
 
@@ -2573,6 +2593,18 @@ func fluentBitSections(conf, header string) []string {
 		}
 	}
 	return sections
+}
+
+// fluentBitField returns the value of the first `Key value` line in a
+// fluent-bit section, whatever whitespace separates them, or "" if absent.
+func fluentBitField(section, key string) string {
+	for _, line := range strings.Split(section, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == key {
+			return strings.Join(fields[1:], " ")
+		}
+	}
+	return ""
 }
 
 // fluentBitPathMatches reports whether a comma-separated fluent-bit tail Path
