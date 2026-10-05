@@ -293,8 +293,11 @@ def normalize_logging_row(
     context = context_match.group("context") if context_match else ""
     # The record's own session first: a record tailed from the audit file has
     # no line prefix, and a text line's prefix can carry a bracket group that
-    # is not a session tag (`[Errno 28]`). A cron session names itself.
-    trigger, attribution = _logging_trigger(payload, _first(payload, "session_id") or context)
+    # is not a session tag (`[Errno 28]`). A cron session names itself. Resolve
+    # it once, from either spelling of the key, so the trigger the session
+    # implies and the session_id on the event cannot disagree.
+    session_id = _first(payload, "session_id", "session.id") or context
+    trigger, attribution = _logging_trigger(payload, session_id)
     timestamp = _parse_time(
         payload.get("occurred_at"),
         _parse_time(row.get("timestamp"), datetime.now(UTC)),
@@ -302,7 +305,6 @@ def normalize_logging_row(
     insert_id = _first(row, "insertId") or _event_id(
         "log", timestamp.isoformat(), audit_event, payload
     )
-    session_id = _first(payload, "session_id", "session.id") or context
     task_id = _first(payload, "task_id")
     message_hash = _first(payload, "message_sha256")
     interaction_id = (

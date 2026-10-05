@@ -412,6 +412,36 @@ class TelemetryNormalizationTest(unittest.TestCase):
         self.assertEqual(event.agent_name, "gateway-runtime")
         self.assertEqual(event.details["collector_container"], "fluent-bit")
 
+    def test_cron_session_under_the_dotted_key_sets_the_trigger(self):
+        # A record whose session is spelled session.id, not session_id, and that
+        # carries no line prefix: the trigger the session implies and the
+        # session_id on the event are resolved from the one value, so a cron
+        # session named only under the dotted key is still attributed to cron.
+        row = {
+            "insertId": "log-dotted",
+            "timestamp": "2026-07-28T19:07:04Z",
+            "logName": "projects/demo/logs/stdout",
+            "resource": {"labels": {"container_name": "fluent-bit"}},
+            "jsonPayload": {
+                "file_path": "/opt/data/profiles/platform/logs/audit.jsonl",
+                "app": "agent",
+                "log_source": "agent-file",
+                "audit_event": "tool_call_end",
+                "severity": "INFO",
+                "tool_name": "terminal",
+                "status": "completed",
+                "session.id": "cron_capacity_20260728_190038",
+            },
+        }
+
+        event = normalize_logging_row(row, "demo-project")
+
+        self.assertIsNotNone(event)
+        assert event is not None
+        self.assertEqual(event.trigger_kind, TriggerKind.CRON)
+        self.assertEqual(event.attribution, AttributionLevel.INHERITED)
+        self.assertEqual(event.session_id, "cron_capacity_20260728_190038")
+
     def test_normalizes_a_record_the_agent_printed_when_the_file_could_not_take_it(self):
         # The fallback shape: the emitter printed the record to its stdout, so
         # the GKE log agent shipped it from the agent container, not the
