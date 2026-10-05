@@ -2472,32 +2472,32 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	}
 	var audit, logs string
 	for _, section := range inputs {
-		switch {
-		case strings.Contains(section, "Tag               agent.audit"):
+		switch fluentBitField(section, "Tag") {
+		case "agent.audit":
 			audit = section
-		case strings.Contains(section, "Tag               agent.logs"):
+		case "agent.logs":
 			logs = section
 		}
 	}
 	if audit == "" || logs == "" {
 		t.Fatalf("fluent-bit.conf lacks the agent.audit or the agent.logs input:\n%s", fbConf)
 	}
-	for _, want := range []string{
-		"Name              tail",
-		"Path              " + fluentBitAuditTailPath,
-		"Parser            audit_json",
-		"Path_Key          file_path",
-		"Read_from_Head    On",
+	for _, want := range []struct{ key, val string }{
+		{"Name", "tail"},
+		{"Path", fluentBitAuditTailPath},
+		{"Parser", "audit_json"},
+		{"Path_Key", "file_path"},
+		{"Read_from_Head", "On"},
 	} {
-		if !strings.Contains(audit, want) {
-			t.Errorf("the audit input lacks %q:\n%s", want, audit)
+		if got := fluentBitField(audit, want.key); got != want.val {
+			t.Errorf("the audit input's %s is %q, want %q:\n%s", want.key, got, want.val, audit)
 		}
 	}
-	if strings.Contains(logs, "Parser") {
-		t.Errorf("the agent.logs input parses its lines; Hermes' log stays text:\n%s", logs)
+	if p := fluentBitField(logs, "Parser"); p != "" {
+		t.Errorf("the agent.logs input parses its lines with parser %q; Hermes' log stays text:\n%s", p, logs)
 	}
-	if !strings.Contains(logs, "Path              /opt/data/logs/*.log") {
-		t.Errorf("the agent.logs input no longer reads the front door's logs:\n%s", logs)
+	if got, want := fluentBitField(logs, "Path"), fluentBitDataMount+"/logs/*.log"; got != want {
+		t.Errorf("the agent.logs input reads %q, not the front door's logs %q:\n%s", got, want, logs)
 	}
 	dbs := regexp.MustCompile(`DB\s+(\S+)`).FindAllStringSubmatch(fbConf, -1)
 	if len(dbs) != 2 || dbs[0][1] == dbs[1][1] {
@@ -2537,8 +2537,39 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 		}
 	}
 
-	if !strings.Contains(parsers, "Name    audit_json\n    Format  json") {
-		t.Errorf("parsers.conf lacks the json decoder the audit input names; the sidecar's own parsers.conf is replaced by this mount, so a built-in name would not resolve")
+	// The section counts are fixed: every section the config has is vetted
+	// below, so a new one -- a reinstated regex lift among them -- has to be
+	// added here first and explained. Counted across every ConfigMap key, case-
+	// insensitively, so a section @INCLUDEd from another key or spelled
+	// [filter] is counted too.
+	for _, want := range []struct {
+		header string
+		count  int
+	}{
+		{"[SERVICE]", 1},
+		{"[INPUT]", 2},
+		{"[FILTER]", 2},
+		{"[OUTPUT]", 1},
+		{"[PARSER]", 2},
+	} {
+		if got := fluentBitCount(cm.Data, want.header); got != want.count {
+			t.Errorf("the ConfigMap has %d %s sections across all keys, want %d; a new section must be vetted in this test", got, want.header, want.count)
+		}
+	}
+
+	// The audit input names audit_json; parsers.conf has to decode it as JSON,
+	// not lift fields with a regex. The sidecar's own parsers.conf is replaced
+	// by this mount, so a built-in name would not resolve.
+	var auditParser string
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if fluentBitField(section, "Name") == "audit_json" {
+			auditParser = section
+		}
+	}
+	if auditParser == "" {
+		t.Errorf("parsers.conf lacks the audit_json parser the audit input names:\n%s", parsers)
+	} else if f := fluentBitField(auditParser, "Format"); !strings.EqualFold(f, "json") {
+		t.Errorf("the audit_json parser's Format is %q, want json; the audit records are JSON, not lifted:\n%s", f, auditParser)
 	}
 	for name, data := range cm.Data {
 		for _, gone := range []string{"hermes_audit_line", "Key_Name      audit_json"} {
@@ -2547,60 +2578,106 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 			}
 		}
 	}
+
 	// No regex lifts fields out of the audit records, under any name: the
 	// records are JSON, decoded by the json parser on the input, and the only
-	// regex is Hermes' own log line. Assert the class, not the one spelling a
-	// lift happened to use. Every parser FILTER reads Hermes' text log with
-	// gchat_event and reaches nothing else, and gchat_event is the only
-	// regex-format parser in parsers.conf.
+	// regex is Hermes' own log line. Assert the class over every [FILTER], by
+	// Name -- an unexpected Name is a section this test has not vetted and
+	// fails closed, not a continue that hides a lift.
 	for _, section := range fluentBitSections(fbConf, "[FILTER]") {
-		if fluentBitField(section, "Name") != "parser" {
-			continue
-		}
-		if match := fluentBitField(section, "Match"); match != "agent.logs" {
-			t.Errorf("a parser FILTER matches %q; a regex parser must not reach the audit records:\n%s", match, section)
-		}
-		if p := fluentBitField(section, "Parser"); p != "gchat_event" {
-			t.Errorf("a parser FILTER names parser %q, not gchat_event; the audit lift must not return:\n%s", p, section)
+		switch name := fluentBitField(section, "Name"); name {
+		case "parser":
+			if match := fluentBitField(section, "Match"); match != "agent.logs" {
+				t.Errorf("a parser FILTER matches %q; a regex parser must not reach the audit records:\n%s", match, section)
+			}
+			if p := fluentBitField(section, "Parser"); p != "gchat_event" {
+				t.Errorf("a parser FILTER names parser %q, not gchat_event; the audit lift must not return:\n%s", p, section)
+			}
+		case "record_modifier":
+			if match := fluentBitField(section, "Match"); match != "agent.*" {
+				t.Errorf("the record_modifier FILTER matches %q, want agent.* (both streams stamped):\n%s", match, section)
+			}
+		default:
+			t.Errorf("unexpected [FILTER] Name %q; a new filter must be vetted here -- is it a regex lift on the audit stream?:\n%s", name, section)
 		}
 	}
+	// gchat_event is the only regex-format parser; every other [PARSER] decodes
+	// rather than lifts.
 	for _, section := range fluentBitSections(parsers, "[PARSER]") {
-		if !strings.Contains(fluentBitField(section, "Format"), "regex") {
-			continue
-		}
-		if name := fluentBitField(section, "Name"); name != "gchat_event" {
+		name := fluentBitField(section, "Name")
+		if format := fluentBitField(section, "Format"); strings.EqualFold(format, "regex") && name != "gchat_event" {
 			t.Errorf("parsers.conf has a regex parser %q besides gchat_event; the audit records are JSON, not lifted:\n%s", name, section)
 		}
 	}
 
-	// Both streams are stamped and shipped.
-	for _, section := range append(fluentBitSections(fbConf, "[FILTER]"), fluentBitSections(fbConf, "[OUTPUT]")...) {
-		if !strings.Contains(section, "record_modifier") && !strings.Contains(section, "Name              stdout") {
-			continue
-		}
-		if !strings.Contains(section, "Match             agent.*") {
-			t.Errorf("this section has to cover agent.logs and agent.audit alike:\n%s", section)
-		}
+	// Both streams are shipped: exactly one stdout output, covering agent.*.
+	outputs := fluentBitSections(fbConf, "[OUTPUT]")
+	if len(outputs) != 1 {
+		t.Fatalf("fluent-bit.conf has %d [OUTPUT] sections, want 1:\n%s", len(outputs), fbConf)
+	}
+	if name := fluentBitField(outputs[0], "Name"); name != "stdout" {
+		t.Errorf("the output is %q, want stdout:\n%s", name, outputs[0])
+	}
+	if match := fluentBitField(outputs[0], "Match"); match != "agent.*" {
+		t.Errorf("the output matches %q, want agent.* (both streams shipped):\n%s", match, outputs[0])
 	}
 }
 
-// fluentBitSections returns every section of conf headed by header.
+// fluentBitHeaderRe matches a section-start line -- a line whose only content is
+// a bracketed section name like [FILTER]. The whole line must match, so a key
+// whose value carries a bracket is not mistaken for a header.
+var fluentBitHeaderRe = regexp.MustCompile(`^\[[A-Za-z0-9_]+\]$`)
+
+// fluentBitSections returns every section of conf whose header equals header
+// (e.g. "[FILTER]"), case-insensitively. A section runs from its header line to
+// the line before the next header, so a blank line, a comment or the header's
+// casing between sections cannot hide one: fluent-bit opens a section on any
+// [NAME] line, needs no separator, and reads the header case-insensitively.
 func fluentBitSections(conf, header string) []string {
 	var sections []string
-	for _, block := range strings.Split(conf, "\n\n") {
-		if strings.HasPrefix(strings.TrimSpace(block), header) {
-			sections = append(sections, block)
+	var cur []string
+	inWanted := false
+	flush := func() {
+		if inWanted && len(cur) > 0 {
+			sections = append(sections, strings.Join(cur, "\n"))
 		}
 	}
+	for _, line := range strings.Split(conf, "\n") {
+		if trimmed := strings.TrimSpace(line); fluentBitHeaderRe.MatchString(trimmed) {
+			flush()
+			inWanted = strings.EqualFold(trimmed, header)
+			cur = nil
+		}
+		if inWanted {
+			cur = append(cur, line)
+		}
+	}
+	flush()
 	return sections
 }
 
+// fluentBitCount returns how many sections with the given header appear across
+// every value in data. Counting over all keys fails closed when a section is
+// added under any of them, including one @INCLUDEd from another file.
+func fluentBitCount(data map[string]string, header string) int {
+	n := 0
+	for _, conf := range data {
+		n += len(fluentBitSections(conf, header))
+	}
+	return n
+}
+
 // fluentBitField returns the value of the first `Key value` line in a
-// fluent-bit section, whatever whitespace separates them, or "" if absent.
+// fluent-bit section, whatever whitespace separates them and whatever case the
+// key is written in, or "" if absent. Comment lines are skipped. fluent-bit's
+// classic-format keys are case-insensitive, so the test reads them that way.
 func fluentBitField(section, key string) string {
 	for _, line := range strings.Split(section, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
 		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[0] == key {
+		if len(fields) >= 2 && strings.EqualFold(fields[0], key) {
 			return strings.Join(fields[1:], " ")
 		}
 	}
