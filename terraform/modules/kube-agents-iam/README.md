@@ -30,8 +30,9 @@ selector's members; a folder's or organisation's members are not listed at plan 
 on the bare project id and created in `project_id`, plus `roles/iam.serviceAccountTokenCreator`
 for the agent bound on each member as a resource (never at project level). Two clusters in one
 project share an account by design (`docs/designs/multi-project-scope.md` §6).
-`scoped_pool_max_accounts` (100, GCP's default service-account quota per project) caps how many
-the plan may create; a pool past it is refused at plan. The members hold no IAM grant of their
+`scoped_pool_max_accounts` bounds how many the plan may create and refuses a pool past it at plan;
+its default of 100 is GCP's default service-account quota, which the agent's own accounts share, so
+set it to the headroom the project has free rather than leaving a large pool at the default. The members hold no IAM grant of their
 own as of 2026-08-12 — the IAM-Condition scoping they were designed around grants nothing for
 Kubernetes object operations — so the default is `false` and should stay there until
 per-cluster RBAC lands. The site's

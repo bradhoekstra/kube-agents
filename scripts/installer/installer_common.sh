@@ -92,8 +92,9 @@ readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 # SCOPED_SA_POOL_ENABLED arms the pool (the composition's scoped_pool_enabled,
 # spec.security.scopedServiceAccountPool.enabled on the CR); off by default,
 # because a pool member holds no IAM grant yet. SCOPED_SA_POOL_MAX_ACCOUNTS is
-# the share of the management project's service-account quota the pool may
-# fill (scoped_pool_max_accounts): GCP's default quota, the module's default.
+# the bound on the pool declared from the management project's free
+# service-account quota (scoped_pool_max_accounts); the module's default of
+# 100 is GCP's default quota, not the headroom, which the plan cannot read.
 readonly SCOPED_SA_POOL_ENABLED_DEFAULT="false"
 readonly SCOPED_SA_POOL_MAX_ACCOUNTS_MIN=1
 readonly SCOPED_SA_POOL_MAX_ACCOUNTS_DEFAULT=100

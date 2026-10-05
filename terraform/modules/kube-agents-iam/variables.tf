@@ -104,13 +104,16 @@ variable "scoped_pool_enabled" {
 
 variable "scoped_pool_max_accounts" {
   description = <<-EOT
-    The most pool members the plan may create in project_id: the host
-    project's service-account quota the pool may fill. GCP's default quota is
-    100 service accounts per project; raise the quota before raising this. A
-    pool that would exceed it is refused at plan (main.tf) rather than failing
-    part-way through an apply with the quota error, which would leave some
-    members created and the mapping incomplete. Read only while
-    scoped_pool_enabled is true.
+    The most pool members the plan may create in project_id, a bound the
+    operator declares from the service-account quota headroom the project has
+    free: the quota (100 per project by GCP's default) is shared with the
+    agent's own accounts, the project's default accounts and every other
+    tenant, and the module cannot read it. The default is the quota itself,
+    so at the default a pool of ninety-odd passes the check and meets the quota
+    mid-apply; set this to the headroom, and raise the quota before raising
+    it. A pool past the declared bound is refused at plan (main.tf) rather
+    than part-way through an apply. Read only while scoped_pool_enabled is
+    true.
   EOT
   type        = number
   nullable    = false

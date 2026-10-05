@@ -636,7 +636,9 @@ Flags for AI Agents & Automation:
                                 no IAM grant yet, so leave it off (default: false)
   --scoped-sa-pool-max-accounts=N
                                 The most pool accounts the plan may create in the install's
-                                project, its service-account quota (default: the module's 100)
+                                project: set it to the service-account quota headroom the
+                                project has free (default: the module's 100, GCP's default
+                                quota, which the agent's own accounts already share)
   --enable-gvisor[=true|false]  Enable GKE Sandbox (gVisor) runtime isolation
                                 (default: DEFAULT_ENABLE_GVISOR, currently true)
   --enable-hermes-dashboard[=true|false]
@@ -885,11 +887,13 @@ parse_args() {
         PARAM_SCOPE_EXCLUDE_CLUSTERS="${1#*=}"; SCOPE_FLAG_PASSED="true"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPE_EXCLUDE_CLUSTERS"; shift ;;
       --scoped-sa-pool-enabled|--scoped-sa-pool-enabled=*)
+        SCOPE_FLAG_PASSED="true"
         PARAM_SCOPED_SA_POOL_ENABLED="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_ENABLED"; shift ;;
       # An empty cap cannot mean "the recorded one" (the flag overrides the
       # file) and must not mean "no cap" in silence; refused like a scope flag.
       --scoped-sa-pool-max-accounts=*)
+        SCOPE_FLAG_PASSED="true"
         PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${1#*=}"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"; shift ;;
       --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
@@ -2014,17 +2018,18 @@ bootstrap_install_env_file() {
       "A later run without it takes the networks the file records, and the model stops seeing the addresses only this run allowed." \
       false \
       "every later install.sh run"
-    # The scoped service account pool: a flag arms it, or raises its cap, for
-    # this run, and the next upgrade.sh or --menu apply regenerates from the
-    # file, deleting the members this run created and disarming the broker.
+    # The scoped service account pool: a flag arms or disarms it, or moves its
+    # cap, for this run, and the next upgrade.sh or --menu apply regenerates
+    # from the file and reverses it either way, so the consequence is read in
+    # both directions rather than assuming the flag armed.
     warn_flag_beats_unrecorded_file_value "$destination" SCOPED_SA_POOL_ENABLED --scoped-sa-pool-enabled \
       "${PARAM_SCOPED_SA_POOL_ENABLED:-}" \
-      "A later run without it renders the pool from what the file records, so the next upgrade.sh or --menu apply deletes the pool accounts this run created and disarms the broker." \
+      "A later run without it renders the pool from what the file records, so the next upgrade.sh or --menu apply reverses this run's choice: pool accounts this run created are deleted and the broker disarmed, or accounts this run deleted are recreated and the broker re-armed." \
       true \
       "every later install.sh run"
     warn_flag_beats_unrecorded_file_value "$destination" SCOPED_SA_POOL_MAX_ACCOUNTS --scoped-sa-pool-max-accounts \
       "${PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS:-}" \
-      "A later run without it takes the cap the file records, or the module's 100 when it records none, and a pool past it is refused at plan." \
+      "A later run without it takes the cap the file records, or the module's 100 when it records none, and refuses a pool past that at plan." \
       false \
       "every later install.sh run"
     # The scope keys: a flag applies its declaration for this run, and the
@@ -4538,11 +4543,12 @@ main() {
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
-    # The menu reloads install.env and reads the scope keys from it alone; a
-    # flag here would be validated and then dropped without a word.
+    # The menu reloads install.env and reads the scope keys, and the scoped
+    # service account pool's switch and cap, from it alone; a flag here would
+    # be validated and then dropped without a word.
     if [ "$SCOPE_FLAG_PASSED" = "true" ]; then
-      print_error "--menu takes no --scope-* flag: it edits install.env in place and reads the scope keys from there."
-      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS or SCOPE_EXCLUDE_CLUSTERS in install.env, or pass the flag to a plain install.sh run."
+      print_error "--menu takes no --scope-* flag, --scoped-sa-pool-enabled or --scoped-sa-pool-max-accounts: it edits install.env in place and reads the scope keys and the pool keys from there."
+      print_info "Set SCOPE_PROJECTS, SCOPE_FOLDERS, SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS, SCOPE_EXCLUDE_PROJECTS, SCOPE_EXCLUDE_CLUSTERS, SCOPED_SA_POOL_ENABLED or SCOPED_SA_POOL_MAX_ACCOUNTS in install.env, or pass the flag to a plain install.sh run."
       exit 1
     fi
     run_menu_system

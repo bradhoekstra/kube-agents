@@ -5213,6 +5213,9 @@ class ScopedSaPoolPersistsThroughInstallEnvTest(unittest.TestCase):
         self.assertIn("--scoped-sa-pool-enabled=true applies to this run only", out)
         self.assertIn("records no SCOPED_SA_POOL_ENABLED", out)
         self.assertIn("Set SCOPED_SA_POOL_ENABLED=true in", out)
+        # The consequence is read per direction: a typed =true is undone by the
+        # next apply deleting the accounts, a typed =false by it recreating them.
+        self.assertIn("accounts this run deleted are recreated and the broker re-armed", out)
         self.assertIn("--scoped-sa-pool-max-accounts=250 applies to this run only", out)
         self.assertIn("Set SCOPED_SA_POOL_MAX_ACCOUNTS=250 in", out)
 
@@ -9492,11 +9495,18 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertNotIn(line, proc.stdout)
 
     def test_the_menu_refuses_a_scope_flag(self):
-        proc = subprocess.run(
-            ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu --scope-projects=p\necho "PASSED=$SCOPE_FLAG_PASSED"'],
-            capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
-        )
-        self.assertIn("PASSED=true", proc.stdout, proc.stderr)
+        # The pool flags are refused the same way: the menu regenerates from
+        # install.env after the pool keys are unset, so a typed
+        # --scoped-sa-pool-enabled=true would be validated and then dropped
+        # without a word, the operator believing the pool armed.
+        for flag in ("--scope-projects=p", "--scoped-sa-pool-enabled=true", "--scoped-sa-pool-max-accounts=7"):
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\nparse_args --menu {flag}\necho "PASSED=$SCOPE_FLAG_PASSED"'],
+                capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
+            )
+            self.assertIn("PASSED=true", proc.stdout, f"{flag}: {proc.stderr}")
+        self.assertIn("--scoped-sa-pool-enabled", self.text[self.text.index("--menu takes no --scope-* flag"):][:600],
+                      "the menu refusal does not name the pool flags it refuses")
         dispatch = self.text.index('if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then')
         refusal = self.text.index("--menu takes no --scope-* flag")
         run = self.text.index("    run_menu_system\n    exit 0")

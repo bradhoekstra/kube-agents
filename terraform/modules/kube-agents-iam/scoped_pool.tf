@@ -61,10 +61,19 @@ locals {
 
       # Service account ids are 6-30 characters and a project id alone can be
       # 30, so the readable part is cosmetic and the hash is what makes it
-      # unique: eight hex characters of sha256 over the project's resource
-      # name, which is what keeps two projects with the same first seventeen
-      # characters on two accounts. Trailing hyphens are stripped because
-      # truncation can leave one and an id ending in a hyphen is invalid.
+      # unique: eight hex characters of sha256 over the install's own
+      # service_account_id and the project's resource name. The project keeps
+      # two projects with the same first seventeen characters on two accounts;
+      # the install's id keeps two installs in one host project (variables.tf:
+      # "a second install in the same project must set its own") on two
+      # members for a project both list, the host project above all, which
+      # every armed install lists. Without it the second install's apply
+      # would stop on a 409 creating the host's member. The ownership check
+      # the installer runs before an apply covers the pool through this: two
+      # installs can only derive the same member id by sharing the agent's
+      # service_account_id, which that check already refuses. Trailing
+      # hyphens are stripped because truncation can leave one and an id
+      # ending in a hyphen is invalid.
       account_id = format(
         "ka-%s-%s",
         replace(
@@ -72,7 +81,7 @@ locals {
           "/-+$/",
           ""
         ),
-        substr(sha256("projects/${project_id}"), 0, 8)
+        substr(sha256("${var.service_account_id}/projects/${project_id}"), 0, 8)
       )
     }
   } : {}

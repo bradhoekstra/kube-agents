@@ -153,11 +153,13 @@ variable "scoped_pool_enabled" {
 
 variable "scoped_pool_max_accounts" {
   description = <<-EOT
-    The most pool members the plan may create in project_id: the share of the
-    host project's service-account quota the pool may fill. GCP's default
-    quota is 100 per project; raise the quota before raising this. A pool
-    that would exceed it is refused at plan. Read only while
-    scoped_pool_enabled is true.
+    The most pool members the plan may create in project_id, declared from
+    the service-account quota headroom the project has free: the quota (100
+    per project by GCP's default) is shared with the agent's own accounts and
+    everything else in the project, and the plan cannot read it, so the
+    default of 100 is the quota rather than the headroom. A pool past the
+    declared bound is refused at plan. Read only while scoped_pool_enabled is
+    true.
   EOT
   type        = number
   nullable    = false

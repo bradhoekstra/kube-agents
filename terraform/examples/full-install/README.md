@@ -642,8 +642,9 @@ and the chart renders the mapping into the CR as `spec.security.scopedServiceAcc
 `enabled` set from the same variable, so the broker is armed by this switch alone and never by
 declaring projects. Two clusters in one project share an account by design
 ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6).
-`scoped_pool_max_accounts` (100, GCP's default service-account quota per project) caps how many
-the plan may create; a pool past it is refused at plan. Off by default, and it should stay off
+`scoped_pool_max_accounts` bounds how many the plan may create and refuses a pool past it at plan;
+its default of 100 is GCP's default service-account quota, which the agent's own accounts share, so
+set it to the headroom the project has free rather than leaving a large pool at the default. Off by default, and it should stay off
 until per-cluster RBAC lands: a member holds no IAM grant, so an armed pool turns every cluster
 read into a `Forbidden`. Through the installer the two come from `SCOPED_SA_POOL_ENABLED` and
 `SCOPED_SA_POOL_MAX_ACCOUNTS` in `install.env`. `scoped_service_accounts` outputs the mapping,

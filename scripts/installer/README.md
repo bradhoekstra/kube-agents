@@ -338,9 +338,9 @@ container is refused while the pool is armed), and the chart renders the mapping
 `spec.security.scopedServiceAccountPool` with `enabled` set from the same key, so declaring
 projects arms nothing on its own. The generator writes `scoped_pool_enabled` on every run, `false`
 by default (a member holds no IAM grant yet, so an armed pool turns every cluster read into a
-`Forbidden`), and `scoped_pool_max_accounts` only when the key is set: the share of the management
-project's service-account quota the pool may fill, 100 (GCP's default quota) when unset, with a
-pool past it refused at plan. `install.sh` takes `--scoped-sa-pool-enabled[=BOOL]` and
+`Forbidden`), and `scoped_pool_max_accounts` only when the key is set: the bound on the pool, declared from the
+management project's free service-account quota, 100 (GCP's default quota, not the headroom)
+when unset, with a pool past it refused at plan. `install.sh` takes `--scoped-sa-pool-enabled[=BOOL]` and
 `--scoped-sa-pool-max-accounts=N` and records them on a first install; a flag on a later run
 applies for that run and warns that the next full upgrade regenerates from the file. A misspelt
 switch, or a cap that is not a whole number of at least 1, stops every front door but

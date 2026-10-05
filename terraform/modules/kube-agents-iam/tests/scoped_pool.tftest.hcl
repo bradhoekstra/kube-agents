@@ -59,8 +59,8 @@ run "an_armed_pool_holds_one_account_per_listed_project" {
     error_message = "output keys: ${jsonencode(keys(output.scoped_service_accounts))}"
   }
   assert {
-    condition     = google_service_account.scoped["team-alpha"].account_id == "ka-team-alpha-9c9843a1"
-    error_message = "team-alpha's account id is ${google_service_account.scoped["team-alpha"].account_id}, not ka-team-alpha-9c9843a1"
+    condition     = google_service_account.scoped["team-alpha"].account_id == "ka-team-alpha-0ed42166"
+    error_message = "team-alpha's account id is ${google_service_account.scoped["team-alpha"].account_id}, not ka-team-alpha-0ed42166"
   }
   assert {
     condition     = alltrue([for account in values(google_service_account.scoped) : account.project == "mgmt-project-1"])
@@ -88,7 +88,7 @@ run "a_long_project_id_is_truncated_without_a_trailing_hyphen" {
   }
 
   assert {
-    condition     = google_service_account.scoped["projectname-abcd-efgh-1"].account_id == "ka-projectname-abcd-f33099e3"
+    condition     = google_service_account.scoped["projectname-abcd-efgh-1"].account_id == "ka-projectname-abcd-d979c84e"
     error_message = "account id: ${google_service_account.scoped["projectname-abcd-efgh-1"].account_id}"
   }
 }

@@ -391,7 +391,9 @@ class ScopedPoolCeilingTest(unittest.TestCase):
         derives the pool from the projects the plan lists in the scope, and the
         broker validates each `projectId` with its `_COMPONENT` pattern, so this
         pins both ends: the for_each keys on the listed project id with nothing
-        reshaping it, the account id hashes the project's resource name, and
+        reshaping it, the account id hashes the install's service_account_id
+        with the project's resource name (so two installs in one host project
+        derive different members), and
         every id the module's own `scope.projects` pattern admits is one the
         broker accepts as a key.
         """
@@ -408,9 +410,11 @@ class ScopedPoolCeilingTest(unittest.TestCase):
             "the pool's key is something other than the listed project id itself",
         )
         self.assertIn(
-            'sha256("projects/${' + for_each.group(1) + '}")',
+            'sha256("${var.service_account_id}/projects/${' + for_each.group(1) + '}")',
             source,
-            "the account id hashes something other than projects/<project_id>",
+            "the account id does not hash the install's service_account_id with the"
+            " project: two installs in one host project would then derive the same"
+            " member id for a project both list and the second apply would 409",
         )
 
         component = getattr(scoped_sa_pool, "_COMPONENT", None)

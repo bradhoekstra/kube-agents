@@ -51,12 +51,16 @@ resource "google_service_account" "agent" {
     }
     # The scoped service account pool (scoped_pool.tf) creates one account per
     # listed project in project_id, against the host project's service-account
-    # quota. Held here, once, rather than on each member: a pool past the cap
-    # would otherwise be refused once per member, and a quota error at apply
-    # would leave the members created so far and the mapping incomplete.
+    # quota, which the agent's own accounts, the project's default accounts and
+    # anything else in the project share. The cap is the operator's declared
+    # bound on the pool, not a reading of that quota: at its default of 100,
+    # GCP's default quota, a pool of ninety-odd can still pass here and hit the
+    # quota mid-apply, which is why the variable asks for the headroom the
+    # project actually has free. Held here, once, rather than on each member,
+    # so a pool past the bound is refused once rather than once per member.
     precondition {
       condition     = !var.scoped_pool_enabled || length(local.scoped_pool) <= var.scoped_pool_max_accounts
-      error_message = "The scoped service account pool would hold ${length(local.scoped_pool)} accounts (the management project, scope.projects and the projects the selectors resolve to, once each, less an exact exclude.projects entry), past scoped_pool_max_accounts (${var.scoped_pool_max_accounts}), the share of ${var.project_id}'s service-account quota the pool may fill; GCP's default quota is 100 per project. Raise the quota in ${var.project_id} and then scoped_pool_max_accounts, declare fewer projects, or set scoped_pool_enabled = false to run on the agent's own identity."
+      error_message = "The scoped service account pool would hold ${length(local.scoped_pool)} accounts (the management project, scope.projects and the projects the selectors resolve to, once each, less an exact exclude.projects entry), past scoped_pool_max_accounts (${var.scoped_pool_max_accounts}), the bound declared on how much of ${var.project_id}'s service-account quota the pool may fill (GCP's default quota is 100 per project, shared with the agent's own accounts and everything else in the project). Raise the quota in ${var.project_id} and then scoped_pool_max_accounts to the headroom free, declare fewer projects, or set scoped_pool_enabled = false to run on the agent's own identity."
     }
   }
 }
