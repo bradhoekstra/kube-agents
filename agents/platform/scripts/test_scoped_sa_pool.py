@@ -45,6 +45,13 @@ OTHER_PROJECT = "some-other-project"
 LOCATION = "us-east4"
 CLUSTER = "bnaylor-ka-test"
 OTHER_CLUSTER = "some-other-cluster"
+# The CRD's `MaxLength=63` on `projectId`; one over it is the first value the
+# pool has to refuse, and the width the refusal log line is sized against.
+LONGEST_NAME_COMPONENT = "a" * 63
+ONE_OVER_THE_LONGEST_NAME_COMPONENT = "a" * 64
+# `credential_proxy.POOL_REFUSAL_LOG_LENGTH`; the refusal at the longest
+# components has to fit under it, or the log line is cut mid-remedy.
+REFUSAL_LOG_LENGTH = 512
 # Spelled the way the Terraform half names a member: `ka-<project prefix>-<hash>`
 # in the host project, not in the project the member reads.
 EMAIL = "ka-bnaylor-kagents-d-1a2b3c4d@host-project.iam.gserviceaccount.com"
@@ -431,6 +438,45 @@ class SelectionTest(unittest.TestCase):
         self.assertIn("will not fall back to the ambient credential", message)
         self.assertIn("spec.scope", message)
         self.assertNotIn("\n", message)
+        self.assertEqual(
+            "no scoped service account for project "
+            f"{OTHER_PROJECT} (cluster projects/{OTHER_PROJECT}/locations/{LOCATION}"
+            f"/clusters/{CLUSTER}): refused; the broker will not fall back to the"
+            " ambient credential. Declare the project in spec.scope and apply,"
+            " or exclude the cluster.",
+            message,
+        )
+
+    def test_the_refusal_fits_the_log_line_at_the_longest_components(self):
+        """The broker logs the refusal through a length cap; the cap is sized
+        against this message at the bound `_name_component` enforces, so a
+        refusal is never cut mid-remedy."""
+        pool = one_project_pool()
+        with self.assertRaises(PoolRefusal) as raised:
+            pool.select(
+                LONGEST_NAME_COMPONENT, LONGEST_NAME_COMPONENT, LONGEST_NAME_COMPONENT
+            )
+        message = str(raised.exception)
+        self.assertTrue(message.endswith("or exclude the cluster."), message)
+        self.assertLess(len(message), REFUSAL_LOG_LENGTH, len(message))
+
+    def test_a_component_over_the_bound_is_refused_before_it_is_interpolated(self):
+        """63 is the CRD's `MaxLength` on `projectId`; 64 is a `ValueError`
+        naming the bound, raised for each of the three components, so the
+        refusal's variable part is bounded and the log cap above is a bound
+        rather than a guess."""
+        pool = one_project_pool()
+        for position in range(3):
+            components = [CLUSTER] * 3
+            components[position] = ONE_OVER_THE_LONGEST_NAME_COMPONENT
+            with self.subTest(position=position):
+                with self.assertRaises(ValueError) as raised:
+                    pool.select(*components)
+                self.assertIn("63", str(raised.exception))
+                self.assertNotIn(ONE_OVER_THE_LONGEST_NAME_COMPONENT, str(raised.exception))
+        with self.assertRaises(PoolRefusal):
+            pool.select(LONGEST_NAME_COMPONENT, LOCATION, CLUSTER)
+        self.assertEqual(63, scoped_sa_pool.MAX_NAME_COMPONENT_LENGTH)
 
     def test_a_near_miss_project_does_not_select_a_neighbour(self):
         """A prefix, an extension or a different project of the same shape."""

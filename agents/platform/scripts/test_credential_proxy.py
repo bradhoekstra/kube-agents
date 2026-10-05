@@ -8426,6 +8426,35 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         self.assertNotIn("\n", refusals[0], refusals[0])
         self.assertIn("forged", refusals[0], "the message was truncated rather than sanitised")
 
+    def test_the_refusal_is_logged_whole_at_the_longest_names(self):
+        """The log cap on the refusal is sized against the message, not a default.
+
+        A real refusal built by `select` at the bound `_name_component` enforces
+        on every component. If the WARNING is cut before the remedy, the
+        operator reading the log is left without the fix the message exists
+        to carry.
+        """
+        import scoped_sa_pool
+
+        longest = "a" * scoped_sa_pool.MAX_NAME_COMPONENT_LENGTH
+        pool = CredentialProxyHandler.executor.scoped_pool
+
+        def refuse(*args, **kwargs):
+            pool.select(longest, longest, longest)
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", refuse):
+            with self.assertLogs("credential-proxy", level="WARNING") as logs:
+                status, body = self.post(
+                    {"requestId": "r6", "argv": ["kubectl", "get", "pods"]}
+                )
+        self.assertEqual(403, status, body)
+        refusals = [line for line in logs.output if "scoped service account refused" in line]
+        self.assertEqual(1, len(refusals), logs.output)
+        self.assertTrue(
+            refusals[0].endswith("or exclude the cluster."),
+            f"the refusal was truncated before its remedy: {refusals[0]!r}",
+        )
+
     def test_the_request_body_cannot_choose_the_account(self):
         """The request body is data, not configuration.
 

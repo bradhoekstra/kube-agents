@@ -124,6 +124,11 @@ MAX_POOL_BYTES = 1 << 20
 # "cluster\n" -- which then goes into the refusal message, and the refusal
 # message goes into a log line.
 _COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
+# The CRD's `MaxLength=63` on `projectId`. GCP project ids stop at 30 and GKE
+# cluster names at 40, so nothing real is refused by it; what it buys is that
+# every name the refusal below interpolates has a bound, which is what lets
+# the broker size the refusal's log line instead of truncating it.
+MAX_NAME_COMPONENT_LENGTH = 63
 
 # `<id>@<project>.iam.gserviceaccount.com`.
 #
@@ -217,6 +222,12 @@ def _name_component(name: str, value: object) -> str:
     """
     if not isinstance(value, str) or not _COMPONENT.fullmatch(value):
         raise ValueError(f"{name} is not a GKE name component: {value!r}")
+    if len(value) > MAX_NAME_COMPONENT_LENGTH:
+        # The value is not echoed: it is the thing that is too long.
+        raise ValueError(
+            f"{name} is longer than {MAX_NAME_COMPONENT_LENGTH} characters"
+            f" ({len(value)})"
+        )
     return value
 
 
@@ -419,12 +430,15 @@ class ScopedServiceAccountPool:
         cluster = _name_component("cluster", cluster)
         member = self._members.get(project)
         if member is None:
+            # Fixed text 185 characters; each name is bounded at
+            # MAX_NAME_COMPONENT_LENGTH, so the whole message is at most 467 and
+            # the broker's POOL_REFUSAL_LOG_LENGTH logs it whole. Lengthen this
+            # and the log line is cut mid-remedy again.
             raise PoolRefusal(
-                f"no scoped service account is provisioned for project {project}"
-                f" (cluster projects/{project}/locations/{location}/clusters/{cluster})."
-                " The broker will not fall back to the ambient credential;"
-                " declare the project in spec.scope and apply, or exclude the"
-                " cluster from the fleet."
+                f"no scoped service account for project {project}"
+                f" (cluster projects/{project}/locations/{location}/clusters/{cluster}):"
+                " refused; the broker will not fall back to the ambient credential."
+                " Declare the project in spec.scope and apply, or exclude the cluster."
             )
         return member
 
