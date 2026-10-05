@@ -312,3 +312,44 @@ run "a_container_with_no_members_adds_nothing_and_is_not_refused" {
     error_message = "pool keys: ${jsonencode(keys(google_service_account.scoped))}"
   }
 }
+
+# The input has the shape the resolver's output has, and nothing else: a key
+# that is not folders/<id> or organizations/<id>, or a member that is not a
+# project ID the CRD accepts (a number, an uppercase name), is refused at the
+# variable, before the pool would file an account under a key the broker
+# never looks up.
+run "a_malformed_container_listing_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      projects      = []
+      folders       = ["123456789012"]
+      organizations = []
+    }
+    scope_container_members = {
+      "folders/123456789012" = ["200000000002"]
+    }
+  }
+
+  expect_failures = [var.scope_container_members]
+}
+
+run "a_container_key_of_the_wrong_shape_is_refused_at_the_variable" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      projects      = []
+      folders       = ["123456789012"]
+      organizations = []
+    }
+    scope_container_members = {
+      "folder/123456789012" = ["team-alpha"]
+    }
+  }
+
+  expect_failures = [var.scope_container_members]
+}

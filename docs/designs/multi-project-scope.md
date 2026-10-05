@@ -430,7 +430,7 @@ which §9 takes up.
 
 Prerequisites the design has to state and the installer has to preflight:
 
-- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable in the management project (the installer enables it before the plan) and `roles/cloudasset.viewer` on the container for that identity too. Before phase 2 it needed only
+- The identity running Terraform needs `resourcemanager.folders.setIamPolicy` on each folder, or `resourcemanager.organizations.setIamPolicy` for an organisation; with the pool armed it also lists the container's projects at plan time, which needs `cloudasset.googleapis.com` searchable in the management project (`install.sh` enables it before the plan) and `roles/cloudasset.viewer` on the container for that identity too; the installer's container preflight probes that permission beside `setIamPolicy` while the pool is armed, and the plan refuses the read itself if the grant arrives late. Before phase 2 it needed only
   project-level IAM admin. The installer's preflight reports which containers it cannot bind rather
   than failing on the first, and makes the IAM probe as the credentials Terraform applies with, read
   the way the google provider reads them, rather than as gcloud's active account.

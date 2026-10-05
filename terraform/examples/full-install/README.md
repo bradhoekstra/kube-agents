@@ -601,7 +601,7 @@ whose attached service projects are in scope, and the scoping project of a Cloud
 Metrics Scope, whose monitored projects are. Neither is a Resource Manager container, so nothing
 is inherited through them. The composition resolves each at plan time through the
 [`kube-agents-scope-resolver`](../../modules/kube-agents-scope-resolver/README.md) module, with the
-same three reads the reconcile makes each run (the Compute API for a host's service projects, the
+same three selector reads the reconcile makes each run (the Compute API for a host's service projects, the
 Monitoring API for a scope's monitored projects, Resource Manager to name each of those, which the
 Monitoring API returns by number), made with the google provider's own token so they are answered
 for the identity that applies, and hands the members to the IAM module, which binds the allowlist

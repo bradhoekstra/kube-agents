@@ -392,8 +392,9 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("by ID for an entry in scope.projects or any selector member", self.main_tf)
         self.assertIn("is dropped by the reconcile but counted here", self.main_tf)
         self.assertIn("drop it from scope.projects", self.main_tf)
-        # Containers are not in the count: their members are unknown at plan
-        # time, they are listed last, and their binding is on the container.
+        # Containers are not in the count: their members, listed at plan time
+        # only for an armed pool, come last in the reconcile's order and their
+        # binding is on the container.
         listed = re.search(r"scope_listed_projects = setunion\((.*?)\n  \)", self.scope_tf, re.DOTALL)
         self.assertIsNotNone(listed)
         self.assertNotIn("folders", listed.group(1))

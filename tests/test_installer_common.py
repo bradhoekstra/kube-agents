@@ -3785,14 +3785,21 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
-             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False):
+             probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False,
+             search_probe=None):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "service-disabled", "missing",
-        "garbage", "down". The stubs record what they saw in a log the test
-        folds into proc.stderr: the bearer curl read from its stdin (-H @-),
-        the impersonation flag gcloud saw, the first bytes of a key file it
-        was pointed at, and any CLOUDSDK_AUTH_* override that reached it."""
+        "garbage", "down". search_probe: the same, answered only to a request
+        for the pool's cloudasset.assets.searchAllResources on that resource
+        ("granted" or "denied"); a resource absent from it answers from
+        probe, whose granted body holds setIamPolicy alone. The stubs record
+        what they saw in a log the test folds into proc.stderr: the bearer
+        curl read from its stdin (-H @-), every permission it was asked
+        (PROBED:<permission>), the impersonation flag gcloud saw, the first
+        bytes of a key file it was pointed at, and any CLOUDSDK_AUTH_*
+        override that reached it."""
         probe = probe or {}
+        search_probe = search_probe or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -3823,6 +3830,12 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             )
             if curl_present:
                 cases = []
+                # The request body (-d) precedes the URL on curl's argv, so a
+                # search case matches the permission then the resource, and
+                # sits before the resource-only cases.
+                for resource, answer in search_probe.items():
+                    body = {"granted": '{"permissions":["cloudasset.assets.searchAllResources"]}', "denied": "{}"}[answer]
+                    cases.append(f"  *\"cloudasset.assets.searchAllResources\"*\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' 200; exit 0 ;;")
                 for resource, answer in probe.items():
                     body, status = {
                         "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
@@ -3843,7 +3856,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 (bin_dir / "curl").write_text(
                     "#!/usr/bin/env bash\n"
                     'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
-                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) echo "PROBED:$(printf \'%s\' "$a" | sed \'s/.*\\["\\(.*\\)"\\].*/\\1/\')" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
                     "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
             # env is an external binary whose argv any local user can read: the
             # stub records what it was handed, then hands over to the real one.
@@ -3917,6 +3930,50 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         self.assertIn("INFO: Nothing was changed.", proc.stdout)
         # An organisation is always warned about, bindable or not.
         self.assertIn("WARN: SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation", proc.stdout)
+
+    def test_the_pool_armed_beside_a_folder_the_identity_cannot_search_names_the_viewer_role(self):
+        # The plan lists the folder's members for the pool, so setIamPolicy
+        # alone is not enough: the search permission is probed too, and a
+        # folder lacking it is reported with the role that grants it.
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": "true"},
+                         probe={"folders/123456789012": "granted"},
+                         search_probe={"folders/123456789012": "denied"})
+        self._assert_rc(proc, 1)
+        self.assertIn("ERROR: Refusing to apply: the Application Default Credentials (the identity Terraform applies with) cannot list the members of folders/123456789012 (cloudasset.assets.searchAllResources)", proc.stdout)
+        self.assertIn("roles/cloudasset.viewer on the folder for that identity", proc.stdout)
+        self.assertIn("scoped service account pool", proc.stdout)
+        self.assertNotIn("cannot set IAM policy on folders/123456789012", proc.stdout)
+        self.assertIn("PROBED:resourcemanager.folders.setIamPolicy\n", proc.stderr)
+        self.assertIn("PROBED:cloudasset.assets.searchAllResources\n", proc.stderr)
+        # An organisation reads the same way, and the warn mode warns instead.
+        proc = self._run(keys={"SCOPE_ORGANIZATIONS": "987654321098", "SCOPED_SA_POOL_ENABLED": "yes"}, mode="warn",
+                         probe={"organizations/987654321098": "granted"},
+                         search_probe={"organizations/987654321098": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("WARN: An applying run would be refused: the Application Default Credentials (the identity Terraform applies with) cannot list the members of organizations/987654321098 (cloudasset.assets.searchAllResources)", proc.stdout)
+        self.assertIn("roles/cloudasset.viewer on the organisation for that identity", proc.stdout)
+
+    def test_the_pool_armed_beside_a_folder_the_identity_can_bind_and_search_passes_silently(self):
+        proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": "true"},
+                         probe={"folders/123456789012": "granted"},
+                         search_probe={"folders/123456789012": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertIn("PROBED:cloudasset.assets.searchAllResources\n", proc.stderr)
+
+    def test_the_pool_off_never_probes_the_search_permission(self):
+        # With the pool off the plan reads no container, so the only
+        # permission asked is setIamPolicy, whatever the search probe would say.
+        for armed in ("false", ""):
+            with self.subTest(armed=armed):
+                proc = self._run(keys={"SCOPE_FOLDERS": "123456789012", "SCOPED_SA_POOL_ENABLED": armed},
+                                 probe={"folders/123456789012": "granted"},
+                                 search_probe={"folders/123456789012": "denied"})
+                self._assert_rc(proc, 0)
+                self.assertNotIn("ERROR", proc.stdout)
+                probed = [line for line in proc.stderr.splitlines() if line.startswith("PROBED:")]
+                self.assertEqual(["PROBED:resourcemanager.folders.setIamPolicy"], probed, proc.stderr)
 
     def test_the_probe_uses_the_credentials_the_provider_would(self):
         # GOOGLE_OAUTH_ACCESS_TOKEN as is; GOOGLE_IMPERSONATE_SERVICE_ACCOUNT

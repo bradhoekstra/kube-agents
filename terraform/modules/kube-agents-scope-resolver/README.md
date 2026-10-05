@@ -3,13 +3,15 @@
 Resolves the two `spec.scope` selectors that are not Resource Manager containers, a Shared VPC host
 (`sharedVpcHosts`) and a Cloud Monitoring Metrics Scope (`metricsScopes`), to the projects they
 reach, at plan time, so the [`kube-agents-iam`](../kube-agents-iam/README.md) module can bind the
-read roles in each. Nothing is inherited through either, which is why the resolution has to happen
+read roles in each; and, while the scoped service account pool is armed, lists each declared
+folder's and organisation's member projects for that pool (the section below the selectors'). Nothing is inherited through either, which is why the resolution has to happen
 before the bindings are planned ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
 §6, §10 step 3).
 
 ## What it reads, and as whom
 
-Three `data "http"` reads, the same the reconcile makes each run: the Compute API's
+Three selector reads, the same the reconcile makes each run, and a fourth for the pool while it is
+armed (its own section below): the Compute API's
 `getXpnResources` for a host's attached service projects (a project that is not a Shared VPC host
 resolves to no members, as it does at runtime); the Monitoring API's `metricsScopes.get` for a
 scope's monitored projects, which it names by project number; and Resource Manager v3 to name each

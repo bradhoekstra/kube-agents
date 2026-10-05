@@ -287,6 +287,15 @@ variable "scope_container_members" {
   type        = map(list(string))
   nullable    = false
   default     = {}
+
+  validation {
+    condition = alltrue([
+      for name, members in var.scope_container_members :
+      can(regex("^(folders|organizations)/[0-9]+$", name))
+      && alltrue([for member in members : can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", member))])
+    ])
+    error_message = "Each scope_container_members key is folders/<numeric id> or organizations/<numeric id>, and each member a GCP project ID (^[a-z][a-z0-9-]{4,28}[a-z0-9]$): the resolver module's container_members output as it is."
+  }
 }
 
 variable "scope_selector_members" {

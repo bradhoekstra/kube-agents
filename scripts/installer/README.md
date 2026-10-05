@@ -283,10 +283,12 @@ the plan, before anything is applied, naming the selector, the status and the AP
 needs `compute.projects.get` on a host, to read the Metrics Scope in its scoping project with the
 Monitoring API enabled there, and `resourcemanager.projects.get` on every monitored project; a
 monitored project it cannot name is left out by naming its project number in
-`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors' reads as
-`check_scope_container_access` probes a container: a container's failure lands inside the apply,
+`SCOPE_EXCLUDE_PROJECTS`. That is why no shell preflight probes the two selectors' reads,
+as `check_scope_container_access` probes a container's binding: the binding's failure lands inside the apply,
 after the Asset API is enabled and some containers are bound, while a failed read lands in the plan
-with nothing changed, `upgrade.sh --plan` included. The bindings themselves are the explicit
+with nothing changed, `upgrade.sh --plan` included. The pool's listing of a container's members is
+the exception that check probes too, while the pool is armed, because `install.sh` enables the
+Asset API before that plan and a listing refused there would leave it enabled. The bindings themselves are the explicit
 projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
 apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
@@ -374,7 +376,11 @@ host project or no enforced organisation policy (`constraints/gcp.restrictServic
 legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
 denies it, read through gcloud's active account, and that the identity Terraform applies with
 holds `resourcemanager.folders.setIamPolicy` on each folder and
-`resourcemanager.organizations.setIamPolicy` on each organisation, asked through Resource
+`resourcemanager.organizations.setIamPolicy` on each organisation, and, while the scoped service
+account pool is armed (`SCOPED_SA_POOL_ENABLED` true beside a container),
+`cloudasset.assets.searchAllResources` on each of them too, since the plan then lists the
+container's members for the pool and refuses without it, after the Asset API has been enabled
+(the remedy named is `roles/cloudasset.viewer` on that container), each asked through Resource
 Manager's `testIamPermissions` with a token minted for the credentials the google provider will
 read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
 `GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything

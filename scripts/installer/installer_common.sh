@@ -181,12 +181,15 @@ readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
 readonly SCOPE_CONTAINER_ID_PATTERN='^[0-9]{1,20}$'
 # What check_scope_container_access verifies before an apply that binds a
 # container: the API the reconcile's container search calls, the permission
-# the applying identity needs on each container kind, the constraints an
-# organisation policy forbids an API through, and where the permission probe
-# is asked.
+# the applying identity needs on each container kind, the permission and the
+# role the same identity needs on every container while the pool lists its
+# members at plan time, the constraints an organisation policy forbids an API
+# through, and where the permission probe is asked.
 readonly SCOPE_ASSET_API="cloudasset.googleapis.com"
 readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
 readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
+readonly SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION="cloudasset.assets.searchAllResources"
+readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -1351,9 +1354,13 @@ print("SCOPED_SA_POOL_ENABLED=" + json.dumps("true" if live["scopedPoolEnabled"]
 # account, whose answer does not depend on who asks: (1) the Cloud Asset API
 # the reconcile's container search calls can be enabled in the host project,
 # meaning it is enabled already or no effective organisation policy forbids
-# it, and (2) this identity can set IAM policy on every container named, so
+# it, (2) this identity can set IAM policy on every container named, so
 # the apply does not stop partway with the API enabled and some containers
-# bound. Every container is probed and every failure named before the run
+# bound, and (3) while the scoped service account pool is armed
+# (scope_pool_lists_containers), this identity can search every container's
+# members through that API, which the plan does for the pool after
+# enable_scope_selector_apis has enabled it and refuses without. Every
+# container is probed and every failure named before the run
 # stops (docs/designs/multi-project-scope.md §6); a probe that cannot decide
 # (no curl, no token, a transport error) warns and lets the apply speak,
 # because an apply that fails to bind fails loudly, unlike the scope replace
@@ -1367,8 +1374,9 @@ check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
   local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
   [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
-  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason
+  local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason pool_lists=false
   identity="$(_scope_terraform_identity_label)"
+  ! scope_pool_lists_containers || pool_lists=true
   if [[ "$organizations" == *[![:space:],]* ]]; then
     print_warning "SCOPE_ORGANIZATIONS binds the agent's read roles on the whole organisation, every project in it included. The design recommends folders until the scoped service account pool grants authority (docs/designs/multi-project-scope.md §9)."
   fi
@@ -1406,6 +1414,14 @@ check_scope_container_access() {
         # granted answer passes silently.
         undecided+=("whether ${identity} can set IAM policy on folders/${entry}${reason:+ ($reason)}")
       fi
+      $pool_lists || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can list the members of folders/${entry}${reason:+ ($reason)}")
+      fi
     done
     for entry in $organizations; do
       [ -n "$entry" ] || continue
@@ -1417,6 +1433,14 @@ check_scope_container_access() {
         # Undecided, and any status the probe does not define: nothing but a
         # granted answer passes silently.
         undecided+=("whether ${identity} can set IAM policy on organizations/${entry}${reason:+ ($reason)}")
+      fi
+      $pool_lists || continue
+      rc=0
+      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} can list the members of organizations/${entry}${reason:+ ($reason)}")
       fi
     done
     $had_noglob || set +f
