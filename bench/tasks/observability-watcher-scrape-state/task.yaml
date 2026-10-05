@@ -62,8 +62,10 @@ verification_spec:
       # An errored kanban_create delegated nothing.
       require_success: true
   # The route: the worker read a PodMonitoring off the install, with `get` or
-  # `describe`, in any letter case, and not the CRD that defines the kind. A
-  # match anywhere in a command, since the worker may chain it behind cd or
+  # `describe`, in any letter case -- not the CRD that defines the kind, and not
+  # a `kubectl auth can-i get podmonitoring` permission probe, which names the
+  # resource without reading it. A match anywhere in a command, since the worker
+  # may chain it behind cd or
   # pipe it into a reader; worker_commands reads the card log's one-line
   # rendering and sees terminal commands only, so a read through an MCP tool is
   # invisible to it. The skill's step spells the kubectl command and every
@@ -74,7 +76,7 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - '(?i)\bkubectl\b[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
+        - '(?i)\bkubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
   # The final answer names the mechanism, the port and one of the two proving
   # series. `mode: assert` because the final message is immutable once the run
   # ends; polling a failed phrase would only wait out the timeout. The required
