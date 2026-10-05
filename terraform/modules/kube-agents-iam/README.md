@@ -29,7 +29,9 @@ the grant in your Terraform, where it is reviewed.
 selector's members; a folder's or organisation's members are not listed at plan time yet), keyed
 on the bare project id and created in `project_id`, plus `roles/iam.serviceAccountTokenCreator`
 for the agent bound on each member as a resource (never at project level). Two clusters in one
-project share an account by design (`docs/designs/multi-project-scope.md` §6).
+project share an account by design (`docs/designs/multi-project-scope.md` §6). Each member's
+description carries the install's identity (`Pool member of <service_account_id> for
+projects/<id>`), and the installer's pre-apply ownership check lists members by it.
 `scoped_pool_max_accounts` bounds how many the plan may create and refuses a pool past it at plan;
 its default of 100 is GCP's default service-account quota, which the agent's own accounts share, so
 set it to the headroom the project has free rather than leaving a large pool at the default. The members hold no IAM grant of their

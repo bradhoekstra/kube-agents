@@ -100,7 +100,10 @@ resource "google_service_account" "scoped" {
   project      = var.project_id
   account_id   = each.value.account_id
   display_name = "Kube-Agents scoped reader: ${each.value.project_id}"
-  description  = "Pool member for projects/${each.value.project_id}. Holds no IAM grant; authority arrives with per-cluster RBAC."
+  # The description is read by the installer's ownership check (installer_common.sh,
+  # check_service_account_ownership): it lists members by this marker to refuse an apply
+  # that would 409 on a member this install's state does not own.
+  description = "Pool member of ${var.service_account_id} for projects/${each.value.project_id}. Holds no IAM grant; authority arrives with per-cluster RBAC."
 }
 
 # REMOVED 2026-08-12: google_project_iam_member.scoped_container_viewer

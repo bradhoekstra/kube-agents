@@ -71,7 +71,7 @@ run "an_armed_pool_holds_one_account_per_listed_project" {
     error_message = "display name: ${google_service_account.scoped["team-alpha"].display_name}"
   }
   assert {
-    condition     = google_service_account.scoped["team-alpha"].description == "Pool member for projects/team-alpha. Holds no IAM grant; authority arrives with per-cluster RBAC."
+    condition     = google_service_account.scoped["team-alpha"].description == "Pool member of kubeagents-platform-gsa for projects/team-alpha. Holds no IAM grant; authority arrives with per-cluster RBAC."
     error_message = "description: ${google_service_account.scoped["team-alpha"].description}"
   }
 }

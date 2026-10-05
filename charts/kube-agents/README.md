@@ -621,7 +621,12 @@ accounts hold no IAM grant as of 2026-08-12, so an armed pool puts the broker
 onto identities that can read nothing, and every cluster read fails — a mapped
 project gets a powerless token and a `Forbidden` from GKE, an unmapped one is
 refused by the broker before any GKE call. `enabled: true` with an empty list
-is refused at install. See the site's
+is refused at install. So is `enabled: true` against a live `PlatformAgent` CRD
+that predates the field: `helm upgrade` does not apply `crds/`, and an older
+CRD would admit the CR with the block pruned, leaving the broker on the agent's
+own identity while the release record says armed, so the chart looks the CRD
+up and fails the render until `kubectl apply --server-side -f
+charts/kube-agents/crds/` has run. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 

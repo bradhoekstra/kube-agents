@@ -154,6 +154,7 @@ class InstallerCommonTest(unittest.TestCase):
         describe_stub='echo "ERROR: (gcloud.container.clusters.describe) NOT_FOUND" >&2; exit 1',
         kms_versions="",
         sa_describe_stub="exit 1",
+        sa_list_stub="exit 1",
         gcloud_stderr=None,
         gcloud_extra_cases="",
         get_credentials_stub=None,
@@ -197,6 +198,7 @@ class InstallerCommonTest(unittest.TestCase):
                 f"{get_cred_case}"
                 f"  *\"keys versions list\"*) printf '%s' '{kms_versions}'; exit 0 ;;\n"
                 f"  *\"service-accounts describe\"*) {sa_describe_stub} ;;\n"
+                f"  *\"service-accounts list\"*) {sa_list_stub} ;;\n"
                 "esac\n"
                 f"printf '%s' '{gcloud_stderr}' >&2\n"
                 f"[ -f '{state_file}' ] && cat '{state_file}'\n"
@@ -771,6 +773,59 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("LITELLM_GSA_NAME", proc.stderr)
+
+    # A `service-accounts list` stub that answers only a filter carrying this
+    # install's marker, the way the real API applies the --filter: a member
+    # whose description names another install's agent is never listed.
+    _POOL_MEMBER_EMAIL = "ka-team-alpha-0ed42166@test-project.iam.gserviceaccount.com"
+    _POOL_LIST_STUB = (
+        '[[ "$*" == *"email:ka-*"* && "$*" == *"Pool member of kubeagents-platform-gsa for "* ]]'
+        f' && {{ echo "{_POOL_MEMBER_EMAIL}"; exit 0; }}; exit 0'
+    )
+
+    def test_service_account_ownership_refuses_a_pool_member_this_state_does_not_own(self):
+        # The lost-state re-install: the agent's account is gone (describe
+        # misses) but the pool members it derived are still there, so the
+        # refusal lists them by the marker their description carries.
+        proc = self._run(
+            self._SHOW_REMEDY,
+            gcloud_exit=1,
+            sa_list_stub=self._POOL_LIST_STUB,
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("a scoped pool member", proc.stderr)
+        self.assertIn(f"gcloud iam service-accounts delete {self._POOL_MEMBER_EMAIL}", proc.stderr)
+        self.assertIn("PLATFORM_AGENT_GSA_NAME", proc.stderr)
+
+    def test_service_account_ownership_passes_a_pool_member_this_state_owns(self):
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_stdout=_service_account_state("kubeagents-platform-gsa", "ka-team-alpha-0ed42166"),
+            sa_describe_stub="exit 0",
+            sa_list_stub=self._POOL_LIST_STUB,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_service_account_ownership_ignores_another_installs_pool_members(self):
+        # The filter names this install's agent, so a member marked for
+        # kubeagents-platform-gsa is not this install's business.
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_exit=1,
+            sa_list_stub=self._POOL_LIST_STUB,
+            env={"PLATFORM_AGENT_GSA_NAME": "other-agent-gsa"},
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("ka-team-alpha", proc.stderr)
+
+    def test_service_account_ownership_treats_a_failing_list_as_no_members(self):
+        proc = self._run(
+            'check_service_account_ownership; echo "rc=$?"',
+            gcloud_exit=1,
+            sa_list_stub='echo "ERROR: (gcloud.iam.service-accounts.list) PERMISSION_DENIED" >&2; exit 1',
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertNotIn("ERROR: Service account", proc.stderr)
 
     # ── hcl_csv_list: --custom-roles documents "space- or comma-separated" ──
 

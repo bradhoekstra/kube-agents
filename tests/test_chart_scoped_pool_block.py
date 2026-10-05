@@ -9,8 +9,18 @@ members: the mapping is declared, visible in the CR, and inert, because
 with no members fails the render, where the message reaches the person running
 the upgrade, rather than installing a CR the broker refuses to start on. The
 schema closes the pool and each member, so a misspelt key is named rather than
-dropped. The text-structural tests run everywhere; the render tests need a helm
-binary, which the agent-startup job lacks.
+dropped.
+
+An armed pool also has to reach a CRD that knows the field. `helm upgrade` never
+applies `crds/`, so on an install whose live CRD predates the pool the API server
+admits the CR with the block pruned: the operator sees no pool, the broker starts
+with the pool off, and every cluster read runs on the agent's own identity while
+the release record says "armed". The template guards that the way it guards
+`integration.forges`: `lookup` the installed CRD and fail the render when
+`spec.security` lacks `scopedServiceAccountPool`. `lookup` returns nothing under
+`helm template`, so the guard is pinned as text here and the render tests are
+unaffected by it. The text-structural tests run everywhere; the render tests need
+a helm binary, which the agent-startup job lacks.
 
 Run: python3 -m unittest discover -s tests -p 'test_chart_scoped_pool_block.py' -v
 """
@@ -35,6 +45,9 @@ _REQUIRED = [
 ]
 _VALUE_PATH = "platformAgent.security.scopedServiceAccountPool"
 _FAIL_MESSAGE = "requires at least one serviceAccounts entry"
+_CRD_LOOKUP = 'lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io"'
+_CRD_DIG = 'dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "security" "properties" (dict) .'
+_CRD_REMEDY = "kubectl apply --server-side -f charts/kube-agents/crds/"
 
 # Deliberately not in alphabetical order, so a render that sorted the list
 # would fail the verbatim comparison.
@@ -69,6 +82,38 @@ class ScopedPoolBlockShapeTest(unittest.TestCase):
         self.assertIsNotNone(guard, "the armed-but-empty guard is missing from the CR template")
         self.assertIn(_VALUE_PATH + ".enabled", guard.group(1))
         self.assertIn(_FAIL_MESSAGE, guard.group(1))
+
+    def _crd_guard(self):
+        """The text from the pool's `$pool` binding to the pool block, which is
+        where the CRD guard has to sit: next to the block it protects."""
+        block = re.search(r"\{\{- \$pool := \.Values\.platformAgent\.security\.scopedServiceAccountPool \| default dict \}\}\n(.*?)scopedServiceAccountPool:\n",
+                          self.template, re.DOTALL)
+        self.assertIsNotNone(block, "the scoped pool block is missing from the CR template")
+        return block.group(1)
+
+    def test_an_armed_pool_looks_up_the_installed_crd(self):
+        # `lookup` is empty under `helm template`, so the guard can only be
+        # pinned as text: the lookup, the dig into `spec.security`, and the key.
+        guard = self._crd_guard()
+        self.assertIn(_CRD_LOOKUP, guard)
+        self.assertIn(_CRD_DIG, guard)
+        self.assertIn('hasKey $props "scopedServiceAccountPool"', guard)
+
+    def test_the_crd_guard_is_gated_on_the_switch(self):
+        # A disabled block pruned by an old CRD changes nothing; only an armed
+        # pool silently falls back onto the agent's own identity, so only an
+        # armed pool pays for the lookup and can fail on it.
+        guard = self._crd_guard()
+        gate = re.search(r"\{\{- if \$pool\.enabled \}\}\n\s*\{\{- \$crd := " + re.escape(_CRD_LOOKUP), guard)
+        self.assertIsNotNone(gate, "the CRD lookup is not gated on $pool.enabled")
+
+    def test_the_crd_guard_fails_naming_the_value_and_the_remedy(self):
+        guard = self._crd_guard()
+        fail = re.search(r'\{\{- if not \(hasKey \$props "scopedServiceAccountPool"\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', guard)
+        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing key")
+        self.assertIn(_VALUE_PATH + ".enabled", fail.group(1))
+        self.assertIn("helm upgrade does not update CRDs", fail.group(1))
+        self.assertIn(_CRD_REMEDY, fail.group(1))
 
     def test_the_switch_defaults_to_false_in_the_rendered_block(self):
         self.assertIn("enabled: {{ $pool.enabled | default false }}", self.template)

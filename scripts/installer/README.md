@@ -336,7 +336,10 @@ account in the management project per project the plan lists (the management pro
 folder's or organisation's members are not listed at plan time yet, so a cluster under a declared
 container is refused while the pool is armed), and the chart renders the mapping into the CR as
 `spec.security.scopedServiceAccountPool` with `enabled` set from the same key, so declaring
-projects arms nothing on its own. The generator writes `scoped_pool_enabled` on every run, `false`
+projects arms nothing on its own. Members carry the install's identity in their description
+(`Pool member of <PLATFORM_AGENT_GSA_NAME> for projects/<id>`), and `check_service_account_ownership`
+lists them by it before every apply, armed or not, so a member left by a lost state is refused
+beside the agent's account rather than 409ing after the agent is deleted. The generator writes `scoped_pool_enabled` on every run, `false`
 by default (a member holds no IAM grant yet, so an armed pool turns every cluster read into a
 `Forbidden`), and `scoped_pool_max_accounts` only when the key is set: the bound on the pool, declared from the
 management project's free service-account quota, 100 (GCP's default quota, not the headroom)

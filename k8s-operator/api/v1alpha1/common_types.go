@@ -1286,9 +1286,11 @@ type ScopedServiceAccountPoolSpec struct {
 	// worth catching in `kubectl apply`.
 	//
 	// No upper bound here: the pool grows with the projects in scope, and the
-	// Terraform module's scoped_pool_max_accounts is where the host project's
-	// service-account quota is enforced, at plan time, before any entry
-	// reaches this list.
+	// Terraform module's scoped_pool_max_accounts is the bound an operator
+	// declares on it from the host project's free service-account quota,
+	// which the plan holds the derived set to before any entry reaches this
+	// list. That bound is declared, not read: the quota is shared with the
+	// agent's own accounts and the plan cannot see it.
 	// +listType=map
 	// +listMapKey=projectId
 	// +optional

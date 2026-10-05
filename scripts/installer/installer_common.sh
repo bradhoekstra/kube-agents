@@ -98,6 +98,13 @@ readonly SCOPE_MAX_PROJECTS_DEFAULT=100
 readonly SCOPED_SA_POOL_ENABLED_DEFAULT="false"
 readonly SCOPED_SA_POOL_MAX_ACCOUNTS_MIN=1
 readonly SCOPED_SA_POOL_MAX_ACCOUNTS_DEFAULT=100
+# A pool member's account id starts with this prefix and its description
+# carries the install's identity (the agent's service account id) as a marker.
+# scoped_pool.tf writes the same two strings; check_service_account_ownership
+# lists members by them, since the installer cannot enumerate members from its
+# inputs (a selector's members are resolved inside the plan).
+readonly SCOPED_SA_POOL_ACCOUNT_ID_PREFIX="ka-"
+readonly SCOPED_SA_POOL_MEMBER_MARKER_FORMAT="Pool member of %s for "
 
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
@@ -1978,9 +1985,10 @@ sys.exit(0)
 # tell a healthy install to delete its own account, so the check stands down
 # and says so. Caller defines print_error / print_info / print_warning.
 check_service_account_ownership() {
-  local in_state line label key account_id email state_rc=0
+  local in_state line label key account_id email state_rc=0 agent_id marker members
   local -a candidates=() foreign=()
-  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")
+  agent_id="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
+  candidates+=("the agent	PLATFORM_AGENT_GSA_NAME	${agent_id}")
   if [ "${TFVARS_ENABLE_GITHUB_MINTER:-false}" = "true" ]; then
     candidates+=("the GitHub token minter	GITHUB_MINTER_GSA_NAME	${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")
   fi
@@ -2004,6 +2012,28 @@ check_service_account_ownership() {
       foreign+=("${label}	${key}	${account_id}	${email}")
     fi
   done
+  # The scoped pool's members (scoped_pool.tf) are derived from the agent's id
+  # and cannot be enumerated from the installer's inputs, so they are discovered
+  # from GCP by the marker their description carries. Checked whether or not
+  # the pool is armed: a leftover member with this install's marker is the same
+  # lost-state case as a leftover agent account and 409s the moment the pool is
+  # armed, so it is listed in the same refusal. A list that fails (no
+  # permission, API off) counts as no members, as the describe's miss does.
+  # shellcheck disable=SC2059 # the format is the named constant
+  marker="$(printf "$SCOPED_SA_POOL_MEMBER_MARKER_FORMAT" "$agent_id")"
+  members="$(trap - ERR; gcloud iam service-accounts list --project "${PROJECT_ID}" \
+    --filter="email:${SCOPED_SA_POOL_ACCOUNT_ID_PREFIX}* AND description:\"${marker}\"" \
+    --format="value(email)" 2>/dev/null)" || members=""
+  while IFS= read -r email; do
+    [ -n "$email" ] || continue
+    account_id="${email%%@*}"
+    if printf '%s\n' "$in_state" | grep -Fxq "$account_id"; then
+      continue
+    fi
+    # Keyed on PLATFORM_AGENT_GSA_NAME: members derive their ids from the
+    # agent's, so renaming the agent is what un-collides them.
+    foreign+=("a scoped pool member	PLATFORM_AGENT_GSA_NAME	${account_id}	${email}")
+  done <<<"$members"
   [ "${#foreign[@]}" -eq 0 ] && return 0
 
   for line in ${foreign[@]+"${foreign[@]}"}; do
