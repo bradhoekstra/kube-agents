@@ -354,6 +354,62 @@ class TestWriterThread(SinkTestCase):
         self.assertEqual(out.getvalue(), '{"audit_event": "x"}\n')
         self.assertIn(str(self.path), captured.output[0])
 
+    def _reset_writer(self):
+        with audit_sink._writer_lock:
+            writer, audit_sink._writer = audit_sink._writer, None
+            audit_sink._pending_writes = 0
+        if writer is not None:
+            writer.shutdown(wait=False)
+
+    def test_a_stalled_writer_spills_to_stdout_rather_than_queueing_without_bound(self):
+        # A write that blocks rather than fails pins the single writer thread.
+        # Without a cap every later event queues in memory unbounded and reaches
+        # neither the file nor the stdout fallback _write takes only on an error.
+        self._reset_writer()
+        self.addCleanup(self._reset_writer)
+        started, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        real = audit_sink.append_line
+
+        def stall(line, path=None):
+            started.set()
+            release.wait(timeout=10)
+            return real(line, path)
+
+        patch = mock.patch.object(audit_sink, "append_line", side_effect=stall)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+        cap = 3
+        out = io.StringIO()
+        with mock.patch.object(audit_sink, "MAX_PENDING_WRITES", cap):
+
+            async def on_loop():
+                # The first emit pins the writer thread; wait until it is in the
+                # stalled write before filling the queue behind it.
+                self.assertIsNotNone(audit_sink.emit({"n": 0}, LOGGER))
+                self.assertTrue(started.wait(timeout=5))
+                for n in range(1, 2 * cap):
+                    audit_sink.emit({"n": n}, LOGGER)
+
+            with contextlib.redirect_stdout(out), self.assertLogs(LOGGER, level="ERROR") as captured:
+                asyncio.run(on_loop())
+                self.assertLessEqual(audit_sink._pending_writes, cap, "the queue grew past the cap")
+                release.set()
+                audit_sink.flush(timeout=10)
+
+        filed = sorted(json.loads(line)["n"] for line in self.lines())
+        spilled = sorted(json.loads(line)["n"] for line in out.getvalue().splitlines())
+        # None lost: the first `cap` on the file, the rest on stdout.
+        self.assertEqual(sorted(filed + spilled), list(range(2 * cap)))
+        self.assertEqual(len(filed), cap)
+        self.assertEqual(len(spilled), cap, "records past the cap were queued instead of spilled to stdout")
+        # Each spill logged an ERROR naming the backlog, never the record.
+        self.assertTrue(any("backed up" in line for line in captured.output))
+        for line in captured.output:
+            self.assertNotIn('"n"', line)
+        self.assertEqual(audit_sink._pending_writes, 0, "the backlog did not drain")
+
 
 class TestRotation(SinkTestCase):
 

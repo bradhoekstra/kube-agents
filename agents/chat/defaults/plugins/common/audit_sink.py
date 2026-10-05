@@ -57,8 +57,10 @@ on its next refresh (5 s), so the one way a record goes unshipped is a
 sidecar more than 30 s behind the file at the moment it rotates.
 
 When the file cannot take a record — a full or read-only volume, a lock held
-past the wait, a profile Hermes refuses to materialise — the record is
-printed to this process's stdout as the same one JSON line, and an ERROR
+past the wait, a profile Hermes refuses to materialise, or the single writer
+thread pinned by a write that blocks rather than returns with
+``MAX_PENDING_WRITES`` records already behind it — the record is printed to
+this process's stdout as the same one JSON line, and an ERROR
 naming the file and the error, carrying neither the record nor its keys, goes
 to Hermes' logger. What the two reach depends on the process. From the
 gateway the stdout is the container log, which the GKE log agent ships to
@@ -111,11 +113,21 @@ AUDIT_FILE_BACKUP_COUNT = 3
 LOCK_WAIT_SECONDS = 1.5
 LOCK_RETRY_INTERVAL_SECONDS = 0.05
 WRITER_THREAD_NAME = "audit-sink"
+# The depth at which emit() stops handing writes to the writer thread and prints
+# to stdout instead. A healthy writer drains in microseconds, so the backlog is
+# zero or one; a write that blocks rather than fails -- a stalled volume, an
+# os.write that does not return -- pins the one writer thread, and without a cap
+# every later event would queue in memory unbounded, reaching neither the file
+# nor the stdout fallback _write takes only on an error. The cap bounds the
+# queue to MAX_PENDING_WRITES records and keeps the trail on stdout.
+MAX_PENDING_WRITES = 256
 _OPEN_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT
 _ENCODING = "utf-8"
 
 _writer: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _writer_lock = threading.Lock()
+# Writes handed to the writer thread and not yet finished; guarded by _writer_lock.
+_pending_writes = 0
 
 
 def hermes_home() -> Path:
@@ -159,20 +171,36 @@ def redact(line: str) -> str:
 def emit(record: Dict[str, Any], logger: logging.Logger) -> Optional[concurrent.futures.Future]:
     """Write ``record`` to the audit file: inline, or on the writer thread when called on an event loop.
 
-    Returns the pending write when it was handed to the writer thread and None
-    when it was done inline. A write that fails does not reach the caller: the
-    record is printed to this process's stdout as the same JSON line and the
-    failure goes to ``logger`` as an ERROR naming the file and the error and
-    nothing of the record (see the module docstring for what each reaches).
+    Returns the pending write when it was handed to the writer thread, and None
+    when it was done inline or taken straight to stdout because the writer thread
+    had ``MAX_PENDING_WRITES`` writes already waiting. A write that fails does not
+    reach the caller: the record is printed to this process's stdout as the same
+    JSON line and the failure goes to ``logger`` as an ERROR naming the file and
+    the error and nothing of the record (see the module docstring for what each
+    reaches).
     """
     line = redact(serialize(record))
     # Resolved here, on the caller's thread: the per-turn profile override is
     # context-local, and the writer thread has no context of its own.
     path = audit_file_path()
-    if _on_event_loop():
-        return _writer_thread().submit(_write, line, path, logger)
-    _write(line, path, logger)
-    return None
+    if not _on_event_loop():
+        _write(line, path, logger)
+        return None
+    global _pending_writes
+    writer = _writer_thread()
+    with _writer_lock:
+        backlog = _pending_writes
+        if backlog < MAX_PENDING_WRITES:
+            _pending_writes += 1
+    if backlog >= MAX_PENDING_WRITES:
+        # The writer thread is not draining -- a write that blocks rather than
+        # fails never reaches _write's stdout fallback. Take that path here, so
+        # the record is kept and the in-memory queue stays bounded.
+        _to_stdout(line, path, logger, f"the writer thread is backed up, {backlog} writes pending")
+        return None
+    future = writer.submit(_write, line, path, logger)
+    future.add_done_callback(_writer_done)
+    return future
 
 
 def flush(timeout: Optional[float] = None) -> None:
@@ -230,12 +258,28 @@ def _writer_thread() -> concurrent.futures.ThreadPoolExecutor:
         return _writer
 
 
+def _writer_done(_future: object) -> None:
+    """One write finished: drop it from the backlog count."""
+    global _pending_writes
+    with _writer_lock:
+        if _pending_writes > 0:
+            _pending_writes -= 1
+
+
 def _write(line: str, path: Path, logger: logging.Logger) -> None:
     try:
         append_line(line, path)
-        return
     except Exception as exc:
-        failure = exc
+        _to_stdout(line, path, logger, exc)
+
+
+def _to_stdout(line: str, path: Path, logger: logging.Logger, failure: object) -> None:
+    """Print the record to stdout as the fallback trail; ERROR if even that fails.
+
+    ``failure`` is the write error, or the reason the write was not attempted at
+    all -- the writer thread backed up. Neither the record nor its keys reach the
+    ERROR, so the console's text-form query does not count it.
+    """
     try:
         print(line, file=sys.stdout, flush=True)
     except Exception as stdout_failure:
