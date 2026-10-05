@@ -225,7 +225,8 @@ FIXTURE_NOT_READY = {
 KNOWN_NO_DOMAIN = {
     "observability-watcher-scrape-state": (
         "a question about the agent's own observability, whether the event "
-        "watcher's metrics are scraped and what proves it, graded on the final "
+        "watcher's metrics are scraped and what proves it, graded on the "
+        "delegation, the worker's read of the PodMonitoring and the final "
         "answer; reads the agent's own install, not the fleet, and no "
         "domains.yaml row describes the agent's own observability"
     ),

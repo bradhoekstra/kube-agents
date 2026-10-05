@@ -1,24 +1,24 @@
 # A question about the agent's own observability: whether the event watcher's
 # Prometheus metrics are scraped on this install, how the scrape is configured
 # and what proves it is working. The answer comes from the kube-agents
-# observability skill, and the skill used to send the agent to the gateway
-# Deployment looking for scrape annotations the operator has never rendered,
-# so the agent reported "not scraped" on an install the managed collector was
-# scraping every 30s through the chart's `<name>-gateway-monitoring`
-# PodMonitoring. The skill now names the PodMonitoring, the listener (the
-# `agent-api-auth` container's `event-metrics` port, 9095) and the Cloud
-# Monitoring series that prove the scrape (`up{job="<name>-gateway-monitoring"}`
-# and `k8s_event_watcher_cluster_up`, with the watcher's own labels arriving as
-# `exported_cluster` and `exported_location`).
+# observability skill. The skill used to send the agent to the gateway
+# Deployment for scrape annotations the operator has never rendered, and an
+# operator reported the agent answering "not scraped" on an install the managed
+# collector scraped every 30s through the chart's `<name>-gateway-monitoring`
+# PodMonitoring. On the live-test install the delegated worker found the
+# PodMonitoring without the skill's help, so this case did not go red against
+# the old skill; it guards the answer instead: the mechanism, the listener (the
+# `agent-api-auth` container's `event-metrics` port, 9095), one of the proving
+# series (`up{job="<name>-gateway-monitoring"}` or `k8s_event_watcher_cluster_up`),
+# and the worker's own read of the PodMonitoring.
 #
 # Graded on the route and the answer. The worker has to have read the
 # PodMonitoring off the install (a `kubectl get podmonitoring` in its terminal
-# log), because the four phrases are the skill's own vocabulary and an answer
-# composed from the skill without a read, or one that read nothing and said
-# "not scraped", would otherwise pass on them; and the final answer has to
-# name the mechanism and the port, which an answer built on the Deployment's
-# annotations does not; which proving series it cites is the judge's to
-# grade. The install under test has to carry the gateway PodMonitoring
+# log), because the required phrases are the skill's own vocabulary and an
+# answer composed from the skill without a read would otherwise pass on them;
+# and the final answer has to name the mechanism, the port and one of the two
+# proving series, which an answer built on the Deployment's annotations does
+# not. The install under test has to carry the gateway PodMonitoring
 # for the question to have the answer the skill gives; the chart renders it
 # where the cluster serves the PodMonitoring API, and a kustomize install
 # needs it applied by hand before the run.
@@ -61,28 +61,39 @@ verification_spec:
       tool_names: ["kanban_create"]
       # An errored kanban_create delegated nothing.
       require_success: true
-  # The route: the worker read the PodMonitoring off the install. A match
-  # anywhere in a command, since the worker may chain it behind cd or pipe it
-  # into a reader; worker_commands reads the card log's one-line rendering.
+  # The route: the worker read a PodMonitoring off the install, with `get` or
+  # `describe`, in any letter case, and not the CRD that defines the kind. A
+  # match anywhere in a command, since the worker may chain it behind cd or
+  # pipe it into a reader; worker_commands reads the card log's one-line
+  # rendering and sees terminal commands only, so a read through an MCP tool is
+  # invisible to it. The skill's step spells the kubectl command and every
+  # recorded run used it.
   - name: the-worker-read-the-podmonitoring
     role: objective
     mode: assert
     check:
       type: worker_commands
       required_patterns:
-        - '\bkubectl\b[^\n|;&]*\bget\b[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
-  # The final answer names the mechanism and its proof. `mode: assert` because
-  # the final message is immutable once the run ends; polling a failed phrase
-  # would only wait out the timeout.
+        - '(?i)\bkubectl\b[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\bcrds?\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
+  # The final answer names the mechanism, the port and one of the two proving
+  # series. `mode: assert` because the final message is immutable once the run
+  # ends; polling a failed phrase would only wait out the timeout. The any_of
+  # series carries the polarity: an answer quotes up{job=...} or
+  # k8s_event_watcher_cluster_up only after querying Cloud Monitoring, which the
+  # bug's annotation-only path never does, so an answer built on the Deployment's
+  # missing annotations lacks the series and fails here. A forbidden "not
+  # scraped" pattern was tried and dropped: a thorough, correct answer notes the
+  # credential-proxy PodMonitoring is not scraped on a one-monitor cluster while
+  # the watcher is, and the pattern rejected that answer.
   - name: the-answer-names-the-podmonitoring-the-listener-and-the-proof
     role: objective
     mode: assert
     check:
       type: report_contains
-      # The proof is left to the route check and the judge: a correct answer
-      # may cite up{job=...} or k8s_event_watcher_cluster_up, and a phrase
-      # check cannot say "either", so it holds the mechanism and the port.
       required_phrases:
         - "PodMonitoring"
         - "gateway-monitoring"
         - "9095"
+      any_of_phrases:
+        - "up{job="
+        - "k8s_event_watcher_cluster_up"
