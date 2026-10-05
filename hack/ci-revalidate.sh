@@ -374,6 +374,14 @@ revalidate_against_green_history() {
   # else, so a PULL_NUMBER beside them (not Prow's doing, but an operator
   # shell's) cannot narrow a batch to one pull; a serial presubmit names its
   # one pull in PULL_NUMBER and PULL_PULL_SHA.
+  # Prow's decoration exports 40-hex SHAs. The ones this run was handed are
+  # held to that shape before any of them reaches gsutil or git, as the
+  # recovered ones are: a value shaped like an option would otherwise reach
+  # `git diff` as one, and an empty file list reads as an inert delta.
+  if [ -n "${PULL_BASE_SHA:-}" ] && ! printf '%s' "${PULL_BASE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+    echo "Step 0: full run: PULL_BASE_SHA is not a 40-hex SHA (${PULL_BASE_SHA})"
+    return 1
+  fi
   local pulls=""
   if [ "${JOB_TYPE:-}" = "${REVALIDATION_BATCH_JOB_TYPE}" ]; then
     if [ -z "${PULL_REFS:-}" ] || [ -z "${PULL_BASE_SHA:-}" ]; then
@@ -405,6 +413,10 @@ for entry in entries[1:]:
     fi
     echo "Step 0: batch of $(printf '%s\n' "${pulls}" | wc -l | tr -d ' ') pull requests; every one must hold a reusable verdict"
   elif [ -n "${PULL_NUMBER:-}" ] && [ -n "${PULL_PULL_SHA:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
+    if ! printf '%s' "${PULL_NUMBER}" | grep -Eq '^[0-9]+$' || ! printf '%s' "${PULL_PULL_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "Step 0: full run: PULL_NUMBER or PULL_PULL_SHA is not <number> and <40-hex SHA> (${PULL_NUMBER}, ${PULL_PULL_SHA})"
+      return 1
+    fi
     pulls="${PULL_NUMBER} ${PULL_PULL_SHA}"
   else
     echo "Step 0: full run: not a decorated Prow presubmit or batch (PULL_NUMBER, PULL_PULL_SHA or PULL_BASE_SHA unset, and JOB_TYPE is not batch)"

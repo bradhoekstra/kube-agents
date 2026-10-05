@@ -18,8 +18,10 @@ key on (scripts/eval_dashboard/collect.py reads nothing from it today).
 """
 
 import json
+import os
 import pathlib
 import subprocess
+import unittest.mock
 import tempfile
 import unittest
 
@@ -33,11 +35,11 @@ _PR = "77"
 _OTHER_PR = "78"
 _JOB = "pull-kube-agents-smoke-test"
 
-# Printed by the script under test before the lifted constants read JOB_NAME,
-# so a test can pin whether the variable was absent from the child's
-# environment or set (possibly empty) -- `${JOB_NAME:-default}` cannot tell
-# the two apart, which is exactly why a test that claims to cover both has
-# to prove it handed the script both.
+# Printed by the wrapper before it sources the script, whose constants read
+# JOB_NAME as they load, so a test can pin whether the variable was absent
+# from the child's environment or set (possibly empty) --
+# `${JOB_NAME:-default}` cannot tell the two apart, which is exactly why a
+# test that claims to cover both has to prove it handed the script both.
 _JOB_NAME_PROBE = 'if [ -n "${JOB_NAME+x}" ]; then echo "JOB_NAME: set"; else echo "JOB_NAME: absent"; fi'
 _JOB_NAME_SET = "JOB_NAME: set"
 _JOB_NAME_ABSENT = "JOB_NAME: absent"
@@ -204,13 +206,60 @@ class RevalidationTest(unittest.TestCase):
         existing = json.loads(path.read_text()) if path.exists() else []
         path.write_text(json.dumps(existing + events))
 
-    def _run(self, cur_head, cur_base, env_overrides=None):
-        # The shipped script, copied into the fixture repo's hack/ so its own
-        # BASH_SOURCE-derived repo_dir points at the fixture checkout, the
-        # same way it points at the real one in the pod; sourced rather than
-        # executed so the wrapper can name the verdict it took.
+    # The three pieces every way of running the script shares -- `_run`
+    # (sourced, with a wrapper naming the verdict) and the entrypoint class's
+    # `_execute` (the file itself) -- live here once, so the set of variables
+    # a test relies on being ABSENT is held in one place. The child env is
+    # built from os.environ, and a developer's shell may export the very
+    # variable a test is unsetting: JOB_TYPE and PULL_REFS from a live batch
+    # run, EVAL_SKIP_REVALIDATION as the operator's lever.
+    _NEUTRALISED = ("JOB_TYPE", "PULL_REFS", "EVAL_SKIP_REVALIDATION")
+
+    def _install_script(self):
+        """The shipped script, copied into the fixture repo's hack/ so its own
+        BASH_SOURCE-derived repo_dir points at the fixture checkout, the same
+        way it points at the real one in the pod."""
         copy = self.repo / "hack" / "ci-revalidate.sh"
         copy.write_text(_CI_REVALIDATE.read_text(encoding="utf-8"))
+        return copy
+
+    def _base_env(self, cur_head, cur_base):
+        self.call_log = self.tmp / "gsutil.calls"
+        env = {
+            "PULL_NUMBER": _PR,
+            "PULL_PULL_SHA": cur_head,
+            "PULL_BASE_SHA": cur_base,
+            "PULL_BASE_REF": "main",
+            # Unset in the pod that is not this job; a developer's shell may
+            # carry one, and the default is what these fixtures name.
+            "JOB_NAME": "",
+            "GSUTIL_OBJECT_DIR": str(self.objects),
+            "GSUTIL_LS_DIR": str(self.listings),
+            "GSUTIL_CALL_LOG": str(self.call_log),
+            "GITHUB_STATUS_DIR": str(self.statuses),
+            "BENCH_GITHUB_TOKEN": "",
+        }
+        # None: absent from the child's environment, not set to an empty
+        # string; a serial test must prove PULL_NUMBER alone selects its path.
+        env.update({key: None for key in self._NEUTRALISED})
+        return env
+
+    def _child_env(self, env):
+        # A None value is dropped AFTER the isolated env is built because
+        # that env starts from os.environ.
+        absent = {key for key, value in env.items() if value is None}
+        child_env = get_isolated_test_env(
+            overrides={key: value for key, value in env.items() if value is not None},
+            bin_dir=self.bin,
+        )
+        for key in absent:
+            child_env.pop(key, None)
+        return child_env
+
+    def _run(self, cur_head, cur_base, env_overrides=None):
+        # Sourced rather than executed so the wrapper can name the verdict it
+        # took; the entrypoint class below executes the file itself.
+        copy = self._install_script()
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -225,38 +274,10 @@ class RevalidationTest(unittest.TestCase):
         )
         under_test = self.repo / "hack" / "step0_under_test.sh"
         under_test.write_text(script)
-        self.call_log = self.tmp / "gsutil.calls"
-        env = {
-            "PULL_NUMBER": _PR,
-            "PULL_PULL_SHA": cur_head,
-            "PULL_BASE_SHA": cur_base,
-            "PULL_BASE_REF": "main",
-            # Unset in the pod that is not this job; a developer's shell may
-            # carry one, and the default is what these fixtures name.
-            "JOB_NAME": "",
-            # Prow's for a batch; absent from a serial presubmit's env here so
-            # the serial tests prove PULL_NUMBER alone selects that path.
-            "JOB_TYPE": None,
-            "PULL_REFS": None,
-            "GSUTIL_OBJECT_DIR": str(self.objects),
-            "GSUTIL_LS_DIR": str(self.listings),
-            "GSUTIL_CALL_LOG": str(self.call_log),
-            "GITHUB_STATUS_DIR": str(self.statuses),
-            "BENCH_GITHUB_TOKEN": "",
-        }
+        env = self._base_env(cur_head, cur_base)
         if env_overrides:
             env.update(env_overrides)
-        # A None value means the variable is absent from the child's
-        # environment, not set to an empty string. It is dropped AFTER the
-        # isolated env is built because that env starts from os.environ, and
-        # a developer's shell may export the very variable a test is unsetting.
-        absent = {key for key, value in env.items() if value is None}
-        child_env = get_isolated_test_env(
-            overrides={key: value for key, value in env.items() if value is not None},
-            bin_dir=self.bin,
-        )
-        for key in absent:
-            child_env.pop(key, None)
+        child_env = self._child_env(env)
         return subprocess.run(
             ["bash", str(under_test)],
             capture_output=True,
@@ -279,12 +300,15 @@ class RevalidationTest(unittest.TestCase):
     def test_the_revalidated_log_line_shape_is_pinned(self):
         """Humans grep build logs for this line (and future collector support
         needs a stable line to key on); the word REVALIDATED and the reused
-        build id must appear together, and the Spyglass URL must follow."""
+        build id must appear together, a serial run names its one build with
+        no pull suffix, and the Spyglass URL must follow."""
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2)
-        self.assertRegex(
-            proc.stdout, r"Step 0: REVALIDATED against green build 200\b"
+        self.assertIn(
+            "Step 0: REVALIDATED against green build 200 -- skipping the eval matrix ===",
+            proc.stdout,
         )
+        self.assertEqual(proc.stdout.count("Step 0: REVALIDATED"), 1)
         self.assertIn(
             "Reused verdict: https://oss.gprow.dev/view/gs/kube-agents-prow/"
             f"pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/200",
@@ -518,6 +542,27 @@ class RevalidationTest(unittest.TestCase):
                 self.assertIn("VERDICT: FULL-RUN", proc.stdout)
                 self.assertIn("PULL_REFS is not <base_ref>:<PULL_BASE_SHA>", proc.stdout)
                 self.assertNotIn("holds a reusable verdict", proc.stdout)
+                # Refused before any SHA reached gsutil (the stub logs every
+                # call) or git (the fixture repo's only reader is the script).
+                self.assertFalse(self.call_log.exists(), "gsutil was called on a refused PULL_REFS")
+
+    def test_a_malformed_base_or_head_sha_is_a_full_run(self):
+        """PULL_BASE_SHA and PULL_PULL_SHA are held to 40-hex before they can
+        reach `git diff`, where a value shaped like an option would be taken
+        as one and an empty file list would read as an inert delta."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        cases = (
+            ("batch base", dict(self._batch_env([(_PR, self.c3)], "--output=/dev/null"), PULL_BASE_SHA="--output=/dev/null"), "PULL_BASE_SHA is not a 40-hex SHA"),
+            ("serial base", {"PULL_BASE_SHA": "--output=/dev/null"}, "PULL_BASE_SHA is not a 40-hex SHA"),
+            ("serial head", {"PULL_PULL_SHA": self.c3[:12]}, "PULL_NUMBER or PULL_PULL_SHA is not"),
+            ("serial number", {"PULL_NUMBER": "77; rm -rf /"}, "PULL_NUMBER or PULL_PULL_SHA is not"),
+        )
+        for name, overrides, reason in cases:
+            with self.subTest(name):
+                proc = self._run(cur_head=self.c4, cur_base=self.c2, env_overrides=overrides)
+                self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+                self.assertIn(reason, proc.stdout)
+                self.assertFalse(self.call_log.exists(), "gsutil was called on a malformed SHA")
 
     def test_a_started_json_entry_with_a_ref_suffix_is_read_the_same_way(self):
         """started.json's repos value is the same Refs.String() shape as
@@ -737,30 +782,29 @@ class RevalidationEntrypointTest(unittest.TestCase):
     _commit = RevalidationTest._commit
     _plant_history = RevalidationTest._plant_history
     _plant_statuses = RevalidationTest._plant_statuses
+    _NEUTRALISED = RevalidationTest._NEUTRALISED
+    _install_script = RevalidationTest._install_script
+    _base_env = RevalidationTest._base_env
+    _child_env = RevalidationTest._child_env
 
     def _execute(self, env_overrides):
-        copy = self.repo / "hack" / "ci-revalidate.sh"
-        copy.write_text(_CI_REVALIDATE.read_text(encoding="utf-8"))
-        env = {
-            "PULL_NUMBER": _PR,
-            "PULL_PULL_SHA": self.c3,
-            "PULL_BASE_SHA": self.c5,
-            "PULL_BASE_REF": "main",
-            "JOB_NAME": "",
-            "GSUTIL_OBJECT_DIR": str(self.objects),
-            "GSUTIL_LS_DIR": str(self.listings),
-            "GITHUB_STATUS_DIR": str(self.statuses),
-            "BENCH_GITHUB_TOKEN": "",
-        }
+        copy = self._install_script()
+        env = self._base_env(self.c3, self.c5)
         env.update(env_overrides)
-        absent = {key for key, value in env.items() if value is None}
-        child_env = get_isolated_test_env(
-            overrides={key: value for key, value in env.items() if value is not None},
-            bin_dir=self.bin,
-        )
-        for key in absent:
-            child_env.pop(key, None)
-        return subprocess.run(["bash", str(copy)], capture_output=True, text=True, env=child_env)
+        return subprocess.run(["bash", str(copy)], capture_output=True, text=True, env=self._child_env(env))
+
+    def test_executed_env_is_isolated_from_the_developers_shell(self):
+        """The shell the live validation used exports a batch's JOB_TYPE and
+        PULL_REFS, and an operator's may export the escape hatch; none may
+        reach the script under test, or the reuse test reds in exactly that
+        shell."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        leaked = {"JOB_TYPE": "batch", "PULL_REFS": f"main:{self.c1},{_PR}:{self.c3}", "EVAL_SKIP_REVALIDATION": "1"}
+        with unittest.mock.patch.dict(os.environ, leaked):
+            proc = self._execute({})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("escape hatch", proc.stdout)
+        self.assertNotIn("batch of", proc.stdout)
 
     def test_executed_a_reuse_exits_zero(self):
         self._plant_history([("200", True, self.c1, self.c3)])
