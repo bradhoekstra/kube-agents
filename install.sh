@@ -293,6 +293,10 @@ bootstrap_install_env() {
   # the environment and records it; a typed --scope-* flag still overrides
   # for one run and is warned about.
   unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  # The scoped service account pool's switch and cap for the same reason: an
+  # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
+  # accounts the next run from a clean shell deletes again.
+  unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
   # Checked before sourcing: a stray quote would otherwise abort the run through
   # the ERR trap with a bash parse error and no indication of which file.
   if ! bash -n "$file" 2>/dev/null; then

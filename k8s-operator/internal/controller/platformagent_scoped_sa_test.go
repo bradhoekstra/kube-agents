@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -25,6 +26,13 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	structuralschema "k8s.io/apiextensions-apiserver/pkg/apiserver/schema"
+	schemacel "k8s.io/apiextensions-apiserver/pkg/apiserver/schema/cel"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	celconfig "k8s.io/apiserver/pkg/apis/cel"
+	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -341,11 +349,95 @@ func TestAnArmedEmptyPoolIsRejectedAtAdmission(t *testing.T) {
 	// prettier folds the long rule and message across lines; the schema the
 	// API server loads is the unfolded string, so compare that.
 	rules := strings.Join(strings.Fields(block[1]), " ")
-	if !strings.Contains(rules, "!self.enabled") || !strings.Contains(rules, "size(self.serviceAccounts) > 0") {
+	if !strings.Contains(rules, "!has(self.enabled) || !self.enabled ||") || !strings.Contains(rules, "size(self.serviceAccounts) > 0") {
 		t.Errorf("the validation does not tie enabled to a non-empty list:\n%s", rules)
 	}
 	if !strings.Contains(rules, "scopedServiceAccountPool.enabled requires at least one serviceAccounts entry") {
 		t.Errorf("the refusal does not name the field and the fix:\n%s", rules)
+	}
+}
+
+// TestThePoolAdmissionRuleEvaluatesAsDocumented runs the pool's CEL rule
+// through the same validator the API server uses, over every shape a CR can
+// carry the block in. The substring test above pins the rule's text; this one
+// pins what the rule does, which is the part that went wrong: `enabled` has
+// `omitempty` and no default, so a block written without the key — the shape
+// an install that provisions the mapping before arming the pool produces —
+// has no `enabled` field for CEL to read, and `!self.enabled` fails with
+// `no such key: enabled` under the "armed pool" message instead of admitting.
+func TestThePoolAdmissionRuleEvaluatesAsDocumented(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(
+		"..", "..", "config", "crd", "bases", "kubeagents.x-k8s.io_platformagents.yaml",
+	))
+	if err != nil {
+		t.Fatalf("reading the generated CRD: %v", err)
+	}
+	var crd apiextensionsv1.CustomResourceDefinition
+	if err := yaml.Unmarshal(raw, &crd); err != nil {
+		t.Fatalf("parsing the generated CRD: %v", err)
+	}
+	var served *apiextensionsv1.JSONSchemaProps
+	for i := range crd.Spec.Versions {
+		if crd.Spec.Versions[i].Served && crd.Spec.Versions[i].Schema != nil {
+			served = crd.Spec.Versions[i].Schema.OpenAPIV3Schema
+			break
+		}
+	}
+	if served == nil {
+		t.Fatal("the CRD serves no version with a schema")
+	}
+	pool := served.Properties["spec"].Properties["security"].Properties["scopedServiceAccountPool"]
+	if len(pool.XValidations) == 0 {
+		t.Fatal("scopedServiceAccountPool carries no x-kubernetes-validations")
+	}
+	var internal apiextensions.JSONSchemaProps
+	if err := apiextensionsv1.Convert_v1_JSONSchemaProps_To_apiextensions_JSONSchemaProps(&pool, &internal, nil); err != nil {
+		t.Fatalf("converting the pool schema: %v", err)
+	}
+	structural, err := structuralschema.NewStructural(&internal)
+	if err != nil {
+		t.Fatalf("the pool schema is not structural: %v", err)
+	}
+	validator := schemacel.NewValidator(structural, true, celconfig.PerCallLimit)
+	if validator == nil {
+		t.Fatal("the pool schema compiled to no CEL validator")
+	}
+	fldPath := field.NewPath("spec", "security", "scopedServiceAccountPool")
+
+	member := map[string]interface{}{
+		"projectId":           "example-project",
+		"serviceAccountEmail": "ka-example-project-1a2b3c4d@example-project.iam.gserviceaccount.com",
+	}
+	const refusal = "requires at least one serviceAccounts entry"
+	cases := []struct {
+		name     string
+		obj      map[string]interface{}
+		admitted bool
+	}{
+		{"empty block", map[string]interface{}{}, true},
+		{"mapping only, empty", map[string]interface{}{"serviceAccounts": []interface{}{}}, true},
+		{"disarmed", map[string]interface{}{"enabled": false}, true},
+		{"disarmed with mapping", map[string]interface{}{"enabled": false, "serviceAccounts": []interface{}{member}}, true},
+		{"armed with mapping", map[string]interface{}{"enabled": true, "serviceAccounts": []interface{}{member}}, true},
+		{"armed, no mapping", map[string]interface{}{"enabled": true}, false},
+		{"armed, empty mapping", map[string]interface{}{"enabled": true, "serviceAccounts": []interface{}{}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs, _ := validator.Validate(context.Background(), fldPath, structural, tc.obj, nil, celconfig.RuntimeCELCostBudget)
+			if tc.admitted {
+				if len(errs) != 0 {
+					t.Errorf("admitted shape %v was refused: %v", tc.obj, errs.ToAggregate())
+				}
+				return
+			}
+			if len(errs) == 0 {
+				t.Fatalf("refused shape %v was admitted", tc.obj)
+			}
+			if got := errs.ToAggregate().Error(); !strings.Contains(got, refusal) {
+				t.Errorf("refusal does not name the fix: %s", got)
+			}
+		})
 	}
 }
 

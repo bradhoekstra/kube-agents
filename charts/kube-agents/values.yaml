@@ -805,7 +805,8 @@ platformAgent:
     # pool is provisioned, so a list that armed the broker by being non-empty
     # would arm every install that provisioned an account. Declaring a project
     # in platformAgent.scope arms nothing either. With `enabled: false` the
-    # list renders nothing and the broker runs on the agent's own identity,
+    # list still reaches the CR, declared and inert, the operator renders
+    # nothing from it, and the broker runs on the agent's own identity,
     # with CREDENTIAL_PROXY_SCOPED_SA_POOL=0 on its container so the mode an
     # install is in is readable from the Deployment; `enabled: true` renders
     # the mapping into the broker's ConfigMap and sets it to 1. Enabled with

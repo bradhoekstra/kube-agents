@@ -707,6 +707,23 @@ class InstallerCommonTest(unittest.TestCase):
             proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
             self.assertIn("P=from-the-file X=unset C=unset M=300", proc.stdout, proc.stderr)
 
+    def test_load_install_env_drops_a_shell_exported_pool_switch(self):
+        # Same rule as the scope keys: the pool's switch renders into the
+        # PlatformAgent and arms the broker, and a pre-change install.env
+        # records neither key, so an inherited SCOPED_SA_POOL_ENABLED=true
+        # would arm the pool for one upgrade.sh run on accounts the next run
+        # from a clean shell deletes again.
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = pathlib.Path(tmp) / "install.env"
+            env_file.write_text("PROJECT_ID=p\n")
+            stray = {"SCOPED_SA_POOL_ENABLED": "true", "SCOPED_SA_POOL_MAX_ACCOUNTS": "250"}
+            probe = 'echo "E=${SCOPED_SA_POOL_ENABLED:-unset} N=${SCOPED_SA_POOL_MAX_ACCOUNTS:-unset}"'
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("E=unset N=unset", proc.stdout, proc.stderr)
+            env_file.write_text("PROJECT_ID=p\nSCOPED_SA_POOL_ENABLED=false\nSCOPED_SA_POOL_MAX_ACCOUNTS=120\n")
+            proc = self._run(f'load_install_env "{env_file}"; {probe}', env=stray)
+            self.assertIn("E=false N=120", proc.stdout, proc.stderr)
+
     def test_service_account_ownership_still_refuses_on_a_clean_absence(self):
         proc = self._run(
             self._SHOW_REMEDY,

@@ -1261,12 +1261,17 @@ type EgressAllowlistSpec struct {
 // start on an empty pool, which is right — an armed pool with no members would
 // refuse every request — but the failure would be a crashloop several layers
 // from the field, so it is caught in `kubectl apply` instead.
-// +kubebuilder:validation:XValidation:rule="!self.enabled || (has(self.serviceAccounts) && size(self.serviceAccounts) > 0)",message="scopedServiceAccountPool.enabled requires at least one serviceAccounts entry; the broker refuses to start on an empty pool"
+//
+// The rule guards `has(self.enabled)` first: `omitempty` drops a false value
+// from the stored object, so a block written without the key has no `enabled`
+// for CEL to read and an unguarded `!self.enabled` fails with `no such key`.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.serviceAccounts) && size(self.serviceAccounts) > 0)",message="scopedServiceAccountPool.enabled requires at least one serviceAccounts entry; the broker refuses to start on an empty pool"
 type ScopedServiceAccountPoolSpec struct {
 	// Enabled arms the credential broker: with it true, every cluster read is
 	// made as the account its project maps to, and a project with no entry is
 	// refused. Default false, and it should stay false until the pool's
 	// accounts hold authority.
+	// +kubebuilder:default=false
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 

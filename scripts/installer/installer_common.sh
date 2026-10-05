@@ -546,6 +546,10 @@ load_install_env() {
   # shell would declare a project the file does not record, and the next run
   # from a clean shell would drop it again and retire its profiles.
   unset SCOPE_PROJECTS SCOPE_FOLDERS SCOPE_ORGANIZATIONS SCOPE_SHARED_VPC_HOSTS SCOPE_METRICS_SCOPES SCOPE_MAX_PROJECTS SCOPE_EXCLUDE_PROJECTS SCOPE_EXCLUDE_CLUSTERS
+  # The scoped service account pool's switch and cap for the same reason: an
+  # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
+  # accounts the next run from a clean shell deletes again.
+  unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.

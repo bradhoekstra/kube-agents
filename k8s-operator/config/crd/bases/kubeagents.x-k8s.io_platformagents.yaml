@@ -10760,6 +10760,7 @@ spec:
                         can be read off the Deployment rather than inferred from what is absent.
                       properties:
                         enabled:
+                          default: false
                           description: |-
                             Enabled arms the credential broker: with it true, every cluster read is
                             made as the account its project maps to, and a project with no entry is
@@ -10823,8 +10824,8 @@ spec:
                             one serviceAccounts entry; the broker refuses to start on
                             an empty pool
                           rule:
-                            "!self.enabled || (has(self.serviceAccounts) && size(self.serviceAccounts)
-                            > 0)"
+                            "!has(self.enabled) || !self.enabled || (has(self.serviceAccounts)
+                            && size(self.serviceAccounts) > 0)"
                     serviceAccountAnnotations:
                       additionalProperties:
                         type: string

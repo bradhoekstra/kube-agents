@@ -1,0 +1,178 @@
+"""The chart renders `spec.security.scopedServiceAccountPool` from
+`platformAgent.security.scopedServiceAccountPool`, in three states.
+
+The chart default (`enabled: false`, no members) renders no block: the CR the
+operator reads says "no pool" rather than carrying a present block with the
+switch off. A disabled block with members renders `enabled: false` and the
+members: the mapping is declared, visible in the CR, and inert, because
+`enabled` is the arming rule and the list alone arms nothing. `enabled: true`
+with no members fails the render, where the message reaches the person running
+the upgrade, rather than installing a CR the broker refuses to start on. The
+schema closes the pool and each member, so a misspelt key is named rather than
+dropped. The text-structural tests run everywhere; the render tests need a helm
+binary, which the agent-startup job lacks.
+
+Run: python3 -m unittest discover -s tests -p 'test_chart_scoped_pool_block.py' -v
+"""
+
+import json
+import pathlib
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+import yaml
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_CHART = _REPO_ROOT / "charts" / "kube-agents"
+_TEMPLATE = _CHART / "templates" / "platform-agent-cr.yaml"
+_REQUIRED = [
+    "--set", "platformAgent.harness.clusterName=ci-cluster",
+    "--set", "platformAgent.harness.location=us-central1",
+    "--set", "platformAgent.harness.projectId=ci-project",
+]
+_VALUE_PATH = "platformAgent.security.scopedServiceAccountPool"
+_FAIL_MESSAGE = "requires at least one serviceAccounts entry"
+
+# Deliberately not in alphabetical order, so a render that sorted the list
+# would fail the verbatim comparison.
+MEMBERS = [
+    {"projectId": "payments-prod",
+     "serviceAccountEmail": "ka-payments-prod-1a2b3c4d@host-project.iam.gserviceaccount.com"},
+    {"projectId": "billing-staging",
+     "serviceAccountEmail": "ka-billing-staging-5e6f7a8b@host-project.iam.gserviceaccount.com"},
+    {"projectId": "analytics-dev",
+     "serviceAccountEmail": "ka-analytics-dev-9c0d1e2f@host-project.iam.gserviceaccount.com"},
+]
+
+
+class ScopedPoolBlockShapeTest(unittest.TestCase):
+    """What the template says, readable without helm."""
+
+    def setUp(self):
+        self.template = _TEMPLATE.read_text()
+
+    def test_the_block_is_gated_on_armed_or_populated_and_not_on_with(self):
+        # `with` on the whole value would render the default's `enabled: false`
+        # as a present block; the gate has to read both keys.
+        block = re.search(r"\{\{- \$pool := \.Values\.platformAgent\.security\.scopedServiceAccountPool \| default dict \}\}\n(.*?)scopedServiceAccountPool:\n",
+                          self.template, re.DOTALL)
+        self.assertIsNotNone(block, "the scoped pool block is missing from the CR template")
+        self.assertIn("{{- if or $pool.enabled $pool.serviceAccounts }}", block.group(1))
+        self.assertNotIn("compactFields", block.group(1))
+
+    def test_an_armed_empty_pool_fails_the_render_by_name(self):
+        guard = re.search(r'\{\{- if and \$pool\.enabled \(not \$pool\.serviceAccounts\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}',
+                          self.template)
+        self.assertIsNotNone(guard, "the armed-but-empty guard is missing from the CR template")
+        self.assertIn(_VALUE_PATH + ".enabled", guard.group(1))
+        self.assertIn(_FAIL_MESSAGE, guard.group(1))
+
+    def test_the_switch_defaults_to_false_in_the_rendered_block(self):
+        self.assertIn("enabled: {{ $pool.enabled | default false }}", self.template)
+
+    def test_the_chart_default_is_disabled_with_no_members(self):
+        values = yaml.safe_load((_CHART / "values.yaml").read_text())
+        pool = values["platformAgent"]["security"]["scopedServiceAccountPool"]
+        self.assertEqual(pool, {"enabled": False, "serviceAccounts": []})
+
+    def test_the_schema_closes_the_pool_and_each_member(self):
+        schema = json.loads((_CHART / "values.schema.json").read_text())
+        pool = schema["properties"]["platformAgent"]["properties"]["security"]["properties"]["scopedServiceAccountPool"]
+        self.assertIs(pool["additionalProperties"], False)
+        self.assertEqual(set(pool["properties"]), {"enabled", "serviceAccounts"})
+        member = pool["properties"]["serviceAccounts"]["items"]
+        self.assertIs(member["additionalProperties"], False)
+        self.assertEqual(set(member["properties"]), {"projectId", "serviceAccountEmail"})
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class ScopedPoolBlockRenderTest(unittest.TestCase):
+    def _render(self, *extra):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *extra,
+             "--show-only", "templates/platform-agent-cr.yaml"],
+            capture_output=True, text=True,
+        )
+        return proc
+
+    def _pool_of(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for document in yaml.safe_load_all(proc.stdout):
+            if isinstance(document, dict) and document.get("kind") == "PlatformAgent":
+                return document["spec"]["security"].get("scopedServiceAccountPool", "ABSENT")
+        self.fail("no PlatformAgent in the render")
+
+    def _values_file(self, pool):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
+        yaml.safe_dump({"platformAgent": {"security": {"scopedServiceAccountPool": pool}}}, handle)
+        handle.close()
+        self.addCleanup(pathlib.Path(handle.name).unlink)
+        return handle.name
+
+    def test_the_default_renders_no_block(self):
+        self.assertEqual(self._pool_of(self._render()), "ABSENT")
+
+    def test_disabled_with_no_members_renders_no_block_however_it_is_spelt(self):
+        # The default written out by hand, and the list set to null, both
+        # coalesce to the same "nothing declared" and render no block.
+        for args in (["-f", self._values_file({"enabled": False, "serviceAccounts": []})],
+                     ["--set-json", f"{_VALUE_PATH}.serviceAccounts=null"],
+                     ["--set-json", f"{_VALUE_PATH}=null"]):
+            with self.subTest(args=args):
+                self.assertEqual(self._pool_of(self._render(*args)), "ABSENT")
+
+    def test_disabled_with_members_renders_the_switch_off_and_the_members(self):
+        rendered = self._pool_of(self._render("-f", self._values_file({"enabled": False, "serviceAccounts": MEMBERS})))
+        self.assertEqual(rendered, {"enabled": False, "serviceAccounts": MEMBERS})
+
+    def test_armed_with_members_renders_the_switch_on_and_the_rows_verbatim_in_order(self):
+        rendered = self._pool_of(self._render("-f", self._values_file({"enabled": True, "serviceAccounts": MEMBERS})))
+        self.assertIs(rendered["enabled"], True)
+        self.assertEqual(rendered["serviceAccounts"], MEMBERS)
+        self.assertEqual([row["projectId"] for row in rendered["serviceAccounts"]],
+                         [row["projectId"] for row in MEMBERS])
+        self.assertEqual(set(rendered), {"enabled", "serviceAccounts"})
+
+    def test_armed_with_no_members_fails_the_render(self):
+        # Against the chart default's empty list, and with the list set to
+        # null, which deletes the key: both are an armed pool with nothing in it.
+        for args in (["--set", f"{_VALUE_PATH}.enabled=true"],
+                     ["--set", f"{_VALUE_PATH}.enabled=true",
+                      "--set-json", f"{_VALUE_PATH}.serviceAccounts=null"],
+                     ["-f", self._values_file({"enabled": True, "serviceAccounts": []})]):
+            with self.subTest(args=args):
+                proc = self._render(*args)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(_FAIL_MESSAGE, proc.stderr)
+                self.assertIn(_VALUE_PATH, proc.stderr)
+
+    def test_members_without_the_switch_render_the_switch_off(self):
+        # Through the chart default, and with the key deleted outright, so the
+        # template's own `default false` is what is under test, not values.yaml.
+        members_only = ["-f", self._values_file({"serviceAccounts": MEMBERS})]
+        for args in (members_only,
+                     [*members_only, "--set-json", f"{_VALUE_PATH}.enabled=null"]):
+            with self.subTest(args=args):
+                rendered = self._pool_of(self._render(*args))
+                self.assertEqual(rendered, {"enabled": False, "serviceAccounts": MEMBERS})
+
+    def test_an_unknown_key_is_refused_by_the_schema(self):
+        # A key the CRD does not have is a mistake the schema names rather
+        # than drops, under the pool and under a member alike.
+        for args in (["--set", f"{_VALUE_PATH}.hostProject=host-project"],
+                     ["--set-json", f"{_VALUE_PATH}.serviceAccounts=" + json.dumps(
+                         [{**MEMBERS[0], "role": "roles/container.viewer"}])]):
+            with self.subTest(args=args):
+                proc = self._render(*args)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn("scopedServiceAccountPool", proc.stderr)
+
+    def test_a_non_boolean_switch_is_refused_by_the_schema(self):
+        # `--set ...enabled=yes` is a string, which the CRD would reject at
+        # apply; the schema refuses it at render.
+        proc = self._render("--set-string", f"{_VALUE_PATH}.enabled=yes")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("enabled", proc.stderr)
