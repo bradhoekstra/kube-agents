@@ -1,23 +1,24 @@
-"""Tests for step 0 of hack/ci-eval-pr.sh: self-revalidation against green history.
+"""Tests for step 0 of the smoke-test presubmit: hack/ci-revalidate.sh.
 
 Step 0 may skip the whole eval matrix, so the property that matters most is
-that it fails CLOSED: the ONLY path that exits early is a prior green build of
-this PR's own job plus head- and base-deltas that both match the inert-path
-list. Everything else -- no history, unreadable or unparsable records, a
-commit the checkout does not have, a single non-inert file on either side,
-the escape hatch -- must fall through to a full run.
+that it fails CLOSED: the ONLY paths that exit early are a prior green build
+of this PR's own job at THIS head (whatever main has done since), or one at
+an earlier head plus head- and base-deltas that both match the inert-path
+list -- and in a batch, one of those for EVERY pull. Everything else -- no
+history, unreadable or unparsable records, a commit the checkout does not
+have, a single non-inert file on either side, one pull of a batch without a
+verdict, the escape hatch -- must fall through to a full run.
 
-The function and its constants are extracted from the script and executed
-with `gsutil` stubbed and a fixture git repository standing in for the
-decorated checkout, so these assertions are against the code that ships. The
-REVALIDATED log line's shape is pinned because humans grep build logs for it,
-and so that any future dashboard-collector support has a stable line to key
-on (scripts/eval_dashboard/collect.py reads nothing from it today).
+The script is copied into a fixture checkout and sourced, then executed with
+`gsutil` and `curl` stubbed and the fixture git repository standing in for
+the decorated checkout, so these assertions are against the code that ships.
+The REVALIDATED log line's shape is pinned because humans grep build logs for
+it, and so that any future dashboard-collector support has a stable line to
+key on (scripts/eval_dashboard/collect.py reads nothing from it today).
 """
 
 import json
 import pathlib
-import re
 import subprocess
 import tempfile
 import unittest
@@ -26,8 +27,10 @@ from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
+_CI_REVALIDATE = _REPO_ROOT / "hack" / "ci-revalidate.sh"
 
 _PR = "77"
+_OTHER_PR = "78"
 _JOB = "pull-kube-agents-smoke-test"
 
 # Printed by the script under test before the lifted constants read JOB_NAME,
@@ -40,18 +43,22 @@ _JOB_NAME_SET = "JOB_NAME: set"
 _JOB_NAME_ABSENT = "JOB_NAME: absent"
 
 _GSUTIL_STUB = """#!/usr/bin/env bash
-# gsutil stub: `ls` prints the fixture listing (or fails like a no-match
-# glob), `cat` serves "<build>.<file>" out of GSUTIL_OBJECT_DIR. Every call
-# is appended to GSUTIL_CALL_LOG so a test can pin WHICH history the script
-# read -- reading another PR's (or another job's) records would reuse a
-# foreign verdict while every content assertion still passed.
+# gsutil stub: `ls` prints the fixture listing for the PR named in the glob
+# (GSUTIL_LS_DIR/<pr>.txt, else GSUTIL_LS_FILE, else it fails like a
+# no-match glob), `cat` serves "<build>.<file>" out of GSUTIL_OBJECT_DIR.
+# Every call is appended to GSUTIL_CALL_LOG so a test can pin WHICH history
+# the script read -- reading another PR's (or another job's) records would
+# reuse a foreign verdict while every content assertion still passed.
 cmd="$1"; shift
 if [ -n "${GSUTIL_CALL_LOG:-}" ]; then
   echo "${cmd} $*" >> "${GSUTIL_CALL_LOG}"
 fi
 case "${cmd}" in
   ls)
-    if [ -n "${GSUTIL_LS_FILE:-}" ] && [ -f "${GSUTIL_LS_FILE}" ]; then
+    pr="$(printf '%s' "$1" | sed -n 's|.*/gke-labs_kube-agents/\\([0-9]*\\)/.*|\\1|p')"
+    if [ -n "${GSUTIL_LS_DIR:-}" ] && [ -f "${GSUTIL_LS_DIR}/${pr}.txt" ]; then
+      cat "${GSUTIL_LS_DIR}/${pr}.txt"
+    elif [ -n "${GSUTIL_LS_FILE:-}" ] && [ -f "${GSUTIL_LS_FILE}" ]; then
       cat "${GSUTIL_LS_FILE}"
     else
       echo "CommandException: One or more URLs matched no objects." >&2
@@ -86,20 +93,6 @@ fi
 """
 
 
-def _extract(pattern, what):
-    text = _CI_EVAL_PR.read_text(encoding="utf-8")
-    match = re.search(pattern, text, re.S | re.M)
-    assert match, f"could not find {what} in hack/ci-eval-pr.sh"
-    return match.group(0)
-
-
-def _extract_constants():
-    text = _CI_EVAL_PR.read_text(encoding="utf-8")
-    lines = re.findall(r"^readonly REVALIDATION_\w+=.*$", text, re.M)
-    assert lines, "no readonly REVALIDATION_* constants in hack/ci-eval-pr.sh"
-    return "\n".join(lines)
-
-
 class RevalidationTest(unittest.TestCase):
     maxDiff = None
 
@@ -120,6 +113,8 @@ class RevalidationTest(unittest.TestCase):
         self.objects.mkdir()
         self.statuses = self.tmp / "statuses"
         self.statuses.mkdir()
+        self.listings = self.tmp / "listings"
+        self.listings.mkdir()
 
         # The fixture checkout. A linear chain is enough: deltas are plain
         # `git diff A B`, so each scenario just picks its four SHAs.
@@ -165,19 +160,21 @@ class RevalidationTest(unittest.TestCase):
         )
         return out.stdout.strip()
 
-    def _plant_history(self, builds, attest=True):
+    def _plant_history(self, builds, attest=True, pr=_PR):
         """builds: [(build_id, passed, base_sha, head_sha)], any record None to omit.
 
         With attest=True (the default), each green build also gets the
         Prow-posted GitHub success status event the script demands; a test
         that plants a "green" GCS record WITHOUT one is modelling the forged
-        record kube-agents-bot's review described.
+        record kube-agents-bot's review described. The listing is written
+        per pull request, which is what lets a batch test plant two
+        histories the stub serves by the PR number in the glob.
         """
         listing = []
         status_events = {}
         for build_id, passed, base_sha, head_sha in builds:
             listing.append(
-                f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build_id}/finished.json"
+                f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}/finished.json"
             )
             if passed is not None:
                 revision = f', "revision": "{head_sha}"' if head_sha else ""
@@ -188,42 +185,41 @@ class RevalidationTest(unittest.TestCase):
             if base_sha is not None:
                 (self.objects / f"{build_id}.started.json").write_text(
                     '{"repos": {"gke-labs/kube-agents": "main:%s,%s:%s"}}'
-                    % (base_sha, _PR, head_sha)
+                    % (base_sha, pr, head_sha)
                 )
             if attest and passed and head_sha:
                 status_events.setdefault(head_sha, []).append(
                     {
                         "context": _JOB,
                         "state": "success",
-                        "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build_id}",
+                        "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/{build_id}",
                     }
                 )
         for head_sha, events in status_events.items():
             self._plant_statuses(head_sha, events)
-        ls_file = self.tmp / "ls.txt"
+        ls_file = self.listings / f"{pr}.txt"
         ls_file.write_text("\n".join(listing) + "\n")
         return ls_file
 
     def _plant_statuses(self, head_sha, events):
-        (self.statuses / f"{head_sha}.json").write_text(json.dumps(events))
+        # Append-only, like GitHub's: two histories (a batch's two pulls)
+        # attesting builds at the same head both keep their events.
+        path = self.statuses / f"{head_sha}.json"
+        existing = json.loads(path.read_text()) if path.exists() else []
+        path.write_text(json.dumps(existing + events))
 
     def _run(self, cur_head, cur_base, ls_file=None, env_overrides=None):
-        # Written into the fixture repo's hack/ so the function's own
+        # The shipped script, copied into the fixture repo's hack/ so its own
         # BASH_SOURCE-derived repo_dir points at the fixture checkout, the
-        # same way it points at the real one in the pod.
+        # same way it points at the real one in the pod; sourced rather than
+        # executed so the wrapper can name the verdict it took.
+        copy = self.repo / "hack" / "ci-revalidate.sh"
+        copy.write_text(_CI_REVALIDATE.read_text(encoding="utf-8"))
         script = "\n".join(
             [
                 "set -euo pipefail",
                 _JOB_NAME_PROBE,
-                _extract_constants(),
-                _extract(
-                    r"^_revalidation_print_delta\(\) \{ # <label> <range> <files-or-empty>\n.*?^\}$",
-                    "_revalidation_print_delta",
-                ),
-                _extract(
-                    r"^revalidate_against_green_history\(\) \{\n.*?^\}$",
-                    "revalidate_against_green_history",
-                ),
+                f'source "{copy}"',
                 "if revalidate_against_green_history; then",
                 '  echo "VERDICT: REVALIDATED-EXIT"',
                 "  exit 0",
@@ -242,7 +238,12 @@ class RevalidationTest(unittest.TestCase):
             # Unset in the pod that is not this job; a developer's shell may
             # carry one, and the default is what these fixtures name.
             "JOB_NAME": "",
+            # Prow's for a batch; absent from a serial presubmit's env here so
+            # the serial tests prove PULL_NUMBER alone selects that path.
+            "JOB_TYPE": None,
+            "PULL_REFS": None,
             "GSUTIL_OBJECT_DIR": str(self.objects),
+            "GSUTIL_LS_DIR": str(self.listings),
             "GSUTIL_CALL_LOG": str(self.call_log),
             "GITHUB_STATUS_DIR": str(self.statuses),
             "BENCH_GITHUB_TOKEN": "",
@@ -349,13 +350,185 @@ class RevalidationTest(unittest.TestCase):
                 self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
                 self.assertIn(f"Attested by the Prow-posted {_JOB} success status", proc.stdout)
 
-    def test_identical_shas_are_trivially_inert(self):
-        """An empty delta means that side's tree is byte-identical to the one
+    def test_an_identical_base_is_trivially_inert(self):
+        """An empty base delta means main's tree is byte-identical to the one
         the green verdict graded -- reuse is correct, not an edge case."""
-        ls = self._plant_history([("200", True, self.c2, self.c4)])
+        ls = self._plant_history([("200", True, self.c2, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertIn("trivially inert", proc.stdout)
+
+    # ── the same head passes whatever main did ──────────────────────────────
+
+    def test_a_green_at_this_head_is_reused_whatever_main_did_since(self):
+        """The retest Tide starts because main moved, serial or batch: the
+        base delta c1..c5 touches code.py, which the inert rule would refuse,
+        and the same-head rule does not look at it."""
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"Step 0: REVALIDATED against green build 200\b")
+        self.assertIn("this head already passed", proc.stdout)
+        self.assertIn(f"base {self.c1} then, {self.c5} now", proc.stdout)
+        self.assertNotIn("code.py", proc.stdout)
+
+    def test_a_green_at_this_head_behind_a_newer_green_elsewhere_is_still_found(self):
+        """A force-push back to an earlier head: the newest green (300) is at
+        c5, and c5..c3 touches code.py, so the inert rule would run full;
+        the older green at this very head (200) is the one to reuse."""
+        ls = self._plant_history(
+            [("300", True, self.c1, self.c5), ("200", True, self.c1, self.c3)]
+        )
+        proc = self._run(cur_head=self.c3, cur_base=self.c2, ls_file=ls)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+        self.assertIn("this head already passed", proc.stdout)
+
+    def test_the_same_head_rule_still_demands_the_attestation(self):
+        """Same head or not, a GCS record with no Prow-posted success status
+        on that head is the forged record, and runs full."""
+        ls = self._plant_history([("200", True, self.c1, self.c3)], attest=False)
+        self._plant_statuses(self.c3, [])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
+    def test_a_red_at_this_head_newer_than_its_green_is_overridden(self):
+        """The newest GREEN wins, as for inert pushes: a later red at the same
+        head is flake or infrastructure by construction."""
+        ls = self._plant_history(
+            [("300", False, self.c5, self.c3), ("200", True, self.c1, self.c3)]
+        )
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+
+    # ── a batch is revalidated pull by pull ──────────────────────────────────
+
+    def _batch_env(self, pulls, cur_base):
+        refs = f"main:{cur_base}," + ",".join(f"{pr}:{sha}" for pr, sha in pulls)
+        return {
+            "PULL_NUMBER": None,
+            "PULL_PULL_SHA": None,
+            "JOB_TYPE": "batch",
+            "PULL_REFS": refs,
+        }
+
+    def test_a_batch_whose_every_pull_is_green_at_its_head_is_reused(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("400", True, self.c2, self.c4)], pr=_OTHER_PR)
+        proc = self._run(
+            cur_head="",
+            cur_base=self.c5,
+            env_overrides=self._batch_env([(_PR, self.c3), (_OTHER_PR, self.c4)], self.c5),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertIn("batch of 2 pull requests", proc.stdout)
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 400\b")
+        calls = self.call_log.read_text().splitlines()
+        for pr in (_PR, _OTHER_PR):
+            self.assertIn(
+                f"ls gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/{_JOB}/*/finished.json",
+                calls,
+            )
+
+    def test_a_batch_runs_full_when_one_pull_has_no_verdict(self):
+        """The second pull's only green is at an older head with a non-inert
+        head delta (c3..c5 touches code.py), so the whole batch runs."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("400", True, self.c1, self.c3)], pr=_OTHER_PR)
+        proc = self._run(
+            cur_head="",
+            cur_base=self.c2,
+            env_overrides=self._batch_env([(_PR, self.c3), (_OTHER_PR, self.c5)], self.c2),
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("files outside REVALIDATION_INERT_PATHS", proc.stdout)
+        self.assertIn("code.py", proc.stdout)
+
+    def test_a_batch_runs_full_when_one_pull_has_no_history(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head="",
+            cur_base=self.c5,
+            env_overrides=self._batch_env([(_PR, self.c3), (_OTHER_PR, self.c4)], self.c5),
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn(f"no finished {_JOB} build for PR #{_OTHER_PR}", proc.stdout)
+
+    def test_a_malformed_pull_refs_is_a_full_run(self):
+        """A PULL_REFS whose entries are not <number>:<40-hex> is a full run
+        before any SHA reaches gsutil or git -- a short SHA, a base alone, a
+        non-numeric number."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        for refs in (
+            f"main:{self.c5}",
+            f"main:{self.c5},{_PR}:{self.c3[:12]}",
+            f"main:{self.c5},pr:{self.c3}",
+            f"main:{self.c5},{_PR}:{self.c3}; rm -rf /",
+        ):
+            with self.subTest(refs=refs):
+                proc = self._run(
+                    cur_head="",
+                    cur_base=self.c5,
+                    env_overrides={
+                        "PULL_NUMBER": None,
+                        "PULL_PULL_SHA": None,
+                        "JOB_TYPE": "batch",
+                        "PULL_REFS": refs,
+                    },
+                )
+                self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+                self.assertIn("PULL_REFS does not name the batch's pulls", proc.stdout)
+
+    def test_a_started_json_entry_with_a_ref_suffix_is_read_the_same_way(self):
+        """started.json's repos value is the same Refs.String() shape as
+        PULL_REFS, so a ":<ref>" third field there must not turn the head
+        into "<sha>:<ref>" and fail the 40-hex check as a malformed SHA."""
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        (self.objects / "200.started.json").write_text(
+            '{"repos": {"gke-labs/kube-agents": "main:%s,%s:%s:refs/heads/topic"}}'
+            % (self.c1, _PR, self.c3)
+        )
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, ls_file=ls)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertNotIn("malformed SHA", proc.stdout)
+
+    def test_a_batch_entry_with_a_ref_suffix_is_accepted(self):
+        """Prow appends ":<ref>" to a pull entry when it knows the branch."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head="",
+            cur_base=self.c5,
+            env_overrides={
+                "PULL_NUMBER": None,
+                "PULL_PULL_SHA": None,
+                "JOB_TYPE": "batch",
+                "PULL_REFS": f"main:{self.c5},{_PR}:{self.c3}:refs/heads/topic",
+            },
+        )
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+
+    def test_pull_refs_without_the_batch_job_type_is_not_a_batch(self):
+        """A serial presubmit also carries PULL_REFS; only JOB_TYPE=batch
+        turns it into the list of pulls, and a serial env missing its own
+        PULL_NUMBER stays a full run."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head="",
+            cur_base=self.c5,
+            env_overrides={
+                "PULL_NUMBER": None,
+                "PULL_PULL_SHA": None,
+                "JOB_TYPE": "presubmit",
+                "PULL_REFS": f"main:{self.c5},{_PR}:{self.c3}",
+            },
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("not a decorated Prow presubmit or batch", proc.stdout)
 
     def test_the_newest_green_wins_and_the_sort_is_numeric(self):
         """Build 90 sorts after 1000 lexicographically; picking it here would
@@ -412,8 +585,10 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("code.py", proc.stdout)
 
     def test_a_non_inert_file_in_the_base_delta_is_a_full_run(self):
-        # Head side identical; main moved c1 -> c5, which touches code.py.
-        ls = self._plant_history([("200", True, self.c1, self.c4)])
+        # Head side inert (c3 -> c4 adds docs/b.md); main moved c1 -> c5,
+        # which touches code.py. Only a NEW head reaches the base-delta rule:
+        # the same head is reused whatever main did, tested above.
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c5, ls_file=ls)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("code.py", proc.stdout)
@@ -517,12 +692,66 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("not a decorated Prow presubmit", proc.stdout)
 
 
+class RevalidationEntrypointTest(unittest.TestCase):
+    """The executed script, not the sourced function: both callers (the Prow
+    job ahead of the lease, and hack/ci-eval-pr.sh) read only its exit code,
+    so the tail that maps the function's verdict onto it is what ships.
+    Borrows the fixture above without inheriting its tests."""
+
+    setUp = RevalidationTest.setUp
+    _git = RevalidationTest._git
+    _commit = RevalidationTest._commit
+    _plant_history = RevalidationTest._plant_history
+    _plant_statuses = RevalidationTest._plant_statuses
+
+    def _execute(self, env_overrides):
+        copy = self.repo / "hack" / "ci-revalidate.sh"
+        copy.write_text(_CI_REVALIDATE.read_text(encoding="utf-8"))
+        env = {
+            "PULL_NUMBER": _PR,
+            "PULL_PULL_SHA": self.c3,
+            "PULL_BASE_SHA": self.c5,
+            "PULL_BASE_REF": "main",
+            "JOB_NAME": "",
+            "GSUTIL_OBJECT_DIR": str(self.objects),
+            "GSUTIL_LS_DIR": str(self.listings),
+            "GITHUB_STATUS_DIR": str(self.statuses),
+            "BENCH_GITHUB_TOKEN": "",
+        }
+        env.update(env_overrides)
+        absent = {key for key, value in env.items() if value is None}
+        child_env = get_isolated_test_env(
+            overrides={key: value for key, value in env.items() if value is not None},
+            bin_dir=self.bin,
+        )
+        for key in absent:
+            child_env.pop(key, None)
+        return subprocess.run(["bash", str(copy)], capture_output=True, text=True, env=child_env)
+
+    def test_executed_a_reuse_exits_zero(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._execute({})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+
+    def test_executed_a_fall_through_exits_one_with_one_reason_line(self):
+        for name, overrides in (
+            ("no history", {}),
+            ("escape hatch", {"EVAL_SKIP_REVALIDATION": "1"}),
+            ("no Prow env", {"PULL_NUMBER": None, "PULL_PULL_SHA": None, "PULL_BASE_SHA": None}),
+        ):
+            with self.subTest(name):
+                proc = self._execute(overrides)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(proc.stdout.count("Step 0: full run:"), 1, proc.stdout)
+
+
 class RevalidationPlacementTest(unittest.TestCase):
     def test_step0_runs_before_anything_expensive_or_stateful(self):
         """The whole point is exiting before cluster work; a later invocation
         would pay for auth, fleet kubeconfigs and token mints first."""
         text = _CI_EVAL_PR.read_text(encoding="utf-8")
-        invocation = text.index("if revalidate_against_green_history; then")
+        invocation = text.index('if bash "${REVALIDATION_SCRIPT}"; then')
         self.assertLess(invocation, text.index('source "${SCRIPT_DIR}/ci-env.sh"'))
         self.assertLess(invocation, text.index("gcloud container clusters get-credentials"))
         self.assertLess(invocation, text.index("trap profile_and_dump_on_exit EXIT"))
