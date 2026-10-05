@@ -72,12 +72,14 @@ not a size per executable, because every route can end up running the heavy case
 | ----------------------------------------------------------------------- | ------------------------------------------------------------------------- |
 | `gcloud`, directly or on a `kubectl`'s cold path                        | 101 to 102 MiB per process; 102 MiB per request across eight listings     |
 | `kubectl` with the auth plugin's `gcloud config config-helper` under it | 48 plus 71 MiB                                                            |
-| `git` followed by the forge refresh helper                              | the helper is Python and runs `gcloud auth print-identity-token` and `gh` |
+| the forge credential helper, then `git`                                 | the helper is Python and runs `gcloud auth print-identity-token` and `gh` |
 
-The last row is why there is no cheaper class for `git`: the vcs verbs, the content-workspace
-`open`, `commit` and `push`, and the forge refresh route all reach `refresh_forge_credential`,
-whose helper (`github_token_refresh.py`) spawns a `gcloud` whenever a credential file is
-configured or the metadata server yields no token, and `gh` always. The reserve is sized for the
+The last row is why there is no cheaper class for `git`: the vcs verbs and the forge refresh
+route reach `refresh_forge_credential`, and the content-workspace `open` and `commit` reach
+`mint_read_credential` for a context repository, and both run the same helper
+(`github_token_refresh.py`), which spawns a `gcloud` whenever a credential file is configured or
+the metadata server yields no token, and `gh` always. On `open` that helper runs before the
+clone; `push` runs no credential call. The reserve is sized for the
 tree a request spawns, not for one process: `gcloud` starts short-lived `gcloud` children of its
 own, which is why the sampler saw twelve processes for eight requests, and the figure that
 matters is the 102 MiB per request the eight listings summed to. The margin to 128 MiB covers
@@ -99,18 +101,38 @@ Where each route reserves, and why there:
 - The exec and vcs routes reserve where they take their slot. On the vcs route that is before
   the body is read, so the route's existing handling of a refusal, including its body drain,
   applies unchanged.
-- The forge refresh route takes no slot today and reserves at its start, before the helper runs.
+- The forge refresh route takes no slot today, and most of its calls spawn nothing:
+  `refresh_forge_credential` returns from its cache when the repository is in the last refresh's
+  scoped set and that refresh is inside `FORGE_REFRESH_COALESCE_SECONDS`, which is the common
+  case for the sandbox `gh` wrapper and the fleet-audit skill, both of which call it before every
+  credentialed step. So the route reads the coalesce cache first, without the refresh lock, and
+  reserves only when a refresh looks needed; then it takes `_refresh_lock`, repeats the coalesce
+  check under it as the function does today, releases the reservation and returns if a
+  concurrent refresh has made it unnecessary, and otherwise runs the helper under the
+  reservation. A cache hit never waits for the budget, and the refresh lock is never held across
+  a budget wait; a second refresher does hold a reservation while it waits for the lock, for the
+  seconds the running helper takes. Called from inside a vcs or content-workspace request, the
+  function runs under that request's reservation and takes none.
 - The content-workspace verbs that spawn (`open`, `grep`, `commit`, `push`) reserve after taking
-  the store's lock and before their first `git`. After the lock, not before: a reservation taken
-  before it would be held for as long as the verb queues behind a clone or push, which the store
-  says is minutes, by a verb running nothing. Before the first `git`, so a refusal leaves no
-  sequence half done. A wait under the store lock delays the other workspace verbs by up to the
-  bound, which is within what the lock already does to them during any clone. The verbs that
-  spawn nothing (`read`, `read_many`, `list`, `close`) reserve nothing. A slot-less request joins
-  the same arrival-order queue as a slot taker and leaves it when it holds its reservation.
-- The cold path reserves nothing of its own: it runs under its `kubectl` request's reservation.
-  Nothing waits for admission under `_kubeconfig_lock`, so `_execute`'s docstring (no lock is ever
-  held while waiting for admission) stays true for it.
+  the store's lock and before the verb's first spawn, which on `open` is the credential mint, not
+  the clone. After the lock, not before: a reservation taken before it would be held for as long
+  as the verb queues behind a clone or push, which the store says is minutes, by a verb running
+  nothing. Before the first spawn, so a refusal leaves no sequence half done. The verbs that spawn
+  nothing (`read`, `read_many`, `list`, `close`) reserve nothing. A slot-less request joins the
+  same arrival-order queue as a slot taker and leaves it when it holds its reservation.
+
+  This reverses a decision the store records: its rationale for taking no slot says a wait while
+  holding its lock would stall every verb behind it, reads included, for the whole of the wait.
+  That is what happens here, for up to the bound, and only when four reservations are already
+  held, which on an install that sweeps is the listing burst, seconds every half hour. The
+  alternative, reserving before the lock, costs the budget 128 MiB per verb queued behind a
+  clone for minutes, up to the store's eight open workspaces, which is a standing cost against a
+  rare stall. The store comment, and the two broker docstrings that say no lock is held while
+  waiting for admission and that the content workspace's git takes no slot, change with the
+  code (§2.6).
+
+- The cold path reserves nothing of its own: it runs under its `kubectl` request's reservation,
+  so nothing waits for admission under `_kubeconfig_lock`.
 
 Two spawns stay outside the budget on purpose: the one-off bootstrap command at startup, which
 runs before the broker serves, and the `git config` read of a repository alias, which is a few
@@ -253,9 +275,12 @@ bullet that explains the busy 503 by the concurrency cap alone, and the agent-su
 consequence that says the two caps together are what the memory limit is sized against and quotes
 the slot message; the site's troubleshooting entry for the busy 503, which quotes the slot
 message and says eight long-running commands may hold slots, where four will hold the budget;
-and the operator's three sizing comments, beside the Resources constants, beside the env block
+the operator's three sizing comments, beside the Resources constants, beside the env block
 (which still names a 256Mi request) and in the sizing test, all of which say the children are
-outside the arithmetic. The docs map's identifier-sources table gains a row for the constants
+outside the arithmetic; and the three locking statements §2.1 reverses or extends: `_execute`'s
+docstring (no lock is held while waiting for a slot), `request_slot`'s docstring (the content
+workspace's git takes no slot because the store's lock serialises it), and the store's own
+rationale for taking none. The docs map's identifier-sources table gains a row for the constants
 that have to agree between the broker and the Go test (the resident reserve, the per-request
 reserve and the output copies).
 
@@ -295,8 +320,9 @@ still waiting at the bound raises `CommandSlotUnavailable` naming the budget, an
 content-workspace and forge refresh routes each answer it with the existing 503 body, the vcs
 route before reading its body; the output term is charged for slots in use, not the cap; a
 `kubectl` request's cold-path `gcloud`s spawn under the request's reservation and take no second
-one; a content-workspace `commit` reserves after the store lock and before its first `git`, and
-a `read` reserves nothing; a spawn on a thread with no reservation takes a transient one; the
+one; a content-workspace `open` reserves after the store lock and before the credential mint, a
+`commit` before its first spawn, and a `read` reserves nothing; a forge refresh that coalesces
+reserves nothing and one that runs the helper reserves before taking the refresh lock; a spawn on a thread with no reservation takes a transient one; the
 degenerate case admits and logs once; a reservation is released with its slot, including after a
 timed-out command and a caller hang-up; an executor constructed without a limit has no budget
 whatever the process's cgroup says.
