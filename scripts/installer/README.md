@@ -300,7 +300,11 @@ Shared VPC host, which the composition enables in the apply that follows the pla
 So before an `install.sh` apply that carries a selector, `enable_scope_selector_apis` lists the
 project's enabled APIs and enables whichever of the ones the declared selectors read is off, as
 gcloud's active account, like the KMS enablement beside it: nothing is called when they are on, which is every re-run and Day-2 apply of an existing install, and a failure is a
-warning, since the plan reports a disabled API with the same command as its remedy. The
+warning, since the plan reports a disabled API with the same command as its remedy. The scoped
+service account pool armed beside a folder or organisation (`SCOPED_SA_POOL_ENABLED` true with
+`SCOPE_FOLDERS` or `SCOPE_ORGANIZATIONS` set) counts as a third selector kind there: the plan
+lists the container's members for the pool through `cloudasset.googleapis.com`, so it is enabled
+first the same way, with the pool's listing named as the reason. The
 generate-only handoff prints the command above the apply, `install.sh --dry-run` skips its plan
 with the command while an API a declared selector reads is off (a dry run enables nothing, and its plan would
 otherwise be refused for a reason the real run does not have), and `upgrade.sh` does none of it,
@@ -332,9 +336,11 @@ hand is reported like any hand edit until the key records it.
 `SCOPED_SA_POOL_ENABLED` and `SCOPED_SA_POOL_MAX_ACCOUNTS` are the scoped service account pool,
 derived from the same scope: with the switch on, the IAM module provisions one reader service
 account in the management project per project the plan lists (the management project,
-`SCOPE_PROJECTS` less an exact `SCOPE_EXCLUDE_PROJECTS` entry, and each selector's members; a
-folder's or organisation's members are not listed at plan time yet, so a cluster under a declared
-container is refused while the pool is armed), and the chart renders the mapping into the CR as
+`SCOPE_PROJECTS` less an exact `SCOPE_EXCLUDE_PROJECTS` entry, each selector's members, and,
+while the pool is armed, each declared folder's or organisation's members, which the plan lists
+through the Asset API `enable_scope_selector_apis` turns on first and which get their accounts on
+that apply; a project created under the container since lags to the next apply, while the
+container-level grant and the reconcile's discovery of it stay zero-touch), and the chart renders the mapping into the CR as
 `spec.security.scopedServiceAccountPool` with `enabled` set from the same key, so declaring
 projects arms nothing on its own. Members carry the install's identity in their description
 (`Pool member of <PLATFORM_AGENT_GSA_NAME> for projects/<id>`), and `check_service_account_ownership`

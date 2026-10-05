@@ -262,8 +262,11 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
 
     def test_the_http_provider_is_required_and_no_lookup_is_made_without_a_selector(self):
         self.assertIn('source  = "hashicorp/http"', self.versions)
-        self.assertIn("count = local.scope_resolves_selectors ? 1 : 0", self._data("google_client_config", "scope_resolver"))
+        # The token is fetched when a selector is declared or a container is
+        # listed for the pool, and never otherwise.
+        self.assertIn("count = local.scope_reads_apis ? 1 : 0", self._data("google_client_config", "scope_resolver"))
         self.assertIn("scope_resolves_selectors = length(local.scope_shared_vpc_hosts) + length(local.scope_metrics_scopes) > 0", self.resolver_tf)
+        self.assertIn("scope_reads_apis = local.scope_resolves_selectors || length(local.scope_listed_containers) > 0", self.resolver_tf)
 
     def test_a_failed_read_fails_the_plan_and_a_non_host_resolves_to_nothing(self):
         host = self._data("http", "scope_shared_vpc_host")
@@ -308,8 +311,8 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("scope => [for member in named : member if can(regex(local.scope_project_id_pattern, member))]", self.resolver_tf)
         self.assertIn("scope_selector_uncarriable = merge(local.scope_shared_vpc_uncarriable, local.scope_metrics_scope_uncarriable)", self.resolver_tf)
         self.assertIn('check "selector_members_the_scope_can_carry"', self.resolver_tf)
-        self.assertIn("condition     = length(local.scope_selector_uncarriable) == 0", self.resolver_tf)
-        self.assertIn("value       = local.scope_selector_uncarriable", (_RESOLVER / "outputs.tf").read_text())
+        self.assertIn("condition     = length(local.scope_uncarriable) == 0", self.resolver_tf)
+        self.assertIn("value       = local.scope_uncarriable", (_RESOLVER / "outputs.tf").read_text())
 
     def test_the_members_reach_the_one_project_binding_with_the_lookup_projects_and_less_an_exact_exclude(self):
         self.assertIn("scope_bound_projects = setunion(local.scope_projects, local.scope_selector_projects)", self.scope_tf)
@@ -578,14 +581,22 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         # module output or a local derived from either makes an input unknown
         # on a first install, and the for_each keyed on it fails the plan.
         inputs = re.findall(r"^\s*(\w+)\s*=\s*(.+?)\s*$", body, re.MULTILINE)
-        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "exclude_projects", "quota_project", "member_cap"})
+        self.assertEqual({key for key, _ in inputs}, {"source", "shared_vpc_hosts", "metrics_scopes", "folders", "organizations", "list_container_members", "exclude_projects", "quota_project", "member_cap"})
         self.assertIn(("member_cap", "var.scope.max_projects"), inputs)
+        # The containers' members are listed for the scoped service account
+        # pool alone (design §6): the resolver reads a container only while
+        # the pool is armed, and the IAM module takes what it listed as data,
+        # like the selectors' members.
+        self.assertIn(("folders", "var.scope.folders"), inputs)
+        self.assertIn(("organizations", "var.scope.organizations"), inputs)
+        self.assertIn(("list_container_members", "var.scoped_pool_enabled"), inputs)
         for key, value in inputs:
             if key != "source":
                 with self.subTest(input=key):
                     self.assertRegex(value, r"^var\.[A-Za-z0-9_.]+$", f"{key} is fed {value}, not a variable")
         iam = re.search(r'module "kube_agents_iam" \{(.*?)\n\}', self.main_tf, re.DOTALL).group(1)
         self.assertIn("scope_selector_members = module.scope_resolver.members", iam)
+        self.assertIn("scope_container_members = module.scope_resolver.container_members", iam)
         self.assertIn("depends_on = [google_project_service.required, module.gke_cluster]", iam)
 
     def test_the_chart_gets_the_same_object_with_the_crds_keys(self):

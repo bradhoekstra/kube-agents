@@ -635,13 +635,22 @@ the snapshot's `containers` array uses.
 
 `scoped_pool_enabled` arms the scoped service account pool from the same `scope` object: the
 IAM module provisions one reader service account in `project_id` per project the plan listed
-(the management project, `scope.projects` less an exact `exclude.projects` entry, and each
-selector's members; a folder's or organisation's members are not listed at plan time yet, so a
-cluster under a declared container is refused while the pool is armed), keyed on the project id,
+(the management project, `scope.projects` less an exact `exclude.projects` entry, each
+selector's members, and each declared folder's and organisation's members, which the resolver
+lists at plan time with the reconcile's own Cloud Asset Inventory search while the pool is armed
+and never while it is off), keyed on the project id,
 and the chart renders the mapping into the CR as `spec.security.scopedServiceAccountPool` with
 `enabled` set from the same variable, so the broker is armed by this switch alone and never by
 declaring projects. Two clusters in one project share an account by design
 ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6).
+A container's member gets a pool account on that apply and nothing else: its grant is the
+container's, inherited, and it is not counted toward `scope.max_projects`. Pool membership under a
+container therefore lags where the grant and discovery do not: a project created beneath a declared
+folder since the last apply is discovered and readable, but refused by the broker until the next
+apply lists it. Listing needs `cloudasset.googleapis.com` on in `project_id` before the first plan
+that arms the pool beside a container, which `install.sh` enables, and
+`roles/cloudasset.viewer` on the container for the planning identity. An exact `exclude.projects`
+entry drops a member from the pool; a glob is the reconcile's alone.
 `scoped_pool_max_accounts` bounds how many the plan may create and refuses a pool past it at plan;
 its default of 100 is GCP's default service-account quota, which the agent's own accounts share, so
 set it to the headroom the project has free rather than leaving a large pool at the default. Off by default, and it should stay off

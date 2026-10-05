@@ -3708,6 +3708,73 @@ class ScopeSelectorApisTest(unittest.TestCase):
         self.assertIn("WARN: Could not enable cloudresourcemanager.googleapis.com in project 'test-project'", proc.stdout)
         self.assertIn("gcloud services enable cloudresourcemanager.googleapis.com --project=test-project", proc.stdout)
 
+    # The scoped service account pool lists a declared folder's or
+    # organisation's members at plan time through the Asset API, which the
+    # composition enables only in the apply that follows, so the pool armed
+    # beside a container is the third reason the plan needs an API on first.
+    POOL_REASON = "lists the declared folder's or organisation's members for the scoped service account pool"
+
+    def test_the_pool_armed_beside_a_container_enables_the_asset_api_and_names_the_pool(self):
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"},
+                     {"SCOPED_SA_POOL_ENABLED": "yes", "SCOPE_ORGANIZATIONS": "987654321098"},
+                     {"SCOPED_SA_POOL_ENABLED": "True", "SCOPE_FOLDERS": " 123456789012, 123456789013 "}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "services enable cloudasset.googleapis.com --project=test-project\n")
+                self.assertIn("INFO: Enabling cloudasset.googleapis.com in project 'test-project'", proc.stdout)
+                self.assertIn(self.POOL_REASON, proc.stdout)
+                self.assertNotIn("Shared VPC host", proc.stdout)
+
+    def test_the_pool_armed_beside_a_container_and_a_selector_enables_both_and_names_both(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012",
+                                 "SCOPE_SHARED_VPC_HOSTS": "shared-net-host"}, enabled="monitoring.googleapis.com")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "services enable compute.googleapis.com cloudasset.googleapis.com --project=test-project\n")
+        self.assertIn("INFO: Enabling compute.googleapis.com, cloudasset.googleapis.com in project 'test-project'", proc.stdout)
+        self.assertIn("Shared VPC host or Metrics Scope", proc.stdout)
+        self.assertIn(self.POOL_REASON, proc.stdout)
+
+    def test_the_pool_armed_beside_a_container_with_the_asset_api_on_calls_nothing(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"},
+                                enabled="cloudasset.googleapis.com")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "")
+        self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_listing_that_fails_with_the_pool_armed_beside_a_container_enables_the_asset_api(self):
+        proc, calls = self._run({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": "123456789012"}, list_fails=True)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertEqual(calls, "services enable cloudasset.googleapis.com --project=test-project\n")
+        self.assertIn("could not be listed", proc.stdout)
+        self.assertIn(self.POOL_REASON, proc.stdout)
+
+    def test_the_pool_armed_without_a_container_calls_nothing(self):
+        # Explicit projects and selector members need no Asset read: the
+        # resolver lists a selector through its own API, and a project is
+        # named already.
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_PROJECTS": "p2-project"},
+                     {"SCOPED_SA_POOL_ENABLED": "true"},
+                     {"SCOPED_SA_POOL_ENABLED": "true", "SCOPE_FOLDERS": " , "}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "")
+                self.assertNotIn("INFO", proc.stdout)
+
+    def test_a_container_with_the_pool_off_calls_nothing(self):
+        # The composition enables the Asset API for the reconcile's container
+        # search in the apply; the plan reads nothing under a container unless
+        # the pool is armed, so there is nothing to enable first.
+        for keys in ({"SCOPED_SA_POOL_ENABLED": "false", "SCOPE_FOLDERS": "123456789012"},
+                     {"SCOPED_SA_POOL_ENABLED": "", "SCOPE_ORGANIZATIONS": "987654321098"},
+                     {"SCOPE_FOLDERS": "123456789012", "SCOPE_ORGANIZATIONS": "987654321098"}):
+            with self.subTest(keys=keys):
+                proc, calls = self._run(keys, list_fails=True)
+                self.assertIn("rc=0", proc.stdout, proc.stderr)
+                self.assertEqual(calls, "")
+                self.assertNotIn("INFO", proc.stdout)
+
 
 class ScopeContainerPreflightTest(unittest.TestCase):
     """check_scope_container_access: silent with no container; with one, the
