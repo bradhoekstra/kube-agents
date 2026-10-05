@@ -626,7 +626,14 @@ that predates the field: `helm upgrade` does not apply `crds/`, and an older
 CRD would admit the CR with the block pruned, leaving the broker on the agent's
 own identity while the release record says armed, so the chart looks the CRD
 up and fails the render until `kubectl apply --server-side -f
-charts/kube-agents/crds/` has run. See the site's
+charts/kube-agents/crds/` has run. One retired key is tolerated for a
+release: every release the composition applied before the pool moved to
+projects recorded `platformAgent.security.scopedServiceAccounts: []`, and a
+harness- or operator-mode retag re-applies the recorded values over this
+chart after checking them against its schema, so the schema admits that key
+only as an empty list, which renders nothing, and refuses a populated one by
+name — that was a pool armed under the old per-cluster field, and the install
+takes `--upgrade-mode=full` so `install.env` renders the new one. See the site's
 [security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
 for what the pool does and does not bound.
 

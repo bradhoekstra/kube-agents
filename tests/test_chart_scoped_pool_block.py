@@ -215,6 +215,25 @@ class ScopedPoolBlockRenderTest(unittest.TestCase):
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn("scopedServiceAccountPool", proc.stderr)
 
+    def test_the_retired_per_cluster_key_is_tolerated_empty_and_refused_populated(self):
+        # Every release the composition applied before the pool moved to
+        # projects recorded `platformAgent.security.scopedServiceAccounts: []`,
+        # and a harness- or operator-mode retag re-applies the recorded values
+        # over this chart after checking them against the schema. The empty
+        # list is therefore admitted for one release and renders nothing, so
+        # the first retag after the move is the no-op it was before; a
+        # populated list was a pool armed under the old field, and that
+        # install takes a full upgrade, so the schema refuses it by name.
+        empty = self._render("--set-json", "platformAgent.security.scopedServiceAccounts=[]")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertNotIn("scopedServiceAccounts", empty.stdout)
+        self.assertNotIn("scopedServiceAccountPool", empty.stdout)
+        populated = self._render("--set-json", "platformAgent.security.scopedServiceAccounts=" + json.dumps(
+            [{"projectId": "p", "location": "l", "clusterName": "c",
+              "serviceAccountEmail": "ka-c-12345678@p.iam.gserviceaccount.com"}]))
+        self.assertNotEqual(populated.returncode, 0)
+        self.assertIn("scopedServiceAccounts", populated.stderr)
+
     def test_a_non_boolean_switch_is_refused_by_the_schema(self):
         # `--set ...enabled=yes` is a string, which the CRD would reject at
         # apply; the schema refuses it at render.
