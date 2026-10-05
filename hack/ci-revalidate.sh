@@ -145,7 +145,11 @@ _revalidation_print_delta() { # <label> <range> <files-or-empty>
 # revalidate_one_pull <number> <head-sha> <base-sha>
 # Returns 0 when the pull request's own green history holds a verdict this
 # run could only repeat, 1 for a full run. Every fall-through path logs
-# exactly one "Step 0: full run:" line naming its reason.
+# exactly one "Step 0: full run:" line naming its reason. A reuse logs the
+# pull's record and appends "<build> (PR #n)" to REVALIDATION_REUSED; the
+# job-level REVALIDATED banner is the caller's, printed only once every pull
+# has one -- a batch whose later pull falls through must not carry a line
+# saying the matrix was skipped.
 revalidate_one_pull() {
   local pull_number="$1" cur_head="$2" cur_base="$3"
   local repo_dir
@@ -172,21 +176,29 @@ revalidate_one_pull() {
   # earlier head), so the scan does not stop at the first green unless it is
   # this head's. finished.json's revision is the head a build ran at, and is
   # held to started.json's below for whichever build is chosen.
-  local build prev_green="" finished candidate_finished candidate_revision
+  # One parse per candidate: it yields "passed <revision>" or nothing, and the
+  # chosen build's revision is kept for the started.json check below.
+  local build prev_green="" finished_revision="" candidate_parsed candidate_revision
   while read -r build; do
     [ -n "${build}" ] || continue
-    candidate_finished="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null)" || continue
-    if ! printf '%s' "${candidate_finished}" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("passed") is True else 1)' 2>/dev/null; then
-      continue
-    fi
+    candidate_parsed="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null | python3 -c '
+import json
+import sys
+
+record = json.load(sys.stdin)
+if record.get("passed") is True:
+    print("passed", record.get("revision") or "")
+' 2>/dev/null)" || candidate_parsed=""
+    [ "${candidate_parsed%% *}" = "passed" ] || continue
+    candidate_revision="${candidate_parsed#passed}"
+    candidate_revision="${candidate_revision# }"
     if [ -z "${prev_green}" ]; then
       prev_green="${build}"
-      finished="${candidate_finished}"
+      finished_revision="${candidate_revision}"
     fi
-    candidate_revision="$(printf '%s' "${candidate_finished}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision") or "")' 2>/dev/null)" || candidate_revision=""
     if [ "${candidate_revision}" = "${cur_head}" ]; then
       prev_green="${build}"
-      finished="${candidate_finished}"
+      finished_revision="${candidate_revision}"
       break
     fi
   done <<EOF_REVALIDATION_CANDIDATES
@@ -241,8 +253,6 @@ print(base, head)
       return 1
     fi
   done
-  local finished_revision
-  finished_revision="$(printf '%s' "${finished}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision") or "")' 2>/dev/null)" || finished_revision=""
   if [ "${finished_revision}" != "${prev_head}" ]; then
     echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
     return 1
@@ -277,10 +287,11 @@ sys.exit(1)
   # away. No git work is needed: the attested record names the head, and
   # the head is this run's.
   if [ "${prev_head}" = "${cur_head}" ]; then
-    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- this head already passed, skipping the eval matrix ==="
+    echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- this head already passed"
     echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
     echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
     echo "Same head ${cur_head}; base ${prev_base} then, ${cur_base} now -- a head that passed once passes"
+    REVALIDATION_REUSED+=("${prev_green} (PR #${pull_number})")
     return 0
   fi
 
@@ -323,12 +334,13 @@ sys.exit(1)
     return 1
   fi
 
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- every change since is inert, skipping the eval matrix ==="
+  echo "PR #${pull_number} holds a reusable verdict: green build ${prev_green} -- every change since is inert"
   echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
   echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
   _revalidation_print_delta "head delta" "${prev_head}..${cur_head}" "${head_delta}"
   _revalidation_print_delta "base delta" "${prev_base}..${cur_base}" "${base_delta}"
   echo "Predicate: every file above matches REVALIDATION_INERT_PATHS ${REVALIDATION_INERT_PATHS}"
+  REVALIDATION_REUSED+=("${prev_green} (PR #${pull_number})")
   return 0
 }
 
@@ -360,23 +372,27 @@ revalidate_against_green_history() {
   if [ -n "${PULL_NUMBER:-}" ] && [ -n "${PULL_PULL_SHA:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
     pulls="${PULL_NUMBER} ${PULL_PULL_SHA}"
   elif [ "${JOB_TYPE:-}" = "${REVALIDATION_BATCH_JOB_TYPE}" ] && [ -n "${PULL_REFS:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
-    # Every entry after the first must be "<number>:<40-hex>[:<ref>]"; the
-    # SHAs are checked here, before anything reads them, for the same reason
-    # the recovered ones are. Anything else is a full run, not a guess.
+    # The first entry must be the base, "<base_ref>:<PULL_BASE_SHA>" -- held
+    # to that, not assumed, so a pull in that slot is refused rather than
+    # dropped unread -- and every entry after it "<number>:<40-hex>[:<ref>]";
+    # the SHAs are checked here, before anything reads them, for the same
+    # reason the recovered ones are. Anything else is a full run, not a guess.
     if ! pulls="$(printf '%s' "${PULL_REFS}" | python3 -c '
 import re
 import sys
 
-entries = sys.stdin.read().split(",")[1:]
-if not entries:
+base_ref, base_sha = sys.argv[1], sys.argv[2]
+entries = sys.stdin.read().split(",")
+head = entries[0].split(":")
+if len(head) != 2 or head[0] != base_ref or head[1] != base_sha or len(entries) < 2:
     raise SystemExit(1)
-for entry in entries:
+for entry in entries[1:]:
     fields = entry.split(":")
     if len(fields) < 2 or not re.fullmatch(r"[0-9]+", fields[0]) or not re.fullmatch(r"[0-9a-f]{40}", fields[1]):
         raise SystemExit(1)
     print(fields[0], fields[1])
-' 2>/dev/null)"; then
-      echo "Step 0: full run: PULL_REFS does not name the batch's pulls as <number>:<sha> entries (${PULL_REFS})"
+' "${PULL_BASE_REF:-${REVALIDATION_DEFAULT_BASE_REF}}" "${PULL_BASE_SHA}" 2>/dev/null)"; then
+      echo "Step 0: full run: PULL_REFS is not <base_ref>:<PULL_BASE_SHA> followed by the batch's pulls as <number>:<sha> entries (${PULL_REFS})"
       return 1
     fi
     echo "Step 0: batch of $(printf '%s\n' "${pulls}" | wc -l | tr -d ' ') pull requests; every one must hold a reusable verdict"
@@ -385,6 +401,7 @@ for entry in entries:
     return 1
   fi
 
+  REVALIDATION_REUSED=()
   local number head
   while read -r number head; do
     [ -n "${number}" ] || continue
@@ -392,6 +409,16 @@ for entry in entries:
   done <<EOF_REVALIDATION_PULLS
 ${pulls}
 EOF_REVALIDATION_PULLS
+  # The one line humans grep for and a collector may key on, so it appears
+  # only when every pull holds a verdict and the exit is 0. Serial: one
+  # build. Batch: one per pull, in PULL_REFS order.
+  local reused
+  reused="$(printf '%s, ' "${REVALIDATION_REUSED[@]}")"
+  reused="${reused%, }"
+  if [ "${#REVALIDATION_REUSED[@]}" -eq 1 ]; then
+    reused="${reused%% (PR #*}"
+  fi
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${reused} -- skipping the eval matrix ==="
   return 0
 }
 

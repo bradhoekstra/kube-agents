@@ -426,8 +426,14 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertIn("batch of 2 pull requests", proc.stdout)
-        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
-        self.assertRegex(proc.stdout, r"REVALIDATED against green build 400\b")
+        self.assertIn(f"PR #{_PR} holds a reusable verdict: green build 200", proc.stdout)
+        self.assertIn(f"PR #{_OTHER_PR} holds a reusable verdict: green build 400", proc.stdout)
+        # One banner for the job, after both pulls, naming both builds.
+        self.assertRegex(
+            proc.stdout,
+            rf"Step 0: REVALIDATED against green build 200 \(PR #{_PR}\), 400 \(PR #{_OTHER_PR}\) -- skipping",
+        )
+        self.assertEqual(proc.stdout.count("Step 0: REVALIDATED"), 1)
         calls = self.call_log.read_text().splitlines()
         for pr in (_PR, _OTHER_PR):
             self.assertIn(
@@ -458,6 +464,11 @@ class RevalidationTest(unittest.TestCase):
         )
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn(f"no finished {_JOB} build for PR #{_OTHER_PR}", proc.stdout)
+        # The first pull's verdict is reported, but the job-level banner that
+        # says the matrix is skipped must not appear in a log of a run that
+        # then ran it: humans and collectors key on that line.
+        self.assertIn(f"PR #{_PR} holds a reusable verdict: green build 200", proc.stdout)
+        self.assertNotIn("REVALIDATED", proc.stdout)
 
     def test_a_malformed_pull_refs_is_a_full_run(self):
         """A PULL_REFS whose entries are not <number>:<40-hex> is a full run
@@ -469,6 +480,11 @@ class RevalidationTest(unittest.TestCase):
             f"main:{self.c5},{_PR}:{self.c3[:12]}",
             f"main:{self.c5},pr:{self.c3}",
             f"main:{self.c5},{_PR}:{self.c3}; rm -rf /",
+            # A pull in the base's slot is refused, not dropped unread.
+            f"{_PR}:{self.c3},{_OTHER_PR}:{self.c4}",
+            # The base entry must be PULL_BASE_SHA under PULL_BASE_REF.
+            f"main:{self.c4},{_PR}:{self.c3}",
+            f"release/0.8:{self.c5},{_PR}:{self.c3}",
         ):
             with self.subTest(refs=refs):
                 proc = self._run(
@@ -482,7 +498,8 @@ class RevalidationTest(unittest.TestCase):
                     },
                 )
                 self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-                self.assertIn("PULL_REFS does not name the batch's pulls", proc.stdout)
+                self.assertIn("PULL_REFS is not <base_ref>:<PULL_BASE_SHA>", proc.stdout)
+                self.assertNotIn("holds a reusable verdict", proc.stdout)
 
     def test_a_started_json_entry_with_a_ref_suffix_is_read_the_same_way(self):
         """started.json's repos value is the same Refs.String() shape as
