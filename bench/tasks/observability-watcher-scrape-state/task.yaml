@@ -64,19 +64,21 @@ verification_spec:
   # The route: the worker read a PodMonitoring off the install, with `get` or
   # `describe`, in any letter case -- not the CRD that defines the kind, and not
   # a `kubectl auth can-i get podmonitoring` permission probe, which names the
-  # resource without reading it. A match anywhere in a command, since the worker
-  # may chain it behind cd or
-  # pipe it into a reader; worker_commands reads the card log's one-line
-  # rendering and sees terminal commands only, so a read through an MCP tool is
-  # invisible to it. The skill's step spells the kubectl command and every
-  # recorded run used it.
+  # resource without reading it. kubectl has to be the command invoked, not text
+  # quoted inside another -- a `grep`/`echo` of the command string reads nothing
+  # -- so the pattern anchors it to the start of a shell segment (the line start
+  # or after `;`, `&`, `|`, `(`, `$(`), behind an optional env-assignment, `sudo`
+  # or `timeout`, which still admits `cd x && kubectl ...` or `kubectl ... | yq`.
+  # worker_commands reads the card log's one-line rendering and sees terminal
+  # commands only, so a read through an MCP tool is invisible to it. The skill's
+  # step spells the kubectl command and every recorded run used it.
   - name: the-worker-read-the-podmonitoring
     role: objective
     mode: assert
     check:
       type: worker_commands
       required_patterns:
-        - '(?i)\bkubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
+        - '(?i)(?:^|[\n;&|(]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*|sudo|timeout[ \t]+[^\s;&|]+)[ \t]+)*kubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
   # The final answer names the mechanism, the port and one of the two proving
   # series. `mode: assert` because the final message is immutable once the run
   # ends; polling a failed phrase would only wait out the timeout. The required
