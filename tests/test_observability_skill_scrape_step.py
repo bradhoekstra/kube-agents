@@ -23,6 +23,7 @@ Run:
 
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -47,9 +48,12 @@ WATCHER_PORT = "9095"
 WATCHER_SERIES = 'up{job="<name>-gateway-monitoring"}'
 WATCHER_UP = "k8s_event_watcher_cluster_up"
 # The #2141 bug, reverted: the Deployment-annotation read must not come back into
-# the step. The operator renders no such annotation, so any form of this command
-# in step 1 is the regression.
-DEPLOYMENT_READ = "kubectl get deployment"
+# the step. The operator renders no such annotation, so any `kubectl get`/
+# `describe` of a deployment in step 1 is the regression, in any spelling
+# (`deployment`, `deployments`, `deploy`). Matched as a command, so the prose
+# that names the Deployment only to say the agent must not read it ("not off
+# Deployment annotations") does not trip it.
+DEPLOYMENT_READ = re.compile(r"(?i)kubectl\s+(get|describe)\s+deploy")
 
 
 def _read(path: Path) -> str:
@@ -74,9 +78,9 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
 
     def test_step_one_does_not_send_the_agent_to_the_deployment_annotations(self):
         step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
-        self.assertNotIn(
-            DEPLOYMENT_READ,
+        self.assertNotRegex(
             step,
+            DEPLOYMENT_READ,
             "step 1 sends the agent back to the Deployment for scrape annotations (the #2141 regression)",
         )
 
