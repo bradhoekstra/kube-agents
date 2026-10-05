@@ -74,17 +74,24 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - '(?i)\bkubectl\b[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\bcrds?\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
+        - '(?i)\bkubectl\b[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
   # The final answer names the mechanism, the port and one of the two proving
   # series. `mode: assert` because the final message is immutable once the run
-  # ends; polling a failed phrase would only wait out the timeout. The any_of
-  # series carries the polarity: an answer quotes up{job=...} or
-  # k8s_event_watcher_cluster_up only after querying Cloud Monitoring, which the
-  # bug's annotation-only path never does, so an answer built on the Deployment's
-  # missing annotations lacks the series and fails here. A forbidden "not
-  # scraped" pattern was tried and dropped: a thorough, correct answer notes the
-  # credential-proxy PodMonitoring is not scraped on a one-monitor cluster while
-  # the watcher is, and the pattern rejected that answer.
+  # ends; polling a failed phrase would only wait out the timeout. The required
+  # phrases are the skill's own vocabulary, so the any_of series raises the bar:
+  # a worker cites up{job=...} or k8s_event_watcher_cluster_up only after it has
+  # queried Cloud Monitoring for them. What these checks do NOT carry is
+  # polarity. A thorough negative answer that queried the series and found it
+  # empty ("up{job=...} returned nothing, 9095 is not scraped") quotes the same
+  # phrases and passes, so a green here means the worker read the PodMonitoring
+  # and queried the series, not that the install is scraped. A forbidden_patterns
+  # entry anchored on the watcher would add the polarity but was dropped: it
+  # false-reds the correct answer that notes the credential-proxy PodMonitoring
+  # is unscraped on a one-monitor cluster while the watcher is, and the correct
+  # negative on any install whose chart renders no gateway PodMonitoring (not
+  # known for the CI pool). The skill regression this case is built around --
+  # step 1 reading scrape annotations off the Deployment -- is guarded model-free
+  # by tests/test_observability_skill_scrape_step.py instead.
   - name: the-answer-names-the-podmonitoring-the-listener-and-the-proof
     role: objective
     mode: assert
