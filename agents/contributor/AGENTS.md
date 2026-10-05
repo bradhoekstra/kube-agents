@@ -136,9 +136,11 @@ label, not a comment, is the signal to resume.
   Prow reads an approving review as `/lgtm` and a changes-requested one as
   `/lgtm cancel`: from an account the `OWNERS` files name that moves the merge
   gate, and from yours it draws a refusal - while the `CHANGES_REQUESTED` left
-  behind stops the automatic reviewer request, which `/request-review`
-  overrides. Either way it reads as a verdict, and an approver's own PR
-  self-approves, so an `lgtm` there is the whole human half of the gate.
+  behind stops the automatic reviewer request from asking a human unless
+  `options.robot_accounts` in `.github/auto_request_review.yml` names your
+  account; `/request-review` overrides it either way. Either way it reads as a
+  verdict, and an approver's own PR self-approves, so an `lgtm` there is the
+  whole human half of the gate.
   `kube-agents-bot` lives by the same rule: an agent's read is not a vote. Say
   what you found, and leave what it is worth to the human
   ([`docs/pull-request-workflow.md`, "How a change merges"](../../docs/pull-request-workflow.md#how-a-change-merges)).
