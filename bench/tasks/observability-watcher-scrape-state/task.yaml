@@ -67,8 +67,21 @@ verification_spec:
   # resource without reading it. kubectl has to be the command invoked, not text
   # quoted inside another -- a `grep`/`echo` of the command string reads nothing
   # -- so the pattern anchors it to the start of a shell segment (the line start
-  # or after `;`, `&`, `|`, `(`, `$(`), behind an optional env-assignment, `sudo`
-  # or `timeout`, which still admits `cd x && kubectl ...` or `kubectl ... | yq`.
+  # or after `;`, `&`, `|`, `(`, `$(`) and refuses a segment that opens a quote
+  # (a single quote, double quote or backtick) before kubectl. Before kubectl it
+  # then admits any run of non-separator, non-quote characters and an optional
+  # path, so a wrapper -- `env`, `time`, `sudo -E`, `timeout -k 5 30`,
+  # `xargs ... kubectl`, a loop's `do kubectl`, an `if kubectl`, `/usr/bin/kubectl`
+  # -- does not hide it, and `cd x && kubectl ...` / `kubectl ... | yq` still
+  # read. The noun must be a bare argument: preceded by a space, tab or comma and
+  # followed by one or the segment end, so a `kind=PodMonitoring` selector or a
+  # `-o yaml > gateway-podmonitoring.yaml` redirect, where the noun is glued to
+  # `=`, `/` or `-`, is not a read. Two false-greens have no single-line regex
+  # fix and stand: a bare `echo kubectl get podmonitoring`, and a shell
+  # metacharacter inside a quoted string that opens a false segment
+  # (`-m "note; kubectl get podmonitoring"`); both are contrived against the
+  # recorded runs. The pattern's whole corpus is pinned in
+  # bench/tests/test_observability_watcher_scrape_patterns.py.
   # worker_commands reads the card log's one-line rendering and sees terminal
   # commands only, so a read through an MCP tool is invisible to it. The skill's
   # step spells the kubectl command and every recorded run used it.
@@ -78,24 +91,20 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - '(?i)(?:^|[\n;&|(]|\$\()[ \t]*(?:(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|]*|sudo|timeout[ \t]+[^\s;&|]+)[ \t]+)*kubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*\bpodmonitorings?(\.monitoring\.googleapis\.com)?\b'
+        - '(?i)(?:^|[\n;&|(]|\$\()[ \t]*(?:[^\n;&|()''"`]*[ \t])?(?:[^\s;&|()''"`]*/)?kubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*[ \t,]podmonitorings?(\.monitoring\.googleapis\.com)?(?=[ \t,/]|$)'
   # The final answer names the mechanism, the port and one of the two proving
   # series. `mode: assert` because the final message is immutable once the run
   # ends; polling a failed phrase would only wait out the timeout. The required
   # phrases are the skill's own vocabulary, so the any_of series raises the bar:
   # a worker cites up{job=...} or k8s_event_watcher_cluster_up only after it has
-  # queried Cloud Monitoring for them. What these checks do NOT carry is
-  # polarity. A thorough negative answer that queried the series and found it
-  # empty ("up{job=...} returned nothing, 9095 is not scraped") quotes the same
-  # phrases and passes, so a green here means the worker read the PodMonitoring
-  # and queried the series, not that the install is scraped. A forbidden_patterns
-  # entry anchored on the watcher would add the polarity but was dropped: it
-  # false-reds the correct answer that notes the credential-proxy PodMonitoring
-  # is unscraped on a one-monitor cluster while the watcher is, and the correct
-  # negative on any install whose chart renders no gateway PodMonitoring (not
-  # known for the CI pool). The skill regression this case is built around --
-  # step 1 reading scrape annotations off the Deployment -- is guarded model-free
-  # by tests/test_observability_skill_scrape_step.py instead.
+  # queried Cloud Monitoring for them. This objective carries no polarity on its
+  # own: a thorough negative that queried the series and found it empty
+  # ("up{job=...} returned nothing, 9095 is not scraped") names all three and
+  # passes it, so a green here means the worker read the PodMonitoring and queried
+  # the series. The conclusion -- that the watcher IS scraped -- is graded by the
+  # next objective. The skill regression this case is built around -- step 1
+  # reading scrape annotations off the Deployment -- is guarded model-free by
+  # tests/test_observability_skill_scrape_step.py.
   - name: the-answer-names-the-podmonitoring-the-listener-and-the-proof
     role: objective
     mode: assert
@@ -108,3 +117,28 @@ verification_spec:
       any_of_phrases:
         - "up{job="
         - "k8s_event_watcher_cluster_up"
+  # The conclusion's polarity, which the objective above does not carry: the
+  # answer must affirm the watcher is scraped, not merely name the mechanism and
+  # series while concluding it is not. any_of of affirmative scrape phrasings,
+  # each a contiguous substring whose word before "scrap" is a non-negator, so an
+  # inserted "not"/"n't" breaks the match: a "scraped"/"is being scraped" answer
+  # hits one, a "not scraped"/"not being scraped" answer hits none. A
+  # forbidden_phrases on the negation is not used -- a correct answer may note the
+  # credential-proxy PodMonitoring is unscraped while the watcher is, and a bare
+  # "not scraped" ban would false-red it. Both polarities are pinned in
+  # bench/tests/test_observability_watcher_scrape_patterns.py.
+  - name: the-answer-affirms-the-watcher-is-scraped
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "is scraped"
+        - "are scraped"
+        - "is being scraped"
+        - "are being scraped"
+        - "is scraping"
+        - "are scraping"
+        - "scrapes the"
+        - "scrapes it"
+        - "scrapes them"
