@@ -33,9 +33,11 @@ run "a_disarmed_pool_provisions_nothing_beside_a_scope" {
 
 # Armed: the host project and each explicit project less an exact exclude,
 # keyed on the project id. The account id is the project's readable prefix
-# plus eight hex characters of sha256("projects/<project_id>"); the literal
-# below was computed outside Terraform so a drift in either operand of the
-# formula fails here rather than filing an account under a new name.
+# plus eight hex characters of
+# sha256("<service_account_id>/projects/<project_id>"); the literal below was
+# computed outside Terraform with the module default service_account_id,
+# kubeagents-platform-gsa, so a drift in either operand of the formula fails
+# here rather than filing an account under a new name.
 run "an_armed_pool_holds_one_account_per_listed_project" {
   command = plan
 
@@ -137,5 +139,32 @@ run "a_selector_member_gets_an_account" {
   assert {
     condition     = toset(keys(google_service_account.scoped)) == toset(["mgmt-project-1", "scoping-proj1", "monitored-proj1"])
     error_message = "pool keys: ${jsonencode(keys(google_service_account.scoped))}"
+  }
+}
+
+# A folder's or an organisation's members are not listed at plan time, so an
+# armed pool with a folder in scope creates members for the host project and
+# the explicit projects only: no member for the folder or anything under it.
+# This is the omission the design records as a follow-up and the broker
+# refuses on at runtime, when a project under the folder has no pool entry.
+run "a_folder_in_scope_adds_no_pool_member" {
+  command = plan
+
+  variables {
+    scoped_pool_enabled = true
+    scope = {
+      projects      = ["team-alpha"]
+      folders       = ["123456789012"]
+      organizations = []
+    }
+  }
+
+  assert {
+    condition     = toset(keys(google_service_account.scoped)) == toset(["mgmt-project-1", "team-alpha"])
+    error_message = "pool keys: ${jsonencode(keys(google_service_account.scoped))}"
+  }
+  assert {
+    condition     = toset(keys(output.scoped_service_accounts)) == toset(["mgmt-project-1", "team-alpha"])
+    error_message = "output keys: ${jsonencode(keys(output.scoped_service_accounts))}"
   }
 }

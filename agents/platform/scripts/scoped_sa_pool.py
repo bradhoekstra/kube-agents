@@ -430,9 +430,11 @@ class ScopedServiceAccountPool:
         cluster = _name_component("cluster", cluster)
         member = self._members.get(project)
         if member is None:
-            # Fixed text 185 characters; each name is bounded at
-            # MAX_NAME_COMPONENT_LENGTH, so the whole message is at most 467 and
-            # the broker's POOL_REFUSAL_LOG_LENGTH logs it whole. Lengthen this
+            # Fixed text 215 characters (the message with every component
+            # empty); four interpolations, each bounded at
+            # MAX_NAME_COMPONENT_LENGTH, so the whole message is at most
+            # 215 + 4 * 63 = 467 and the broker's POOL_REFUSAL_LOG_LENGTH logs
+            # it whole. test_scoped_sa_pool.py pins both numbers; lengthen this
             # and the log line is cut mid-remedy again.
             raise PoolRefusal(
                 f"no scoped service account for project {project}"

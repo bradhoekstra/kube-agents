@@ -52,6 +52,12 @@ ONE_OVER_THE_LONGEST_NAME_COMPONENT = "a" * 64
 # `credential_proxy.POOL_REFUSAL_LOG_LENGTH`; the refusal at the longest
 # components has to fit under it, or the log line is cut mid-remedy.
 REFUSAL_LOG_LENGTH = 512
+# The refusal's fixed text, measured with every component empty, and the
+# number of components it interpolates (the project twice). The comment above
+# the refusal in `scoped_sa_pool.select` states both; the test below holds it
+# to them, and to the 467 ceiling `POOL_REFUSAL_LOG_LENGTH` was sized against.
+REFUSAL_FIXED_LENGTH = 215
+REFUSAL_COMPONENT_COUNT = 4
 # Spelled the way the Terraform half names a member: `ka-<project prefix>-<hash>`
 # in the host project, not in the project the member reads.
 EMAIL = "ka-bnaylor-kagents-d-1a2b3c4d@host-project.iam.gserviceaccount.com"
@@ -420,6 +426,19 @@ class SelectionTest(unittest.TestCase):
         with self.assertRaises(PoolRefusal):
             pool.select(OTHER_PROJECT, LOCATION, CLUSTER)
 
+    def test_only_the_project_slot_is_the_key(self):
+        """A mapped project id in the location or cluster slot selects nothing.
+
+        The positive tests pin that the project is sufficient; this pins that
+        it is the only key. A `select` that also consulted the cluster name
+        (`members.get(project) or members.get(cluster)`) would pass every other
+        test here and let a kubeconfig's cluster name, which the agent
+        influences, pick an account.
+        """
+        pool = one_project_pool()
+        with self.assertRaises(PoolRefusal):
+            pool.select(OTHER_PROJECT, PROJECT, PROJECT)
+
     def test_the_refusal_names_the_project_and_the_cluster_it_could_not_serve(self):
         """An operator hits this first; it has to say which project was missing.
 
@@ -458,6 +477,10 @@ class SelectionTest(unittest.TestCase):
             )
         message = str(raised.exception)
         self.assertTrue(message.endswith("or exclude the cluster."), message)
+        self.assertEqual(
+            REFUSAL_FIXED_LENGTH + REFUSAL_COMPONENT_COUNT * len(LONGEST_NAME_COMPONENT),
+            len(message),
+        )
         self.assertLess(len(message), REFUSAL_LOG_LENGTH, len(message))
 
     def test_a_component_over_the_bound_is_refused_before_it_is_interpolated(self):

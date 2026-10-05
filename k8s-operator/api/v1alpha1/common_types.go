@@ -1262,9 +1262,14 @@ type EgressAllowlistSpec struct {
 // refuse every request — but the failure would be a crashloop several layers
 // from the field, so it is caught in `kubectl apply` instead.
 //
-// The rule guards `has(self.enabled)` first: `omitempty` drops a false value
-// from the stored object, so a block written without the key has no `enabled`
-// for CEL to read and an unguarded `!self.enabled` fails with `no such key`.
+// The rule guards `has(self.enabled)` first. On the API server the guard is
+// never false: `enabled` carries a default, structural defaulting runs before
+// CEL, so the key is present by the time the rule reads it. It stays because
+// the rule is also evaluated offline, by
+// TestThePoolAdmissionRuleEvaluatesAsDocumented and any validator that does
+// not apply defaults, where a block written without the key would otherwise
+// fail `!self.enabled` with `no such key`; and a guard that is true whenever
+// the key is present costs nothing.
 // +kubebuilder:validation:XValidation:rule="!has(self.enabled) || !self.enabled || (has(self.serviceAccounts) && size(self.serviceAccounts) > 0)",message="scopedServiceAccountPool.enabled requires at least one serviceAccounts entry; the broker refuses to start on an empty pool"
 type ScopedServiceAccountPoolSpec struct {
 	// Enabled arms the credential broker: with it true, every cluster read is

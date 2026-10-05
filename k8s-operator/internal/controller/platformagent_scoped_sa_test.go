@@ -360,11 +360,14 @@ func TestAnArmedEmptyPoolIsRejectedAtAdmission(t *testing.T) {
 // TestThePoolAdmissionRuleEvaluatesAsDocumented runs the pool's CEL rule
 // through the same validator the API server uses, over every shape a CR can
 // carry the block in. The substring test above pins the rule's text; this one
-// pins what the rule does, which is the part that went wrong: `enabled` has
-// `omitempty` and no default, so a block written without the key — the shape
-// an install that provisions the mapping before arming the pool produces —
-// has no `enabled` field for CEL to read, and `!self.enabled` fails with
-// `no such key: enabled` under the "armed pool" message instead of admitting.
+// pins what the rule does, which is the part that went wrong: this validator
+// applies no defaults, so a block written without the key — the shape an
+// install that provisions the mapping before arming the pool produces — has
+// no `enabled` field for CEL to read, and an unguarded `!self.enabled` fails
+// with `no such key: enabled` under the "armed pool" message instead of
+// admitting. On the API server the field's default makes the key present
+// before CEL runs; the `has()` guard is what keeps the rule's meaning the same
+// in both places.
 func TestThePoolAdmissionRuleEvaluatesAsDocumented(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(
 		"..", "..", "config", "crd", "bases", "kubeagents.x-k8s.io_platformagents.yaml",
