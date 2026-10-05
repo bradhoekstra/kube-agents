@@ -612,9 +612,11 @@ func TestUsagePoller_ConfigMapOwnerReferenceEnqueuesNoReconcile(t *testing.T) {
 }
 
 // A listener that cannot be read leaves the pod's baseline and the totals
-// untouched, costs one log line, and records one Warning event when the
-// streak reaches two polls, not before; a pod the first poll could not scrape,
-// created before the document, is recorded on its next scrape and adds
+// untouched, costs one log line, and records a Warning event from the second
+// failed poll onward, re-recorded every poll with a byte-identical message so
+// the event recorder folds the repeats into one live Event rather than one the
+// API server's hourly retention would drop; a pod the first poll could not
+// scrape, created before the document, is recorded on its next scrape and adds
 // nothing.
 func TestUsagePoller_FailureStreaksAndLateRecording(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
@@ -628,10 +630,11 @@ func TestUsagePoller_FailureStreaksAndLateRecording(t *testing.T) {
 	default:
 	}
 	h.poll(10)
+	var first string
 	select {
-	case ev := <-h.recorder.Events:
-		if !strings.Contains(ev, usageScrapeFailingReason) || !strings.Contains(ev, "agent-gateway-aaa") {
-			t.Fatalf("event = %q, want %s naming the pod", ev, usageScrapeFailingReason)
+	case first = <-h.recorder.Events:
+		if !strings.Contains(first, usageScrapeFailingReason) || !strings.Contains(first, "agent-gateway-aaa") {
+			t.Fatalf("event = %q, want %s naming the pod", first, usageScrapeFailingReason)
 		}
 	default:
 		t.Fatal("no event after two failed polls")
@@ -639,8 +642,11 @@ func TestUsagePoller_FailureStreaksAndLateRecording(t *testing.T) {
 	h.poll(15)
 	select {
 	case ev := <-h.recorder.Events:
-		t.Fatalf("a second event for the same streak: %s", ev)
+		if ev != first {
+			t.Fatalf("the third poll's event = %q, want it byte-identical to the second's %q so the recorder folds them", ev, first)
+		}
 	default:
+		t.Fatal("no event after a third failed poll; a standing failure must re-record so its cause outlives the event TTL")
 	}
 	if doc := h.document(); doc.Pods["gw-a"] != nil {
 		t.Fatalf("an unreadable pod was recorded: %+v", doc.Pods["gw-a"])
@@ -656,6 +662,42 @@ func TestUsagePoller_FailureStreaksAndLateRecording(t *testing.T) {
 	h.poll(25)
 	if status := h.status(); status.EventsIngestedTotal != 3 {
 		t.Fatalf("after the first counted poll: %+v", status)
+	}
+}
+
+// A standing failure re-records the Warning on every poll from the second on,
+// each with a byte-identical message. That identity is what lets the event
+// recorder fold them into a single Event whose count rises and whose
+// LastTimestamp stays fresh, so the cause outlives the API server's one-hour
+// Event retention -- rather than the symptom, a frozen lastActiveTime, standing
+// alone the morning after a NetworkPolicy started blocking the scrape.
+func TestUsagePoller_AStandingFailureReRecordsAStableWarning(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+
+	var msgs []string
+	for minute := 5; minute <= 25; minute += 5 {
+		h.poll(minute)
+		select {
+		case ev := <-h.recorder.Events:
+			msgs = append(msgs, ev)
+		default:
+			msgs = append(msgs, "")
+		}
+	}
+	// Poll 1: a log line only, no event. Polls 2..5: an event each, identical.
+	if msgs[0] != "" {
+		t.Fatalf("an event after one failed poll: %q", msgs[0])
+	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i] == "" {
+			t.Fatalf("no event after failed poll %d; a standing failure must re-record every poll", i+1)
+		}
+		if msgs[i] != msgs[1] {
+			t.Fatalf("poll %d event = %q, want it byte-identical to poll 2's %q so the recorder folds them", i+1, msgs[i], msgs[1])
+		}
 	}
 }
 

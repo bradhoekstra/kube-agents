@@ -497,10 +497,17 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 }
 
 // noteScrapeFailure records a failed scrape of target: one log line when the
-// streak starts, naming the pod and the error kind and never the body, and
-// one Warning event on the CR when it reaches usageScrapeFailureEventStreak,
-// so that the symptom, a lastActiveTime that stops advancing, has its cause
-// beside it in `kubectl describe`.
+// streak starts, naming the pod and the error kind and never the body, and a
+// Warning event on the CR from usageScrapeFailureEventStreak polls onward,
+// re-recorded every failing poll so that the symptom, a lastActiveTime that
+// stops advancing, keeps a live cause beside it in `kubectl describe`. The
+// message carries no per-poll count on purpose: a standing failure writes the
+// same (reason, message) every poll, which the event recorder folds into one
+// Event with a rising count and a refreshed LastTimestamp, so the cause
+// outlives the API server's one-hour Event retention instead of vanishing an
+// hour after the single record the old streak-threshold write left. The
+// recorder's own spam filter bounds the writes to roughly one per five
+// minutes, so re-recording every poll is not an event storm.
 func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1alpha1.PlatformAgent, target usageTarget, err error) {
 	p.mu.Lock()
 	streak := p.streaks[target.uid]
@@ -513,16 +520,18 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1al
 	p.mu.Unlock()
 
 	// The kind, and for a status kind the HTTP code: usageScrapeError's text
-	// is a closed vocabulary, never a byte the peer sent.
+	// is a closed vocabulary, never a byte the peer sent. It is stable across a
+	// standing failure of one kind, which is what lets the recorder fold the
+	// repeats; a kind that changes writes a new message, as it should.
 	detail := usageScrapeDetail(err)
 	if count == 1 {
 		log.Info("a metrics listener could not be read; its pod's baseline and the totals are unchanged until it recovers",
 			"pod", target.name, "counter", target.counter, "error", detail)
 	}
-	if count == usageScrapeFailureEventStreak {
+	if count >= usageScrapeFailureEventStreak {
 		p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason,
-			fmt.Sprintf("status.usage.%s is not advancing: the metrics listener of pod %s has failed %d polls in a row (%s). %s",
-				target.counter, target.name, count, detail, usageScrapeGuidance(err)))
+			fmt.Sprintf("status.usage.%s is not advancing: the metrics listener of pod %s cannot be scraped (%s). %s",
+				target.counter, target.name, detail, usageScrapeGuidance(err)))
 	}
 }
 

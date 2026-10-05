@@ -418,8 +418,10 @@ NetworkPolicy regime that blocks the rule, a relabelled operator pod, a listener
 proxy environment on the operator pod that a client without the no-proxy transport would obey, is
 a `lastActiveTime` that stops advancing while commands are plainly running and events are
 plainly being triaged. A `kubectl describe`
-of the CR shows the operator's events; the implementation records one warning event per failure
-streak so that the symptom has a cause beside it without a log search.
+of the CR shows the operator's events; the implementation records a warning event from the second
+failing poll of a streak onward, re-recorded every poll with a stable message so the recorder folds
+the repeats into one event with a rising count and a refreshed timestamp, keeping the cause beside
+the symptom past the API server's one-hour event retention rather than an hour after a single write.
 
 ## What stays unwritten, and what lands it
 

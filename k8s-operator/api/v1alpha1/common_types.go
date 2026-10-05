@@ -1853,7 +1853,10 @@ type AgentUsageStatus struct {
 	// LastActiveTime is the time of the last poll in which a counter above
 	// moved: a brokered command ran, or an event was accepted for triage.
 	// Until SessionsTotal has a source, a chat turn that runs no brokered
-	// command does not move it. Advances at most once per five minutes.
+	// command does not move it. Scheduled maintenance jobs that run brokered
+	// commands do move it, though -- the Controller Stall Watch cron runs some
+	// every 30 minutes by default -- so it marks agent activity of any origin,
+	// not human or operator use alone. Advances at most once per five minutes.
 	// +optional
 	LastActiveTime *metav1.Time `json:"lastActiveTime,omitempty"`
 }

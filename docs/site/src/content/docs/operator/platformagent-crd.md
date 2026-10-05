@@ -728,7 +728,7 @@ The operator writes observed state to the `status` subresource:
 | `usage.toolExecutionsTotal`            | int64    | Commands the credential broker ran, successful or not, plus requests it rejected or failed on before running (its `success` and `error` outcomes), cumulative; policy refusals, `busy` and `abandoned` are not counted. Read from `kubeagents_tool_invocations_total` every five minutes. |
 | `usage.remediationsProposedTotal`      | int64    | Declared; nothing writes it yet (no series counts proposals).                                                                                                                                                                                                                             |
 | `usage.remediationsAppliedTotal`       | int64    | Declared; nothing writes it yet (approvals are log records, not a metric).                                                                                                                                                                                                                |
-| `usage.lastActiveTime`                 | time     | The last poll in which one of the two counters above moved; a chat turn that runs no brokered command does not move it.                                                                                                                                                                   |
+| `usage.lastActiveTime`                 | time     | The last poll in which one of the two counters above moved; a chat turn that runs no brokered command does not move it, and a scheduled job that runs one does, so it is not a record of human use alone.                                                                                 |
 
 `usage.toolExecutionsTotal`, `usage.eventsIngestedTotal` and `usage.lastActiveTime` are produced by
 the operator, on the leader and off the reconcile path: every five minutes it reads the credential
@@ -739,7 +739,9 @@ behind. They under-count rather than over-count: a listener that cannot be read 
 and its backlog is added when it is read again, but a backlog past the per-poll ceiling, an honest
 burst past it, or what a process counted after its last read and before it restarted, is lost once.
 A `lastActiveTime` that stops advancing while commands plainly run is the symptom of a listener the
-operator cannot reach; the CR's events name the pod. The counters the table above marks as unwritten stay absent until a
+operator cannot reach; the CR's events name the pod. It advances on any brokered command, including
+those a scheduled job runs -- the Controller Stall Watch cron issues some every 30 minutes by
+default -- so a recent `lastActiveTime` is not evidence that a person used the agent. The counters the table above marks as unwritten stay absent until a
 series exists for each
 ([what lands them](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/usage-counters-producer.md#what-stays-unwritten-and-what-lands-it)).
 
