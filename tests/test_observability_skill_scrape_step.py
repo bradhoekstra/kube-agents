@@ -49,11 +49,19 @@ WATCHER_SERIES = 'up{job="<name>-gateway-monitoring"}'
 WATCHER_UP = "k8s_event_watcher_cluster_up"
 # The #2141 bug, reverted: the Deployment-annotation read must not come back into
 # the step. The operator renders no such annotation, so any `kubectl get`/
-# `describe` of a deployment in step 1 is the regression, in any spelling
-# (`deployment`, `deployments`, `deploy`). Matched as a command, so the prose
-# that names the Deployment only to say the agent must not read it ("not off
-# Deployment annotations") does not trip it.
-DEPLOYMENT_READ = re.compile(r"(?i)kubectl\s+(get|describe)\s+deploy")
+# `describe` of a deployment in step 1 is the regression, in any spelling of the
+# noun (`deploy`, `deployment`, `deployments`, `deployments.apps`) and with any
+# flags between `kubectl`, the verb and the noun (`kubectl -n ns get deployment`,
+# `kubectl get -o yaml deployment`): the gaps are `[^\n]*`, not whitespace, so the
+# match describes "a deployment read on one line" rather than one command shape.
+# Held to one line (`[^\n]*`, never `.`), so the prose that names the Deployment
+# only to forbid it ("not off Deployment annotations", "whatever the Deployment
+# says") carries no `kubectl` on its line and does not trip.
+DEPLOYMENT_READ = re.compile(r"(?i)kubectl\b[^\n]*\b(get|describe)\b[^\n]*\bdeploy(ments?)?(\.apps)?\b")
+# The same bug by its own noun, not the resource it read: the scrape opt-in
+# annotation. A revert that reads it off the pod template instead of the
+# Deployment is the same regression, and no `deploy` pattern would catch it.
+PROM_SCRAPE_ANNOTATION = re.compile(r"(?i)prometheus\.io/scrape")
 
 
 def _read(path: Path) -> str:
@@ -82,6 +90,14 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
             step,
             DEPLOYMENT_READ,
             "step 1 sends the agent back to the Deployment for scrape annotations (the #2141 regression)",
+        )
+
+    def test_step_one_does_not_read_scrape_opt_in_annotations(self):
+        step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
+        self.assertNotRegex(
+            step,
+            PROM_SCRAPE_ANNOTATION,
+            "step 1 tells the agent to read the prometheus.io/scrape annotation (the #2141 regression, by any resource)",
         )
 
 
