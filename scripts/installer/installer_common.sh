@@ -1146,8 +1146,14 @@ require_scope_cluster_triples() {
 # operator recorded it. No PlatformAgent type served, no CR, no release: pass.
 # L, R and K are the projects, folders, organisations, Shared VPC hosts,
 # Metrics Scopes and exclusions, every list the chart renders, since a list it
-# renders is one the apply replaces, and the cap, which the apply sets the same
-# way (a CR at the CRD's default reads as the key unset).
+# renders is one the apply replaces, the cap, which the apply sets the same
+# way (a CR at the CRD's default reads as the key unset), and the scoped
+# pool's switch, spec.security.scopedServiceAccountPool.enabled, which the
+# generator writes from SCOPED_SA_POOL_ENABLED alone (false when the key is
+# absent): a live true the key does not record would be disarmed by the apply,
+# its members destroyed and the broker put on the ambient credential, so it
+# weighs like a cap off the default, an armed pool alone included. The members
+# list is derived from the scope and is not compared.
 # Anything that stops the read -- no context for this install in the
 # kubeconfig, the CR or the record unreadable -- is a refusal, because the
 # apply itself needs no kubeconfig (the helm provider authenticates with a
@@ -1218,11 +1224,18 @@ cr_text, record_text, served_text = sys.stdin.read().split("\x1e\n", 2)
 ok, refuse = sys.argv[1], sys.argv[2]
 keys = sys.argv[3:11]
 default_cap = int(sys.argv[11])
+pool_key_armed = sys.argv[12] == "true"
 
 def split(value):
     return [item for item in re.split(r"[,\s]+", value) if item]
 
-def normalise(scope):
+def pool_armed(spec_or_values):
+    # spec.security.scopedServiceAccountPool.enabled on the CR, and the same
+    # path under platformAgent in the record; absent reads as false.
+    security = (spec_or_values or {}).get("security") or {}
+    return bool((security.get("scopedServiceAccountPool") or {}).get("enabled"))
+
+def normalise(scope, armed):
     scope = scope or {}
     exclude = scope.get("exclude") or {}
     clusters = sorted(
@@ -1236,30 +1249,33 @@ def normalise(scope):
         "metricsScopes": sorted(set(scope.get("metricsScopes") or [])),
         "maxProjects": int(scope.get("maxProjects") or default_cap),
         "exclude": {"projects": sorted(set(exclude.get("projects") or [])), "clusters": clusters},
+        "scopedPoolEnabled": bool(armed),
     }
 
 def is_empty(scope):
-    # Nothing live to protect: no list, no exclusion, and the cap at the default
-    # the CRD sets, which is what the apply renders for a key left unset.
+    # Nothing live to protect: no list, no exclusion, the cap at the default
+    # the CRD sets, which is what the apply renders for a key left unset, and
+    # the pool off, which is what it renders for SCOPED_SA_POOL_ENABLED absent.
     return not (scope["projects"] or scope["folders"] or scope["organizations"]
                 or scope["sharedVpcHosts"] or scope["metricsScopes"]
                 or scope["exclude"]["projects"] or scope["exclude"]["clusters"]
-                or scope["maxProjects"] != default_cap)
+                or scope["maxProjects"] != default_cap
+                or scope["scopedPoolEnabled"])
 
 items = json.loads(cr_text).get("items") or []
 if len(items) > 1:
     sys.exit("more than one PlatformAgent is served: " + ", ".join(i["metadata"]["name"] for i in items))
-live_raw = items[0].get("spec", {}).get("scope") if items else None
-if live_raw is None:
-    print(ok)
-    sys.exit(0)
-live = normalise(live_raw)
+spec = items[0].get("spec") or {} if items else {}
+# A CR with no scope block normalises to the empty declaration, so the switch
+# is weighed whether or not a scope stands beside it.
+live = normalise(spec.get("scope"), pool_armed(spec))
 if is_empty(live):
     print(ok)
     sys.exit(0)
 def recorded(text):
-    raw = ((json.loads(text or "{}") or {}).get("platformAgent") or {}).get("scope")
-    return normalise(raw) if raw is not None else None
+    values = (json.loads(text or "{}") or {}).get("platformAgent") or {}
+    raw = values.get("scope")
+    return normalise(raw, pool_armed(values)) if raw is not None else None
 
 records = [r for r in (recorded(record_text), recorded(served_text)) if r is not None]
 declared = normalise({
@@ -1273,7 +1289,7 @@ declared = normalise({
         "projects": split(keys[5]),
         "clusters": [dict(zip(("projectId", "location", "clusterName"), t.split("/"))) for t in split(keys[6])],
     },
-})
+}, pool_key_armed)
 if live in records or live == declared:
     print(ok)
     sys.exit(0)
@@ -1289,7 +1305,10 @@ print("SCOPE_EXCLUDE_CLUSTERS=" + json.dumps(" ".join("/".join(c) for c in live[
 # Always among the lines: when the cap is why the compare refused, the key the
 # operator has to change may be one they must blank, not set.
 print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"]) if live["maxProjects"] != default_cap else ""))
-' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" 2>"$err_file")"; then
+# The same for the pool switch: blank when the live pool is off, so the lines
+# never reproduce a false, and the key an operator may have to blank is named.
+print("SCOPED_SA_POOL_ENABLED=" + json.dumps("true" if live["scopedPoolEnabled"] else ""))
+' "$SCOPE_VERDICT_OK" "$SCOPE_VERDICT_REFUSE" "${SCOPE_PROJECTS:-}" "${SCOPE_FOLDERS:-}" "${SCOPE_ORGANIZATIONS:-}" "${SCOPE_SHARED_VPC_HOSTS:-}" "${SCOPE_METRICS_SCOPES:-}" "${SCOPE_EXCLUDE_PROJECTS:-}" "${SCOPE_EXCLUDE_CLUSTERS:-}" "${SCOPE_MAX_PROJECTS:-}" "$SCOPE_MAX_PROJECTS_DEFAULT" "$(hcl_bool "${SCOPED_SA_POOL_ENABLED:-$SCOPED_SA_POOL_ENABLED_DEFAULT}")" 2>"$err_file")"; then
     _scope_check_failed "$mode" "the live and recorded scope could not be compared: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     local rc=$?
     rm -f "$err_file"
@@ -1303,16 +1322,16 @@ print("SCOPE_MAX_PROJECTS=" + json.dumps(str(live["maxProjects"]) if live["maxPr
   cr_name="${lines%%$'\n'*}"
   lines="${lines#*$'\n'}"
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
-    print_warning "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. A full upgrade would replace it, and the reconcile would retire the projects it drops; the plan below shows the change. Record the live declaration in install.env first:"
+    print_warning "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry (the scoped service account pool's switch counts as part of it). A full upgrade would replace it, and the reconcile would retire the projects it drops, or disarm the pool; the plan below shows the change. Record the live declaration in install.env first:"
   else
-    print_error "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry. The first apply whose rendered scope differs from the recorded one replaces it, and the reconcile then retires the projects it drops, deleting their Cluster Agent profiles over its next two clean runs."
+    print_error "The PlatformAgent '${cr_name}' in namespace '${namespace}' declares a scope this install did not write and install.env does not carry (the scoped service account pool's switch counts as part of it). The first apply whose rendered scope differs from the recorded one replaces it, and the reconcile then retires the projects it drops, deleting their Cluster Agent profiles over its next two clean runs; a pool armed on the CR that SCOPED_SA_POOL_ENABLED does not record is disarmed the same way, its members destroyed and the credential broker put on the agent's own credential."
     print_info "Record the live declaration in install.env and re-run:"
   fi
   while IFS= read -r first_line; do
     print_info "  ${first_line}"
   done <<<"$lines"
   [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ] && return 0
-  print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope to what install.env declares and re-run; the apply then renders the same value it already holds."
+  print_info "Or, if install.env is right and the PlatformAgent is not, edit the PlatformAgent's spec.scope (and spec.security.scopedServiceAccountPool.enabled) to what install.env declares and re-run; the apply then renders the same value it already holds."
   return 1
 }
 

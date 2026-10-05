@@ -352,7 +352,10 @@ cannot refuse a teardown.
 
 Before a full apply the front doors read the live `PlatformAgent` through the install's own
 kubeconfig context and refuse when it carries a scope that neither the release record nor the
-keys account for, printing the `SCOPE_*` lines that reproduce it; a read that cannot decide (no
+keys account for, printing the `SCOPE_*` lines that reproduce it; the scoped pool's switch
+(`spec.security.scopedServiceAccountPool.enabled`) is weighed with the lists and the cap, so a
+pool armed on the CR that `SCOPED_SA_POOL_ENABLED` does not record is refused the same way, with
+that key among the lines, rather than disarmed by the apply. A read that cannot decide (no
 context, an unreadable CR or release) refuses too, because the apply itself needs no kubeconfig
 and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope` in
 `installer_common.sh`; `upgrade.sh --plan` warns instead). An `install.sh` re-run

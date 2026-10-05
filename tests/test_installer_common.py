@@ -230,6 +230,14 @@ class InstallerCommonTest(unittest.TestCase):
                     # Blanking it is "unset", which that arm wants: `:-` takes
                     # the default for an empty value as well as an absent one.
                     "ENABLE_DRIFT_DETECTOR": "",
+                    # Same again for the scoped pool's two keys, read as
+                    # ${VAR:-} and refused (rc=1, no tfvars) on a malformed
+                    # value: a shell exporting SCOPED_SA_POOL_MAX_ACCOUNTS=0
+                    # would otherwise fail every generator case that does not
+                    # set them, and SCOPED_SA_POOL_ENABLED=true would arm the
+                    # pool in every file the cases read.
+                    "SCOPED_SA_POOL_ENABLED": "",
+                    "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
                     **(env or {}),
                 },
                 bin_dir=str(bin_dir),
@@ -1136,12 +1144,6 @@ class InstallerCommonTest(unittest.TestCase):
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertIn(expected, dest.read_text())
 
-    # Empty reads as unset, so a developer's own exported value cannot stand in.
-    _SCOPED_POOL_UNSET = {
-        "SCOPED_SA_POOL_ENABLED": "",
-        "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
-    }
-
     def test_tfvars_carry_the_scoped_sa_pool(self):
         # The switch is always written, false by default, so the file states
         # whether the pool is armed; the cap only when set, like the scope's.
@@ -1159,7 +1161,7 @@ class InstallerCommonTest(unittest.TestCase):
                 with self.subTest(env=env):
                     proc = self._run(
                         f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                        env={"API_SERVER_KEY": "k", **self._SCOPED_POOL_UNSET, **env},
+                        env={"API_SERVER_KEY": "k", **env},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -1184,7 +1186,7 @@ class InstallerCommonTest(unittest.TestCase):
                 with self.subTest(key=key, value=value):
                     proc = self._run(
                         f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
-                        env={"API_SERVER_KEY": "k", **self._SCOPED_POOL_UNSET, key: value},
+                        env={"API_SERVER_KEY": "k", key: value},
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=1", proc.stdout, proc.stderr)
@@ -3300,7 +3302,10 @@ class PreApplyScopeCheckTest(unittest.TestCase):
             env = {"PROJECT_ID": "test-project", "CLUSTER_NAME": "test-cluster", "REGION": "us-central1",
                    "SCOPE_PROJECTS": "", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
                    "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
-                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": ""}
+                   "SCOPE_EXCLUDE_PROJECTS": "", "SCOPE_EXCLUDE_CLUSTERS": "",
+                   # Read as ${VAR:-} like the scope keys: a developer's exported
+                   # switch must not arm the declaration a case compares against.
+                   "SCOPED_SA_POOL_ENABLED": ""}
             env.update(keys or {})
             body = (
                 "set -u\n"
@@ -3392,6 +3397,60 @@ class PreApplyScopeCheckTest(unittest.TestCase):
                                                            "SCOPE_MAX_PROJECTS": "250"})
         self._assert_rc(proc, 1)
         self.assertIn('INFO:   SCOPE_MAX_PROJECTS=""', proc.stdout)
+
+    def test_an_armed_pool_alone_on_a_scope_less_cr_is_a_hand_edit(self):
+        # spec.security.scopedServiceAccountPool.enabled is part of the declaration the
+        # apply replaces: the generator writes scoped_pool_enabled from
+        # SCOPED_SA_POOL_ENABLED alone, false when the key is absent, so a live true
+        # the key does not record is disarmed by the next full apply -- its members
+        # destroyed and the broker put on the ambient credential. It is refused with
+        # the key among the lines, and an armed pool alone is not "nothing live to
+        # protect" even with no scope block beside it. The members list is derived
+        # from the scope, so only the switch is compared.
+        armed_only = ('{"items":[{"metadata":{"name":"platform-agent"},"spec":{"security":{"scopedServiceAccountPool":'
+                      '{"enabled":true,"serviceAccounts":[{"projectId":"p2-project","serviceAccountEmail":"ka-x@p.iam.gserviceaccount.com"}]}}}}]}')
+        proc = self._run(armed_only, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPE_PROJECTS=""', proc.stdout)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED="true"', proc.stdout)
+        self._assert_rc(self._run(armed_only, "norelease", keys={"SCOPED_SA_POOL_ENABLED": "true"}), 0)
+        self._assert_rc(self._run(armed_only, "norelease", keys={"SCOPED_SA_POOL_ENABLED": "yes"}), 0)
+        for label, disarmed in (
+            ("enabled false", armed_only.replace('"enabled":true', '"enabled":false')),
+            ("an empty pool block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{"security":{"scopedServiceAccountPool":{}}}}]}'),
+            ("no security block", '{"items":[{"metadata":{"name":"platform-agent"},"spec":{}}]}'),
+        ):
+            with self.subTest(case=label):
+                proc = self._run(disarmed, "norelease")
+                self._assert_rc(proc, 0)
+                self.assertNotIn("ERROR", proc.stdout)
+                self.assertNotIn("WARN", proc.stdout)
+
+    def test_an_armed_pool_beside_a_scope_is_a_hand_edit_until_the_key_records_it(self):
+        # The switch is weighed with the lists and the cap: a CR armed by hand beside a
+        # scope the record accounts for is refused on the switch alone, passes once the
+        # key records it, and passes when the record carries it (the installer armed it).
+        armed = _LIVE_SCOPE_CR.replace('"spec":{"scope"', '"spec":{"security":{"scopedServiceAccountPool":{"enabled":true}},"scope"')
+        record = ('{"platformAgent":{"scope":{"projects":["p2-project","p3-project"],"exclude":{"projects":[],'
+                  '"clusters":[{"projectId":"p2-project","location":"us-central1","clusterName":"c1"}]}}}}')
+        scope_keys = {"SCOPE_PROJECTS": "p2-project p3-project", "SCOPE_EXCLUDE_CLUSTERS": "p2-project/us-central1/c1"}
+        proc = self._run(armed, record)
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED="true"', proc.stdout)
+        self._assert_rc(self._run(armed, record, keys={**scope_keys, "SCOPED_SA_POOL_ENABLED": "true"}), 0)
+        armed_record = record.replace('{"platformAgent":{', '{"platformAgent":{"security":{"scopedServiceAccountPool":{"enabled":true}},')
+        self._assert_rc(self._run(armed, armed_record), 0)
+        # A record and keys that arm it beside a CR disarmed by hand refuse on the switch
+        # alone, and the line is blank: the lines never reproduce the false the apply
+        # would render, nor the true that was refused.
+        proc = self._run(_LIVE_SCOPE_CR, armed_record, keys={**scope_keys, "SCOPED_SA_POOL_ENABLED": "true"})
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED=""', proc.stdout)
+        # And the switch is among the lines of every refusal, blank when the live
+        # pool is off, beside the cap.
+        proc = self._run(_LIVE_SCOPE_CR, "norelease")
+        self._assert_rc(proc, 1)
+        self.assertIn('INFO:   SCOPED_SA_POOL_ENABLED=""', proc.stdout)
 
     def test_a_scope_the_installer_wrote_may_be_changed_or_emptied(self):
         # L == R: the record shows the installer rendered it; the keys are the
