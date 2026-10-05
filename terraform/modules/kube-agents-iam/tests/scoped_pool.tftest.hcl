@@ -1,9 +1,10 @@
 # The scoped service account pool: one account per project the plan can list
 # in the scope (scope.tf, local.scope_listed_projects), keyed on the bare
 # project id, and only while scoped_pool_enabled arms it. These cases pin the
-# key, the account id a project produces, the cap on the host project's
-# service-account quota, and that a selector's members are pool members like
-# an explicit project. The provider is mocked, so a plan here creates nothing.
+# key, the account id a project produces, the declared bound on the pool
+# (scoped_pool_max_accounts, which the plan holds the derived set to; it is
+# not a reading of the host project's quota), and that a selector's members
+# are pool members like an explicit project. The provider is mocked, so a plan here creates nothing.
 
 mock_provider "google" {}
 
@@ -93,8 +94,8 @@ run "a_long_project_id_is_truncated_without_a_trailing_hyphen" {
   }
 }
 
-# The pool may fill the host project's service-account quota and no more:
-# four listed projects against a cap of three is refused at plan.
+# A pool past the declared bound is refused at plan, once, on the agent
+# account: four listed projects against a bound of three.
 run "a_pool_past_the_account_cap_is_refused" {
   command = plan
 

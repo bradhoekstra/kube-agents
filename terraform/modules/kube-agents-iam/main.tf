@@ -60,7 +60,7 @@ resource "google_service_account" "agent" {
     # so a pool past the bound is refused once rather than once per member.
     precondition {
       condition     = !var.scoped_pool_enabled || length(local.scoped_pool) <= var.scoped_pool_max_accounts
-      error_message = "The scoped service account pool would hold ${length(local.scoped_pool)} accounts (the management project, scope.projects and the projects the selectors resolve to, once each, less an exact exclude.projects entry), past scoped_pool_max_accounts (${var.scoped_pool_max_accounts}), the bound declared on how much of ${var.project_id}'s service-account quota the pool may fill (GCP's default quota is 100 per project, shared with the agent's own accounts and everything else in the project). Raise the quota in ${var.project_id} and then scoped_pool_max_accounts to the headroom free, declare fewer projects, or set scoped_pool_enabled = false to run on the agent's own identity."
+      error_message = "The scoped service account pool would hold ${length(local.scoped_pool)} accounts (the management project, scope.projects and the projects the selectors resolve to, once each, less an exact exclude.projects entry), past scoped_pool_max_accounts (${var.scoped_pool_max_accounts}), the bound declared on the pool from the service-account quota headroom ${var.project_id} has free (GCP's default quota is 100 per project, shared with the agent's own accounts and everything else there, and the plan cannot read it). Raise the quota in ${var.project_id} and then scoped_pool_max_accounts to the headroom free, declare fewer projects, or set scoped_pool_enabled = false to run on the agent's own identity."
     }
   }
 }
