@@ -1606,10 +1606,12 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// two fixed reserves, has to admit at least two requests at once, each
 	// with its child reserve and its output allowance, or a listing phase
 	// cannot parallelise at all. The slot cap above is an upper bound on the
-	// count and enters this rule only as that. The four figures are the
+	// count and enters this rule only as that. The four figures and the
+	// floor are declared in credential_proxy_manifests.go as copies of the
 	// broker's (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
 	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
-	// OUTPUT_COPIES_PER_COMMAND); change them together.
+	// OUTPUT_COPIES_PER_COMMAND, BUDGET_MINIMUM_ADMITTED_REQUESTS), and
+	// tests/test_credential_proxy_sizing_parity.py fails when the two drift.
 	admitted := credentialProxyAdmittedRequests(limit, int64(capBytes))
 	if admitted < credentialProxyMinimumAdmittedRequests {
 		t.Errorf("the proxy's %d-byte limit admits %d requests at once under the child memory budget (%d MiB resident + %d MiB workspace reserves, %d MiB per request plus %d x %d-byte output); at least %d are needed — raise the limit or lower the output cap",

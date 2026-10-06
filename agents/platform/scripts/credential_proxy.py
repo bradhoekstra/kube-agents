@@ -158,6 +158,8 @@ ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # end up running the heavy case (§2.1). The operator's sizing test declares
 # the same four figures under matching names (credential_proxy_manifests.go)
 # and asserts the arithmetic against the rendered limit; change them together.
+# They, and BUDGET_MINIMUM_ADMITTED_REQUESTS below, are held equal by
+# tests/test_credential_proxy_sizing_parity.py.
 MEBIBYTE = 1024 * 1024
 REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
 # The broker process and Envoy: 168 MiB measured, with margin.
