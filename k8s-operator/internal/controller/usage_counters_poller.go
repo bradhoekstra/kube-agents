@@ -65,7 +65,14 @@ const (
 	// usageConfigMapImmutableReason is the Warning event's reason when the
 	// counters ConfigMap cannot be updated because it is immutable.
 	usageConfigMapImmutableReason = "UsageConfigMapImmutable"
-	usagePollerLogName            = "usage-counters"
+	// usageConfigMapForeignReason is the Warning event's reason when a ConfigMap
+	// under the counters name is not the operator's and is left untouched.
+	usageConfigMapForeignReason = "UsageConfigMapForeign"
+	// usageOwnerKindPlatformAgent is the owner-reference Kind that names a
+	// PlatformAgent, so a counters ConfigMap the operator owns is recognised by
+	// owner when its instance label is absent.
+	usageOwnerKindPlatformAgent = "PlatformAgent"
+	usagePollerLogName          = "usage-counters"
 	// The two sentences the Warning event can end with; usageScrapeGuidance
 	// picks one by the failure's class.
 	usageScrapeConnectGuidance  = "Check that the pod's NetworkPolicy admits the operator's pods on the metrics port and that the listener is up."
@@ -479,12 +486,34 @@ func usageStatusFloor(value int64) int64 {
 	return value
 }
 
+// usageConfigMapIsOurs reports whether cm is a usage-counters ConfigMap the
+// operator wrote for agent, by either signal the operator leaves: the instance
+// label it stamps on every object it owns, or an owner reference naming a
+// PlatformAgent of this name. The owner match is by name, not UID, on purpose
+// -- a CR deleted and re-applied under the same name leaves its predecessor's
+// ConfigMap with a stale UID but the right name, and resetting that is what the
+// design wants. A ConfigMap another writer parked under the name carries
+// neither signal.
+func usageConfigMapIsOurs(cm *corev1.ConfigMap, agent *agentv1alpha1.PlatformAgent) bool {
+	if cm.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+		return true
+	}
+	for _, ref := range cm.OwnerReferences {
+		if ref.Kind == usageOwnerKindPlatformAgent && ref.Name == agent.Name {
+			return true
+		}
+	}
+	return false
+}
+
 // writeDocument writes doc to the CR's ConfigMap, creating it with a
 // non-controller owner reference to the CR: collected with the CR, but not
 // re-enqueueing it, since the controller Owns ConfigMaps with no predicate and
 // a controller-owned one would cost a reconcile on every write. An existing
-// ConfigMap, a predecessor's included, is updated in place, its owner
-// reference moved to this CR.
+// ConfigMap the operator owns -- by instance label or an owner reference of
+// this name, a predecessor's on a delete-and-recreate included -- is updated in
+// place; one parked under the name that is not the operator's is left untouched,
+// with a Warning on the CR.
 func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.ConfigMap, doc *usageDocument) error {
 	raw, err := json.Marshal(doc)
 	if err != nil {
@@ -492,6 +521,17 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 	}
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: usageCountersConfigMapName(agent), Namespace: agent.Namespace}}
 	if existing != nil {
+		if !usageConfigMapIsOurs(existing, agent) {
+			// Someone else parked a ConfigMap under our name. Taking it over
+			// would stamp our labels and an owner reference onto an object we
+			// do not own, which the finalizer would then delete; a CR deleted
+			// and re-applied under the same name is still ours by name, so that
+			// case is unaffected. Leave it, and surface why status.usage is
+			// frozen where the design promises -- kubectl describe on the CR.
+			p.r.recordEvent(agent, corev1.EventTypeWarning, usageConfigMapForeignReason,
+				fmt.Sprintf("a ConfigMap named %s already exists and is not the operator's: status.usage will not advance until it is removed", cm.Name))
+			return fmt.Errorf("the usage counters ConfigMap %s is not the operator's; refusing to overwrite it", cm.Name)
+		}
 		cm = existing.DeepCopy()
 	}
 	withCommonLabels(cm, agent)

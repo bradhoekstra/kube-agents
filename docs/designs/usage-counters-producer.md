@@ -321,11 +321,17 @@ carries an owner reference to the CR, without the controller flag, so it is coll
 CR but does not re-enqueue it: the controller `Owns` ConfigMaps with no predicate, and a
 controller-owned one would cost a reconcile on every write. The document also records the UID
 of the CR it was accumulated for, and the poller compares it, and the owner reference's UID,
-with the CR's. A mismatch is treated as absent and overwritten: it is what a CR deleted and
-re-applied under the same name sees while the collector has not yet removed the old ConfigMap,
-or was kept from removing it, and without the check the new CR would inherit a predecessor's
-totals, through the status patch that fires whenever the status is behind. A name is not
-ownership; the finalizer applies the same rule to the data volume. What the poller reads back
+with the CR's. A mismatch means the document is treated as absent and its counters re-seeded,
+and the ConfigMap holding it overwritten: it is what a CR deleted and re-applied under the same
+name sees while the collector has not yet removed the old ConfigMap, or was kept from removing
+it, and without the check the new CR would inherit a predecessor's totals, through the status
+patch that fires whenever the status is behind. The overwrite is gated on ownership: the poller
+rewrites a ConfigMap under the name only when it is the operator's own -- carrying the instance
+label, or an owner reference naming a PlatformAgent of this name, which a predecessor's does on
+a delete-and-recreate. A ConfigMap another writer parked under the name has neither; the poller
+leaves it untouched, records a `UsageConfigMapForeign` Warning on the CR, and `status.usage`
+stays where it was until the object is removed. A name is not ownership; the finalizer applies
+the same rule to the data volume. What the poller reads back
 is bounded before it is used, with a bound of its own for the totals, which honestly outgrow
 any per-pod or per-poll figure: every sample non-negative and finite, every total non-negative,
 finite and below the `int64` headroom the status field has, no total below the status it

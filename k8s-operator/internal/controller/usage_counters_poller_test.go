@@ -1127,3 +1127,52 @@ func TestUsagePoller_AnImmutableConfigMapRecordsAWarning(t *testing.T) {
 		t.Fatalf("status.usage advanced despite the rejected write: %+v", status)
 	}
 }
+
+// A ConfigMap another writer parked under the counters name -- no operator
+// instance label, no owner reference to the CR -- is not taken over: the poll
+// leaves its data, labels and owner references untouched, records a Warning, and
+// does not advance the status.
+func TestUsagePoller_AForeignConfigMapIsLeftUntouched(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	cmName := usageTestAgentName + usageCountersConfigMapSuffix
+	foreign := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      cmName,
+			Namespace: usageTestNamespace,
+			Labels:    map[string]string{"owner": "someone-else"},
+		},
+		Data: map[string]string{"their-key": "their-value"},
+	}
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), foreign)...)
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+
+	h.poll(5) // Would write the ConfigMap; the foreign one is refused instead.
+
+	select {
+	case ev := <-h.recorder.Events:
+		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapForeignReason) || !strings.Contains(ev, cmName) {
+			t.Fatalf("event %q, want a Warning naming the foreign ConfigMap %s", ev, cmName)
+		}
+	default:
+		t.Fatal("no Warning event was recorded for the foreign ConfigMap")
+	}
+
+	if status := h.status(); status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("status.usage advanced despite the foreign ConfigMap: %+v", status)
+	}
+
+	cm := h.configMap()
+	if len(cm.Data) != 1 || cm.Data["their-key"] != "their-value" {
+		t.Errorf("the foreign ConfigMap's data was changed: %v", cm.Data)
+	}
+	if _, ok := cm.Data[usageCountersDocumentKey]; ok {
+		t.Errorf("the counters document was written into the foreign ConfigMap: %v", cm.Data)
+	}
+	if len(cm.OwnerReferences) != 0 {
+		t.Errorf("an owner reference was added to the foreign ConfigMap: %+v", cm.OwnerReferences)
+	}
+	if cm.Labels[labelInstance] != "" {
+		t.Errorf("an instance label was added to the foreign ConfigMap: %v", cm.Labels)
+	}
+}
