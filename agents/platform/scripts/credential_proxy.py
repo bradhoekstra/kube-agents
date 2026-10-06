@@ -7812,7 +7812,25 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            self.executor.refresh_forge_credential(forge.name, repository)
+            self.executor.refresh_forge_credential(
+                forge.name, repository, caller=getattr(self, "connection", None)
+            )
+        except CallerHungUp:
+            # Queued for the child memory budget and gone before the helper
+            # ran: nothing to answer, as on the exec route.
+            LOGGER.info(
+                "%s credential refresh abandoned: the caller disconnected while queued "
+                "for the memory budget; the helper was not started",
+                forge.name,
+            )
+            return
+        except CommandSlotUnavailable as exc:
+            # The budget's refusal (§2.3), the same 503 the exec and vcs routes
+            # answer, rather than the generic branch's 502 that would read as
+            # a failed mint.
+            LOGGER.warning("%s credential refresh queued too long", forge.name)
+            self._busy(exc)
+            return
         except PermissionError:
             # `refresh_forge_credential` asks the managed list too, because the
             # in-process callers do not come through here. Reaching it from this

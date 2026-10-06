@@ -5718,8 +5718,10 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 class ForgeRefreshRouteTest(unittest.TestCase):
     """What `POST /v1/forge/refresh` answers, and what it declines to say."""
 
-    def _post(self, body, **executor):
+    def _post(self, body, connection=None, **executor):
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        if connection is not None:
+            handler.connection = connection
         handler.max_request_bytes = 10 * 1024 * 1024
         encoded = json.dumps(body).encode()
         handler.headers = {"Content-Length": str(len(encoded))}
@@ -5736,7 +5738,7 @@ class ForgeRefreshRouteTest(unittest.TestCase):
         calls = []
         replies = self._post(
             {"repository": "gke-agentic/infra"},
-            refresh_forge_credential=lambda provider, repository: calls.append(
+            refresh_forge_credential=lambda provider, repository, caller=None: calls.append(
                 (provider, repository)
             ),
         )
@@ -5749,7 +5751,7 @@ class ForgeRefreshRouteTest(unittest.TestCase):
     def test_a_failure_answers_a_reason_code_and_no_detail(self):
         refusal = "Minty returned error (HTTP 403): installation not found"
 
-        def fail(provider, repository):
+        def fail(provider, repository, caller=None):
             raise RuntimeError(refusal)
 
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
@@ -5765,12 +5767,50 @@ class ForgeRefreshRouteTest(unittest.TestCase):
     def test_a_host_this_install_serves_no_credential_for_is_refused(self):
         replies = self._post(
             {"repository": "https://git.example.invalid/acme/infra"},
-            refresh_forge_credential=lambda provider, repository: self.fail(
+            refresh_forge_credential=lambda provider, repository, caller=None: self.fail(
                 "refreshed a credential for an unknown host"
             ),
         )
 
         self.assertNotEqual(replies[0][0], HTTPStatus.OK)
+
+    def test_the_route_hands_its_connection_to_the_refresh(self):
+        # Review focus 5: the caller is passed so a hang-up while queued for
+        # the budget is noticed; a stub without the keyword would be a
+        # TypeError the generic branch reads as a 502.
+        seen = {}
+
+        def record(provider, repository, caller=None):
+            seen["caller"] = caller
+
+        handler_connection = object()
+        replies = self._post(
+            {"repository": "gke-agentic/infra"}, refresh_forge_credential=record,
+            connection=handler_connection,
+        )
+        self.assertIs(handler_connection, seen["caller"])
+        self.assertEqual(HTTPStatus.OK, replies[0][0])
+
+    def test_a_refresh_refused_by_the_budget_answers_the_busy_503(self):
+        def busy(provider, repository, caller=None):
+            raise credential_proxy.CommandSlotUnavailable(
+                "the credential proxy is at its child memory budget (128 MiB reserved of 704 MiB)"
+            )
+
+        replies = self._post({"repository": "gke-agentic/infra"}, refresh_forge_credential=busy)
+        status, payload = replies[0]
+        self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
+        self.assertEqual("CREDENTIAL_PROXY_BUSY", payload["code"])
+        self.assertIn("child memory budget", payload["error"])
+
+    def test_a_caller_that_hangs_up_while_queued_gets_no_response(self):
+        def gone(provider, repository, caller=None):
+            raise credential_proxy.CallerHungUp("the caller disconnected while queued for a slot")
+
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            replies = self._post({"repository": "gke-agentic/infra"}, refresh_forge_credential=gone)
+        self.assertEqual([], replies)
+        self.assertTrue(any("abandoned" in line for line in logs.output), logs.output)
 
 
 class RedactCredentialsTest(unittest.TestCase):
