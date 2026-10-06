@@ -81,6 +81,20 @@
 # before any git command sees them, so a forged record cannot smuggle
 # arguments.
 #
+# GitHub read credential. The attestation read is made with a one-hour token
+# minted from the ledger-reader App's key when EVAL_LEDGER_APP_KEY_FILE is
+# set -- hack/ledger_token_mint.py, the mint hack/ci-eval-pr.sh uses for
+# grading, narrowed here to metadata: read, which is enough to list a public
+# repository's commit statuses (probed 2026-10-06 against a public repository
+# outside the App's installation: HTTP 200, on the App's own 15,000/h limit
+# where an anonymous read shares the host's 60/h). A mint that fails is a
+# full run: no anonymous second attempt, and never the PAT the job also
+# mounts, which the harness itself stopped reading once the App key was
+# there. Without a key file the read carries BENCH_GITHUB_TOKEN when the
+# shell holds one, else it is anonymous, and one log line says which. The
+# token reaches python through its environment, never argv, so ps does not
+# show it.
+#
 # Downstream note: a revalidated run's build log carries no per-task result
 # lines and no final-verdict line. scripts/eval_dashboard/collect.py already
 # tolerates that shape -- aborted runs produce taskless builds today -- and
@@ -121,8 +135,8 @@ readonly REVALIDATION_REPO_KEY="gke-labs/kube-agents"
 readonly REVALIDATION_DEFAULT_BASE_REF="main"
 # Where the Prow-posted status events live: the attestation that a claimed
 # green build really ran and really passed (see the trust-surface note
-# above). Read with BENCH_GITHUB_TOKEN when the job mounts one, falling back
-# to an anonymous read of the public repo.
+# above). Read with the credential revalidation_read_credential chooses
+# (header, "GitHub read credential").
 readonly REVALIDATION_STATUS_API="https://api.github.com/repos/gke-labs/kube-agents/commits"
 # How many of the newest builds to inspect for a green one. Each costs one
 # gsutil cat (~1s); an active PR rarely stacks this many pushes between
@@ -132,6 +146,17 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 # PULL_REFS as "<base_ref>:<base_sha>,<number>:<sha>[,...]" (each pull entry
 # may carry a third ":<ref>" field) with no PULL_NUMBER or PULL_PULL_SHA.
 readonly REVALIDATION_BATCH_JOB_TYPE="batch"
+# The mint behind the read credential (header, "GitHub read credential"):
+# the harness's own, beside this file. Its one argument is the exit code it
+# uses for a failure another attempt could survive; step 0 does not retry,
+# so a transient and a credential fault are the same full run, and the code
+# is passed only because the module's contract asks for one. The body is the
+# narrowest the mint accepts, and all a public repository's statuses need.
+REVALIDATION_MINT_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ledger_token_mint.py"
+readonly REVALIDATION_MINT_SCRIPT
+readonly REVALIDATION_MINT_BODY='{"permissions":{"metadata":"read"}}'
+readonly REVALIDATION_MINT_RETRYABLE=75
+readonly REVALIDATION_STATUS_TIMEOUT_SECONDS=30
 
 _revalidation_print_delta() { # <label> <range> <files-or-empty>
   echo "${1} (${2}):"
@@ -140,6 +165,31 @@ _revalidation_print_delta() { # <label> <range> <files-or-empty>
   else
     echo "    (empty -- identical trees, trivially inert)"
   fi
+}
+
+# Chooses the credential the status reads carry, says which in the log, and
+# leaves it in REVALIDATION_STATUS_TOKEN (empty for an anonymous read). Once
+# per run, ahead of the pulls, so a batch mints once. Returns 1 when a key
+# file is set and the mint fails: that is a full run, not an anonymous
+# retry and not the mounted PAT -- the mint's own message precedes the
+# reason line. Header, "GitHub read credential".
+revalidation_read_credential() {
+  REVALIDATION_STATUS_TOKEN=""
+  if [ -n "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    local minted
+    if ! minted="$(LEDGER_MINT_BODY="${REVALIDATION_MINT_BODY}" python3 "${REVALIDATION_MINT_SCRIPT}" "${REVALIDATION_MINT_RETRYABLE}")"; then
+      echo "Step 0: full run: could not mint a GitHub read token from the App key at ${EVAL_LEDGER_APP_KEY_FILE} (the mint's message is above); not reading anonymously and not reading the mounted PAT"
+      return 1
+    fi
+    REVALIDATION_STATUS_TOKEN="${minted%% *}"
+    echo "Step 0: GitHub statuses read with a token minted from the App key at ${EVAL_LEDGER_APP_KEY_FILE}, narrowed to ${REVALIDATION_MINT_BODY}, expires ${minted##* }"
+  elif [ -n "${BENCH_GITHUB_TOKEN:-}" ]; then
+    REVALIDATION_STATUS_TOKEN="${BENCH_GITHUB_TOKEN}"
+    echo "Step 0: GitHub statuses read with the BENCH_GITHUB_TOKEN this shell holds (no EVAL_LEDGER_APP_KEY_FILE to mint from)"
+  else
+    echo "Step 0: GitHub statuses read anonymously: neither EVAL_LEDGER_APP_KEY_FILE nor BENCH_GITHUB_TOKEN is set, so the read shares this host's anonymous rate limit"
+  fi
+  return 0
 }
 
 # revalidate_one_pull <number> <head-sha> <base-sha>
@@ -260,29 +310,55 @@ print(base, head)
     echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
     return 1
   fi
-  local statuses curl_auth=()
-  [ -n "${BENCH_GITHUB_TOKEN:-}" ] && curl_auth=(-H "Authorization: Bearer ${BENCH_GITHUB_TOKEN}")
-  statuses="$(curl -fsS --max-time 30 ${curl_auth[@]+"${curl_auth[@]}"} "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
-    || statuses="$(curl -fsS --max-time 30 "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
-    || { echo "Step 0: full run: could not read GitHub statuses for ${prev_head} to attest green build ${prev_green}"; return 1; }
-  if ! printf '%s' "${statuses}" | python3 -c '
+  # The read carries the credential revalidation_read_credential chose,
+  # handed to python through its environment so it is on no argv. One
+  # attempt: a read GitHub refuses names its HTTP code and is a full run,
+  # with no second, anonymous try (header, "GitHub read credential").
+  local attested
+  attested="$(REVALIDATION_STATUS_TOKEN="${REVALIDATION_STATUS_TOKEN:-}" python3 -c '
 import json
+import os
 import sys
+import urllib.error
+import urllib.request
 
-context, build = sys.argv[1], sys.argv[2]
+url, context, build, timeout = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+headers = {"Accept": "application/vnd.github+json", "User-Agent": "kube-agents-ci-revalidate"}
+token = os.environ.get("REVALIDATION_STATUS_TOKEN")
+if token:
+    headers["Authorization"] = "Bearer " + token
+try:
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
+        statuses = json.load(response)
+except urllib.error.HTTPError as exc:
+    print("http", exc.code)
+    sys.exit(0)
+except Exception as exc:
+    print("error", type(exc).__name__)
+    sys.exit(0)
 needle = "/" + context + "/" + build
-for status in json.load(sys.stdin):
+for status in statuses:
     if (
         status.get("context") == context
         and status.get("state") == "success"
         and needle in (status.get("target_url") or "")
     ):
+        print("attested")
         sys.exit(0)
-sys.exit(1)
-' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null; then
-    echo "Step 0: full run: GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green} -- refusing to trust the GCS record alone"
-    return 1
-  fi
+print("absent")
+' "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" 2>/dev/null)" || attested="error python3"
+  case "${attested}" in
+    attested) ;;
+    absent)
+      echo "Step 0: full run: GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green} -- refusing to trust the GCS record alone"
+      return 1 ;;
+    http\ *)
+      echo "Step 0: full run: GitHub answered HTTP ${attested#http } reading statuses for ${prev_head} to attest green build ${prev_green}; not retrying anonymously"
+      return 1 ;;
+    *)
+      echo "Step 0: full run: could not read GitHub statuses for ${prev_head} to attest green build ${prev_green} (${attested#error })"
+      return 1 ;;
+  esac
 
   # The head itself has passed: the first kind of reusable verdict. The
   # base is not compared -- a retest Tide starts because main moved, serial
@@ -364,10 +440,6 @@ revalidate_against_green_history() {
     echo "Step 0: full run: no python3 on PATH to parse the job records with"
     return 1
   fi
-  if ! command -v curl >/dev/null 2>&1; then
-    echo "Step 0: full run: no curl on PATH to read the GitHub status attestation with"
-    return 1
-  fi
 
   # The pulls to revalidate, one "<number> <head-sha>" per line. JOB_TYPE
   # decides which shape is read: a batch's pulls are PULL_REFS and nothing
@@ -422,6 +494,8 @@ for entry in entries[1:]:
     echo "Step 0: full run: not a decorated Prow presubmit or batch (PULL_NUMBER, PULL_PULL_SHA or PULL_BASE_SHA unset, and JOB_TYPE is not batch)"
     return 1
   fi
+
+  revalidation_read_credential || return 1
 
   REVALIDATION_REUSED=()
   local number head

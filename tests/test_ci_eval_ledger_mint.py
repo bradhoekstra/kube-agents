@@ -34,6 +34,7 @@ from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
+_LEDGER_MINT = _REPO_ROOT / "hack" / "ledger_token_mint.py"
 
 # What the stub reports, mirroring _ledger_token_mint's own contract: the
 # retryable code is read out of the script rather than written here, because a
@@ -202,7 +203,7 @@ class LedgerMintRetryTest(unittest.TestCase):
 
 
 # Installed through PYTHONPATH: python imports sitecustomize at startup, so the
-# heredoc's urllib.request.urlopen is replaced before the mint runs. The
+# mint module's urllib.request.urlopen is replaced before the mint runs. The
 # request it was handed is written out for the test to read.
 _FAKE_URLOPEN = textwrap.dedent(
     '''
@@ -234,14 +235,14 @@ _FAKE_URLOPEN = textwrap.dedent(
 
 
 class LedgerMintRequestTest(unittest.TestCase):
-    """The Python half of _ledger_token_mint, run for real against a faked GitHub.
+    """hack/ledger_token_mint.py, run for real through _ledger_token_mint against a faked GitHub.
 
     The retry tests above stub the mint in shell, so the lines that turn
     LEDGER_MINT_BODY into the POST's data and Content-Type never ran under
     test, and a regression there -- `data=mint_data` dropped, the `if
     mint_body:` inverted -- would mint the installation's whole grant (issues:
     write on every pool repository since the ledger reset's grant) and stay
-    green. Here the real heredoc signs with a throwaway RSA key and posts to
+    green. Here the real mint module signs with a throwaway RSA key and posts to
     a urlopen installed through sitecustomize, and the request is asserted.
     """
 
@@ -265,6 +266,10 @@ class LedgerMintRequestTest(unittest.TestCase):
         script = "\n".join(
             [
                 "set -euo pipefail",
+                # The mint module lives beside the script; the extracted
+                # constant finds it through the same SCRIPT_DIR the script sets.
+                f'SCRIPT_DIR="{_CI_EVAL_PR.parent}"',
+                _extract(r"^LEDGER_MINT_SCRIPT=[^\n]*$", "LEDGER_MINT_SCRIPT"),
                 _extract(r"^LEDGER_MINT_RETRYABLE=\d+$", "LEDGER_MINT_RETRYABLE"),
                 _extract(r"^LEDGER_MINT_ATTEMPTS=\d+$", "LEDGER_MINT_ATTEMPTS"),
                 _extract(r"^LEDGER_RESET_MINT_ATTEMPTS=\d+$", "LEDGER_RESET_MINT_ATTEMPTS"),
@@ -334,7 +339,7 @@ class LedgerMintRequestTest(unittest.TestCase):
 class LedgerMintContractTest(unittest.TestCase):
     """The two halves of the retry live in different languages.
 
-    The shell decides what it retries; the python inside _ledger_token_mint
+    The shell decides what it retries; the python in hack/ledger_token_mint.py
     decides what is retryable. A literal written twice would let them drift
     into a mint that retries a wrong PEM three times, or reports a network
     blip as a credential fault.
@@ -342,11 +347,11 @@ class LedgerMintContractTest(unittest.TestCase):
 
     def test_the_python_is_handed_the_retryable_code_rather_than_repeating_it(self):
         body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
-        self.assertIn('python3 - "${LEDGER_MINT_RETRYABLE}"', body)
-        self.assertIn("retryable = int(sys.argv[1])", body)
+        self.assertIn('python3 "${LEDGER_MINT_SCRIPT}" "${LEDGER_MINT_RETRYABLE}"', body)
+        self.assertIn("retryable = int(sys.argv[1])", _LEDGER_MINT.read_text(encoding="utf-8"))
 
     def test_a_credential_answer_from_github_is_terminal(self):
-        body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
+        body = _LEDGER_MINT.read_text(encoding="utf-8")
         branch = re.search(r"except urllib\.error\.HTTPError.*?^except", body, re.S | re.M)
         self.assertIsNotNone(branch, "could not find the HTTPError branch")
         # Server-side and rate-limited answers retry; every other status, which
@@ -356,7 +361,7 @@ class LedgerMintContractTest(unittest.TestCase):
         self.assertIn("sys.exit(message)", branch.group(0))
 
     def test_an_unreachable_api_is_retryable(self):
-        body = _extract(r"^_ledger_token_mint\(\) \{.*?^\}", "_ledger_token_mint")
+        body = _LEDGER_MINT.read_text(encoding="utf-8")
         branch = re.search(r"^except Exception as exc:.*?^print\(", body, re.S | re.M)
         self.assertIsNotNone(branch, "could not find the catch-all branch")
         self.assertIn("temporary(", branch.group(0))

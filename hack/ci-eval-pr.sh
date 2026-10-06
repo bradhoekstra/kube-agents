@@ -788,117 +788,18 @@ LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read"
 # before its close. Narrowed to the leased repository at mint, as the ledger
 # reset's issues: write is (docs/ci-pool-projects.md 5.3).
 AGENT_PULLS_RESET_PERMISSIONS='{"pull_requests":"write","contents":"write","issues":"write"}'
+# The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
+# _ledger_token_mint below.
+LEDGER_MINT_SCRIPT="${SCRIPT_DIR}/ledger_token_mint.py"
 
 # Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
 # any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
-# 1 when it could not. Its own function rather than inline in the command
-# substitution below: bash 3.2, which is what macOS ships and what a
-# contributor runs `bash -n` with, mis-parses a heredoc inside $( ).
+# 1 when it could not. The Python is hack/ledger_token_mint.py rather than a
+# heredoc here so that step 0 (hack/ci-revalidate.sh) mints the same way from
+# the same file: the key path, the ids and the body reach it through the
+# environment, and argv carries the retryable code alone.
 _ledger_token_mint() {
-  python3 - "${LEDGER_MINT_RETRYABLE}" <<'PY'
-import base64
-import json
-import os
-import subprocess
-import sys
-import time
-import urllib.error
-import urllib.request
-
-# Passed in rather than duplicated, so the two halves of the contract cannot
-# drift: the shell decides what it retries, this decides what is retryable.
-retryable = int(sys.argv[1])
-
-
-def temporary(message):
-    sys.stderr.write(message + "\n")
-    sys.exit(retryable)
-
-
-key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
-app_id = os.environ["EVAL_LEDGER_APP_ID"]
-installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
-# What the token may reach. The grading mint asks for its three reads
-# (LEDGER_GRADING_MINT_BODY) and the ledger reset asks for one repository and
-# `issues: write` (ledger_reset_token). An empty body would mean the
-# installation's whole grant -- issues: write on every pool repository -- so
-# it is refused here rather than sent: a caller that forgets the body fails
-# to mint instead of silently holding the widest token there is. A token
-# narrowed at mint cannot be widened by whoever holds it afterwards.
-mint_body = os.environ.get("LEDGER_MINT_BODY", "").strip()
-if not mint_body:
-    sys.exit(
-        "LEDGER_MINT_BODY is empty; refusing to mint for App %s: a mint without a body "
-        "receives the installation's whole grant, and every caller names what it asks for"
-        % app_id
-    )
-
-
-def b64(raw):
-    return base64.urlsafe_b64encode(raw).rstrip(b"=")
-
-
-# GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
-# room for clock skew, and the backdated iat covers a runner that is slow.
-now = int(time.time())
-header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
-payload = b64(
-    json.dumps(
-        {"iat": now - 60, "exp": now + 540, "iss": app_id}, separators=(",", ":")
-    ).encode()
-)
-signing_input = header + b"." + payload
-
-signed = subprocess.run(
-    ["openssl", "dgst", "-sha256", "-sign", key_file],
-    input=signing_input,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE,
-)
-if signed.returncode != 0:
-    sys.exit(
-        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:300])
-    )
-jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
-
-mint_headers = {"Authorization": "Bearer " + jwt, "Accept": "application/vnd.github+json", "Content-Type": "application/json", "User-Agent": "kube-agents-ci-eval-pr"}
-request = urllib.request.Request(
-    "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
-    method="POST",
-    headers=mint_headers,
-    data=mint_body.encode(),
-)
-try:
-    with urllib.request.urlopen(request, timeout=30) as response:
-        body = json.load(response)
-except urllib.error.HTTPError as exc:
-    # 401: the PEM is not App app_id's. 404: the installation id is wrong, or
-    # the App was uninstalled from the org. Neither survives another attempt,
-    # and a caller holding two locks should hear about them on the first.
-    # 403 stays terminal with them: on this endpoint it is a suspended
-    # installation as often as a secondary rate limit, and the two read alike
-    # from here. 422 is terminal too: with a body it means the installation
-    # does not hold a permission or repository the body asked for, which is
-    # an organisation-settings change, not something a retry reaches.
-    message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
-        exc.code,
-        exc.reason,
-        app_id,
-        installation_id,
-    )
-    if exc.code >= 500 or exc.code == 429:
-        temporary(message)
-    sys.exit(message)
-except Exception as exc:
-    # A timeout, a reset connection, DNS: api.github.com was not reached, which
-    # says nothing about the credential.
-    temporary(
-        "could not reach api.github.com to mint for App %s (%s: %s)"
-        % (app_id, type(exc).__name__, exc)
-    )
-
-print(body["token"] + " " + body["expires_at"])
-PY
+  python3 "${LEDGER_MINT_SCRIPT}" "${LEDGER_MINT_RETRYABLE}"
 }
 
 # Puts a fresh token in the CALLING shell's BENCH_GITHUB_TOKEN and prints where

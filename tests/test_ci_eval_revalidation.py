@@ -9,9 +9,11 @@ history, unreadable or unparsable records, a commit the checkout does not
 have, a single non-inert file on either side, one pull of a batch without a
 verdict, the escape hatch -- must fall through to a full run.
 
-The script is copied into a fixture checkout and sourced, then executed with
-`gsutil` and `curl` stubbed and the fixture git repository standing in for
-the decorated checkout, so these assertions are against the code that ships.
+The script is copied into a fixture checkout (with the mint module beside
+it) and sourced, then executed with `gsutil` stubbed, GitHub faked by a
+`sitecustomize` that replaces urlopen for every python the script runs, and
+the fixture git repository standing in for the decorated checkout, so these
+assertions are against the code that ships.
 The REVALIDATED log line's shape is pinned because humans grep build logs for
 it, and so that any future dashboard-collector support has a stable line to
 key on (scripts/eval_dashboard/collect.py reads nothing from it today).
@@ -23,6 +25,7 @@ import pathlib
 import subprocess
 import unittest.mock
 import tempfile
+import textwrap
 import unittest
 
 from tests.testing.common import get_isolated_test_env
@@ -30,6 +33,7 @@ from tests.testing.common import get_isolated_test_env
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_EVAL_PR = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _CI_REVALIDATE = _REPO_ROOT / "hack" / "ci-revalidate.sh"
+_LEDGER_MINT = _REPO_ROOT / "hack" / "ledger_token_mint.py"
 
 _PR = "77"
 _OTHER_PR = "78"
@@ -76,21 +80,62 @@ esac
 """
 
 
-_CURL_STUB = """#!/usr/bin/env bash
-# curl stub for the GitHub status attestation: serves
-# GITHUB_STATUS_DIR/<sha>.json for .../commits/<sha>/statuses requests and
-# fails like `curl -f` otherwise. Flags are skipped; the URL is the last
-# argument.
-url=""
-for arg in "$@"; do url="${arg}"; done
-sha="$(printf '%s' "${url}" | sed -n 's|.*/commits/\\([0-9a-f]*\\)/statuses.*|\\1|p')"
-object="${GITHUB_STATUS_DIR:-}/${sha}.json"
-if [ -n "${sha}" ] && [ -f "${object}" ]; then
-  cat "${object}"
-else
-  exit 22
-fi
-"""
+# Installed through PYTHONPATH: python imports sitecustomize at startup, so
+# every urllib.request.urlopen the script's python runs -- the mint and the
+# status read -- lands here, and the GitHub a test wants is the one it
+# serves. Each request is appended to GITHUB_REQUEST_LOG as one JSON line
+# (url, method, Authorization header, body), so a test can pin which
+# credential a read carried and that a refused read was not tried again.
+# Statuses come from GITHUB_STATUS_DIR/<sha>.json, or an empty list for a
+# head with no file, which is what GitHub answers for a commit with no
+# events; GITHUB_FAKE_STATUS_HTTP forces an HTTP error on the read and
+# GITHUB_FAKE_MINT_HTTP one on the mint.
+_FAKE_GITHUB = textwrap.dedent(
+    '''
+    import io
+    import json
+    import os
+    import re
+    import urllib.error
+    import urllib.request
+
+
+    def _answer(url, code, payload):
+        body = io.BytesIO(json.dumps(payload).encode())
+        if code >= 400:
+            raise urllib.error.HTTPError(url, code, "fake", {}, body)
+        return body
+
+
+    def _fake_urlopen(request, timeout=None):
+        url = request.full_url
+        with open(os.environ["GITHUB_REQUEST_LOG"], "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "url": url,
+                "method": request.get_method(),
+                "authorization": request.get_header("Authorization"),
+                "data": request.data.decode() if request.data is not None else None,
+            }) + "\\n")
+        if "/access_tokens" in url:
+            code = int(os.environ.get("GITHUB_FAKE_MINT_HTTP") or 201)
+            minted = {"token": "ghs_minted", "expires_at": "2026-10-06T12:00:00Z"}
+            return _answer(url, code, minted if code == 201 else {"message": "fake mint failure"})
+        found = re.search(r"/commits/([0-9a-f]+)/statuses", url)
+        if not found:
+            return _answer(url, 500, {"message": "the fake serves mints and status reads only"})
+        forced = os.environ.get("GITHUB_FAKE_STATUS_HTTP")
+        if forced:
+            return _answer(url, int(forced), {"message": "fake status failure"})
+        path = os.path.join(os.environ.get("GITHUB_STATUS_DIR", ""), found.group(1) + ".json")
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as fh:
+                return io.BytesIO(fh.read().encode())
+        return _answer(url, 200, [])
+
+
+    urllib.request.urlopen = _fake_urlopen
+    '''
+)
 
 
 class RevalidationTest(unittest.TestCase):
@@ -101,13 +146,16 @@ class RevalidationTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = pathlib.Path(tmp.name)
 
-        # The stub gsutil and curl, first on PATH.
+        # The stub gsutil, first on PATH; the fake GitHub, first on PYTHONPATH.
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        for name, content in (("gsutil", _GSUTIL_STUB), ("curl", _CURL_STUB)):
-            stub = self.bin / name
-            stub.write_text(content)
-            stub.chmod(0o755)
+        stub = self.bin / "gsutil"
+        stub.write_text(_GSUTIL_STUB)
+        stub.chmod(0o755)
+        self.pysite = self.tmp / "pysite"
+        self.pysite.mkdir()
+        (self.pysite / "sitecustomize.py").write_text(_FAKE_GITHUB, encoding="utf-8")
+        self.requests_log = self.tmp / "github.requests"
 
         self.objects = self.tmp / "objects"
         self.objects.mkdir()
@@ -213,7 +261,7 @@ class RevalidationTest(unittest.TestCase):
     # built from os.environ, and a developer's shell may export the very
     # variable a test is unsetting: JOB_TYPE and PULL_REFS from a live batch
     # run, EVAL_SKIP_REVALIDATION as the operator's lever.
-    _NEUTRALISED = ("JOB_TYPE", "PULL_REFS", "EVAL_SKIP_REVALIDATION")
+    _NEUTRALISED = ("JOB_TYPE", "PULL_REFS", "EVAL_SKIP_REVALIDATION", "EVAL_LEDGER_APP_KEY_FILE")
 
     def _install_script(self):
         """The shipped script, copied into the fixture repo's hack/ so its own
@@ -221,7 +269,25 @@ class RevalidationTest(unittest.TestCase):
         way it points at the real one in the pod."""
         copy = self.repo / "hack" / "ci-revalidate.sh"
         copy.write_text(_CI_REVALIDATE.read_text(encoding="utf-8"))
+        # The mint module the script finds beside itself, as in the pod.
+        (self.repo / "hack" / _LEDGER_MINT.name).write_text(_LEDGER_MINT.read_text(encoding="utf-8"))
         return copy
+
+    def _requests(self):
+        """Every GitHub request the run made, oldest first."""
+        if not self.requests_log.exists():
+            return []
+        return [json.loads(line) for line in self.requests_log.read_text(encoding="utf-8").splitlines()]
+
+    def _throwaway_key(self):
+        key = self.tmp / "throwaway.pem"
+        try:
+            gen = subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"], capture_output=True, text=True)
+        except FileNotFoundError:  # pragma: no cover - a machine without openssl
+            self.skipTest("openssl is not on PATH, and the mint signs its JWT with it")
+        if gen.returncode != 0:  # pragma: no cover
+            self.skipTest(f"openssl could not generate a throwaway key: {gen.stderr}")
+        return key
 
     def _base_env(self, cur_head, cur_base):
         self.call_log = self.tmp / "gsutil.calls"
@@ -237,6 +303,8 @@ class RevalidationTest(unittest.TestCase):
             "GSUTIL_LS_DIR": str(self.listings),
             "GSUTIL_CALL_LOG": str(self.call_log),
             "GITHUB_STATUS_DIR": str(self.statuses),
+            "GITHUB_REQUEST_LOG": str(self.requests_log),
+            "PYTHONPATH": str(self.pysite),
             "BENCH_GITHUB_TOKEN": "",
         }
         # None: absent from the child's environment, not set to an empty
@@ -771,6 +839,106 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("not a decorated Prow presubmit", proc.stdout)
 
 
+    # ── the read credential ──────────────────────────────────────────────────
+
+    def test_the_app_key_mints_the_read_token_and_the_pat_is_never_sent(self):
+        """With the key file set the status read carries a token minted from
+        it, narrowed to metadata: read, and the PAT the pod also mounts is
+        on no request -- the harness's own rule, now step 0's."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head=self.c4,
+            cur_base=self.c2,
+            env_overrides={
+                "EVAL_LEDGER_APP_KEY_FILE": str(self._throwaway_key()),
+                "BENCH_GITHUB_TOKEN": "the-mounted-pat",
+            },
+        )
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertIn("GitHub statuses read with a token minted from the App key", proc.stdout)
+        mints = [r for r in self._requests() if "/access_tokens" in r["url"]]
+        reads = [r for r in self._requests() if "/statuses" in r["url"]]
+        self.assertEqual(1, len(mints), self._requests())
+        self.assertEqual({"permissions": {"metadata": "read"}}, json.loads(mints[0]["data"]))
+        self.assertIn("/app/installations/157029058/access_tokens", mints[0]["url"])
+        self.assertEqual(["Bearer ghs_minted"], [r["authorization"] for r in reads])
+        self.assertNotIn("the-mounted-pat", proc.stdout + proc.stderr + self.requests_log.read_text())
+
+    def test_a_batch_mints_once_for_all_its_pulls(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_history([("300", True, self.c1, self.c4)], pr=_OTHER_PR)
+        proc = self._run(
+            cur_head=self.c3,
+            cur_base=self.c1,
+            env_overrides={
+                "JOB_TYPE": "batch",
+                "PULL_NUMBER": None,
+                "PULL_PULL_SHA": None,
+                "PULL_REFS": f"main:{self.c1},{_PR}:{self.c3},{_OTHER_PR}:{self.c4}",
+                "EVAL_LEDGER_APP_KEY_FILE": str(self._throwaway_key()),
+            },
+        )
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertEqual(1, len([r for r in self._requests() if "/access_tokens" in r["url"]]))
+        self.assertEqual(2, len([r for r in self._requests() if "/statuses" in r["url"]]))
+
+    def test_a_failed_mint_is_a_full_run_with_no_anonymous_read(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head=self.c4,
+            cur_base=self.c2,
+            env_overrides={
+                "EVAL_LEDGER_APP_KEY_FILE": str(self._throwaway_key()),
+                "GITHUB_FAKE_MINT_HTTP": "401",
+                "BENCH_GITHUB_TOKEN": "the-mounted-pat",
+            },
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("Step 0: full run: could not mint a GitHub read token", proc.stdout)
+        self.assertEqual(1, proc.stdout.count("Step 0: full run:"), proc.stdout)
+        # The mint's own diagnostic precedes the reason line, on stderr.
+        self.assertIn("HTTP 401", proc.stderr)
+        self.assertEqual([], [r for r in self._requests() if "/statuses" in r["url"]])
+
+    def test_without_a_key_the_shells_token_is_used_and_said_so(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2, env_overrides={"BENCH_GITHUB_TOKEN": "shell-token"})
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertIn("read with the BENCH_GITHUB_TOKEN this shell holds", proc.stdout)
+        self.assertEqual(["Bearer shell-token"], [r["authorization"] for r in self._requests()])
+
+    def test_without_any_credential_the_read_is_anonymous_and_said_so(self):
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertIn("GitHub statuses read anonymously", proc.stdout)
+        self.assertEqual([None], [r["authorization"] for r in self._requests()])
+
+    def test_a_refused_status_read_is_a_full_run_with_no_second_attempt(self):
+        """What the old curl pair did on any failure was try again
+        anonymously, in silence; a refused read now names its code and is
+        tried once."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(
+            cur_head=self.c4,
+            cur_base=self.c2,
+            env_overrides={"BENCH_GITHUB_TOKEN": "shell-token", "GITHUB_FAKE_STATUS_HTTP": "403"},
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("GitHub answered HTTP 403 reading statuses", proc.stdout)
+        self.assertIn("not retrying anonymously", proc.stdout)
+        self.assertEqual(1, len([r for r in self._requests() if "/statuses" in r["url"]]))
+
+    def test_the_token_reaches_python_through_the_environment_not_argv(self):
+        """ps shows argv to every process on the node; it does not show the
+        environment. The read's python takes the token from there, and no
+        shell line builds an Authorization header."""
+        text = _CI_REVALIDATE.read_text(encoding="utf-8")
+        self.assertIn('os.environ.get("REVALIDATION_STATUS_TOKEN")', text)
+        self.assertNotIn("Authorization: Bearer ${", text)
+        self.assertNotIn("curl", text)
+
+
 class RevalidationEntrypointTest(unittest.TestCase):
     """The executed script, not the sourced function: both callers (the Prow
     job ahead of the lease, and hack/ci-eval-pr.sh) read only its exit code,
@@ -784,6 +952,7 @@ class RevalidationEntrypointTest(unittest.TestCase):
     _plant_statuses = RevalidationTest._plant_statuses
     _NEUTRALISED = RevalidationTest._NEUTRALISED
     _install_script = RevalidationTest._install_script
+    _requests = RevalidationTest._requests
     _base_env = RevalidationTest._base_env
     _child_env = RevalidationTest._child_env
 
