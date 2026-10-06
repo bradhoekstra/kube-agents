@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 )
 
 // PreventDeletionAnnotation blocks deletion when set to "true".
@@ -53,6 +54,29 @@ const PreventDeletionAnnotation = "kubeagents.x-k8s.io/prevent-deletion"
 // container port and config/webhook/service.yaml as the Service targetPort. A mismatch
 // reproduces exactly the outage described above, so TestWebhookPortsMatchDefault guards it.
 const DefaultPort = 10250
+
+// The credential-proxy sizing checks (validateCredentialProxyResources).
+//
+// GKE Autopilot's general-purpose compute class admits a container unchanged
+// only while its memory sits between 1 GiB and 6.5 GiB per vCPU, and raises the
+// smaller side of the pair to reach the band otherwise. The operator declares
+// the proxy's defaults at the lower edge of that band (500m and 512Mi) so the
+// manifest it writes is the pod Autopilot admits; an override that leaves the
+// band is admitted at figures the CR does not show, and the chart's quota
+// preflight, which sums the CR's figures, is short by the difference. A
+// warning rather than a refusal: the pod still runs, and on Standard nothing
+// is resized at all.
+const (
+	autopilotMinMemoryBytesPerVCPU int64 = 1 << 30
+	autopilotMaxMemoryBytesPerVCPU int64 = 6656 << 20 // 6.5 GiB
+	milliCPUPerCPU                 int64 = 1000
+	bytesPerMiB                    int64 = 1 << 20
+	bytesPerGiB                    int64 = 1 << 30
+)
+
+// credentialProxyResourceNames are the quantities the operator declares on the
+// proxy container, and so the ones a request can exceed a limit on.
+var credentialProxyResourceNames = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 
 // The two refusals validateBusCredentialSource makes, one per route in
 // agentv1alpha1.BusCredentialRoutes. Each names the thing matched, so the
@@ -142,6 +166,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	var allErrs field.ErrorList
+	var warnings admission.Warnings
 
 	// 1. Enforce 1 PlatformAgent per cluster limit (enforced at cluster level on the Hub/Management cluster)
 	if v.Client != nil {
@@ -248,6 +273,14 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 			}
 			seenPullSecrets[name] = struct{}{}
 		}
+
+		// 2f. The credential-proxy container's requests and limits, checked as
+		// the operator will render them rather than as written: the override is
+		// merged over the defaults per key, so a CR that raises only
+		// requests.memory collides with a limit it never wrote.
+		proxyErrs, proxyWarnings := validateCredentialProxyResources(platformAgent.Spec.Deployment, depPath.Child("credentialProxy", "resources"))
+		allErrs = append(allErrs, proxyErrs...)
+		warnings = append(warnings, proxyWarnings...)
 	}
 
 	// 3. Validate Security ServiceAccountName
@@ -272,8 +305,9 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	// applied to everyone. `spec.integration.github` is a deprecated alias that
 	// resolves to the same declaration, so the field paths below are rendered in
 	// whichever spelling was written.
-	gitErrs, warnings := validateGitIntegration(platformAgent.Spec.Integration)
+	gitErrs, gitWarnings := validateGitIntegration(platformAgent.Spec.Integration)
 	allErrs = append(allErrs, gitErrs...)
+	warnings = append(warnings, gitWarnings...)
 
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
@@ -284,6 +318,91 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return warnings, nil
+}
+
+// validateCredentialProxyResources checks spec.deployment.credentialProxy.resources
+// on the result the operator renders: its defaults with the CR's keys merged
+// over them (controller.CredentialProxyResources). Three checks, two of them
+// refusals:
+//
+//  1. The memory limit admits at least two brokered commands at once. The
+//     broker derives how many it admits from the limit it reads through the
+//     Downward API, and its degenerate case admits a request that does not fit
+//     rather than refusing forever, so a limit set too low is a slower OOM, not
+//     an error anywhere else. The message names the floor and what the given
+//     limit would have admitted.
+//  2. No request exceeds its limit. The API server would refuse the Deployment
+//     the operator writes, which surfaces as a reconcile error on an object the
+//     author never wrote; refusing here puts the error on the field that has
+//     the problem, and names which side is the operator's default when the CR
+//     set only the other one.
+//  3. A warning when either the request pair or the limit pair leaves the
+//     memory-per-vCPU band Autopilot admits unchanged (the constants above).
+//
+// Nothing runs when the CR carries no override: the defaults satisfy all three
+// by construction, and the sizing test in internal/controller pins that.
+func validateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, path *field.Path) (field.ErrorList, admission.Warnings) {
+	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
+		return nil, nil
+	}
+	override := deployment.CredentialProxy.Resources
+	merged := controller.CredentialProxyResources(deployment)
+	var errs field.ErrorList
+	var warnings admission.Warnings
+
+	limit := merged.Limits[corev1.ResourceMemory]
+	floor := controller.CredentialProxyMemoryLimitFloorBytes()
+	if limit.Value() < floor {
+		errs = append(errs, field.Invalid(
+			path.Child("limits", "memory"), limit.String(),
+			fmt.Sprintf("a %s memory limit admits %d brokered command(s) at once; the credential proxy needs at least %dMi to admit %d, which is the floor (its resident and content-workspace reserves plus two commands' child and output allowances at the operator's output cap)",
+				limit.String(), controller.CredentialProxyAdmittedRequests(limit.Value()), floor/bytesPerMiB, controller.CredentialProxyAdmittedRequests(floor)),
+		))
+	}
+
+	for _, name := range credentialProxyResourceNames {
+		request, hasRequest := merged.Requests[name]
+		limit, hasLimit := merged.Limits[name]
+		if !hasRequest || !hasLimit || request.Cmp(limit) <= 0 {
+			continue
+		}
+		// The defaults are consistent with each other, so at least one side of
+		// a crossed pair is the override's; the error goes on that side, and
+		// says when the other is the operator's.
+		_, overrodeRequest := override.Requests[name]
+		_, overrodeLimit := override.Limits[name]
+		switch {
+		case overrodeRequest && overrodeLimit:
+			errs = append(errs, field.Invalid(path.Child("requests", string(name)), request.String(),
+				fmt.Sprintf("exceeds the %s %s limit set beside it", limit.String(), name)))
+		case overrodeRequest:
+			errs = append(errs, field.Invalid(path.Child("requests", string(name)), request.String(),
+				fmt.Sprintf("exceeds the operator's default %s %s limit, which this override does not raise; set limits.%s as well", limit.String(), name, name)))
+		default:
+			errs = append(errs, field.Invalid(path.Child("limits", string(name)), limit.String(),
+				fmt.Sprintf("is below the operator's default %s %s request, which this override does not lower; set requests.%s as well", request.String(), name, name)))
+		}
+	}
+
+	for _, side := range []struct {
+		name string
+		list corev1.ResourceList
+	}{{"requests", merged.Requests}, {"limits", merged.Limits}} {
+		cpu, hasCPU := side.list[corev1.ResourceCPU]
+		memory, hasMemory := side.list[corev1.ResourceMemory]
+		if !hasCPU || !hasMemory || cpu.IsZero() || memory.IsZero() {
+			continue
+		}
+		bytesPerVCPU := memory.Value() * milliCPUPerCPU / cpu.MilliValue()
+		if bytesPerVCPU >= autopilotMinMemoryBytesPerVCPU && bytesPerVCPU <= autopilotMaxMemoryBytesPerVCPU {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot raises the smaller side into that band, so the pod it admits is larger than this CR declares and the chart's quota preflight, which sums the CR's figures, is short by the difference",
+			path.Child(side.name), memory.String(), cpu.String(), float64(bytesPerVCPU)/float64(bytesPerGiB),
+			autopilotMinMemoryBytesPerVCPU/bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU)/float64(bytesPerGiB)))
+	}
+	return errs, warnings
 }
 
 // validateReservedVolumeMounts refuses a user-authored container that mounts a
