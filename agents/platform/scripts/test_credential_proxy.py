@@ -2854,6 +2854,7 @@ class CommandExecutorTest(unittest.TestCase):
         max_output_bytes=1024,
         kubectl_timeout_seconds=credential_proxy.DEFAULT_KUBECTL_TIMEOUT_SECONDS,
         max_concurrent_commands=credential_proxy.DEFAULT_MAX_CONCURRENT_COMMANDS,
+        memory_limit_bytes=None,
     ):
         return CommandExecutor(
             timeout_seconds=timeout_seconds,
@@ -2862,6 +2863,7 @@ class CommandExecutorTest(unittest.TestCase):
             scoped_pool=None,
             kubectl_timeout_seconds=kubectl_timeout_seconds,
             max_concurrent_commands=max_concurrent_commands,
+            memory_limit_bytes=memory_limit_bytes,
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
@@ -3849,6 +3851,31 @@ class CommandExecutorTest(unittest.TestCase):
             )
         with self.assertRaises(ValueError):
             self.executor(max_concurrent_commands=0)
+
+    def test_an_executor_without_a_limit_has_no_budget(self):
+        # Whatever cgroup the test runner is in: only `serve` derives the limit.
+        executor = self.executor()
+        self.assertIsNone(executor.memory_limit_bytes)
+        self.assertIsNone(executor.children_budget_bytes)
+        self.assertIsNone(executor.requests_the_budget_admits())
+
+    def test_the_budget_is_the_limit_less_the_two_fixed_reserves(self):
+        mib = credential_proxy.MEBIBYTE
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            executor = self.executor(memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib)
+        self.assertEqual(1024 * mib, executor.memory_limit_bytes)
+        self.assertEqual((1024 - 192 - 128) * mib, executor.children_budget_bytes)
+        # 704 MiB against 128 MiB reserve + 6 x 8 MiB output per request = 176 MiB.
+        self.assertEqual(4, executor.requests_the_budget_admits())
+        self.assertTrue(
+            any("child memory budget enabled" in line and "admits 4" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_missing_limit_is_logged_once_at_startup(self):
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            self.executor(memory_limit_bytes=None)
+        self.assertTrue(any("child memory budget disabled" in line for line in logs.output), logs.output)
 
     def test_slots_are_granted_in_arrival_order(self):
         # Under sustained saturation the request that has waited longest must
@@ -6141,7 +6168,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
     def tearDown(self):
         CredentialProxyHandler.enforce_read_only = self.original
 
-    def _serve_with(self, enforce_value):
+    def _serve_with(self, enforce_value, extra_env: dict | None = None):
         owner = self
         bound = []
 
@@ -6185,6 +6212,7 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         }
         if enforce_value is not None:
             environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
+        environment.update(extra_env or {})
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
                     mock.patch.object(credential_proxy, "ThreadingTCPHTTPServer", mock.MagicMock()), \
@@ -6200,6 +6228,18 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
     def test_serve_arms_the_gate_by_default(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
+
+    def test_serve_hands_the_executor_the_container_limit(self):
+        # The derivation runs in `serve`, not in the executor, so a test that
+        # builds an executor directly gets no budget whatever the runner's
+        # cgroup says, and this is the one place the variable has to reach.
+        self._serve_with(None, extra_env={credential_proxy.ENV_MEMORY_LIMIT_BYTES: "1073741824"})
+        self.assertEqual(1073741824, CredentialProxyHandler.executor.memory_limit_bytes)
+
+    def test_serve_disables_the_budget_when_no_limit_is_known(self):
+        with mock.patch.object(credential_proxy, "CGROUP_MEMORY_MAX_PATH", str(Path(self.tmp.name) / "absent")):
+            self._serve_with(None)
+        self.assertIsNone(CredentialProxyHandler.executor.memory_limit_bytes)
 
     def test_serve_disarms_the_gate_when_the_env_var_says_false(self):
         CredentialProxyHandler.enforce_read_only = True

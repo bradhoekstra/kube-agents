@@ -4346,6 +4346,7 @@ class CommandExecutor:
         scoped_pool: "scoped_sa_pool.ScopedServiceAccountPool | None | object" = _FROM_ENVIRONMENT,
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
+        memory_limit_bytes: int | None = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
@@ -4367,6 +4368,39 @@ class CommandExecutor:
         # The deadline the commands of the request on this thread share; set by
         # `request_slot` for as long as the slot is held, read by `_execute`.
         self._request_budget = threading.local()
+        # The child memory budget (design §2.2). None disables it: admission
+        # is then by slot alone, which is what every broker did before the
+        # budget and what a broker with no known limit still does. Derived in
+        # `serve` and handed in explicitly, never read here, so an executor a
+        # test constructs is budgeted only if the test says so.
+        self.memory_limit_bytes = memory_limit_bytes
+        self.children_budget_bytes: int | None = None
+        if memory_limit_bytes is not None:
+            self.children_budget_bytes = (
+                memory_limit_bytes - BROKER_RESIDENT_RESERVE_BYTES - CONTENT_WORKSPACE_RESERVE_BYTES
+            )
+        # Bytes reserved by admitted requests right now; guarded by
+        # `_slot_condition` like the slot count, because admission reads both.
+        self._reserved_bytes = 0
+        # The degenerate case (§2.3) warns once per process, not once per request.
+        self._budget_warned = False
+        if self.children_budget_bytes is None:
+            LOGGER.info(
+                "child memory budget disabled: no container memory limit known (%s unset and %s "
+                "unreadable or unlimited); admission is by slot alone",
+                ENV_MEMORY_LIMIT_BYTES,
+                CGROUP_MEMORY_MAX_PATH,
+            )
+        else:
+            LOGGER.info(
+                "child memory budget enabled limit=%dMiB children=%dMiB per_request=%dMiB "
+                "(admits %d requests at once beside the slot cap of %d)",
+                memory_limit_bytes // MEBIBYTE,
+                self.children_budget_bytes // MEBIBYTE,
+                REQUEST_CHILD_MEMORY_RESERVE_BYTES // MEBIBYTE,
+                self.requests_the_budget_admits(),
+                max_concurrent_commands,
+            )
         self.state_dir = Path(state_dir)
         self.home_dir = self.state_dir / "home"
         self.workspace_dir = Path(
@@ -4600,6 +4634,30 @@ class CommandExecutor:
         """How many requests hold a slot right now."""
         with self._slot_condition:
             return self._slots_in_use
+
+    @property
+    def reserved_bytes(self) -> int:
+        """Bytes the admitted requests have reserved for their children right now."""
+        with self._slot_condition:
+            return self._reserved_bytes
+
+    def _request_cost_bytes(self, takes_slot: bool) -> int:
+        """What one more admitted request costs the budget: its child reserve,
+        plus the broker's own output allowance if it also takes a slot."""
+        cost = REQUEST_CHILD_MEMORY_RESERVE_BYTES
+        if takes_slot:
+            cost += OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes
+        return cost
+
+    def requests_the_budget_admits(self) -> int | None:
+        """How many slot-taking requests fit the budget at once; None when it is off.
+
+        The number the startup line prints and the operator's sizing test
+        derives the same way, so the two can be compared.
+        """
+        if self.children_budget_bytes is None:
+            return None
+        return max(0, self.children_budget_bytes // self._request_cost_bytes(takes_slot=True))
 
     @property
     def queued_requests(self) -> int:
@@ -8099,6 +8157,9 @@ def serve(args: argparse.Namespace) -> None:
         max_concurrent_commands=getattr(
             args, "max_concurrent_commands", DEFAULT_MAX_CONCURRENT_COMMANDS
         ),
+        # The container's limit, through the operator's Downward API variable
+        # or the cgroup file; None, and the budget is off (design §2.4).
+        memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
     )
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
