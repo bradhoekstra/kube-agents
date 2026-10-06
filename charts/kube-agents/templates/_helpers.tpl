@@ -811,7 +811,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- end }}
 
 {{- define "kube-agents.parseCpuMillis" -}}
-{{- $raw := trim (toString .) -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
 {{- $binaryCores := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimalCores := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
@@ -866,8 +866,9 @@ honest — a quota that large cannot constrain this release either way.
 {{- end }}
 
 {{- /* A quantity in the CRD's grammar rewritten into the one parseCpuMillis and
-       parseBytes read: the leading "+" dropped, `.5` written `0.5`, and `1.` written
-       `1`. The sign is the caller's to refuse; this leaves a "-" in place. */ -}}
+       parseBytes read, which both call it first: trimmed, the leading "+" dropped,
+       `.5` written `0.5`, and `1.` written `1`. A "-" is left in place, so a negative
+       still fails the parse. */ -}}
 {{- define "kube-agents.normalizeQuantity" -}}
 {{- $raw := trimPrefix "+" (trim (toString .)) -}}
 {{- if hasPrefix "." $raw -}}
@@ -877,7 +878,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- end }}
 
 {{- define "kube-agents.parseBytes" -}}
-{{- $raw := trim (toString .) -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
 {{- $binary := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimal := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}

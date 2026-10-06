@@ -262,6 +262,18 @@ class PreflightDecisionTest(unittest.TestCase):
             _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
         )
 
+    def test_credential_proxy_quantities_in_the_crds_dotted_forms_are_counted(self) -> None:
+        # `2.Gi` and `.5Ki` are in the CRD's grammar and resource.ParseQuantity reads
+        # them; the preflight parses them as 2Gi and 512 cores rather than refusing.
+        base = self._requirements()
+        raised = self._requirements(values={"platformAgent": {"deployment": {"credentialProxy": {
+            "resources": {"limits": {"memory": "2.Gi", "cpu": ".5Ki"}}}}}})
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
+        )
+        self.assertEqual(raised["limitsCpu"] - base["limitsCpu"], 512 * 1000 - _PROXY_CPU_LIMIT_MILLIS)
+
     def test_credential_proxy_ephemeral_limit_alone_moves_the_request_with_it(self) -> None:
         """An override of limits.ephemeral-storage alone is counted as a request of the same size.
 

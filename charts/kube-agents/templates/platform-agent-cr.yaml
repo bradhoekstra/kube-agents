@@ -231,7 +231,6 @@ spec:
     {{- $proxyNames := list "cpu" "memory" "ephemeral-storage" }}
     {{- /* The CRD's quantity grammar, the sign already stripped, with the
            exponent narrowed to the integer form resource.ParseQuantity reads.
-           kube-agents.normalizeQuantity rewrites `.5` and `1.` so that
            parseCpuMillis and parseBytes read every form this admits. */}}
     {{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" }}
     {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
@@ -263,11 +262,10 @@ spec:
     {{- $proxyParsed := dict "requests" (dict) "limits" (dict) }}
     {{- range $side, $set := $proxyMerged }}
       {{- range $name, $raw := $set }}
-        {{- $normal := include "kube-agents.normalizeQuantity" $raw }}
         {{- if eq $name "cpu" }}
-        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseCpuMillis" $normal | int64) }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseCpuMillis" $raw | int64) }}
         {{- else }}
-        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseBytes" $normal | int64) }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseBytes" $raw | int64) }}
         {{- end }}
       {{- end }}
     {{- end }}
