@@ -4079,6 +4079,70 @@ class CommandExecutorTest(unittest.TestCase):
             logs.output,
         )
 
+    def test_a_request_queued_behind_a_budget_held_head_is_refused_naming_the_budget(self):
+        # Eight slots, one in use: the head waits for the budget, and the
+        # request behind it never reaches the head. The slot cap held neither.
+        executor = self.budgeted(admits=1)
+        holder = self.hold_a_slot(executor, seconds=2)
+        head_refused = []
+
+        def head():
+            try:
+                with executor.request_slot():
+                    pass
+            except credential_proxy.CommandSlotUnavailable as error:
+                head_refused.append(str(error))
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.6):
+            head_thread = threading.Thread(target=head)
+            head_thread.start()
+            deadline = time.monotonic() + 5
+            while executor.queued_requests < 1:
+                if time.monotonic() > deadline:
+                    self.fail("the head never joined the queue")
+                time.sleep(0.01)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                    with executor.request_slot():
+                        self.fail("admitted past the budget")
+            head_thread.join()
+        message = str(raised.exception)
+        self.assertIn("memory budget", message)
+        self.assertNotIn("concurrent commands", message)
+        self.assertEqual(1, executor.slots_in_use)
+        holder.join()
+
+    @staticmethod
+    def wait_for_a_slot(executor):
+        """Queue for a slot and let it go at once; a refusal is fine."""
+        try:
+            with executor.request_slot():
+                pass
+        except credential_proxy.CommandSlotUnavailable:
+            pass
+
+    def test_a_slot_less_reservation_skips_the_queue_when_the_budget_is_off(self):
+        # Disabled, admission is by slot alone: a route that takes no slot
+        # never waits, however full the slots are.
+        executor = self.executor(max_concurrent_commands=1)
+        self.assertIsNone(executor.children_budget_bytes)
+        self.hold_a_slot(executor, seconds=2)
+        waiter = threading.Thread(target=self.wait_for_a_slot, args=(executor,))
+        waiter.start()
+        self.addCleanup(waiter.join)
+        deadline = time.monotonic() + 5
+        while executor.queued_requests < 1:
+            if time.monotonic() > deadline:
+                self.fail("the slot taker never joined the queue")
+            time.sleep(0.01)
+        started = time.monotonic()
+        with executor.reserve_child_memory():
+            self.assertTrue(getattr(executor._request_budget, "reserved", False))
+            self.assertEqual(1, executor.queued_requests)
+            self.assertEqual(0, executor.reserved_bytes)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertFalse(getattr(executor._request_budget, "reserved", False))
+
     def test_a_request_too_large_for_an_empty_budget_is_admitted_with_one_warning(self):
         # The degenerate case (§2.3): a limit so small that nothing fits must
         # not refuse every command forever.

@@ -4751,13 +4751,23 @@ class CommandExecutor:
     def _admit(self, takes_slot: bool, caller: socket.socket | None) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
-        both kinds, so a slot-less reserver is neither starved nor privileged."""
+        both kinds, so a slot-less reserver is neither starved nor privileged.
+        With the budget off a slot-less reserver has nothing to wait for and
+        skips the queue, as the routes that take no slot always have."""
+        if not takes_slot and self.children_budget_bytes is None:
+            previously_reserved = getattr(self._request_budget, "reserved", False)
+            try:
+                self._request_budget.reserved = True
+                yield
+            finally:
+                self._request_budget.reserved = previously_reserved
+            return
         queued_at = time.monotonic()
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         ticket = object()
         # Set once this request reached the head of the queue with a slot free
-        # and the budget alone held it; the refusal and the wait log use it to
-        # name the bound that was hit.
+        # and the budget alone held it; the wait log uses it to name the bound
+        # that held the request.
         blocked_by_budget = False
         with self._slot_condition:
             self._slot_queue.append(ticket)
@@ -4771,7 +4781,13 @@ class CommandExecutor:
                         blocked_by_budget = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        if takes_slot and not blocked_by_budget:
+                        # Named for the bound holding the request now: with a
+                        # slot free, only the budget can be in its way, whether
+                        # it held this request at the head or one ahead of it.
+                        held_by_budget = self.children_budget_bytes is not None and (
+                            not takes_slot or self._slots_in_use < self.max_concurrent_commands
+                        )
+                        if not held_by_budget:
                             # Worded for the queue: slots may well have freed in
                             # the meantime and gone to earlier arrivals, so "none
                             # finished" would be false for a request that was
