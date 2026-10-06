@@ -181,12 +181,40 @@ spec:
       serving a CRD from before the field prunes silently and a reader mistakes
       for an override. The operator merges what is here over its defaults per
       key, so a block carrying only limits.memory is complete as written.
+
+      Each quantity is quoted rather than passed through toYaml, for the reason
+      env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
+      the CRD types a quantity as int-or-string, so the API server refuses the
+      bare number. A nulled leaf (`memory: null`, Helm's way to drop a key) is
+      skipped, so a map holding nothing else writes no block either. Any other
+      key goes through as written, for the operator to refuse by name.
     */}}
     {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
-    {{- if $proxyResources }}
+    {{- $proxyQuantities := dict }}
+    {{- range $side := list "limits" "requests" }}
+      {{- $set := dict }}
+      {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
+        {{- if not (kindIs "invalid" $quantity) }}
+          {{- $_ := set $set $name $quantity }}
+        {{- end }}
+      {{- end }}
+      {{- if $set }}
+        {{- $_ := set $proxyQuantities $side $set }}
+      {{- end }}
+    {{- end }}
+    {{- $proxyOther := omit $proxyResources "limits" "requests" }}
+    {{- if or $proxyQuantities $proxyOther }}
     credentialProxy:
       resources:
-        {{- toYaml $proxyResources | nindent 8 }}
+        {{- range $side, $set := $proxyQuantities }}
+        {{ $side }}:
+          {{- range $name := keys $set | sortAlpha }}
+          {{ $name }}: {{ index $set $name | toString | quote }}
+          {{- end }}
+        {{- end }}
+        {{- with $proxyOther }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}

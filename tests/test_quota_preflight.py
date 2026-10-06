@@ -123,6 +123,8 @@ _PROXY_CPU_REQUEST_MILLIS = 500
 _PROXY_CPU_LIMIT_MILLIS = 1000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+_PROXY_FLOAT_CPU_LIMIT = 1.5
+_PROXY_FLOAT_CPU_LIMIT_MILLIS = 1500
 # The operator renders no ephemeral-storage request on the proxy, so the API server sets it
 # to the limit: footprint.yaml's 2Gi request is that defaulting, and it follows an override
 # of the limit alone.
@@ -193,8 +195,8 @@ class PreflightDecisionTest(unittest.TestCase):
         finally:
             pathlib.Path(values_path).unlink(missing_ok=True)
 
-    def _requirements(self, sets: list[str] | None = None) -> dict:
-        res = self._render({"probe": {"emitRequirements": True}}, sets)
+    def _requirements(self, sets: list[str] | None = None, values: dict | None = None) -> dict:
+        res = self._render({"probe": {"emitRequirements": True}, **(values or {})}, sets)
         self.assertEqual(res.returncode, 0, f"render failed:\n{res.stderr}")
         for doc in yaml.safe_load_all(res.stdout):
             if doc and doc.get("metadata", {}).get("name") == "probe-requirements":
@@ -246,6 +248,20 @@ class PreflightDecisionTest(unittest.TestCase):
         # A request the override does not name keeps the footprint's, not the new limit.
         self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
         self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_credential_proxy_cpu_written_as_a_float_is_counted(self) -> None:
+        # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.
+        base = self._requirements()
+        raised = self._requirements(values={"platformAgent": {"deployment": {"credentialProxy": {
+            "resources": {"limits": {"cpu": _PROXY_FLOAT_CPU_LIMIT, "memory": "2Gi"}}}}}})
+        self.assertEqual(
+            raised["limitsCpu"] - base["limitsCpu"],
+            _PROXY_FLOAT_CPU_LIMIT_MILLIS - _PROXY_CPU_LIMIT_MILLIS,
+        )
+        self.assertEqual(
+            raised["limitsMemory"] - base["limitsMemory"],
+            _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
+        )
 
     def test_credential_proxy_ephemeral_limit_alone_moves_the_request_with_it(self) -> None:
         """An override of limits.ephemeral-storage alone is counted as a request of the same size.

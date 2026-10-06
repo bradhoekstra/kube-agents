@@ -16,6 +16,7 @@ import json
 import pathlib
 import shutil
 import subprocess
+import tempfile
 import unittest
 
 import yaml
@@ -33,6 +34,17 @@ _REQUIRED = [
 ]
 _VALUE_PATH = "platformAgent.deployment.credentialProxy.resources"
 _CR_PATH = ("spec", "deployment", "credentialProxy", "resources")
+
+
+def _proxy_values(resources):
+    return {"platformAgent": {"deployment": {"credentialProxy": {"resources": resources}}}}
+
+
+def _cr_resources(cr):
+    node = cr
+    for key in _CR_PATH:
+        node = node[key]
+    return node
 
 
 def _schema_node(path):
@@ -57,11 +69,15 @@ class SchemaDeclaresTheKeyTest(unittest.TestCase):
 
 @unittest.skipUnless(_HELM, "helm is not installed")
 class CredentialProxyResourcesRenderTest(unittest.TestCase):
-    def _render_cr(self, sets=(), expect_failure=False):
+    def _render_cr(self, sets=(), expect_failure=False, values=None):
         args = [_HELM, "template", "r", str(_CHART), "-s", _CR_TEMPLATE, *_REQUIRED]
         for item in sets:
             args += ["--set", item]
-        res = subprocess.run(args, capture_output=True, text=True)
+        with tempfile.NamedTemporaryFile("w", suffix=".yaml") as fh:
+            # A values file, unlike `--set`, hands the chart YAML floats and nulls.
+            yaml.safe_dump(values or {}, fh)
+            fh.flush()
+            res = subprocess.run([*args, "-f", fh.name], capture_output=True, text=True)
         if expect_failure:
             return res
         self.assertEqual(res.returncode, 0, res.stderr)
@@ -79,6 +95,22 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         cr = self._render_cr([f"{_VALUE_PATH}=null"])
         self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
 
+    def test_a_nulled_leaf_alone_writes_no_block(self):
+        # A non-empty map whose only leaf is null holds nothing to override.
+        for values in (_proxy_values({"limits": {"memory": None}}),
+                       _proxy_values({"limits": {"memory": None}, "requests": {"cpu": None}})):
+            cr = self._render_cr(values=values)
+            self.assertNotIn("credentialProxy", cr["spec"]["deployment"], values)
+
+    def test_a_nulled_leaf_beside_a_set_one_is_dropped(self):
+        cr = self._render_cr(values=_proxy_values({"limits": {"memory": None, "cpu": "2"}}))
+        self.assertEqual(_cr_resources(cr), {"limits": {"cpu": "2"}})
+
+    def test_a_float_cpu_from_a_values_file_reaches_the_cr_as_a_string(self):
+        # The CRD types a quantity as int-or-string; a bare 1.5 is refused by the API server.
+        cr = self._render_cr(values=_proxy_values({"limits": {"cpu": 1.5, "memory": "2Gi"}}))
+        self.assertEqual(_cr_resources(cr), {"limits": {"cpu": "1.5", "memory": "2Gi"}})
+
     def test_a_memory_limit_alone_reaches_the_cr_as_written(self):
         cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=2Gi"])
         node = cr
@@ -94,10 +126,8 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
             f"{_VALUE_PATH}.limits.memory=4Gi",
             f"{_VALUE_PATH}.limits.cpu=2",
         ])
-        node = cr
-        for key in _CR_PATH:
-            node = node[key]
-        self.assertEqual(node, {"requests": {"memory": "1Gi"}, "limits": {"memory": "4Gi", "cpu": 2}})
+        # `--set ...cpu=2` is an integer; the CR carries it quoted, which the CRD accepts.
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "1Gi"}, "limits": {"memory": "4Gi", "cpu": "2"}})
 
     def test_the_schema_refuses_an_unknown_key_under_credential_proxy(self):
         res = self._render_cr(["platformAgent.deployment.credentialProxy.replicas=2"], expect_failure=True)
