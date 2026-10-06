@@ -5252,7 +5252,9 @@ class CommandExecutor:
         """
         return getattr(getattr(self, "_request_budget", None), "deadline", None)
 
-    def refresh_forge_credential(self, provider: str, repository: str) -> None:
+    def refresh_forge_credential(
+        self, provider: str, repository: str, caller: socket.socket | None = None
+    ) -> None:
         """Make this install's credential for `repository` current, or raise.
 
         The privileged operation a `BrokeredCredential` names and does not
@@ -5264,6 +5266,17 @@ class CommandExecutor:
         Whether the repository is one this install acts on is settled here too,
         for the reason `_repository_is_permitted` gives: this is the call that
         spends the token, so it is the call that has to ask.
+
+        Where the budget is charged (§2.1): called from inside a vcs request,
+        this runs under that request's reservation and takes none. Called from
+        the refresh route, which holds no slot, it reads the coalesce cache
+        first without the lock -- the common case for the sandbox `gh` wrapper
+        and the fleet-audit skill, which call it before every credentialed
+        step -- and reserves only when a refresh looks needed; the lock is
+        never held across a budget wait, and a second refresher holds a
+        reservation while it waits for the lock, for the seconds the running
+        helper takes. `caller` is the route's connection, dropped if it hangs
+        up while queued.
         """
         helper = self._forge_helper(provider)
         forge = _provider_forge(provider)
@@ -5276,13 +5289,44 @@ class CommandExecutor:
         org = clean_repo.split("/", 1)[0] if "/" in clean_repo else clean_repo
         failure_key = (provider, org)
         queued_at = time.monotonic()
+        # getattr: an executor built without `__init__`, as the lock and caches
+        # below allow for, has no budget and nothing reserved.
+        request_budget = getattr(self, "_request_budget", None)
+        covered = getattr(request_budget, "reserved", False) or getattr(
+            request_budget, "exempt", False
+        )
+        if covered or getattr(self, "children_budget_bytes", None) is None:
+            self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+            return
+        if self._refresh_is_current(provider, clean_repo):
+            return
+        with self.reserve_child_memory(caller=caller):
+            self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+
+    def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
+        """The coalesce check, readable without the lock: the cache entry is a
+        tuple replaced whole, so a reader sees the old one or the new one."""
+        now = time.monotonic()
+        current = self._refresh_cache.get(provider)
+        if current is None:
+            return False
+        last_refresh, cached_scoped = current
+        return clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS
+
+    def _refresh_under_lock(
+        self,
+        provider: str,
+        helper: Path,
+        repository: str,
+        clean_repo: str,
+        failure_key: tuple[str, str],
+        queued_at: float,
+    ) -> None:
+        """The serialised part of `refresh_forge_credential`: re-check the
+        coalesce cache, honour the failure memo, and run the helper."""
         with self._refresh_lock:
-            now = time.monotonic()
-            current = self._refresh_cache.get(provider)
-            if current is not None:
-                last_refresh, cached_scoped = current
-                if clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS:
-                    return
+            if self._refresh_is_current(provider, clean_repo):
+                return
             failure = self._refresh_failure_cache.get(failure_key)
             if failure is not None:
                 failed_at, exc = failure

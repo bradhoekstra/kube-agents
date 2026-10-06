@@ -5537,6 +5537,93 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)
 
+    # ---- Where the child memory budget is charged (design §2.1) -------------
+
+    def _budgeted_executor(self, admits=1):
+        """A constructed executor with a budget that admits `admits` slot-taking
+        requests, whose helper spawn is faked and whose repository is managed."""
+        executor = CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=1024,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+        per_request = (
+            credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            + credential_proxy.OUTPUT_COPIES_PER_COMMAND * executor.max_output_bytes
+        )
+        executor.memory_limit_bytes = (
+            credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + admits * per_request
+        )
+        executor.children_budget_bytes = (
+            executor.memory_limit_bytes
+            - credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            - credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+        )
+        self.assertEqual(admits, executor.requests_the_budget_admits())
+        executor.execute_internal = lambda argv, cwd=None: credential_proxy.ExecutionResult(
+            exit_code=0, stdout="", stderr="", duration_ms=5, truncated=False, timed_out=False
+        )
+        managed = mock.patch.object(credential_proxy, "repository_is_managed", return_value=True)
+        managed.start()
+        self.addCleanup(managed.stop)
+        return executor
+
+    def _hold_the_budget(self, executor):
+        """Fill the budget from another thread, so this one is not covered."""
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+
+    def test_a_coalesced_refresh_reserves_nothing_and_never_waits(self):
+        executor = self._budgeted_executor(admits=1)
+        executor._refresh_cache["github"] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
+        self._hold_the_budget(executor)
+        held = executor.reserved_bytes
+        started = time.monotonic()
+        executor.refresh_forge_credential("github", "gke-agentic/infra")
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(held, executor.reserved_bytes)
+
+    def test_a_refresh_that_runs_the_helper_reserves_before_taking_the_lock(self):
+        executor = self._budgeted_executor(admits=1)
+        seen = []
+        real_run = executor._run_forge_helper
+
+        def record(*args, **kwargs):
+            seen.append((executor.reserved_bytes, executor._refresh_lock.locked()))
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(executor, "_run_forge_helper", record):
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+        self.assertEqual([(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, True)], seen)
+        self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_refresh_inside_a_vcs_request_takes_no_second_reservation(self):
+        executor = self._budgeted_executor(admits=1)
+        with executor.request_slot():
+            executor.refresh_forge_credential("github", "gke-agentic/infra")
+            self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+
+    def test_a_refresh_queued_for_the_budget_is_refused_at_the_bound(self):
+        executor = self._budgeted_executor(admits=1)
+        self._hold_the_budget(executor)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable):
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+        self.assertFalse(executor._refresh_lock.locked())
+
 
 class ForgeRefreshRouteTest(unittest.TestCase):
     """What `POST /v1/forge/refresh` answers, and what it declines to say."""
