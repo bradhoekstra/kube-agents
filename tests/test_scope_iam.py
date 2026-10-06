@@ -199,7 +199,9 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         self.assertIn("condition     = local.scope_selectors_resolved", self.main_tf)
         self.assertIn("kube-agents-scope-resolver", self.main_tf)
 
-    def test_the_reads_are_the_reconciles_three_against_the_apis_it_calls(self):
+    def test_the_reads_are_the_reconciles_against_the_apis_it_calls(self):
+        # Three selector reads, and the container listing for the pool, each
+        # the call the reconcile makes against the same API.
         host = self._data("http", "scope_shared_vpc_host")
         self.assertIn("for_each = local.scope_shared_vpc_hosts", host)
         self.assertIn('url                = "${local.scope_compute_api_url}/projects/${each.key}/getXpnResources?maxResults=${local.scope_xpn_page_size}"', host)
@@ -209,6 +211,10 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
         named = self._data("http", "scope_monitored_project")
         self.assertIn("for_each = local.scope_monitored_numbers", named)
         self.assertIn('url                = "${local.scope_resource_manager_api_url}/projects/${each.key}"', named)
+        container = self._data("http", "scope_container")
+        self.assertIn("for_each = local.scope_listed_containers", container)
+        self.assertIn("local.scope_container_url[each.key]", container)
+        self.assertIn('scope_asset_api_url', self.resolver_tf)
         self.assertIn('scope_compute_api_url          = "https://compute.googleapis.com/compute/v1"', self.resolver_tf)
         self.assertIn('scope_monitoring_api_url       = "https://monitoring.googleapis.com/v1"', self.resolver_tf)
         self.assertIn('scope_resource_manager_api_url = "https://cloudresourcemanager.googleapis.com/v3"', self.resolver_tf)
@@ -251,7 +257,8 @@ class ScopeSelectorResolutionTest(unittest.TestCase):
                           'anytrue([for marker in local.scope_api_off_markers : strcontains(self.response_body, marker)]) ? local.scope_api_off_clause[local.')
         for name, api in (("scope_shared_vpc_host", "scope_compute_api_service"),
                           ("scope_metrics_scope", "scope_monitoring_api_service"),
-                          ("scope_monitored_project", "scope_resource_manager_api_service")):
+                          ("scope_monitored_project", "scope_resource_manager_api_service"),
+                          ("scope_container", "scope_asset_api_service")):
             with self.subTest(read=name):
                 self.assertIn("request_headers    = local.scope_resolver_headers", self._data("http", name))
                 self.assertIn(consumer_first + api + '] : ""}', self._data("http", name))
