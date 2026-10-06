@@ -75,8 +75,9 @@ const (
 	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
 	// move neither. The limit they are sized against is a CR field
 	// (spec.deployment.credentialProxy.resources), and the broker derives what
-	// it admits from that limit, so the limit is the one knob and the caps
-	// follow it; a CR override of a cap would detach the two again.
+	// it admits from that limit, so the limit is the CR's knob and the admitted
+	// count follows it; the two caps stay the operator's constants, and a CR
+	// override of either would detach them from the limit again.
 	credentialProxyMaxOutputBytes        = "8388608"
 	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
