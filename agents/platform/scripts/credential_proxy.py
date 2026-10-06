@@ -195,7 +195,8 @@ CGROUP_NO_LIMIT = "max"
 # knob, and the operator's spec.deployment.env reaches it.
 DEFAULT_SESSION_MAX_CONCURRENT_COMMANDS = 2
 ENV_SESSION_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_SESSION_MAX_CONCURRENT_COMMANDS"
-# How long a request waits for a slot before it is refused with 503. Long
+# How long a request waits for admission -- a slot under the slot cap and room
+# under the child memory budget alike -- before it is refused with 503. Long
 # enough to ride out a burst of one-shot reads, short enough that a queue held
 # up by long-running commands answers its callers rather than parking them.
 COMMAND_SLOT_WAIT_SECONDS = 60
@@ -1335,11 +1336,13 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
 
 
 class CommandSlotUnavailable(RuntimeError):
-    """A request waited COMMAND_SLOT_WAIT_SECONDS without reaching a free slot.
+    """A request waited COMMAND_SLOT_WAIT_SECONDS without being admitted.
 
-    Slots go in arrival order, so this is the request that has waited longest,
-    whether the slots never freed or freed only for the requests ahead of it.
-    Answered 503 rather than run anyway: a request past the cap is the one that
+    Admission covers the slot cap and the child memory budget alike, and the
+    message names whichever held the request. Admission goes in arrival order,
+    so this is the request that has waited longest, whether the slots or the
+    budget never freed or freed only for the requests ahead of it. Answered
+    503 rather than run anyway: a request past either bound is the one that
     would take the container over its memory limit, and an OOM kill fails every
     request in flight for every caller, not just this one.
     """
@@ -1402,7 +1405,8 @@ class SessionSlots:
 
 
 class CallerHungUp(Exception):
-    """The caller closed its connection while its request waited for a slot.
+    """The caller closed its connection while its request waited for admission
+    (a slot, room under the child memory budget, or both).
 
     Nothing to run and nobody to answer: the route logs it and returns, and the
     slot goes to a caller that is still there.
@@ -4733,7 +4737,8 @@ class CommandExecutor:
 
     @property
     def queued_requests(self) -> int:
-        """How many requests are waiting for a slot right now."""
+        """How many requests are waiting for admission right now, whether for a
+        slot or for room under the child memory budget."""
         with self._slot_condition:
             return len(self._slot_queue)
 
@@ -8333,10 +8338,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return contextlib.nullcontext()
 
     def _busy(self, exc: CommandSlotUnavailable) -> None:
-        """Answer a broker at its concurrency cap, on whichever route asked.
+        """Answer a broker at its concurrency cap or child memory budget, on
+        whichever route asked.
 
-        Not a refusal of what was asked and not a fault: the command past the
-        cap is the one that would take the container over its memory limit.
+        Not a refusal of what was asked and not a fault: the command past
+        either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
         failure.
