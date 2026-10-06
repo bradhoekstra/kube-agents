@@ -63,43 +63,32 @@ verification_spec:
       tool_names: ["kanban_create"]
       # An errored kanban_create delegated nothing.
       require_success: true
-  # The route: the worker read a PodMonitoring off the install, with `get` or
-  # `describe`, in any letter case -- not the CRD that defines the kind, and not
-  # a `kubectl auth can-i get podmonitoring` permission probe, which names the
-  # resource without reading it. kubectl has to be the command invoked, not text
-  # quoted inside another -- a `grep`/`echo` of the command string reads nothing
-  # -- so the pattern anchors it to the start of a shell segment (the line start,
-  # after `;`, `&`, `|`, `(`, `$(`, or after a `sh -c '`/`bash -c "` wrapper, the
-  # one quoted opener that is a command position and not a quoted string) and
-  # otherwise refuses a segment that opens a quote (a single quote, double quote
-  # or backtick) before kubectl. Before kubectl it then admits any run of
-  # non-separator, non-quote characters and an optional path, so a wrapper --
-  # `env`, `time`, `sudo -E`, `timeout -k 5 30`, `xargs ... kubectl`, a loop's
-  # `do kubectl`, an `if kubectl`, `/usr/bin/kubectl` -- does not hide it, and
-  # `cd x && kubectl ...` / `kubectl ... | yq` still read. The noun is an argument
-  # preceded by a space, tab, comma or quote and followed by one of those, a `/`,
-  # a segment terminator (`;`, `&`, `|`, `)`) or the command's end, so a
-  # `kind=PodMonitoring` selector or a `-o yaml > gateway-podmonitoring.yaml`
-  # redirect, where the noun is glued to `=`, `/` or `-` before it, is not a read,
-  # while a quoted noun (`get "podmonitoring"`) and a read that ends its segment
-  # (`kubectl get podmonitoring | yq`, `echo $(kubectl get podmonitoring)`) are.
-  # Three false-greens have no single-line regex fix and stand: a bare
-  # `echo kubectl get podmonitoring`, a shell metacharacter inside a quoted string
-  # that opens a false segment (`-m "note; kubectl get podmonitoring"`), and a
-  # `sh -c '…'` wrapper quoted inside another command
-  # (`echo "sh -c 'kubectl get podmonitoring'"`); all three are contrived against
-  # the recorded runs. The pattern's whole corpus is pinned in
-  # bench/tests/test_observability_watcher_scrape_patterns.py.
-  # worker_commands reads the card log's one-line rendering and sees terminal
-  # commands only, so a read through an MCP tool is invisible to it. The skill's
-  # step spells the kubectl command and every recorded run used it.
+  # The route: some delegated worker command both invokes kubectl and names the
+  # PodMonitoring. This check is deliberately loose -- it confirms that `kubectl`
+  # and `podmonitoring` co-occur in one command, nothing more. A precise regex
+  # that insists `podmonitoring` be the resource argument of a `get`/`describe`
+  # re-implements shell grammar and leaked in both directions across many review
+  # rounds: it refused real reads wrapped in `sh -c`, env assignments, `xargs` or
+  # `$(...)`, and admitted a CRD read, a `can-i` probe, or the kind in a filename.
+  # The loose check has no false-reds -- every real read, however wrapped,
+  # matches -- and its false-greens (a `can-i` probe, a CRD read, the kind in an
+  # output filename or selector value, or the command quoted inside a
+  # `grep`/`echo`) are accepted: the answer objectives below cannot be satisfied
+  # without an actual read, because a worker that only probed permissions or read
+  # the CRD cannot name port 9095 and the proving series. What it still refuses is
+  # the regression this case guards -- the old skill's Deployment-annotation path
+  # (`kubectl get deployment ... -o yaml`), which never names the PodMonitoring --
+  # and any answer composed without reading it. worker_commands sees terminal
+  # commands only, so a read through an MCP tool is invisible to it; the skill's
+  # step spells the kubectl command and every recorded run used it. The corpus is
+  # pinned in bench/tests/test_observability_watcher_scrape_patterns.py.
   - name: the-worker-read-the-podmonitoring
     role: objective
     mode: assert
     check:
       type: worker_commands
       required_patterns:
-        - '(?i)(?:^|[\n;&|(]|\$\(|\b(?:sh|bash|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\s+[''\"])[ \t]*(?:[^\n;&|()''"`]*[ \t])?(?:[^\s;&|()''"`]*/)?kubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*[ \t,''\"]podmonitorings?(\.monitoring\.googleapis\.com)?(?=[ \t,/;&|)''\"]|$)'
+        - '(?i)\bkubectl\b.*\bpodmonitoring'
   # The final answer names the mechanism, the port and one of the two proving
   # series. `mode: assert` because the final message is immutable once the run
   # ends; polling a failed phrase would only wait out the timeout. The required
@@ -135,17 +124,19 @@ verification_spec:
   # subject ("nothing is scraping it"), and an enumerated-negation regex here
   # leaked on contractions, perfect tense, active voice, bulleted negations and
   # "unscraped" -- negation is not finitely enumerable, so each round patched one
-  # shape and missed the next. required_phrases pins the affirmative token and
-  # forbidden_phrases reds the negative; the nuance a substring could not carry
-  # -- a correct answer may note the credential-proxy PodMonitoring is unscraped
-  # while the watcher is -- is left to the judge against expected_output, which
-  # the verifier's docstring reserves for anything fuzzier than an author-chosen
-  # phrase. The token survives the normalizer: `**Scraped: Yes**` folds to
-  # `scraped: yes` (emphasis dropped, lowercased). Two residuals stand, each
-  # requiring the worker to ignore the verdict-line instruction and contrived
-  # against a compliant answer: a negative that omits the line but carries the
-  # substring "scraped: yes" inline false-greens, and an affirmative that also
-  # writes "scraped: no" in prose false-reds. Both are pinned in
+  # shape and missed the next. required_phrases pins the affirmative token;
+  # forbidden_patterns reds the negative one with a line-anchored pattern
+  # (`(?m)^\s*scraped:\s*no\b`) rather than a bare substring, so it fires only on
+  # a line whose verdict is `Scraped: no`: not on `scraped: nothing`/`not
+  # yet`/`none` (the word boundary), and not on an affirmative that mentions
+  # "scraped: no" in a later clause or aside (the line anchor), which a bare
+  # substring red-ed. The nuance a substring could not carry -- a correct answer
+  # may note the credential-proxy PodMonitoring is unscraped while the watcher is
+  # -- is left to the judge against expected_output. The token survives the
+  # normalizer: `**Scraped: Yes**` folds to `scraped: yes` (emphasis dropped,
+  # lowercased). One residual stands, contrived against a compliant answer: a
+  # negative that omits the verdict line but carries the substring "scraped: yes"
+  # inline false-greens. It is pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py.
   - name: the-answer-affirms-the-watcher-is-scraped
     role: objective
@@ -154,5 +145,5 @@ verification_spec:
       type: report_contains
       required_phrases:
         - "Scraped: yes"
-      forbidden_phrases:
-        - "Scraped: no"
+      forbidden_patterns:
+        - '(?m)^\s*scraped:\s*no\b'
