@@ -4282,6 +4282,60 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual("now\n", result.stdout)
         self.assertLess(time.monotonic() - started, 1.0)
 
+    # ---- Where a spawn is charged (design §2.1) ------------------------------
+
+    def test_a_spawn_on_a_thread_with_no_reservation_takes_a_transient_one(self):
+        # No shipped route reaches this branch once every route reserves at
+        # its start; it exists so a new route that forgets to is throttled
+        # rather than uncounted.
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=1)
+        started = time.monotonic()
+        result = executor.execute_internal(["/bin/echo", "now"])
+        self.assertEqual("now\n", result.stdout)
+        self.assertGreaterEqual(time.monotonic() - started, 0.5)
+        self.assertEqual(0, executor.reserved_bytes)
+
+    def test_commands_under_a_request_take_no_second_reservation(self):
+        # A kubectl's cold-path gcloud, a vcs verb's several gits: one
+        # reservation per request, held by the route, covers them all.
+        executor = self.budgeted(admits=1)
+        with executor.request_slot():
+            self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+            started = time.monotonic()
+            result = executor.execute_internal(["/bin/echo", "inside"])
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual("inside\n", result.stdout)
+            self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+
+    def test_the_content_workspace_git_reserves_nothing(self):
+        # The store serves one verb at a time under its own lock; its one
+        # process tree at a time is the fixed CONTENT_WORKSPACE_RESERVE_BYTES
+        # term, subtracted whether or not a workspace is open, so its spawns
+        # must neither wait for the budget nor count against it.
+        with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
+            executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=1)
+        tree = executor.content_workspace_root / "t"
+        tree.mkdir(parents=True)
+        started = time.monotonic()
+        result = executor.execute_workspace_git(["git", "check-ref-format", "refs/heads/main"], cwd=tree)
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+
+    def test_the_fixed_workspace_term_is_subtracted_with_no_workspace_open(self):
+        mib = credential_proxy.MEBIBYTE
+        executor = self.executor(memory_limit_bytes=1024 * mib)
+        self.assertEqual((1024 - 192 - 128) * mib, executor.children_budget_bytes)
+
+    def test_a_transient_reservation_is_released_after_a_timed_out_command(self):
+        # Review focus 2.
+        executor = self.budgeted(admits=1)
+        result = executor._execute(["/bin/sleep", "5"], timeout_seconds=0.2)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(0, executor.reserved_bytes)
+
     # ---- Bounding a kubectl that cannot reach its control plane -------------
 
     def test_kubectl_read_is_given_a_request_timeout_and_the_short_deadline(self):
@@ -10562,6 +10616,9 @@ class ReadCredentialMintTest(unittest.TestCase):
     def _executor(self, result=None):
         executor = credential_proxy.CommandExecutor.__new__(credential_proxy.CommandExecutor)
         executor.calls = []
+        # The mint runs under the store's fixed workspace term
+        # (`_outside_budget`), which records the exemption per thread.
+        executor._request_budget = threading.local()
 
         def run(argv):
             executor.calls.append(list(argv))

@@ -4748,6 +4748,20 @@ class CommandExecutor:
         return False
 
     @contextlib.contextmanager
+    def _outside_budget(self) -> Iterator[None]:
+        """Spawns inside this block are the content workspace's, covered by
+        the fixed CONTENT_WORKSPACE_RESERVE_BYTES term rather than a
+        reservation (§2.1): the store's lock is the bound and the reserve is
+        its size, and a wait for admission under that lock would stall every
+        verb behind it, reads included."""
+        previous = getattr(self._request_budget, "exempt", False)
+        self._request_budget.exempt = True
+        try:
+            yield
+        finally:
+            self._request_budget.exempt = previous
+
+    @contextlib.contextmanager
     def _admit(self, takes_slot: bool, caller: socket.socket | None) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
@@ -5075,12 +5089,13 @@ class CommandExecutor:
                 f"`git {subcommand}` is not one of the subcommands the broker "
                 "issues on its own behalf"
             )
-        return self._execute(
-            [executable_path, *argv[1:]],
-            cwd=str(cwd),
-            containment_root=self.content_workspace_root,
-            extra_config=tuple(config),
-        )
+        with self._outside_budget():
+            return self._execute(
+                [executable_path, *argv[1:]],
+                cwd=str(cwd),
+                containment_root=self.content_workspace_root,
+                extra_config=tuple(config),
+            )
 
     def execute_vcs_git(
         self,
@@ -5340,9 +5355,12 @@ class CommandExecutor:
             raise PermissionError(
                 f"{repository} is not a context repository of this install"
             )
-        result = self._run_forge_helper(
-            provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
-        )
+        # Reached only from the store's `open` and `commit`, under its lock:
+        # the fixed workspace term covers it, as it does the store's git.
+        with self._outside_budget():
+            result = self._run_forge_helper(
+                provider, helper, [FORGE_READ_ONLY_FLAG, repository], "read-only credential mint"
+            )
         token = result.stdout.strip()
         if not token:
             raise RuntimeError("read-only credential mint returned no token")
@@ -5849,23 +5867,38 @@ class CommandExecutor:
             # back timed out rather than running past what the request was
             # allowed.
             effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
-        started = time.monotonic()
-        process = subprocess.Popen(
-            argv,
-            cwd=command_cwd,
-            env=command_environment,
-            stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+        # Every child the broker starts comes through here. A thread that holds
+        # a reservation (a route admitted it) or runs the store's git (exempt,
+        # covered by the fixed term) spawns under that; any other thread takes
+        # a transient reservation for the child's lifetime, with the same wait
+        # and the same refusal, so a route that forgets to reserve is throttled
+        # rather than uncounted.
+        covered = getattr(self._request_budget, "reserved", False) or getattr(
+            self._request_budget, "exempt", False
         )
-        captured = _capture_output(
-            process,
-            stdin=stdin.encode("utf-8") if stdin is not None else None,
-            limit=self.max_output_bytes,
-            timeout=effective_timeout,
-            caller=caller,
+        admission = (
+            contextlib.nullcontext()
+            if covered or self.children_budget_bytes is None
+            else self.reserve_child_memory(caller=caller)
         )
+        with admission:
+            started = time.monotonic()
+            process = subprocess.Popen(
+                argv,
+                cwd=command_cwd,
+                env=command_environment,
+                stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            captured = _capture_output(
+                process,
+                stdin=stdin.encode("utf-8") if stdin is not None else None,
+                limit=self.max_output_bytes,
+                timeout=effective_timeout,
+                caller=caller,
+            )
         stdout_text, stdout_cut = _bounded_text(captured.stdout, self.max_output_bytes)
         stderr_text, stderr_cut = _bounded_text(captured.stderr, self.max_output_bytes)
         if captured.timed_out and argv and Path(argv[0]).name == "kubectl":
