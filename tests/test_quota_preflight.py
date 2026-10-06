@@ -221,7 +221,7 @@ class PreflightDecisionTest(unittest.TestCase):
         override's limit.
         """
         base = self._requirements()
-        raised = self._requirements([f"{_PROXY_VALUE}.limits.memory=2Gi"])
+        raised = self._requirements([f"{_PROXY_VALUE}.limits.memory={_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES}"])
         self.assertEqual(
             raised["limitsMemory"] - base["limitsMemory"],
             _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES - _PROXY_MEMORY_LIMIT_BYTES,
@@ -233,8 +233,8 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_credential_proxy_request_and_cpu_overrides_are_each_counted(self) -> None:
         base = self._requirements()
         raised = self._requirements([
-            f"{_PROXY_VALUE}.requests.memory=1Gi",
-            f"{_PROXY_VALUE}.limits.cpu=2",
+            f"{_PROXY_VALUE}.requests.memory={_PROXY_MEMORY_LIMIT_BYTES}",
+            f"{_PROXY_VALUE}.limits.cpu={_PROXY_OVERRIDE_CPU_LIMIT_MILLIS}m",
         ])
         self.assertEqual(
             raised["requestsMemory"] - base["requestsMemory"],
@@ -252,7 +252,7 @@ class PreflightDecisionTest(unittest.TestCase):
         # A values file's `cpu: 1.5` arrives as a YAML float, not the string `--set` gives.
         base = self._requirements()
         raised = self._requirements(values={"platformAgent": {"deployment": {"credentialProxy": {
-            "resources": {"limits": {"cpu": _PROXY_FLOAT_CPU_LIMIT, "memory": "2Gi"}}}}}})
+            "resources": {"limits": {"cpu": _PROXY_FLOAT_CPU_LIMIT, "memory": str(_PROXY_OVERRIDE_MEMORY_LIMIT_BYTES)}}}}}})
         self.assertEqual(
             raised["limitsCpu"] - base["limitsCpu"],
             _PROXY_FLOAT_CPU_LIMIT_MILLIS - _PROXY_CPU_LIMIT_MILLIS,
@@ -270,13 +270,13 @@ class PreflightDecisionTest(unittest.TestCase):
         to 10Gi of request headroom that then refuses the pod.
         """
         base = self._requirements()
-        raised = self._requirements([f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"])
+        raised = self._requirements([f"{_PROXY_VALUE}.limits.ephemeral-storage={_PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES}"])
         moved = _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES - _PROXY_EPHEMERAL_LIMIT_BYTES
         self.assertEqual(raised["limitsEphemeral"] - base["limitsEphemeral"], moved)
         self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], moved)
         # An explicit request still wins over the defaulting.
         explicit = self._requirements([
-            f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi",
+            f"{_PROXY_VALUE}.limits.ephemeral-storage={_PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES}",
             f"{_PROXY_VALUE}.requests.ephemeral-storage=4Gi",
         ])
         self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"],
