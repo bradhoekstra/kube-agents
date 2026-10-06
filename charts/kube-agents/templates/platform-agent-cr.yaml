@@ -185,16 +185,18 @@ spec:
       Each quantity is quoted rather than passed through toYaml, for the reason
       env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
       the CRD types a quantity as int-or-string, so the API server refuses the
-      bare number. A nulled leaf (`memory: null`, Helm's way to drop a key) is
-      skipped, so a map holding nothing else writes no block either. Any other
-      key goes through as written, for the operator to refuse by name.
+      bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
+      null (`memory: null`, Helm's way to drop a key) or the empty string, which
+      the CRD's quantity pattern refuses. A map holding nothing else writes no
+      block either. Any other key goes through as written, for the operator to
+      refuse by name.
     */}}
     {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
     {{- $proxyQuantities := dict }}
     {{- range $side := list "limits" "requests" }}
       {{- $set := dict }}
       {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
-        {{- if not (kindIs "invalid" $quantity) }}
+        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
           {{- $_ := set $set $name $quantity }}
         {{- end }}
       {{- end }}

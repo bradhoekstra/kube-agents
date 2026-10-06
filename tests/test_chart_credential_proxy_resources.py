@@ -106,6 +106,20 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         cr = self._render_cr(values=_proxy_values({"limits": {"memory": None, "cpu": "2"}}))
         self.assertEqual(_cr_resources(cr), {"limits": {"cpu": "2"}})
 
+    def test_an_empty_string_leaf_alone_writes_no_block(self):
+        # The chart reads "" as unset, as kube-agents.compactFields does; rendered,
+        # `memory: ""` is refused by the CRD's quantity pattern.
+        for values in (_proxy_values({"limits": {"memory": ""}}),
+                       _proxy_values({"limits": {"memory": ""}, "requests": {"cpu": ""}})):
+            cr = self._render_cr(values=values)
+            self.assertNotIn("credentialProxy", cr["spec"]["deployment"], values)
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory="])
+        self.assertNotIn("credentialProxy", cr["spec"]["deployment"])
+
+    def test_an_empty_string_leaf_beside_a_set_one_is_dropped(self):
+        cr = self._render_cr(values=_proxy_values({"limits": {"memory": "", "cpu": 1}}))
+        self.assertEqual(_cr_resources(cr), {"limits": {"cpu": "1"}})
+
     def test_a_float_cpu_from_a_values_file_reaches_the_cr_as_a_string(self):
         # The CRD types a quantity as int-or-string; a bare 1.5 is refused by the API server.
         cr = self._render_cr(values=_proxy_values({"limits": {"cpu": 1.5, "memory": "2Gi"}}))
