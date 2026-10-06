@@ -4207,6 +4207,38 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, executor.slots_in_use)
         holder.join()
 
+    def test_a_reservation_queued_behind_a_slot_held_head_is_not_told_the_budget_held_it(self):
+        # One slot, a budget for eight: the head waits for the slot cap, and
+        # the slot-less reservation behind it would fit the budget at once.
+        executor = self.budgeted(admits=8, max_concurrent_commands=1)
+        holder = self.hold_a_slot(executor, seconds=2)
+
+        def head():
+            try:
+                with executor.request_slot():
+                    pass
+            except credential_proxy.CommandSlotUnavailable:
+                pass
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.6):
+            head_thread = threading.Thread(target=head)
+            head_thread.start()
+            deadline = time.monotonic() + 5
+            while executor.queued_requests < 1:
+                if time.monotonic() > deadline:
+                    self.fail("the head never joined the queue")
+                time.sleep(0.01)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                    with executor.reserve_child_memory():
+                        self.fail("admitted ahead of the queue")
+            head_thread.join()
+        message = str(raised.exception)
+        self.assertNotIn("memory budget", message)
+        self.assertIn("admission queue", message)
+        self.assertIn("1 concurrent commands", message)
+        holder.join()
+
     @staticmethod
     def wait_for_a_slot(executor):
         """Queue for a slot and let it go at once; a refusal is fine."""

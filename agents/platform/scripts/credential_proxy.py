@@ -4369,6 +4369,14 @@ def _capture_output(
     )
 
 
+@dataclass(eq=False)
+class _AdmissionTicket:
+    """A request's place in the admission queue. Compared by identity; the
+    kind is kept so a refusal behind it can name the bound holding it."""
+
+    takes_slot: bool
+
+
 class CommandExecutor:
     ALLOWED_EXECUTABLES = broker_executables()
 
@@ -4398,7 +4406,7 @@ class CommandExecutor:
         # refused as one that had just arrived.
         self._slot_condition = threading.Condition()
         self._slots_in_use = 0
-        self._slot_queue: collections.deque[object] = collections.deque()
+        self._slot_queue: collections.deque[_AdmissionTicket] = collections.deque()
         # The deadline the commands of the request on this thread share; set by
         # `request_slot` for as long as the slot is held, read by `_execute`.
         self._request_budget = threading.local()
@@ -4819,6 +4827,49 @@ class CommandExecutor:
             return True
         return False
 
+    def _refusal_text(self, takes_slot: bool) -> str:
+        """Why a request still queued at the bound is refused, named for what
+        holds it now. Called under `_slot_condition`.
+
+        The budget when this request does not fit it; the slot cap when it
+        takes a slot and none is free. Otherwise this request is clear and
+        only the queue ahead of it holds it -- one FIFO for both kinds, so a
+        slot-less reserver can wait behind a head the slot cap holds -- and
+        the text names whatever holds that head.
+        """
+        slots_full = self._slots_in_use >= self.max_concurrent_commands
+        # With nothing admitted `_fits_budget` would take its degenerate
+        # branch and log; this request fits trivially then anyway.
+        nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
+        fits = nothing_admitted or self._fits_budget(takes_slot)
+        budget_text = ""
+        if self.children_budget_bytes is not None:
+            budget_text = (
+                f"the credential proxy is at its child memory budget "
+                f"({self._budget_in_use_text()}) and this request "
+                f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
+            )
+        if not fits:
+            return budget_text
+        if takes_slot and slots_full:
+            # Worded for the queue: slots may well have freed in the meantime
+            # and gone to earlier arrivals, so "none finished" would be false
+            # for a request that was overtaken rather than starved.
+            return (
+                f"the credential proxy is at its limit of "
+                f"{self.max_concurrent_commands} concurrent commands and this "
+                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                f"free slot; retry shortly"
+            )
+        head = self._slot_queue[0]
+        if budget_text and not (head.takes_slot and slots_full):
+            return budget_text
+        return (
+            f"the credential proxy's admission queue is held by requests waiting on its "
+            f"limit of {self.max_concurrent_commands} concurrent commands and this request "
+            f"waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
+        )
+
     @contextlib.contextmanager
     def _outside_budget(self) -> Iterator[None]:
         """Spawns inside this block are the content workspace's, covered by
@@ -4850,7 +4901,7 @@ class CommandExecutor:
             return
         queued_at = time.monotonic()
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
-        ticket = object()
+        ticket = _AdmissionTicket(takes_slot)
         # Set once this request reached the head of the queue with a slot free
         # and the budget alone held it; the wait log uses it to name the bound
         # that held the request.
@@ -4867,28 +4918,7 @@ class CommandExecutor:
                         blocked_by_budget = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        # Named for the bound holding the request now: with a
-                        # slot free, only the budget can be in its way, whether
-                        # it held this request at the head or one ahead of it.
-                        held_by_budget = self.children_budget_bytes is not None and (
-                            not takes_slot or self._slots_in_use < self.max_concurrent_commands
-                        )
-                        if not held_by_budget:
-                            # Worded for the queue: slots may well have freed in
-                            # the meantime and gone to earlier arrivals, so "none
-                            # finished" would be false for a request that was
-                            # overtaken rather than starved.
-                            raise CommandSlotUnavailable(
-                                f"the credential proxy is at its limit of "
-                                f"{self.max_concurrent_commands} concurrent commands and this "
-                                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
-                                f"free slot; retry shortly"
-                            )
-                        raise CommandSlotUnavailable(
-                            f"the credential proxy is at its child memory budget "
-                            f"({self._budget_in_use_text()}) and this request "
-                            f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
-                        )
+                        raise CommandSlotUnavailable(self._refusal_text(takes_slot))
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
                         raise CallerHungUp("the caller disconnected while queued for a slot")
