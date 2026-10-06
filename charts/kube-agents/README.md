@@ -528,7 +528,8 @@ install can outgrow the default, and
 [the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
 has the arithmetic. The
 operator refuses a memory limit below 672Mi, a request above its limit, a
-negative quantity, a zero limit and `claims`, whether or not its webhook is
+negative quantity, a zero limit, `claims`, and any resource name other than
+`cpu`, `memory` and `ephemeral-storage`, whether or not its webhook is
 enabled: the reconciler leaves the proxy Deployment as last applied and reports
 `Degraded` (`Reason: InvalidCredentialProxyResources`), and the webhook, where
 enabled, refuses the same override at apply. It warns when memory per CPU leaves
