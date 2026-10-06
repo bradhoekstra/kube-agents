@@ -6195,6 +6195,86 @@ func TestReconcile_AnUnreadableEntryReportsTheHeldPruning(t *testing.T) {
 	}
 }
 
+func TestReconcile_AHeldPruningOutranksARefusedCredentialProxyOverride(t *testing.T) {
+	// A refused proxy override leaves the proxy at the operator's defaults; a
+	// held pruning leaves a write policy in place. Degraded carries one
+	// reason, and it is the one that reports lost function. Once the entry is
+	// fixed the proxy refusal surfaces, so it was ranked, not dropped.
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "held", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+				}},
+			}},
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{Org: "test-org"},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	state := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "held-gitops-state", Namespace: "test-ns"},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://x:y@github.com:test-org/repo-y"},{"type":"github","url":"https://github.com/test-org/repo-1"}]`,
+		},
+	}
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "github-token-minter-config",
+			Namespace:   "test-ns",
+			Annotations: map[string]string{AnnotationManagedMinterKeys: "repo-x.yaml"},
+		},
+		Data: map[string]string{"default.yaml": minterTemplateWithReadScope, "repo-x.yaml": "tracked"},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, state, minterCM, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "held", Namespace: "test-ns"}}
+	ctx := context.Background()
+	degradedReason := func() string {
+		t.Helper()
+		for range 2 {
+			if _, err := r.Reconcile(ctx, req); err != nil {
+				t.Fatalf("Reconcile() = %v", err)
+			}
+		}
+		got := &agentv1alpha1.PlatformAgent{}
+		if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+			t.Fatalf("get agent: %v", err)
+		}
+		degraded := meta.FindStatusCondition(got.Status.Conditions, "Degraded")
+		if degraded == nil || degraded.Status != metav1.ConditionTrue {
+			t.Fatalf("Degraded = %v, expected True", degraded)
+		}
+		return degraded.Reason
+	}
+
+	if got := degradedReason(); got != conditionReasonMinterPruningHeld {
+		t.Errorf("Degraded reason = %s, expected %s over the refused proxy override", got, conditionReasonMinterPruningHeld)
+	}
+
+	fixed := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(state), fixed); err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	fixed.Data["managed_repos"] = `[{"type":"github","url":"https://github.com/test-org/repo-1"}]`
+	if err := cl.Update(ctx, fixed); err != nil {
+		t.Fatalf("update state: %v", err)
+	}
+	if got := degradedReason(); got != conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Degraded reason = %s after the entry was fixed, expected %s", got, conditionReasonInvalidCredentialProxyResources)
+	}
+}
+
 func TestSyncGithubTokenMinterConfigMap_AnotherForgesEntryDoesNotHoldPruning(t *testing.T) {
 	// A gitlab-typed entry is not an unreadable GitHub spelling: repo-x left
 	// managed_repos, so its tracked policy is pruned as it would be without

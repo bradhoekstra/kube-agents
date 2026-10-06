@@ -3581,16 +3581,6 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded%s. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr), withheld)
 		degradedStatus = metav1.ConditionTrue
-	} else if proxyResourcesRefusal != "" {
-		// Same shape as the git refusal above: the spec is read here, on
-		// every pass, rather than carried from reconcileCredentialProxy, so
-		// the condition clears on the pass the override is corrected.
-		newPhase = "Degraded"
-		condStatus = metav1.ConditionFalse
-		condReason = conditionReasonInvalidCredentialProxyResources
-		degradedReason = conditionReasonInvalidCredentialProxyResources
-		condMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
-		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
@@ -3604,6 +3594,18 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if proxyResourcesRefusal != "" {
+		// Same shape as the git refusal above: the spec is read here, on
+		// every pass, rather than carried from reconcileCredentialProxy, so
+		// the condition clears on the pass the override is corrected. Last,
+		// because the proxy runs at the operator's defaults meanwhile: the
+		// reasons above report lost function and must not be masked by it.
+		newPhase = "Degraded"
+		condStatus = metav1.ConditionFalse
+		condReason = conditionReasonInvalidCredentialProxyResources
+		degradedReason = conditionReasonInvalidCredentialProxyResources
+		condMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
+		degradedStatus = metav1.ConditionTrue
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg
