@@ -219,15 +219,22 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			entry = &usagePodEntry{Name: s.Name, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[s.UID] = entry
 			changed = true
-			// A new replica whose live sibling was counted after it started
-			// is the one pod the whole-sample rule does not fit: the sibling
-			// supplied the events this pod injected in the meantime. It is
-			// recorded at its sample with the sibling's marker and adds
-			// nothing, as a known replica behind its sibling would be.
+			// A new replica feeding a Max counter beside a live sibling is
+			// recorded with the sibling's as-read marker, not this poll's
+			// stamp. A sibling counted after this replica started supplied the
+			// events it has injected since, so the whole-sample rule does not
+			// fit and it adds nothing (the late-read rule). Otherwise it still
+			// competes as a candidate below, but behind the sibling, so a
+			// catch-up that loses the fold is reset next poll rather than
+			// counted on top -- the treatment a known replica behind its
+			// sibling gets. The Max branch moves it to stamp only if it is
+			// taken or ties.
 			if usageAggregationFor(s.Counter) == usageAggregateMax {
-				if latest, ok := latestSiblingMarker(doc, markers, s.UID, s.Counter); ok && latest.Time.After(s.Created) {
+				if latest, ok := latestSiblingMarker(doc, markers, s.UID, s.Counter); ok {
 					entry.Marker = latest
-					continue
+					if latest.Time.After(s.Created) {
+						continue
+					}
 				}
 			}
 			if s.Created.After(doc.FirstRecorded.Time) && s.Sample <= usageDeltaCeiling {

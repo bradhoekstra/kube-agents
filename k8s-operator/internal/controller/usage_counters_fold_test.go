@@ -637,6 +637,44 @@ func TestFoldUsage_ANewReplicaCompetesWithTheOldOnesDifference(t *testing.T) {
 	})
 }
 
+func TestFoldUsage_ALosingNewReplicaResetsItsCatchUpNextPoll(t *testing.T) {
+	// Two gateway replicas share the event stream (Max). A new replica that
+	// loses the fold to a live sibling is recorded behind that sibling, so its
+	// first catch-up is reset next poll rather than counted on top of what the
+	// sibling already supplied. Before the marker fix it was stamped with the
+	// poll it lost, read as current next poll, and its catch-up double-counted.
+	first := foldClock(0)
+	oldCreated := first.Add(-time.Hour)
+	newCreated := foldClock(3)
+	doc := foldDoc(first, foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first))
+
+	// Poll 5: the old replica advances by 10 and wins; the new replica, read at
+	// 2, loses and is recorded at the sibling's as-read marker, not this poll's.
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 5, live: []string{foldPodB}, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, oldCreated, 110, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, newCreated, 2, ptr.To(9.0)),
+		}, want: 10, moved: true},
+	})
+	if b := doc.Pods[foldPodB]; !b.Marker.Time.Equal(first) {
+		t.Fatalf("the losing new replica takes the sibling's as-read marker, not the poll it lost: %+v", b)
+	}
+
+	// Poll 10: the old replica is flat and the new replica catches up to 5. The
+	// catch-up is the sibling's events, already counted, so it resets and adds
+	// nothing; the total stays 10. (Before the fix the new replica read as
+	// current, its catch-up of 3 was taken, and the total reached 13.)
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, oldCreated, 110, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, newCreated, 5, ptr.To(9.0)),
+		}, want: 10, moved: false},
+	})
+	if b := doc.Pods[foldPodB]; b.Sample != 5 || !b.Marker.Time.Equal(foldClock(5)) {
+		t.Fatalf("the reset advances the new replica's baseline and takes the live sibling's marker: %+v", b)
+	}
+}
+
 func TestAddUsageTotal_RefusesPastTheCeiling(t *testing.T) {
 	doc := foldDoc(foldClock(0))
 	doc.Totals[usageCounterToolExecutions] = usageTotalCeiling - 1
@@ -823,7 +861,11 @@ func TestFoldUsage_ThreeReplicasResetAgainstTheLatestMarker(t *testing.T) {
 	first := foldClock(0)
 	created := first.Add(-time.Hour)
 	const podC = "gateway-c"
-	for round := 0; round < 5; round++ { // map order varies; the answer must not
+	// The reset must pick the latest sibling marker whatever order the map
+	// yields its entries, so the loop re-rolls that order. A first-wins bug
+	// escapes a handful of rounds often (~30-50% at five); 64 drive the escape
+	// below 1e-6, deterministic for correct code.
+	for round := 0; round < 64; round++ {
 		doc := foldDoc(first,
 			foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), foldClock(10)),
 			foldEntry(foldPodB, usageCounterEventsIngested, 100, ptr.To(1.0), foldClock(5)),
