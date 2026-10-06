@@ -580,14 +580,21 @@ type injectCounts struct {
 	// Failed is events whose inject did not land. They were acked regardless,
 	// so this counter is the only record that they existed.
 	Failed int
+
+	// OutOfScope is events the joiner marked DriftEvent.OutOfScope: logged
+	// with injectHeldOutOfScopeMarker and held here before a session was
+	// opened. Not a failure and not a delivery, and not Suppressed either --
+	// that is the daemon declining a card this binary sent, and this is a card
+	// never sent, so the day's budget is untouched.
+	OutOfScope int
 }
 
 // String renders the tally, always printing every field. A zero that is absent
 // reads as a category that did not apply; a printed zero reads as one that did
 // not happen, and those differ.
 func (c injectCounts) String() string {
-	return fmt.Sprintf("injected=%d suppressed=%d duplicate=%d failed=%d",
-		c.Injected, c.Suppressed, c.Duplicate, c.Failed)
+	return fmt.Sprintf("injected=%d suppressed=%d duplicate=%d failed=%d out_of_scope=%d",
+		c.Injected, c.Suppressed, c.Duplicate, c.Failed, c.OutOfScope)
 }
 
 // insertIDSet remembers the audit entries this process has already injected,
@@ -645,7 +652,8 @@ func newDriftInjectHandler(inject *driftInjector) *driftInjectHandler {
 	return &driftInjectHandler{inject: inject, seen: newInsertIDSet(seenInsertIDsCap)}
 }
 
-// Handle logs the event and then injects it.
+// Handle logs the event, then injects it -- unless there is no injector, the
+// joiner marked it out of scope, or its insertId was already sent.
 //
 // The log comes first and unconditionally. It is the record that the detector
 // saw this change, and it has to survive a daemon that is down -- an operator
@@ -661,6 +669,21 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 	logDriftEvent(ctx, event)
 
 	if h.inject == nil {
+		return
+	}
+
+	// Held before the seen set, because nothing is sent: marking the id would
+	// turn a later in-scope record carrying it into a "duplicate" of a card
+	// that never existed. Read off the event rather than off the outcome,
+	// since joinUnreachable alone does not say whether a profile names the
+	// cluster -- DriftEvent.OutOfScope is the joiner's answer to that, and
+	// the cases it leaves unmarked (a profiled cluster the join could not
+	// read, an unknown scope) are the ones that must keep sending so a
+	// detector that was meant to reach a cluster stays loud about it.
+	if event.OutOfScope {
+		h.counts.OutOfScope++
+		log.Printf("%s: inject held for insert_id=%s cluster=%s (outside the install's scope: no Cluster Agent profile names it); the %s card was not sent and no alert budget was spent",
+			commandName, event.Record.InsertID, event.Record.Cluster, injectKindDrift)
 		return
 	}
 

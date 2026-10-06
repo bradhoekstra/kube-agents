@@ -20,6 +20,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 
@@ -430,5 +431,34 @@ func TestZeroDiscovererDiscardsSkipsRatherThanPanicking(t *testing.T) {
 	}
 	if len(clusters) != 0 {
 		t.Errorf("got %d clusters, want none", len(clusters))
+	}
+}
+
+func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T) {
+	dir := t.TempDir()
+	writeClusterProfile(t, dir, "prod-a", "p1", "prod", "us-central1")
+	writeClusterProfile(t, dir, "prod-b", "p1", "prod", "europe-west1")
+	writeNonClusterProfile(t, dir, "platform")
+	writeProfile(t, dir, "broken", "model: [")
+	writeProfile(t, dir, ".swap", "cluster_identity:\n  project: p1\n  cluster: hidden\n  location: us-central1\n")
+
+	got, err := ReadIdentities(dir)
+	if err != nil {
+		t.Fatalf("ReadIdentities: %v", err)
+	}
+	want := []string{"p1/europe-west1/prod", "p1/us-central1/prod"}
+	names := make([]string, 0, len(got))
+	for _, id := range got {
+		names = append(names, id.String())
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("ReadIdentities = %v, want %v (two cluster profiles; the platform profile, the unparsable one and the dot-directory are not clusters)", names, want)
+	}
+}
+
+func TestReadIdentitiesReportsAnUnreadableDirectory(t *testing.T) {
+	if _, err := ReadIdentities(filepath.Join(t.TempDir(), "absent")); err == nil {
+		t.Fatal("ReadIdentities on a missing directory returned nil error, want one: the caller treats this as scope unknown")
 	}
 }

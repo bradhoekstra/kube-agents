@@ -126,6 +126,38 @@ func (d Discoverer) skip(profile string, err error) {
 	}
 }
 
+// ReadIdentities lists the cluster identity of every Cluster Agent profile in
+// dir, reading only the profiles' config files: no credential is minted and the
+// GKE API is not asked anything, so it costs a directory read and is safe to
+// call again while the process runs. It is the scope question -- does a profile
+// name this cluster? -- as distinct from Discover's reachability question, and
+// the two answers differ for every profile Discover skips.
+//
+// Entries that are not cluster profiles (no cluster_identity block, a hidden
+// directory, a file) are left out, and so is a profile whose config does not
+// parse: Discover already reports that one at startup, and a scope listing
+// that failed on it would make one broken profile hide the whole fleet. Only a
+// directory that cannot be read at all is an error, because then the scope is
+// unknown rather than empty.
+func ReadIdentities(dir string) ([]Identity, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
+	}
+	var ids []Identity
+	for _, e := range entries {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), hiddenPrefix) {
+			continue
+		}
+		identity, err := ReadIdentity(filepath.Join(dir, e.Name(), profileConfigFile))
+		if err != nil || identity == nil {
+			continue
+		}
+		ids = append(ids, *identity)
+	}
+	return ids, nil
+}
+
 // Discover scans a Hermes profiles directory (normally /opt/data/profiles) and
 // returns one Cluster per Cluster Agent profile found.
 //

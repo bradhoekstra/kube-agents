@@ -453,6 +453,38 @@ func TestJoinDisabledReason(t *testing.T) {
 	}
 }
 
+// The two shutdown lines that name the unreachable clusters tell the operator
+// what became of their records, one line per disposition: the first names the
+// clusters a profile names and the run could not join (or every unreachable
+// cluster when no --profiles-dir declared a scope), whose records went out
+// thin; the second names the clusters no profile names, whose records were
+// held -- profile them or exclude them.
+func TestUnreachableClustersLine(t *testing.T) {
+	names := []string{`"example-project/us-central1/prod-b"=3`}
+	got := unreachableClustersLine(names)
+	for _, want := range []string{"forwarded without ownership", "Cluster Agent profile names them", names[0]} {
+		if !strings.Contains(got, want) {
+			t.Errorf("unreachableClustersLine() = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "outside the install's scope") {
+		t.Errorf("unreachableClustersLine() = %q, want it not to claim a hold that did not happen", got)
+	}
+}
+
+func TestOutOfScopeClustersLine(t *testing.T) {
+	names := []string{`"example-project/us-central1/prod-b"=3`}
+	got := outOfScopeClustersLine(names)
+	for _, want := range []string{"outside the install's scope", "no Cluster Agent profile names them", "held out of the inject", "exclude them", names[0]} {
+		if !strings.Contains(got, want) {
+			t.Errorf("outOfScopeClustersLine() = %q, want it to contain %q", got, want)
+		}
+	}
+	if strings.Contains(got, "forwarded without ownership") {
+		t.Errorf("outOfScopeClustersLine() = %q, want it not to say the records were forwarded", got)
+	}
+}
+
 func TestLooksLikeProjectNumber(t *testing.T) {
 	// The whole test is "nothing but digits", and it is exact rather than
 	// heuristic because a GCP project ID must begin with a lowercase letter.
