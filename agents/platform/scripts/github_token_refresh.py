@@ -175,15 +175,21 @@ REFRESH_HELPER_BUDGET_SECONDS = (
 #: broker.
 BROKER_ADMISSION_WAIT_SECONDS = 60
 
-#: Room for the connection and the response on top of the two waits.
+#: Room for the connection and the response on top of the waits.
 SIDECAR_REFRESH_MARGIN_SECONDS = 10
 
-#: The client's socket timeout on the refresh POST. A refresh admitted late in
-#: the broker's wait still runs the whole helper and answers 200 once the token
-#: has landed, so a client that gives up sooner reports a refresh that succeeded
-#: as failed.
+#: The client's socket timeout on the refresh POST. Before its own helper
+#: starts, the broker may hold a refresh twice: waiting, without a reservation,
+#: for another caller's refresh of the same forge already in flight -- as long
+#: as that helper runs, so its budget -- and then queueing for admission. A
+#: refresh admitted late still runs the whole helper and answers 200 once the
+#: token has landed, so a client that gives up sooner reports a refresh that
+#: succeeded as failed.
 SIDECAR_REFRESH_TIMEOUT_SECONDS = (
-    BROKER_ADMISSION_WAIT_SECONDS + REFRESH_HELPER_BUDGET_SECONDS + SIDECAR_REFRESH_MARGIN_SECONDS
+    REFRESH_HELPER_BUDGET_SECONDS
+    + BROKER_ADMISSION_WAIT_SECONDS
+    + REFRESH_HELPER_BUDGET_SECONDS
+    + SIDECAR_REFRESH_MARGIN_SECONDS
 )
 
 #: Bounds the ssh hop around the gateway's forward to the sandbox, which runs
@@ -704,8 +710,9 @@ def refresh_git_credentials(
     if proxy_url:
         # In the agent sandbox: delegate to the credential sidecar.
         # The sidecar manages bounded retries against Minty internally. The
-        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers the
-        # broker's admission wait and the helper's budget after it, and fails
+        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers a
+        # refresh already in flight, the broker's admission wait and the
+        # helper's budget after it, and fails
         # fast on any error without re-triggering retries.
         # The forge-neutral route, naming the provider and the repository by
         # its URL rather than as a bare slug: a broker serving more than one

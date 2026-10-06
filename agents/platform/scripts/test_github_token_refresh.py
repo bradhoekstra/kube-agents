@@ -206,9 +206,10 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_waits_out_the_brokers_admission_and_the_helper(self, urlopen, run):
-        # The broker may queue a refresh behind its child memory budget for
-        # COMMAND_SLOT_WAIT_SECONDS before the helper starts; a client that gives
-        # up sooner reports a token that landed as a failed refresh.
+        # Before the helper starts, the broker may hold a refresh behind one
+        # already in flight for the same forge, then queue it behind its child
+        # memory budget for COMMAND_SLOT_WAIT_SECONDS; a client that gives up
+        # sooner reports a token that landed as a failed refresh.
         response = MagicMock()
         response.__enter__.return_value.status = 200
         urlopen.return_value = response
@@ -222,13 +223,14 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
         timeout = urlopen.call_args.kwargs["timeout"]
         self.assertEqual(github_token_refresh.SIDECAR_REFRESH_TIMEOUT_SECONDS, timeout)
-        # 60 s of admission wait, 81.5 s of helper (20 identity, 16.5 Minty,
-        # 3 x 15 CLI), 10 s of margin.
-        self.assertEqual(151.5, timeout)
+        # 81.5 s for a refresh already in flight, 60 s of admission wait,
+        # 81.5 s of its own helper (20 identity, 16.5 Minty, 3 x 15 CLI), 10 s
+        # of margin.
+        self.assertEqual(233.0, timeout)
         self.assertGreater(
             timeout,
             credential_proxy.COMMAND_SLOT_WAIT_SECONDS
-            + github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS,
+            + 2 * github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS,
         )
         self.assertEqual(
             credential_proxy.COMMAND_SLOT_WAIT_SECONDS,
