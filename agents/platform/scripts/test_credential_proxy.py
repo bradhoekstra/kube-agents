@@ -2783,6 +2783,56 @@ class SessionRoleExecutableTest(unittest.TestCase):
         self.assertEqual(200, status, body)
 
 
+class ChildMemoryBudgetDerivationTest(unittest.TestCase):
+    """Where the broker learns its memory limit (design §2.4)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cgroup = Path(self.tmp.name) / "memory.max"
+
+    def test_the_downward_api_variable_wins(self):
+        self.cgroup.write_text("536870912\n", encoding="utf-8")
+        limit = credential_proxy.child_memory_limit_bytes(
+            {credential_proxy.ENV_MEMORY_LIMIT_BYTES: "1073741824"}, cgroup_path=self.cgroup
+        )
+        self.assertEqual(1073741824, limit)
+
+    def test_the_cgroup_file_is_the_fallback(self):
+        self.cgroup.write_text("536870912\n", encoding="utf-8")
+        self.assertEqual(
+            536870912, credential_proxy.child_memory_limit_bytes({}, cgroup_path=self.cgroup)
+        )
+
+    def test_a_cgroup_without_a_limit_disables_the_budget(self):
+        self.cgroup.write_text("max\n", encoding="utf-8")
+        self.assertIsNone(credential_proxy.child_memory_limit_bytes({}, cgroup_path=self.cgroup))
+
+    def test_nothing_readable_disables_the_budget(self):
+        self.assertIsNone(
+            credential_proxy.child_memory_limit_bytes({}, cgroup_path=self.cgroup / "absent")
+        )
+
+    def test_a_variable_that_is_not_a_positive_integer_disables_the_budget(self):
+        # Review focus 1: never raise at startup, never budget against zero.
+        for raw in ("0", "-1", "lots", ""):
+            with self.subTest(raw=raw):
+                self.assertIsNone(
+                    credential_proxy.child_memory_limit_bytes(
+                        {credential_proxy.ENV_MEMORY_LIMIT_BYTES: raw},
+                        cgroup_path=self.cgroup / "absent",
+                    )
+                )
+
+    def test_the_constants_match_the_design(self):
+        mib = credential_proxy.MEBIBYTE
+        self.assertEqual(128 * mib, credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES)
+        self.assertEqual(192 * mib, credential_proxy.BROKER_RESIDENT_RESERVE_BYTES)
+        self.assertEqual(128 * mib, credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES)
+        self.assertEqual(6, credential_proxy.OUTPUT_COPIES_PER_COMMAND)
+        self.assertEqual("CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES", credential_proxy.ENV_MEMORY_LIMIT_BYTES)
+
+
 class CommandExecutorTest(unittest.TestCase):
     CONTEXT = "gke_demo-project_us-central1_cluster-a"
 

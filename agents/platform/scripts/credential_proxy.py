@@ -145,6 +145,36 @@ PIPES_CLOSED_POLL_SECONDS = 0.5
 # says which routes hold a slot and why the others take none.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
+# The child memory budget (docs/designs/credential-proxy-child-memory-budget.md).
+# The slot cap above counts requests; the container's memory limit holds
+# processes, and the children a request spawns -- gcloud at about 102 MiB per
+# request across a listing burst, kubectl plus its auth-plugin helper at about
+# the same -- are most of what a wide-scope install's container holds. So a
+# request that runs commands also reserves this much for its children when it
+# is admitted, and the sum of reservations has to fit what is left of the
+# limit after the broker's own resident set and the content workspace's one
+# process tree at a time. One size for every route, because every route can
+# end up running the heavy case (§2.1). The operator's sizing test declares
+# the same four figures under matching names (credential_proxy_manifests.go)
+# and asserts the arithmetic against the rendered limit; change them together.
+MEBIBYTE = 1024 * 1024
+REQUEST_CHILD_MEMORY_RESERVE_BYTES = 128 * MEBIBYTE
+# The broker process and Envoy: 168 MiB measured, with margin.
+BROKER_RESIDENT_RESERVE_BYTES = 192 * MEBIBYTE
+# The content workspace store serves one verb at a time under its own lock, so
+# at most one of its process trees exists at any moment; that is a fixed term
+# rather than a reservation per verb, and it is one request's worth.
+CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
+# What the broker itself holds per admitted request, as a multiple of the
+# output cap: the two capped stream buffers, their decoded text, the JSON body
+# and its encoding. Charged for the slots in use, not for the cap.
+OUTPUT_COPIES_PER_COMMAND = 6
+# Where the limit comes from, in order: the operator's Downward API variable,
+# then the cgroup v2 file for a broker whose Deployment predates the variable.
+# A value of `max` in the file means no limit, and no limit means no budget.
+ENV_MEMORY_LIMIT_BYTES = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
+CGROUP_MEMORY_MAX_PATH = "/sys/fs/cgroup/memory.max"
+CGROUP_NO_LIMIT = "max"
 # The session role's own share of that pool. Session pods are opened by chat
 # conversations, and under the cluster-view flag all of them draw on the one
 # pool the platform agent's shell uses, so without a bound of their own a
@@ -1239,6 +1269,35 @@ class AuthenticationError(Exception):
     to the client, which gets an undifferentiated 401 — telling an unidentified
     caller *why* it failed tells it how to succeed.
     """
+
+
+def child_memory_limit_bytes(
+    environ: "Mapping[str, str] | None" = None,
+    cgroup_path: "str | Path" = CGROUP_MEMORY_MAX_PATH,
+) -> int | None:
+    """The container's memory limit in bytes, or None when the budget is off.
+
+    Reads the operator's Downward API variable first, then the cgroup file, and
+    answers None for anything that is not a positive integer: a variable set to
+    `0` or to text, a file that says `max`, a file that is not there. None is
+    "admission by slot alone, as before this budget", logged once by the
+    executor; it is never an error, because a broker that refuses to start over
+    a sizing hint is worse than one that runs unbudgeted.
+    """
+    source = os.environ if environ is None else environ
+    raw = (source.get(ENV_MEMORY_LIMIT_BYTES) or "").strip()
+    if not raw:
+        try:
+            raw = Path(cgroup_path).read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if raw == CGROUP_NO_LIMIT:
+            return None
+    try:
+        limit = int(raw)
+    except ValueError:
+        return None
+    return limit if limit > 0 else None
 
 
 class CommandSlotUnavailable(RuntimeError):
