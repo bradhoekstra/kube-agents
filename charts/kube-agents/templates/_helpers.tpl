@@ -1088,6 +1088,56 @@ the check needs `get`/`list` on `resourcequotas` in the release namespace, and a
 without it installs with `--set quotaPreflight.enabled=false`. Nothing here can soften that:
 a Go template cannot catch the error `lookup` raises.
 */}}
+{{/*
+The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
+merged over it, per key, as resolveCredentialProxyResources does in the operator
+(k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
+carries replaces that number, a key it omits keeps footprint.yaml's. A request the override
+omits keeps the default request rather than falling back to the override's limit, which is
+how kube-agents.workloadResources reads a chart workload and why that helper is not reused
+here -- the operator renders the default request, so that is what the pod asks for.
+Takes (dict "workload" <footprint entry> "override" <resources block>) and returns the
+entry's six numbers and pod count as JSON.
+*/}}
+{{- define "kube-agents.credentialProxyFootprint" -}}
+{{- $workload := .workload | default dict -}}
+{{- $override := .override | default dict -}}
+{{- $req := (index $override "requests") | default dict -}}
+{{- $lim := (index $override "limits") | default dict -}}
+{{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}
+{{- $cpuLim := $workload.cpuMillisLimit | default 0 | int64 -}}
+{{- $memReq := $workload.memoryBytesRequest | default 0 | int64 -}}
+{{- $memLim := $workload.memoryBytesLimit | default 0 | int64 -}}
+{{- $ephReq := $workload.ephemeralStorageBytesRequest | default 0 | int64 -}}
+{{- $ephLim := $workload.ephemeralStorageBytesLimit | default 0 | int64 -}}
+{{- /* declaredQuantity with an empty fallback answers "" for an absent or null key, which
+       `with` skips, so `memory: null` keeps the default as it does on the CR. */ -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "cpu") "fallback" "") -}}
+{{- $cpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "cpu") "fallback" "") -}}
+{{- $cpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "memory") "fallback" "") -}}
+{{- $memReq = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "") -}}
+{{- $memLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
+{{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "ephemeral-storage") "fallback" "") -}}
+{{- $ephLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- end -}}
+{{- dict
+      "cpuMillisRequest" $cpuReq "cpuMillisLimit" $cpuLim
+      "memoryBytesRequest" $memReq "memoryBytesLimit" $memLim
+      "ephemeralStorageBytesRequest" $ephReq "ephemeralStorageBytesLimit" $ephLim
+      "pods" ($workload.pods | default 1 | int64)
+   | toJson -}}
+{{- end }}
+
 {{- define "kube-agents.quotaRequirements" -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of
@@ -1257,8 +1307,17 @@ a Go template cannot catch the error `lookup` raises.
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
+  {{- /* The one operator-rendered workload with a sizing override in values: the proxy's
+         footprint entry takes platformAgent.deployment.credentialProxy.resources over it
+         per key (kube-agents.credentialProxyFootprint) before it is summed, so a raised
+         memory limit is counted here as the pod the operator will write, rather than the
+         preflight passing a quota the release will not fit. */ -}}
+  {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- if and (eq $key "credentialProxy") $proxyOverride -}}
+        {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
+      {{- end -}}
       {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
       {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
       {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}

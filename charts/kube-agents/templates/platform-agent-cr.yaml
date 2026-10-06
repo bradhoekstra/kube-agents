@@ -175,6 +175,19 @@ spec:
         {{- end }}
       {{- end }}
     {{- end }}
+    {{- /*
+      Rendered only when a key is set. An empty block would write
+      `credentialProxy: {resources: {}}` onto every CR, which an API server
+      serving a CRD from before the field prunes silently and a reader mistakes
+      for an override. The operator merges what is here over its defaults per
+      key, so a block carrying only limits.memory is complete as written.
+    */}}
+    {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
+    {{- if $proxyResources }}
+    credentialProxy:
+      resources:
+        {{- toYaml $proxyResources | nindent 8 }}
+    {{- end }}
   security:
     serviceAccountName: {{ .Values.platformAgent.security.serviceAccountName | quote }}
     {{- with .Values.platformAgent.security.serviceAccountAnnotations }}
