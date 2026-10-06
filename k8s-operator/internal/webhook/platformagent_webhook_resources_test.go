@@ -93,6 +93,23 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
 	}
 }
 
+// A crossed memory pair is refused once. 4Gi against the default 500m CPU
+// request is 8 GiB per vCPU, outside the Autopilot band, but the band warning
+// would restate a pair already refused.
+func TestCredentialProxyCrossedMemoryPairIsRefusedWithoutABandWarning(t *testing.T) {
+	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
+	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("4Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+	}).Spec.Deployment, path)
+	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.requests.memory" {
+		t.Errorf("expected the crossed-pair refusal alone, got %v", errs)
+	}
+	if len(warnings) != 0 {
+		t.Errorf("the crossed pair drew band warnings: %v", warnings)
+	}
+}
+
 // The CPU limit comes down with it: 672Mi against the default 1 CPU is 0.66 GiB
 // per vCPU, which the band check would warn on, and that would be a true
 // warning rather than this test's subject.

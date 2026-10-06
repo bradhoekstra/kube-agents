@@ -210,6 +210,8 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		// says when the other is the operator's.
 		_, overrodeRequest := override.Requests[name]
 		_, overrodeLimit := override.Limits[name]
+		refused[requestPath.String()] = true
+		refused[limitPath.String()] = true
 		switch {
 		case overrodeRequest && overrodeLimit:
 			errs = append(errs, field.Invalid(requestPath, request.String(),
@@ -226,8 +228,11 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	for _, side := range sides {
 		cpu, hasCPU := side.list[corev1.ResourceCPU]
 		memory, hasMemory := side.list[corev1.ResourceMemory]
+		// A quantity already refused, alone or as half of a crossed pair,
+		// draws no band advice: the warning would restate the refusal.
 		if !hasCPU || !hasMemory || cpu.Sign() <= 0 || memory.Sign() <= 0 ||
-			refused[path.Child(side.name, string(corev1.ResourceMemory)).String()] {
+			refused[path.Child(side.name, string(corev1.ResourceMemory)).String()] ||
+			refused[path.Child(side.name, string(corev1.ResourceCPU)).String()] {
 			continue
 		}
 		// memory against cpu × each edge, in Quantity arithmetic, which falls
