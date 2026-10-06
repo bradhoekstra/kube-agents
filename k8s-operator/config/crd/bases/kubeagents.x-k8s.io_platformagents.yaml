@@ -1098,8 +1098,9 @@ spec:
                             pod declares no resourceClaims. The reconciler leaves the proxy
                             Deployment as last applied and sets Degraded whether or not the
                             validating webhook is enabled, and the webhook, where it is, refuses the
-                            override at apply. The webhook warns when the memory-to-CPU limit ratio
-                            leaves the band GKE Autopilot admits unchanged. On GKE Autopilot without bursting, a
+                            override at apply. The webhook warns when memory per CPU, on the requests
+                            pair and on the limits pair, leaves the band GKE Autopilot admits
+                            unchanged. On GKE Autopilot without bursting, a
                             container's limits follow its requests, so raise requests.memory
                             alongside limits.memory there.
                           properties:

@@ -104,17 +104,34 @@ func TestCredentialProxyFullOverrideReplacesEveryKey(t *testing.T) {
 	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 }
 
-// TestCredentialProxyOverrideDoesNotAliasTheCR: the render copies quantities
-// out of the CR rather than sharing them, so a later mutation of the rendered
-// container cannot reach back into the object the reconciler was handed.
+// TestCredentialProxyOverrideDoesNotAliasTheCR: the render builds maps of its
+// own rather than handing back the CR's, and copies each quantity, so writing
+// to the rendered Requests or Limits, or to a rendered quantity in place,
+// cannot reach back into the object the reconciler was handed. The in-place
+// case needs a quantity held in decimal form, whose value sits behind a
+// pointer that a struct copy shares and only DeepCopy separates.
 func TestCredentialProxyOverrideDoesNotAliasTheCR(t *testing.T) {
-	override := &corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")}}
+	decimalLimit := resource.MustParse("2Gi")
+	decimalLimit.ToDec()
+	override := &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("1Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: decimalLimit},
+	}
 	got := resolveCredentialProxyResources(&agentv1alpha1.DeploymentSpec{CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: override}})
 	rendered := got.Limits[corev1.ResourceMemory]
-	rendered.Add(resource.MustParse("1Gi"))
-	got.Limits[corev1.ResourceMemory] = rendered
+	rendered.AsDec().SetScale(rendered.AsDec().Scale() - 1)
 	if override.Limits.Memory().Cmp(resource.MustParse("2Gi")) != 0 {
-		t.Errorf("mutating the rendered limit changed the CR's override to %s", override.Limits.Memory())
+		t.Fatalf("scaling the rendered limit in place changed the CR's override to %d bytes", override.Limits.Memory().Value())
+	}
+	got.Requests[corev1.ResourceMemory] = resource.MustParse("3Gi")
+	got.Limits[corev1.ResourceMemory] = resource.MustParse("4Gi")
+	got.Requests["hugepages-2Mi"] = resource.MustParse("2Mi")
+	delete(got.Limits, corev1.ResourceMemory)
+	if len(override.Requests) != 1 || override.Requests.Memory().Cmp(resource.MustParse("1Gi")) != 0 {
+		t.Errorf("writing the rendered requests changed the CR's override to %v", override.Requests)
+	}
+	if len(override.Limits) != 1 || override.Limits.Memory().Cmp(resource.MustParse("2Gi")) != 0 {
+		t.Errorf("writing the rendered limits changed the CR's override to %v", override.Limits)
 	}
 }
 
