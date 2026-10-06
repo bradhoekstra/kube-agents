@@ -13,23 +13,23 @@ regex tweak that reads fine but shifts what matches:
   ``WorkerCommandsVerifier`` ``re.search``es each pattern against the raw command
   string, so this test does the same.
 
-* ``the-answer-affirms-the-watcher-is-scraped`` -- a ``report_contains`` whose
-  ``any_of_patterns`` tie a scrape verb to a watcher anchor (the affirmative) and
-  whose ``forbidden_patterns`` red a negated conclusion an affirmative substring
-  would still contain. A correct "scraped" answer hits an any_of and no forbidden;
-  a "not scraped" answer -- including one that negates the subject ("nothing is
-  scraping it") rather than the verb, or buries the affirmative in a hypothetical
-  ("whether GMP is scraping it: it is not") -- hits a forbidden or no any_of.
-  ``ReportContainsVerifier`` ``re.search``es ``any_of_patterns`` against
-  ``_normalize(text)`` (flat) and ``forbidden_patterns`` against
-  ``_normalize_lines(text)`` (per line), so this test reproduces both and
-  cross-checks them against the real verifier when the bench package imports.
+* ``the-answer-affirms-the-watcher-is-scraped`` -- a ``report_contains`` that
+  grades a verdict token the prompt asks the worker to emit, a first line
+  ``Scraped: yes`` or ``Scraped: no``, rather than reading polarity out of free
+  prose. ``required_phrases`` pins the affirmative token and ``forbidden_phrases``
+  reds the negative one; the nuance (a correct answer may note the
+  credential-proxy PodMonitoring is unscraped while the watcher is) is left to the
+  judge. A correct answer carries ``Scraped: yes`` and not ``Scraped: no``; a
+  negative carries ``Scraped: no`` or omits the token, so it fails on the
+  forbidden phrase or the missing required one. ``ReportContainsVerifier`` tests
+  both against ``_normalize(text)`` (substring, flat), so this test reproduces
+  that and cross-checks the normalizer against the real verifier when the bench
+  package imports.
 
-The patterns are read from task.yaml, not duplicated here, so the test pins the
-file rather than a copy of it. The residuals that neither slot can refuse without
-a shell or English parser are asserted as known false-greens/false-reds, so a
-future tightening that fixes one trips this test and updates the task.yaml comment
-with it.
+The checks are read from task.yaml, not duplicated here, so the test pins the
+file rather than a copy of it. The residuals that neither check can refuse cleanly
+are asserted as known false-greens/false-reds, so a future tightening that fixes
+one trips this test and updates the task.yaml comment with it.
 
 Run:
   python3 -m pytest bench/tests/test_observability_watcher_scrape_patterns.py -v
@@ -166,50 +166,51 @@ ROUTE_KNOWN_RESIDUALS = [
 
 # --- polarity corpus --------------------------------------------------------
 
-# Correct answers: the watcher IS scraped. Each must hit an any_of pattern and no
-# forbidden pattern. The last two are the adverb-split and non-pronoun-object
-# shapes a contiguous substring missed.
+# Correct answers: the watcher IS scraped. Each carries the `Scraped: yes` token
+# and not `Scraped: no`, so required_phrases is satisfied and forbidden_phrases is
+# not. The second mixes a scraped watcher with an unscraped credential-proxy --
+# the token carries the verdict, the prose nuance goes to the judge; the third
+# folds case and markdown the normalizer strips.
 POLARITY_CORRECT = [
-    'Yes. The watcher metrics are scraped through the `platform-agent-gateway-monitoring` '
-    'PodMonitoring on port 9095; up{job="platform-agent-gateway-monitoring"} reads 1.',
-    "The watcher's metrics are being scraped every 30s by GKE Managed Prometheus via the "
-    "gateway-monitoring PodMonitoring (9095). Note the credential-proxy metrics are not "
-    "being scraped yet.",
-    "Yes -- port 9095 is scraped through the gateway-monitoring PodMonitoring; "
-    "k8s_event_watcher_cluster_up confirms it.",
-    "GKE Managed Prometheus scrapes the watcher's 9095 endpoint through the "
-    "gateway-monitoring PodMonitoring.",
-    "GKE Managed Prometheus is successfully scraping port 9095 through the "
-    "gateway-monitoring PodMonitoring.",
-    "The watcher's 9095 metrics are currently being scraped every 30s.",
+    "Scraped: yes. The watcher metrics are scraped through the "
+    '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
+    'up{job="platform-agent-gateway-monitoring"} reads 1.',
+    "Scraped: yes. The watcher's 9095 metrics are scraped every 30s by GKE "
+    "Managed Prometheus via the gateway-monitoring PodMonitoring. The "
+    "credential-proxy metrics are not being scraped yet.",
+    "**Scraped: Yes.** k8s_event_watcher_cluster_up confirms port 9095 is "
+    "scraped through the gateway-monitoring PodMonitoring.",
 ]
 
-# Incorrect answers: the watcher is NOT scraped. Each must miss every any_of or
-# hit a forbidden pattern, even though they name the same mechanism, port and
-# series the other objective checks -- including answers that negate the subject
-# rather than the verb, mix a scraped proxy with the unscraped watcher, or bury
-# the affirmative verb in a hypothetical.
+# Incorrect answers: the watcher is NOT scraped. Each carries the `Scraped: no`
+# token (hitting forbidden_phrases) or omits the verdict line (missing
+# required_phrases), even though some name the same mechanism, port and series the
+# other objective checks. The last three are shapes the earlier enumerated-negation
+# regex false-greened -- a contraction, perfect tense, active voice -- that the
+# token reds on the verdict alone.
 POLARITY_INCORRECT = [
-    "No. The event watcher's metrics are not scraped: the gateway-monitoring "
-    "PodMonitoring targets 9095 but up{job=...} returns nothing.",
-    "The watcher is not being scraped. The gateway Deployment carries no "
-    "prometheus.io/scrape annotation; port 9095 is unmonitored.",
-    "The metrics at 9095 are not scraped through any PodMonitoring; "
-    "gateway-monitoring does not exist on this install.",
-    "Nothing is scraping the watcher's 9095 endpoint.",
-    "None of the k8s_event_watcher_* series are scraped.",
-    "No collector scrapes the gateway-monitoring target.",
-    "The credential-proxy PodMonitoring is scraped on 8766; the watcher is not scraped.",
-    "I checked whether GMP is scraping it: it is not.",
+    "Scraped: no. The event watcher's metrics are not scraped: the "
+    "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
+    "nothing.",
+    "Scraped: no. The gateway Deployment carries no prometheus.io/scrape "
+    "annotation; port 9095 is unmonitored.",
+    "The watcher is not being scraped; nothing targets 9095.",
+    "Scraped: no. 9095 isn't scraped.",
+    "Scraped: no. The watcher was never scraped on this install.",
+    "Scraped: no. Prometheus is not scraping 9095.",
 ]
 
-# Polarity residuals, documented in the task.yaml comment and accepted. A
-# copula-less watcher negation beside an anchored affirmative false-greens; an
-# affirmative whose only scrape clause names no anchor false-reds. Asserted so a
-# future tightening that fixes one trips this test and updates the comment.
-POLARITY_KNOWN_FALSE_GREEN = "GMP scrapes port 9095. The watcher? not scraped."
+# Polarity residuals, documented in the task.yaml comment and accepted. Each needs
+# the worker to ignore the verdict-line instruction: a negative that omits the line
+# but carries the "scraped: yes" substring inline false-greens; an affirmative that
+# also writes "scraped: no" in prose false-reds. Asserted so a future tightening
+# that fixes one trips this test and updates the comment.
+POLARITY_KNOWN_FALSE_GREEN = (
+    "Is it scraped: yes it has a gateway-monitoring PodMonitoring, but nothing "
+    "scrapes 9095."
+)
 POLARITY_KNOWN_FALSE_RED = (
-    "The gateway-monitoring PodMonitoring targets 9095. Yes, it is scraped."
+    "Scraped: yes. The credential-proxy, by contrast, is scraped: no."
 )
 
 
@@ -240,20 +241,21 @@ class ObservabilityWatcherRouteRegex(unittest.TestCase):
 class ObservabilityWatcherPolarity(unittest.TestCase):
     def setUp(self):
         check = _check_named(POLARITY_OBJECTIVE)
-        self.any_of = [re.compile(p) for p in check.get("any_of_patterns", [])]
-        self.forbidden = [re.compile(p) for p in check.get("forbidden_patterns", [])]
-        self.assertTrue(self.any_of, "polarity objective should carry any_of_patterns")
+        self.required = check.get("required_phrases", [])
+        self.forbidden = check.get("forbidden_phrases", [])
         self.assertTrue(
-            self.forbidden, "polarity objective should carry forbidden_patterns"
+            self.required, "polarity objective should carry required_phrases"
+        )
+        self.assertTrue(
+            self.forbidden, "polarity objective should carry forbidden_phrases"
         )
 
     def _affirms(self, answer: str) -> bool:
-        """``ReportContainsVerifier``'s verdict for an any_of + forbidden check."""
-        flat = _normalize(answer)
-        lines = _normalize_lines(answer)
-        any_hit = any(p.search(flat) for p in self.any_of)
-        forbidden_hit = any(p.search(lines) for p in self.forbidden)
-        return any_hit and not forbidden_hit
+        """``ReportContainsVerifier``'s verdict for a required + forbidden check."""
+        text = _normalize(answer)
+        missing = any(_normalize(p) not in text for p in self.required)
+        present = any(_normalize(p) in text for p in self.forbidden)
+        return not missing and not present
 
     def test_correct_answers_affirm(self):
         for answer in POLARITY_CORRECT:
@@ -270,14 +272,14 @@ class ObservabilityWatcherPolarity(unittest.TestCase):
                 )
 
     def test_known_residual_false_green_still_affirms(self):
-        # Documented in the task.yaml polarity comment: a copula-less watcher
-        # negation beside an anchored affirmative has no single-regex fix that
-        # leaves the legitimate "credential-proxy is not scraped" mention alone.
+        # Documented in the task.yaml polarity comment: a negative that ignores the
+        # verdict-line instruction and carries the "scraped: yes" substring inline
+        # has no substring fix that leaves the compliant token alone.
         self.assertTrue(self._affirms(POLARITY_KNOWN_FALSE_GREEN))
 
     def test_known_residual_false_red_still_fails(self):
-        # Documented in the task.yaml polarity comment: an affirmative whose only
-        # scrape clause names no anchor fails closed (the safe direction).
+        # Documented in the task.yaml polarity comment: an affirmative that also
+        # writes "scraped: no" in prose fails closed (the safe direction).
         self.assertFalse(self._affirms(POLARITY_KNOWN_FALSE_RED))
 
 

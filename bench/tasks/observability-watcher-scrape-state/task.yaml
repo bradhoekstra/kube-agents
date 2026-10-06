@@ -35,15 +35,17 @@ prompt: >-
   Are the event watcher's Prometheus metrics being scraped on this install?
   Tell me how the scrape is configured, where the watcher's listener is, and
   which series in Cloud Monitoring prove that the collector is scraping it.
+  Begin your reply with a single line -- `Scraped: yes` or `Scraped: no` --
+  then explain.
 expected_output: >-
-  The scrape is configured by the PodMonitoring named after the agent with the
-  gateway-monitoring suffix, which targets the event watcher's listener on the
-  gateway pod's agent-api-auth container, port 9095 (event-metrics); the proof
-  that the collector is scraping it is in Cloud Monitoring, as up for that job
-  and k8s_event_watcher_cluster_up for each watched cluster, with the watcher's
-  own cluster and location labels arriving as exported_cluster and
-  exported_location. The answer does not rest on scrape annotations on the
-  gateway Deployment, which the operator does not render.
+  Scraped: yes. The scrape is configured by the PodMonitoring named after the
+  agent with the gateway-monitoring suffix, which targets the event watcher's
+  listener on the gateway pod's agent-api-auth container, port 9095
+  (event-metrics); the proof that the collector is scraping it is in Cloud
+  Monitoring, as up for that job and k8s_event_watcher_cluster_up for each
+  watched cluster, with the watcher's own cluster and location labels arriving
+  as exported_cluster and exported_location. The answer does not rest on scrape
+  annotations on the gateway Deployment, which the operator does not render.
 infrastructure:
   deployer: noop
 validated: false
@@ -125,36 +127,32 @@ verification_spec:
         - "k8s_event_watcher_cluster_up"
   # The conclusion's polarity, which the objective above does not carry: the
   # answer must affirm the watcher is scraped, not merely name the mechanism and
-  # series while concluding it is not. A substring cannot carry this -- "is
-  # scraping" sits inside "whether GMP is scraping it: it is not", and "is
-  # scraped" survives a negated subject ("nothing is scraping it", "none of the
-  # series are scraped") -- so polarity uses the verifier's two regex slots.
-  # any_of_patterns carry the affirmative, each tying a scrape verb to a watcher
-  # anchor in the same clause -- the listener's `9095`/`event-metrics`, the
-  # `gateway-monitoring` PodMonitoring, the `watcher`, or the `k8s_event_watcher*`
-  # series -- in either voice ("9095 is being scraped", "GMP scrapes the watcher's
-  # 9095 endpoint"), which an answer about the credential-proxy's own
-  # PodMonitoring does not hit. forbidden_patterns red the negation an affirmative
-  # substring would still contain: an anchor negated in its own clause ("the
-  # watcher is not scraped") and a negated subject ("nothing scrapes it"). A
-  # forbidden_phrases on a bare "not scraped" is not used -- a correct answer may
-  # note the credential-proxy PodMonitoring is unscraped while the watcher is, and
-  # the ban would false-red it; anchoring the negation to the watcher's clause
-  # leaves that mention alone. Anchors are spelled without underscores, which
-  # _normalize strips before the regex runs. Two residuals stand, contrived
-  # against the recorded runs: a copula-less watcher negation beside an
-  # affirmative ("GMP scrapes 9095. The watcher? not scraped.") false-greens, and
-  # an affirmative whose only scrape clause names no anchor ("yes, it is scraped")
-  # false-reds. Both polarities and the residuals are pinned in
+  # series while concluding it is not. Polarity is graded as a verdict token the
+  # prompt asks the worker to emit -- a first line `Scraped: yes` or
+  # `Scraped: no` -- not by reading it out of free prose. A substring or regex
+  # over the prose cannot carry English negation: "is scraping" sits inside
+  # "whether GMP is scraping it: it is not", "is scraped" survives a negated
+  # subject ("nothing is scraping it"), and an enumerated-negation regex here
+  # leaked on contractions, perfect tense, active voice, bulleted negations and
+  # "unscraped" -- negation is not finitely enumerable, so each round patched one
+  # shape and missed the next. required_phrases pins the affirmative token and
+  # forbidden_phrases reds the negative; the nuance a substring could not carry
+  # -- a correct answer may note the credential-proxy PodMonitoring is unscraped
+  # while the watcher is -- is left to the judge against expected_output, which
+  # the verifier's docstring reserves for anything fuzzier than an author-chosen
+  # phrase. The token survives the normalizer: `**Scraped: Yes**` folds to
+  # `scraped: yes` (emphasis dropped, lowercased). Two residuals stand, each
+  # requiring the worker to ignore the verdict-line instruction and contrived
+  # against a compliant answer: a negative that omits the line but carries the
+  # substring "scraped: yes" inline false-greens, and an affirmative that also
+  # writes "scraped: no" in prose false-reds. Both are pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py.
   - name: the-answer-affirms-the-watcher-is-scraped
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_patterns:
-        - '(?:watcher|9095|event-metrics|gateway-monitoring|k8seventwatcher\w*)[^.;]{0,70}\b(?:is|are)\b[^.;]{0,30}scrap(?:ed|ing)\b'
-        - '\bscrap(?:es|ed|ing)\b[^.;]{0,40}(?:watcher|9095|event-metrics|gateway-monitoring|k8seventwatcher\w*)'
-      forbidden_patterns:
-        - '(?:watcher|9095|event-metrics|gateway-monitoring|k8seventwatcher\w*)[^.;\n]{0,70}\b(?:is|are)\b[^.;\n]{0,20}\b(?:not|never|no longer)\b[^.;\n]{0,20}scrap'
-        - '\b(?:nothing|nobody|none of|neither|no (?:collector|scraper|podmonitoring|prometheus|one|job|pipeline))\b[^.;\n]{0,70}scrap'
+      required_phrases:
+        - "Scraped: yes"
+      forbidden_phrases:
+        - "Scraped: no"
