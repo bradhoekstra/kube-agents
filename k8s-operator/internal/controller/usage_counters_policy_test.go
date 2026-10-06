@@ -52,15 +52,21 @@ func operatorPeerRules(np *networkingv1.NetworkPolicy) map[int32]networkingv1.Ne
 	return found
 }
 
-// operatorRules is every ingress rule of np that admits a peer carrying the
-// operator's pod label -- the whole rule, so a test can see what else the rule
-// opens beside that peer (a second peer, an empty or wider Ports list), which
-// operatorPeerRules drops.
-func operatorRules(np *networkingv1.NetworkPolicy) []networkingv1.NetworkPolicyIngressRule {
+// operatorRules is every ingress rule of np that names the operator -- a peer
+// carrying the operator's pod label, or one whose namespace selector names the
+// operator's namespace -- returning the whole rule, so a test can see what else
+// the rule opens beside that peer (a second peer, an empty or wider Ports list)
+// and whether a second rule reaches the operator at all, both of which
+// operatorPeerRules drops. Keying on the namespace selector as well as the pod
+// label is what catches a sibling rule that widens the operator's reach through
+// a namespace-only peer, which the pod label alone would miss.
+func operatorRules(np *networkingv1.NetworkPolicy, operatorNamespace string) []networkingv1.NetworkPolicyIngressRule {
 	var rules []networkingv1.NetworkPolicyIngressRule
 	for _, rule := range np.Spec.Ingress {
 		for _, peer := range rule.From {
-			if peer.PodSelector != nil && peer.PodSelector.MatchLabels[operatorPodNameLabel] == operatorPodNameValue {
+			byPod := peer.PodSelector != nil && peer.PodSelector.MatchLabels[operatorPodNameLabel] == operatorPodNameValue
+			byNamespace := peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[labelMetadataName] == operatorNamespace
+			if byPod || byNamespace {
 				rules = append(rules, rule)
 				break
 			}
@@ -128,7 +134,10 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	// port: exactly one rule, equal to operatorMetricsIngressRule's output. A
 	// second peer in the rule's From, or an empty or wider Ports list, passes the
 	// port-and-selector checks above (operatorPeerRules keeps only the labelled
-	// peer and nothing when Ports is empty) but is caught here.
+	// peer and nothing when Ports is empty) but is caught here. operatorRules
+	// keys on the operator's namespace selector as well as its pod label, so a
+	// second rule that reaches the operator through a namespace-only peer -- one
+	// operatorPeerRules never records -- lands here too and trips the count.
 	for name, np := range map[string]*networkingv1.NetworkPolicy{
 		"gateway": buildNetworkPolicy(agent, nil, profile, false, "", false),
 		"broker":  credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace),
@@ -141,7 +150,7 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 		if !ok {
 			t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace")
 		}
-		rules := operatorRules(np)
+		rules := operatorRules(np, policyTestOperatorNamespace)
 		if len(rules) != 1 {
 			t.Fatalf("%s policy: %d rules admit the operator peer, want exactly 1: %+v", name, len(rules), rules)
 		}
@@ -168,5 +177,35 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	}
 	if !equality.Semantic.DeepEqual(built.Spec.PodSelector, applied.Spec.PodSelector) || !equality.Semantic.DeepEqual(built.Spec.PolicyTypes, applied.Spec.PolicyTypes) {
 		t.Error("the applied broker policy differs from the builder's beyond the appended rule")
+	}
+}
+
+// A rule that reaches the operator through a namespace-only peer -- the operator
+// namespace on any port, no pod label -- is a sibling operatorPeerRules never
+// records, because it keeps only peers carrying the pod label. operatorRules now
+// keys on the namespace selector too, so the "exactly one rule" check in the
+// test above catches such a sibling; this pins that the helper sees it.
+func TestOperatorRulesSeeASiblingNamespaceOnlyRule(t *testing.T) {
+	metrics, ok := operatorMetricsIngressRule(policyTestOperatorNamespace, eventWatcherMetricsPort)
+	if !ok {
+		t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace")
+	}
+	// A namespace-only peer on all ports: the worst-case widening the per-peer
+	// projection missed on the gateway.
+	sibling := networkingv1.NetworkPolicyIngressRule{
+		From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelMetadataName: policyTestOperatorNamespace}},
+		}},
+	}
+	np := &networkingv1.NetworkPolicy{
+		Spec: networkingv1.NetworkPolicySpec{Ingress: []networkingv1.NetworkPolicyIngressRule{metrics, sibling}},
+	}
+	if n := len(operatorRules(np, policyTestOperatorNamespace)); n != 2 {
+		t.Errorf("operatorRules saw %d rules naming the operator, want 2 (the metrics rule and the namespace-only sibling)", n)
+	}
+	// operatorPeerRules, keyed on the pod label, still sees only the metrics rule:
+	// this is the gap operatorRules closes.
+	if n := len(operatorPeerRules(np)); n != 1 {
+		t.Errorf("operatorPeerRules saw %d operator peers, want 1 (the sibling has no pod label)", n)
 	}
 }
