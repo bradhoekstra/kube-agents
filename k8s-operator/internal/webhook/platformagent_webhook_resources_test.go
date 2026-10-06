@@ -219,17 +219,33 @@ func TestCredentialProxyClaimsAreRefused(t *testing.T) {
 	}
 }
 
-// Every name the override introduces is checked for a crossed pair, not only
-// the three the operator declares.
-func TestCredentialProxyCrossedHugepagesPairIsRefused(t *testing.T) {
+// hugepages must have request equal to limit, which the API server enforces
+// and this validation would otherwise not; the proxy declares no hugepages, so
+// the name is refused outright, on both sides, whatever the quantities.
+func TestCredentialProxyHugepagesAreRefusedByName(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
-		Requests: corev1.ResourceList{"hugepages-2Mi": resource.MustParse("4Mi")},
-		Limits:   corev1.ResourceList{"hugepages-2Mi": resource.MustParse("2Mi")},
+		Requests: corev1.ResourceList{"hugepages-2Mi": resource.MustParse("2Mi")},
+		Limits:   corev1.ResourceList{"hugepages-2Mi": resource.MustParse("4Mi")},
 	}))
-	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.hugepages-2Mi")
-	if !strings.Contains(msg, "2Mi hugepages-2Mi limit set beside it") {
-		t.Errorf("message %q does not name the limit set in the same override", msg)
+	for _, side := range []string{"requests", "limits"} {
+		msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources."+side+".hugepages-2Mi")
+		if !strings.Contains(msg, "cpu, memory and ephemeral-storage") {
+			t.Errorf("%s: message %q does not name the accepted resources", side, msg)
+		}
+	}
+}
+
+// An extended resource requested with no limit is a Deployment the API server
+// refuses as Invalid; refused here by name instead.
+func TestCredentialProxyExtendedResourceIsRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{"nvidia.com/gpu": resource.MustParse("1")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.nvidia.com/gpu")
+	if !strings.Contains(msg, "declares no other resource") {
+		t.Errorf("message %q does not say the proxy declares nothing else", msg)
 	}
 }
 

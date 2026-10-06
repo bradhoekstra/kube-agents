@@ -54,6 +54,7 @@ const (
 // The refusals ValidateCredentialProxyResources makes that carry no figures
 // of their own.
 const (
+	credentialProxyResourceNameRefusal  = "the credential-proxy container accepts cpu, memory and ephemeral-storage only and declares no other resource; any other name is one the API server refuses as written (an extended resource without its limit, hugepages whose request and limit differ) or the pod has no use for"                                            // #nosec G101 -- Error message, not a credential
 	credentialProxyClaimsRefusal        = "the credential-proxy pod declares no resourceClaims, so a claim named here cannot take effect"                                                                                                                                                                                                                                 // #nosec G101 -- Error message, not a credential
 	credentialProxyNegativeRefusal      = "must not be negative; the API server refuses a container that declares one"                                                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
 	credentialProxyZeroLimitRefusal     = "a limit of zero leaves the container nothing of this resource; omit the key to keep the operator's default"                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
@@ -73,6 +74,13 @@ const credentialProxyRefusalMoreFmt = " (and %d more)" // #nosec G101 -- Message
 // credentialProxyResourcesPath is where the override sits on the CR.
 var credentialProxyResourcesPath = field.NewPath("spec", "deployment", "credentialProxy", "resources")
 
+// credentialProxyResourceNames are the only names the override may carry: the
+// quantities the proxy container declares. Anything else (an extended
+// resource, hugepages, a misspelt name) reaches the API server unchecked here,
+// which refuses several such shapes as Invalid, and the reconciler would read
+// that as an immutable-field change and recreate the proxy.
+var credentialProxyResourceNames = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
+
 // byteCountResources are the names whose quantity is a count of bytes, and so
 // has to fit the int64 the Downward API and the kubelet carry it in.
 var byteCountResources = []corev1.ResourceName{corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
@@ -89,6 +97,8 @@ var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 //
 //   - claims. The proxy pod declares no resourceClaims, so the key cannot
 //     take effect and the render drops it.
+//   - Any resource name other than cpu, memory and ephemeral-storage
+//     (credentialProxyResourceNames).
 //   - A negative quantity on either side, a zero limit, or a byte count
 //     beyond an int64. The API server refuses the first; the second leaves
 //     the container nothing; the third cannot reach the broker as the byte
@@ -134,6 +144,11 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		for _, name := range sortedResourceNames(side.list) {
 			quantity := side.list[name]
 			at := path.Child(side.name, string(name))
+			if !slices.Contains(credentialProxyResourceNames, name) {
+				errs = append(errs, field.Forbidden(at, credentialProxyResourceNameRefusal))
+				refused[at.String()] = true
+				continue
+			}
 			var msg string
 			switch {
 			case quantity.Sign() < 0:

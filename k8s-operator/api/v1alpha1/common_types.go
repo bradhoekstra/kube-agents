@@ -923,9 +923,10 @@ type CredentialProxySpec struct {
 	// limit. The broker sizes how many commands it admits at once from the
 	// memory limit, so raising the limit is the one knob for an install whose
 	// fleet outgrows the default; the ephemeral-storage limit bounds the content
-	// workspace the broker clones into. The operator refuses a memory limit
-	// below what admits two commands at once, a request above its limit, a
-	// negative quantity and a zero limit; `claims` is refused, because the proxy
+	// workspace the broker clones into. Only cpu, memory and ephemeral-storage
+	// are accepted, the quantities the container declares. The operator
+	// refuses a memory limit below what admits two commands at once, a request
+	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
 	// pod declares no resourceClaims. The reconciler leaves the proxy
 	// Deployment as last applied and sets Degraded whether or not the
 	// validating webhook is enabled, and the webhook, where it is, refuses the
