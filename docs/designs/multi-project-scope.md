@@ -1,8 +1,9 @@
 # An Opt-In Multi-Project Scope for the Platform Agent
 
 > **STATUS — design of record; phase 1's mechanism is implemented: `spec.scope` on the CR, the operator's rendering of it, the reconcile's per-project outcomes and `fleet_scope.json` snapshot, the bootstrap gate's reading of it, and the event console links. Step 2's mechanism is implemented too: `folders` and `organizations` on the CR, the Cloud Asset Inventory resolver and its allowlist entry, container outcomes with the freeze and `over-cap` rules, the index-versus-declaration rule (§7: a member the index no longer places is kept for a day, the declaration retires it sooner), and `via` and `containers` in the snapshot. Step 3's runtime half is implemented too: `sharedVpcHosts` and `metricsScopes` on the CR, their two lookups and allowlist entries, the naming of monitored projects by number, their rows in `containers` and the freeze through them. Steps 1 and 2's IAM bindings, installer paths and the chart's rendering of `spec.scope` are implemented too: the `kube-agents-iam` module's `scope` input binding `scope_roles` per explicit project and `scope_roles` plus `roles/cloudasset.viewer` on each folder and organisation, the composition's `scope` variable feeding the module and the chart from one value and enabling `cloudasset.googleapis.com` when a container is declared, the installer's `SCOPE_PROJECTS`, `SCOPE_FOLDERS`, `SCOPE_ORGANIZATIONS`, `SCOPE_EXCLUDE_PROJECTS` and `SCOPE_EXCLUDE_CLUSTERS` keys, and the pre-apply preflight for container IAM and the Asset API under organisation policy. Step 3's IAM bindings and installer path are implemented too: the composition resolves `shared_vpc_hosts` and `metrics_scopes` at plan time through the `kube-agents-scope-resolver` module, with the provider's own token (`data "http"` against the Compute, Monitoring and Resource Manager APIs), and `kube-agents-iam` binds `scope_roles` in every project resolved and in each scoping project, and `roles/compute.viewer` alone in a host not otherwise in scope, a failed read failing the plan; the composition and the installer's `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES` keys carry both to the module and the chart from one value, and the pre-apply scope check weighs them. The declared resolved-set cap (`spec.scope.maxProjects`, the phase 2 follow-up) is implemented: the CRD field, the operator's render of it into the declaration, the reconcile's scaled listing and parallel prune, the gate's ceiling, the composition's `scope.max_projects` through both modules and the chart, and `SCOPE_MAX_PROJECTS` on the installer path. The scoped service account pool is keyed per project (§6): `spec.security.scopedServiceAccountPool` with `enabled` and derived `serviceAccounts` rows replaces the hand-listed `scopedServiceAccounts`, the `kube-agents-iam` module derives the members from the host project, `scope.projects` and the selectors' members and arms nothing unless `scoped_pool_enabled` is set, the composition and `SCOPED_SA_POOL_ENABLED` carry the switch, and the broker keys on the project; a folder's or organisation's members are not yet listed at plan time, so a cluster under a declared container is refused while the pool is armed until that follow-up lands. Step 5's architecture edits (§9) and site edits (§8) are in. Step 1's `platform_mcp_server.py` change and step 4 do not ship yet.** Without a declared `spec.scope` the Platform Agent discovers clusters in one GCP project, its service account holds roles in one project, and the
-> architecture documents define it as one agent per project. This document proposes replacing that
-> single project with a declared scope, and gives the order the change has to land in. Each section
+> architecture documents defined it as one agent per project until step 5 moved them to the declared
+> scope (§9). This document records replacing that single project with a declared scope, and the order
+> the change landed in. Each section
 > says what is true on `main` now and what the design changes.
 
 **Scope:** Which GCP projects a single kube-agents install manages, how that set is declared,
@@ -43,12 +44,13 @@ agent's service account with `google_project_iam_member` in `var.project_id` and
 list call without widening IAM would produce a 403 per extra project, which `_all_clusters` reports
 and then treats as "skip create this run".
 
-The documents agree with both. `docs/architecture/01-vision-scope.md:75` gives the Platform Agent a
-cardinality of "1 per project"; `02-agent-personas.md:280` says it is "scoped to its one project" and
-"cannot read or reach another project"; `03-security-model.md:114` lists "any other project" under
-what it is forbidden to touch; `06-api-and-data-contracts.md:82` keys the `platform` tier on a single
-`projectId`. Single-project is the documented end-state, so this is a scope change to the
-architecture, not a gap in the implementation of it.
+The documents agreed with both when this was written. `docs/architecture/01-vision-scope.md:75` gave the
+Platform Agent a cardinality of "1 per project"; `02-agent-personas.md:280` said it was "scoped to its one
+project" and "cannot read or reach another project"; `03-security-model.md:114` listed "any other project"
+under what it is forbidden to touch; `06-api-and-data-contracts.md:82` keyed the `platform` tier on a
+single `projectId`. Single-project was the documented end-state, so this was a scope change to the
+architecture, not a gap in the implementation of it; §9 records the edit, and the pages now read "one
+per declared scope".
 
 The cost today is that an organisation with clusters in several projects installs kube-agents
 several times: one management cluster, one operator, one Pub/Sub topic, one chat front door per

@@ -105,15 +105,15 @@ is not narrowed per requester; access is instead limited to trusted humans (§4a
 down-scoping to the requesting human is deferred hardening (§4a, [08](08-agent-runtime-and-identity.md)
 §5).
 
-Exactly **one agent runs per scope** — 1 Platform Agent per **project**, 1 Cluster Admin Agent per
+Exactly **one agent runs per scope** — 1 Platform Agent per **declared scope** (one project by default), 1 Cluster Admin Agent per
 **cluster**, 1 Developer Team Agent per **namespace** — and each is read-only within **exactly its own
 level**:
 
-| Tier                                   | Kubernetes API (read-only)                                                                                   | Cloud API (read-only)               | Only write path                      | May NOT                                                                                     |
-| -------------------------------------- | ------------------------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------- |
-| **Platform Agent** (1/scope)           | Read within **its declared scope** (the clusters of the projects `spec.scope` names; one project by default) | Read roles in each project in scope | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads; **any project outside its scope** |
-| **Cluster Admin Agent** (1/cluster)    | Read **its one cluster only**                                                                                | Cluster-scoped read                 | GitOps repo (PRs)                    | Any direct write; **any other cluster**; project scope                                      |
-| **Developer Team Agent** (1/namespace) | Read **its one namespace only**                                                                              | Namespace-scoped read               | GitOps repo (PRs)                    | Any direct write; **any other namespace**; cluster/project scope                            |
+| Tier                                   | Kubernetes API (read-only)                                                                                         | Cloud API (read-only)               | Only write path                      | May NOT                                                                                     |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------ | ------------------------------------------------------------------------------------------- |
+| **Platform Agent** (1/scope)           | Read within **its declared scope** (the clusters of the projects `spec.scope` resolves to; one project by default) | Read roles in each project in scope | GitOps repo (PRs) via brokered token | Any direct cluster/cloud write; operate tenant workloads; **any project outside its scope** |
+| **Cluster Admin Agent** (1/cluster)    | Read **its one cluster only**                                                                                      | Cluster-scoped read                 | GitOps repo (PRs)                    | Any direct write; **any other cluster**; project scope                                      |
+| **Developer Team Agent** (1/namespace) | Read **its one namespace only**                                                                                    | Namespace-scoped read               | GitOps repo (PRs)                    | Any direct write; **any other namespace**; cluster/project scope                            |
 
 **The controller enforces this ceiling.** For each `Agent` CR, the kube-agents controller sets the pod's
 `serviceAccountName` to exactly this SA ([08](08-agent-runtime-and-identity.md)), and the SA's RBAC +

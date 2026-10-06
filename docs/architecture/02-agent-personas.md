@@ -264,14 +264,14 @@ for a delegation too, and the child task's envelope names the target and the sam
 
 ---
 
-## 3. Persona: Platform Agent (project scope)
+## 3. Persona: Platform Agent (scope)
 
-**Cardinality:** 1 per scope — one project by default, the projects `spec.scope` declares otherwise. **Exists today** (`agents/platform/`).
+**Cardinality:** 1 per scope — one project by default, otherwise the projects `spec.scope` resolves to. **Exists today** (`agents/platform/`).
 
 ### Role
 
 The senior custodian and **architect of the fleet and of the other agents**. It is the primary
-human chat entrypoint into the harness and the authority at the project level.
+human chat entrypoint into the harness and the authority at the scope level.
 
 ### Responsibilities
 
@@ -284,8 +284,8 @@ human chat entrypoint into the harness and the authority at the project level.
 
 ### Authority & limits
 
-- **Read-only, scoped to its declared scope** (the clusters of the projects, folders and organisations
-  `spec.scope` names; one project by default) — it cannot read or reach a project outside its declared scope. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
+- **Read-only, scoped to its declared scope** (the clusters of the projects `spec.scope` resolves to;
+  one project by default) — it cannot read or reach a project outside its declared scope. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
   no direct cluster/cloud write (see §2.2, [03](03-security-model.md) §3).
 - All infrastructure mutation is declarative (git-reviewed + CI/CD pipeline), never direct `kubectl` (per
   `SOUL.md §1`, §3).
@@ -359,7 +359,7 @@ The three personas form a **cascade** that mirrors containment: each layer owns 
 the layer beneath it.
 
 ```
-Platform Agent  (1 / project)
+Platform Agent  (1 / scope)
    └─ owns lifecycle of →  Cluster Admin Agent  (1 / cluster)
                               └─ owns lifecycle of →  Developer Team Agent  (1 / namespace)
 ```
@@ -443,11 +443,11 @@ model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
   (Workload-Identity-bound) and the optional gVisor execution sandbox (deferred,
   [08](08-agent-runtime-and-identity.md) §5.1); placement derives from `tier` + `scope`
 
-| `tier`           | Scope key fields                  | Identity scope           | Chat entrypoint / handle (§2.4)         |
-| ---------------- | --------------------------------- | ------------------------ | --------------------------------------- |
-| `platform`       | project                           | project-wide, read fleet | Platform teams — `@platform-<project>`  |
-| `cluster-admin`  | project + cluster                 | single cluster           | Cluster admins — `@cluster-<cluster>`   |
-| `developer-team` | project + cluster + **namespace** | single namespace         | Developer team — `@devteam-<namespace>` |
+| `tier`           | Scope key fields                       | Identity scope                    | Chat entrypoint / handle (§2.4)         |
+| ---------------- | -------------------------------------- | --------------------------------- | --------------------------------------- |
+| `platform`       | management project + scope declaration | read across the projects in scope | Platform teams — `@platform-<project>`  |
+| `cluster-admin`  | project + cluster                      | single cluster                    | Cluster admins — `@cluster-<cluster>`   |
+| `developer-team` | project + cluster + **namespace**      | single namespace                  | Developer team — `@devteam-<namespace>` |
 
 **Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
 default (read-only) permissions — otherwise identical, so a single `Agent` CRD expresses all three (one

@@ -43,7 +43,10 @@ metadata:
 spec:
   tier: platform | cluster-admin | developer-team # persona / containment level (immutable)
   scope:
-    projectId: <proj> # all tiers
+    projectId: <proj> # all tiers; the platform tier's management project
+    # platform tier only, optional: the scope declaration -- projects, folders,
+    # organizations, sharedVpcHosts, metricsScopes, exclude -- as `spec.scope` on the
+    # PlatformAgent carries it; absent, the scope is the management project alone
     clusterName: <cluster> # cluster + namespace tiers
     namespace: <ns> # namespace tier only (also the pod's placement namespace)
   parentRef: { name: <parent-agent> } # required for non-platform tiers
@@ -78,11 +81,11 @@ Scion's launch primitive as a Phase-1 integration, [08](08-agent-runtime-and-ide
 
 ### 1.2 Per-tier field usage, cardinality & validation
 
-| `tier`           | Required scope fields                                                    | `parentRef`             | Cardinality     |
-| ---------------- | ------------------------------------------------------------------------ | ----------------------- | --------------- |
-| `platform`       | `projectId` (the management project), `scope` (the resolved project set) | — (root)                | 1 per scope     |
-| `cluster-admin`  | `projectId`, `clusterName`                                               | parent = platform agent | 1 per cluster   |
-| `developer-team` | `projectId`, `clusterName`, `namespace`                                  | parent = cluster-admin  | 1 per namespace |
+| `tier`           | Required scope fields                                                 | `parentRef`             | Cardinality     |
+| ---------------- | --------------------------------------------------------------------- | ----------------------- | --------------- |
+| `platform`       | `projectId` (the management project); the scope declaration, optional | — (root)                | 1 per scope     |
+| `cluster-admin`  | `projectId`, `clusterName`                                            | parent = platform agent | 1 per cluster   |
+| `developer-team` | `projectId`, `clusterName`, `namespace`                               | parent = cluster-admin  | 1 per namespace |
 
 **Validation (v1).** The `Agent` CR + its identity manifests are reviewed on the PR (the review-gate).
 **Cardinality — exactly one agent per `(tier, scope)` — is enforced by the controller's validating
@@ -126,11 +129,11 @@ ClusterRole and namespace Role (`buildMinimalPlatformRole` / `reconcileRBAC`,
 write verbs" (there are none) but **stop minting RBAC at runtime** and pre-create these as reviewed,
 tier-scoped manifests (per the table below):
 
-| Tier           | K8s permission (pre-created, read-only)                                                                                                                                                                                                       | Cloud SA (Workload Identity)    |
-| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------- |
-| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | project-scoped **viewer** roles |
-| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                                                                                                                        | cluster-scoped viewer           |
-| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                                                                                                                         | namespace-scoped viewer         |
+| Tier           | K8s permission (pre-created, read-only)                                                                                                                                                                                                       | Cloud SA (Workload Identity)            |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| Platform       | `get/list/watch` cluster-wide; `get/list/watch` on `kubeagents.x-k8s.io` (and provisioning CRs such as KCC `*.cnrm.cloud.google.com` where the customer runs them); cloud state read via the read-only cloud SA (**no** create/update/delete) | the read roles in each project in scope |
+| Cluster Admin  | `get/list/watch` scoped to its cluster                                                                                                                                                                                                        | cluster-scoped viewer                   |
+| Developer Team | `Role` `get/list/watch` in its **one namespace** only                                                                                                                                                                                         | namespace-scoped viewer                 |
 
 The per-request user-permission check (`SubjectAccessReview` + IAM) and its `create` on
 `subjectaccessreviews` grant belong to the **deferred** user-scoped authorization (§2a) — **not in
