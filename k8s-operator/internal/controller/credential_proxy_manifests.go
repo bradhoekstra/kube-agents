@@ -104,8 +104,11 @@ const (
 	// slots in use fit the limit less credentialProxyResidentReserveBytes and
 	// credentialProxyWorkspaceReserveBytes -- four at once at the 1Gi below,
 	// with the slot cap as the upper bound. The sizing test in
-	// platformagent_manifests_test.go asserts that the limit admits at least
-	// two. Raising the limit raises the admitted count; the caps stay here.
+	// platformagent_manifests_test.go and the admission webhook hold the limit
+	// to at least two. An install raises the limit through
+	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources
+	// merges it over these defaults per key), which raises the admitted count;
+	// the caps stay here.
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
@@ -117,14 +120,23 @@ const (
 	// Autopilot for the 256Mi the admission added.
 	credentialProxyCPURequest    = "500m"
 	credentialProxyMemoryRequest = "512Mi"
+	// The limits. CPU is the ceiling a mint or a listing may burst to on
+	// Standard; memory is what the comment above sizes; ephemeral storage
+	// bounds the content workspace (the broker's own clone of a repository
+	// under its state emptyDir) together with /tmp, so a runaway clone fills
+	// the container's allowance rather than the node's disk. A CR override
+	// that sets only limits.memory keeps all three of the others.
+	credentialProxyCPULimit              = "1"
+	credentialProxyMemoryLimit           = "1Gi"
+	credentialProxyEphemeralStorageLimit = "2Gi"
 	// credentialProxyMemoryLimitEnv carries the container's own memory limit
 	// in bytes to the broker, which derives its child memory budget from it
 	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef the
 	// broker reads once at start, so a limit changed by whatever recreates the
-	// pod (a later CR field, a VPA eviction) is the one it budgets against; an
-	// in-place resize is not seen until the next start. In the base env list
-	// and so reserved in mergeCredentialProxyEnv, because a CR that could set
-	// it would detach the budget from the limit.
+	// pod (spec.deployment.credentialProxy.resources, a VPA eviction) is the
+	// one it budgets against; an in-place resize is not seen until the next
+	// start. In the base env list and so reserved in mergeCredentialProxyEnv,
+	// because a CR that could set it would detach the budget from the limit.
 	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
 	// The child memory budget's terms, in bytes, as the broker declares them
 	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
@@ -132,8 +144,8 @@ const (
 	// OUTPUT_COPIES_PER_COMMAND). The sizing test reads them, and
 	// tests/test_credential_proxy_sizing_parity.py holds them, and
 	// credentialProxyMinimumAdmittedRequests below, equal to the broker's;
-	// they are declared here rather than in the test so that a later
-	// admission check can read the same copy. The design
+	// they are declared here rather than in the test so that the admission
+	// webhook reads the same copy. The design
 	// (docs/designs/credential-proxy-child-memory-budget.md §2.2) is why each
 	// is the size it is. Change the Python side in the same commit.
 	credentialProxyResidentReserveBytes   int64 = 192 << 20
@@ -141,11 +153,18 @@ const (
 	credentialProxyRequestReserveBytes    int64 = 128 << 20
 	credentialProxyOutputCopiesPerCommand int64 = 6
 	// credentialProxyMinimumAdmittedRequests is the floor the sizing test
-	// holds the limit to: fewer than two and a listing phase cannot
-	// parallelise at all. The broker's counterpart is
+	// and the admission webhook hold the limit to: fewer than two and a
+	// listing phase cannot parallelise at all. The broker's counterpart is
 	// BUDGET_MINIMUM_ADMITTED_REQUESTS in credential_proxy.py.
 	credentialProxyMinimumAdmittedRequests int64 = 2
 )
+
+// credentialProxyOutputCapBytes is credentialProxyMaxOutputBytes as a count.
+// The constant is a string because it is rendered into the container's env;
+// the budget arithmetic below needs the number. resource.MustParse at package
+// scope fails the binary at init on a malformed literal, which the sizing test
+// reaches before any install does.
+var credentialProxyOutputCapBytes = ptr.To(resource.MustParse(credentialProxyMaxOutputBytes)).Value()
 
 // credentialProxyRequestCostBytes is what one admitted request costs the
 // broker's child memory budget: its child reserve plus the output the broker
@@ -169,6 +188,64 @@ func credentialProxyAdmittedRequests(limitBytes, outputCapBytes int64) int64 {
 func credentialProxyMinimumMemoryLimitBytes(outputCapBytes int64) int64 {
 	return credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes +
 		credentialProxyMinimumAdmittedRequests*credentialProxyRequestCostBytes(outputCapBytes)
+}
+
+// CredentialProxyResources is the requests and limits the proxy container is
+// rendered with under deployment: the operator's defaults with the CR's
+// spec.deployment.credentialProxy.resources merged over them per key. The
+// webhook validates this rather than the override alone, because a CR that
+// raises only requests.memory collides with the default limit, not with a
+// limit it wrote.
+func CredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	return resolveCredentialProxyResources(deployment)
+}
+
+// CredentialProxyMemoryLimitFloorBytes is the smallest memory limit the webhook
+// admits for the proxy container, at the operator's output cap.
+func CredentialProxyMemoryLimitFloorBytes() int64 {
+	return credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes)
+}
+
+// CredentialProxyAdmittedRequests is how many commands the broker admits at
+// once under limitBytes, at the operator's output cap; the webhook quotes it
+// beside the floor so a refused limit says what it would have bought.
+func CredentialProxyAdmittedRequests(limitBytes int64) int64 {
+	return credentialProxyAdmittedRequests(limitBytes, credentialProxyOutputCapBytes)
+}
+
+// resolveCredentialProxyResources merges the CR's override over the defaults.
+//
+// Per key rather than wholesale, which is the opposite of what
+// spec.deployment.resources does for the agent container, and on purpose: the
+// one setting an install reaches for is the memory limit (#2324), and a
+// wholesale replacement would make "raise the limit to 2Gi" silently drop the
+// CPU request Autopilot sizes the pod by and the ephemeral-storage limit that
+// bounds the content workspace. Each key the override carries wins; each it
+// omits keeps the operator's value. Claims, the fourth map on
+// ResourceRequirements, are not carried: the proxy pod names no ResourceClaim.
+func resolveCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	resolved := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(credentialProxyCPURequest),
+			corev1.ResourceMemory: resource.MustParse(credentialProxyMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(credentialProxyCPULimit),
+			corev1.ResourceMemory:           resource.MustParse(credentialProxyMemoryLimit),
+			corev1.ResourceEphemeralStorage: resource.MustParse(credentialProxyEphemeralStorageLimit),
+		},
+	}
+	if deployment == nil || deployment.CredentialProxy == nil || deployment.CredentialProxy.Resources == nil {
+		return resolved
+	}
+	override := deployment.CredentialProxy.Resources
+	for name, quantity := range override.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range override.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
 }
 
 // credentialProxyFederation returns the federation config when it is complete.
@@ -393,18 +470,13 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 			TimeoutSeconds:      5,
 			FailureThreshold:    3,
 		},
-		Resources: corev1.ResourceRequirements{
-			// Sized where the constants are declared: CPU for the warm-up
-			// after an eviction, memory for Envoy, the broker's bounded share
-			// and the child processes the broker budgets against this limit
-			// (see the constants above). Lower than the sidecar's limit, which
-			// sized for the event watcher's informer caches; nothing here
-			// holds cluster state.
-			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(credentialProxyCPURequest), corev1.ResourceMemory: resource.MustParse(credentialProxyMemoryRequest)},
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
-			},
-		},
+		// Sized where the constants are declared: CPU for the warm-up after an
+		// eviction, memory for Envoy, the broker's bounded share and the child
+		// processes the broker budgets against this limit. Lower than the
+		// sidecar's limit, which sized for the event watcher's informer
+		// caches; nothing here holds cluster state.
+		// spec.deployment.credentialProxy.resources overrides any key of it.
+		Resources:       resolveCredentialProxyResources(agent.Spec.Deployment),
 		VolumeMounts:    volumeMounts,
 		SecurityContext: securityContext,
 	}

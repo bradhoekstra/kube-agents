@@ -897,6 +897,11 @@ type DeploymentSpec struct {
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
+	// CredentialProxy configures the credential-proxy container, the broker that
+	// runs every credentialed command on the agent's behalf in a pod of its own.
+	// +optional
+	CredentialProxy *CredentialProxySpec `json:"credentialProxy,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -906,6 +911,24 @@ type DeploymentSpec struct {
 	// +listMapKey=name
 	// +optional
 	Storages []StorageSpec `json:"storages,omitempty"`
+}
+
+// CredentialProxySpec configures the credential-proxy container.
+type CredentialProxySpec struct {
+	// Resources overrides the credential-proxy container's requests and limits.
+	// Each key set here replaces the operator's default for that key and the
+	// rest keep their defaults, unlike spec.deployment.resources, which replaces
+	// the agent container's block wholesale: a CR that sets only limits.memory
+	// keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+	// limit. The broker sizes how many commands it admits at once from the
+	// memory limit, so raising the limit is the one knob for an install whose
+	// fleet outgrows the default; the ephemeral-storage limit bounds the content
+	// workspace the broker clones into. The validating webhook refuses a memory
+	// limit below what admits two commands at once, and a request above its
+	// limit, and warns when the memory-to-CPU limit ratio leaves the band GKE
+	// Autopilot admits unchanged.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // StorageSpec defines custom PersistentVolumeClaim and volume mount configuration.

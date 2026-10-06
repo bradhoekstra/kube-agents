@@ -73,7 +73,10 @@ const (
 	// The paragraph above their use ties the two to the proxy container's
 	// memory limit, and the cap test asserts the three from the rendered env.
 	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
-	// move neither, because the limit they are sized against is not a CR field.
+	// move neither. The limit they are sized against is a CR field
+	// (spec.deployment.credentialProxy.resources), and the broker derives what
+	// it admits from that limit, so the limit is the one knob and the caps
+	// follow it; a CR override of a cap would detach the two again.
 	credentialProxyMaxOutputBytes        = "8388608"
 	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
@@ -4038,7 +4041,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// its child process (credential_proxy_manifests.go has the terms).
 		// Raising this cap lowers how many requests the same limit admits,
 		// which is why it is set here and so reserved rather than left to
-		// spec.deployment.env. The cap test asserts the arithmetic from the
+		// spec.deployment.env. The limit itself is a CR field,
+		// spec.deployment.credentialProxy.resources, and the admitted count
+		// follows it; a CR that could also raise a cap would detach the cap
+		// from what holds it. The cap test asserts the arithmetic from the
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
