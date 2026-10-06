@@ -4207,37 +4207,121 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, executor.slots_in_use)
         holder.join()
 
-    def test_a_reservation_queued_behind_a_slot_held_head_is_not_told_the_budget_held_it(self):
-        # One slot, a budget for eight: the head waits for the slot cap, and
-        # the slot-less reservation behind it would fit the budget at once.
-        executor = self.budgeted(admits=8, max_concurrent_commands=1)
-        holder = self.hold_a_slot(executor, seconds=2)
+    def queue_a_slot_taker(self, executor, refused=None):
+        """Queue a slot-taking request on another thread and return once it
+        is in the queue; a refusal at the bound is recorded in `refused`."""
 
         def head():
             try:
                 with executor.request_slot():
                     pass
-            except credential_proxy.CommandSlotUnavailable:
-                pass
+            except credential_proxy.CommandSlotUnavailable as error:
+                if refused is not None:
+                    refused.append(str(error))
 
+        queued_before = executor.queued_requests
+        thread = threading.Thread(target=head)
+        thread.start()
+        self.addCleanup(thread.join)
+        deadline = time.monotonic() + 5
+        while executor.queued_requests <= queued_before:
+            if time.monotonic() > deadline:
+                self.fail("the slot taker never joined the queue")
+            time.sleep(0.01)
+        return thread
+
+    def hold_a_slot_until(self, executor, release):
+        """Hold a request slot on another thread until `release` is set."""
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=hold)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5), "the slot holder never got its slot")
+        return thread
+
+    def test_a_reservation_is_admitted_past_a_head_the_slot_cap_holds(self):
+        # One slot, a budget for eight: the head waits for the slot cap only,
+        # so the slot-less reservation behind it, which fits, goes first.
+        executor = self.budgeted(admits=8, max_concurrent_commands=1)
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.queue_a_slot_taker(executor)
+
+        started = time.monotonic()
+        with executor.reserve_child_memory():
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertEqual(1, executor.queued_requests, "the head should still be queued")
+            self.assertEqual(1, executor.slots_in_use)
+            self.assertEqual(2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+        release.set()
+
+    def test_a_reservation_queued_behind_a_slot_held_head_is_admitted_past_it(self):
+        # Same shape, with the head refused at its own bound: the reservation
+        # never waits for it and is never refused.
+        executor = self.budgeted(admits=8, max_concurrent_commands=1)
+        holder = self.hold_a_slot(executor, seconds=1)
+        refused = []
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.6):
-            head_thread = threading.Thread(target=head)
-            head_thread.start()
-            deadline = time.monotonic() + 5
-            while executor.queued_requests < 1:
-                if time.monotonic() > deadline:
-                    self.fail("the head never joined the queue")
-                time.sleep(0.01)
+            head_thread = self.queue_a_slot_taker(executor, refused)
             with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+                with executor.reserve_child_memory():
+                    self.assertEqual(1, executor.queued_requests)
+            head_thread.join()
+        self.assertEqual(1, len(refused))
+        self.assertIn("1 concurrent commands", refused[0])
+        holder.join()
+
+    def test_a_fitting_reservation_keeps_its_place_behind_a_budget_held_head(self):
+        # Eight slots, one in flight. The budget is one slot-taker's worth plus
+        # one reservation and a byte: the next slot-taker (which also carries
+        # an output allowance) does not fit, the reservation behind it does.
+        # Admitting the reservation would take budget the head is waiting for.
+        mib = credential_proxy.MEBIBYTE
+        executor = self.budgeted(admits=1, max_output_bytes=mib)
+        executor.children_budget_bytes += credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES + 1
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.assertFalse(executor._fits_budget(takes_slot=True))
+        self.assertTrue(executor._fits_budget(takes_slot=False))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            self.queue_a_slot_taker(executor)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
                 with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
                     with executor.reserve_child_memory():
-                        self.fail("admitted ahead of the queue")
-            head_thread.join()
+                        self.fail("admitted ahead of a head the budget holds")
+            release.set()
         message = str(raised.exception)
-        self.assertNotIn("memory budget", message)
-        self.assertIn("admission queue", message)
-        self.assertIn("1 concurrent commands", message)
-        holder.join()
+        self.assertIn("admission queue is held by requests waiting for its child memory budget", message)
+        self.assertIn("waited 0.3s behind them", message)
+        self.assertNotIn("without fitting", message)
+        self.assertNotIn("concurrent commands", message)
+
+    def test_a_reservation_that_does_not_fit_is_not_admitted_past_a_slot_held_head(self):
+        # One slot, a budget for one: the head waits for the slot cap, but the
+        # reservation behind it does not fit the budget either, so it waits
+        # and is refused naming the budget.
+        executor = self.budgeted(admits=1, max_concurrent_commands=1)
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.assertFalse(executor._fits_budget(takes_slot=False))
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            self.queue_a_slot_taker(executor)
+            with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
+                with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                    with executor.reserve_child_memory():
+                        self.fail("admitted past the budget")
+            release.set()
+        message = str(raised.exception)
+        self.assertIn("child memory budget", message)
+        self.assertIn("without fitting", message)
+        self.assertNotIn("admission queue", message)
 
     @staticmethod
     def wait_for_a_slot(executor):

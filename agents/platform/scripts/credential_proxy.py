@@ -4376,7 +4376,8 @@ def _capture_output(
 @dataclass(eq=False)
 class _AdmissionTicket:
     """A request's place in the admission queue. Compared by identity; the
-    kind is kept so a refusal behind it can name the bound holding it."""
+    kind is kept so a slot-less reserver can tell whether only the slot cap
+    holds the tickets ahead of it (`CommandExecutor._admit`)."""
 
     takes_slot: bool
 
@@ -4790,7 +4791,8 @@ class CommandExecutor:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
         wait, same refusal and hang-up handling as `request_slot` while the
-        budget is on. With the budget off it takes no queue at all and only
+        budget is on, except that it is admitted past slot-takers the full
+        slot cap holds (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
         reservation; `caller` is then unused."""
         with self._admit(takes_slot=False, caller=caller):
@@ -4837,25 +4839,24 @@ class CommandExecutor:
         holds it now. Called under `_slot_condition`.
 
         The budget when this request does not fit it; the slot cap when it
-        takes a slot and none is free. Otherwise this request is clear and
-        only the queue ahead of it holds it -- one FIFO for both kinds, so a
-        slot-less reserver can wait behind a head the slot cap holds -- and
-        the text names whatever holds that head.
+        takes a slot and none is free. Otherwise this request fits and is
+        clear of the slot cap, and only the queue ahead of it holds it. With
+        the budget on, that queue is held by the budget: a slot-taker here has
+        a free slot, so what is ahead of it lacks only budget, and a slot-less
+        reserver is admitted past tickets the slot cap alone holds (`_admit`).
+        The text says so, and never that this request waited without fitting.
         """
         slots_full = self._slots_in_use >= self.max_concurrent_commands
         # With nothing admitted `_fits_budget` would take its degenerate
         # branch and log; this request fits trivially then anyway.
         nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
         fits = nothing_admitted or self._fits_budget(takes_slot)
-        budget_text = ""
-        if self.children_budget_bytes is not None:
-            budget_text = (
+        if not fits:
+            return (
                 f"the credential proxy is at its child memory budget "
                 f"({self._budget_in_use_text()}) and this request "
                 f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
             )
-        if not fits:
-            return budget_text
         if takes_slot and slots_full:
             # Worded for the queue: slots may well have freed in the meantime
             # and gone to earlier arrivals, so "none finished" would be false
@@ -4866,13 +4867,13 @@ class CommandExecutor:
                 f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
                 f"free slot; retry shortly"
             )
-        head = self._slot_queue[0]
-        if budget_text and not (head.takes_slot and slots_full):
-            return budget_text
+        if self.children_budget_bytes is not None:
+            holder = f"waiting for its child memory budget ({self._budget_in_use_text()})"
+        else:
+            holder = f"waiting on its limit of {self.max_concurrent_commands} concurrent commands"
         return (
-            f"the credential proxy's admission queue is held by requests waiting on its "
-            f"limit of {self.max_concurrent_commands} concurrent commands and this request "
-            f"waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
+            f"the credential proxy's admission queue is held by requests {holder} and this "
+            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
         )
 
     @contextlib.contextmanager
@@ -4889,13 +4890,31 @@ class CommandExecutor:
         finally:
             self._request_budget.exempt = previous
 
+    def _only_the_slot_cap_holds_ahead_of(self, ticket: _AdmissionTicket) -> bool:
+        """Whether every ticket ahead of `ticket` takes a slot while the slots
+        are full. Those wait on the slot cap, not the budget, so a slot-less
+        reserver admitted past them takes nothing they are waiting for (§2.3).
+        Called under `_slot_condition`."""
+        if self._slots_in_use < self.max_concurrent_commands:
+            return False
+        for ahead in self._slot_queue:
+            if ahead is ticket:
+                return True
+            if not ahead.takes_slot:
+                return False
+        return False
+
     @contextlib.contextmanager
     def _admit(self, takes_slot: bool, caller: socket.socket | None) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
-        both kinds, so a slot-less reserver is neither starved nor privileged.
-        With the budget off a slot-less reserver has nothing to wait for and
-        skips the queue, as the routes that take no slot always have."""
+        both kinds, with one exception: a slot-less reserver that fits the
+        budget is admitted past tickets ahead of it that are all slot-takers
+        held by a full slot cap, because it competes with them for nothing.
+        Behind a ticket the budget holds, order is kept, since a reserver
+        admitted first would take budget that ticket is waiting for. With the
+        budget off a slot-less reserver has nothing to wait for and skips the
+        queue, as the routes that take no slot always have."""
         if not takes_slot and self.children_budget_bytes is None:
             previously_reserved = getattr(self._request_budget, "reserved", False)
             try:
@@ -4915,11 +4934,13 @@ class CommandExecutor:
             self._slot_queue.append(ticket)
             try:
                 while True:
-                    at_head = self._slot_queue[0] is ticket
+                    eligible = self._slot_queue[0] is ticket or (
+                        not takes_slot and self._only_the_slot_cap_holds_ahead_of(ticket)
+                    )
                     slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
-                    if at_head and slot_free and self._fits_budget(takes_slot):
+                    if eligible and slot_free and self._fits_budget(takes_slot):
                         break
-                    if at_head and slot_free:
+                    if eligible and slot_free:
                         blocked_by_budget = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
