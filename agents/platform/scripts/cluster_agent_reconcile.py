@@ -159,8 +159,9 @@ _api_disabled_this_run: set[str] = set()
 # would already overrun it. Creates still run in the fixed order.
 # Sized for the default cap: the workers and the budget scale with the declared cap
 # (`_list_workers`, `_list_budget_seconds` below) so a run that may list twice the
-# projects keeps the same margin per project, workers first and the budget only once
-# the workers reach their ceiling; the bootstrap gate's ceiling follows the budget.
+# projects keeps the same margin per project. The workers are at their ceiling from the
+# default cap, so it is the budget that grows with the cap; the bootstrap gate's ceiling
+# follows the budget.
 LIST_WORKERS = 8
 # Every lookup is a gcloud process the credential proxy runs, and the proxy admits
 # four requests at once under its child memory budget at the operator's default limit

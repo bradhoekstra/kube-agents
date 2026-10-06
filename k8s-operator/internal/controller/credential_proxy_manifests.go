@@ -90,26 +90,21 @@ const (
 	// while the pod warms. On Standard the ceiling is the 1-CPU limit and the
 	// request is scheduling weight, which matters only on a contended node.
 	//
-	// Memory is set by the CPU. Nothing here holds cluster state. What the
-	// container holds is Envoy (53 to 66Mi resident on a live install, 85Mi in
-	// the report that led to the bounds below), the broker process, and one
-	// child process per in-flight request. The broker's own share is bounded:
-	// credential_proxy.py keeps at most CREDENTIAL_PROXY_MAX_OUTPUT_BYTES of
-	// each stream, bounds the decoded text to the same size (output that is
-	// not UTF-8 would otherwise triple), holds about six times that per
-	// request at peak (the two buffers, their decoded text, the JSON body and
-	// its encoding; 48Mi measured against the 8 MiB cap, 37Mi for output that
-	// is not UTF-8), and admits at most CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
-	// requests at once, each holding its slot until its response is written --
-	// 384Mi at the 8 MiB cap and the default of eight, which the cap test in
-	// platformagent_manifests_test.go asserts against the 1Gi limit alongside
-	// this request. The term that varies is the children: kubectl 1.35 listing
-	// 4,000 pods measured 432Mi resident for -o json and 1,281Mi for -o yaml.
-	// On a cgroup v2 node the kubelet arms the group OOM killer for the
-	// container, so one such child past the limit takes Envoy and the broker
-	// down with it -- a container restart, not one failed command. An install
-	// whose clusters make that routine moves credentialProxyMaxConcurrentCommands
-	// and the limit together; neither is a CR field today.
+	// Memory. Nothing here holds cluster state. What the container holds is
+	// Envoy (53 to 66Mi resident on a live install), the broker process (104Mi
+	// measured), the broker's bounded share of each in-flight request's
+	// output (about six times CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 48Mi against
+	// the 8 MiB cap), and the child processes: about 102Mi per request for a
+	// gcloud listing or a kubectl with its auth plugin, measured on a
+	// 143-cluster install. The broker budgets the children itself: it reads
+	// this container's limit through credentialProxyMemoryLimitEnv, reserves
+	// credentialProxyRequestReserveBytes per admitted request, and admits a
+	// request only when the reservations plus the output allowance of the
+	// slots in use fit the limit less credentialProxyResidentReserveBytes and
+	// credentialProxyWorkspaceReserveBytes -- four at once at the 1Gi below,
+	// with the slot cap as the upper bound. The sizing test in
+	// platformagent_manifests_test.go asserts that the limit admits at least
+	// two. Raising the limit raises the admitted count; the caps stay here.
 	//
 	// Autopilot enforces a CPU:memory ratio between 1:1 and 1:6.5 GiB per vCPU
 	// and raises the smaller request to meet it, so a 500m pod is admitted at
@@ -398,9 +393,10 @@ func buildCredentialProxyContainer(agent *agentv1alpha1.PlatformAgent) corev1.Co
 		Resources: corev1.ResourceRequirements{
 			// Sized where the constants are declared: CPU for the warm-up
 			// after an eviction, memory for Envoy, the broker's bounded share
-			// and one child process per in-flight request. Lower than the
-			// sidecar's limit, which sized for the event watcher's informer
-			// caches; nothing here holds cluster state.
+			// and the child processes the broker budgets against this limit
+			// (see the constants above). Lower than the sidecar's limit, which
+			// sized for the event watcher's informer caches; nothing here
+			// holds cluster state.
 			Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse(credentialProxyCPURequest), corev1.ResourceMemory: resource.MustParse(credentialProxyMemoryRequest)},
 			Limits: corev1.ResourceList{
 				corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("1Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),

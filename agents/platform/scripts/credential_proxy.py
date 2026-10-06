@@ -139,10 +139,11 @@ PIPES_CLOSED_POLL_SECONDS = 0.5
 # A long-running command (`logs -f`, `wait`, `rollout`) holds its slot for as
 # long as it runs. The operator sets CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS
 # from a constant of its own beside the output cap and reserves the name, and
-# its cap test sizes the container's memory limit against the two, so the
-# value an install runs moves with that limit rather than through the CR; this
+# the value an install runs is the operator's rather than the CR's; this
 # default is for a broker run outside the operator. `CommandExecutor.request_slot`
-# says which routes hold a slot and why the others take none.
+# says which routes hold a slot and why the others take none. Within the cap,
+# the child memory budget below decides how many are admitted at once; the cap
+# is the upper bound.
 DEFAULT_MAX_CONCURRENT_COMMANDS = 8
 ENV_MAX_CONCURRENT_COMMANDS = "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"
 # The child memory budget (docs/designs/credential-proxy-child-memory-budget.md).
@@ -4715,7 +4716,13 @@ class CommandExecutor:
         callers rather than the cap. The other routes take no slot: the forge
         refresh is a short call to the minter, the content workspace's git is
         serialised by the store's own lock, and the Cloud API relay answers
-        from a bounded read of its own.
+        from a bounded read of its own. The forge refresh reserves child memory
+        without a slot when it will run its helper; the content workspace's git
+        takes neither a slot nor a reservation, because the store's lock
+        serialises it and the budget carries it as a fixed term
+        (`_outside_budget`). Admission also requires the request's child memory
+        reservation to fit the budget (`_fits_budget`), in the same queue and
+        under the same wait.
 
         Slots go in arrival order. The wait is woken every
         COMMAND_SLOT_POLL_SECONDS at the latest and `caller`, when given, is
@@ -4742,7 +4749,10 @@ class CommandExecutor:
     def reserve_child_memory(self, caller: socket.socket | None = None) -> Iterator[None]:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
-        wait, same refusal and hang-up handling as `request_slot`."""
+        wait, same refusal and hang-up handling as `request_slot` while the
+        budget is on. With the budget off it takes no queue at all and only
+        marks the thread as covered, so `_execute` takes no transient
+        reservation; `caller` is then unused."""
         with self._admit(takes_slot=False, caller=caller):
             yield
 
@@ -5068,8 +5078,11 @@ class CommandExecutor:
         Slots are a request's, not a command's (`request_slot`), so a helper
         takes none of its own: it runs inside whichever request needed it -- a
         vcs verb refreshing its credential -- or, from the refresh route and
-        the cron behind it, inside none. It is a short call to the minter
-        either way, not a listing.
+        the cron behind it, inside none. A call that no reservation covers
+        takes a transient one in `_execute` for the helper's lifetime; on the
+        refresh route and the cron, `refresh_forge_credential` reserves before
+        it takes the refresh lock, so no budget wait happens under the lock.
+        It is a short call to the minter either way, not a listing.
         """
         return self._execute(argv, cwd=cwd)
 
@@ -5893,11 +5906,14 @@ class CommandExecutor:
         `caller` is the connection the command answers, if it answers one; see
         `_capture_output`. Internal callers leave it unset.
 
-        No concurrency slot is taken here. A slot is a request's, held by the
-        route from admission until the response is written (`request_slot`),
-        so every command a request runs -- the kubeconfig cache-fill made under
-        `_kubeconfig_lock` included -- is covered by the one its request holds,
-        and no lock is ever held while waiting for a slot.
+        No concurrency slot is taken here, and no reservation on a thread that
+        already holds one: a slot and a child memory reservation are a
+        request's, held by the route from admission until the response is
+        written (`request_slot`), so every command a request runs -- the
+        kubeconfig cache-fill made under `_kubeconfig_lock` included -- is
+        covered by the one its request holds, and no lock is ever held while
+        waiting for admission. A thread that holds no reservation and is not
+        the store's takes a transient one for the child's lifetime.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root
@@ -5951,7 +5967,9 @@ class CommandExecutor:
         # covered by the fixed term) spawns under that; any other thread takes
         # a transient reservation for the child's lifetime, with the same wait
         # and the same refusal, so a route that forgets to reserve is throttled
-        # rather than uncounted.
+        # rather than uncounted. A caller that reaches this point uncovered
+        # while holding a lock would wait for the budget under that lock,
+        # which is why every route reserves before it takes one.
         covered = getattr(self._request_budget, "reserved", False) or getattr(
             self._request_budget, "exempt", False
         )

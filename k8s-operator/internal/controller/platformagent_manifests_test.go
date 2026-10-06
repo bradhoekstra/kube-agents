@@ -1579,9 +1579,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// or an OOMKill takes gcloud, kubectl, gh and git away from every agent
 	// the proxy serves.
 	//
-	// The children -- one kubectl or gcloud per in-flight command -- are
-	// outside this arithmetic. A kubectl listing thousands of objects runs to
-	// hundreds of MiB on its own, and the rest of the limit is what holds it.
+	// The children are the second assertion below, in the broker's own terms.
 	//
 	// The resting footprint is the container's own memory request rather than
 	// a measured constant: the ~250Mi the old sidecar held steady was mostly

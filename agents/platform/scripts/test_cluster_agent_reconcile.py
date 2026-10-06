@@ -1361,9 +1361,9 @@ class ScopeTest(HomesMixin):
                 self.assertEqual(self._snapshot()[rec.SCOPE_MAX_PROJECTS_KEY], rec.RESOLVED_SET_CAP)
 
     def test_the_workers_and_the_budget_scale_with_the_cap(self):
-        # Workers first, up to their ceiling, then the budget: a cap of 200 lists with twice
-        # the workers in the same budget; past 400 the workers are capped and the budget
-        # grows a round at a time.
+        # The workers are at their ceiling from the default cap, so a larger cap lists with
+        # the same workers and the budget grows a round per default cap's worth of projects;
+        # a smaller cap keeps the default workers and budget.
         per_default = rec.LIST_WORKERS
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
@@ -1373,11 +1373,11 @@ class ScopeTest(HomesMixin):
         self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         budget = rec.LIST_BUDGET_SECONDS
         self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), 2 * budget, "workers now cap at the default, so 2x cap needs 2 rounds")
-        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 4 * budget, "4x cap needs 4 rounds at the capped worker count")
-        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * budget)
-        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 10 * budget)
-        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * rec.PRUNE_BUDGET_SECONDS, "prune budget scales with the list budget, which now grows once workers cap")
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), 2 * budget, "the workers are already at their ceiling at the default cap, so the budget doubles with the cap")
+        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 4 * budget, "4x the cap needs 4 rounds at the ceiling worker count")
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * budget, "5x the cap needs 5 rounds at the ceiling worker count")
+        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 10 * budget, "10x the cap needs 10 rounds at the ceiling worker count")
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * rec.PRUNE_BUDGET_SECONDS, "the prune budget scales with the list budget, which grows with the cap at the ceiling worker count")
         # The prune's budget follows the profiles too, per describe rather than per round
         # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
         # sequential walk's time whatever the worker count, and eight stay on the floor.

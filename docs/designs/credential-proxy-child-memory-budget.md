@@ -1,6 +1,6 @@
 # A Child Memory Budget for the Credential Proxy
 
-> **STATUS — design of record; not yet implemented.** The credential proxy caps how many
+> **STATUS — implemented.** The credential proxy caps how many
 > requests run commands at once, and its container's memory limit is sized against that cap
 > and the output each request may hold. The child processes those requests spawn are outside
 > that arithmetic, and on a wide-scope install they are most of what the container holds.
@@ -206,6 +206,16 @@ negative would refuse every command forever, which is worse than the OOM it was 
 prevent. The operator's sizing test (§2.5) makes sure the operator's own numbers never reach
 this branch.
 
+A budget that would admit fewer than `BUDGET_MINIMUM_ADMITTED_REQUESTS` (two) requests at once is
+treated as absent: the broker logs one WARNING at startup naming the limit it read and the floor,
+`child_memory_budget_floor_bytes` (672 MiB at the 8 MiB output cap: the two fixed reserves plus two
+requests' cost), and admits by slot alone. The case is real. GKE Autopilot without bursting sets a
+container's limits equal to its requests, so the proxy's limit there is its 512Mi request, under
+which the budget would admit one request and serialise every brokered command; a listing phase
+that cannot run two at once costs more than the out-of-memory exposure the budget prevents. The
+operator's sizing test holds its own limit to the same floor
+(`credentialProxyMinimumAdmittedRequests`).
+
 ### 2.4 Where the limit comes from
 
 In order:
@@ -218,8 +228,8 @@ In order:
 2. `/sys/fs/cgroup/memory.max`, for a broker whose Deployment carries no such variable: an
    image paired with an operator older than this change, or a run outside the operator. A value
    of `max` means no limit.
-3. Neither readable, or unparsable, or `max`: the budget is disabled, logged once at startup,
-   and admission is by slot alone, as today.
+3. Neither readable, or unparsable, or `max`, or under the floor (§2.3): the budget is disabled,
+   logged once at startup, and admission is by slot alone, as today.
 
 The derivation runs in `serve`, which builds the executor from the parsed arguments, and hands
 `CommandExecutor` an explicit optional limit that defaults to none. A test that constructs the executor directly therefore gets
