@@ -774,11 +774,14 @@ platformAgent:
     # limit and claims, whether or not its webhook is enabled: the reconciler
     # leaves the proxy Deployment as last applied and reports Degraded, and the
     # webhook, where enabled, refuses the override at apply. It warns when memory
-    # per CPU leaves the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged.
-    # On GKE Autopilot without bursting, a container's
-    # limits follow its requests, so raise requests.memory alongside limits.memory
-    # there. On an existing install the chart fails the upgrade when the
-    # installed CRD predates the field; apply crds/ first (upgrade.sh does).
+    # per CPU, on the requests pair and on the limits pair, leaves the 1 to 6.5
+    # GiB per vCPU band Autopilot admits unchanged: on the requests pair, that
+    # Autopilot raises the smaller request into the band; on the limits pair,
+    # that Autopilot without bursting sets the limits equal to the requests, so
+    # a limits-only override does not take effect there and requests.memory is
+    # the field to raise. With bursting the declared limits stand. On an existing
+    # install the chart fails the upgrade when the installed CRD predates the
+    # field; apply crds/ first (upgrade.sh does).
     credentialProxy:
       resources: {}
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator

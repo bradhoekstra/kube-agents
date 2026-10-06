@@ -932,9 +932,11 @@ type CredentialProxySpec struct {
 	// validating webhook is enabled, and the webhook, where it is, refuses the
 	// override at apply. The webhook warns when memory per CPU, on the requests
 	// pair and on the limits pair, leaves the band GKE Autopilot admits
-	// unchanged. On GKE Autopilot without bursting, a
-	// container's limits follow its requests, so raise requests.memory
-	// alongside limits.memory there.
+	// unchanged: on the requests pair, that Autopilot raises the smaller request
+	// into the band; on the limits pair, that Autopilot without bursting sets
+	// the limits equal to the requests, so a limits-only override does not take
+	// effect there and requests.memory is the field to raise. With bursting the
+	// declared limits stand.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }

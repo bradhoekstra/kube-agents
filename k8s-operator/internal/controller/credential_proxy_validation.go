@@ -31,9 +31,10 @@ import (
 
 // GKE Autopilot's general-purpose compute class admits a container unchanged
 // only while its memory sits between 1 GiB and 6.5 GiB per vCPU, and raises the
-// smaller side of the pair to reach the band otherwise. The operator declares
-// the proxy's defaults at the lower edge of that band (500m and 512Mi) so the
-// manifest it writes is the pod Autopilot admits; an override that leaves the
+// smaller request of the pair to reach the band otherwise; limits it either
+// sets equal to the requests (no bursting) or keeps as declared (bursting).
+// The operator declares the proxy's defaults at the lower edge of that band
+// (500m and 512Mi) so the manifest it writes is the pod Autopilot admits; an override that leaves the
 // band is admitted at figures the CR does not show, and the chart's quota
 // preflight, which sums the CR's figures, is short by the difference. A
 // warning rather than a refusal: the pod still runs, and on Standard nothing
@@ -54,16 +55,17 @@ const (
 // The refusals ValidateCredentialProxyResources makes that carry no figures
 // of their own.
 const (
-	credentialProxyResourceNameRefusal  = "the credential-proxy container accepts cpu, memory and ephemeral-storage only and declares no other resource; any other name is one the API server refuses as written (an extended resource without its limit, hugepages whose request and limit differ) or the pod has no use for"                                            // #nosec G101 -- Error message, not a credential
-	credentialProxyClaimsRefusal        = "the credential-proxy pod declares no resourceClaims, so a claim named here cannot take effect"                                                                                                                                                                                                                                 // #nosec G101 -- Error message, not a credential
-	credentialProxyNegativeRefusal      = "must not be negative; the API server refuses a container that declares one"                                                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
-	credentialProxyZeroLimitRefusal     = "a limit of zero leaves the container nothing of this resource; omit the key to keep the operator's default"                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
-	credentialProxyUnrepresentableFmt   = "is not a representable byte count: it exceeds the %d bytes an int64 holds, which is what the Downward API hands the broker"                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
-	credentialProxyFloorRefusalFmt      = "a %s memory limit is under the %dMi floor at which the budget admits %d commands; below it the broker turns the budget off and admits by the slot cap alone, which is the exposure the budget exists to remove"                                                                                                                // #nosec G101 -- Error message, not a credential
-	credentialProxyCrossedBesideFmt     = "exceeds the %s %s limit set beside it"                                                                                                                                                                                                                                                                                         // #nosec G101 -- Error message, not a credential
-	credentialProxyCrossedDefLimitFmt   = "exceeds the operator's default %s %s limit, which this override does not raise; set limits.%s as well"                                                                                                                                                                                                                         // #nosec G101 -- Error message, not a credential
-	credentialProxyCrossedDefRequestFmt = "is below the operator's default %s %s request, which this override does not lower; set requests.%s as well"                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
-	credentialProxyBandWarningFmt       = "%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot raises the smaller side into that band, so the pod it admits is larger than this CR declares and the chart's quota preflight, which sums the CR's figures, is short by the difference" // #nosec G101 -- Error message, not a credential
+	credentialProxyResourceNameRefusal    = "the credential-proxy container accepts cpu, memory and ephemeral-storage only and declares no other resource; any other name is one the API server refuses as written (an extended resource without its limit, hugepages whose request and limit differ) or the pod has no use for"                                                                               // #nosec G101 -- Error message, not a credential
+	credentialProxyClaimsRefusal          = "the credential-proxy pod declares no resourceClaims, so a claim named here cannot take effect"                                                                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
+	credentialProxyNegativeRefusal        = "must not be negative; the API server refuses a container that declares one"                                                                                                                                                                                                                                                                                       // #nosec G101 -- Error message, not a credential
+	credentialProxyZeroLimitRefusal       = "a limit of zero leaves the container nothing of this resource; omit the key to keep the operator's default"                                                                                                                                                                                                                                                       // #nosec G101 -- Error message, not a credential
+	credentialProxyUnrepresentableFmt     = "is not a representable byte count: it exceeds the %d bytes an int64 holds, which is what the Downward API hands the broker"                                                                                                                                                                                                                                       // #nosec G101 -- Error message, not a credential
+	credentialProxyFloorRefusalFmt        = "a %s memory limit is under the %dMi floor at which the budget admits %d commands; below it the broker turns the budget off and admits by the slot cap alone, which is the exposure the budget exists to remove"                                                                                                                                                   // #nosec G101 -- Error message, not a credential
+	credentialProxyCrossedBesideFmt       = "exceeds the %s %s limit set beside it"                                                                                                                                                                                                                                                                                                                            // #nosec G101 -- Error message, not a credential
+	credentialProxyCrossedDefLimitFmt     = "exceeds the operator's default %s %s limit, which this override does not raise; set limits.%s as well"                                                                                                                                                                                                                                                            // #nosec G101 -- Error message, not a credential
+	credentialProxyCrossedDefRequestFmt   = "is below the operator's default %s %s request, which this override does not lower; set requests.%s as well"                                                                                                                                                                                                                                                       // #nosec G101 -- Error message, not a credential
+	credentialProxyRequestsBandWarningFmt = "%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot raises the smaller side into that band, so the pod it admits is larger than this CR declares and the chart's quota preflight, which sums the CR's figures, is short by the difference"                                    // #nosec G101 -- Error message, not a credential
+	credentialProxyLimitsBandWarningFmt   = "%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot sizes a pod from its requests, and without bursting sets the limits equal to the requests, so a limits-only override does not take effect there (raise requests.memory instead); with bursting the declared limits stand" // #nosec G101 -- Error message, not a credential
 )
 
 // credentialProxyRefusalMoreFmt counts the refusals past the first, which the
@@ -114,8 +116,10 @@ var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 //     that has the problem, and names which side is the operator's default
 //     when the CR set only the other one.
 //
-// And one warning, when the requests pair or the limits pair leaves the
-// memory-per-vCPU band Autopilot admits unchanged (the constants above).
+// And a warning per pair that leaves the memory-per-vCPU band Autopilot admits
+// unchanged (the constants above): on the requests pair, that Autopilot
+// resizes the pod; on the limits pair, that without bursting Autopilot sets
+// the limits equal to the requests, so requests.memory is the field to raise.
 //
 // Nothing runs when the CR carries no override: the defaults satisfy every
 // check by construction, and the sizing test pins that.
@@ -217,7 +221,11 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 			continue
 		}
 		gibPerVCPU := memory.AsApproximateFloat64() / cpu.AsApproximateFloat64() / float64(bytesPerGiB)
-		warnings = append(warnings, fmt.Sprintf(credentialProxyBandWarningFmt,
+		format := credentialProxyRequestsBandWarningFmt
+		if side.name == credentialProxyLimitsField {
+			format = credentialProxyLimitsBandWarningFmt
+		}
+		warnings = append(warnings, fmt.Sprintf(format,
 			path.Child(side.name), memory.String(), cpu.String(), gibPerVCPU,
 			autopilotMinMemoryBytesPerVCPU/bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU)/float64(bytesPerGiB)))
 	}

@@ -532,10 +532,13 @@ negative quantity, a zero limit, `claims`, and any resource name other than
 `cpu`, `memory` and `ephemeral-storage`, whether or not its webhook is
 enabled: the reconciler leaves the proxy Deployment as last applied and reports
 `Degraded` (`Reason: InvalidCredentialProxyResources`), and the webhook, where
-enabled, refuses the same override at apply. It warns when memory per CPU leaves
-the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On GKE Autopilot without bursting, a
-container's limits follow its requests, so raise `requests.memory` alongside
-`limits.memory` there. The quota preflight counts the override. On an
+enabled, refuses the same override at apply. It warns when memory per CPU, on
+the requests pair and on the limits pair, leaves the 1 to 6.5 GiB per vCPU band
+Autopilot admits unchanged: on the requests pair, that Autopilot raises the
+smaller request into the band; on the limits pair, that Autopilot without
+bursting sets the limits equal to the requests, so a limits-only override does
+not take effect there and `requests.memory` is the field to raise. With bursting
+the declared limits stand. The quota preflight counts the override. On an
 existing install, apply the chart's `crds/` before setting the value (`helm
 upgrade` does not, `upgrade.sh` does): against a CRD that predates
 `spec.deployment.credentialProxy`, the API server would prune the value silently

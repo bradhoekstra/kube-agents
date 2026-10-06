@@ -164,7 +164,9 @@ func TestCredentialProxyEphemeralStorageRequestAboveItsLimitIsRefused(t *testing
 
 // 8Gi of memory against the default 1 CPU limit is 8 GiB per vCPU, past the
 // 6.5 GiB Autopilot admits unchanged: a warning on the limits pair, the
-// requests pair (512Mi per 500m) still inside the band, and no error.
+// requests pair (512Mi per 500m) still inside the band, and no error. Autopilot
+// resizes requests, not limits, so the warning says what it does to limits
+// instead: sets them to the requests without bursting, keeps them with it.
 func TestCredentialProxyMemoryPerCPUOutsideTheAutopilotBandWarns(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
@@ -176,10 +178,13 @@ func TestCredentialProxyMemoryPerCPUOutsideTheAutopilotBandWarns(t *testing.T) {
 	if len(warnings) != 1 {
 		t.Fatalf("expected one warning, got %v", warnings)
 	}
-	for _, want := range []string{"spec.deployment.credentialProxy.resources.limits", "8.00 GiB per vCPU", "1 to 6.5 GiB per vCPU", "quota preflight"} {
+	for _, want := range []string{"spec.deployment.credentialProxy.resources.limits", "8.00 GiB per vCPU", "1 to 6.5 GiB per vCPU", "sets the limits equal to the requests", "raise requests.memory", "with bursting the declared limits stand"} {
 		if !strings.Contains(warnings[0], want) {
 			t.Errorf("warning %q does not say %q", warnings[0], want)
 		}
+	}
+	if strings.Contains(warnings[0], "raises the smaller side") {
+		t.Errorf("limits-pair warning %q describes the requests resize", warnings[0])
 	}
 }
 
@@ -194,8 +199,16 @@ func TestCredentialProxyRequestPairOutsideTheAutopilotBandWarns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected admission, got: %v", err)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.deployment.credentialProxy.resources.requests") || !strings.Contains(warnings[0], "8.00 GiB per vCPU") {
-		t.Errorf("expected one warning on the requests pair at 8 GiB per vCPU, got %v", warnings)
+	if len(warnings) != 1 {
+		t.Fatalf("expected one warning on the requests pair, got %v", warnings)
+	}
+	for _, want := range []string{"spec.deployment.credentialProxy.resources.requests", "8.00 GiB per vCPU", "raises the smaller side", "quota preflight"} {
+		if !strings.Contains(warnings[0], want) {
+			t.Errorf("warning %q does not say %q", warnings[0], want)
+		}
+	}
+	if strings.Contains(warnings[0], "sets the limits equal to the requests") {
+		t.Errorf("requests-pair warning %q carries the limits-pair text", warnings[0])
 	}
 }
 
