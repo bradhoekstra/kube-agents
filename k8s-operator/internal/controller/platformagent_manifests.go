@@ -4049,6 +4049,14 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// the same figure; setting it here is what makes it the operator's to
 		// move, together with the limit above.
 		{Name: "CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS", Value: credentialProxyMaxConcurrentCommands},
+		// The container's own memory limit, for the broker's child memory
+		// budget. See credentialProxyMemoryLimitEnv for why it is a
+		// resourceFieldRef and why it is reserved.
+		{Name: credentialProxyMemoryLimitEnv, ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+			ContainerName: credentialProxyContainerName,
+			Resource:      containerMemoryLimitResource,
+			Divisor:       resource.MustParse("1"),
+		}}},
 		{Name: "CREDENTIAL_PROXY_STATE_DIR", Value: "/var/lib/credential-proxy"},
 		{Name: "CREDENTIAL_PROXY_UNIX_SOCKET", Value: "/var/run/credential-proxy/backend.sock"},
 		// The credentialed port, the same constant the container port and the

@@ -121,7 +121,57 @@ const (
 	// Autopilot for the 256Mi the admission added.
 	credentialProxyCPURequest    = "500m"
 	credentialProxyMemoryRequest = "512Mi"
+	// credentialProxyContainerName is the broker container, named exactly
+	// here because the Downward API reference below has to match it.
+	credentialProxyContainerName = "envoy-credential-proxy"
+	// credentialProxyMemoryLimitEnv carries the container's own memory limit
+	// in bytes to the broker, which derives its child memory budget from it
+	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef, so
+	// a limit moved by a CR field or a VPA is the limit the broker budgets
+	// against; in the base env list and so reserved in mergeCredentialProxyEnv,
+	// because a CR that could set it would detach the budget from the limit.
+	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
+	// The child memory budget's terms, in bytes, as the broker declares them
+	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
+	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
+	// OUTPUT_COPIES_PER_COMMAND). Declared here rather than in the test so the
+	// sizing test and the admission webhook's floor read one copy; the design
+	// (docs/designs/credential-proxy-child-memory-budget.md §2.2) is why each
+	// is the size it is. Change the Python side in the same commit.
+	credentialProxyResidentReserveBytes   int64 = 192 << 20
+	credentialProxyWorkspaceReserveBytes  int64 = 128 << 20
+	credentialProxyRequestReserveBytes    int64 = 128 << 20
+	credentialProxyOutputCopiesPerCommand int64 = 6
+	// credentialProxyMinimumAdmittedRequests is the floor the sizing test and
+	// the webhook hold the limit to: fewer than two and a listing phase cannot
+	// parallelise at all. The broker's counterpart is
+	// BUDGET_MINIMUM_ADMITTED_REQUESTS in credential_proxy.py.
+	credentialProxyMinimumAdmittedRequests int64 = 2
 )
+
+// credentialProxyRequestCostBytes is what one admitted request costs the
+// broker's child memory budget: its child reserve plus the output the broker
+// itself may hold for it.
+func credentialProxyRequestCostBytes(outputCapBytes int64) int64 {
+	return credentialProxyRequestReserveBytes + credentialProxyOutputCopiesPerCommand*outputCapBytes
+}
+
+// credentialProxyAdmittedRequests is how many requests the broker admits at
+// once under a memory limit, the number its startup line prints.
+func credentialProxyAdmittedRequests(limitBytes, outputCapBytes int64) int64 {
+	budget := limitBytes - credentialProxyResidentReserveBytes - credentialProxyWorkspaceReserveBytes
+	if budget <= 0 {
+		return 0
+	}
+	return budget / credentialProxyRequestCostBytes(outputCapBytes)
+}
+
+// credentialProxyMinimumMemoryLimitBytes is the smallest limit that admits
+// credentialProxyMinimumAdmittedRequests at once.
+func credentialProxyMinimumMemoryLimitBytes(outputCapBytes int64) int64 {
+	return credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes +
+		credentialProxyMinimumAdmittedRequests*credentialProxyRequestCostBytes(outputCapBytes)
+}
 
 // credentialProxyFederation returns the federation config when it is complete.
 //
