@@ -166,9 +166,13 @@ LIST_WORKERS = 8
 # Every lookup is a gcloud process the credential proxy runs, and the proxy admits
 # four requests at once under its child memory budget at the operator's default limit
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): an eight-wide burst runs
-# in two waves and the second waits one listing, inside the 60s admission bound at the
-# slowest listing observed; a sixteen-wide one ran in four and its last wave could be
-# refused. So the ceiling is the default until the budget's admitted count is raised.
+# in two waves and the second waits one listing. That fits the 60s admission bound at the
+# slowest listing observed (25s), but LIST_TIMEOUT_SECONDS allows 120s: a first wave whose
+# listings all run past 60s makes the second wave's lookups busy refusals, recorded
+# unlisted for the tick and retried on the next, as a lookup that reaches its timeout is.
+# A sixteen-wide burst runs in four waves, the last waiting three listings, past the bound
+# at the slowest listing observed; so the ceiling is the default until the budget's admitted count is raised; lowering it to the
+# admitted count is the one-line change if refusals appear in practice.
 LIST_WORKERS_MAX = LIST_WORKERS
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150

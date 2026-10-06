@@ -1368,7 +1368,7 @@ class ScopeTest(HomesMixin):
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
         self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
-        self.assertEqual(per_default, rec.LIST_WORKERS_MAX, "the ceiling is the default: the credential proxy's child memory budget admits four requests at once at the operator's limit, and an eight-wide burst waits one listing where a sixteen-wide one can outwait the 60s bound (docs/designs/credential-proxy-child-memory-budget.md §2.2)")
+        self.assertEqual(per_default, rec.LIST_WORKERS_MAX, "the ceiling is the default: the credential proxy's child memory budget admits four requests at once at the operator's limit, so an eight-wide burst's second wave waits one listing -- inside the 60s admission bound at observed listing times, refused busy and retried next tick when the first wave runs past it (LIST_TIMEOUT_SECONDS allows 120s); lower the pool to the admitted count if refusals appear (docs/designs/credential-proxy-child-memory-budget.md §2.2)")
         self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         budget = rec.LIST_BUDGET_SECONDS
