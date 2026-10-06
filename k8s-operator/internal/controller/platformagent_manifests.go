@@ -5278,10 +5278,13 @@ func getConfigMapHash(configMap *corev1.ConfigMap) (string, error) {
 // to change — a bump that changed it would have left every record as text,
 // silently — and a logger writing untrusted text could have planted a line
 // shaped like a record. Tailing a file of the emitters' own, as JSON, removes
-// both: nothing here reads a Hermes log format, and a log line cannot become a
-// record. What remains is a write to the file itself, which any process under
-// the agent's uid with a path to the profile's logs/ can make; that is the
-// volume's boundary, not this configuration's.
+// both for the trail: no audit record is lifted from a Hermes line, so a prefix
+// bump cannot silently drop one and logged text cannot forge one. gchat_event
+// still reads the gateway's lines, but only to enrich the agent.logs stream —
+// it matches agent.logs, never agent.audit, and builds no record. What remains
+// is a write to the file itself, which any process under the agent's uid with a
+// path to the profile's logs/ can make; that is the volume's boundary, not this
+// configuration's.
 //
 // The audit input matches every profile's file (fluentBitAuditTailPath), not
 // only the profiles that emit today. The agent.logs input is unchanged and still
