@@ -4105,8 +4105,10 @@ class CommandExecutorTest(unittest.TestCase):
             pass
 
     def test_the_output_term_is_charged_for_slots_in_use_not_the_cap(self):
-        # Budget for exactly two requests at a 1 KiB cap; with the cap of
-        # eight charged up front nothing would fit at all.
+        # Budget for exactly two requests at a 1 KiB cap. With the output
+        # allowance charged for the cap of eight up front, the first request
+        # would cost 128 MiB + 8 x 6 KiB and the second would not fit, since
+        # the budget holds only 2 x (128 MiB + 6 KiB).
         executor = self.budgeted(admits=2, max_concurrent_commands=8)
         release = threading.Event()
         held = []
