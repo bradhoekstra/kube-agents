@@ -171,8 +171,9 @@ LIST_WORKERS = 8
 # listings all run past 60s makes the second wave's lookups busy refusals, recorded
 # unlisted for the tick and retried on the next, as a lookup that reaches its timeout is.
 # A sixteen-wide burst runs in four waves, the last waiting three listings, past the bound
-# at the slowest listing observed; so the ceiling is the default until the budget's admitted count is raised; lowering it to the
-# admitted count is the one-line change if refusals appear in practice.
+# at the slowest listing observed. So the ceiling is the default until the budget's
+# admitted count is raised; lowering it to the admitted count is the one-line change if
+# refusals appear in practice.
 LIST_WORKERS_MAX = LIST_WORKERS
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
