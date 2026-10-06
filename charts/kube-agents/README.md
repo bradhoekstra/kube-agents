@@ -529,7 +529,9 @@ install can outgrow the default, and
 has the arithmetic. The
 operator's webhook, where enabled, refuses a memory limit below 672Mi and a
 request above its limit, and warns when memory per CPU leaves the 1 to 6.5 GiB
-per vCPU band Autopilot admits unchanged. The quota preflight counts the override.
+per vCPU band Autopilot admits unchanged. On GKE Autopilot without bursting, a
+container's limits follow its requests, so raise `requests.memory` alongside
+`limits.memory` there. The quota preflight counts the override.
 
 #### PlatformAgent annotations
 
@@ -717,8 +719,10 @@ pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
 it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
 merged over its footprint entry per key, as the operator renders it, so a raised limit is
-summed at the raised figure; a `PlatformAgent` edited by hand after the install is outside
-what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
+summed at the raised figure, and an override setting only `limits.ephemeral-storage` is counted
+as a request of that size too, because the operator renders no ephemeral-storage request and
+the API server defaults it to the limit; a `PlatformAgent` edited by hand after the install is
+outside what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to

@@ -1319,7 +1319,9 @@ returns the entry's six numbers and pod count as JSON.
          footprint entry takes platformAgent.deployment.credentialProxy.resources over it
          per key (kube-agents.credentialProxyFootprint) before it is summed, so a raised
          memory limit is counted here as the pod the operator will write, rather than the
-         preflight passing a quota the release will not fit. */ -}}
+         preflight passing a quota the release will not fit. An ephemeral-storage limit set
+         alone is counted as a request of that size too: the operator renders no
+         ephemeral-storage request and the API server defaults it to the limit. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
