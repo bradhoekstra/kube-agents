@@ -141,8 +141,10 @@ handling below runs first, so a new pod's whole sample competes with an old pod'
 and the larger wins, which is still the better estimate of the two. A replica whose entry is behind
 its sibling's marker when it next advances is reset without adding and takes the sibling's
 marker, as the resets section says, so one straddle does not cost the next lone advance, and
-that rule reads the stored markers alone, so it holds across a leader change. It
-makes the layout under-count rather than over-count: informer skew that straddles a poll
+that rule reads the stored markers alone, so it holds across a leader change between
+replicas that both stay live; a former leader that terminates mid-straddle is the exception, in
+the resets section below. It makes the layout under-count rather than over-count: informer skew that
+straddles a poll
 boundary, one replica ahead at one poll and the other catching up by the next, drops the
 catch-up instead of counting it twice, and a replica's events its sibling did not inject, a
 sibling whose daemon dropped them on its daily ceiling or whose dedup snapshot was kept while
@@ -267,7 +269,15 @@ each pod it scraped:
   it advances in a poll the sibling does not, so its events in a poll the sibling was missed are
   lost too. A terminating pod is never read again, so it is not live: its entry is dropped and
   its marker suppresses no sibling, which is what keeps a rollout from losing the new replica's
-  intervals. A reset that took the sibling's marker after the poll would close the missed-sibling
+  intervals. The drop runs before the markers are snapshotted, so it has a cost in the
+  mirror case: a replica trailing a leader that then terminates is never reset against the gone
+  leader's marker, and its pending catch-up -- the events the leader already counted -- is taken
+  a second time when it next advances, an over-count of one straddle's events and the one place
+  this layout over-counts rather than under-counts. That cost is accepted: snapshotting the
+  departed markers would close it, but a departed sibling would then suppress a genuinely new
+  replica's first advance when it is read late in a rollout, and a real interval would be lost
+  for good; a bounded one-time double count is preferred to a permanent loss. A reset that took
+  the sibling's marker after the poll would close the missed-sibling
   loss as well and open an over-count instead, a replica trailing its sibling by one poll having
   its catch-up counted whenever the sibling is quiet, and the under-count is the one preferred.
 
@@ -361,8 +371,10 @@ time the ConfigMap recorded, not its own, so `lastActiveTime` says when the coun
 rather than when the status caught up. That time is in the ConfigMap for this reason: in the
 poller's memory alone it would die with the process that took it. The other order would
 leave the totals behind the status after a crash, and the next poll would add the interval's
-deltas a second time. Under-counting until the next poll is the error this document prefers
-everywhere; an over-count is permanent.
+deltas a second time. Under-counting until the next poll is the error this document prefers where
+the over-count it trades against would be permanent, as this crash's double-add would be. The
+one exception runs the other way: the terminating-leader case in the resets section accepts a
+bounded over-count because there it is the under-count that would be permanent.
 
 ## Write cadence and the status writers
 
