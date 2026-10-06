@@ -1146,6 +1146,28 @@ returns the entry's six numbers and pod count as JSON.
    | toJson -}}
 {{- end }}
 
+{{/*
+The credential-proxy container's default requests and limits, and the smallest memory limit the
+operator accepts, for the CR template's static check of
+platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
+credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
+credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
+credentialProxyMinimumMemoryLimitBytes at the default output cap, 672Mi
+(k8s-operator/internal/controller/credential_proxy_manifests.go).
+tests/test_credential_proxy_sizing_parity.py holds them equal; change both sides together.
+The defaults carry no ephemeral-storage request because the operator renders none.
+*/}}
+{{- define "kube-agents.credentialProxyDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "500m" "memory" "512Mi")
+      "limits" (dict "cpu" "1" "memory" "1Gi" "ephemeral-storage" "2Gi")
+   | toJson -}}
+{{- end }}
+
+{{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
+704643072
+{{- end }}
+
 {{- define "kube-agents.quotaRequirements" -}}
 {{- $footprint := .Files.Get "files/footprint.yaml" | fromYaml -}}
 {{- /* The footprint is the only source for the operator-rendered pods, which are most of

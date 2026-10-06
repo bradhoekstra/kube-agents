@@ -771,10 +771,13 @@ platformAgent:
     # when the proxy is OOM-killed under a large fleet. The quota preflight
     # counts the override. The operator refuses a memory limit below 672Mi (two
     # commands at once), a request above its limit, a negative quantity, a zero
-    # limit and claims, whether or not its webhook is enabled: the reconciler
+    # limit, claims, and any resource name other than cpu, memory and
+    # ephemeral-storage, whether or not its webhook is enabled: the reconciler
     # ignores the override, renders the proxy Deployment at its defaults and
     # reports Degraded, and the webhook, where enabled, refuses the override at
-    # apply. It warns when memory per CPU, on the requests pair and on the
+    # apply. The chart fails the render on the same override first, and on any
+    # key under resources other than requests, limits and claims, which the CRD
+    # would prune silently. The operator warns when memory per CPU, on the requests pair and on the
     # limits pair, leaves the 1 to 6.5 GiB per vCPU band Autopilot admits
     # unchanged: on the requests pair, that Autopilot raises the smaller request
     # into the band; on the limits pair, that Autopilot without bursting sets

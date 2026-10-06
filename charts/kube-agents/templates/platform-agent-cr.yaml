@@ -188,8 +188,7 @@ spec:
       bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
       null (`memory: null`, Helm's way to drop a key) or the empty string, which
       the CRD's quantity pattern refuses. A map holding nothing else writes no
-      block either. Any other key goes through as written, for the operator to
-      refuse by name.
+      block either.
     */}}
     {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
     {{- $proxyQuantities := dict }}
@@ -204,7 +203,98 @@ spec:
         {{- $_ := set $proxyQuantities $side $set }}
       {{- end }}
     {{- end }}
-    {{- $proxyOther := omit $proxyResources "limits" "requests" }}
+    {{- /*
+      Checked here, on the operator's defaults with the override merged over
+      them, for the reason the shell sandbox's guard above gives: an override
+      the operator refuses would install cleanly and sit Degraded, the proxy at
+      its defaults, with no Helm error to read. So the render fails on what the
+      operator refuses and the values alone decide (ValidateCredentialProxyResources
+      in k8s-operator/internal/controller/credential_proxy_validation.go): a
+      key the CRD does not declare, which the API server would prune silently
+      (`limit:` for `limits:`), claims, a resource name the container does not
+      declare, a negative quantity, a zero limit, a memory limit under the
+      floor, and a request above its limit. The defaults and the floor are
+      kube-agents.credentialProxyDefaults and
+      kube-agents.credentialProxyMemoryFloorBytes. A quantity the parsers do not
+      read skips the comparisons it is in and is left to the CRD's pattern.
+    */}}
+    {{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" }}
+    {{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha }}
+    {{- if $proxyUnknown }}
+    {{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) }}
+    {{- end }}
+    {{- if index $proxyResources "claims" }}
+    {{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) }}
+    {{- end }}
+    {{- $proxyNames := list "cpu" "memory" "ephemeral-storage" }}
+    {{- /* The shapes kube-agents.parseCpuMillis and parseBytes read. A quantity
+           of another shape is dropped from the merged result, so it skips the
+           comparisons it would take part in rather than failing the parse. */}}
+    {{- $proxyQuantityPatterns := dict
+          "cpu" "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+|[munkMGTPE])?$"
+          "memory" "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+|m|[KMGTPE]i|[kMGTPE])?$"
+          "ephemeral-storage" "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+|m|[KMGTPE]i|[kMGTPE])?$" }}
+    {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
+    {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
+    {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
+    {{- range $side := list "requests" "limits" }}
+      {{- range $name, $raw := index $proxyDefaults $side }}
+        {{- $_ := set (index $proxyMerged $side) $name $raw }}
+      {{- end }}
+    {{- end }}
+    {{- range $side, $set := $proxyQuantities }}
+      {{- range $name, $quantity := $set }}
+        {{- $raw := toString $quantity | trim }}
+        {{- if not (has $name $proxyNames) }}
+        {{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) }}
+        {{- end }}
+        {{- if hasPrefix "-" $raw }}
+        {{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) }}
+        {{- end }}
+        {{- $raw = trimPrefix "+" $raw }}
+        {{- if regexMatch (index $proxyQuantityPatterns $name) $raw }}
+        {{- $_ := set (index $proxyMerged $side) $name $raw }}
+        {{- else }}
+        {{- $_ := unset (index $proxyMerged $side) $name }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- if $proxyQuantities }}
+    {{- $proxyParsed := dict "requests" (dict) "limits" (dict) }}
+    {{- range $side, $set := $proxyMerged }}
+      {{- range $name, $raw := $set }}
+        {{- if eq $name "cpu" }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseCpuMillis" $raw | int64) }}
+        {{- else }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseBytes" $raw | int64) }}
+        {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- range $name, $limit := $proxyParsed.limits }}
+      {{- if eq $limit 0 }}
+      {{- fail (printf "%s.limits.%s is %s; a limit of zero leaves the container none, and the operator refuses it. Omit the key to keep the default (%s)" $proxyPrefix $name (index $proxyMerged.limits $name) (index $proxyDefaults.limits $name)) }}
+      {{- end }}
+    {{- end }}
+    {{- if and (hasKey $proxyParsed.limits "memory") (lt $proxyParsed.limits.memory $proxyFloor) }}
+    {{- fail (printf "%s.limits.memory is %s, under the %dMi floor at which the credential proxy's child memory budget admits two commands at once; below it the broker turns the budget off, and the operator refuses it. Set at least %dMi" $proxyPrefix $proxyMerged.limits.memory (div $proxyFloor 1048576) (div $proxyFloor 1048576)) }}
+    {{- end }}
+    {{- range $name, $request := $proxyParsed.requests }}
+      {{- $limit := index $proxyParsed.limits $name }}
+      {{- if and (hasKey $proxyParsed.limits $name) (gt $request $limit) }}
+      {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
+      {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
+      {{- $req := index $proxyMerged.requests $name }}
+      {{- $lim := index $proxyMerged.limits $name }}
+      {{- if and $setRequest $setLimit }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds limits.%s (%s); a request above its limit is refused by the API server, and by the operator" $proxyPrefix $name $req $name $lim) }}
+      {{- else if $setRequest }}
+      {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
+      {{- else }}
+      {{- fail (printf "%s.limits.%s (%s) is below the operator's default requests.%s (%s), which the override does not lower; set requests.%s as well" $proxyPrefix $name $lim $name $req $name) }}
+      {{- end }}
+      {{- end }}
+    {{- end }}
+    {{- end }}
     {{- /*
       The same CRD guard as the scoped pool's below, for the same reason:
       `helm upgrade` never applies crds/, and an API server serving a CRD from
@@ -213,7 +303,7 @@ spec:
       carries the override, and nothing says so. `lookup` is empty under
       `helm template`, so the guard fires only against a live install.
     */}}
-    {{- if or $proxyQuantities $proxyOther }}
+    {{- if $proxyQuantities }}
     {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
     {{- if $crd }}
     {{- $deploymentProps := dict }}
@@ -233,9 +323,6 @@ spec:
           {{- range $name := keys $set | sortAlpha }}
           {{ $name }}: {{ index $set $name | toString | quote }}
           {{- end }}
-        {{- end }}
-        {{- with $proxyOther }}
-        {{- toYaml . | nindent 8 }}
         {{- end }}
     {{- end }}
   security:

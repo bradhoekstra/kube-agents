@@ -1,11 +1,12 @@
 """The chart forwards `platformAgent.deployment.credentialProxy.resources` to the CR.
 
 The value is the chart's route to `spec.deployment.credentialProxy.resources`, the
-PlatformAgent field that sizes the credential-proxy container. Three things have to hold:
+PlatformAgent field that sizes the credential-proxy container. Four things have to hold:
 a default render writes no block at all (an empty one would be pruned by an API server
 serving an older CRD and read as an override by everyone else); a set value reaches the
-CR under the path the operator reads; and the schema, which is closed under
-`platformAgent.deployment`, declares the key and refuses one it does not know beneath it.
+CR under the path the operator reads; the schema, which is closed under
+`platformAgent.deployment`, declares the key and refuses one it does not know beneath it;
+and an override the operator would refuse fails the render instead of installing Degraded.
 
 The quota preflight's arithmetic over the same value is in test_quota_preflight.py.
 
@@ -154,6 +155,71 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         self.assertIn("replicas", res.stderr)
 
 
+@unittest.skipUnless(_HELM, "helm is not installed")
+class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
+    """What the operator refuses, the render refuses first: rendered, the release would
+    install cleanly and the proxy would sit Degraded at its defaults with no Helm error."""
+
+    _render_cr = CredentialProxyResourcesRenderTest._render_cr
+
+    def _render_error(self, sets=(), values=None):
+        res = self._render_cr(sets, expect_failure=True, values=values)
+        self.assertNotEqual(res.returncode, 0, res.stdout)
+        return res.stderr
+
+    def test_a_misspelt_key_fails_naming_it_and_the_accepted_ones(self):
+        # The CRD's resources object declares claims, limits and requests only, so
+        # `limit:` would be pruned by the API server and the override lost.
+        err = self._render_error([f"{_VALUE_PATH}.limit.memory=2Gi"])
+        self.assertIn(f"{_VALUE_PATH} carries limit", err)
+        self.assertIn("the accepted keys are requests, limits and claims", err)
+
+    def test_claims_fail(self):
+        err = self._render_error([f"{_VALUE_PATH}.claims[0].name=gpu"])
+        self.assertIn(f"{_VALUE_PATH}.claims is not supported", err)
+
+    def test_a_resource_name_the_container_does_not_declare_fails(self):
+        err = self._render_error([f"{_VALUE_PATH}.limits.hugepages-2Mi=1Gi"])
+        self.assertIn(f"{_VALUE_PATH}.limits.hugepages-2Mi", err)
+
+    def test_a_memory_limit_under_the_floor_fails_naming_it(self):
+        err = self._render_error([f"{_VALUE_PATH}.limits.memory=512Mi"])
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is 512Mi, under the 672Mi floor", err)
+
+    def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
+        err = self._render_error([f"{_VALUE_PATH}.requests.memory=2Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (2Gi) exceeds the operator's default limits.memory (1Gi)", err)
+        self.assertIn("set limits.memory as well", err)
+
+    def test_a_limit_below_the_default_request_fails_naming_the_pair(self):
+        err = self._render_error([f"{_VALUE_PATH}.limits.cpu=200m"])
+        self.assertIn(f"{_VALUE_PATH}.limits.cpu (200m) is below the operator's default requests.cpu (500m)", err)
+
+    def test_a_request_above_the_limit_set_beside_it_fails(self):
+        err = self._render_error([f"{_VALUE_PATH}.requests.memory=4Gi", f"{_VALUE_PATH}.limits.memory=2Gi"])
+        self.assertIn(f"{_VALUE_PATH}.requests.memory (4Gi) exceeds limits.memory (2Gi)", err)
+
+    def test_an_ephemeral_storage_request_above_the_default_limit_fails(self):
+        err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=3Gi"])
+        self.assertIn("limits.ephemeral-storage (2Gi)", err)
+
+    def test_a_negative_quantity_fails(self):
+        err = self._render_error(values=_proxy_values({"requests": {"cpu": "-1"}}))
+        self.assertIn(f"{_VALUE_PATH}.requests.cpu is -1", err)
+
+    def test_a_zero_limit_fails(self):
+        err = self._render_error([f"{_VALUE_PATH}.limits.cpu=0"])
+        self.assertIn(f"{_VALUE_PATH}.limits.cpu is 0", err)
+
+    def test_a_two_gi_limit_renders(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=2Gi"])
+        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "2Gi"}})
+
+    def test_a_limit_at_the_floor_renders(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=672Mi"])
+        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "672Mi"}})
+
+
 class CrdGuardTest(unittest.TestCase):
     """`helm upgrade` does not apply crds/, so an override against a CRD from before
     the field would be pruned silently. `lookup` is empty under `helm template`, so
@@ -165,12 +231,12 @@ class CrdGuardTest(unittest.TestCase):
 
     def setUp(self):
         template = (_CHART / _CR_TEMPLATE).read_text()
-        block = re.search(r"\{\{- \$proxyOther := .*?\n(.*?)\n\s*credentialProxy:\n", template, re.DOTALL)
+        block = re.search(r"\n(\s*\{\{- if \$proxyQuantities \}\}\n\s*\{\{- \$crd := .*?)\n\s*credentialProxy:\n", template, re.DOTALL)
         self.assertIsNotNone(block, "the credentialProxy block is missing from the CR template")
         self.guard = block.group(1)
 
     def test_a_set_override_looks_up_the_installed_crd(self):
-        gate = re.search(r"\{\{- if or \$proxyQuantities \$proxyOther \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
+        gate = re.search(r"\{\{- if \$proxyQuantities \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
         self.assertIsNotNone(gate, "the CRD lookup is not gated on a set override")
 
     def test_the_guard_reads_the_storage_versions_deployment_properties(self):

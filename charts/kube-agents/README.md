@@ -526,13 +526,16 @@ sizes how many commands it admits at once from that limit, which makes it the
 value to raise when the proxy is OOM-killed under a large fleet; a wide-scope
 install can outgrow the default, and
 [the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
-has the arithmetic. The
-operator refuses a memory limit below 672Mi, a request above its limit, a
-negative quantity, a zero limit, `claims`, and any resource name other than
-`cpu`, `memory` and `ephemeral-storage`, whether or not its webhook is
-enabled: the reconciler ignores the override, renders the proxy Deployment at
-its defaults and reports `Degraded` (`Reason: InvalidCredentialProxyResources`), and the webhook, where
-enabled, refuses the same override at apply. It warns when memory per CPU, on
+has the arithmetic. The operator refuses a memory limit below 672Mi, a request
+above its limit, a negative quantity, a zero limit, `claims`, and any resource
+name other than `cpu`, `memory` and `ephemeral-storage`, whether or not its
+webhook is enabled: the reconciler ignores the override, renders the proxy
+Deployment at its defaults and reports `Degraded`
+(`Reason: InvalidCredentialProxyResources`), and the webhook, where enabled,
+refuses the same override at apply. The chart fails the render on the same
+override first, and on any key under `resources` other than `requests`,
+`limits` and `claims` (`limit:` for `limits:`), which the CRD would prune
+silently. The operator warns when memory per CPU, on
 the requests pair and on the limits pair, leaves the 1 to 6.5 GiB per vCPU band
 Autopilot admits unchanged: on the requests pair, that Autopilot raises the
 smaller request into the band; on the limits pair, that Autopilot without
