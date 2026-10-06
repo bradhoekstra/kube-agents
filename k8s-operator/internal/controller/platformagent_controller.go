@@ -261,7 +261,7 @@ const (
 	// ValidateCredentialProxyResources, so the proxy Deployment is not
 	// written and one already running keeps its last valid rendering.
 	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
-	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the credential-proxy Deployment is not written, so one already running keeps its last valid rendering, and none is created, until the override is corrected"
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the credential-proxy Deployment is not written, so one already running keeps its last valid rendering, and none is created, until the override is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
