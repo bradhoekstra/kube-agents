@@ -499,8 +499,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 // noteScrapeFailure records a failed scrape of target: one log line when the
 // streak starts, naming the pod and the error kind and never the body, and a
 // Warning event on the CR from usageScrapeFailureEventStreak polls onward,
-// re-recorded every failing poll so that the symptom, a lastActiveTime that
-// stops advancing, keeps a live cause beside it in `kubectl describe`. The
+// re-recorded every failing poll so that a live cause stays in `kubectl
+// describe` beside the symptom -- a stalled lastActiveTime, or on an HA family
+// whose sibling still advances, a counter that has quietly dropped this pod. The
 // message carries no per-poll count on purpose: a standing failure writes the
 // same (reason, message) every poll, which the event recorder folds into one
 // Event with a rising count and a refreshed LastTimestamp, so the cause
@@ -525,12 +526,12 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1al
 	// repeats; a kind that changes writes a new message, as it should.
 	detail := usageScrapeDetail(err)
 	if count == 1 {
-		log.Info("a metrics listener could not be read; its pod's baseline and the totals are unchanged until it recovers",
+		log.Info("a metrics listener could not be read; this pod is not counted and its baseline is not advanced until it recovers",
 			"pod", target.name, "counter", target.counter, "error", detail)
 	}
 	if count >= usageScrapeFailureEventStreak {
 		p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason,
-			fmt.Sprintf("status.usage.%s is not advancing: the metrics listener of pod %s cannot be scraped (%s). %s",
+			fmt.Sprintf("status.usage.%s is not counting pod %s: its metrics listener cannot be scraped (%s). The total stops advancing unless another pod carries it. %s",
 				target.counter, target.name, detail, usageScrapeGuidance(err)))
 	}
 }
