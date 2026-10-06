@@ -8024,11 +8024,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 forge.name, repository, caller=getattr(self, "connection", None)
             )
         except CallerHungUp:
-            # Queued for the child memory budget and gone before the helper
-            # ran: nothing to answer, as on the exec route.
+            # Queued for admission -- the child memory budget, or a refresh
+            # already in flight -- and gone before the helper ran: nothing to
+            # answer, as on the exec route.
             LOGGER.info(
                 "%s credential refresh abandoned: the caller disconnected while queued "
-                "for the memory budget; the helper was not started",
+                "for admission; the helper was not started",
                 forge.name,
             )
             return
