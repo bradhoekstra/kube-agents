@@ -225,8 +225,9 @@ In order:
    block so the two cannot drift: a limit changed by a future CR field, or by a Vertical Pod
    Autoscaler recreating the pod, is the limit the broker budgets against.
 2. `/sys/fs/cgroup/memory.max`, for a broker whose Deployment carries no such variable: an
-   image paired with an operator older than this change, or a run outside the operator. A value
-   of `max` means no limit.
+   image paired with an operator older than this change, or a run outside the operator. A
+   variable set to anything but a positive integer is logged at WARNING and read as unset. A
+   value of `max` in the file means no limit.
 3. Neither readable, or unparsable, or `max`, or under the floor (§2.3): the budget is disabled,
    logged once at startup, and admission is by slot alone.
 

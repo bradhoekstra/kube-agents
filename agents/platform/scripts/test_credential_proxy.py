@@ -2813,9 +2813,9 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
             credential_proxy.child_memory_limit_bytes({}, cgroup_path=self.cgroup / "absent")
         )
 
-    def test_a_variable_that_is_not_a_positive_integer_disables_the_budget(self):
+    def test_a_bad_variable_and_no_cgroup_limit_disables_the_budget(self):
         # Review focus 1: never raise at startup, never budget against zero.
-        for raw in ("0", "-1", "lots", ""):
+        for raw in ("0", "-1", "lots", "1Gi", ""):
             with self.subTest(raw=raw):
                 self.assertIsNone(
                     credential_proxy.child_memory_limit_bytes(
@@ -2823,6 +2823,30 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
                         cgroup_path=self.cgroup / "absent",
                     )
                 )
+
+    def test_a_variable_that_is_not_a_positive_integer_falls_through_to_the_cgroup(self):
+        self.cgroup.write_text("536870912\n", encoding="utf-8")
+        for raw in ("0", "-1", "lots", "1Gi"):
+            with self.subTest(raw=raw):
+                with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                    limit = credential_proxy.child_memory_limit_bytes(
+                        {credential_proxy.ENV_MEMORY_LIMIT_BYTES: raw}, cgroup_path=self.cgroup
+                    )
+                self.assertEqual(536870912, limit)
+                self.assertEqual(1, len(logs.output))
+                self.assertIn(
+                    f"CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES={raw!r} is not a positive integer "
+                    "byte count; ignoring it",
+                    logs.output[0],
+                )
+
+    def test_an_empty_variable_reads_as_unset_without_a_warning(self):
+        self.cgroup.write_text("536870912\n", encoding="utf-8")
+        with self.assertNoLogs(credential_proxy.LOGGER, level="WARNING"):
+            limit = credential_proxy.child_memory_limit_bytes(
+                {credential_proxy.ENV_MEMORY_LIMIT_BYTES: ""}, cgroup_path=self.cgroup
+            )
+        self.assertEqual(536870912, limit)
 
     def test_the_constants_match_the_design(self):
         mib = credential_proxy.MEBIBYTE

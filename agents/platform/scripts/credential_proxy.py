@@ -1287,27 +1287,40 @@ def child_memory_limit_bytes(
 ) -> int | None:
     """The container's memory limit in bytes, or None when the budget is off.
 
-    Reads the operator's Downward API variable first, then the cgroup file, and
-    answers None for anything that is not a positive integer: a variable set to
-    `0` or to text, a file that says `max`, a file that is not there. None is
-    "admission by slot alone, as before this budget", logged once by the
-    executor; it is never an error, because a broker that refuses to start over
-    a sizing hint is worse than one that runs unbudgeted.
+    Reads the operator's Downward API variable first, then the cgroup file. A
+    variable set to anything but a positive integer (`0`, `1Gi`, text) is
+    logged once and ignored, and the file is read as though it were unset. The
+    file answers None for anything that is not a positive integer: `max`, a
+    file that is not there. None is "admission by slot alone, as before this
+    budget", logged once by the executor; it is never an error, because a
+    broker that refuses to start over a sizing hint is worse than one that runs
+    unbudgeted.
     """
     source = os.environ if environ is None else environ
     raw = (source.get(ENV_MEMORY_LIMIT_BYTES) or "").strip()
-    if not raw:
-        try:
-            raw = Path(cgroup_path).read_text(encoding="utf-8").strip()
-        except OSError:
-            return None
-        if raw == CGROUP_NO_LIMIT:
-            return None
+    if raw:
+        limit = _positive_int(raw)
+        if limit is not None:
+            return limit
+        LOGGER.warning(
+            "%s=%r is not a positive integer byte count; ignoring it", ENV_MEMORY_LIMIT_BYTES, raw
+        )
     try:
-        limit = int(raw)
+        raw = Path(cgroup_path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == CGROUP_NO_LIMIT:
+        return None
+    return _positive_int(raw)
+
+
+def _positive_int(raw: str) -> int | None:
+    """`raw` as an int when it is a positive integer, else None."""
+    try:
+        value = int(raw)
     except ValueError:
         return None
-    return limit if limit > 0 else None
+    return value if value > 0 else None
 
 
 def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
@@ -4422,8 +4435,8 @@ class CommandExecutor:
             )
         elif self.children_budget_bytes is None:
             LOGGER.info(
-                "child memory budget disabled: no container memory limit known (%s unset and %s "
-                "unreadable or unlimited); admission is by slot alone",
+                "child memory budget disabled: no container memory limit known (%s unset or not a "
+                "positive integer, and %s unreadable or unlimited); admission is by slot alone",
                 ENV_MEMORY_LIMIT_BYTES,
                 CGROUP_MEMORY_MAX_PATH,
             )

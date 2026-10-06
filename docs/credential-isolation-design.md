@@ -843,7 +843,7 @@ Consequences:
   the output allowance of the slots in use has to fit the budget the broker derives
   from its container's memory limit (`CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES`, a Downward
   API `resourceFieldRef` the operator renders; the cgroup's `memory.max` when it is
-  absent; no budget when neither is readable) less 192 MiB for the broker and Envoy and
+  absent or not a positive integer; no budget when neither is readable) less 192 MiB for the broker and Envoy and
   128 MiB for the content workspace's one process tree at a time. At the operator's
   defaults that admits four requests at once, whatever executable fills them; the slot
   cap is the upper bound. Raising the container's limit raises the admitted count; the
