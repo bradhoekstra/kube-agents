@@ -5624,6 +5624,96 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
         self.assertFalse(executor._refresh_lock.locked())
 
+    def _wait_until(self, condition, deadline_seconds=5):
+        deadline = time.monotonic() + deadline_seconds
+        while not condition():
+            if time.monotonic() > deadline:
+                self.fail("condition not reached before the deadline")
+            time.sleep(0.01)
+
+    def test_the_refresh_lock_is_free_while_a_refresher_waits_for_the_budget(self):
+        executor = self._budgeted_executor(admits=1)
+        calls = []
+        real_run = executor._run_forge_helper
+
+        def record(*args, **kwargs):
+            calls.append(args)
+            return real_run(*args, **kwargs)
+
+        release = threading.Event()
+        held = threading.Event()
+
+        def hold():
+            with executor.request_slot():
+                held.set()
+                release.wait(5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        self.addCleanup(release.set)
+        self.assertTrue(held.wait(5))
+        errors = []
+
+        def refresh():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+            except Exception as exc:  # surfaced by the assertion below
+                errors.append(exc)
+
+        with mock.patch.object(executor, "_run_forge_helper", record), \
+             mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
+            refresher = threading.Thread(target=refresh)
+            refresher.start()
+            self._wait_until(lambda: executor.queued_requests > 0)
+            self.assertFalse(executor._refresh_lock.locked())
+            release.set()
+            refresher.join(5)
+        self.assertFalse(refresher.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(calls))
+        holder.join(5)
+        self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_second_refresher_releases_its_reservation_after_the_under_lock_recheck(self):
+        executor = self._budgeted_executor(admits=2)
+        entered = threading.Event()
+        finish = threading.Event()
+        calls = []
+
+        def blocking_helper(*args, **kwargs):
+            calls.append(args)
+            entered.set()
+            finish.wait(5)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        errors = []
+
+        def refresh():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+            except Exception as exc:  # surfaced by the assertion below
+                errors.append(exc)
+
+        self.addCleanup(finish.set)
+        with mock.patch.object(executor, "_run_forge_helper", blocking_helper):
+            first = threading.Thread(target=refresh)
+            first.start()
+            self.assertTrue(entered.wait(5))
+            second = threading.Thread(target=refresh)
+            second.start()
+            self._wait_until(
+                lambda: executor.reserved_bytes
+                == 2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            )
+            finish.set()
+            first.join(5)
+            second.join(5)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual([], errors)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, executor.reserved_bytes)
+
 
 class ForgeRefreshRouteTest(unittest.TestCase):
     """What `POST /v1/forge/refresh` answers, and what it declines to say."""
