@@ -261,7 +261,14 @@ class RevalidationTest(unittest.TestCase):
     # built from os.environ, and a developer's shell may export the very
     # variable a test is unsetting: JOB_TYPE and PULL_REFS from a live batch
     # run, EVAL_SKIP_REVALIDATION as the operator's lever.
-    _NEUTRALISED = ("JOB_TYPE", "PULL_REFS", "EVAL_SKIP_REVALIDATION", "EVAL_LEDGER_APP_KEY_FILE")
+    _NEUTRALISED = (
+        "JOB_TYPE",
+        "PULL_REFS",
+        "EVAL_SKIP_REVALIDATION",
+        "EVAL_LEDGER_APP_KEY_FILE",
+        "EVAL_LEDGER_APP_ID",
+        "EVAL_LEDGER_INSTALLATION_ID",
+    )
 
     def _install_script(self):
         """The shipped script, copied into the fixture repo's hack/ so its own

@@ -40,6 +40,8 @@ HTTP_TIMEOUT_SECONDS = 30
 # room for clock skew, and the backdated iat covers a runner that is slow.
 JWT_BACKDATE_SECONDS = 60
 JWT_LIFETIME_SECONDS = 540
+# How much of openssl's stderr a signing failure quotes.
+OPENSSL_STDERR_LIMIT = 300
 
 retryable = int(sys.argv[1])
 
@@ -90,7 +92,7 @@ signed = subprocess.run(
 )
 if signed.returncode != 0:
     sys.exit(
-        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:300])
+        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:OPENSSL_STDERR_LIMIT])
     )
 jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
 

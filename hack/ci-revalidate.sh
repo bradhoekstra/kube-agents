@@ -157,6 +157,7 @@ readonly REVALIDATION_MINT_SCRIPT
 readonly REVALIDATION_MINT_BODY='{"permissions":{"metadata":"read"}}'
 readonly REVALIDATION_MINT_RETRYABLE=75
 readonly REVALIDATION_STATUS_TIMEOUT_SECONDS=30
+readonly REVALIDATION_USER_AGENT="kube-agents-ci-revalidate"
 
 _revalidation_print_delta() { # <label> <range> <files-or-empty>
   echo "${1} (${2}):"
@@ -322,8 +323,8 @@ import sys
 import urllib.error
 import urllib.request
 
-url, context, build, timeout = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-headers = {"Accept": "application/vnd.github+json", "User-Agent": "kube-agents-ci-revalidate"}
+url, context, build, timeout, agent = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
+headers = {"Accept": "application/vnd.github+json", "User-Agent": agent}
 token = os.environ.get("REVALIDATION_STATUS_TOKEN")
 if token:
     headers["Authorization"] = "Bearer " + token
@@ -346,7 +347,7 @@ for status in statuses:
         print("attested")
         sys.exit(0)
 print("absent")
-' "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" 2>/dev/null)" || attested="error python3"
+' "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" "${REVALIDATION_USER_AGENT}" 2>/dev/null)" || attested="error python3"
   case "${attested}" in
     attested) ;;
     absent)

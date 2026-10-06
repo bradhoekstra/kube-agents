@@ -262,7 +262,9 @@ class LedgerMintRequestTest(unittest.TestCase):
         (self.tmp / "sitecustomize.py").write_text(_FAKE_URLOPEN, encoding="utf-8")
         self.capture = self.tmp / "request.json"
 
-    def _mint(self, call, expect_rc=0):
+    def _mint(self, call, expect_rc=0, ids=None):
+        """ids: the EVAL_LEDGER_APP_ID / EVAL_LEDGER_INSTALLATION_ID pair to export,
+        None for the ledger-reader App's, or {} to export neither."""
         script = "\n".join(
             [
                 "set -euo pipefail",
@@ -291,9 +293,12 @@ class LedgerMintRequestTest(unittest.TestCase):
                     "PYTHONPATH": str(self.tmp),
                     "MINT_CAPTURE_FILE": str(self.capture),
                     "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
-                    "EVAL_LEDGER_APP_ID": "4739812",
-                    "EVAL_LEDGER_INSTALLATION_ID": "157029058",
                     "BENCH_GITHUB_TOKEN": "the-mounted-pat",
+                    **(
+                        {"EVAL_LEDGER_APP_ID": "4739812", "EVAL_LEDGER_INSTALLATION_ID": "157029058"}
+                        if ids is None
+                        else ids
+                    ),
                 }
             ),
         )
@@ -325,6 +330,24 @@ class LedgerMintRequestTest(unittest.TestCase):
         )
         self.assertEqual("application/json", seen["content_type"])
         self.assertIn("RESET=ghs_minted", proc.stdout)
+
+    def test_the_ids_come_from_the_environment_when_it_sets_them(self):
+        seen, _ = self._mint(
+            'mint_ledger_token "unit-under-test"',
+            ids={"EVAL_LEDGER_APP_ID": "424242", "EVAL_LEDGER_INSTALLATION_ID": "515151"},
+        )
+        self.assertIn("/app/installations/515151/access_tokens", seen["url"])
+
+    def test_the_ids_default_to_the_ledger_reader_app(self):
+        """Step 0 (hack/ci-revalidate.sh) exports neither id and calls the
+        module with a body alone, so what it mints with is the module's own
+        default -- which test_verify_ci_pool_project holds to the verifier's
+        and the harness's copies. mint_ledger_token itself logs the exported
+        ids, so the step-0 shape is the module through _ledger_token_mint."""
+        seen, _ = self._mint(
+            'LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint >/dev/null', ids={}
+        )
+        self.assertIn("/app/installations/157029058/access_tokens", seen["url"])
 
     def test_a_bodiless_mint_is_refused_rather_than_sent(self):
         # The endpoint's contract: no body, the installation's whole grant --
