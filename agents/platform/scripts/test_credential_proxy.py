@@ -3812,12 +3812,31 @@ class CommandExecutorTest(unittest.TestCase):
 
         threading.Thread(target=hang_up, daemon=True).start()
         started = time.monotonic()
-        with self.assertRaises(credential_proxy.CallerHungUp):
+        with self.assertRaises(credential_proxy.CallerHungUp) as raised:
             with executor.request_slot(caller=ours):
                 self.fail("a slot was granted to a caller that had gone")
 
         # Back before the slot would have freed.
         self.assertLess(time.monotonic() - started, 2.5)
+        self.assertEqual("the caller disconnected while queued for a slot", str(raised.exception))
+
+    def test_a_slot_less_reserver_that_hangs_up_is_named_as_queued_for_the_budget(self):
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=2)
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.3)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        with self.assertRaises(credential_proxy.CallerHungUp) as raised:
+            with executor.reserve_child_memory(caller=ours):
+                self.fail("a reservation was granted to a caller that had gone")
+        self.assertEqual(
+            "the caller disconnected while queued for the memory budget", str(raised.exception)
+        )
 
     def test_unexpected_bytes_from_the_caller_are_not_taken_for_a_hang_up(self):
         # After the request body nothing more is expected, but a peer that
@@ -6048,6 +6067,10 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         second.join(5)
         self.assertFalse(second.is_alive())
         self.assertIsInstance(second_results[0], credential_proxy.CallerHungUp)
+        self.assertEqual(
+            "the caller disconnected while waiting for a refresh already in flight",
+            str(second_results[0]),
+        )
         self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
         finish.set()
         first.join(5)
@@ -6146,13 +6169,15 @@ class ForgeRefreshRouteTest(unittest.TestCase):
         self.assertIn("child memory budget", payload["error"])
 
     def test_a_caller_that_hangs_up_while_queued_gets_no_response(self):
+        why = "the caller disconnected while waiting for a refresh already in flight"
+
         def gone(provider, repository, caller=None):
-            raise credential_proxy.CallerHungUp("the caller disconnected while queued for a slot")
+            raise credential_proxy.CallerHungUp(why)
 
         with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
             replies = self._post({"repository": "gke-agentic/infra"}, refresh_forge_credential=gone)
         self.assertEqual([], replies)
-        self.assertTrue(any("abandoned" in line for line in logs.output), logs.output)
+        self.assertTrue(any("abandoned: " + why in line for line in logs.output), logs.output)
 
 
 class RedactCredentialsTest(unittest.TestCase):

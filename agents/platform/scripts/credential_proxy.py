@@ -4954,7 +4954,13 @@ class CommandExecutor:
                         raise CommandSlotUnavailable(self._refusal_text(takes_slot))
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        raise CallerHungUp("the caller disconnected while queued for a slot")
+                        held_by_slots = takes_slot and (
+                            saw_slots_full or self.children_budget_bytes is None
+                        )
+                        raise CallerHungUp(
+                            "the caller disconnected while queued for "
+                            + ("a slot" if held_by_slots else "the memory budget")
+                        )
                 if takes_slot:
                     self._slots_in_use += 1
                 reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
@@ -5474,7 +5480,7 @@ class CommandExecutor:
                 )
             running.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
             if caller is not None and _caller_has_gone(caller):
-                raise CallerHungUp("the caller disconnected while waiting for a credential refresh")
+                raise CallerHungUp("the caller disconnected while waiting for a refresh already in flight")
 
     @contextlib.contextmanager
     def _holding_refresh_lock(
@@ -5496,7 +5502,7 @@ class CommandExecutor:
                         f"{COMMAND_SLOT_WAIT_SECONDS}s for another refresh to finish; retry shortly"
                     )
                 if caller is not None and _caller_has_gone(caller):
-                    raise CallerHungUp("the caller disconnected while waiting for a credential refresh")
+                    raise CallerHungUp("the caller disconnected while waiting for a refresh already in flight")
         try:
             yield
         finally:
@@ -8026,14 +8032,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             self.executor.refresh_forge_credential(
                 forge.name, repository, caller=getattr(self, "connection", None)
             )
-        except CallerHungUp:
+        except CallerHungUp as exc:
             # Queued for admission -- the child memory budget, or a refresh
             # already in flight -- and gone before the helper ran: nothing to
-            # answer, as on the exec route.
+            # answer, as on the exec route. The exception names the wait.
             LOGGER.info(
-                "%s credential refresh abandoned: the caller disconnected while queued "
-                "for admission; the helper was not started",
+                "%s credential refresh abandoned: %s; the helper was not started",
                 forge.name,
+                exc,
             )
             return
         except CommandSlotUnavailable as exc:
