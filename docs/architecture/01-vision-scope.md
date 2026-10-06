@@ -70,11 +70,11 @@ assume more of the presentation layer as trust, safety, and coverage grow.
 The audience model is three layers, each served by a dedicated agent persona whose scope maps onto
 a level of the containment hierarchy (scope → cluster → namespace, the scope being one or more projects):
 
-| Layer                | Agent persona            | Cardinality                        | User                   | Scope of action                                                                                                                                            |
-| -------------------- | ------------------------ | ---------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Scope / fleet**    | **Platform Agent**       | 1 per scope (one or more projects) | Platform teams         | Fleet lifecycle, cluster provisioning, cross-cluster governance, global RBAC & policy, cost/capacity, compliance audits.                                   |
-| **Cluster**          | **Cluster Admin Agent**  | 1 per cluster                      | Cluster administrators | Cluster-level operations: node pools, cluster add-ons, namespace/tenant provisioning within the cluster, cluster-scoped policy and quotas.                 |
-| **Namespace / team** | **Developer Team Agent** | 1 per namespace                    | Developer teams        | Self-service within a single namespace: workload onboarding, scaling, troubleshooting, observability — constrained by the boundaries the layers above set. |
+| Layer                | Agent persona            | Cardinality                                         | User                   | Scope of action                                                                                                                                            |
+| -------------------- | ------------------------ | --------------------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Scope / fleet**    | **Platform Agent**       | 1 per install, over a scope of one or more projects | Platform teams         | Fleet lifecycle, cluster provisioning, cross-cluster governance, global RBAC & policy, cost/capacity, compliance audits.                                   |
+| **Cluster**          | **Cluster Admin Agent**  | 1 per cluster                                       | Cluster administrators | Cluster-level operations: node pools, cluster add-ons, namespace/tenant provisioning within the cluster, cluster-scoped policy and quotas.                 |
+| **Namespace / team** | **Developer Team Agent** | 1 per namespace                                     | Developer teams        | Self-service within a single namespace: workload onboarding, scaling, troubleshooting, observability — constrained by the boundaries the layers above set. |
 
 **SRE is a cross-cutting concern, not a persona.** Reliability work — incident response, capacity
 planning, observability, rollout safety — appears as critical user journeys at every layer, scoped
@@ -118,7 +118,7 @@ Portability is a design constraint, not a current feature. See the delta and its
 
 - Establish intent-driven, agent-mediated operations as the primary interface to a K8s fleet.
 - Serve platform, cluster-admin, and developer-team users as three distinct, layered personas
-  (1 per scope, one or more projects / 1 per cluster / 1 per namespace) with enforced containment boundaries.
+  (1 per install over a scope of one or more projects / 1 per cluster / 1 per namespace) with enforced containment boundaries.
 - Keep all infrastructure mutation declarative, reviewable, and auditable.
 - Make proactive detection and remediation of fleet drift a first-class behavior.
 - Keep core concepts cloud-agnostic even while GKE is the first supported target.

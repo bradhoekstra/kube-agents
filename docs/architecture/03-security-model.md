@@ -105,7 +105,7 @@ is not narrowed per requester; access is instead limited to trusted humans (§4a
 down-scoping to the requesting human is deferred hardening (§4a, [08](08-agent-runtime-and-identity.md)
 §5).
 
-Exactly **one agent runs per scope** — 1 Platform Agent per **declared scope** (one project by default), 1 Cluster Admin Agent per
+Exactly **one agent runs per scope** — 1 Platform Agent per **install** (over a declared scope of one or more projects), 1 Cluster Admin Agent per
 **cluster**, 1 Developer Team Agent per **namespace** — and each is read-only within **exactly its own
 level**:
 

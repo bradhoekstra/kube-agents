@@ -13,7 +13,7 @@
 ## TL;DR
 
 `kube-agents` defines **three agent personas**, one per level of the Kubernetes containment
-hierarchy: the **Platform Agent** (1 per scope, one or more projects), the **Cluster Admin Agent** (1 per cluster), and
+hierarchy: the **Platform Agent** (1 per install, over a scope of one or more projects), the **Cluster Admin Agent** (1 per cluster), and
 the **Developer Team Agent** (1 per namespace). Each persona shares a common anatomy — a `SOUL.md`
 identity, a config, a scoped skill set, memory, event triggers with a heartbeat backstop, and a
 controller-reconciled pod — but differs in **scope, authority, skills, and permissions**.
@@ -28,7 +28,7 @@ This is the end-state roster; the Platform Agent exists today, the other two are
 
 | Persona                  | Scope                                      | Cardinality     | Owns / governs                                                               | Bounded by                                         |
 | ------------------------ | ------------------------------------------ | --------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
-| **Platform Agent**       | GCP/cloud **scope** (one or more projects) | 1 per scope     | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
+| **Platform Agent**       | GCP/cloud **scope** (one or more projects) | 1 per install   | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
 | **Cluster Admin Agent**  | A single **cluster**                       | 1 per cluster   | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents    | Platform Agent policy + project guardrails         |
 | **Developer Team Agent** | A single **namespace**                     | 1 per namespace | Workloads within its namespace                                               | Cluster Admin policy + cluster/project guardrails  |
 
@@ -266,7 +266,7 @@ for a delegation too, and the child task's envelope names the target and the sam
 
 ## 3. Persona: Platform Agent (scope)
 
-**Cardinality:** 1 per scope — one project by default, otherwise the projects `spec.scope` resolves to. **Exists today** (`agents/platform/`).
+**Cardinality:** 1 per install, whatever its scope declares — one project by default, otherwise the projects `spec.scope` resolves to; what scales with the fleet is the Cluster Agent profile, one per cluster. **Exists today** (`agents/platform/`).
 
 ### Role
 
@@ -359,7 +359,7 @@ The three personas form a **cascade** that mirrors containment: each layer owns 
 the layer beneath it.
 
 ```
-Platform Agent  (1 / scope)
+Platform Agent  (1 / install, over a scope of 1+ projects)
    └─ owns lifecycle of →  Cluster Admin Agent  (1 / cluster)
                               └─ owns lifecycle of →  Developer Team Agent  (1 / namespace)
 ```
@@ -481,7 +481,7 @@ the platform-tier instance ([07](07-implementation-roadmap.md)).
 
 A harness confirms this doc's design with:
 
-- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per scope** (one `PlatformAgent` per management cluster, whatever its scope declares);
+- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per install** (one `PlatformAgent` per management cluster, whatever its scope declares);
   `-l kube-agents/tier=cluster-admin` exactly **1 per cluster**; `-l kube-agents/tier=developer-team`
   exactly **1 per namespace**. A second `Agent` CR for the same `(tier, scope)` is **rejected by the
   controller's cardinality webhook**.

@@ -50,7 +50,7 @@ project" and "cannot read or reach another project"; `03-security-model.md:114` 
 under what it is forbidden to touch; `06-api-and-data-contracts.md:82` keyed the `platform` tier on a
 single `projectId`. Single-project was the documented end-state, so this was a scope change to the
 architecture, not a gap in the implementation of it; §9 records the edit, and the pages now read "one
-per declared scope".
+per install, over a scope of one or more projects".
 
 The cost today is that an organisation with clusters in several projects installs kube-agents
 several times: one management cluster, one operator, one Pub/Sub topic, one chat front door per
@@ -553,7 +553,7 @@ folder-level aggregated sink can replace N per-project sinks, and that is its ow
 
 The architecture documents move from "its one project" to "its declared scope":
 
-- `01-vision-scope.md:75` and `:121`: cardinality becomes "1 per scope (one or more projects)".
+- `01-vision-scope.md:75` and `:121`: cardinality becomes "1 per install, over a scope of one or more projects".
 - `02-agent-personas.md:16`, `:31`, `:262`, `:280-282`, `:477`: the persona is scoped to the projects
   in `spec.scope`, and the containment sentence becomes "it cannot read or reach a project outside
   its declared scope".
