@@ -3,13 +3,17 @@
 The ``tool_call_audit`` plugin and the ``chat_message_audit`` hook build their
 records with ``audit_schema.envelope`` and hand them to :func:`emit`, which
 appends one JSON object per line to a file under the profile's ``logs/``
-directory that nothing else writes. The fluent-bit sidecar in the gateway pod
+directory. The fluent-bit sidecar in the gateway pod
 tails that file with its JSON parser (``buildFluentBitConfigMap`` in the
 operator), so the record's keys reach Cloud Logging as ``jsonPayload`` fields
 without a regex over anything Hermes wrote. The emitters used to log the
 record through Hermes' logger and the sidecar lifted the object back out of
 the formatted line by its prefix — a prefix that was Hermes' to change, and
-that any logger writing untrusted text could have imitated.
+that any logger writing untrusted text could have imitated. Closing that route
+leaves the file itself as the boundary: any process under the agent's uid with a
+path to the profile's ``logs/`` can append a line the sidecar ships as a record,
+which is the volume's boundary, not this sink's (the operator's
+``buildFluentBitConfigMap`` says the same).
 
 Which profile's file: the one the record is emitted under.
 ``hermes_constants.get_hermes_home()`` is how the running Hermes names it —
