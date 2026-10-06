@@ -171,6 +171,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	if !refused[limitPath.String()] && limit.CmpInt64(floor) < 0 {
 		errs = append(errs, field.Invalid(limitPath, limit.String(),
 			fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), floor/bytesPerMiB, credentialProxyMinimumAdmittedRequests)))
+		refused[limitPath.String()] = true
 	}
 
 	for _, name := range sortedResourceNames(merged.Requests) {

@@ -25,8 +25,10 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 )
 
 func proxyResourcesAgent(override *corev1.ResourceRequirements) *agentv1alpha1.PlatformAgent {
@@ -68,6 +70,25 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testi
 	for _, want := range []string{"a 512Mi memory limit is under the 672Mi floor at which the budget admits 2 commands", "turns the budget off and admits by the slot cap alone"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message %q does not say %q", msg, want)
+		}
+	}
+}
+
+// A limit under the floor is refused once. It also sits under the default
+// 512Mi request and, against the default 1 CPU, outside the Autopilot band;
+// neither restates it, because raising requests.memory cannot make it valid
+// and the band warning is advice about a quantity already refused.
+func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
+	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
+	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("400Mi")},
+	}).Spec.Deployment, path)
+	if len(errs) != 1 || errs[0].Field != "spec.deployment.credentialProxy.resources.limits.memory" || !strings.Contains(errs[0].Detail, "672Mi floor") {
+		t.Errorf("expected the floor refusal alone, got %v", errs)
+	}
+	for _, w := range warnings {
+		if strings.Contains(w, "resources.limits") {
+			t.Errorf("the refused limit drew a band warning: %q", w)
 		}
 	}
 }
