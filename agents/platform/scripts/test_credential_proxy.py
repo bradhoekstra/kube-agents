@@ -2831,6 +2831,10 @@ class ChildMemoryBudgetDerivationTest(unittest.TestCase):
         self.assertEqual(128 * mib, credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES)
         self.assertEqual(6, credential_proxy.OUTPUT_COPIES_PER_COMMAND)
         self.assertEqual("CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES", credential_proxy.ENV_MEMORY_LIMIT_BYTES)
+        self.assertEqual(1024 * 1024, mib)
+        self.assertEqual("/sys/fs/cgroup/memory.max", credential_proxy.CGROUP_MEMORY_MAX_PATH)
+        self.assertEqual("max", credential_proxy.CGROUP_NO_LIMIT)
+        self.assertEqual(2, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
 
 
 class CommandExecutorTest(unittest.TestCase):
@@ -4100,6 +4104,40 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
         release.set()
 
+    def test_four_requests_fit_at_the_defaults_and_a_fifth_waits(self):
+        # Design §2.2: a 1024 MiB limit and an 8 MiB output cap leave 704 MiB
+        # for children, four requests of 128 + 6 x 8 MiB. Without the
+        # slots-in-use output term a fifth would fit (5 x 128 = 640 <= 704).
+        mib = credential_proxy.MEBIBYTE
+        executor = self.executor(
+            memory_limit_bytes=1024 * mib, max_output_bytes=8 * mib, max_concurrent_commands=8
+        )
+        self.assertEqual(4, executor.requests_the_budget_admits())
+        release = threading.Event()
+        held = []
+
+        def hold():
+            with executor.request_slot():
+                held.append(1)
+                release.wait(5)
+
+        threads = [threading.Thread(target=hold) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+            self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        deadline = time.monotonic() + 5
+        while len(held) < 4 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(4, executor.slots_in_use)
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with executor.request_slot():
+                    self.fail("a fifth request was admitted at the defaults")
+        self.assertIn("memory budget", str(raised.exception))
+        release.set()
+
     def test_a_wait_for_the_budget_is_logged(self):
         executor = self.budgeted(admits=1)
         self.hold_a_slot(executor, seconds=2)
@@ -4338,9 +4376,12 @@ class CommandExecutorTest(unittest.TestCase):
         executor = self.budgeted(admits=1)
         with executor.request_slot():
             self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
-            started = time.monotonic()
-            result = executor.execute_internal(["/bin/echo", "inside"])
-            self.assertLess(time.monotonic() - started, 0.5)
+            with mock.patch.object(
+                executor,
+                "reserve_child_memory",
+                side_effect=AssertionError("a second reservation was taken"),
+            ):
+                result = executor.execute_internal(["/bin/echo", "inside"])
             self.assertEqual("inside\n", result.stdout)
             self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
 
@@ -4351,13 +4392,16 @@ class CommandExecutorTest(unittest.TestCase):
         # must neither wait for the budget nor count against it.
         with mock.patch.dict(os.environ, {"CREDENTIAL_PROXY_CONTENT_WORKSPACE": "1"}):
             executor = self.budgeted(admits=1)
-        self.hold_a_slot(executor, seconds=1)
+        self.hold_a_slot(executor, seconds=3)
         tree = executor.content_workspace_root / "t"
         tree.mkdir(parents=True)
-        started = time.monotonic()
-        result = executor.execute_workspace_git(["git", "check-ref-format", "refs/heads/main"], cwd=tree)
+        with mock.patch.object(
+            executor,
+            "reserve_child_memory",
+            side_effect=AssertionError("the content workspace's git took a reservation"),
+        ):
+            result = executor.execute_workspace_git(["git", "check-ref-format", "refs/heads/main"], cwd=tree)
         self.assertEqual(0, result.exit_code, result.stderr)
-        self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
 
     def test_the_fixed_workspace_term_is_subtracted_with_no_workspace_open(self):
