@@ -123,6 +123,11 @@ _PROXY_CPU_REQUEST_MILLIS = 500
 _PROXY_CPU_LIMIT_MILLIS = 1000
 _PROXY_OVERRIDE_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _PROXY_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+# The operator renders no ephemeral-storage request on the proxy, so the API server sets it
+# to the limit: footprint.yaml's 2Gi request is that defaulting, and it follows an override
+# of the limit alone.
+_PROXY_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
+_PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
 
 
@@ -241,6 +246,26 @@ class PreflightDecisionTest(unittest.TestCase):
         # A request the override does not name keeps the footprint's, not the new limit.
         self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
         self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
+
+    def test_credential_proxy_ephemeral_limit_alone_moves_the_request_with_it(self) -> None:
+        """An override of limits.ephemeral-storage alone is counted as a request of the same size.
+
+        The operator renders no ephemeral-storage request, so the API server defaults it to
+        the limit; counting the footprint's 2Gi against a 10Gi limit passes a quota with 2
+        to 10Gi of request headroom that then refuses the pod.
+        """
+        base = self._requirements()
+        raised = self._requirements([f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"])
+        moved = _PROXY_OVERRIDE_EPHEMERAL_LIMIT_BYTES - _PROXY_EPHEMERAL_LIMIT_BYTES
+        self.assertEqual(raised["limitsEphemeral"] - base["limitsEphemeral"], moved)
+        self.assertEqual(raised["requestsEphemeral"] - base["requestsEphemeral"], moved)
+        # An explicit request still wins over the defaulting.
+        explicit = self._requirements([
+            f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi",
+            f"{_PROXY_VALUE}.requests.ephemeral-storage=4Gi",
+        ])
+        self.assertEqual(explicit["requestsEphemeral"] - base["requestsEphemeral"],
+                         4 * 1024**3 - _PROXY_EPHEMERAL_LIMIT_BYTES)
 
     def test_credential_proxy_null_override_key_keeps_the_default(self) -> None:
         # `memory: null` is how a values file drops a key; it means "not set", as on the CR.

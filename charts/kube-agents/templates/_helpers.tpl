@@ -1092,12 +1092,18 @@ a Go template cannot catch the error `lookup` raises.
 The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
 merged over it, per key, as resolveCredentialProxyResources does in the operator
 (k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
-carries replaces that number, a key it omits keeps footprint.yaml's. A request the override
-omits keeps the default request rather than falling back to the override's limit, which is
-how kube-agents.workloadResources reads a chart workload and why that helper is not reused
-here -- the operator renders the default request, so that is what the pod asks for.
-Takes (dict "workload" <footprint entry> "override" <resources block>) and returns the
-entry's six numbers and pod count as JSON.
+carries replaces that number, a key it omits keeps footprint.yaml's -- with one exception
+that follows the API server rather than the operator. The operator renders a CPU and a
+memory request explicitly, so an override that raises only the limit leaves the request where
+the operator put it. It renders no ephemeral-storage request at all: the 2Gi request in
+footprint.yaml is the API server defaulting an absent request to the limit
+(scripts/generate_chart_footprint.py models the same rule), and that defaulting follows the
+override's limit, so `limits: {ephemeral-storage: 10Gi}` alone is a 10Gi request too. Summing
+it at 2Gi would pass a quota the pod is then refused on. kube-agents.workloadResources
+applies the request-follows-limit rule to every key, which is right for a chart workload
+whose requests the values own and wrong for the two the operator renders, so it is not
+reused here. Takes (dict "workload" <footprint entry> "override" <resources block>) and
+returns the entry's six numbers and pod count as JSON.
 */}}
 {{- define "kube-agents.credentialProxyFootprint" -}}
 {{- $workload := .workload | default dict -}}
@@ -1124,11 +1130,13 @@ entry's six numbers and pod count as JSON.
 {{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "memory") "fallback" "") -}}
 {{- $memLim = include "kube-agents.parseBytes" . | int64 -}}
 {{- end -}}
-{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
-{{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
-{{- end -}}
 {{- with include "kube-agents.declaredQuantity" (dict "value" (index $lim "ephemeral-storage") "fallback" "") -}}
 {{- $ephLim = include "kube-agents.parseBytes" . | int64 -}}
+{{- /* No operator-rendered request to keep: the API server sets it to this limit. */ -}}
+{{- $ephReq = $ephLim -}}
+{{- end -}}
+{{- with include "kube-agents.declaredQuantity" (dict "value" (index $req "ephemeral-storage") "fallback" "") -}}
+{{- $ephReq = include "kube-agents.parseBytes" . | int64 -}}
 {{- end -}}
 {{- dict
       "cpuMillisRequest" $cpuReq "cpuMillisLimit" $cpuLim
