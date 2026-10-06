@@ -1568,7 +1568,7 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// hold it. credential_proxy.py reads a command's output as it streams,
 	// keeps at most the cap per stream and bounds the decoded text to the
 	// same size, so what the broker holds per in-flight request is about six
-	// times the cap, transiently: the two capped stream buffers, their decoded
+	// times the cap (credentialProxyOutputCopiesPerCommand), transiently: the two capped stream buffers, their decoded
 	// text, and the JSON body and its encoding (measured at 48 MiB per request
 	// against the 8 MiB cap for text, 37 MiB for bytes that are not UTF-8).
 	// A request holds its slot until its response is written, and concurrency
@@ -1586,12 +1586,11 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 	// the event watcher's informer caches, which stayed in the gateway Pod
 	// when #913 moved the proxy out, and the request is upstream's statement
 	// of what this pod holds with nothing in flight.
-	const copiesPerCommand = 6
 	inFlight, err := strconv.ParseInt(env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"], 10, 64)
 	if err != nil || inFlight < 1 {
 		t.Fatalf("proxy concurrency cap %q is not a positive integer", env["CREDENTIAL_PROXY_MAX_CONCURRENT_COMMANDS"])
 	}
-	burst := int64(capBytes) * copiesPerCommand * inFlight
+	burst := int64(capBytes) * credentialProxyOutputCopiesPerCommand * inFlight
 	steadyStateBytes := proxy.Resources.Requests.Memory().Value()
 	if steadyStateBytes == 0 {
 		t.Fatal("the proxy container declares no memory request, so the burst below has no resting footprint to add to")
