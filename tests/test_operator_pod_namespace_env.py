@@ -85,6 +85,17 @@ class OperatorNamespaceEnvTest(unittest.TestCase):
         self.assertIsNotNone(match, "operatorSelectorLabels is not defined in _helpers.tpl")
         rendered = match.group(1).replace("{{ .Chart.Name }}", yaml.safe_load(_CHART_YAML.read_text())["name"])
         self.assertIn(f"{label}: {value}", rendered)
+        pod_template = re.search(
+            r"\n\s*template:\s*\n\s*metadata:\s*\n\s*labels:\s*\n(?P<labels>.*?)\n\s*(?:annotations|spec):",
+            _OPERATOR_TEMPLATE.read_text(),
+            re.S,
+        )
+        self.assertIsNotNone(pod_template, f"{_OPERATOR_TEMPLATE} has no pod-template labels block")
+        self.assertIn(
+            "kube-agents.operatorSelectorLabels",
+            pod_template.group("labels"),
+            f"{_OPERATOR_TEMPLATE} pod-template labels no longer include the selector-labels helper the NetworkPolicy selects on",
+        )
 
 
 if __name__ == "__main__":
