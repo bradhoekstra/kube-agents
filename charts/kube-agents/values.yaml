@@ -772,7 +772,7 @@ platformAgent:
     # counts the override. The operator's webhook, where enabled, refuses a
     # memory limit below 672Mi (two commands at once) and a request above its
     # limit, and warns when memory per CPU leaves the 1 to 6.5 GiB per vCPU band
-    # Autopilot admits unchanged. On GKE Autopilot without bursting a container's
+    # Autopilot admits unchanged. On GKE Autopilot without bursting, a container's
     # limits follow its requests, so raise requests.memory alongside limits.memory
     # there.
     credentialProxy:
