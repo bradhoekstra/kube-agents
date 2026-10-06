@@ -934,8 +934,9 @@ type CredentialProxySpec struct {
 	// pair and on the limits pair, leaves the band GKE Autopilot admits
 	// unchanged: on the requests pair, that Autopilot raises the smaller request
 	// into the band; on the limits pair, that Autopilot without bursting sets
-	// the limits equal to the requests, so a limits-only override does not take
-	// effect there and requests.memory is the field to raise. With bursting the
+	// the limits equal to the requests, so a limit raised without its request
+	// takes no effect there and the warning names the request to raise, and a
+	// limit lowered without its request follows that request. With bursting the
 	// declared limits stand.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`

@@ -536,9 +536,10 @@ enabled, refuses the same override at apply. It warns when memory per CPU, on
 the requests pair and on the limits pair, leaves the 1 to 6.5 GiB per vCPU band
 Autopilot admits unchanged: on the requests pair, that Autopilot raises the
 smaller request into the band; on the limits pair, that Autopilot without
-bursting sets the limits equal to the requests, so a limits-only override does
-not take effect there and `requests.memory` is the field to raise. With bursting
-the declared limits stand. The quota preflight counts the override. On an
+bursting sets the limits equal to the requests, so a limit raised without its
+request takes no effect there (the warning names the request to raise) and one
+lowered without its request follows the request. With bursting the declared
+limits stand. The quota preflight counts the override. On an
 existing install, apply the chart's `crds/` before setting the value (`helm
 upgrade` does not, `upgrade.sh` does): against a CRD that predates
 `spec.deployment.credentialProxy`, the API server would prune the value silently

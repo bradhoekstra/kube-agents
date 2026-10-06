@@ -178,13 +178,68 @@ func TestCredentialProxyMemoryPerCPUOutsideTheAutopilotBandWarns(t *testing.T) {
 	if len(warnings) != 1 {
 		t.Fatalf("expected one warning, got %v", warnings)
 	}
-	for _, want := range []string{"spec.deployment.credentialProxy.resources.limits", "8.00 GiB per vCPU", "1 to 6.5 GiB per vCPU", "sets the limits equal to the requests", "raise requests.memory", "with bursting the declared limits stand"} {
+	for _, want := range []string{"spec.deployment.credentialProxy.resources.limits", "8.00 GiB per vCPU", "1 to 6.5 GiB per vCPU", "sets the limits equal to the requests", "limits.memory has no effect there (raise requests.memory instead)", "with bursting the declared limits stand"} {
 		if !strings.Contains(warnings[0], want) {
 			t.Errorf("warning %q does not say %q", warnings[0], want)
 		}
 	}
 	if strings.Contains(warnings[0], "raises the smaller side") {
 		t.Errorf("limits-pair warning %q describes the requests resize", warnings[0])
+	}
+	if strings.Contains(warnings[0], "requests.cpu") {
+		t.Errorf("limits-pair warning %q names requests.cpu for a memory-only override", warnings[0])
+	}
+}
+
+// limitsBandWarning admits override and returns its one warning, which must be
+// on the limits pair.
+func limitsBandWarning(t *testing.T, override *corev1.ResourceRequirements) string {
+	t.Helper()
+	val := &PlatformAgentCustomValidator{}
+	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(override))
+	if err != nil {
+		t.Fatalf("an out-of-band ratio must warn, not refuse: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "spec.deployment.credentialProxy.resources.limits") {
+		t.Fatalf("expected one warning on the limits pair, got %v", warnings)
+	}
+	return warnings[0]
+}
+
+// A CPU-only limits override names the CPU request, not the memory one.
+func TestCredentialProxyLimitsBandWarningNamesTheCPURequestForACPUOverride(t *testing.T) {
+	warning := limitsBandWarning(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("4")},
+	})
+	if !strings.Contains(warning, "limits.cpu has no effect there (raise requests.cpu instead)") {
+		t.Errorf("warning %q does not name requests.cpu", warning)
+	}
+	if strings.Contains(warning, "requests.memory") {
+		t.Errorf("warning %q names requests.memory for a CPU-only override", warning)
+	}
+}
+
+// Both limits raised without either request: both requests are named.
+func TestCredentialProxyLimitsBandWarningNamesBothRequestsWhenBothLimitsAreRaised(t *testing.T) {
+	warning := limitsBandWarning(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("16Gi")},
+	})
+	if !strings.Contains(warning, "limits.cpu and limits.memory have no effect there (raise requests.cpu and requests.memory instead)") {
+		t.Errorf("warning %q does not name both requests", warning)
+	}
+}
+
+// A lowered limit is not one to raise a request for: without bursting the
+// request replaces it.
+func TestCredentialProxyLimitsBandWarningSaysALoweredLimitFollowsTheRequest(t *testing.T) {
+	warning := limitsBandWarning(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("768Mi")},
+	})
+	if !strings.Contains(warning, "limits.memory follows requests.memory there rather than the value set here") {
+		t.Errorf("warning %q does not say the lowered limit follows the request", warning)
+	}
+	if strings.Contains(warning, "raise") {
+		t.Errorf("warning %q tells a lowered limit to raise something", warning)
 	}
 }
 
@@ -213,7 +268,8 @@ func TestCredentialProxyRequestPairOutsideTheAutopilotBandWarns(t *testing.T) {
 }
 
 // A memory limit of 1Gi against a 4-CPU limit is 0.25 GiB per vCPU, below
-// the band's lower edge; the smaller side Autopilot raises is then memory.
+// the band's lower edge. It is the limits pair, which Autopilot does not
+// resize: without bursting it sets the limits equal to the requests.
 func TestCredentialProxyBelowTheAutopilotBandWarns(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
