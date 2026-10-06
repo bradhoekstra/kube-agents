@@ -4176,6 +4176,28 @@ class CommandExecutorTest(unittest.TestCase):
             logs.output,
         )
 
+    def test_a_wait_behind_a_budget_held_head_is_logged_as_the_budget(self):
+        # Two slots of eight in use fill the budget: the head waits for it and
+        # the slot taker behind it never sees the slot cap full. Both are
+        # admitted on the one wake that frees the budget, and neither wait was
+        # for a slot.
+        executor = self.budgeted(admits=2)
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
+        self.hold_a_slot_until(executor, release)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_LOG_MS", 100), \
+             self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            head = self.queue_a_slot_taker(executor)
+            behind = self.queue_a_slot_taker(executor)
+            time.sleep(3 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+            release.set()
+            head.join(5)
+            behind.join(5)
+        waits = [line for line in logs.output if "request waited" in line]
+        self.assertEqual(2, len(waits), logs.output)
+        self.assertTrue(all("for memory budget" in line for line in waits), waits)
+        self.assertFalse(any("slots were busy" in line for line in waits), waits)
+
     def test_a_request_queued_behind_a_budget_held_head_is_refused_naming_the_budget(self):
         # Eight slots, one in use: the head waits for the budget, and the
         # request behind it never reaches the head. The slot cap held neither.

@@ -4932,10 +4932,11 @@ class CommandExecutor:
         queued_at = time.monotonic()
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         ticket = _AdmissionTicket(takes_slot)
-        # Set once this request reached the head of the queue with a slot free
-        # and the budget alone held it; the wait log uses it to name the bound
-        # that held the request.
-        blocked_by_budget = False
+        # Set if this slot-taking request ever found the slot cap full while it
+        # waited. The wait log names the slot cap only then; otherwise, with the
+        # budget on, what held it was the budget, directly or through the
+        # budget-held tickets ahead of it.
+        saw_slots_full = False
         with self._slot_condition:
             self._slot_queue.append(ticket)
             try:
@@ -4946,8 +4947,8 @@ class CommandExecutor:
                     slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
                     if eligible and slot_free and self._fits_budget(takes_slot):
                         break
-                    if eligible and slot_free:
-                        blocked_by_budget = True
+                    if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
+                        saw_slots_full = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise CommandSlotUnavailable(self._refusal_text(takes_slot))
@@ -4970,7 +4971,7 @@ class CommandExecutor:
             self._request_budget.reserved = True
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                if blocked_by_budget:
+                if self.children_budget_bytes is not None and not saw_slots_full:
                     with self._slot_condition:
                         in_use = self._budget_in_use_text()
                     LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
