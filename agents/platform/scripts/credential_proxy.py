@@ -4393,11 +4393,12 @@ class CommandExecutor:
             )
         else:
             LOGGER.info(
-                "child memory budget enabled limit=%dMiB children=%dMiB per_request=%dMiB "
-                "(admits %d requests at once beside the slot cap of %d)",
+                "child memory budget enabled limit=%dMiB children=%dMiB child_reserve=%dMiB "
+                "request_cost=%dMiB (admits %d requests at once beside the slot cap of %d)",
                 memory_limit_bytes // MEBIBYTE,
                 self.children_budget_bytes // MEBIBYTE,
                 REQUEST_CHILD_MEMORY_RESERVE_BYTES // MEBIBYTE,
+                self._request_cost_bytes(takes_slot=True) // MEBIBYTE,
                 self.requests_the_budget_admits(),
                 max_concurrent_commands,
             )
@@ -4699,51 +4700,135 @@ class CommandExecutor:
         end to end -- longer than the idle time Envoy allows the stream in
         front of the broker, which is sized against this one.
         """
+        with self._admit(takes_slot=True, caller=caller):
+            yield
+
+    @contextlib.contextmanager
+    def reserve_child_memory(self, caller: socket.socket | None = None) -> Iterator[None]:
+        """Hold a child memory reservation without a slot, for a route that
+        spawns but holds no output (the forge refresh, §2.1). Same queue, same
+        wait, same refusal and hang-up handling as `request_slot`."""
+        with self._admit(takes_slot=False, caller=caller):
+            yield
+
+    def _fits_budget(self, takes_slot: bool) -> bool:
+        """Whether one more request fits the child memory budget right now.
+
+        Called under `_slot_condition`. With the budget off, always. The
+        output term is charged for the slots that would be in use after this
+        admission, not for the cap, so two requests in flight are not billed
+        for eight. The degenerate case -- nothing admitted and this request
+        alone does not fit -- admits with a warning logged once per process:
+        otherwise a limit small enough to make the budget negative would
+        refuse every command forever, which is worse than the OOM it exists to
+        prevent (§2.3). The operator's sizing test keeps its own numbers off
+        this branch.
+        """
+        if self.children_budget_bytes is None:
+            return True
+        needed = (
+            self._reserved_bytes
+            + OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+            + self._request_cost_bytes(takes_slot)
+        )
+        if needed <= self.children_budget_bytes:
+            return True
+        if self._reserved_bytes == 0 and self._slots_in_use == 0:
+            if not self._budget_warned:
+                LOGGER.warning(
+                    "one request's cost of %d MiB exceeds the child memory budget of %d MiB "
+                    "(limit %d MiB); admitting it alone rather than refusing every command. "
+                    "Raise the container's memory limit.",
+                    needed // MEBIBYTE,
+                    self.children_budget_bytes // MEBIBYTE,
+                    (self.memory_limit_bytes or 0) // MEBIBYTE,
+                )
+                self._budget_warned = True
+            return True
+        return False
+
+    @contextlib.contextmanager
+    def _admit(self, takes_slot: bool, caller: socket.socket | None) -> Iterator[None]:
+        """Admit one request: a slot if `takes_slot`, and a child memory
+        reservation whenever the budget is on. One arrival-order queue for
+        both kinds, so a slot-less reserver is neither starved nor privileged."""
         queued_at = time.monotonic()
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         ticket = object()
+        # Set once this request reached the head of the queue with a slot free
+        # and the budget alone held it; the refusal and the wait log use it to
+        # name the bound that was hit.
+        blocked_by_budget = False
         with self._slot_condition:
             self._slot_queue.append(ticket)
             try:
-                while not (
-                    self._slot_queue[0] is ticket
-                    and self._slots_in_use < self.max_concurrent_commands
-                ):
+                while True:
+                    at_head = self._slot_queue[0] is ticket
+                    slot_free = (not takes_slot) or self._slots_in_use < self.max_concurrent_commands
+                    if at_head and slot_free and self._fits_budget(takes_slot):
+                        break
+                    if at_head and slot_free:
+                        blocked_by_budget = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        # Worded for the queue: slots may well have freed in
-                        # the meantime and gone to earlier arrivals, so "none
-                        # finished" would be false for a request that was
-                        # overtaken rather than starved.
+                        if takes_slot and not blocked_by_budget:
+                            # Worded for the queue: slots may well have freed in
+                            # the meantime and gone to earlier arrivals, so "none
+                            # finished" would be false for a request that was
+                            # overtaken rather than starved.
+                            raise CommandSlotUnavailable(
+                                f"the credential proxy is at its limit of "
+                                f"{self.max_concurrent_commands} concurrent commands and this "
+                                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                                f"free slot; retry shortly"
+                            )
                         raise CommandSlotUnavailable(
-                            f"the credential proxy is at its limit of "
-                            f"{self.max_concurrent_commands} concurrent commands and this "
-                            f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
-                            f"free slot; retry shortly"
+                            f"the credential proxy is at its child memory budget "
+                            f"({self._reserved_bytes // MEBIBYTE} MiB reserved of "
+                            f"{(self.children_budget_bytes or 0) // MEBIBYTE} MiB) and this request "
+                            f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
                         )
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
                         raise CallerHungUp("the caller disconnected while queued for a slot")
-                self._slots_in_use += 1
+                if takes_slot:
+                    self._slots_in_use += 1
+                reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
+                self._reserved_bytes += reserved
             finally:
                 # Admitted or leaving, the ticket comes out and the next in
                 # line is woken to look again.
                 self._slot_queue.remove(ticket)
                 self._slot_condition.notify_all()
-        self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+        previously_reserved = getattr(self._request_budget, "reserved", False)
         try:
+            if takes_slot:
+                self._request_budget.deadline = time.monotonic() + self.timeout_seconds
+            self._request_budget.reserved = True
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                LOGGER.info(
-                    "request waited %dms for a slot (all %d slots were busy)",
-                    waited_ms,
-                    self.max_concurrent_commands,
-                )
+                if blocked_by_budget:
+                    LOGGER.info(
+                        "request waited %dms for memory budget (%d MiB reserved of %d MiB)",
+                        waited_ms,
+                        self.reserved_bytes // MEBIBYTE,
+                        (self.children_budget_bytes or 0) // MEBIBYTE,
+                    )
+                else:
+                    LOGGER.info(
+                        "request waited %dms for a slot (all %d slots were busy)",
+                        waited_ms,
+                        self.max_concurrent_commands,
+                    )
             yield
         finally:
-            self._request_budget.deadline = None
+            self._request_budget.reserved = previously_reserved
+            if takes_slot:
+                self._request_budget.deadline = None
             with self._slot_condition:
-                self._slots_in_use -= 1
+                if takes_slot:
+                    self._slots_in_use -= 1
+                self._reserved_bytes -= reserved
                 self._slot_condition.notify_all()
 
     def bootstrap(self, command: str) -> None:

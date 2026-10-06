@@ -3993,6 +3993,150 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertGreater(waited_ms, 1000)
         self.assertLess(result.duration_ms, waited_ms / 2)
 
+    # ---- The child memory budget at admission (design §2.2, §2.3) ----------
+
+    def budgeted(self, admits, max_concurrent_commands=8, max_output_bytes=1024):
+        """An executor whose budget admits exactly `admits` slot-taking requests."""
+        per_request = (
+            credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            + credential_proxy.OUTPUT_COPIES_PER_COMMAND * max_output_bytes
+        )
+        limit = (
+            credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
+            + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
+            + admits * per_request
+        )
+        executor = self.executor(
+            max_concurrent_commands=max_concurrent_commands,
+            max_output_bytes=max_output_bytes,
+            memory_limit_bytes=limit,
+        )
+        self.assertEqual(admits, executor.requests_the_budget_admits())
+        return executor
+
+    def test_a_request_that_fits_a_slot_but_not_the_budget_waits(self):
+        # Eight slots, a budget for one: the second request waits for the
+        # first's reservation, not for a slot.
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=1)
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+
+        started = time.monotonic()
+        with executor.request_slot():
+            waited = time.monotonic() - started
+        self.assertGreaterEqual(waited, 0.5)
+        self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_request_still_waiting_at_the_bound_is_refused_naming_the_budget(self):
+        executor = self.budgeted(admits=1)
+        holder = self.hold_a_slot(executor, seconds=2)
+
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.2):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as raised:
+                with executor.request_slot():
+                    self.fail("admitted past the budget")
+        message = str(raised.exception)
+        self.assertIn("memory budget", message)
+        self.assertIn("128 MiB reserved", message)
+        self.assertNotIn("concurrent commands", message)
+        holder.join()
+        with executor.request_slot():
+            pass
+
+    def test_the_output_term_is_charged_for_slots_in_use_not_the_cap(self):
+        # Budget for exactly two requests at a 1 KiB cap; with the cap of
+        # eight charged up front nothing would fit at all.
+        executor = self.budgeted(admits=2, max_concurrent_commands=8)
+        release = threading.Event()
+        held = []
+
+        def hold():
+            with executor.request_slot():
+                held.append(1)
+                release.wait(5)
+
+        threads = [threading.Thread(target=hold) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+            self.addCleanup(thread.join)
+        self.addCleanup(release.set)
+        deadline = time.monotonic() + 5
+        while len(held) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(2, len(held), "two requests should fit the budget at once")
+        self.assertEqual(2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+        release.set()
+
+    def test_a_wait_for_the_budget_is_logged(self):
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=2)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_LOG_MS", 100):
+            with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                with executor.request_slot():
+                    pass
+        self.assertTrue(
+            any("for memory budget" in line and "128 MiB reserved of" in line for line in logs.output),
+            logs.output,
+        )
+
+    def test_a_request_too_large_for_an_empty_budget_is_admitted_with_one_warning(self):
+        # The degenerate case (§2.3): a limit so small that nothing fits must
+        # not refuse every command forever.
+        tiny = credential_proxy.BROKER_RESIDENT_RESERVE_BYTES + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES + 1
+        executor = self.executor(memory_limit_bytes=tiny)
+        self.assertEqual(0, executor.requests_the_budget_admits())
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            with executor.request_slot():
+                pass
+            with executor.request_slot():
+                pass
+        warnings = [line for line in logs.output if "exceeds the child memory budget" in line]
+        self.assertEqual(1, len(warnings), logs.output)
+
+    def test_a_slot_less_reservation_joins_the_same_queue(self):
+        # The forge refresh route reserves without a slot (§2.1); it waits in
+        # arrival order behind slot takers and is released with the block.
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=1)
+        started = time.monotonic()
+        with executor.reserve_child_memory():
+            self.assertTrue(getattr(executor._request_budget, "reserved", False))
+            self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+            self.assertEqual(0, executor.slots_in_use)
+            waited = time.monotonic() - started
+        self.assertGreaterEqual(waited, 0.5)
+        self.assertEqual(0, executor.reserved_bytes)
+        self.assertFalse(getattr(executor._request_budget, "reserved", False))
+
+    def test_a_reservation_is_released_when_the_block_raises(self):
+        executor = self.budgeted(admits=1)
+        with self.assertRaises(RuntimeError):
+            with executor.request_slot():
+                raise RuntimeError("the command blew up")
+        self.assertEqual(0, executor.reserved_bytes)
+        self.assertEqual(0, executor.slots_in_use)
+
+    def test_a_caller_that_hangs_up_while_queued_for_the_budget_is_dropped(self):
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=3)
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.3)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        started = time.monotonic()
+        with self.assertRaises(credential_proxy.CallerHungUp):
+            with executor.request_slot(caller=ours):
+                self.fail("admitted a caller that had hung up")
+
+        # Back before the reservation would have freed, holding nothing.
+        self.assertLess(time.monotonic() - started, 2.5)
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+        self.assertEqual(1, executor.slots_in_use)
+
     def test_an_emptied_group_gets_no_sigkill(self):
         # Once the group is seen empty its id is free for reuse, so the second
         # signal goes only to a group the grace ran out on. The sleep replaces
