@@ -157,11 +157,10 @@ _api_disabled_this_run: set[str] = set()
 # time; 240s at the default cap with few profiles) and kills it on expiry
 # with nothing written; two hanging projects listed in turn at LIST_TIMEOUT_SECONDS each
 # would already overrun it. Creates still run in the fixed order.
-# Sized for the default cap: the workers and the budget scale with the declared cap
-# (`_list_workers`, `_list_budget_seconds` below) so a run that may list twice the
-# projects keeps the same margin per project. The workers are at their ceiling from the
-# default cap, so it is the budget that grows with the cap; the bootstrap gate's ceiling
-# follows the budget.
+# Sized for the default cap. The workers are at their ceiling from the default cap
+# (`_list_workers`), so the budget alone grows with the declared cap, by
+# LIST_BUDGET_SECONDS per default cap's worth of projects (`_list_budget_seconds`); the
+# bootstrap gate's ceiling follows the budget.
 LIST_WORKERS = 8
 # Every lookup is a gcloud process the credential proxy runs, and the proxy admits
 # four requests at once under its child memory budget at the operator's default limit
@@ -230,14 +229,16 @@ _API_DISABLED_MARKERS = ("SERVICE_DISABLED", "accessNotConfigured", "API has not
 
 def _list_workers(cap: int) -> int:
     """Workers for the bounded lookups: LIST_WORKERS per default cap's worth of projects,
-    up to LIST_WORKERS_MAX, so the per-project margin holds as the cap grows."""
+    up to LIST_WORKERS_MAX. The two are equal, so this is the ceiling from the default cap
+    and a larger cap is met by the listing budget instead."""
     return max(LIST_WORKERS, min(LIST_WORKERS_MAX, -(-cap * LIST_WORKERS // RESOLVED_SET_CAP)))
 
 
 def _list_budget_seconds(cap: int) -> float:
     """The listing budget for a cap: LIST_BUDGET_SECONDS per round of projects-per-worker
-    the default cap needs, so it grows only once the workers have reached their ceiling.
-    The bootstrap gate's ceiling is this plus its settle time (bootstrap_scan_gate.py)."""
+    the default cap needs. The workers are at their ceiling from the default cap, so it
+    grows by LIST_BUDGET_SECONDS per default cap's worth of projects. The bootstrap gate's
+    ceiling is this plus its settle time (bootstrap_scan_gate.py)."""
     rounds_at_default = RESOLVED_SET_CAP / LIST_WORKERS
     rounds = cap / _list_workers(cap)
     return LIST_BUDGET_SECONDS * max(1, -(-rounds // rounds_at_default))
@@ -1452,7 +1453,8 @@ def reconcile(dry_run: bool = False) -> dict:
     # selectors together, one call each, and the naming of the monitored projects a Metrics
     # Scope returned by number; then the explicit and selector projects. Container members
     # arrive with their clusters, so no per-project listing follows for them (design §4).
-    # The cap the declaration carries sizes the run: the workers and the budget scale with it.
+    # The cap the declaration carries sizes the run's listing budget (the workers are at
+    # their ceiling from the default cap).
     cap = _cap_of(scope)
     workers = _list_workers(cap)
     list_budget = _list_budget_seconds(cap)

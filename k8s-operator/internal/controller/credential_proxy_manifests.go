@@ -121,10 +121,12 @@ const (
 	credentialProxyContainerName = "envoy-credential-proxy"
 	// credentialProxyMemoryLimitEnv carries the container's own memory limit
 	// in bytes to the broker, which derives its child memory budget from it
-	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef, so
-	// a limit moved by a CR field or a VPA is the limit the broker budgets
-	// against; in the base env list and so reserved in mergeCredentialProxyEnv,
-	// because a CR that could set it would detach the budget from the limit.
+	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef the
+	// broker reads once at start, so a limit changed by whatever recreates the
+	// pod (a later CR field, a VPA eviction) is the one it budgets against; an
+	// in-place resize is not seen until the next start. In the base env list
+	// and so reserved in mergeCredentialProxyEnv, because a CR that could set
+	// it would detach the budget from the limit.
 	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
 	// The child memory budget's terms, in bytes, as the broker declares them
 	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,

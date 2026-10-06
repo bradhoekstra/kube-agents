@@ -871,10 +871,10 @@ Consequences:
 - An exec command whose caller disconnects while it runs is ended rather than
   left to run to its deadline for nobody: `SIGTERM`, then `SIGKILL` two
   seconds later, to the whole process group it started. The same two-step end
-  applies at the deadline. On both the exec and vcs routes, a caller that
-  disconnects while queued for a slot is dropped without anything being
-  started; a vcs verb's own git commands, once started, run to completion
-  unwatched. Slots go in arrival order, so the caller refused after the wait
+  applies at the deadline. On the exec, vcs and forge refresh routes, a caller
+  that disconnects while queued for admission (a slot, the child memory budget,
+  or both) is dropped without anything being started; a vcs verb's own git commands, once started, run to completion
+  unwatched. Admission goes in arrival order, so the caller refused after the wait
   is the one that waited longest. Disconnecting means the peer closed for good
   (`POLLHUP` on the broker's Unix socket); a peer that only shut its writing
   half is still answered, and a broker spoken to over TCP, where a closed peer
