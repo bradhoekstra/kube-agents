@@ -874,9 +874,10 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 
 // reconcileInvalidCredentialProxyResources reconciles a CR whose
 // credential-proxy override the shared validation refuses, against an install
-// that already runs the proxy at the defaults, and asserts the operator's
-// refusal: Degraded with InvalidCredentialProxyResources, a Warning event that
-// names the field, and the running Deployment neither rewritten nor deleted.
+// whose running proxy Deployment is stale (an older image), and asserts the
+// operator's refusal: Degraded with InvalidCredentialProxyResources, a Warning
+// event that names the field, and the Deployment applied regardless, at the
+// operator's default resources, so the rest of what it carries keeps flowing.
 // The webhook is not in the loop, as on a chart install, which leaves it off.
 func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.ResourceRequirements, wantField string) {
 	t.Helper()
@@ -893,20 +894,14 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	atDefaults := agent.DeepCopy()
 	atDefaults.Spec.Deployment.CredentialProxy = nil
 	running := buildCredentialProxyDeployment(atDefaults, "policy-hash")
+	staleImage := "example.invalid/stale-credential-proxy:old"
+	running.Spec.Template.Spec.Containers[0].Image = staleImage
 
-	deploymentDeletes := 0
-	funcs := fakeServerSideApplyInterceptors()
-	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
-		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment && obj.GetName() == running.Name {
-			deploymentDeletes++
-		}
-		return cl.Delete(ctx, obj, opts...)
-	}
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(agent, shellSandboxKeysSecret(agent), running).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(funcs).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 	recorder := record.NewFakeRecorder(64)
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: recorder}
@@ -940,10 +935,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 
 	dep := &appsv1.Deployment{}
 	if err := cl.Get(ctx, client.ObjectKeyFromObject(running), dep); err != nil {
-		t.Fatalf("the running proxy Deployment is gone: %v", err)
-	}
-	if deploymentDeletes != 0 {
-		t.Errorf("the proxy Deployment was deleted %d time(s); an invalid override must leave it in place", deploymentDeletes)
+		t.Fatalf("the proxy Deployment is gone: %v", err)
 	}
 	var proxy *corev1.Container
 	for i := range dep.Spec.Template.Spec.Containers {
@@ -954,8 +946,22 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if proxy == nil {
 		t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
 	}
-	if !equality.Semantic.DeepEqual(proxy.Resources, resolveCredentialProxyResources(atDefaults.Spec.Deployment)) {
-		t.Errorf("the proxy container's resources changed to %v; the last valid rendering should keep serving", proxy.Resources)
+	if want := resolveCredentialProxyImage(agent.Spec.Deployment); proxy.Image != want || proxy.Image == staleImage {
+		t.Errorf("the proxy container's image = %q, want %q; a refused override must not stop the Deployment being applied", proxy.Image, want)
+	}
+	wantResources := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("500m"),
+			corev1.ResourceMemory: resource.MustParse("512Mi"),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse("1"),
+			corev1.ResourceMemory:           resource.MustParse("1Gi"),
+			corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
+		},
+	}
+	if !equality.Semantic.DeepEqual(proxy.Resources, wantResources) {
+		t.Errorf("the proxy container's resources = %v, want the operator's defaults %v; a refused override is ignored", proxy.Resources, wantResources)
 	}
 
 	close(recorder.Events)

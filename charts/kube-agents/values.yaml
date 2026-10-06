@@ -772,10 +772,11 @@ platformAgent:
     # counts the override. The operator refuses a memory limit below 672Mi (two
     # commands at once), a request above its limit, a negative quantity, a zero
     # limit and claims, whether or not its webhook is enabled: the reconciler
-    # leaves the proxy Deployment as last applied and reports Degraded, and the
-    # webhook, where enabled, refuses the override at apply. It warns when memory
-    # per CPU, on the requests pair and on the limits pair, leaves the 1 to 6.5
-    # GiB per vCPU band Autopilot admits unchanged: on the requests pair, that
+    # ignores the override, renders the proxy Deployment at its defaults and
+    # reports Degraded, and the webhook, where enabled, refuses the override at
+    # apply. It warns when memory per CPU, on the requests pair and on the
+    # limits pair, leaves the 1 to 6.5 GiB per vCPU band Autopilot admits
+    # unchanged: on the requests pair, that
     # Autopilot raises the smaller request into the band; on the limits pair,
     # that Autopilot without bursting sets the limits equal to the requests, so
     # a limits-only override does not take effect there and requests.memory is

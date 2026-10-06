@@ -1096,10 +1096,10 @@ spec:
                             are accepted, the quantities the container declares. The operator
                             refuses a memory limit below what admits two commands at once, a request
                             above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
-                            pod declares no resourceClaims. The reconciler leaves the proxy
-                            Deployment as last applied and sets Degraded whether or not the
-                            validating webhook is enabled, and the webhook, where it is, refuses the
-                            override at apply. The webhook warns when memory per CPU, on the requests
+                            pod declares no resourceClaims. The reconciler ignores a refused override,
+                            renders the proxy Deployment at the operator's defaults and sets Degraded
+                            whether or not the validating webhook is enabled, and the webhook, where
+                            it is, refuses the override at apply. The webhook warns when memory per CPU, on the requests
                             pair and on the limits pair, leaves the band GKE Autopilot admits
                             unchanged: on the requests pair, that Autopilot raises the smaller request
                             into the band; on the limits pair, that Autopilot without bursting sets

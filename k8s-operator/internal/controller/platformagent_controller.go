@@ -258,10 +258,10 @@ const (
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
 	// conditionReasonInvalidCredentialProxyResources: the CR's
 	// spec.deployment.credentialProxy.resources fails
-	// ValidateCredentialProxyResources, so the proxy Deployment is not
-	// written and one already running keeps its last valid rendering.
+	// ValidateCredentialProxyResources, so the override is ignored and the
+	// proxy Deployment is rendered at the operator's default resources.
 	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
-	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the credential-proxy Deployment is not written, so one already running keeps its last valid rendering, and none is created, until the override is corrected" // #nosec G101 -- Condition message, not a credential
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the override is ignored and the credential-proxy Deployment runs at the operator's default resources until it is corrected" // #nosec G101 -- Condition message, not a credential
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -2260,33 +2260,36 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// floor runs the broker with its budget off, and a request above its limit
 	// is refused by the API server as Invalid, which
 	// applyCredentialProxyDeployment reads as an immutable-field change and
-	// answers by deleting the running proxy. Refused, the Deployment is not
-	// written at all: one already running keeps its last valid rendering
-	// (and is not rolled for a Secret rotation meanwhile), and
-	// updateStatusReady reports the refusal as Degraded. The Service and the
-	// NetworkPolicy do not depend on the override and are still applied.
+	// answers by deleting the running proxy. Refused, the override is ignored
+	// rather than the Deployment withheld: the Deployment is rendered at the
+	// operator's default resources, so the image, the policy hash that rolls
+	// the pod for a pool-mapping change, the Secret env hash and the caller and
+	// egress env keep flowing, and updateStatusReady reports the refusal as
+	// Degraded.
 	refusal, warnings := credentialProxyResourcesRefusal(agent)
 	for _, warning := range warnings {
 		logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
 	}
+	rendered := agent
 	if refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is not written",
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is rendered at the operator's default resources",
 			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
 		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
-	} else {
-		// This pod, not the gateway, is where the Slack and Teams tokens and the
-		// model-provider keys are read out of a Secret as environment, so it needs
-		// the same digest — see platformagent_secret_hash.go. Stamping only the
-		// gateway would have left the credentials most likely to be rotated
-		// reaching a container that never restarts. (On a Slack-armed next
-		// install the Slack pair is read by the A2A gateway instead, which
-		// reconcileA2A stamps.)
-		proxy := buildCredentialProxyDeployment(agent, policyHash)
-		if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
-			return err
-		}
-		objs = append(objs, proxy)
+		rendered = agent.DeepCopy()
+		rendered.Spec.Deployment.CredentialProxy = nil
 	}
+	// This pod, not the gateway, is where the Slack and Teams tokens and the
+	// model-provider keys are read out of a Secret as environment, so it needs
+	// the same digest — see platformagent_secret_hash.go. Stamping only the
+	// gateway would have left the credentials most likely to be rotated
+	// reaching a container that never restarts. (On a Slack-armed next install
+	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
+	// stamps.)
+	proxy := buildCredentialProxyDeployment(rendered, policyHash)
+	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
+		return err
+	}
+	objs = append(objs, proxy)
 	objs = append(objs, credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
