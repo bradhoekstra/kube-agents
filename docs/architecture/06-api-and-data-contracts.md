@@ -211,14 +211,16 @@ gateway C14, [08](08-agent-runtime-and-identity.md) §3.)_
 
 **Handle grammar.** An agent's handle is its `<tier>-<scope>` name (`02` §6.1):
 
-| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)`                   |
-| ---------------- | -------------------------- | -------------------- | --------------------------------------------- |
-| `platform`       | `@platform-<project>`      | —                    | `(platform, management project)`, the install |
-| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`                    |
-| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`                        |
+| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)`                                                            |
+| ---------------- | -------------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| `platform`       | `@platform-<project>`      | —                    | `(platform, install)`, the management cluster; the handle names its management project |
+| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`                                                             |
+| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`                                                                 |
 
-The map is **derived** from the same `(tier, scope)` key the cardinality webhook enforces (§1.2) —
-no separate routing registry to maintain or drift.
+The map is **derived** from the same key the cardinality webhook enforces (§1.2: the install for the
+platform tier, `(tier, scope)` below it) — no separate routing registry to maintain or drift. The
+platform handle names the management project; a second install in the same project sets its own
+handle, as it sets its own account and release names.
 
 **Slash-command grammar.** `@kage /<handle> <text>` (e.g. `/cluster-bravo`, `/devteam-charlie`)
 dispatches directly to the named agent — constant-time, no inference. On Google Chat a slash command

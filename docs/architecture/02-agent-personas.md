@@ -227,8 +227,8 @@ last):
 **Handles are derived, not a registry.** An agent's handle is its `<tier>-<scope>` name (§6.1) —
 `@platform-<project>`, `@cluster-admin-<cluster>` (short alias `@cluster-<cluster>`), and
 `@developer-team-<namespace>` (short alias `@devteam-<namespace>`). Each handle maps
-deterministically to the unique `(tier, scope)` **`Agent` CR** the controller already keys
-cardinality on (§8), so there is no separate routing table to drift
+deterministically to the unique **`Agent` CR** the controller already keys cardinality on (§8: the
+install for the platform tier, `(tier, scope)` below it), so there is no separate routing table to drift
 ([06](06-api-and-data-contracts.md) §2b).
 
 **Precedence: deterministic over inference.** A slash command (1) or an explicit handle (2) always
@@ -266,7 +266,7 @@ for a delegation too, and the child task's envelope names the target and the sam
 
 ## 3. Persona: Platform Agent (scope)
 
-**Cardinality:** 1 per install, whatever its scope declares — one project by default, otherwise the projects `spec.scope` resolves to; what scales with the fleet is the Cluster Admin Agent, one per cluster (shipped today as the Cluster Agent profile). **Exists today** (`agents/platform/`).
+**Cardinality:** 1 per install (its management cluster), whatever its scope declares — one project by default, otherwise the projects `spec.scope` resolves to. **Exists today** (`agents/platform/`).
 
 ### Role
 
@@ -445,14 +445,14 @@ model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
 
 | `tier`           | Scope key fields                                                      | Identity scope                    | Chat entrypoint / handle (§2.4)         |
 | ---------------- | --------------------------------------------------------------------- | --------------------------------- | --------------------------------------- |
-| `platform`       | the install (its management project); `spec.scope` is its declaration | read across the projects in scope | Platform teams — `@platform-<project>`  |
+| `platform`       | the install (its management cluster); `spec.scope` is its declaration | read across the projects in scope | Platform teams — `@platform-<project>`  |
 | `cluster-admin`  | project + cluster                                                     | single cluster                    | Cluster admins — `@cluster-<cluster>`   |
 | `developer-team` | project + cluster + **namespace**                                     | single namespace                  | Developer team — `@devteam-<namespace>` |
 
 **Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
 default (read-only) permissions — otherwise identical, so a single `Agent` CRD expresses all three (one
 CR per persona) and the **thin** controller handles pod lifecycle/isolation/identity/sandbox +
-`(tier,scope)` cardinality (it references pre-created identity; it mints no RBAC). The three personas
+cardinality (the install for the platform tier, `(tier,scope)` below it; it references pre-created identity; it mints no RBAC). The three personas
 stay three at the **behavior** layer (`SOUL.md`, skills, scope). Migration: today's `PlatformAgent`
 CRD/operator is **generalized** into the `Agent` CRD + controller, and today's `PlatformAgent` becomes
 the platform-tier instance ([07](07-implementation-roadmap.md)).
