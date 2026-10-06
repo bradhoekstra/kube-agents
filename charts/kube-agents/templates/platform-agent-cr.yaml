@@ -215,8 +215,10 @@ spec:
       declare, a negative quantity, a zero limit, a memory limit under the
       floor, and a request above its limit. The defaults and the floor are
       kube-agents.credentialProxyDefaults and
-      kube-agents.credentialProxyMemoryFloorBytes. A quantity the parsers do not
-      read skips the comparisons it is in and is left to the CRD's pattern.
+      kube-agents.credentialProxyMemoryFloorBytes. A quantity outside the
+      CRD's grammar, or inside it in a form resource.ParseQuantity does not read
+      (a fractional exponent), fails the render naming the key: dropping it
+      would skip the checks above while the CRD admitted it.
     */}}
     {{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" }}
     {{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha }}
@@ -227,16 +229,15 @@ spec:
     {{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) }}
     {{- end }}
     {{- $proxyNames := list "cpu" "memory" "ephemeral-storage" }}
-    {{- /* The shapes kube-agents.parseCpuMillis and parseBytes read. A quantity
-           of another shape is dropped from the merged result, so it skips the
-           comparisons it would take part in rather than failing the parse. */}}
-    {{- $proxyQuantityPatterns := dict
-          "cpu" "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+|[munkMGTPE])?$"
-          "memory" "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+|m|[KMGTPE]i|[kMGTPE])?$"
-          "ephemeral-storage" "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+|m|[KMGTPE]i|[kMGTPE])?$" }}
+    {{- /* The CRD's quantity grammar, the sign already stripped, with the
+           exponent narrowed to the integer form resource.ParseQuantity reads.
+           kube-agents.normalizeQuantity rewrites `.5` and `1.` so that
+           parseCpuMillis and parseBytes read every form this admits. */}}
+    {{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" }}
     {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
+    {{- $proxyRendered := dict "requests" (dict) "limits" (dict) }}
     {{- range $side := list "requests" "limits" }}
       {{- range $name, $raw := index $proxyDefaults $side }}
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
@@ -251,22 +252,22 @@ spec:
         {{- if hasPrefix "-" $raw }}
         {{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) }}
         {{- end }}
-        {{- $raw = trimPrefix "+" $raw }}
-        {{- if regexMatch (index $proxyQuantityPatterns $name) $raw }}
-        {{- $_ := set (index $proxyMerged $side) $name $raw }}
-        {{- else }}
-        {{- $_ := unset (index $proxyMerged $side) $name }}
+        {{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) }}
+        {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) }}
         {{- end }}
+        {{- $_ := set (index $proxyMerged $side) $name $raw }}
+        {{- $_ := set (index $proxyRendered $side) $name $raw }}
       {{- end }}
     {{- end }}
     {{- if $proxyQuantities }}
     {{- $proxyParsed := dict "requests" (dict) "limits" (dict) }}
     {{- range $side, $set := $proxyMerged }}
       {{- range $name, $raw := $set }}
+        {{- $normal := include "kube-agents.normalizeQuantity" $raw }}
         {{- if eq $name "cpu" }}
-        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseCpuMillis" $raw | int64) }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseCpuMillis" $normal | int64) }}
         {{- else }}
-        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseBytes" $raw | int64) }}
+        {{- $_ := set (index $proxyParsed $side) $name (include "kube-agents.parseBytes" $normal | int64) }}
         {{- end }}
       {{- end }}
     {{- end }}
@@ -318,10 +319,11 @@ spec:
     {{- end }}
     credentialProxy:
       resources:
-        {{- range $side, $set := $proxyQuantities }}
+        {{- range $side := keys $proxyQuantities | sortAlpha }}
         {{ $side }}:
+          {{- $set := index $proxyRendered $side }}
           {{- range $name := keys $set | sortAlpha }}
-          {{ $name }}: {{ index $set $name | toString | quote }}
+          {{ $name }}: {{ index $set $name | quote }}
           {{- end }}
         {{- end }}
     {{- end }}

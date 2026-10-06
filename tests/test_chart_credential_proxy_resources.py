@@ -219,6 +219,33 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=672Mi"])
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "672Mi"}})
 
+    # The CRD's grammar admits `.5Gi`, `1.Gi` and `500n`, and resource.ParseQuantity
+    # reads them, so the render has to read them too: a form it dropped instead would
+    # skip the floor and pair checks and install Degraded.
+    def test_a_leading_dot_quantity_is_read_and_refused_by_the_floor(self):
+        err = self._render_error([f"{_VALUE_PATH}.limits.memory=.5Gi"])
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is .5Gi, under the 672Mi floor", err)
+
+    def test_a_trailing_dot_quantity_renders(self):
+        cr = self._render_cr(values=_proxy_values({"limits": {"memory": "1.Gi"}}))
+        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "1.Gi"}})
+
+    def test_a_nano_cpu_request_renders_as_the_crd_and_operator_read_it(self):
+        # 500n is a positive quantity under the default 1-core limit: the CRD admits
+        # it and the operator refuses nothing about it, so the render passes it on.
+        cr = self._render_cr(values=_proxy_values({"requests": {"cpu": "500n"}}))
+        self.assertEqual(_cr_resources(cr), {"requests": {"cpu": "500n"}})
+
+    def test_a_quantity_outside_the_grammar_fails_naming_the_key(self):
+        for value in ("abc", "1e.5", "2GB"):
+            err = self._render_error(values=_proxy_values({"limits": {"memory": value}}))
+            self.assertIn(f'{_VALUE_PATH}.limits.memory is "{value}", which is not a Kubernetes quantity', err)
+
+    def test_a_padded_quantity_renders_trimmed(self):
+        # The checks read the trimmed value; the CRD's anchored pattern refuses the padding.
+        cr = self._render_cr(values=_proxy_values({"limits": {"memory": " 2Gi"}}))
+        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "2Gi"}})
+
 
 class CrdGuardTest(unittest.TestCase):
     """`helm upgrade` does not apply crds/, so an override against a CRD from before

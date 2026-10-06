@@ -813,6 +813,7 @@ honest — a quota that large cannot constrain this release either way.
 {{- define "kube-agents.parseCpuMillis" -}}
 {{- $raw := trim (toString .) -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
+{{- $binaryCores := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 -}}
 {{- $decimalCores := dict "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
 {{- if or (eq $raw "") (eq $raw "<nil>") -}}
 0
@@ -836,6 +837,15 @@ honest — a quota that large cannot constrain this release either way.
 {{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
 {{- else -}}
 {{- $out := "" -}}
+{{- range $unit, $mult := $binaryCores -}}
+{{- if and (eq $out "") (hasSuffix $unit $raw) -}}
+{{- $n := trimSuffix $unit $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse CPU quantity %q — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- $out = include "kube-agents.clampInt64" (mulf (mulf (float64 $n) $mult) 1000.0) -}}
+{{- end -}}
+{{- end -}}
 {{- range $unit, $mult := $decimalCores -}}
 {{- if and (eq $out "") (hasSuffix $unit $raw) -}}
 {{- $n := trimSuffix $unit $raw -}}
@@ -855,6 +865,17 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* A quantity in the CRD's grammar rewritten into the one parseCpuMillis and
+       parseBytes read: the leading "+" dropped, `.5` written `0.5`, and `1.` written
+       `1`. The sign is the caller's to refuse; this leaves a "-" in place. */ -}}
+{{- define "kube-agents.normalizeQuantity" -}}
+{{- $raw := trimPrefix "+" (trim (toString .)) -}}
+{{- if hasPrefix "." $raw -}}
+{{- $raw = printf "0%s" $raw -}}
+{{- end -}}
+{{- regexReplaceAll "^([0-9]+)\\.([^0-9]|$)" $raw "${1}${2}" -}}
+{{- end }}
+
 {{- define "kube-agents.parseBytes" -}}
 {{- $raw := trim (toString .) -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
@@ -868,6 +889,18 @@ honest — a quota that large cannot constrain this release either way.
 {{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
 {{- end -}}
 {{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000.0)) -}}
+{{- else if hasSuffix "u" $raw -}}
+{{- $n := trimSuffix "u" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000.0)) -}}
+{{- else if hasSuffix "n" $raw -}}
+{{- $n := trimSuffix "n" $raw -}}
+{{- if not (regexMatch $numeric $n) -}}
+{{- fail (printf "quota preflight: cannot parse quantity %q (memory, storage or count) — set quotaPreflight.enabled=false to bypass, and please report it." $raw) -}}
+{{- end -}}
+{{- include "kube-agents.clampInt64" (ceil (divf (float64 $n) 1000000000.0)) -}}
 {{- else -}}
 {{- $out := "" -}}
 {{- range $unit, $mult := $binary -}}
