@@ -4562,6 +4562,10 @@ class CommandExecutor:
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
+        # Per provider, the refresh-route call that will run the helper next;
+        # set when it is done. See `refresh_forge_credential`.
+        self._forge_refresh_in_flight: dict[str, threading.Event] = {}
+        self._forge_refresh_in_flight_lock = threading.Lock()
         self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
         self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -5328,6 +5332,18 @@ class CommandExecutor:
         return self._forge_refresh_lock
 
     @property
+    def _refresh_in_flight(self) -> dict[str, threading.Event]:
+        if getattr(self, "_forge_refresh_in_flight", None) is None:
+            self._forge_refresh_in_flight = {}
+        return self._forge_refresh_in_flight
+
+    @property
+    def _refresh_in_flight_lock(self) -> threading.Lock:
+        if getattr(self, "_forge_refresh_in_flight_lock", None) is None:
+            self._forge_refresh_in_flight_lock = threading.Lock()
+        return self._forge_refresh_in_flight_lock
+
+    @property
     def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
         if getattr(self, "_last_forge_refresh", None) is None:
             self._last_forge_refresh = {}
@@ -5367,11 +5383,17 @@ class CommandExecutor:
         the refresh route, which holds no slot, it reads the coalesce cache
         first without the lock -- the common case for the sandbox `gh` wrapper
         and the fleet-audit skill, which call it before every credentialed
-        step -- and reserves only when a refresh looks needed; the lock is
-        never held across a budget wait, and a second refresher holds a
-        reservation while it waits for the lock, for the seconds the running
-        helper takes. `caller` is the route's connection, dropped if it hangs
-        up while queued.
+        step -- and reserves only when it will run the helper itself. A caller
+        that finds a refresh for the same provider already in flight from this
+        route waits for it without a reservation, then repeats the lock-free
+        checks: the coalesce cache, and a failure recorded since it arrived,
+        which it re-raises. Only a caller that finds none in flight marks
+        itself as the next refresher and reserves, so the route holds one
+        reservation per provider however many callers queue behind it, and the
+        lock is never held across a budget wait. The wait for an in-flight
+        refresh is bounded and watched like admission: CommandSlotUnavailable
+        after COMMAND_SLOT_WAIT_SECONDS, CallerHungUp when `caller`, the
+        route's connection, hangs up.
         """
         helper = self._forge_helper(provider)
         forge = _provider_forge(provider)
@@ -5393,10 +5415,43 @@ class CommandExecutor:
         if covered or getattr(self, "children_budget_bytes", None) is None:
             self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
             return
-        if self._refresh_is_current(provider, clean_repo):
-            return
-        with self.reserve_child_memory(caller=caller):
-            self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        while True:
+            if self._refresh_is_current(provider, clean_repo):
+                return
+            failure = self._refresh_failure_cache.get(failure_key)
+            if failure is not None and failure[0] >= queued_at:
+                raise failure[1]
+            with self._refresh_in_flight_lock:
+                running = self._refresh_in_flight.get(provider)
+                if running is None:
+                    mine = threading.Event()
+                    self._refresh_in_flight[provider] = mine
+                    break
+            self._await_refresh_in_flight(provider, running, deadline, caller)
+        try:
+            with self.reserve_child_memory(caller=caller):
+                self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+        finally:
+            with self._refresh_in_flight_lock:
+                self._refresh_in_flight.pop(provider, None)
+            mine.set()
+
+    @staticmethod
+    def _await_refresh_in_flight(
+        provider: str, running: threading.Event, deadline: float, caller: socket.socket | None
+    ) -> None:
+        """Wait, holding nothing, for another caller's refresh of `provider`."""
+        while not running.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CommandSlotUnavailable(
+                    f"a {provider} credential refresh was still running after "
+                    f"{COMMAND_SLOT_WAIT_SECONDS}s; retry shortly"
+                )
+            running.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
+            if caller is not None and _caller_has_gone(caller):
+                raise CallerHungUp("the caller disconnected while waiting for a credential refresh")
 
     def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
         """The coalesce check, readable without the lock: the cache entry is a

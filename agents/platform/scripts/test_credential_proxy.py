@@ -5862,42 +5862,121 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         holder.join(5)
         self.assertEqual(0, executor.reserved_bytes)
 
-    def test_a_second_refresher_releases_its_reservation_after_the_under_lock_recheck(self):
-        executor = self._budgeted_executor(admits=2)
+    def _start_blocking_refresh(self, executor, results, outcome=None):
+        """Start a route-path refresh whose helper blocks until the returned
+        event is set; `outcome` is what the helper returns, or raises."""
         entered = threading.Event()
         finish = threading.Event()
         calls = []
 
         def blocking_helper(*args, **kwargs):
             calls.append(args)
-            entered.set()
-            finish.wait(5)
+            if len(calls) == 1:
+                entered.set()
+                finish.wait(5)
+                if isinstance(outcome, Exception):
+                    raise outcome
             return subprocess.CompletedProcess([], 0, "", "")
 
-        errors = []
+        patch = mock.patch.object(executor, "_run_forge_helper", blocking_helper)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(finish.set)
+        first = self._refresh_in_thread(executor, results)
+        self.assertTrue(entered.wait(5))
+        return first, finish, calls
 
+    @staticmethod
+    def _refresh_in_thread(executor, results, caller=None):
         def refresh():
             try:
-                executor.refresh_forge_credential("github", "gke-agentic/infra")
-            except Exception as exc:  # surfaced by the assertion below
-                errors.append(exc)
+                executor.refresh_forge_credential("github", "gke-agentic/infra", caller=caller)
+                results.append("ok")
+            except Exception as exc:  # surfaced by the assertions
+                results.append(exc)
 
-        self.addCleanup(finish.set)
-        with mock.patch.object(executor, "_run_forge_helper", blocking_helper):
-            first = threading.Thread(target=refresh)
-            first.start()
-            self.assertTrue(entered.wait(5))
-            second = threading.Thread(target=refresh)
-            second.start()
-            self._wait_until(
-                lambda: executor.reserved_bytes
-                == 2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
-            )
-            finish.set()
-            first.join(5)
-            second.join(5)
-        self.assertFalse(first.is_alive() or second.is_alive())
-        self.assertEqual([], errors)
+        thread = threading.Thread(target=refresh)
+        thread.start()
+        return thread
+
+    def test_a_second_refresher_waits_for_the_in_flight_refresh_without_reserving(self):
+        executor = self._budgeted_executor(admits=2)
+        results = []
+        first, finish, calls = self._start_blocking_refresh(executor, results)
+        late_results = []
+        second = self._refresh_in_thread(executor, late_results)
+        third = self._refresh_in_thread(executor, late_results)
+        # Both late arrivals are parked on the in-flight refresh, not on the lock.
+        time.sleep(3 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+        self.assertTrue(second.is_alive() and third.is_alive())
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+        finish.set()
+        for thread in (first, second, third):
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(["ok"], results)
+        self.assertEqual(["ok", "ok"], late_results)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, executor.reserved_bytes)
+        self.assertEqual({}, executor._refresh_in_flight)
+
+    def test_a_waiter_whose_refresh_ended_stale_reserves_and_runs_the_helper_itself(self):
+        # A timeout is not memoised, so the cache is still stale when the wait
+        # ends and the waiter has a refresh of its own to run.
+        executor = self._budgeted_executor(admits=2)
+        results = []
+        first, finish, calls = self._start_blocking_refresh(
+            executor, results, outcome=TimeoutError("credential refresh timed out")
+        )
+        second_results = []
+        second = self._refresh_in_thread(executor, second_results)
+        time.sleep(2 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+        finish.set()
+        first.join(5)
+        second.join(5)
+        self.assertIsInstance(results[0], TimeoutError)
+        self.assertEqual(["ok"], second_results)
+        self.assertEqual(2, len(calls))
+        self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_waiter_re_raises_a_failure_recorded_while_it_waited_without_reserving(self):
+        executor = self._budgeted_executor(admits=2)
+        results = []
+        first, finish, calls = self._start_blocking_refresh(
+            executor, results, outcome=RuntimeError("Minty unavailable")
+        )
+        second_results = []
+        second = self._refresh_in_thread(executor, second_results)
+        time.sleep(2 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+        reserve = mock.patch.object(executor, "reserve_child_memory", side_effect=AssertionError("reserved"))
+        reserve.start()
+        self.addCleanup(reserve.stop)
+        finish.set()
+        first.join(5)
+        second.join(5)
+        self.assertIsInstance(results[0], RuntimeError)
+        self.assertIs(results[0], second_results[0])
+        self.assertEqual(1, len(calls))
+
+    def test_a_waiter_that_hangs_up_raises_and_reserves_nothing(self):
+        executor = self._budgeted_executor(admits=2)
+        results = []
+        first, finish, calls = self._start_blocking_refresh(executor, results)
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+        second_results = []
+        second = self._refresh_in_thread(executor, second_results, caller=ours)
+        time.sleep(2 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+        theirs.close()
+        second.join(5)
+        self.assertFalse(second.is_alive())
+        self.assertIsInstance(second_results[0], credential_proxy.CallerHungUp)
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+        finish.set()
+        first.join(5)
+        self.assertEqual(["ok"], results)
         self.assertEqual(1, len(calls))
         self.assertEqual(0, executor.reserved_bytes)
 
