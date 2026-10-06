@@ -223,14 +223,14 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
         timeout = urlopen.call_args.kwargs["timeout"]
         self.assertEqual(github_token_refresh.SIDECAR_REFRESH_TIMEOUT_SECONDS, timeout)
-        # 81.5 s for a refresh already in flight, 60 s of admission wait,
-        # 81.5 s of its own helper (20 identity, 16.5 Minty, 3 x 15 CLI), 10 s
-        # of margin.
-        self.assertEqual(233.0, timeout)
+        # 60 s bound on the wait for a refresh already in flight, 60 s of
+        # admission wait, 81.5 s of its own helper (20 identity, 16.5 Minty,
+        # 3 x 15 CLI), 10 s of margin.
+        self.assertEqual(211.5, timeout)
         self.assertGreater(
             timeout,
-            credential_proxy.COMMAND_SLOT_WAIT_SECONDS
-            + 2 * github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS,
+            2 * credential_proxy.COMMAND_SLOT_WAIT_SECONDS
+            + github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS,
         )
         self.assertEqual(
             credential_proxy.COMMAND_SLOT_WAIT_SECONDS,

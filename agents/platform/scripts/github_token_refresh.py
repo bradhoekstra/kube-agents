@@ -180,13 +180,17 @@ SIDECAR_REFRESH_MARGIN_SECONDS = 10
 
 #: The client's socket timeout on the refresh POST. Before its own helper
 #: starts, the broker may hold a refresh twice: waiting, without a reservation,
-#: for another caller's refresh of the same forge already in flight -- as long
-#: as that helper runs, so its budget -- and then queueing for admission. A
+#: for another caller's refresh of the same forge already in flight (and then
+#: for the refresh lock), both inside one bound of COMMAND_SLOT_WAIT_SECONDS
+#: from arrival, and then queueing for admission under a bound of its own. A
 #: refresh admitted late still runs the whole helper and answers 200 once the
 #: token has landed, so a client that gives up sooner reports a refresh that
-#: succeeded as failed.
+#: succeeded as failed. A second refresher behind a helper that runs past that
+#: first bound is told busy even though the first helper lands the token seconds
+#: later; this client reports that as a failed refresh, and the next call
+#: coalesces on the fresh token.
 SIDECAR_REFRESH_TIMEOUT_SECONDS = (
-    REFRESH_HELPER_BUDGET_SECONDS
+    BROKER_ADMISSION_WAIT_SECONDS
     + BROKER_ADMISSION_WAIT_SECONDS
     + REFRESH_HELPER_BUDGET_SECONDS
     + SIDECAR_REFRESH_MARGIN_SECONDS

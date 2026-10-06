@@ -5397,7 +5397,10 @@ class CommandExecutor:
         The route's waits for an in-flight refresh and for the lock share one
         bound and are watched like admission: CommandSlotUnavailable after
         COMMAND_SLOT_WAIT_SECONDS from arrival, CallerHungUp when `caller`,
-        the route's connection, hangs up.
+        the route's connection, hangs up. So a second refresher behind a
+        helper that runs past that bound is told busy even though the first
+        helper lands the token seconds later; the client reports a failed
+        refresh, and its next call coalesces on the fresh token.
         """
         helper = self._forge_helper(provider)
         forge = _provider_forge(provider)
