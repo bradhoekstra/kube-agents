@@ -235,6 +235,15 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 					if latest.Time.After(s.Created) {
 						continue
 					}
+				} else {
+					// No live sibling was read this poll: every replica of this
+					// counter is new, so there is no as-read marker to inherit.
+					// Record it behind this poll at FirstRecorded, a prior poll,
+					// so that the one that loses the fold below is reset next
+					// poll rather than counted on top; the winner still advances
+					// to stamp through the Max branch. Without this it would keep
+					// stamp, read as current next poll, and double-count.
+					entry.Marker = doc.FirstRecorded
 				}
 			}
 			if s.Created.After(doc.FirstRecorded.Time) && s.Sample <= usageDeltaCeiling {

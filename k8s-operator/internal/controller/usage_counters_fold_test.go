@@ -675,6 +675,46 @@ func TestFoldUsage_ALosingNewReplicaResetsItsCatchUpNextPoll(t *testing.T) {
 	}
 }
 
+// The sibling the test above does not cover: both Max replicas are read for the
+// first time in one poll, so neither has a live sibling to inherit a marker
+// from. The loser must still land behind this poll -- at FirstRecorded -- so its
+// first catch-up is reset next poll rather than counted on top of what the
+// winner already supplied. Before the fix the loser kept this poll's stamp, read
+// as current next poll, and its catch-up double-counted (100 -> 140).
+func TestFoldUsage_TwoNewReplicasInOnePollDoNotDoubleCount(t *testing.T) {
+	first := foldClock(0)
+	createdA := foldClock(1)
+	createdB := foldClock(2)
+	doc := foldDoc(first) // Empty: no Max entry to inherit a marker from.
+
+	// Poll 5: both replicas are new. The larger sample (A at 100) wins the fold
+	// and its whole sample is taken; B at 60 loses and must be recorded behind
+	// this poll. want is the winner's sample only.
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 5, live: []string{foldPodA, foldPodB}, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, createdA, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, createdB, 60, ptr.To(1.0)),
+		}, want: 100, moved: true},
+	})
+	if b := doc.Pods[foldPodB]; !b.Marker.Time.Equal(first) {
+		t.Fatalf("the losing new replica takes FirstRecorded, not the poll it lost: %+v", b)
+	}
+
+	// Poll 10: A is flat and B catches up by 40. The catch-up is the events the
+	// winner already supplied, so it resets and adds nothing; the total stays
+	// 100. (Before the fix B read as current, its catch-up was taken, and the
+	// total reached 140.)
+	doc = runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, createdA, 100, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, createdB, 100, ptr.To(1.0)),
+		}, want: 100, moved: false},
+	})
+	if b := doc.Pods[foldPodB]; b.Sample != 100 || !b.Marker.Time.Equal(foldClock(5)) {
+		t.Fatalf("the reset advances the new replica's baseline and takes the live sibling's marker: %+v", b)
+	}
+}
+
 func TestAddUsageTotal_RefusesPastTheCeiling(t *testing.T) {
 	doc := foldDoc(foldClock(0))
 	doc.Totals[usageCounterToolExecutions] = usageTotalCeiling - 1
