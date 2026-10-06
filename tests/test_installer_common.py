@@ -3623,9 +3623,13 @@ class ScopeSelectorApisTest(unittest.TestCase):
     APIs the plan-time resolution of that selector reads is off (Resource
     Manager and Monitoring for a Metrics Scope, Compute for a Shared VPC host,
     the composition's own split), since the reads run in the plan and the
-    composition enables the APIs only in the apply that follows. Nothing is
-    called when they are on; a listing that fails enables every API the
-    declared selectors read; an enable that fails is a warning, not an abort."""
+    composition enables the APIs only in the apply that follows. The scoped
+    service account pool armed beside a folder or organisation counts as a
+    third kind: the plan lists the container's members through the Asset API,
+    so that API is enabled first too, with the pool's listing as the reason.
+    Nothing is called when they are on; a listing that fails enables every
+    API the declared selectors and the pool read; an enable that fails is a
+    warning, not an abort."""
 
     ALL = "cloudresourcemanager.googleapis.com monitoring.googleapis.com compute.googleapis.com"
 
@@ -3785,9 +3789,11 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     """check_scope_container_access: silent with no container; with one, the
     Asset API must be enabled in the host project or no effective policy may
     deny it, and the applying identity must hold setIamPolicy on every
-    container, asked through testIamPermissions. Every failure is named
-    before the refusal; a probe that cannot decide warns and lets the apply
-    speak; "warn" turns the refusal into a warning."""
+    container, asked through testIamPermissions, and, while the scoped
+    service account pool is armed, cloudasset.assets.searchAllResources there
+    too, since the plan lists the container's members for the pool. Every
+    failure is named before the refusal; a probe that cannot decide warns and
+    lets the apply speak; "warn" turns the refusal into a warning."""
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
              probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False,

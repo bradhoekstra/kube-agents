@@ -50,7 +50,7 @@ variable "folders" {
 
   validation {
     condition     = alltrue([for entry in var.folders : can(regex("^[0-9]+$", entry))])
-    error_message = "Each folders entry is a numeric folder ID (^[0-9]+$), the pattern the CRD accepts for the same field."
+    error_message = "Each folders entry is a numeric Resource Manager folder ID (^[0-9]+$), as spec.scope.folders names one."
   }
 }
 
@@ -65,7 +65,7 @@ variable "organizations" {
 
   validation {
     condition     = alltrue([for entry in var.organizations : can(regex("^[0-9]+$", entry))])
-    error_message = "Each organizations entry is a numeric organization ID (^[0-9]+$), the pattern the CRD accepts for the same field."
+    error_message = "Each organizations entry is a numeric Resource Manager organization ID (^[0-9]+$), as spec.scope.organizations names one."
   }
 }
 
@@ -114,13 +114,13 @@ variable "quota_project" {
 
 variable "exclude_projects" {
   description = <<-EOT
-    The scope's `exclude.projects` entries. Only an entry that is a bare
-    project number acts here: a monitored project the Monitoring API returned
+    The scope's `exclude.projects` entries. Two kinds of entry act here. A
+    bare project number: a monitored project the Monitoring API returned
     under that number is neither named nor listed, and the reconcile matches
     the number on every row a scope named by it, so the member leaves the set
-    whether or not a run had named it before; and an entry that names a
-    container's member exactly by ID drops it from `container_members`, so it
-    gets no pool account. For the selectors IDs and globs are the caller's to
+    whether or not a run had named it before. An exact project ID naming a
+    container's member: it is dropped from `container_members`, so it gets no
+    pool account. For the selectors, IDs and globs are the caller's to
     apply (kube-agents-iam withholds the grant of a Shared VPC service project
     an entry names by ID and keeps a monitored project's, which the reconcile's
     naming call needs; the reconcile evaluates globs).
