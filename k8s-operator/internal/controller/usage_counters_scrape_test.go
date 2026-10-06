@@ -211,6 +211,31 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			t.Errorf("kind = %q, want %q: the connection succeeded and the peer answered junk", got, usageScrapeKindMalformed)
 		}
 	})
+	t.Run("a peer that accepts then closes before a byte", func(t *testing.T) {
+		// Accept and drop the connection without answering -- a reset, a broken
+		// pipe, or a clean EOF, never a status line. Nothing answered, so the
+		// kind is connect (the NetworkPolicy/listener guidance), not the
+		// malformed-response kind that says the listener answered.
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer ln.Close()
+		go func() {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}()
+		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageCounterEventsIngested)
+		if err == nil {
+			t.Fatal("a peer that answered nothing scraped successfully")
+		}
+		if got := scrapeKind(t, err); got != usageScrapeKindConnect {
+			t.Errorf("kind = %q, want %q: the peer accepted and closed without answering", got, usageScrapeKindConnect)
+		}
+	})
 	t.Run("a listener that stalls mid-body", func(t *testing.T) {
 		// Headers promptly, then nothing: the client's timeout fires on the
 		// body read, and the kind says timeout, not read.

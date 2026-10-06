@@ -87,9 +87,6 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
-	// netOpDial is the Op a *net.OpError carries for a failure before the
-	// connection existed; after it, the error is the peer's doing.
-	netOpDial = "dial"
 )
 
 var toolInvocationsCountedStatuses = map[string]bool{"success": true, "error": true}
@@ -127,10 +124,11 @@ func (e *usageScrapeError) Error() string {
 }
 
 // usageConnectKind classifies a client.Do error by what happened rather than
-// where it surfaced: a timeout, a dial that was refused, unreachable or failed
-// otherwise, and for anything after the connection existed, a response net/http
-// could not parse, so the event points the reader at the peer rather than at a
-// policy. Never the text net/http builds from the bytes it read.
+// where it surfaced: a timeout, a dial that was refused, unreachable, a
+// connection the peer accepted but never answered on, or -- only when the peer
+// did send a status line the client could not parse -- a malformed response, so
+// the event points the reader at the layer that failed rather than at a policy.
+// Never the text net/http builds from the bytes it read.
 func usageConnectKind(err error) string {
 	if usageTimedOut(err) {
 		return usageScrapeKindTimeout
@@ -141,8 +139,17 @@ func usageConnectKind(err error) string {
 	if errors.Is(err, syscall.EHOSTUNREACH) || errors.Is(err, syscall.ENETUNREACH) {
 		return usageScrapeKindUnreachable
 	}
+	// A reset, a broken pipe, any other net.OpError, or a clean EOF before a
+	// byte was read is a connection the peer did not answer on, whatever the
+	// Op: a listener down between accept and its first write, or a mesh
+	// sidecar resetting the operator's plaintext GET. The connect guidance --
+	// check the NetworkPolicy and that the listener is up -- fits those, not
+	// the response guidance that says the listener answered.
 	var opErr *net.OpError
-	if errors.As(err, &opErr) && opErr.Op == netOpDial {
+	if errors.As(err, &opErr) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, io.EOF) {
 		return usageScrapeKindConnect
 	}
 	return usageScrapeKindMalformed
