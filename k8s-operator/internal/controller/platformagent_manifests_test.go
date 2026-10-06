@@ -2610,6 +2610,40 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 		}
 	}
 
+	// gchat_event is trusted by name above, so its regex is pinned verbatim: a
+	// change to what it captures -- widening it to lift an audit field through the
+	// one parser the guard exempts -- has to be re-vetted here, not merged silently.
+	var gchatParser string
+	for _, section := range fluentBitSections(parsers, "[PARSER]") {
+		if fluentBitField(section, "Name") == "gchat_event" {
+			gchatParser = section
+		}
+	}
+	if gchatParser == "" {
+		t.Errorf("parsers.conf lacks the gchat_event parser:\n%s", parsers)
+	} else if got, want := fluentBitField(gchatParser, "Regex"), `User=(?<gchat_user>[^,\s]+),\s*Session=(?<gchat_session>[^,\s]+)`; got != want {
+		t.Errorf("gchat_event Regex is %q, want %q; a change to the one trusted regex must be re-vetted here", got, want)
+	}
+
+	// No parser merges a decoded field back into the record. Decode_Field /
+	// Decode_Field_As json <field> takes a JSON object a line carries and lifts
+	// its keys into the record -- the audit lift by another name. The records are
+	// decoded whole by the json-format audit_json parser on the input; nothing
+	// else decodes a field. Fail closed on the key across every ConfigMap value.
+	for name, data := range cm.Data {
+		for _, line := range strings.Split(data, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "#") {
+				continue
+			}
+			if f := strings.Fields(line); len(f) >= 1 {
+				switch strings.ToLower(f[0]) {
+				case "decode_field", "decode_field_as":
+					t.Errorf("%s carries %q; a Decode_Field merge lifts a field into the record, the audit records are JSON on the input:\n%s", name, strings.TrimSpace(line), data)
+				}
+			}
+		}
+	}
+
 	// Both streams are shipped: exactly one stdout output, covering agent.*.
 	outputs := fluentBitSections(fbConf, "[OUTPUT]")
 	if len(outputs) != 1 {
@@ -2623,16 +2657,20 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	}
 }
 
-// fluentBitHeaderRe matches a section-start line -- a line whose only content is
-// a bracketed section name like [FILTER]. The whole line must match, so a key
-// whose value carries a bracket is not mistaken for a header.
-var fluentBitHeaderRe = regexp.MustCompile(`^\[[A-Za-z0-9_]+\]$`)
+// fluentBitHeaderRe matches a section-start line and captures its name. fluent-bit
+// opens a section on any line whose first non-space byte is '[', taking the name
+// up to the first ']' and ignoring the rest of the line, so this is a prefix match,
+// not the whole line: [FILTER] # lift opens a live filter and has to be seen as
+// one. A key line never begins with '[' -- a key whose value carries a bracket
+// still starts with the key -- so a prefix match cannot mistake a value for a header.
+var fluentBitHeaderRe = regexp.MustCompile(`^\[([A-Za-z0-9_]+)\]`)
 
-// fluentBitSections returns every section of conf whose header equals header
+// fluentBitSections returns every section of conf whose header names header
 // (e.g. "[FILTER]"), case-insensitively. A section runs from its header line to
-// the line before the next header, so a blank line, a comment or the header's
-// casing between sections cannot hide one: fluent-bit opens a section on any
-// [NAME] line, needs no separator, and reads the header case-insensitively.
+// the line before the next header, so a blank line, a comment, trailing text
+// after the ']' or the header's casing between sections cannot hide one:
+// fluent-bit opens a section on any line that starts [NAME], needs no separator,
+// ignores what follows the ']', and reads the header case-insensitively.
 func fluentBitSections(conf, header string) []string {
 	var sections []string
 	var cur []string
@@ -2643,9 +2681,9 @@ func fluentBitSections(conf, header string) []string {
 		}
 	}
 	for _, line := range strings.Split(conf, "\n") {
-		if trimmed := strings.TrimSpace(line); fluentBitHeaderRe.MatchString(trimmed) {
+		if m := fluentBitHeaderRe.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
 			flush()
-			inWanted = strings.EqualFold(trimmed, header)
+			inWanted = strings.EqualFold("["+m[1]+"]", header)
 			cur = nil
 		}
 		if inWanted {
