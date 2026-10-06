@@ -535,7 +535,12 @@ enabled: the reconciler leaves the proxy Deployment as last applied and reports
 enabled, refuses the same override at apply. It warns when memory per CPU leaves
 the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On GKE Autopilot without bursting, a
 container's limits follow its requests, so raise `requests.memory` alongside
-`limits.memory` there. The quota preflight counts the override.
+`limits.memory` there. The quota preflight counts the override. On an
+existing install, apply the chart's `crds/` before setting the value (`helm
+upgrade` does not, `upgrade.sh` does): against a CRD that predates
+`spec.deployment.credentialProxy`, the API server would prune the value silently
+while the release record kept it, so the chart looks up the installed CRD and
+fails the upgrade instead.
 
 #### PlatformAgent annotations
 

@@ -777,7 +777,8 @@ platformAgent:
     # per CPU leaves the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged.
     # On GKE Autopilot without bursting, a container's
     # limits follow its requests, so raise requests.memory alongside limits.memory
-    # there.
+    # there. On an existing install the chart fails the upgrade when the
+    # installed CRD predates the field; apply crds/ first (upgrade.sh does).
     credentialProxy:
       resources: {}
   # pre-delete hook that removes the PlatformAgent CR and waits for the operator

@@ -14,6 +14,7 @@ Run: python3 -m unittest discover -s tests -p 'test_chart_credential_proxy_resou
 
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -151,6 +152,37 @@ class CredentialProxyResourcesRenderTest(unittest.TestCase):
         # phrase in lower case. Both name the parent and the key.
         self.assertIn("credentialProxy", res.stderr)
         self.assertIn("replicas", res.stderr)
+
+
+class CrdGuardTest(unittest.TestCase):
+    """`helm upgrade` does not apply crds/, so an override against a CRD from before
+    the field would be pruned silently. `lookup` is empty under `helm template`, so
+    the guard can only be pinned as text here; the render tests above show the block
+    still renders when the lookup returns nothing. The failing branch is exercised
+    only against a live install."""
+
+    _LOOKUP = 'lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io"'
+
+    def setUp(self):
+        template = (_CHART / _CR_TEMPLATE).read_text()
+        block = re.search(r"\{\{- \$proxyOther := .*?\n(.*?)\n\s*credentialProxy:\n", template, re.DOTALL)
+        self.assertIsNotNone(block, "the credentialProxy block is missing from the CR template")
+        self.guard = block.group(1)
+
+    def test_a_set_override_looks_up_the_installed_crd(self):
+        gate = re.search(r"\{\{- if or \$proxyQuantities \$proxyOther \}\}\n\s*\{\{- \$crd := " + re.escape(self._LOOKUP), self.guard)
+        self.assertIsNotNone(gate, "the CRD lookup is not gated on a set override")
+
+    def test_the_guard_reads_the_storage_versions_deployment_properties(self):
+        self.assertIn("{{- if .storage }}", self.guard)
+        self.assertIn('dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "deployment" "properties" (dict) .', self.guard)
+
+    def test_the_guard_fails_naming_the_field_and_the_remedy(self):
+        fail = re.search(r'\{\{- if not \(hasKey \$deploymentProps "credentialProxy"\) \}\}\n\s*\{\{- fail "([^"]*)" \}\}', self.guard)
+        self.assertIsNotNone(fail, "the CRD guard does not fail on a missing key")
+        for want in ("predates spec.deployment.credentialProxy", "helm upgrade does not update CRDs",
+                     "charts/kube-agents/crds/", "upgrade.sh", "prunes the value silently", "release record keeps it"):
+            self.assertIn(want, fail.group(1))
 
 
 if __name__ == "__main__":
