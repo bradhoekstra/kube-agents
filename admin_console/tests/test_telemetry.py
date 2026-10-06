@@ -370,7 +370,8 @@ class TelemetryNormalizationTest(unittest.TestCase):
 
     def test_normalizes_a_cron_tool_audit_tailed_from_the_audit_file(self):
         # The row the sidecar writes from the profile's audit file: the record's
-        # keys as fields, no Hermes line at all, and the session as a field.
+        # keys as fields, no Hermes line at all, the session as a field, and the
+        # emitter's own agent_profile naming the profile the console resolves.
         row = {
             "insertId": "log-tailed",
             "timestamp": "2026-07-28T19:07:04Z",
@@ -384,6 +385,7 @@ class TelemetryNormalizationTest(unittest.TestCase):
             },
             "jsonPayload": {
                 "file_path": "/opt/data/profiles/platform/logs/audit.jsonl",
+                "agent_profile": "platform",
                 "app": "agent",
                 "log_source": "agent-file",
                 "audit_event": "tool_call_end",
@@ -409,7 +411,7 @@ class TelemetryNormalizationTest(unittest.TestCase):
         self.assertEqual(event.session_id, "cron_capacity_20260728_190038")
         self.assertEqual(event.interaction_id, "task-1")
         self.assertEqual(event.status, "completed")
-        self.assertEqual(event.agent_name, "gateway-runtime")
+        self.assertEqual(event.agent_name, "platform")
         self.assertEqual(event.details["collector_container"], "fluent-bit")
 
     def test_cron_session_under_the_dotted_key_sets_the_trigger(self):

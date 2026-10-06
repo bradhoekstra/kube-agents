@@ -15,7 +15,7 @@ path to the profile's ``logs/`` can append a line the sidecar ships as a record,
 which is the volume's boundary, not this sink's (the operator's
 ``buildFluentBitConfigMap`` says the same).
 
-Which profile's file: the one the record is emitted under.
+Which profile's file, and the ``agent_profile`` stamped on the record: the one the record is emitted under.
 ``hermes_constants.get_hermes_home()`` is how the running Hermes names it —
 the context-local override the gateway sets around a turn it serves for
 another profile, then ``HERMES_HOME``, which a kanban worker is launched with
@@ -100,6 +100,16 @@ HERMES_HOME_ENV = "HERMES_HOME"
 # What the agent image sets HERMES_HOME to, and the default every script in
 # this tree falls back to when the variable is unset.
 DEFAULT_HERMES_HOME = "/opt/data"
+# The record field naming the profile whose audit file the record lands in, so a
+# record the sidecar tails is self-describing. The Admin Console reads it as the
+# agent name (telemetry.normalize_logging_row); without it a tailed record falls
+# back to the fluent-bit container name.
+AGENT_PROFILE_FIELD = "agent_profile"
+# A named profile's home is <hermes-home>/profiles/<name>: the directory just
+# under the home that marks one, and the name a record gets when its home is the
+# home itself (the front door).
+PROFILES_DIR_NAME = "profiles"
+DEFAULT_PROFILE_NAME = "default"
 # Owner read-write, group read. Every container the operator renders onto the
 # volume runs as the same uid, so the sidecar reads the file as its owner; the
 # group bit is for a reader a CR adds under a uid of its own, and no uid but
@@ -153,6 +163,17 @@ def audit_file_path(home: Optional[Path] = None) -> Path:
     return (home or hermes_home()) / LOGS_DIR_NAME / AUDIT_FILE_NAME
 
 
+def profile_name(home: Path) -> str:
+    """The profile ``home`` belongs to: ``<name>`` for a ``profiles/<name>`` home, else the default.
+
+    A named profile's home is ``<hermes-home>/profiles/<name>``; the front door's
+    home is the hermes home itself, whose records are the default profile's.
+    """
+    if home.parent.name == PROFILES_DIR_NAME:
+        return home.name
+    return DEFAULT_PROFILE_NAME
+
+
 def lock_file_path(path: Path) -> Path:
     """The lock file beside the audit file at ``path``."""
     return path.with_name(path.name + AUDIT_LOCK_FILE_SUFFIX)
@@ -182,11 +203,18 @@ def emit(record: Dict[str, Any], logger: logging.Logger) -> Optional[concurrent.
     JSON line and the failure goes to ``logger`` as an ERROR naming the file and
     the error and nothing of the record (see the module docstring for what each
     reaches).
+
+    Before serialisation the record is stamped with ``AGENT_PROFILE_FIELD``, the
+    profile it is emitted under, so a tailed line names its own profile.
     """
-    line = redact(serialize(record))
     # Resolved here, on the caller's thread: the per-turn profile override is
-    # context-local, and the writer thread has no context of its own.
-    path = audit_file_path()
+    # context-local, and the writer thread has no context of its own. The home
+    # names the profile, stamped onto the record so a tailed line is self-
+    # describing (the console reads AGENT_PROFILE_FIELD as the agent name).
+    home = hermes_home()
+    record = {**record, AGENT_PROFILE_FIELD: profile_name(home)}
+    line = redact(serialize(record))
+    path = audit_file_path(home)
     if not _on_event_loop():
         _write(line, path, logger)
         return None

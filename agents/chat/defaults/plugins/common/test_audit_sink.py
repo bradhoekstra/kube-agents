@@ -215,7 +215,7 @@ class TestRedaction(SinkTestCase):
     def test_inside_hermes_the_line_passes_through_its_redactor_forced(self):
         calls = self.fake_hermes_redactor()
         self.emit({"args": f"export GL={GITLAB_TOKEN}"})
-        self.assertEqual(json.loads(self.lines()[0]), {"args": f"export GL={GITLAB_TOKEN_MASKED}"})
+        self.assertEqual(json.loads(self.lines()[0]), {"agent_profile": "default", "args": f"export GL={GITLAB_TOKEN_MASKED}"})
         self.assertEqual(calls, [True], "security.redact_secrets: false must not reopen the trail")
 
     def test_the_stdout_fallback_is_redacted_too(self):
@@ -223,7 +223,7 @@ class TestRedaction(SinkTestCase):
         self.home.joinpath("logs").write_text("not a directory")
         with self.assertLogs(LOGGER, level="ERROR"):
             printed = self.emit({"args": f"export GL={GITLAB_TOKEN}"})
-        self.assertEqual(json.loads(printed), {"args": f"export GL={GITLAB_TOKEN_MASKED}"})
+        self.assertEqual(json.loads(printed), {"agent_profile": "default", "args": f"export GL={GITLAB_TOKEN_MASKED}"})
 
 
 class TestEmit(SinkTestCase):
@@ -232,14 +232,14 @@ class TestEmit(SinkTestCase):
         with self.assertNoLogs(LOGGER, level="INFO"):
             printed = self.emit({"audit_event": "x", "n": 1})
         self.assertEqual(printed, "")
-        self.assertEqual([json.loads(line) for line in self.lines()], [{"audit_event": "x", "n": 1}])
+        self.assertEqual([json.loads(line) for line in self.lines()], [{"agent_profile": "default", "audit_event": "x", "n": 1}])
 
     def test_a_record_the_file_cannot_take_is_printed_to_stdout(self):
         self.home.joinpath("logs").write_text("not a directory")
         with self.assertLogs(LOGGER, level="ERROR") as captured:
             printed = self.emit({"audit_event": "x", "tool": "Bash"})
         # The record, whole, as the one line stdout receives.
-        self.assertEqual(printed, '{"audit_event": "x", "tool": "Bash"}\n')
+        self.assertEqual(printed, '{"agent_profile": "default", "audit_event": "x", "tool": "Bash"}\n')
         # The notice names the file and the error and nothing of the record,
         # so the console's text-form query does not count it.
         notice = captured.output[0]
@@ -256,7 +256,7 @@ class TestEmit(SinkTestCase):
         with mock.patch.object(audit_sink, "LOCK_WAIT_SECONDS", 0.2):
             with self.assertLogs(LOGGER, level="ERROR") as captured:
                 printed = self.emit({"audit_event": "x"})
-        self.assertEqual(printed, '{"audit_event": "x"}\n')
+        self.assertEqual(printed, '{"agent_profile": "default", "audit_event": "x"}\n')
         self.assertIn("another writer has held", captured.output[0])
         self.assertEqual(self.lines(), [])
 
@@ -269,7 +269,7 @@ class TestEmit(SinkTestCase):
         self.fake_hermes(get_hermes_home=lambda: self.home, mkdir_under_hermes_home=refuse)
         with self.assertLogs(LOGGER, level="ERROR") as captured:
             printed = self.emit({"audit_event": "x"})
-        self.assertEqual(printed, '{"audit_event": "x"}\n')
+        self.assertEqual(printed, '{"agent_profile": "default", "audit_event": "x"}\n')
         self.assertIn("Named profile home does not exist", captured.output[0])
         self.assertNotIn("audit_event", captured.output[0])
         self.assertFalse(self.path.parent.exists(), "the sink made the directory Hermes refused")
@@ -285,6 +285,27 @@ class TestEmit(SinkTestCase):
             audit_sink.emit({"audit_event": "x"}, LOGGER)
         self.assertIn("the record is lost", captured.output[0])
         self.assertNotIn("audit_event", captured.output[0])
+
+
+class TestProfileStamp(SinkTestCase):
+    """Every emitted record names the profile whose file it lands in, so a tailed record is self-describing."""
+
+    def test_a_named_profile_home_is_stamped_by_its_name(self):
+        # Hermes serves a turn under a named profile; the record names it, so the
+        # console reads the profile rather than the collector container it would
+        # otherwise fall back to.
+        served = self.home / "profiles" / "platform"
+        self.fake_hermes(get_hermes_home=lambda: served)
+        self.emit({"audit_event": "x"})
+        record = json.loads((served / "logs" / "audit.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(record, {"agent_profile": "platform", "audit_event": "x"})
+
+    def test_a_front_door_home_is_stamped_default(self):
+        # The front door's home is the hermes home itself, not a profiles/<name>
+        # child, so its records are the default profile's.
+        self.emit({"audit_event": "x"})
+        record = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(record, {"agent_profile": "default", "audit_event": "x"})
 
 
 class TestWriterThread(SinkTestCase):
@@ -351,7 +372,7 @@ class TestWriterThread(SinkTestCase):
         with contextlib.redirect_stdout(out), self.assertLogs(LOGGER, level="ERROR") as captured:
             asyncio.run(on_loop())
             audit_sink.flush(timeout=5)
-        self.assertEqual(out.getvalue(), '{"audit_event": "x"}\n')
+        self.assertEqual(out.getvalue(), '{"agent_profile": "default", "audit_event": "x"}\n')
         self.assertIn(str(self.path), captured.output[0])
 
     def _reset_writer(self):
