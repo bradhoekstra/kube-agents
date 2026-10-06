@@ -519,35 +519,21 @@ means zero rather than unset.
 `platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
 container, the broker that runs every credentialed command in a pod of its own.
 It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
-key is set, and the operator merges it over its defaults per key (500m CPU and
-512Mi requests; 1 CPU, 1Gi memory and 2Gi ephemeral-storage limits), so
-`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The broker
-sizes how many commands it admits at once from that limit, which makes it the
-value to raise when the proxy is OOM-killed under a large fleet; a wide-scope
-install can outgrow the default, and
+key is set, and the operator merges it over its defaults per key, so
+`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The
+[`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
+is canonical for the defaults, what the operator refuses and how it reports it,
+and the Autopilot band warnings;
 [the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
-has the arithmetic. The operator refuses a memory limit below 672Mi, a request
-above its limit, a negative quantity, a zero limit, `claims`, and any resource
-name other than `cpu`, `memory` and `ephemeral-storage`, whether or not its
-webhook is enabled: the reconciler ignores the override, renders the proxy
-Deployment at its defaults and reports `Degraded`
-(`Reason: InvalidCredentialProxyResources`), and the webhook, where enabled,
-refuses the same override at apply. The chart fails the render on the same
-override first, and on any key under `resources` other than `requests`,
-`limits` and `claims` (`limit:` for `limits:`), which the CRD would prune
-silently. The operator warns when memory per CPU, on
-the requests pair and on the limits pair, leaves the 1 to 6.5 GiB per vCPU band
-Autopilot admits unchanged: on the requests pair, that Autopilot raises the
-smaller request into the band; on the limits pair, that Autopilot without
-bursting sets the limits equal to the requests, so a limit raised without its
-request takes no effect there (the warning names the request to raise) and one
-lowered without its request follows the request. With bursting the declared
-limits stand. The quota preflight counts the override. On an
-existing install, apply the chart's `crds/` before setting the value (`helm
-upgrade` does not, `upgrade.sh` does): against a CRD that predates
-`spec.deployment.credentialProxy`, the API server would prune the value silently
-while the release record kept it, so the chart looks up the installed CRD and
-fails the upgrade instead.
+has the arithmetic behind the memory floor. The chart fails the render on an
+override the operator would refuse, on a quantity it cannot read, and on any key
+under `resources` other than `requests`, `limits` and `claims` (`limit:` for
+`limits:`), which the CRD would prune silently. The quota preflight sums the
+override merged over the operator's defaults. On an existing install, apply the
+chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
+does): against a CRD that predates `spec.deployment.credentialProxy`, the API
+server would prune the value silently while the release record kept it, so the
+chart looks up the installed CRD and fails the upgrade instead.
 
 #### PlatformAgent annotations
 
