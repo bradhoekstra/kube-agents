@@ -190,8 +190,8 @@ admitted, and the second wave waits one listing: over two hours on the install a
 Four requests at once is the cost of the design at the default limit, and it binds long-running
 commands too: four `kubectl logs --follow` or `kubectl wait` hold the budget for as
 long as they run, where the slot cap alone let eight. An install that needs more raises the limit and the
-budget follows; today no CR field moves the proxy container's limit, so that is the follow-up this
-design makes safe rather than something it ships. The output term is the worst case, a request
+budget follows; `spec.deployment.credentialProxy.resources` moves the proxy container's limit, and
+the budget is what makes that one setting safe to raise alone. The output term is the worst case, a request
 holding its full capped output, which a listing never does; charging captured bytes instead of
 the cap would roughly double the concurrency and is the refinement to measure first if four
 proves tight.

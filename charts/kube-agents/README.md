@@ -523,8 +523,10 @@ key is set, and the operator merges it over its defaults per key (500m CPU and
 512Mi requests; 1 CPU, 1Gi memory and 2Gi ephemeral-storage limits), so
 `limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The broker
 sizes how many commands it admits at once from that limit, which makes it the
-value to raise when the proxy is OOM-killed under a large fleet: an install whose
-scope resolved to about 140 clusters across 36 projects outgrew the default. The
+value to raise when the proxy is OOM-killed under a large fleet; a wide-scope
+install can outgrow the default, and
+[the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
+has the arithmetic. The
 operator's webhook, where enabled, refuses a memory limit below 672Mi and a
 request above its limit, and warns when memory per CPU leaves the 1 to 6.5 GiB
 per vCPU band Autopilot admits unchanged. The quota preflight counts the override.

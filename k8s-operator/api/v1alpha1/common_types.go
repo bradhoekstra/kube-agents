@@ -926,7 +926,9 @@ type CredentialProxySpec struct {
 	// workspace the broker clones into. The validating webhook refuses a memory
 	// limit below what admits two commands at once, and a request above its
 	// limit, and warns when the memory-to-CPU limit ratio leaves the band GKE
-	// Autopilot admits unchanged.
+	// Autopilot admits unchanged. On GKE Autopilot without bursting a
+	// container's limits follow its requests, so raise requests.memory
+	// alongside limits.memory there.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
