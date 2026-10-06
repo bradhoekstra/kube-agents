@@ -206,11 +206,15 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usag
 	return foldUsageBody(resp.Body, counter)
 }
 
-// foldUsageBody scans body line by line and keeps none of it: a sample line of
-// counter's family, or of the start-time gauge, is parsed on its own with
-// expfmt and folded into the running sum as it is read; every other line is
-// skipped unread. A line past the bound, a wanted line that does not parse, or
-// a sample that is negative or not finite is a failed scrape.
+// foldUsageBody scans body line by line and keeps none of it: a line that could
+// be counter's family or the start-time gauge -- one that contains its name as a
+// substring -- is parsed on its own with expfmt, and a metric expfmt names as
+// the family or the gauge is folded into the running sum as it is read; every
+// other line is skipped unread. The substring is only a prefilter: the parser,
+// not a hand-read of the line, names the metric, so the name in a comment or a
+// label value adds nothing and a UTF-8 name the parser accepts is not dropped by
+// a stricter hand-read. A line past the bound, a candidate line that does not
+// parse, or a sample that is negative or not finite is a failed scrape.
 func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 	family, statuses := usageSeriesFor(counter)
 	parser := expfmt.NewTextParser(model.UTF8Validation)
@@ -220,28 +224,37 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 	scanner.Buffer(make([]byte, 0, usageScrapeLineBuffer), usageScrapeMaxLineBytes)
 	for scanner.Scan() {
 		line := scanner.Text()
-		name := usageLineName(line)
-		if name != family && name != processStartTimeSeries {
+		// A cheap substring prefilter before the parser is handed the line: a
+		// line mentioning neither name cannot be a wanted series, whatever the
+		// parser would make of it. A line that mentions one still has the
+		// parser, not this read, decide what it is.
+		if !strings.Contains(line, family) && !strings.Contains(line, processStartTimeSeries) {
 			continue
 		}
 		families, err := parser.TextToMetricFamilies(strings.NewReader(line + "\n"))
-		if err != nil || families[name] == nil {
+		if err != nil {
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindParse}
 		}
-		for _, metric := range families[name].GetMetric() {
-			value, ok := usageSampleValue(metric)
-			if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
-			}
-			if name == processStartTimeSeries {
-				captured := value
-				start = &captured
+		for _, name := range []string{family, processStartTimeSeries} {
+			mf := families[name]
+			if mf == nil {
 				continue
 			}
-			if statuses != nil && !statuses[usageLabelValue(metric, toolInvocationsStatusLabel)] {
-				continue
+			for _, metric := range mf.GetMetric() {
+				value, ok := usageSampleValue(metric)
+				if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+					return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+				}
+				if name == processStartTimeSeries {
+					captured := value
+					start = &captured
+					continue
+				}
+				if statuses != nil && !statuses[usageLabelValue(metric, toolInvocationsStatusLabel)] {
+					continue
+				}
+				sum += value
 			}
-			sum += value
 		}
 	}
 	if err := scanner.Err(); err != nil {
@@ -259,23 +272,6 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 	}
 	return usageReading{Sample: int64(sum), StartTime: start}, nil
-}
-
-// usageLineName is the metric name a sample line starts with, read the way
-// expfmt reads it: leading blanks skipped, then everything up to the label
-// set or the value. "" for a comment or a blank line. A line with no
-// separator is returned whole, so a bare wanted name reaches expfmt and
-// fails there rather than being skipped as another family.
-func usageLineName(line string) string {
-	line = strings.TrimLeft(line, " \t")
-	if line == "" || line[0] == '#' {
-		return ""
-	}
-	end := strings.IndexAny(line, "{ \t")
-	if end < 0 {
-		return line
-	}
-	return line[:end]
 }
 
 // usageSampleValue is the sample of a metric parsed from a single line, which

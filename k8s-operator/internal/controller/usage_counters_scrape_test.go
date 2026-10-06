@@ -278,6 +278,25 @@ func TestPodUsageSource_SkipsOtherLinesUnread(t *testing.T) {
 	}
 }
 
+// A line in the UTF-8 name-in-braces form the parser is configured to accept is
+// counted, not dropped. The prefilter matches the name as a substring and the
+// parser names the metric; the hand-rolled name read it replaced returned "" for
+// a line that opens with a brace and skipped it, under-counting the sample.
+func TestPodUsageSource_CountsAUTF8NamedLine(t *testing.T) {
+	body := strings.Join([]string{
+		`{"` + eventsInjectedSeries + `",cluster="c"} 9`,
+		eventsInjectedSeries + " 5",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Sample != 14 {
+		t.Errorf("sample = %d, want 14: the UTF-8 named line (9) plus the classic line (5)", reading.Sample)
+	}
+}
+
 // The transport is built by hand: no proxy function at all, so an HTTP_PROXY
 // in the operator's environment cannot take a pod-network GET; bounded
 // response headers; and a client that stops at the first redirect. Asserted
@@ -304,25 +323,5 @@ func TestPodUsageSource_TransportUsesNoProxyAndBoundsHeaders(t *testing.T) {
 	}
 	if source.client.Timeout != usageScrapeTimeout {
 		t.Errorf("client timeout = %v, want %v", source.client.Timeout, usageScrapeTimeout)
-	}
-}
-
-func TestUsageLineName(t *testing.T) {
-	cases := map[string]string{
-		"":                   "",
-		"# HELP x y":         "",
-		"   # HELP x y":      "",
-		"  name 1":           "name",
-		"	name{a=\"b\"} 1":   "name",
-		`name{a="b"} 1`:      "name",
-		"name 1":             "name",
-		"name\t1":            "name",
-		"name_only_no_value": "name_only_no_value",
-		`kubeagents_tool_invocations_total{tool="kubectl"} 2`: "kubeagents_tool_invocations_total",
-	}
-	for line, want := range cases {
-		if got := usageLineName(line); got != want {
-			t.Errorf("usageLineName(%q) = %q, want %q", line, got, want)
-		}
 	}
 }
