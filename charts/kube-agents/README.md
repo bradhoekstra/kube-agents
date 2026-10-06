@@ -516,6 +516,19 @@ to `null`/`""`, which **omits** the field and lets the CRD's own default apply
 — setting `false` is therefore distinct from leaving it unset, and `replicas: 0`
 means zero rather than unset.
 
+`platformAgent.deployment.credentialProxy.resources` sizes the credential-proxy
+container, the broker that runs every credentialed command in a pod of its own.
+It is forwarded to the CR's `spec.deployment.credentialProxy.resources` when any
+key is set, and the operator merges it over its defaults per key (500m CPU and
+512Mi requests; 1 CPU, 1Gi memory and 2Gi ephemeral-storage limits), so
+`limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The broker
+sizes how many commands it admits at once from that limit, which makes it the
+value to raise when the proxy is OOM-killed under a large fleet: an install whose
+scope resolved to about 140 clusters across 36 projects outgrew the default. The
+operator's webhook, where enabled, refuses a memory limit below 672Mi and a
+request above its limit, and warns when memory per CPU leaves the 1 to 6.5 GiB
+per vCPU band Autopilot admits unchanged. The quota preflight counts the override.
+
 #### PlatformAgent annotations
 
 `platformAgent.annotations` is copied onto the CR's `metadata.annotations`, and
@@ -700,7 +713,10 @@ have no replica count to multiply, and the pre-delete cleanup hook Job (one pod,
 sizes come from `files/footprint.yaml` because the chart cannot render them itself. The agent
 pod is multiplied by `platformAgent.deployment.availability.replicas`; the shell sandbox, the
 credential proxy and the PersistentVolumeClaims are not, because they do not scale with
-it. A replica count of `0` costs nothing, and a `resources` key you have pruned
+it. The credential proxy is counted with `platformAgent.deployment.credentialProxy.resources`
+merged over its footprint entry per key, as the operator renders it, so a raised limit is
+summed at the raised figure; a `PlatformAgent` edited by hand after the install is outside
+what the chart can see. A replica count of `0` costs nothing, and a `resources` key you have pruned
 (`--set litellm.resources.limits=null`) counts as zero rather than failing the render —
 though note that if a namespace ResourceQuota restricts that compute resource (such as
 `limits.cpu` or `limits.memory`), Kubernetes quota admission requires every container to
