@@ -78,11 +78,11 @@ Scion's launch primitive as a Phase-1 integration, [08](08-agent-runtime-and-ide
 
 ### 1.2 Per-tier field usage, cardinality & validation
 
-| `tier`           | Required scope fields                   | `parentRef`             | Cardinality     |
-| ---------------- | --------------------------------------- | ----------------------- | --------------- |
-| `platform`       | `projectId`                             | — (root)                | 1 per project   |
-| `cluster-admin`  | `projectId`, `clusterName`              | parent = platform agent | 1 per cluster   |
-| `developer-team` | `projectId`, `clusterName`, `namespace` | parent = cluster-admin  | 1 per namespace |
+| `tier`           | Required scope fields                                                    | `parentRef`             | Cardinality     |
+| ---------------- | ------------------------------------------------------------------------ | ----------------------- | --------------- |
+| `platform`       | `projectId` (the management project), `scope` (the resolved project set) | — (root)                | 1 per scope     |
+| `cluster-admin`  | `projectId`, `clusterName`                                               | parent = platform agent | 1 per cluster   |
+| `developer-team` | `projectId`, `clusterName`, `namespace`                                  | parent = cluster-admin  | 1 per namespace |
 
 **Validation (v1).** The `Agent` CR + its identity manifests are reviewed on the PR (the review-gate).
 **Cardinality — exactly one agent per `(tier, scope)` — is enforced by the controller's validating

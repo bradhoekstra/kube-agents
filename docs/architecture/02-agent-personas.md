@@ -13,7 +13,7 @@
 ## TL;DR
 
 `kube-agents` defines **three agent personas**, one per level of the Kubernetes containment
-hierarchy: the **Platform Agent** (1 per project), the **Cluster Admin Agent** (1 per cluster), and
+hierarchy: the **Platform Agent** (1 per scope, one or more projects), the **Cluster Admin Agent** (1 per cluster), and
 the **Developer Team Agent** (1 per namespace). Each persona shares a common anatomy — a `SOUL.md`
 identity, a config, a scoped skill set, memory, event triggers with a heartbeat backstop, and a
 controller-reconciled pod — but differs in **scope, authority, skills, and permissions**.
@@ -26,11 +26,11 @@ This is the end-state roster; the Platform Agent exists today, the other two are
 
 ## 1. The roster
 
-| Persona                  | Scope                  | Cardinality     | Owns / governs                                                               | Bounded by                                         |
-| ------------------------ | ---------------------- | --------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
-| **Platform Agent**       | GCP/cloud **project**  | 1 per project   | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
-| **Cluster Admin Agent**  | A single **cluster**   | 1 per cluster   | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents    | Platform Agent policy + project guardrails         |
-| **Developer Team Agent** | A single **namespace** | 1 per namespace | Workloads within its namespace                                               | Cluster Admin policy + cluster/project guardrails  |
+| Persona                  | Scope                                      | Cardinality     | Owns / governs                                                               | Bounded by                                         |
+| ------------------------ | ------------------------------------------ | --------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
+| **Platform Agent**       | GCP/cloud **scope** (one or more projects) | 1 per scope     | The fleet: clusters, cross-cluster policy, global RBAC, Cluster Admin Agents | Human platform team + project-level approval gates |
+| **Cluster Admin Agent**  | A single **cluster**                       | 1 per cluster   | Cluster internals: node pools, add-ons, namespaces, Developer Team Agents    | Platform Agent policy + project guardrails         |
+| **Developer Team Agent** | A single **namespace**                     | 1 per namespace | Workloads within its namespace                                               | Cluster Admin policy + cluster/project guardrails  |
 
 Every persona serves SRE critical user journeys within its own scope (see
 [01-vision-scope.md](01-vision-scope.md) §3); SRE is not a separate persona.
@@ -266,7 +266,7 @@ for a delegation too, and the child task's envelope names the target and the sam
 
 ## 3. Persona: Platform Agent (project scope)
 
-**Cardinality:** 1 per project. **Exists today** (`agents/platform/`).
+**Cardinality:** 1 per scope — one project by default, the projects `spec.scope` declares otherwise. **Exists today** (`agents/platform/`).
 
 ### Role
 
@@ -284,8 +284,8 @@ human chat entrypoint into the harness and the authority at the project level.
 
 ### Authority & limits
 
-- **Read-only, scoped to its one project** (the project's clusters/fleet) — it cannot read or reach
-  another project. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
+- **Read-only, scoped to its declared scope** (the clusters of the projects, folders and organisations
+  `spec.scope` names; one project by default) — it cannot read or reach a project outside its declared scope. It proposes changes — including child `Agent` CRs — to the GitOps repo; it holds
   no direct cluster/cloud write (see §2.2, [03](03-security-model.md) §3).
 - All infrastructure mutation is declarative (git-reviewed + CI/CD pipeline), never direct `kubectl` (per
   `SOUL.md §1`, §3).
@@ -481,7 +481,7 @@ the platform-tier instance ([07](07-implementation-roadmap.md)).
 
 A harness confirms this doc's design with:
 
-- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per project**;
+- **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per scope** (one `PlatformAgent` per management cluster, whatever its scope declares);
   `-l kube-agents/tier=cluster-admin` exactly **1 per cluster**; `-l kube-agents/tier=developer-team`
   exactly **1 per namespace**. A second `Agent` CR for the same `(tier, scope)` is **rejected by the
   controller's cardinality webhook**.
