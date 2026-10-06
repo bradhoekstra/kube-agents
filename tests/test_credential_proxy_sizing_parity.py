@@ -13,6 +13,14 @@ or crossing the operator's default requests and limits, from copies of its own.
 Each side declares its own copy, so nothing but this test stops one moving
 without the others. The files are read as text: importing the broker pulls in
 its runtime dependencies.
+
+The output cap has one source: `credentialProxyMaxOutputBytes` in
+`k8s-operator/internal/controller/platformagent_manifests.go`. The operator
+derives its floor from it and sets it on the broker as
+`CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`, the `max_output_bytes` the broker's
+`OUTPUT_COPIES_PER_COMMAND * max_output_bytes` multiplies (the broker's own
+fallback, used only without the operator, is not the deployed cap). This test
+reads the cap from that constant rather than declaring one.
 """
 
 from __future__ import annotations
@@ -25,9 +33,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BROKER = REPO_ROOT / "agents/platform/scripts/credential_proxy.py"
 OPERATOR = REPO_ROOT / "k8s-operator/internal/controller/credential_proxy_manifests.go"
 CHART_HELPERS = REPO_ROOT / "charts/kube-agents/templates/_helpers.tpl"
+OPERATOR_MANIFESTS = REPO_ROOT / "k8s-operator/internal/controller/platformagent_manifests.go"
 MEBIBYTE = 1024 * 1024
-DEFAULT_OUTPUT_CAP_BYTES = 8 * MEBIBYTE
-FLOOR_AT_DEFAULT_OUTPUT_CAP_BYTES = 672 * MEBIBYTE
+FLOOR_AT_OPERATOR_OUTPUT_CAP_BYTES = 672 * MEBIBYTE
 
 # (broker name, operator name, whether the figure is in MiB on both sides).
 TERMS = (
@@ -68,6 +76,11 @@ def operator_terms() -> dict[str, int]:
         else:
             terms[name] = _match(rf"^\s*{name}\s+int64\s*=\s*(\d+)\s*$", text, OPERATOR)
     return terms
+
+
+def operator_output_cap_bytes() -> int:
+    text = OPERATOR_MANIFESTS.read_text(encoding="utf-8")
+    return _match(r'^\s*credentialProxyMaxOutputBytes\s*=\s*"(\d+)"', text, OPERATOR_MANIFESTS)
 
 
 # (chart side, chart key, operator constant) for the defaults the chart merges over.
@@ -136,17 +149,18 @@ class CredentialProxySizingParityTest(unittest.TestCase):
                     "credential_proxy_manifests.go differ; change them together",
                 )
 
-    def test_both_sides_derive_the_same_floor_at_the_default_output_cap(self):
+    def test_both_sides_derive_the_same_floor_at_the_operators_output_cap(self):
         broker = broker_terms()
         operator = operator_terms()
-        broker_floor = floor_bytes(*(broker[name] for name, _, _ in TERMS), DEFAULT_OUTPUT_CAP_BYTES)
-        operator_floor = floor_bytes(*(operator[name] for _, name, _ in TERMS), DEFAULT_OUTPUT_CAP_BYTES)
-        self.assertEqual(FLOOR_AT_DEFAULT_OUTPUT_CAP_BYTES, broker_floor)
-        self.assertEqual(FLOOR_AT_DEFAULT_OUTPUT_CAP_BYTES, operator_floor)
+        cap = operator_output_cap_bytes()
+        broker_floor = floor_bytes(*(broker[name] for name, _, _ in TERMS), cap)
+        operator_floor = floor_bytes(*(operator[name] for _, name, _ in TERMS), cap)
+        self.assertEqual(FLOOR_AT_OPERATOR_OUTPUT_CAP_BYTES, broker_floor)
+        self.assertEqual(FLOOR_AT_OPERATOR_OUTPUT_CAP_BYTES, operator_floor)
 
     def test_the_chart_declares_the_same_floor(self):
         operator = operator_terms()
-        operator_floor = floor_bytes(*(operator[name] for _, name, _ in TERMS), DEFAULT_OUTPUT_CAP_BYTES)
+        operator_floor = floor_bytes(*(operator[name] for _, name, _ in TERMS), operator_output_cap_bytes())
         self.assertEqual(
             chart_floor_bytes(),
             operator_floor,
