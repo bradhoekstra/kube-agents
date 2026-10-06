@@ -3644,7 +3644,12 @@ class ScopeSelectorApisTest(unittest.TestCase):
                 "esac\nexit 1\n"
             )
             (bin_dir / "gcloud").chmod(0o755)
+            # Every key the helper reads is blanked here, the pool's switch and
+            # the container keys beside the selectors', so a developer's shell
+            # (`set -a; source install.env`) cannot arm the pool in a case that
+            # did not; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_SHARED_VPC_HOSTS": "", "SCOPE_METRICS_SCOPES": "",
+                   "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "", "SCOPED_SA_POOL_ENABLED": "",
                    "GCLOUD_LOG": str(log)}
             env.update(keys)
             body = (
@@ -3876,7 +3881,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             # gcloud's credential variables straight from the environment, so a
             # developer's shell must not reach them; each case sets its own.
             env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
-                   "SCOPE_PROBE_LOG": str(probe_log)}
+                   "SCOPED_SA_POOL_ENABLED": "", "SCOPE_PROBE_LOG": str(probe_log)}
             env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
             env.update(keys or {})
             env.update(env_extra or {})

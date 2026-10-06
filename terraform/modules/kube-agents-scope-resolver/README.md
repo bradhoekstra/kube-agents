@@ -72,7 +72,14 @@ cluster and lists to an empty list) is refused, a container whose clusters are i
 than 500 clusters under the container) is refused whatever `member_cap` is, as a Shared VPC host's
 second page is. An exact `exclude_projects` entry drops a member from the pool; a glob is the
 reconcile's alone. A member with a legacy domain-scoped ID is left out, listed in
-`uncarriable_members` under the container's key and warned about by the same `check` block.
+`uncarriable_members` under the container's key and warned about by the same `check` block; the
+management project (`quota_project`) is left out of a container's members whatever its ID, and is in
+neither list, since `kube-agents-iam` seeds the pool with it itself. The search is eventually
+consistent and the plan carries no state to grace an index gap with, so a container the index
+answers with no cluster at all is warned about by a second `check` block (applying that answer
+destroys every member's pool account; re-plan later, or pin the projects in `scope.projects`, which
+does not depend on the index), while a shorter but non-empty answer is applied as read, the limit
+the design records.
 
 ## Why a module of its own
 

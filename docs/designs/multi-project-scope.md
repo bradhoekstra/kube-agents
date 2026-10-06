@@ -422,7 +422,7 @@ measured here, so it stays host-only until it is (§11).
 
 Inheritance is the point of offering containers at all. A folder-level binding reaches every
 project beneath it, including one created tomorrow, so onboarding a new project under a declared
-folder is zero-touch for discovery and IAM: it appears at the next hourly reconcile with no change to the CR, the tfvars, or the IAM. With the pool armed (below), its account arrives with the next apply, and its clusters are refused by the broker until then. That is the answer to "maintaining the list over time": the list is a container, and
+folder is zero-touch for discovery and IAM: it appears at the next hourly reconcile with no change to the CR, the tfvars, or the IAM. With the pool armed (below), its account arrives with the next apply, and its clusters are refused by the broker until then. The plan-time listing is one answer from the same eventually consistent index, and unlike the reconcile's rule below it has no grace, since a plan carries no state to grace with: a project the index leaves out on one plan loses its pool account on that apply and gets a new one, under a new unique ID, on the next; the resolver warns when a container answers no member at all, and a project pinned in `scope.projects` does not depend on the index. That is the answer to "maintaining the list over time": the list is a container, and
 GCP maintains it.
 
 The same inheritance widens the blast radius of the one service account that holds these roles,

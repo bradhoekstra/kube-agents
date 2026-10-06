@@ -129,9 +129,69 @@ run "a_legacy_id_member_is_left_out_and_warned" {
   expect_failures = [check.selector_members_the_scope_can_carry]
 }
 
-# A container with no cluster answers with no `results` key: an empty list,
-# not a refusal, and the key is present for kube-agents-iam's precondition.
-run "a_container_with_no_cluster_resolves_to_an_empty_list" {
+# The management project is the pool's unconditionally (kube-agents-iam seeds
+# it and drops it from a container's members itself), so a folder whose
+# clusters include its own lists it in neither container_members nor
+# uncarriable_members, whichever ID form it has, and the check stays quiet.
+run "the_management_project_is_not_a_container_member" {
+  command = plan
+
+  override_data {
+    target = data.http.scope_container["folders/123456789012"]
+    values = {
+      status_code = 200
+      response_body = jsonencode({ results = [
+        { name = "//container.googleapis.com/projects/mgmt-project-1/locations/us-central1/clusters/mgmt" },
+        { name = "//container.googleapis.com/projects/fleet-proj-a/locations/us-central1/clusters/prod" },
+      ] })
+    }
+  }
+
+  assert {
+    condition     = jsonencode(output.container_members) == jsonencode({ "folders/123456789012" = ["fleet-proj-a"] })
+    error_message = "container_members: ${jsonencode(output.container_members)}"
+  }
+  assert {
+    condition     = output.uncarriable_members == {}
+    error_message = "uncarriable: ${jsonencode(output.uncarriable_members)}"
+  }
+}
+
+run "a_legacy_management_project_is_neither_a_member_nor_uncarriable" {
+  command = plan
+
+  variables {
+    quota_project = "example.com:mgmt-project"
+  }
+
+  override_data {
+    target = data.http.scope_container["folders/123456789012"]
+    values = {
+      status_code = 200
+      response_body = jsonencode({ results = [
+        { name = "//container.googleapis.com/projects/example.com:mgmt-project/locations/us-central1/clusters/mgmt" },
+        { name = "//container.googleapis.com/projects/fleet-proj-a/locations/us-central1/clusters/prod" },
+      ] })
+    }
+  }
+
+  assert {
+    condition     = jsonencode(output.container_members) == jsonencode({ "folders/123456789012" = ["fleet-proj-a"] })
+    error_message = "container_members: ${jsonencode(output.container_members)}"
+  }
+  assert {
+    condition     = output.uncarriable_members == {}
+    error_message = "the management project gets its pool account regardless, so it is not uncarriable: ${jsonencode(output.uncarriable_members)}"
+  }
+}
+
+# A container that answers no member at all, with no `results` key or an
+# empty one, lists to an empty list, not a refusal, and the key is present
+# for kube-agents-iam's precondition; but the search is eventually
+# consistent and the plan has no state to grace an index gap with, so an
+# empty answer for a listed container is warned about, since applying it
+# retires every member's pool account.
+run "a_container_with_no_cluster_resolves_to_an_empty_list_and_is_warned" {
   command = plan
 
   override_data {
@@ -143,6 +203,24 @@ run "a_container_with_no_cluster_resolves_to_an_empty_list" {
     condition     = jsonencode(output.container_members) == jsonencode({ "folders/123456789012" = [] })
     error_message = "container_members: ${jsonencode(output.container_members)}"
   }
+
+  expect_failures = [check.listed_containers_name_a_member]
+}
+
+run "an_empty_results_array_is_warned_the_same_way" {
+  command = plan
+
+  override_data {
+    target = data.http.scope_container["folders/123456789012"]
+    values = { status_code = 200, response_body = jsonencode({ results = [] }) }
+  }
+
+  assert {
+    condition     = jsonencode(output.container_members) == jsonencode({ "folders/123456789012" = [] })
+    error_message = "container_members: ${jsonencode(output.container_members)}"
+  }
+
+  expect_failures = [check.listed_containers_name_a_member]
 }
 
 # The pool off: no container is read, whatever is declared, and the output is

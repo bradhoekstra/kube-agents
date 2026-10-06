@@ -387,16 +387,25 @@ data "http" "scope_container" {
 
 locals {
   # Every project the search named under each container, by ID, distinct and
-  # sorted, less an exact exclude entry; a legacy domain-scoped ID takes the
-  # host path -- left out of `container_members`, reported in
-  # `uncarriable_members` and by the check below -- since no pool account can
-  # be keyed on an ID the CRD's patterns refuse.
-  scope_container_named = {
+  # sorted, as the index answered it: what the empty-answer check below reads.
+  scope_container_listed = {
     for container, response in data.http.scope_container :
     container => response.status_code == 200 && can(keys(jsondecode(response.response_body))) ? sort(distinct(compact([
       for result in try(jsondecode(response.response_body).results, []) :
       try(regex(local.scope_cluster_asset_name_pattern, result.name)["project"], "")
     ]))) : []
+  }
+  # The same less the management project, which kube-agents-iam seeds the
+  # pool with unconditionally and drops from a container's members itself, so
+  # it is neither a member here nor, when its ID is a legacy domain-scoped one
+  # (quota_project admits that form), uncarriable: it gets its pool account
+  # regardless. Then less an exact exclude entry; a legacy domain-scoped ID
+  # takes the host path -- left out of `container_members`, reported in
+  # `uncarriable_members` and by the check below -- since no pool account can
+  # be keyed on an ID the CRD's patterns refuse.
+  scope_container_named = {
+    for container, listed in local.scope_container_listed :
+    container => [for member in listed : member if member != var.quota_project]
   }
   scope_container_members = {
     for container, named in local.scope_container_named :
@@ -408,6 +417,24 @@ locals {
     if length([for member in named : member if !can(regex(local.scope_project_id_pattern, member))]) > 0
   }
   scope_uncarriable = merge(local.scope_selector_uncarriable, local.scope_container_uncarriable)
+  # The listed containers the index answered with no cluster at all, before
+  # the management project and the excludes are taken out: what the
+  # empty-answer check below names.
+  scope_containers_answered_empty = sort([for container, listed in local.scope_container_listed : container if length(listed) == 0])
+}
+
+# A warning, not a refusal: Cloud Asset Inventory search is eventually
+# consistent, and where the reconcile keeps a member the index omits for a day
+# (design §7, INDEX_LAG_GRACE_SECONDS) the plan carries no state to grace one
+# with, so it applies the answer as read. The shape an index gap most often
+# takes, and the one that empties a whole container's pool in one apply, is a
+# container answered with no member at all; that is what this names. A
+# shorter but non-empty answer is not told apart from a project that left.
+check "listed_containers_name_a_member" {
+  assert {
+    condition     = length(local.scope_containers_answered_empty) == 0
+    error_message = "folders / organizations: the Cloud Asset API named no GKE cluster under ${join(", ", local.scope_containers_answered_empty)}, so the scoped service account pool would list no member there. The search is eventually consistent and the plan carries no state to grace an index gap with: for a container known to hold clusters an empty answer is more likely index lag than an empty container, and applying it would destroy every member's pool account, each re-created under a new unique ID on the plan the index answers again. Re-plan later, or pin the projects wanted in scope.projects, which does not depend on the index."
+  }
 }
 
 # A warning, not a refusal: the member is not in the set, and the plan says so

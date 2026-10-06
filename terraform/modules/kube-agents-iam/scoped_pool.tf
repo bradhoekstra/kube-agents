@@ -30,8 +30,15 @@
 # and are not counted at plan. So the container grant and discovery stay
 # zero-touch while pool membership under a container lags: a project created
 # beneath it since the last apply is refused by the broker until the next
-# apply lists it. An exact `exclude.projects` entry drops a member from the
-# pool; a glob is the reconcile's alone. The pool is armed by
+# apply lists it. The listing is one answer from an eventually consistent
+# index, and the plan carries no state to grace it with, unlike the
+# reconcile's day for a member the index omits: a project the index leaves
+# out on one plan loses its account on that apply and gets a new one, under
+# a new unique ID, on the next (the resolver warns when a container answers
+# no member at all, the shape an index gap most often takes); a project
+# pinned in `scope.projects` does not depend on the index. An exact
+# `exclude.projects` entry drops a member from the pool; a glob is the
+# reconcile's alone. The pool is armed by
 # `scoped_pool_enabled` alone, off by default and independent of the scope, so
 # declaring `projects` arms nothing.
 #
