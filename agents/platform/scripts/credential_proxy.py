@@ -176,7 +176,7 @@ OUTPUT_COPIES_PER_COMMAND = 6
 # is slower than the OOM exposure the budget prevents, and the case is real --
 # GKE Autopilot without bursting sets a container's limits equal to its
 # requests, so the proxy's limit there is its 512Mi request. The operator's
-# sizing test and the admission webhook hold the limit to the same floor
+# sizing test holds the limit to the same floor
 # (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
 BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # Where the limit comes from, in order: the operator's Downward API variable,
@@ -5080,7 +5080,8 @@ class CommandExecutor:
         vcs verb refreshing its credential -- or, from the refresh route and
         the cron behind it, inside none. A call that no reservation covers
         takes a transient one in `_execute` for the helper's lifetime; on the
-        refresh route and the cron, `refresh_forge_credential` reserves before
+        refresh route, which the cron reaches over HTTP
+        (github_token_refresh.py), `refresh_forge_credential` reserves before
         it takes the refresh lock, so no budget wait happens under the lock.
         It is a short call to the minter either way, not a listing.
         """
@@ -5912,8 +5913,9 @@ class CommandExecutor:
         written (`request_slot`), so every command a request runs -- the
         kubeconfig cache-fill made under `_kubeconfig_lock` included -- is
         covered by the one its request holds, and no lock is ever held while
-        waiting for admission. A thread that holds no reservation and is not
-        the store's takes a transient one for the child's lifetime.
+        waiting for admission. While the budget is on, a thread that holds no
+        reservation and is not the store's takes a transient one for the
+        child's lifetime.
         """
         root = containment_root or self.workspace_dir
         command_cwd = root

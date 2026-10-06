@@ -129,16 +129,17 @@ const (
 	// The child memory budget's terms, in bytes, as the broker declares them
 	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
 	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
-	// OUTPUT_COPIES_PER_COMMAND). Declared here rather than in the test so the
-	// sizing test and the admission webhook's floor read one copy; the design
+	// OUTPUT_COPIES_PER_COMMAND). The sizing test reads them; they are
+	// declared here rather than in the test so that a later admission check
+	// can read the same copy. The design
 	// (docs/designs/credential-proxy-child-memory-budget.md §2.2) is why each
 	// is the size it is. Change the Python side in the same commit.
 	credentialProxyResidentReserveBytes   int64 = 192 << 20
 	credentialProxyWorkspaceReserveBytes  int64 = 128 << 20
 	credentialProxyRequestReserveBytes    int64 = 128 << 20
 	credentialProxyOutputCopiesPerCommand int64 = 6
-	// credentialProxyMinimumAdmittedRequests is the floor the sizing test and
-	// the webhook hold the limit to: fewer than two and a listing phase cannot
+	// credentialProxyMinimumAdmittedRequests is the floor the sizing test
+	// holds the limit to: fewer than two and a listing phase cannot
 	// parallelise at all. The broker's counterpart is
 	// BUDGET_MINIMUM_ADMITTED_REQUESTS in credential_proxy.py.
 	credentialProxyMinimumAdmittedRequests int64 = 2
