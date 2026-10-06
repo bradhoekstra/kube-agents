@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Step 0 of the smoke-test presubmit: reuse a pull request's own green verdict
+# Step 0 of the smoke-test presubmit: reuse a pull request's own verdict
 # ==============================================================================
-# Exits 0 when every pull request this job is testing already holds a green
+# Exits 0 when every pull request this job is testing already holds a
 # verdict this run could only repeat, and 1 (one "Step 0: full run:" line
 # naming the reason) when it does not. The Prow job runs this BEFORE it
 # leases an evaluation project, so a reused verdict costs a pod start and a
@@ -10,7 +10,7 @@
 # matrix; hack/ci-eval-pr.sh runs it again as its own first step for a job
 # definition that has not yet hoisted it, where it saves the matrix alone.
 #
-# Two things count as a verdict this run could only repeat. The first is a
+# Three things count as a verdict this run could only repeat. The first is a
 # green build at THIS head (#1202): Tide credits a presubmit only against the
 # base SHA it ran on, so every merge to main retests, or batches, every other
 # green pull request whose head has not changed -- over the three weeks to
@@ -35,7 +35,33 @@
 # excuse it: it predates the first and answers a push, which is the
 # author's act, where the first answers a retest nobody asked for. Widening
 # it is a separate decision with its own record, not a consequence of this
-# one.
+# one. The third is an admin /override of this job's context at THIS head:
+# the override plugin posts a success status reading "Overridden by <user>"
+# (kubernetes-sigs/prow, pkg/plugins/override), which only a repository
+# admin can obtain, and it is the admin's decision that this head merges
+# without the job passing. A retest Tide starts after main moves posts
+# `pending` over that status and, run in full, comes back with whatever red
+# the override was given for -- so the override had to be repeated after
+# every merge, and the phantom retest Tide starts on a pull request it has
+# just merged by override ran the whole matrix for nobody (#2464 on
+# 2026-10-06: two overrides six minutes apart, then a phantom). Reusing
+# the override is the same trade as reusing a green, at the admin's
+# standing instead of the job's. It is read at the current head only -- a
+# push clears an override, as the plugin documents -- and a later
+# `/override-cancel` on the head ("Override cancelled by <user>", a failure
+# status) withdraws it. The override is checked first, before the job
+# history: it needs no GCS record, and the pull request it answers usually
+# has none that passed. A reuse exits 0, and Prow then writes a passed build
+# at the head that the first two rules would read as a green -- which would
+# carry an override past a cancel and, through the inert rule, onto heads
+# the admin never saw. So a reuse that rests on an override records itself:
+# REVALIDATION_OVERRIDE_MARKER in the build's artifacts, written only once
+# every pull holds a verdict, and a passed build carrying it is skipped by
+# the green scan as an override's standing rather than a run. A reuse of a
+# green is not marked: a build that reused a real green is attested in its
+# own right, and marking it would push the real green past the scan's depth
+# on a pull request Tide retests often. A run that cannot record the marker
+# (no ARTIFACTS directory, an unwritable one) does not reuse an override.
 #
 # A batch job (Tide testing several pull requests merged together) is
 # revalidated pull by pull: every one must hold a reusable verdict, else the
@@ -46,13 +72,23 @@
 # unparsable record, a commit the checkout does not have, any file escaping
 # the inert list, one pull of a batch without a verdict -- is one log line
 # and a full run. The first run on a pull request has no green history, so
-# it is always a full run. EVAL_SKIP_REVALIDATION=1 is the escape hatch: it
+# it is a full run unless an admin overrode the head before it. EVAL_SKIP_REVALIDATION=1 is the escape hatch: it
 # forces a full run for debugging a suspect reuse.
 #
 # One asymmetry is deliberate: the NEWEST GREEN wins -- the newest at this
 # head when there is one, else the newest at any -- so a newer red full run
 # at the same head, or at inert distance from an older green, is overridden
-# on the next trigger. For an inert delta that is the same judgement a
+# on the next trigger. The same holds for an /override: a later aborted or
+# red run at the head does not withdraw it; only a cancel does, and this
+# Prow build has no /override-cancel (its command help lists /override
+# alone), so on it an override stands until a push, or until an operator
+# forces every run full with EVAL_SKIP_REVALIDATION=1 in oss-test-infra.
+# Before this rule a lost re-pin race put the overridden job back through
+# the matrix, which was no recall anyone could invoke, only one that
+# sometimes happened. The reuse exits 0, so what crier then posts on the
+# head is an ordinary "Job succeeded." status; the /override comment and the
+# REVALIDATED line in the build log are the record that it was an override,
+# and the check UI no longer says so. For an inert delta that is the same judgement a
 # passing /retest would render -- the delta cannot feed the eval differently,
 # so the red was flake or infrastructure by construction. For the same head
 # it is not: a full run that reached the matrix at a newer base (a step-0
@@ -79,9 +115,21 @@
 # pending run does not erase an earlier build's success event; verified
 # against #1127's head 50e0f44f). The SHAs are also required to be 40-hex
 # before any git command sees them, so a forged record cannot smuggle
-# arguments.
+# arguments. An /override has no GCS record to bind to, so its binding is
+# the poster and the pull request: the event must be the Prow bot's own
+# (creator login REVALIDATION_STATUS_POSTER), carry the plugin's
+# description, and name this pull request in its URL
+# (REVALIDATION_PULL_URL_PREFIX), since a commit's statuses are shared by
+# every pull request that contains it. The plugin writes that description
+# only after GitHub confirmed the commenter is a repository admin -- on
+# this build; upstream also honours allowed_github_teams and
+# allow_top_level_owners, and prow/oss/plugins.yaml in oss-test-infra sets
+# neither for the plugin, so widening it there widens who step 0 trusts. A copy of that description under another login -- the sticky
+# re-pin's, posted with a workflow token -- is not read as one; the
+# original event is still on the head beside it.
 #
-# GitHub read credential. The attestation read is made with a one-hour token
+# GitHub read credential. Both status reads -- the override's and the
+# attestation's, one read per head -- are made with a one-hour token
 # minted from the ledger-reader App's key when EVAL_LEDGER_APP_KEY_FILE is
 # set -- hack/ledger_token_mint.py, the mint hack/ci-eval-pr.sh uses for
 # grading, narrowed here to metadata: read, which is enough to list a public
@@ -138,10 +186,47 @@ readonly REVALIDATION_DEFAULT_BASE_REF="main"
 # above). Read with the credential revalidation_read_credential chooses
 # (header, "GitHub read credential").
 readonly REVALIDATION_STATUS_API="https://api.github.com/repos/gke-labs/kube-agents/commits"
+# What the override plugin posts, and who: the Prow bot's login on this
+# build, and the description prefixes of an /override and of its
+# `/override-cancel` (kubernetes-sigs/prow, pkg/plugins/override:
+# overrideDescriptionPrefix and cancelDesc; the cancel is honoured for the
+# day this Prow build carries it, which today it does not). The description
+# is matched as a prefix because the events carry suffixes: on this build
+# crier's report of the override's ProwJob has the `BaseSHA:` one, upstream's
+# plugin now stamps its own status with it too, and upstream's sticky
+# variant appends a sentinel.
+readonly REVALIDATION_STATUS_POSTER="google-oss-prow[bot]"
+readonly REVALIDATION_OVERRIDE_PREFIX="Overridden by"
+readonly REVALIDATION_OVERRIDE_CANCEL_PREFIX="Override cancelled by"
+# A commit's statuses are shared by every pull request that contains it, so
+# an override is bound to THIS pull request through the URL its events
+# carry: crier's report of the override's ProwJob points at the /override
+# comment, "<pull URL prefix>/<number>#issuecomment-<id>", and the plugin's
+# own status keeps the Spyglass URL of the build it overrode, under this
+# pull request's history path. An event naming neither is another pull
+# request's override of the same commit.
+readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/pull"
 # How many of the newest builds to inspect for a green one. Each costs one
 # gsutil cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
 readonly REVALIDATION_HISTORY_LIMIT=20
+# The status read pages through GitHub's newest-first events (100 a page,
+# following `Link: rel="next"`) up to this many pages. One page is not
+# enough: the sticky re-pin posts a copy on every open head after every
+# merge to main -- about two dozen a day -- so the one Prow-bot event an
+# override binds to is past the first hundred within days, where a green's
+# attestation matches the re-pin copies themselves (they carry the build's
+# URL). Ten pages is a thousand events, some six weeks of re-pins at an
+# unchanged head; past that the read stops and what it has is searched, so
+# an event further back is simply not found -- an absent override, an
+# unattested green -- and the run falls through to whatever else holds.
+readonly REVALIDATION_STATUS_PAGE_SIZE=100
+readonly REVALIDATION_STATUS_PAGE_LIMIT=10
+# The record a reuse that rests on an /override leaves in the build's
+# artifacts (header, the third kind of verdict): Prow's sidecar uploads the
+# ARTIFACTS directory beside finished.json, so the green scan can tell such
+# a build from a run and skip it. Its content names what was reused.
+readonly REVALIDATION_OVERRIDE_MARKER="step0-reused-override.json"
 # What Prow exports as JOB_TYPE for a Tide batch, whose pulls arrive in
 # PULL_REFS as "<base_ref>:<base_sha>,<number>:<sha>[,...]" (each pull entry
 # may carry a third ":<ref>" field) with no PULL_NUMBER or PULL_PULL_SHA.
@@ -163,6 +248,71 @@ readonly REVALIDATION_MINT_BODY='{"permissions":{"metadata":"read"}}'
 readonly REVALIDATION_MINT_RETRYABLE=75
 readonly REVALIDATION_STATUS_TIMEOUT_SECONDS=30
 readonly REVALIDATION_USER_AGENT="kube-agents-ci-revalidate"
+
+# A head's status events are read once per run and kept here, keyed by SHA:
+# the override check reads the current head, and the attestation reads the
+# green build's head, which on a retest is the same one -- one read, and a
+# refused read is refused once, never asked again under the same credential.
+# Outcome is "ok", "http <code>" or "error <name>"; the body is kept only
+# for "ok". Global so the functions below share them whichever is called
+# first; the driver empties both at the start of a run.
+declare -gA REVALIDATION_STATUS_OUTCOME=()
+declare -gA REVALIDATION_STATUS_BODY=()
+
+# revalidation_fetch_statuses <sha>: fills the two maps for that head,
+# reading GitHub only the first time; the caller then reads
+# REVALIDATION_STATUS_OUTCOME[<sha>] itself. (Called directly, never in a
+# command substitution: a subshell's cache would be lost on return.) The
+# read carries the credential
+# revalidation_read_credential chose, handed to python through its
+# environment so it is on no argv. One attempt: a read GitHub refuses names
+# its HTTP code, with no second, anonymous try (header, "GitHub read
+# credential").
+revalidation_fetch_statuses() {
+  local sha="$1"
+  if [ -z "${REVALIDATION_STATUS_OUTCOME[${sha}]:-}" ]; then
+    local fetched
+    fetched="$(REVALIDATION_STATUS_TOKEN="${REVALIDATION_STATUS_TOKEN:-}" python3 -c '
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+import re
+
+url, timeout, agent, page_limit = sys.argv[1], int(sys.argv[2]), sys.argv[3], int(sys.argv[4])
+headers = {"Accept": "application/vnd.github+json", "User-Agent": agent}
+token = os.environ.get("REVALIDATION_STATUS_TOKEN")
+if token:
+    headers["Authorization"] = "Bearer " + token
+statuses = []
+pages = 0
+# Newest first, a page at a time, following the Link header GitHub sets while
+# there is a next page; the cap bounds a head with years of events.
+while url and pages < page_limit:
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
+            statuses.extend(json.load(response))
+            link = response.headers.get("Link") or ""
+    except urllib.error.HTTPError as exc:
+        print("http", exc.code)
+        sys.exit(0)
+    except Exception as exc:
+        print("error", type(exc).__name__)
+        sys.exit(0)
+    pages += 1
+    found = re.search(r"<([^>]+)>;\s*rel=\"next\"", link)
+    url = found.group(1) if found else None
+print("ok")
+print(json.dumps(statuses))
+' "${REVALIDATION_STATUS_API}/${sha}/statuses?per_page=${REVALIDATION_STATUS_PAGE_SIZE}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" "${REVALIDATION_USER_AGENT}" "${REVALIDATION_STATUS_PAGE_LIMIT}" 2>/dev/null)" || fetched="error python3"
+    REVALIDATION_STATUS_OUTCOME[${sha}]="${fetched%%$'\n'*}"
+    if [ "${REVALIDATION_STATUS_OUTCOME[${sha}]}" = "ok" ]; then
+      REVALIDATION_STATUS_BODY[${sha}]="${fetched#*$'\n'}"
+    fi
+  fi
+}
 
 _revalidation_print_delta() { # <label> <range> <files-or-empty>
   echo "${1} (${2}):"
@@ -198,18 +348,119 @@ revalidation_read_credential() {
   return 0
 }
 
+# revalidate_override_at_head <number> <head-sha> <base-sha>
+# The third kind of verdict (header): returns 0 when GitHub holds an
+# /override of this job's context on the head, posted by the Prow bot and
+# not withdrawn by a later cancel, and 1 otherwise. It prints no "Step 0:
+# full run:" line -- the job history is read next and names the reason --
+# but a refused read and a cancelled override are each noted, so neither is
+# lost behind the history's reason. The head's events come from the
+# per-run cache, so the attestation that follows a fall-through does not
+# read the same head again.
+revalidate_override_at_head() {
+  local pull_number="$1" cur_head="$2" cur_base="$3"
+  # Without somewhere to record the reuse (header: the marker), an override
+  # is not consulted at all; the green history, which needs no record, is.
+  # Prow's decoration exports ARTIFACTS; step 0 runs before anything else in
+  # the job writes there, so the directory is made rather than assumed.
+  if [ -z "${ARTIFACTS:-}" ] || ! mkdir -p "${ARTIFACTS}" 2>/dev/null; then
+    echo "Step 0: no ARTIFACTS directory to record a reused /override in (ARTIFACTS=${ARTIFACTS:-unset}), so no /override is consulted; the job history is read next"
+    return 1
+  fi
+  revalidation_fetch_statuses "${cur_head}"
+  local outcome="${REVALIDATION_STATUS_OUTCOME[${cur_head}]}"
+  case "${outcome}" in
+    ok) ;;
+    http\ *)
+      echo "Step 0: GitHub answered HTTP ${outcome#http } reading statuses for ${cur_head} for an /override; the job history is read next"
+      return 1 ;;
+    *)
+      echo "Step 0: could not read GitHub statuses for ${cur_head} for an /override (${outcome#error }); the job history is read next"
+      return 1 ;;
+  esac
+  local found comment_url_prefix history_url_prefix
+  comment_url_prefix="${REVALIDATION_PULL_URL_PREFIX}/${pull_number}#"
+  history_url_prefix="${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/"
+  found="$(printf '%s' "${REVALIDATION_STATUS_BODY[${cur_head}]}" | python3 -c '
+import json
+import sys
+
+context, poster, prefix, cancel_prefix, comment_url, history_url = sys.argv[1:7]
+statuses = json.load(sys.stdin)
+
+
+def first_word(text):
+    words = text.split()
+    return words[0] if words else "(unnamed)"
+
+
+# The plugin'"'"'s own events only: this context, posted by the Prow bot.
+events = [
+    status for status in statuses
+    if status.get("context") == context and (status.get("creator") or {}).get("login") == poster
+]
+# The newest override that names this pull request; of the two events one
+# /override leaves in the same second, the one pointing at the comment.
+override = None
+for status in events:
+    description = status.get("description") or ""
+    url = status.get("target_url") or ""
+    if status.get("state") != "success" or not description.startswith(prefix + " "):
+        continue
+    if not (url.startswith(comment_url) or url.startswith(history_url)):
+        continue
+    rank = (status.get("created_at") or "", url.startswith(comment_url))
+    if override is None or rank > override[0]:
+        override = (rank, status)
+if override is None:
+    print("absent")
+    sys.exit(0)
+when, override = override[0][0], override[1]
+for status in events:
+    description = status.get("description") or ""
+    if description.startswith(cancel_prefix) and (status.get("created_at") or "") > when:
+        print("cancelled", cancel_prefix, first_word(description[len(cancel_prefix):]))
+        sys.exit(0)
+print("overridden", first_word((override.get("description") or "")[len(prefix):]), when, override.get("target_url") or "")
+' "${REVALIDATION_JOB_NAME}" "${REVALIDATION_STATUS_POSTER}" "${REVALIDATION_OVERRIDE_PREFIX}" "${REVALIDATION_OVERRIDE_CANCEL_PREFIX}" "${comment_url_prefix}" "${history_url_prefix}" 2>/dev/null)" || found="unparsable"
+  case "${found}" in
+    overridden\ *) ;;
+    cancelled\ *)
+      echo "Step 0: the /override on ${cur_head} was cancelled (${found#cancelled }); not reused"
+      return 1 ;;
+    *)
+      return 1 ;;
+  esac
+  local user when url rest
+  rest="${found#overridden }"
+  user="${rest%% *}"; rest="${rest#* }"
+  when="${rest%% *}"; url="${rest#* }"
+  echo "PR #${pull_number} holds a reusable verdict: /override by ${user} -- this head was overridden"
+  echo "Reused verdict: ${url:-(no comment URL on the status)}"
+  echo "Attested by the ${REVALIDATION_STATUS_POSTER} ${REVALIDATION_JOB_NAME} success status on ${cur_head} reading \"${REVALIDATION_OVERRIDE_PREFIX} ${user}\" at ${when} and naming PR #${pull_number}, which the override plugin posts for a repository admin only"
+  echo "Same head ${cur_head}; base ${cur_base} now -- an override given to this head stands until a push or a cancel"
+  REVALIDATION_REUSED+=("/override by ${user} (PR #${pull_number})")
+  REVALIDATION_REUSED_OVERRIDE=1
+  return 0
+}
+
 # revalidate_one_pull <number> <head-sha> <base-sha>
-# Returns 0 when the pull request's own green history holds a verdict this
-# run could only repeat, 1 for a full run. Every fall-through path logs
-# exactly one "Step 0: full run:" line naming its reason. A reuse logs the
-# pull's record and appends "<build> (PR #n)" to REVALIDATION_REUSED; the
-# job-level REVALIDATED banner is the caller's, printed only once every pull
-# has one -- a batch whose later pull falls through must not carry a line
-# saying the matrix was skipped.
+# Returns 0 when the pull request holds a verdict this run could only
+# repeat -- an /override at this head, else one from its own green history
+# -- and 1 for a full run. Every fall-through path logs exactly one
+# "Step 0: full run:" line naming its reason. A reuse logs the pull's record
+# and appends "<kind> <id> (PR #n)" to REVALIDATION_REUSED; the job-level
+# REVALIDATED banner is the caller's, printed only once every pull has one
+# -- a batch whose later pull falls through must not carry a line saying
+# the matrix was skipped.
 revalidate_one_pull() {
   local pull_number="$1" cur_head="$2" cur_base="$3"
   local repo_dir
   repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+  if revalidate_override_at_head "${pull_number}" "${cur_head}" "${cur_base}"; then
+    return 0
+  fi
 
   local history_dir="${REVALIDATION_HISTORY_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}"
   local listing
@@ -249,6 +500,12 @@ if record.get("passed") is True:
     print("passed", record.get("revision") or "")
 ' 2>/dev/null)" || candidate_parsed=""
     [ "${candidate_parsed%% *}" = "passed" ] || continue
+    # A passed build that only reused an /override is that override's
+    # standing, not a run (header): skipped, so a cancel or a push is not
+    # carried past by the record the reuse left.
+    if gsutil stat "${history_dir}/${build}/artifacts/${REVALIDATION_OVERRIDE_MARKER}" >/dev/null 2>&1; then
+      continue
+    fi
     candidate_revision="${candidate_parsed#passed}"
     candidate_revision="${candidate_revision# }"
     if [ -z "${prev_green}" ]; then
@@ -316,32 +573,18 @@ print(base, head)
     echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
     return 1
   fi
-  # The read carries the credential revalidation_read_credential chose,
-  # handed to python through its environment so it is on no argv. One
-  # attempt: a read GitHub refuses names its HTTP code and is a full run,
-  # with no second, anonymous try (header, "GitHub read credential").
-  local attested
-  attested="$(REVALIDATION_STATUS_TOKEN="${REVALIDATION_STATUS_TOKEN:-}" python3 -c '
+  # The head's events come from the per-run cache (revalidation_fetch_statuses):
+  # read once, with the credential chosen above, and a refused read is a
+  # full run with no second, anonymous try (header, "GitHub read credential").
+  revalidation_fetch_statuses "${prev_head}"
+  local attested="${REVALIDATION_STATUS_OUTCOME[${prev_head}]}"
+  if [ "${attested}" = "ok" ]; then
+    attested="$(printf '%s' "${REVALIDATION_STATUS_BODY[${prev_head}]}" | python3 -c '
 import json
-import os
 import sys
-import urllib.error
-import urllib.request
 
-url, context, build, timeout, agent = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), sys.argv[5]
-headers = {"Accept": "application/vnd.github+json", "User-Agent": agent}
-token = os.environ.get("REVALIDATION_STATUS_TOKEN")
-if token:
-    headers["Authorization"] = "Bearer " + token
-try:
-    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
-        statuses = json.load(response)
-except urllib.error.HTTPError as exc:
-    print("http", exc.code)
-    sys.exit(0)
-except Exception as exc:
-    print("error", type(exc).__name__)
-    sys.exit(0)
+context, build = sys.argv[1], sys.argv[2]
+statuses = json.load(sys.stdin)
 needle = "/" + context + "/" + build
 for status in statuses:
     if (
@@ -352,7 +595,8 @@ for status in statuses:
         print("attested")
         sys.exit(0)
 print("absent")
-' "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" "${REVALIDATION_JOB_NAME}" "${prev_green}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" "${REVALIDATION_USER_AGENT}" 2>/dev/null)" || attested="error python3"
+' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null)" || attested="error unparsable"
+  fi
   case "${attested}" in
     attested) ;;
     absent)
@@ -376,7 +620,7 @@ print("absent")
     echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}/${prev_green}"
     echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
     echo "Same head ${cur_head}; base ${prev_base} then, ${cur_base} now -- a head that passed once passes"
-    REVALIDATION_REUSED+=("${prev_green} (PR #${pull_number})")
+    REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
     return 0
   fi
 
@@ -425,7 +669,7 @@ print("absent")
   _revalidation_print_delta "head delta" "${prev_head}..${cur_head}" "${head_delta}"
   _revalidation_print_delta "base delta" "${prev_base}..${cur_base}" "${base_delta}"
   echo "Predicate: every file above matches REVALIDATION_INERT_PATHS ${REVALIDATION_INERT_PATHS}"
-  REVALIDATION_REUSED+=("${prev_green} (PR #${pull_number})")
+  REVALIDATION_REUSED+=("green build ${prev_green} (PR #${pull_number})")
   return 0
 }
 
@@ -504,6 +748,9 @@ for entry in entries[1:]:
   revalidation_read_credential || return 1
 
   REVALIDATION_REUSED=()
+  REVALIDATION_REUSED_OVERRIDE=""
+  REVALIDATION_STATUS_OUTCOME=()
+  REVALIDATION_STATUS_BODY=()
   local number head
   while read -r number head; do
     [ -n "${number}" ] || continue
@@ -511,16 +758,37 @@ for entry in entries[1:]:
   done <<EOF_REVALIDATION_PULLS
 ${pulls}
 EOF_REVALIDATION_PULLS
+  # A reuse resting on an /override records itself before anything says the
+  # matrix is skipped (header): the marker is what keeps the passed build
+  # this exit produces out of the green scan. Written only here, once every
+  # pull holds a verdict, so a batch that falls through on a later pull
+  # leaves no marker on a run that then happened.
+  if [ -n "${REVALIDATION_REUSED_OVERRIDE}" ]; then
+    if ! printf '%s\n' "${REVALIDATION_REUSED[@]}" | python3 -c '
+import json
+import sys
+
+job, out = sys.argv[1], sys.argv[2]
+reused = [line for line in sys.stdin.read().splitlines() if line]
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump({"job": job, "reused": reused}, fh)
+' "${REVALIDATION_JOB_NAME}" "${ARTIFACTS}/${REVALIDATION_OVERRIDE_MARKER}" 2>/dev/null; then
+      echo "Step 0: full run: could not write ${ARTIFACTS}/${REVALIDATION_OVERRIDE_MARKER} to record the reused /override; a reuse that leaves no record would read as a green"
+      return 1
+    fi
+    echo "Recorded the reused /override in ${ARTIFACTS}/${REVALIDATION_OVERRIDE_MARKER}, so the green scan reads this build as an override's standing, not a run"
+  fi
   # The one line humans grep for and a collector may key on, so it appears
   # only when every pull holds a verdict and the exit is 0. Serial: one
-  # build. Batch: one per pull, in PULL_REFS order.
+  # verdict. Batch: one per pull, in PULL_REFS order, each naming its kind
+  # ("green build <id>" or "/override by <user>").
   local reused
   reused="$(printf '%s, ' "${REVALIDATION_REUSED[@]}")"
   reused="${reused%, }"
   if [ "${#REVALIDATION_REUSED[@]}" -eq 1 ]; then
     reused="${reused%% (PR #*}"
   fi
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${reused} -- skipping the eval matrix ==="
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against ${reused} -- skipping the eval matrix ==="
   return 0
 }
 
