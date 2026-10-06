@@ -863,7 +863,7 @@ Consequences:
   A request that waits more than 60 seconds for admission is answered
   `503 CREDENTIAL_PROXY_BUSY`, naming the slot cap
   (`the credential proxy is at its limit of 8 concurrent commands …`) or the budget
-  (`the credential proxy is at its child memory budget (… MiB reserved of … MiB) …`),
+  (`the credential proxy is at its child memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests) …`),
   whichever held it.
   A long-running command holds its slot and reservation for as long as it runs,
   and a caller that stops reading its response is given up on after 60 seconds

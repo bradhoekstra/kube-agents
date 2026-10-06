@@ -198,7 +198,7 @@ branch and read as a `FORGE_TOKEN_REFRESH_FAILED` 502. It gains the same handler
 needs neither. The sandbox shim, the `busy`
 metric status, the audit record and the site's troubleshooting entry then see the signal they see
 today, with a different sentence in it. A wait of a second or more logs, as a slot wait does:
-`request waited %dms for memory budget (%d MiB reserved of %d MiB)`.
+`request waited %dms for memory budget (… MiB in use of … MiB: … MiB reserved for children, … MiB of output allowance for … requests)`, the figure the admission check compares.
 
 A request whose own cost exceeds the budget while no other request is admitted is admitted anyway,
 with a warning logged once per process. Otherwise a limit small enough to make the budget

@@ -4686,6 +4686,20 @@ class CommandExecutor:
             cost += OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes
         return cost
 
+    def _budget_in_use_text(self) -> str:
+        """The budget's use as `_fits_budget` counts it, for the refusal and
+        the wait log: reservations plus the output allowance of the slots in
+        use, so the figure printed is the figure the check compared. Called
+        under `_slot_condition`."""
+        output_allowance = OUTPUT_COPIES_PER_COMMAND * self.max_output_bytes * self._slots_in_use
+        return (
+            f"{(self._reserved_bytes + output_allowance) // MEBIBYTE} MiB in use of "
+            f"{(self.children_budget_bytes or 0) // MEBIBYTE} MiB: "
+            f"{self._reserved_bytes // MEBIBYTE} MiB reserved for children, "
+            f"{output_allowance // MEBIBYTE} MiB of output allowance for "
+            f"{self._slots_in_use} requests"
+        )
+
     def requests_the_budget_admits(self) -> int | None:
         """How many slot-taking requests fit the budget at once; None when it is off.
 
@@ -4859,8 +4873,7 @@ class CommandExecutor:
                             )
                         raise CommandSlotUnavailable(
                             f"the credential proxy is at its child memory budget "
-                            f"({self._reserved_bytes // MEBIBYTE} MiB reserved of "
-                            f"{(self.children_budget_bytes or 0) // MEBIBYTE} MiB) and this request "
+                            f"({self._budget_in_use_text()}) and this request "
                             f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
                         )
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
@@ -4883,12 +4896,9 @@ class CommandExecutor:
             waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
                 if blocked_by_budget:
-                    LOGGER.info(
-                        "request waited %dms for memory budget (%d MiB reserved of %d MiB)",
-                        waited_ms,
-                        self.reserved_bytes // MEBIBYTE,
-                        (self.children_budget_bytes or 0) // MEBIBYTE,
-                    )
+                    with self._slot_condition:
+                        in_use = self._budget_in_use_text()
+                    LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
                 else:
                     LOGGER.info(
                         "request waited %dms for a slot (all %d slots were busy)",
@@ -5964,7 +5974,10 @@ class CommandExecutor:
             # back timed out rather than running past what the request was
             # allowed.
             effective_timeout = max(min(effective_timeout, request_deadline - time.monotonic()), 0)
-        # Every child the broker starts comes through here. A thread that holds
+        # Every child the broker starts while serving comes through here, with
+        # two deliberate exemptions (design §2.1): the bootstrap command, which
+        # runs before the broker serves anything, and `_read_repo_alias`'s
+        # `git config`, a few hundred KB over in milliseconds. A thread that holds
         # a reservation (a route admitted it) or runs the store's git (exempt,
         # covered by the fixed term) spawns under that; any other thread takes
         # a transient reservation for the child's lifetime, with the same wait

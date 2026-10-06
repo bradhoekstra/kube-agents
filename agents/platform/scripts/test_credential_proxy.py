@@ -4070,6 +4070,7 @@ class CommandExecutorTest(unittest.TestCase):
         message = str(raised.exception)
         self.assertIn("memory budget", message)
         self.assertIn("128 MiB reserved", message)
+        self.assertIn("MiB of output allowance for 1 requests", message)
         self.assertNotIn("concurrent commands", message)
         holder.join()
         with executor.request_slot():
@@ -4107,7 +4108,7 @@ class CommandExecutorTest(unittest.TestCase):
                 with executor.request_slot():
                     pass
         self.assertTrue(
-            any("for memory budget" in line and "128 MiB reserved of" in line for line in logs.output),
+            any("for memory budget" in line and "128 MiB reserved for children" in line for line in logs.output),
             logs.output,
         )
 
@@ -5794,7 +5795,8 @@ class ForgeRefreshRouteTest(unittest.TestCase):
     def test_a_refresh_refused_by_the_budget_answers_the_busy_503(self):
         def busy(provider, repository, caller=None):
             raise credential_proxy.CommandSlotUnavailable(
-                "the credential proxy is at its child memory budget (128 MiB reserved of 704 MiB)"
+                "the credential proxy is at its child memory budget (128 MiB in use of 704 MiB: "
+                "128 MiB reserved for children, 0 MiB of output allowance for 0 requests)"
             )
 
         replies = self._post({"repository": "gke-agentic/infra"}, refresh_forge_credential=busy)
