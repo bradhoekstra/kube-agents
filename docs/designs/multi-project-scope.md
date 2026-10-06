@@ -559,8 +559,9 @@ The architecture documents move from "its one project" to "its declared scope":
   its declared scope".
 - `03-security-model.md:114`, `:123`, and `:381`: the forbidden column and the containment sentence
   read "any project outside its scope".
-- `06-api-and-data-contracts.md:82`: the `platform` tier's scope field becomes the resolved project
-  set, with `projectId` kept as the management project.
+- `06-api-and-data-contracts.md:82`: the `platform` tier's required scope field stays `projectId`,
+  the management project, with the scope declaration optional beside it; its cardinality key is the
+  install.
 
 What does not change: read-only stays read-only. Every grant outside the host project carries the
 `scope_roles` allowlist of §6 and nothing else; the non-viewer roles in `project_roles`

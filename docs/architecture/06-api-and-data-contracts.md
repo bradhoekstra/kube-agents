@@ -44,9 +44,8 @@ spec:
   tier: platform | cluster-admin | developer-team # persona / containment level (immutable)
   scope:
     projectId: <proj> # all tiers; the platform tier's management project
-    # platform tier only, optional: the scope declaration -- projects, folders,
-    # organizations, sharedVpcHosts, metricsScopes, exclude -- as `spec.scope` on the
-    # PlatformAgent carries it; absent, the scope is the management project alone
+    # platform tier only, optional: the scope declaration, as `spec.scope` on the PlatformAgent
+    # carries it (the CRD reference page owns its keys); absent, the scope is the management project alone
     clusterName: <cluster> # cluster + namespace tiers
     namespace: <ns> # namespace tier only (also the pod's placement namespace)
   parentRef: { name: <parent-agent> } # required for non-platform tiers
@@ -88,8 +87,8 @@ Scion's launch primitive as a Phase-1 integration, [08](08-agent-runtime-and-ide
 | `developer-team` | `projectId`, `clusterName`, `namespace`                               | parent = cluster-admin  | 1 per namespace                                   |
 
 **Validation (v1).** The `Agent` CR + its identity manifests are reviewed on the PR (the review-gate).
-**Cardinality — exactly one agent per `(tier, scope)` — is enforced by the controller's validating
-webhook** (a duplicate CR is rejected at apply time), not left to convention. RBAC least-privilege is
+**Cardinality — exactly one platform agent per install (its management cluster), and one agent per
+`(tier, scope)` below it — is enforced by the controller's validating webhook** (a duplicate CR is rejected at apply time), not left to convention. RBAC least-privilege is
 enforced at apply time by an in-tree **`ValidatingAdmissionPolicy`** (denies an agent SA any write verb
 or a wrong-scope binding, [03](03-security-model.md) §4). The cross-object checks (correct parent tier;
 child ⊆ parent attenuation ceiling) are **deferred** to the hardening admission webhook
@@ -212,11 +211,11 @@ gateway C14, [08](08-agent-runtime-and-identity.md) §3.)_
 
 **Handle grammar.** An agent's handle is its `<tier>-<scope>` name (`02` §6.1):
 
-| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)` |
-| ---------------- | -------------------------- | -------------------- | --------------------------- |
-| `platform`       | `@platform-<project>`      | —                    | `(platform, project)`       |
-| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`  |
-| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`      |
+| Tier             | Canonical handle           | Short alias          | Resolves to `(tier, scope)`                   |
+| ---------------- | -------------------------- | -------------------- | --------------------------------------------- |
+| `platform`       | `@platform-<project>`      | —                    | `(platform, management project)`, the install |
+| `cluster-admin`  | `@cluster-admin-<cluster>` | `@cluster-<cluster>` | `(cluster-admin, cluster)`                    |
+| `developer-team` | `@developer-team-<ns>`     | `@devteam-<ns>`      | `(developer-team, ns)`                        |
 
 The map is **derived** from the same `(tier, scope)` key the cardinality webhook enforces (§1.2) —
 no separate routing registry to maintain or drift.

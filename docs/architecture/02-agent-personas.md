@@ -266,7 +266,7 @@ for a delegation too, and the child task's envelope names the target and the sam
 
 ## 3. Persona: Platform Agent (scope)
 
-**Cardinality:** 1 per install, whatever its scope declares — one project by default, otherwise the projects `spec.scope` resolves to; what scales with the fleet is the Cluster Agent profile, one per cluster. **Exists today** (`agents/platform/`).
+**Cardinality:** 1 per install, whatever its scope declares — one project by default, otherwise the projects `spec.scope` resolves to; what scales with the fleet is the Cluster Admin Agent, one per cluster (shipped today as the Cluster Agent profile). **Exists today** (`agents/platform/`).
 
 ### Role
 
@@ -443,11 +443,11 @@ model verified in **[Scion](https://github.com/GoogleCloudPlatform/scion)**
   (Workload-Identity-bound) and the optional gVisor execution sandbox (deferred,
   [08](08-agent-runtime-and-identity.md) §5.1); placement derives from `tier` + `scope`
 
-| `tier`           | Scope key fields                       | Identity scope                    | Chat entrypoint / handle (§2.4)         |
-| ---------------- | -------------------------------------- | --------------------------------- | --------------------------------------- |
-| `platform`       | management project + scope declaration | read across the projects in scope | Platform teams — `@platform-<project>`  |
-| `cluster-admin`  | project + cluster                      | single cluster                    | Cluster admins — `@cluster-<cluster>`   |
-| `developer-team` | project + cluster + **namespace**      | single namespace                  | Developer team — `@devteam-<namespace>` |
+| `tier`           | Scope key fields                                                      | Identity scope                    | Chat entrypoint / handle (§2.4)         |
+| ---------------- | --------------------------------------------------------------------- | --------------------------------- | --------------------------------------- |
+| `platform`       | the install (its management project); `spec.scope` is its declaration | read across the projects in scope | Platform teams — `@platform-<project>`  |
+| `cluster-admin`  | project + cluster                                                     | single cluster                    | Cluster admins — `@cluster-<cluster>`   |
+| `developer-team` | project + cluster + **namespace**                                     | single namespace                  | Developer team — `@devteam-<namespace>` |
 
 **Why one tier-discriminated CRD:** the personas differ only in `tier` + `scope` + `parentRef` +
 default (read-only) permissions — otherwise identical, so a single `Agent` CRD expresses all three (one
@@ -463,7 +463,7 @@ the platform-tier instance ([07](07-implementation-roadmap.md)).
 
 ### Goals
 
-- Define three scope-bounded personas that map 1:1 onto project / cluster / namespace.
+- Define three scope-bounded personas that map 1:1 onto scope / cluster / namespace.
 - Keep every persona the same _kind_ of agent (shared anatomy: `Agent` CR + Hermes harness).
 - Make the cascade explicit: each layer provisions and governs the next, via declarative workflow.
 - Keep SRE as a cross-cutting set of CUJs, not a persona.
@@ -483,8 +483,8 @@ A harness confirms this doc's design with:
 
 - **Cardinality:** `kubectl get pods -l kube-agents/tier=platform` returns exactly **1 per install** (one `PlatformAgent` per management cluster, whatever its scope declares);
   `-l kube-agents/tier=cluster-admin` exactly **1 per cluster**; `-l kube-agents/tier=developer-team`
-  exactly **1 per namespace**. A second `Agent` CR for the same `(tier, scope)` is **rejected by the
-  controller's cardinality webhook**.
+  exactly **1 per namespace**. A second `Agent` CR for the same key — the install (its management cluster) for the platform
+  tier, `(tier, scope)` for the tiers below it — is **rejected by the controller's cardinality webhook**.
 - **Per-persona identity:** each agent pod's `spec.serviceAccountName` is its tier/scope read-only KSA
   (03 §3); labels `kube-agents/tier` and `kube-agents/parent` are set.
 - **Indirect coordination:** assert the four properties in §2.3, not the absence of a channel. No
