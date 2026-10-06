@@ -1619,10 +1619,11 @@ func TestCredentialProxyOutputCapClearsTheLargestFleetDump(t *testing.T) {
 		t.Errorf("the child memory budget's floor is %d bytes and the proxy's limit is %d", minimum, limit)
 	}
 
-	// The broker budgets against the limit it actually has, read through the
-	// Downward API rather than copied from the Resources block, so a limit
-	// moved by a CR field or a VPA is the limit it sees. A literal here would
-	// be the drift the design forbids.
+	// The broker budgets against the limit it actually has, read once at start
+	// through the Downward API rather than copied from the Resources block, so
+	// a limit moved by whatever recreates the pod (no CR field sets it today)
+	// is the one it budgets against. A literal here would be the drift the
+	// design forbids.
 	var limitEnv *corev1.EnvVar
 	for i := range proxy.Env {
 		if proxy.Env[i].Name == credentialProxyMemoryLimitEnv {
