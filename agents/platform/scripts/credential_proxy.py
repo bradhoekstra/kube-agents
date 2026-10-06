@@ -169,6 +169,15 @@ CONTENT_WORKSPACE_RESERVE_BYTES = 128 * MEBIBYTE
 # output cap: the two capped stream buffers, their decoded text, the JSON body
 # and its encoding. Charged for the slots in use, not for the cap.
 OUTPUT_COPIES_PER_COMMAND = 6
+# The fewest requests a budget may admit at once and still be used. Under
+# this the broker treats the budget as absent and admits by slot alone, as it
+# did before the budget existed: a listing phase that cannot run two at once
+# is slower than the OOM exposure the budget prevents, and the case is real --
+# GKE Autopilot without bursting sets a container's limits equal to its
+# requests, so the proxy's limit there is its 512Mi request. The operator's
+# sizing test and the admission webhook hold the limit to the same floor
+# (credentialProxyMinimumAdmittedRequests in credential_proxy_manifests.go).
+BUDGET_MINIMUM_ADMITTED_REQUESTS = 2
 # Where the limit comes from, in order: the operator's Downward API variable,
 # then the cgroup v2 file for a broker whose Deployment predates the variable.
 # A value of `max` in the file means no limit, and no limit means no budget.
@@ -1298,6 +1307,17 @@ def child_memory_limit_bytes(
     except ValueError:
         return None
     return limit if limit > 0 else None
+
+
+def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
+    """The smallest container limit at which the budget admits
+    BUDGET_MINIMUM_ADMITTED_REQUESTS slot-taking requests at once."""
+    per_request = REQUEST_CHILD_MEMORY_RESERVE_BYTES + OUTPUT_COPIES_PER_COMMAND * max_output_bytes
+    return (
+        BROKER_RESIDENT_RESERVE_BYTES
+        + CONTENT_WORKSPACE_RESERVE_BYTES
+        + BUDGET_MINIMUM_ADMITTED_REQUESTS * per_request
+    )
 
 
 class CommandSlotUnavailable(RuntimeError):
@@ -4384,7 +4404,22 @@ class CommandExecutor:
         self._reserved_bytes = 0
         # The degenerate case (§2.3) warns once per process, not once per request.
         self._budget_warned = False
-        if self.children_budget_bytes is None:
+        floor = child_memory_budget_floor_bytes(max_output_bytes)
+        if memory_limit_bytes is not None and memory_limit_bytes < floor:
+            # Treated as absent: a budget that admits fewer than
+            # BUDGET_MINIMUM_ADMITTED_REQUESTS serialises every brokered
+            # command. `memory_limit_bytes` keeps the value read.
+            self.children_budget_bytes = None
+            LOGGER.warning(
+                "child memory budget disabled: the container limit of %d MiB is under the floor "
+                "of %d MiB at which the budget admits %d requests at once; admission is by slot "
+                "alone, as without a budget. Raise the proxy container's memory limit (on GKE "
+                "Autopilot without bursting, its memory request, which the limit follows).",
+                memory_limit_bytes // MEBIBYTE,
+                floor // MEBIBYTE,
+                BUDGET_MINIMUM_ADMITTED_REQUESTS,
+            )
+        elif self.children_budget_bytes is None:
             LOGGER.info(
                 "child memory budget disabled: no container memory limit known (%s unset and %s "
                 "unreadable or unlimited); admission is by slot alone",

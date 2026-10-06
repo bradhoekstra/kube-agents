@@ -3877,6 +3877,33 @@ class CommandExecutorTest(unittest.TestCase):
             self.executor(memory_limit_bytes=None)
         self.assertTrue(any("child memory budget disabled" in line for line in logs.output), logs.output)
 
+    def test_a_limit_under_the_floor_disables_the_budget_with_a_warning(self):
+        # Autopilot without bursting sets limits equal to requests, so the
+        # proxy's limit there is its 512Mi request; a budget derived from it
+        # would admit one request at a time, worse than slot-only admission.
+        mib = credential_proxy.MEBIBYTE
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            executor = self.executor(memory_limit_bytes=512 * mib, max_output_bytes=8 * mib)
+        self.assertEqual(512 * mib, executor.memory_limit_bytes)
+        self.assertIsNone(executor.children_budget_bytes)
+        self.assertIsNone(executor.requests_the_budget_admits())
+        warning = [line for line in logs.output if "under the floor" in line]
+        self.assertEqual(1, len(warning), logs.output)
+        self.assertIn("512 MiB", warning[0])
+        self.assertIn("672 MiB", warning[0])
+        # Slot-only admission, as today: a reservation neither waits nor counts.
+        self.hold_a_slot(executor, seconds=1)
+        with executor.reserve_child_memory():
+            self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_limit_at_the_floor_enables_the_budget_for_two(self):
+        mib = credential_proxy.MEBIBYTE
+        floor = credential_proxy.child_memory_budget_floor_bytes(8 * mib)
+        self.assertEqual(672 * mib, floor)
+        executor = self.executor(memory_limit_bytes=floor, max_output_bytes=8 * mib)
+        self.assertEqual(2, executor.requests_the_budget_admits())
+        self.assertIsNotNone(executor.children_budget_bytes)
+
     def test_slots_are_granted_in_arrival_order(self):
         # Under sustained saturation the request that has waited longest must
         # be the next served, and the one refused after the wait must be the
@@ -4006,11 +4033,16 @@ class CommandExecutorTest(unittest.TestCase):
             + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
             + admits * per_request
         )
-        executor = self.executor(
-            max_concurrent_commands=max_concurrent_commands,
-            max_output_bytes=max_output_bytes,
-            memory_limit_bytes=limit,
-        )
+        # A budget for one is under the production floor and would be treated
+        # as absent; the floor is lowered for construction only, so the
+        # admission tests can hold the one reservation that blocks the next.
+        floor = min(admits, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
+        with mock.patch.object(credential_proxy, "BUDGET_MINIMUM_ADMITTED_REQUESTS", floor):
+            executor = self.executor(
+                max_concurrent_commands=max_concurrent_commands,
+                max_output_bytes=max_output_bytes,
+                memory_limit_bytes=limit,
+            )
         self.assertEqual(admits, executor.requests_the_budget_admits())
         return executor
 
@@ -4144,10 +4176,13 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertFalse(getattr(executor._request_budget, "reserved", False))
 
     def test_a_request_too_large_for_an_empty_budget_is_admitted_with_one_warning(self):
-        # The degenerate case (§2.3): a limit so small that nothing fits must
-        # not refuse every command forever.
-        tiny = credential_proxy.BROKER_RESIDENT_RESERVE_BYTES + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES + 1
-        executor = self.executor(memory_limit_bytes=tiny)
+        # The degenerate case (§2.3): a budget so small that nothing fits must
+        # not refuse every command forever. A limit that small is under the
+        # floor and disables the budget at construction, so this branch is
+        # defensive, reachable only if the fixed terms or the cost move at
+        # runtime; the test lowers the budget after construction to reach it.
+        executor = self.budgeted(admits=2)
+        executor.children_budget_bytes = executor._request_cost_bytes(takes_slot=True) - 1
         self.assertEqual(0, executor.requests_the_budget_admits())
         with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
             with executor.request_slot():
@@ -4335,6 +4370,30 @@ class CommandExecutorTest(unittest.TestCase):
         result = executor._execute(["/bin/sleep", "5"], timeout_seconds=0.2)
         self.assertTrue(result.timed_out)
         self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_transient_reservation_is_released_when_popen_raises(self):
+        executor = self.budgeted(admits=1)
+        with self.assertRaises(FileNotFoundError):
+            executor._execute(["/nonexistent/binary"])
+        self.assertEqual(0, executor.reserved_bytes)
+
+    def test_a_caller_that_hangs_up_while_queued_for_a_transient_reservation_spawns_nothing(self):
+        executor = self.budgeted(admits=1)
+        self.hold_a_slot(executor, seconds=2)
+        ours, theirs = socket.socketpair()
+        self.addCleanup(ours.close)
+
+        def hang_up():
+            time.sleep(0.3)
+            theirs.close()
+
+        threading.Thread(target=hang_up, daemon=True).start()
+        with mock.patch.object(credential_proxy.subprocess, "Popen", wraps=subprocess.Popen) as popen:
+            with self.assertRaises(credential_proxy.CallerHungUp):
+                executor._execute(["/bin/echo", "never"], caller=ours)
+        popen.assert_not_called()
+        # Still exactly the holder's reservation: the dropped caller took none.
+        self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
 
     # ---- Bounding a kubectl that cannot reach its control plane -------------
 
