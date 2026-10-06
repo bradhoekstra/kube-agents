@@ -5,7 +5,8 @@ broker and the operator.
 
 The broker (`agents/platform/scripts/credential_proxy.py`) admits requests
 against these terms; the operator's sizing test
-(`k8s-operator/internal/controller/credential_proxy_manifests.go`) holds the
+(`TestCredentialProxyOutputCapClearsTheLargestFleetDump` in
+`k8s-operator/internal/controller/platformagent_manifests_test.go`) holds the
 rendered memory limit to the floor they imply. Each side declares its own copy,
 so nothing but this test stops one moving without the other. Both files are
 read as text: importing the broker pulls in its runtime dependencies.

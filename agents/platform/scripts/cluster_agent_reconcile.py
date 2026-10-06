@@ -150,8 +150,9 @@ _denied_this_run: set[str] = set()
 _api_disabled_this_run: set[str] = set()
 # The listing phase is bounded: the management project lists first and alone, then the
 # containers resolve `workers` at a time, then the explicit projects `workers` at a time,
-# and a lookup still running when the listing budget is spent reads unreachable; both are
-# sized from the declared cap below (LIST_WORKERS and LIST_BUDGET_SECONDS at the default). The
+# and a lookup still running when the listing budget is spent reads unreachable; `workers`
+# is fixed at LIST_WORKERS and only the budget is sized from the declared cap below
+# (LIST_BUDGET_SECONDS at the default). The
 # bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the listing
 # and prune budgets for the declared cap and the profiles on the volume, plus its settle
 # time; 240s at the default cap with few profiles) and kills it on expiry
