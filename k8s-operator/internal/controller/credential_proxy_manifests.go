@@ -118,7 +118,7 @@ const (
 	credentialProxyMemoryRequest = "512Mi"
 	// credentialProxyContainerName is the broker container, named exactly
 	// here because the Downward API reference below has to match it.
-	credentialProxyContainerName = "envoy-credential-proxy"
+	credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential
 	// credentialProxyMemoryLimitEnv carries the container's own memory limit
 	// in bytes to the broker, which derives its child memory budget from it
 	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef the
@@ -127,7 +127,7 @@ const (
 	// in-place resize is not seen until the next start. In the base env list
 	// and so reserved in mergeCredentialProxyEnv, because a CR that could set
 	// it would detach the budget from the limit.
-	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES"
+	credentialProxyMemoryLimitEnv = "CREDENTIAL_PROXY_MEMORY_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
 	// The child memory budget's terms, in bytes, as the broker declares them
 	// (credential_proxy.py: BROKER_RESIDENT_RESERVE_BYTES,
 	// CONTENT_WORKSPACE_RESERVE_BYTES, REQUEST_CHILD_MEMORY_RESERVE_BYTES,
