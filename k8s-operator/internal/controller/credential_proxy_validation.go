@@ -58,7 +58,7 @@ const (
 	credentialProxyNegativeRefusal      = "must not be negative; the API server refuses a container that declares one"
 	credentialProxyZeroLimitRefusal     = "a limit of zero leaves the container nothing of this resource; omit the key to keep the operator's default"
 	credentialProxyUnrepresentableFmt   = "is not a representable byte count: it exceeds the %d bytes an int64 holds, which is what the Downward API hands the broker"
-	credentialProxyFloorRefusalFmt      = "a %s memory limit admits %d brokered command(s) at once; the credential proxy needs at least %dMi to admit %d, which is the floor (its resident and content-workspace reserves plus two commands' child and output allowances at the operator's output cap)"
+	credentialProxyFloorRefusalFmt      = "a %s memory limit is under the %dMi floor at which the budget admits %d commands; below it the broker turns the budget off and admits by the slot cap alone, which is the exposure the budget exists to remove"
 	credentialProxyCrossedBesideFmt     = "exceeds the %s %s limit set beside it"
 	credentialProxyCrossedDefLimitFmt   = "exceeds the operator's default %s %s limit, which this override does not raise; set limits.%s as well"
 	credentialProxyCrossedDefRequestFmt = "is below the operator's default %s %s request, which this override does not lower; set requests.%s as well"
@@ -94,8 +94,10 @@ var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 //     the container nothing; the third cannot reach the broker as the byte
 //     count it reads its limit as.
 //   - A memory limit under the floor at which the broker's child memory
-//     budget admits two commands. The message names the floor and what the
-//     given limit would have admitted.
+//     budget admits two commands. Below it the broker does not run a smaller
+//     budget: it turns the budget off and admits by the slot cap alone, so a
+//     limit set too low is the unbudgeted exposure, not an error anywhere
+//     else.
 //   - A request above its limit, on any name the merged result carries. The
 //     API server would refuse the Deployment, which the reconciler would read
 //     as an immutable-field change; refusing here puts the error on the field
@@ -153,7 +155,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes)
 	if !refused[limitPath.String()] && limit.CmpInt64(floor) < 0 {
 		errs = append(errs, field.Invalid(limitPath, limit.String(),
-			fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), credentialProxyAdmittedRequests(limit.Value(), credentialProxyOutputCapBytes), floor/bytesPerMiB, credentialProxyMinimumAdmittedRequests)))
+			fmt.Sprintf(credentialProxyFloorRefusalFmt, limit.String(), floor/bytesPerMiB, credentialProxyMinimumAdmittedRequests)))
 	}
 
 	for _, name := range sortedResourceNames(merged.Requests) {

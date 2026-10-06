@@ -192,7 +192,9 @@ commands too: four `kubectl logs --follow` or `kubectl wait` hold the budget for
 long as they run, where the slot cap alone let eight. An install that needs more raises the limit and the
 budget follows: `spec.deployment.credentialProxy.resources` moves the proxy container's limit,
 the one knob, and the budget is what makes it safe to set in either direction, since raising it
-lets the budget admit more, up to the slot cap, and lowering it cannot OOM. The output term is
+lets the budget admit more, up to the slot cap, and lowering it cannot OOM while it stays at or above the floor
+(§2.3); below the floor the budget is off and the slot cap alone holds, so the operator refuses
+such a limit at reconcile, and the webhook refuses it at apply where it is enabled. The output term is
 the worst case, a request holding its full capped output, which a listing never does; charging
 captured bytes instead of the cap would roughly double the concurrency and is the refinement to
 measure first if four proves tight.

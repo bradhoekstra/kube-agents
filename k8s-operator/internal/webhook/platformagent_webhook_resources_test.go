@@ -56,15 +56,16 @@ func fieldErrorMessage(t *testing.T, err error, path string) string {
 }
 
 // The floor at the operator's defaults: 192Mi + 128Mi + 2 × (128Mi + 6 × 8Mi)
-// (docs/designs/credential-proxy-child-memory-budget.md §2.5). A limit of
-// 512Mi leaves 192Mi after the fixed reserves, which admits one command.
+// (docs/designs/credential-proxy-child-memory-budget.md §2.5). Under it the
+// broker does not run a smaller budget: it turns the budget off and admits by
+// the slot cap alone, and the refusal says so.
 func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testing.T) {
 	val := &PlatformAgentCustomValidator{}
 	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
 	}))
 	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.limits.memory")
-	for _, want := range []string{"512Mi memory limit admits 1 brokered command", "at least 672Mi to admit 2"} {
+	for _, want := range []string{"a 512Mi memory limit is under the 672Mi floor at which the budget admits 2 commands", "turns the budget off and admits by the slot cap alone"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("message %q does not say %q", msg, want)
 		}
