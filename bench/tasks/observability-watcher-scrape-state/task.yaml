@@ -66,21 +66,27 @@ verification_spec:
   # a `kubectl auth can-i get podmonitoring` permission probe, which names the
   # resource without reading it. kubectl has to be the command invoked, not text
   # quoted inside another -- a `grep`/`echo` of the command string reads nothing
-  # -- so the pattern anchors it to the start of a shell segment (the line start
-  # or after `;`, `&`, `|`, `(`, `$(`) and refuses a segment that opens a quote
-  # (a single quote, double quote or backtick) before kubectl. Before kubectl it
-  # then admits any run of non-separator, non-quote characters and an optional
-  # path, so a wrapper -- `env`, `time`, `sudo -E`, `timeout -k 5 30`,
-  # `xargs ... kubectl`, a loop's `do kubectl`, an `if kubectl`, `/usr/bin/kubectl`
-  # -- does not hide it, and `cd x && kubectl ...` / `kubectl ... | yq` still
-  # read. The noun must be a bare argument: preceded by a space, tab or comma and
-  # followed by one or the segment end, so a `kind=PodMonitoring` selector or a
-  # `-o yaml > gateway-podmonitoring.yaml` redirect, where the noun is glued to
-  # `=`, `/` or `-`, is not a read. Two false-greens have no single-line regex
-  # fix and stand: a bare `echo kubectl get podmonitoring`, and a shell
-  # metacharacter inside a quoted string that opens a false segment
-  # (`-m "note; kubectl get podmonitoring"`); both are contrived against the
-  # recorded runs. The pattern's whole corpus is pinned in
+  # -- so the pattern anchors it to the start of a shell segment (the line start,
+  # after `;`, `&`, `|`, `(`, `$(`, or after a `sh -c '`/`bash -c "` wrapper, the
+  # one quoted opener that is a command position and not a quoted string) and
+  # otherwise refuses a segment that opens a quote (a single quote, double quote
+  # or backtick) before kubectl. Before kubectl it then admits any run of
+  # non-separator, non-quote characters and an optional path, so a wrapper --
+  # `env`, `time`, `sudo -E`, `timeout -k 5 30`, `xargs ... kubectl`, a loop's
+  # `do kubectl`, an `if kubectl`, `/usr/bin/kubectl` -- does not hide it, and
+  # `cd x && kubectl ...` / `kubectl ... | yq` still read. The noun is an argument
+  # preceded by a space, tab, comma or quote and followed by one of those, a `/`,
+  # a segment terminator (`;`, `&`, `|`, `)`) or the command's end, so a
+  # `kind=PodMonitoring` selector or a `-o yaml > gateway-podmonitoring.yaml`
+  # redirect, where the noun is glued to `=`, `/` or `-` before it, is not a read,
+  # while a quoted noun (`get "podmonitoring"`) and a read that ends its segment
+  # (`kubectl get podmonitoring | yq`, `echo $(kubectl get podmonitoring)`) are.
+  # Three false-greens have no single-line regex fix and stand: a bare
+  # `echo kubectl get podmonitoring`, a shell metacharacter inside a quoted string
+  # that opens a false segment (`-m "note; kubectl get podmonitoring"`), and a
+  # `sh -c '…'` wrapper quoted inside another command
+  # (`echo "sh -c 'kubectl get podmonitoring'"`); all three are contrived against
+  # the recorded runs. The pattern's whole corpus is pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py.
   # worker_commands reads the card log's one-line rendering and sees terminal
   # commands only, so a read through an MCP tool is invisible to it. The skill's
@@ -91,7 +97,7 @@ verification_spec:
     check:
       type: worker_commands
       required_patterns:
-        - '(?i)(?:^|[\n;&|(]|\$\()[ \t]*(?:[^\n;&|()''"`]*[ \t])?(?:[^\s;&|()''"`]*/)?kubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*[ \t,]podmonitorings?(\.monitoring\.googleapis\.com)?(?=[ \t,/]|$)'
+        - '(?i)(?:^|[\n;&|(]|\$\(|\b(?:sh|bash|zsh|dash|ksh)\s+(?:-\w+\s+)*-\w*c\s+[''\"])[ \t]*(?:[^\n;&|()''"`]*[ \t])?(?:[^\s;&|()''"`]*/)?kubectl\b(?![^\n|;&]*\bcan-i\b)[^\n|;&]*\b(get|describe)\b(?![^\n|;&]*\b(crds?|customresourcedefinitions?)\b)[^\n|;&]*[ \t,''\"]podmonitorings?(\.monitoring\.googleapis\.com)?(?=[ \t,/;&|)''\"]|$)'
   # The final answer names the mechanism, the port and one of the two proving
   # series. `mode: assert` because the final message is immutable once the run
   # ends; polling a failed phrase would only wait out the timeout. The required
@@ -119,26 +125,36 @@ verification_spec:
         - "k8s_event_watcher_cluster_up"
   # The conclusion's polarity, which the objective above does not carry: the
   # answer must affirm the watcher is scraped, not merely name the mechanism and
-  # series while concluding it is not. any_of of affirmative scrape phrasings,
-  # each a contiguous substring whose word before "scrap" is a non-negator, so an
-  # inserted "not"/"n't" breaks the match: a "scraped"/"is being scraped" answer
-  # hits one, a "not scraped"/"not being scraped" answer hits none. A
-  # forbidden_phrases on the negation is not used -- a correct answer may note the
-  # credential-proxy PodMonitoring is unscraped while the watcher is, and a bare
-  # "not scraped" ban would false-red it. Both polarities are pinned in
+  # series while concluding it is not. A substring cannot carry this -- "is
+  # scraping" sits inside "whether GMP is scraping it: it is not", and "is
+  # scraped" survives a negated subject ("nothing is scraping it", "none of the
+  # series are scraped") -- so polarity uses the verifier's two regex slots.
+  # any_of_patterns carry the affirmative, each tying a scrape verb to a watcher
+  # anchor in the same clause -- the listener's `9095`/`event-metrics`, the
+  # `gateway-monitoring` PodMonitoring, the `watcher`, or the `k8s_event_watcher*`
+  # series -- in either voice ("9095 is being scraped", "GMP scrapes the watcher's
+  # 9095 endpoint"), which an answer about the credential-proxy's own
+  # PodMonitoring does not hit. forbidden_patterns red the negation an affirmative
+  # substring would still contain: an anchor negated in its own clause ("the
+  # watcher is not scraped") and a negated subject ("nothing scrapes it"). A
+  # forbidden_phrases on a bare "not scraped" is not used -- a correct answer may
+  # note the credential-proxy PodMonitoring is unscraped while the watcher is, and
+  # the ban would false-red it; anchoring the negation to the watcher's clause
+  # leaves that mention alone. Anchors are spelled without underscores, which
+  # _normalize strips before the regex runs. Two residuals stand, contrived
+  # against the recorded runs: a copula-less watcher negation beside an
+  # affirmative ("GMP scrapes 9095. The watcher? not scraped.") false-greens, and
+  # an affirmative whose only scrape clause names no anchor ("yes, it is scraped")
+  # false-reds. Both polarities and the residuals are pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py.
   - name: the-answer-affirms-the-watcher-is-scraped
     role: objective
     mode: assert
     check:
       type: report_contains
-      any_of_phrases:
-        - "is scraped"
-        - "are scraped"
-        - "is being scraped"
-        - "are being scraped"
-        - "is scraping"
-        - "are scraping"
-        - "scrapes the"
-        - "scrapes it"
-        - "scrapes them"
+      any_of_patterns:
+        - '(?:watcher|9095|event-metrics|gateway-monitoring|k8seventwatcher\w*)[^.;]{0,70}\b(?:is|are)\b[^.;]{0,30}scrap(?:ed|ing)\b'
+        - '\bscrap(?:es|ed|ing)\b[^.;]{0,40}(?:watcher|9095|event-metrics|gateway-monitoring|k8seventwatcher\w*)'
+      forbidden_patterns:
+        - '(?:watcher|9095|event-metrics|gateway-monitoring|k8seventwatcher\w*)[^.;\n]{0,70}\b(?:is|are)\b[^.;\n]{0,20}\b(?:not|never|no longer)\b[^.;\n]{0,20}scrap'
+        - '\b(?:nothing|nobody|none of|neither|no (?:collector|scraper|podmonitoring|prometheus|one|job|pipeline))\b[^.;\n]{0,70}scrap'
