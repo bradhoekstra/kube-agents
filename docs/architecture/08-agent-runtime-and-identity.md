@@ -156,7 +156,7 @@ delivers:
   1 Dev-Team/namespace — enforced by the controller's cardinality webhook) → tier/tenant isolation with
   **no shared-pod blast radius and no cross-tenant in-process leakage**: a Developer Team Agent's pod
   **cannot read another namespace**, a Cluster Admin Agent's **cannot reach another cluster**, and a
-  Platform Agent's **cannot reach another project** ([03](03-security-model.md) §3–§4).
+  Platform Agent's **cannot reach a project outside its declared scope** ([03](03-security-model.md) §3–§4).
 - **Trusted-human access** — only authenticated, allowlisted humans can reach an agent
   ([03](03-security-model.md) §4a). This, plus the read-only ceiling, is how the human→agent boundary
   is secured in v1.
