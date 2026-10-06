@@ -162,10 +162,13 @@ _api_disabled_this_run: set[str] = set()
 # projects keeps the same margin per project, workers first and the budget only once
 # the workers reach their ceiling; the bootstrap gate's ceiling follows the budget.
 LIST_WORKERS = 8
-# Every lookup is a gcloud process in the sandbox over ssh, and no install has measured
-# the sandbox at more than eight at once (#1913 is to): twice that covers the estate
-# behind #1354 and holds the ceiling until the measurement says otherwise.
-LIST_WORKERS_MAX = 16
+# Every lookup is a gcloud process the credential proxy runs, and the proxy admits
+# four requests at once under its child memory budget at the operator's default limit
+# (docs/designs/credential-proxy-child-memory-budget.md §2.2): an eight-wide burst runs
+# in two waves and the second waits one listing, inside the 60s admission bound at the
+# slowest listing observed; a sixteen-wide one ran in four and its last wave could be
+# refused. So the ceiling is the default until the budget's admitted count is raised.
+LIST_WORKERS_MAX = LIST_WORKERS
 LIST_TIMEOUT_SECONDS = 120
 LIST_BUDGET_SECONDS = 150
 LIST_GRACE_SECONDS = 5

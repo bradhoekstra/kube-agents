@@ -1367,17 +1367,17 @@ class ScopeTest(HomesMixin):
         per_default = rec.LIST_WORKERS
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP), per_default)
         self.assertEqual(rec._list_workers(rec.RESOLVED_SET_CAP // 2), per_default)
-        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), 2 * per_default)
-        self.assertEqual(2 * per_default, rec.LIST_WORKERS_MAX, "the ceiling is twice the default until #1913 measures the sandbox")
+        self.assertEqual(rec._list_workers(2 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
+        self.assertEqual(per_default, rec.LIST_WORKERS_MAX, "the ceiling is the default: the credential proxy's child memory budget admits four requests at once at the operator's limit, and an eight-wide burst waits one listing where a sixteen-wide one can outwait the 60s bound (docs/designs/credential-proxy-child-memory-budget.md §2.2)")
         self.assertEqual(rec._list_workers(4 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         self.assertEqual(rec._list_workers(50 * rec.RESOLVED_SET_CAP), rec.LIST_WORKERS_MAX)
         budget = rec.LIST_BUDGET_SECONDS
         self.assertEqual(rec._list_budget_seconds(rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), budget)
-        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 2 * budget)
-        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * budget)
-        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 5 * budget)
-        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 3 * rec.PRUNE_BUDGET_SECONDS)
+        self.assertEqual(rec._list_budget_seconds(2 * rec.RESOLVED_SET_CAP), 2 * budget, "workers now cap at the default, so 2x cap needs 2 rounds")
+        self.assertEqual(rec._list_budget_seconds(4 * rec.RESOLVED_SET_CAP), 4 * budget, "4x cap needs 4 rounds at the capped worker count")
+        self.assertEqual(rec._list_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * budget)
+        self.assertEqual(rec._list_budget_seconds(10 * rec.RESOLVED_SET_CAP), 10 * budget)
+        self.assertEqual(rec._prune_budget_seconds(5 * rec.RESOLVED_SET_CAP), 5 * rec.PRUNE_BUDGET_SECONDS, "prune budget scales with the list budget, which now grows once workers cap")
         # The prune's budget follows the profiles too, per describe rather than per round
         # of workers: the sandbox's CPU serialises the describes, so 120 profiles get the
         # sequential walk's time whatever the worker count, and eight stay on the floor.
