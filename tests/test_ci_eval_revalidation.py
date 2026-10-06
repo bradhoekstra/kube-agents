@@ -320,16 +320,13 @@ class RevalidationTest(unittest.TestCase):
         return env
 
     def _child_env(self, env):
-        # A None value is dropped AFTER the isolated env is built because
-        # that env starts from os.environ.
-        absent = {key for key, value in env.items() if value is None}
-        child_env = get_isolated_test_env(
+        # A None value names a variable the child must not see; the helper
+        # drops it from its os.environ copy, since an override cannot.
+        return get_isolated_test_env(
             overrides={key: value for key, value in env.items() if value is not None},
             bin_dir=self.bin,
+            absent=[key for key, value in env.items() if value is None],
         )
-        for key in absent:
-            child_env.pop(key, None)
-        return child_env
 
     def _run(self, cur_head, cur_base, env_overrides=None):
         # Sourced rather than executed so the wrapper can name the verdict it
@@ -631,6 +628,12 @@ class RevalidationTest(unittest.TestCase):
             ("serial base", {"PULL_BASE_SHA": "--output=/dev/null"}, "PULL_BASE_SHA is not a 40-hex SHA"),
             ("serial head", {"PULL_PULL_SHA": self.c3[:12]}, "PULL_NUMBER or PULL_PULL_SHA is not"),
             ("serial number", {"PULL_NUMBER": "77; rm -rf /"}, "PULL_NUMBER or PULL_PULL_SHA is not"),
+            # A well-formed first line over a second: the check holds the whole
+            # value, where a line-wise grep would pass the first line and hand
+            # both to git.
+            ("multi-line base", {"PULL_BASE_SHA": f"{self.c2}\n--output=/dev/null"}, "PULL_BASE_SHA is not a 40-hex SHA"),
+            ("multi-line head", {"PULL_PULL_SHA": f"{self.c4}\n--output=/dev/null"}, "PULL_NUMBER or PULL_PULL_SHA is not"),
+            ("multi-line number", {"PULL_NUMBER": f"{_PR}\n77"}, "PULL_NUMBER or PULL_PULL_SHA is not"),
         )
         for name, overrides, reason in cases:
             with self.subTest(name):

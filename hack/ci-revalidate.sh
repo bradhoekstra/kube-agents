@@ -146,6 +146,11 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 # PULL_REFS as "<base_ref>:<base_sha>,<number>:<sha>[,...]" (each pull entry
 # may carry a third ":<ref>" field) with no PULL_NUMBER or PULL_PULL_SHA.
 readonly REVALIDATION_BATCH_JOB_TYPE="batch"
+# The shapes a SHA and a pull number are held to before anything reads them,
+# matched with [[ =~ ]] against the whole value: a `grep -q` on the value would
+# pass one whose first line is well-formed and whose second is anything.
+readonly REVALIDATION_SHA_RE='^[0-9a-f]{40}$'
+readonly REVALIDATION_NUMBER_RE='^[0-9]+$'
 # The mint behind the read credential (header, "GitHub read credential"):
 # the harness's own, beside this file. Its one argument is the exit code it
 # uses for a failure another attempt could survive; step 0 does not retry,
@@ -302,7 +307,7 @@ print(base, head)
   #      context on that head whose target URL names this very build.
   local sha
   for sha in "${prev_base}" "${prev_head}"; do
-    if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+    if ! [[ "${sha}" =~ ${REVALIDATION_SHA_RE} ]]; then
       echo "Step 0: full run: build ${prev_green}'s started.json holds a malformed SHA (PR #${pull_number})"
       return 1
     fi
@@ -451,7 +456,7 @@ revalidate_against_green_history() {
   # held to that shape before any of them reaches gsutil or git, as the
   # recovered ones are: a value shaped like an option would otherwise reach
   # `git diff` as one, and an empty file list reads as an inert delta.
-  if [ -n "${PULL_BASE_SHA:-}" ] && ! printf '%s' "${PULL_BASE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+  if [ -n "${PULL_BASE_SHA:-}" ] && ! [[ "${PULL_BASE_SHA}" =~ ${REVALIDATION_SHA_RE} ]]; then
     echo "Step 0: full run: PULL_BASE_SHA is not a 40-hex SHA (${PULL_BASE_SHA})"
     return 1
   fi
@@ -486,7 +491,7 @@ for entry in entries[1:]:
     fi
     echo "Step 0: batch of $(printf '%s\n' "${pulls}" | wc -l | tr -d ' ') pull requests; every one must hold a reusable verdict"
   elif [ -n "${PULL_NUMBER:-}" ] && [ -n "${PULL_PULL_SHA:-}" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
-    if ! printf '%s' "${PULL_NUMBER}" | grep -Eq '^[0-9]+$' || ! printf '%s' "${PULL_PULL_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+    if ! [[ "${PULL_NUMBER}" =~ ${REVALIDATION_NUMBER_RE} ]] || ! [[ "${PULL_PULL_SHA}" =~ ${REVALIDATION_SHA_RE} ]]; then
       echo "Step 0: full run: PULL_NUMBER or PULL_PULL_SHA is not <number> and <40-hex SHA> (${PULL_NUMBER}, ${PULL_PULL_SHA})"
       return 1
     fi

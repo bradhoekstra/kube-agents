@@ -284,6 +284,11 @@ class LedgerMintRequestTest(unittest.TestCase):
                 call,
             ]
         )
+        exported = (
+            {"EVAL_LEDGER_APP_ID": "4739812", "EVAL_LEDGER_INSTALLATION_ID": "157029058"}
+            if ids is None
+            else ids
+        )
         proc = subprocess.run(
             ["bash", "-c", script],
             capture_output=True,
@@ -294,12 +299,12 @@ class LedgerMintRequestTest(unittest.TestCase):
                     "MINT_CAPTURE_FILE": str(self.capture),
                     "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
                     "BENCH_GITHUB_TOKEN": "the-mounted-pat",
-                    **(
-                        {"EVAL_LEDGER_APP_ID": "4739812", "EVAL_LEDGER_INSTALLATION_ID": "157029058"}
-                        if ids is None
-                        else ids
-                    ),
-                }
+                    **exported,
+                },
+                # A shell that has run the harness exports both ids; an id the
+                # caller did not name must be absent, not inherited, or the
+                # default case asserts the shell's value.
+                absent=[key for key in ("EVAL_LEDGER_APP_ID", "EVAL_LEDGER_INSTALLATION_ID") if key not in exported],
             ),
         )
         self.assertEqual(expect_rc, proc.returncode, proc.stderr)
