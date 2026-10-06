@@ -155,7 +155,12 @@ func (p *UsageCounterPoller) NeedLeaderElection() bool { return true }
 // per process, not per CR.
 func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 	log := logf.FromContext(parent).WithName(usagePollerLogName)
-	budget := p.pollBudget()
+	// A hand-built poller (the envtest harness) may leave pollBudget nil; fall
+	// back to the interval so a missing seam cannot panic the poll.
+	budget := usageCountersPollInterval
+	if p.pollBudget != nil {
+		budget = p.pollBudget()
+	}
 	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
 	var list agentv1alpha1.PlatformAgentList
