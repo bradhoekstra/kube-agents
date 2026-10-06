@@ -527,9 +527,12 @@ value to raise when the proxy is OOM-killed under a large fleet; a wide-scope
 install can outgrow the default, and
 [the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
 has the arithmetic. The
-operator's webhook, where enabled, refuses a memory limit below 672Mi and a
-request above its limit, and warns when memory per CPU leaves the 1 to 6.5 GiB
-per vCPU band Autopilot admits unchanged. On GKE Autopilot without bursting, a
+operator refuses a memory limit below 672Mi, a request above its limit, a
+negative quantity, a zero limit and `claims`, whether or not its webhook is
+enabled: the reconciler leaves the proxy Deployment as last applied and reports
+`Degraded` (`Reason: InvalidCredentialProxyResources`), and the webhook, where
+enabled, refuses the same override at apply. It warns when memory per CPU leaves
+the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged. On GKE Autopilot without bursting, a
 container's limits follow its requests, so raise `requests.memory` alongside
 `limits.memory` there. The quota preflight counts the override.
 

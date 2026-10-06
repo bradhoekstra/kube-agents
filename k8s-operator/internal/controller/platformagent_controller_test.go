@@ -36,8 +36,10 @@ import (
 	nodev1 "k8s.io/api/node/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -49,6 +51,7 @@ import (
 	"k8s.io/apimachinery/pkg/version"
 	"k8s.io/client-go/discovery"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -867,6 +870,121 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	if !strings.Contains(degradedCond.Message, "Admission webhook will reject updates to this resource until corrected") {
 		t.Errorf("expected Degraded condition message to mention admission webhook rejection, got %q", degradedCond.Message)
 	}
+}
+
+// reconcileInvalidCredentialProxyResources reconciles a CR whose
+// credential-proxy override the shared validation refuses, against an install
+// that already runs the proxy at the defaults, and asserts the operator's
+// refusal: Degraded with InvalidCredentialProxyResources, a Warning event that
+// names the field, and the running Deployment neither rewritten nor deleted.
+// The webhook is not in the loop, as on a chart install, which leaves it off.
+func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.ResourceRequirements, wantField string) {
+	t.Helper()
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-resources", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: override},
+			}},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	atDefaults := agent.DeepCopy()
+	atDefaults.Spec.Deployment.CredentialProxy = nil
+	running := buildCredentialProxyDeployment(atDefaults, "policy-hash")
+
+	deploymentDeletes := 0
+	funcs := fakeServerSideApplyInterceptors()
+	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment && obj.GetName() == running.Name {
+			deploymentDeletes++
+		}
+		return cl.Delete(ctx, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent), running).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	recorder := record.NewFakeRecorder(64)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: recorder}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	ctx := context.Background()
+
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("Status.Phase = %q, want Degraded", updated.Status.Phase)
+	}
+	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidCredentialProxyResources {
+		t.Fatalf("Degraded condition = %v, want True/%s", degraded, conditionReasonInvalidCredentialProxyResources)
+	}
+	if !strings.Contains(degraded.Message, wantField) {
+		t.Errorf("Degraded message %q does not name %s", degraded.Message, wantField)
+	}
+	ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Ready condition = %v, want False/%s", ready, conditionReasonInvalidCredentialProxyResources)
+	}
+
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(running), dep); err != nil {
+		t.Fatalf("the running proxy Deployment is gone: %v", err)
+	}
+	if deploymentDeletes != 0 {
+		t.Errorf("the proxy Deployment was deleted %d time(s); an invalid override must leave it in place", deploymentDeletes)
+	}
+	var proxy *corev1.Container
+	for i := range dep.Spec.Template.Spec.Containers {
+		if dep.Spec.Template.Spec.Containers[i].Name == credentialProxyContainerName {
+			proxy = &dep.Spec.Template.Spec.Containers[i]
+		}
+	}
+	if proxy == nil {
+		t.Fatalf("no %s container in the proxy Deployment", credentialProxyContainerName)
+	}
+	if !equality.Semantic.DeepEqual(proxy.Resources, resolveCredentialProxyResources(atDefaults.Spec.Deployment)) {
+		t.Errorf("the proxy container's resources changed to %v; the last valid rendering should keep serving", proxy.Resources)
+	}
+
+	close(recorder.Events)
+	var warned bool
+	for event := range recorder.Events {
+		if strings.HasPrefix(event, corev1.EventTypeWarning+" "+conditionReasonInvalidCredentialProxyResources) && strings.Contains(event, wantField) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no Warning %s event naming %s", conditionReasonInvalidCredentialProxyResources, wantField)
+	}
+}
+
+// A memory limit under the floor: rendered, the broker would turn its budget
+// off and admit eight commands into 512Mi.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyLimitUnderTheFloorIsRefused(t *testing.T) {
+	reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("512Mi")},
+	}, "spec.deployment.credentialProxy.resources.limits.memory")
+}
+
+// A request above the default limit: rendered, the API server refuses the
+// Deployment as Invalid, which applyCredentialProxyDeployment reads as the
+// immutable-selector case and answers by deleting the running proxy.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyRequestAboveTheLimitIsRefused(t *testing.T) {
+	reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+	}, "spec.deployment.credentialProxy.resources.requests.memory")
 }
 
 func TestPlatformAgentReconciler_Reconcile_NonGitHubRepo(t *testing.T) {

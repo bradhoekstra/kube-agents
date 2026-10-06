@@ -131,16 +131,16 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("request cost = %d MiB, want 176", got/mib)
 	}
 	defaultLimit := resource.MustParse(credentialProxyMemoryLimit)
-	if got := CredentialProxyAdmittedRequests(defaultLimit.Value()); got != 4 {
+	if got := credentialProxyAdmittedRequests(defaultLimit.Value(), credentialProxyOutputCapBytes); got != 4 {
 		t.Errorf("the default limit admits %d requests, want 4", got)
 	}
-	if got := CredentialProxyMemoryLimitFloorBytes(); got != 672*mib {
+	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
 	}
-	if got := CredentialProxyAdmittedRequests(CredentialProxyMemoryLimitFloorBytes()); got != credentialProxyMinimumAdmittedRequests {
+	if got := credentialProxyAdmittedRequests(credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes), credentialProxyOutputCapBytes); got != credentialProxyMinimumAdmittedRequests {
 		t.Errorf("the floor admits %d requests, want %d", got, credentialProxyMinimumAdmittedRequests)
 	}
-	if got := CredentialProxyAdmittedRequests(credentialProxyResidentReserveBytes); got != 0 {
+	if got := credentialProxyAdmittedRequests(credentialProxyResidentReserveBytes, credentialProxyOutputCapBytes); got != 0 {
 		t.Errorf("a limit below the fixed reserves admits %d requests, want 0", got)
 	}
 }

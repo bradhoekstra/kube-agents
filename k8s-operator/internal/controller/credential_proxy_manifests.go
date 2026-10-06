@@ -104,8 +104,8 @@ const (
 	// slots in use fit the limit less credentialProxyResidentReserveBytes and
 	// credentialProxyWorkspaceReserveBytes -- four at once at the 1Gi below,
 	// with the slot cap as the upper bound. The sizing test in
-	// platformagent_manifests_test.go and the admission webhook hold the limit
-	// to at least two. An install raises the limit through
+	// platformagent_manifests_test.go and ValidateCredentialProxyResources
+	// hold the limit to at least two. An install raises the limit through
 	// spec.deployment.credentialProxy.resources (resolveCredentialProxyResources
 	// merges it over these defaults per key), which raises the admitted count;
 	// the caps stay here.
@@ -144,8 +144,8 @@ const (
 	// OUTPUT_COPIES_PER_COMMAND). The sizing test reads them, and
 	// tests/test_credential_proxy_sizing_parity.py holds them, and
 	// credentialProxyMinimumAdmittedRequests below, equal to the broker's;
-	// they are declared here rather than in the test so that the admission
-	// webhook reads the same copy. The design
+	// they are declared here rather than in the test so that
+	// ValidateCredentialProxyResources reads the same copy. The design
 	// (docs/designs/credential-proxy-child-memory-budget.md §2.2) is why each
 	// is the size it is. Change the Python side in the same commit.
 	credentialProxyResidentReserveBytes   int64 = 192 << 20
@@ -153,7 +153,7 @@ const (
 	credentialProxyRequestReserveBytes    int64 = 128 << 20
 	credentialProxyOutputCopiesPerCommand int64 = 6
 	// credentialProxyMinimumAdmittedRequests is the floor the sizing test
-	// and the admission webhook hold the limit to: fewer than two and a
+	// and ValidateCredentialProxyResources hold the limit to: fewer than two and a
 	// listing phase cannot parallelise at all. The broker's counterpart is
 	// BUDGET_MINIMUM_ADMITTED_REQUESTS in credential_proxy.py.
 	credentialProxyMinimumAdmittedRequests int64 = 2
@@ -188,29 +188,6 @@ func credentialProxyAdmittedRequests(limitBytes, outputCapBytes int64) int64 {
 func credentialProxyMinimumMemoryLimitBytes(outputCapBytes int64) int64 {
 	return credentialProxyResidentReserveBytes + credentialProxyWorkspaceReserveBytes +
 		credentialProxyMinimumAdmittedRequests*credentialProxyRequestCostBytes(outputCapBytes)
-}
-
-// CredentialProxyResources is the requests and limits the proxy container is
-// rendered with under deployment: the operator's defaults with the CR's
-// spec.deployment.credentialProxy.resources merged over them per key. The
-// webhook validates this rather than the override alone, because a CR that
-// raises only requests.memory collides with the default limit, not with a
-// limit it wrote.
-func CredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
-	return resolveCredentialProxyResources(deployment)
-}
-
-// CredentialProxyMemoryLimitFloorBytes is the smallest memory limit the webhook
-// admits for the proxy container, at the operator's output cap.
-func CredentialProxyMemoryLimitFloorBytes() int64 {
-	return credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes)
-}
-
-// CredentialProxyAdmittedRequests is how many commands the broker admits at
-// once under limitBytes, at the operator's output cap; the webhook quotes it
-// beside the floor so a refused limit says what it would have bought.
-func CredentialProxyAdmittedRequests(limitBytes int64) int64 {
-	return credentialProxyAdmittedRequests(limitBytes, credentialProxyOutputCapBytes)
 }
 
 // resolveCredentialProxyResources merges the CR's override over the defaults.

@@ -1092,10 +1092,14 @@ spec:
                             limit. The broker sizes how many commands it admits at once from the
                             memory limit, so raising the limit is the one knob for an install whose
                             fleet outgrows the default; the ephemeral-storage limit bounds the content
-                            workspace the broker clones into. The validating webhook refuses a memory
-                            limit below what admits two commands at once, and a request above its
-                            limit, and warns when the memory-to-CPU limit ratio leaves the band GKE
-                            Autopilot admits unchanged. On GKE Autopilot without bursting, a
+                            workspace the broker clones into. The operator refuses a memory limit
+                            below what admits two commands at once, a request above its limit, a
+                            negative quantity and a zero limit; `claims` is refused, because the proxy
+                            pod declares no resourceClaims. The reconciler leaves the proxy
+                            Deployment as last applied and sets Degraded whether or not the
+                            validating webhook is enabled, and the webhook, where it is, refuses the
+                            override at apply. The webhook warns when the memory-to-CPU limit ratio
+                            leaves the band GKE Autopilot admits unchanged. On GKE Autopilot without bursting, a
                             container's limits follow its requests, so raise requests.memory
                             alongside limits.memory there.
                           properties:

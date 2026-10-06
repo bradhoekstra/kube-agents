@@ -203,3 +203,86 @@ func TestCredentialProxyEmptyOverrideIsAdmitted(t *testing.T) {
 		}
 	}
 }
+
+// claims has nowhere to go: the proxy pod declares no resourceClaims, so the
+// render drops the key, and admitting it would show a CR a setting it does not
+// have.
+func TestCredentialProxyClaimsAreRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Claims: []corev1.ResourceClaim{{Name: "gpu"}},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.claims")
+	if !strings.Contains(msg, "declares no resourceClaims") {
+		t.Errorf("message %q does not say why claims cannot take effect", msg)
+	}
+}
+
+// Every name the override introduces is checked for a crossed pair, not only
+// the three the operator declares.
+func TestCredentialProxyCrossedHugepagesPairIsRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{"hugepages-2Mi": resource.MustParse("4Mi")},
+		Limits:   corev1.ResourceList{"hugepages-2Mi": resource.MustParse("2Mi")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.hugepages-2Mi")
+	if !strings.Contains(msg, "2Mi hugepages-2Mi limit set beside it") {
+		t.Errorf("message %q does not name the limit set in the same override", msg)
+	}
+}
+
+// The CRD's quantity pattern admits a leading minus; the API server refuses
+// the Deployment that carries one.
+func TestCredentialProxyNegativeRequestIsRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("-1Mi")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.requests.memory")
+	if !strings.Contains(msg, "must not be negative") {
+		t.Errorf("message %q does not refuse the negative quantity", msg)
+	}
+}
+
+// A zero limit on a name with no default request beside it is not caught by
+// the crossed-pair check, and an ephemeral-storage limit of zero evicts the
+// pod on its first write.
+func TestCredentialProxyZeroLimitIsRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse("0")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.limits.ephemeral-storage")
+	if !strings.Contains(msg, "a limit of zero") {
+		t.Errorf("message %q does not refuse the zero limit", msg)
+	}
+}
+
+// 9Pi of memory per CPU is past where memory × 1000 fits an int64; the band
+// arithmetic must not wrap into a negative ratio.
+func TestCredentialProxyBandArithmeticDoesNotWrapAtPetabytes(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("9Pi")},
+	}))
+	if err != nil {
+		t.Fatalf("a 9Pi limit is representable and above the floor, got: %v", err)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "9437184.00 GiB per vCPU") {
+		t.Errorf("expected one warning at 9437184.00 GiB per vCPU, got %v", warnings)
+	}
+}
+
+// 10E is a valid quantity and more bytes than an int64 holds, so the
+// Downward API cannot hand it to the broker as a byte count.
+func TestCredentialProxyUnrepresentableMemoryLimitIsRefused(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("10E")},
+	}))
+	msg := fieldErrorMessage(t, err, "spec.deployment.credentialProxy.resources.limits.memory")
+	if !strings.Contains(msg, "not a representable byte count") || strings.Contains(msg, "floor") {
+		t.Errorf("message %q should refuse 10E as unrepresentable and nothing else", msg)
+	}
+}

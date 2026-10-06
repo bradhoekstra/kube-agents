@@ -256,6 +256,12 @@ const (
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	// conditionReasonInvalidCredentialProxyResources: the CR's
+	// spec.deployment.credentialProxy.resources fails
+	// ValidateCredentialProxyResources, so the proxy Deployment is not
+	// written and one already running keeps its last valid rendering.
+	conditionReasonInvalidCredentialProxyResources = "InvalidCredentialProxyResources"
+	invalidCredentialProxyResourcesMsgFmt          = "Invalid spec.deployment.credentialProxy.resources (%s); the credential-proxy Deployment is not written, so one already running keeps its last valid rendering, and none is created, until the override is corrected"
 	// conditionReasonMinterPruningHeld: a GitHub repository entry the minter
 	// sync cannot read holds every tracked policy, so a repository removed
 	// from the lists keeps its write policy until the entry is fixed.
@@ -2248,22 +2254,40 @@ func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key 
 // business knowing where the relays run. credential_proxy_manifests.go carries
 // the reasoning for why the pod is its own.
 func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
-	// This pod, not the gateway, is where the Slack and Teams tokens and the
-	// model-provider keys are read out of a Secret as environment, so it needs
-	// the same digest — see platformagent_secret_hash.go. Stamping only the
-	// gateway would have left the credentials most likely to be rotated
-	// reaching a container that never restarts. (On a Slack-armed next install
-	// the Slack pair is read by the A2A gateway instead, which reconcileA2A
-	// stamps.)
-	proxy := buildCredentialProxyDeployment(agent, policyHash)
-	if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
-		return err
+	objs := []client.Object{buildCredentialProxyService(agent)}
+	// The resources override is checked here as well as at admission, because
+	// the chart installs with the webhook off. Rendered, an override under the
+	// floor runs the broker with its budget off, and a request above its limit
+	// is refused by the API server as Invalid, which
+	// applyCredentialProxyDeployment reads as an immutable-field change and
+	// answers by deleting the running proxy. Refused, the Deployment is not
+	// written at all: one already running keeps its last valid rendering
+	// (and is not rolled for a Secret rotation meanwhile), and
+	// updateStatusReady reports the refusal as Degraded. The Service and the
+	// NetworkPolicy do not depend on the override and are still applied.
+	refusal, warnings := credentialProxyResourcesRefusal(agent)
+	for _, warning := range warnings {
+		logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
 	}
-	objs := []client.Object{
-		buildCredentialProxyService(agent),
-		proxy,
-		credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace),
+	if refusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.deployment.credentialProxy.resources; the credential-proxy Deployment is not written",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidCredentialProxyResources, refusal)
+	} else {
+		// This pod, not the gateway, is where the Slack and Teams tokens and the
+		// model-provider keys are read out of a Secret as environment, so it needs
+		// the same digest — see platformagent_secret_hash.go. Stamping only the
+		// gateway would have left the credentials most likely to be rotated
+		// reaching a container that never restarts. (On a Slack-armed next
+		// install the Slack pair is read by the A2A gateway instead, which
+		// reconcileA2A stamps.)
+		proxy := buildCredentialProxyDeployment(agent, policyHash)
+		if err := r.stampSecretEnvHash(ctx, agent, proxy, &proxy.Spec.Template); err != nil {
+			return err
+		}
+		objs = append(objs, proxy)
 	}
+	objs = append(objs, credentialProxyNetworkPolicyWithOperatorPeer(agent, r.OperatorNamespace))
 	for _, obj := range objs {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
@@ -3521,6 +3545,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
+	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
+
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
 	// The Degraded message is the Ready one unless a branch says otherwise.
@@ -3551,6 +3577,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			}
 		}
 		condMsg = fmt.Sprintf("Invalid git integration (%s); the refused entries are not seeded%s. Admission webhook will reject updates to this resource until corrected", gitProblemList(gitRepoErr), withheld)
+		degradedStatus = metav1.ConditionTrue
+	} else if proxyResourcesRefusal != "" {
+		// Same shape as the git refusal above: the spec is read here, on
+		// every pass, rather than carried from reconcileCredentialProxy, so
+		// the condition clears on the pass the override is corrected.
+		newPhase = "Degraded"
+		condStatus = metav1.ConditionFalse
+		condReason = conditionReasonInvalidCredentialProxyResources
+		degradedReason = conditionReasonInvalidCredentialProxyResources
+		condMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"

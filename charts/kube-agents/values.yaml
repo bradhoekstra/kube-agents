@@ -769,10 +769,13 @@ platformAgent:
     # raises the memory limit and keeps the rest. The broker sizes how many
     # commands it admits at once from that limit, so it is the setting to raise
     # when the proxy is OOM-killed under a large fleet. The quota preflight
-    # counts the override. The operator's webhook, where enabled, refuses a
-    # memory limit below 672Mi (two commands at once) and a request above its
-    # limit, and warns when memory per CPU leaves the 1 to 6.5 GiB per vCPU band
-    # Autopilot admits unchanged. On GKE Autopilot without bursting, a container's
+    # counts the override. The operator refuses a memory limit below 672Mi (two
+    # commands at once), a request above its limit, a negative quantity, a zero
+    # limit and claims, whether or not its webhook is enabled: the reconciler
+    # leaves the proxy Deployment as last applied and reports Degraded, and the
+    # webhook, where enabled, refuses the override at apply. It warns when memory
+    # per CPU leaves the 1 to 6.5 GiB per vCPU band Autopilot admits unchanged.
+    # On GKE Autopilot without bursting, a container's
     # limits follow its requests, so raise requests.memory alongside limits.memory
     # there.
     credentialProxy:
