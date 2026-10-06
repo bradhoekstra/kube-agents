@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -285,6 +286,14 @@ func main() {
 	if operatorNamespace == "" {
 		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
 			"variable", controller.OperatorNamespaceEnv)
+	} else if errs := validation.IsValidLabelValue(operatorNamespace); len(errs) > 0 {
+		// A value the selector cannot carry is treated as unknown: written into
+		// the NetworkPolicy it would have the API server reject the policy on
+		// every reconcile. Clear it so the rule is not rendered and the poller,
+		// which could reach no pod without it, is not started.
+		setupLog.Info("the operator's namespace is not a valid label value; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
+		operatorNamespace = ""
 	}
 
 	reconciler := &controller.PlatformAgentReconciler{

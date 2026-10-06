@@ -39,6 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/utils/ptr"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/yaml"
@@ -5907,9 +5908,15 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 // shape as the collector's rule beside it, narrowed to a pod selector so that
 // the listener reaches the collector and the operator, both readers of
 // counters, and nothing else in either namespace. False when the namespace is
-// unknown, off the cluster, where nothing could reach a pod IP in any case.
+// unknown, off the cluster, where nothing could reach a pod IP in any case, and
+// when it is not a valid label value: written verbatim into the selector it
+// would have the API server reject the whole policy, failing every reconcile.
 func operatorMetricsIngressRule(operatorNamespace string, port int32) (networkingv1.NetworkPolicyIngressRule, bool) {
 	if operatorNamespace == "" {
+		return networkingv1.NetworkPolicyIngressRule{}, false
+	}
+	if errs := validation.IsValidLabelValue(operatorNamespace); len(errs) > 0 {
+		manifestsLog.Info("the operator's namespace is not a valid label value; the agent policy will not admit the operator on the metrics port", "value", operatorNamespace)
 		return networkingv1.NetworkPolicyIngressRule{}, false
 	}
 	return networkingv1.NetworkPolicyIngressRule{

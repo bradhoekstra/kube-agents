@@ -26,6 +26,10 @@ import (
 
 const policyTestOperatorNamespace = "operator-ns"
 
+// policyTestMalformedNamespace is not a valid label value: the API server would
+// reject a NetworkPolicy that carried it in a selector.
+const policyTestMalformedNamespace = "Not A Valid NS!"
+
 // operatorPeerRules is every ingress rule of np whose peer is the operator's
 // pods, keyed by the ports it opens.
 func operatorPeerRules(np *networkingv1.NetworkPolicy) map[int32]networkingv1.NetworkPolicyPeer {
@@ -74,6 +78,17 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	}
 	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, ""))); n != 0 {
 		t.Errorf("the broker policy renders %d operator rule(s) with no namespace, want 0", n)
+	}
+	// A malformed namespace is treated like an unknown one: written into a
+	// selector it would have the API server reject the whole policy, so neither
+	// policy renders the operator rule.
+	malformed := defaultTestNetpolProfile()
+	malformed.OperatorNamespace = policyTestMalformedNamespace
+	if n := len(operatorPeerRules(buildNetworkPolicy(agent, nil, malformed, false, "", false))); n != 0 {
+		t.Errorf("the gateway policy renders %d operator rule(s) with a malformed namespace, want 0", n)
+	}
+	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestMalformedNamespace))); n != 0 {
+		t.Errorf("the broker policy renders %d operator rule(s) with a malformed namespace, want 0", n)
 	}
 	// The builder itself is unchanged: no operator rule, whatever the caller knows.
 	if n := len(operatorPeerRules(buildCredentialProxyNetworkPolicy(agent))); n != 0 {
