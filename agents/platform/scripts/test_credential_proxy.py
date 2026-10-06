@@ -5982,6 +5982,59 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertIs(results[0], second_results[0])
         self.assertEqual(1, len(calls))
 
+    def test_a_route_refresher_waits_on_a_vcs_verbs_refresh_without_reserving(self):
+        executor = self._budgeted_executor(admits=2)
+        entered = threading.Event()
+        finish = threading.Event()
+        self.addCleanup(finish.set)
+        calls = []
+
+        def blocking_helper(*args, **kwargs):
+            calls.append(args)
+            entered.set()
+            finish.wait(5)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        covered_results = []
+
+        def vcs_verb():
+            try:
+                with executor.request_slot():
+                    executor.refresh_forge_credential("github", "gke-agentic/infra")
+                covered_results.append("ok")
+            except Exception as exc:  # surfaced by the assertions
+                covered_results.append(exc)
+
+        with mock.patch.object(executor, "_run_forge_helper", blocking_helper):
+            covered = threading.Thread(target=vcs_verb)
+            covered.start()
+            self.assertTrue(entered.wait(5))
+            route_results = []
+            route = self._refresh_in_thread(executor, route_results)
+            time.sleep(3 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+            self.assertTrue(route.is_alive())
+            self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+            finish.set()
+            covered.join(5)
+            route.join(5)
+        self.assertEqual(["ok"], covered_results)
+        self.assertEqual(["ok"], route_results)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, executor.reserved_bytes)
+        self.assertEqual({}, executor._refresh_in_flight)
+
+    def test_a_route_refresher_gives_up_on_a_held_refresh_lock_at_the_bound(self):
+        # The lock held by something no marker names -- another provider's
+        # helper -- bounds the route's wait for it like admission.
+        executor = self._budgeted_executor(admits=2)
+        executor._refresh_lock.acquire()
+        self.addCleanup(executor._refresh_lock.release)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable):
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+        self.assertEqual(0, executor.reserved_bytes)
+        self.assertEqual({}, executor._refresh_in_flight)
+
     def test_a_waiter_that_hangs_up_raises_and_reserves_nothing(self):
         executor = self._budgeted_executor(admits=2)
         results = []

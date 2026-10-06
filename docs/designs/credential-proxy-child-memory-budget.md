@@ -113,14 +113,16 @@ Where each route reserves, and why there:
   case for the sandbox `gh` wrapper and the fleet-audit skill, both of which call it before every
   credentialed step. So the route reads the coalesce cache first, without the refresh lock, and
   reserves only when it will run the helper itself. A caller that finds a refresh for the same
-  provider already in flight from the route waits for it without a reservation, then repeats the
-  lock-free checks: the coalesce cache, and a failure recorded since it arrived, which it
+  provider already in flight -- the route's, or a vcs verb's, which marks itself without a
+  reservation of its own -- waits for it without a reservation, then repeats the lock-free
+  checks: the coalesce cache, and a failure recorded since it arrived, which it
   re-raises. Only a caller that finds none in flight marks itself as the next refresher, reserves,
   takes `_refresh_lock`, repeats the coalesce check under it as the function does, and runs the
   helper under the reservation. So the route holds one reservation per provider however many
   callers queue behind it, a cache hit never waits for the budget, and the refresh lock is never
-  held across a budget wait. The wait for an in-flight refresh is bounded by the admission wait
-  and refused busy past it. The route hands its connection to the wait, as the exec and
+  held across a budget wait. The route's waits for an in-flight refresh and for the lock share
+  one bound, the admission wait counted from arrival, and are refused busy past it. The route
+  hands its connection to the wait, as the exec and
   vcs routes hand theirs to the slot wait, so a caller that hangs up while queued is dropped
   before the helper runs, and the route has a handler for that drop (a log line and no
   response, as the exec route has) beside the busy handler. Called from inside a vcs request,

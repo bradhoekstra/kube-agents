@@ -5391,10 +5391,13 @@ class CommandExecutor:
         which it re-raises. Only a caller that finds none in flight marks
         itself as the next refresher and reserves, so the route holds one
         reservation per provider however many callers queue behind it, and the
-        lock is never held across a budget wait. The wait for an in-flight
-        refresh is bounded and watched like admission: CommandSlotUnavailable
-        after COMMAND_SLOT_WAIT_SECONDS, CallerHungUp when `caller`, the
-        route's connection, hangs up.
+        lock is never held across a budget wait. A covered caller marks its
+        refresh as in flight too, without a reservation of its own, so a route
+        caller arriving during a vcs verb's refresh waits on it the same way.
+        The route's waits for an in-flight refresh and for the lock share one
+        bound and are watched like admission: CommandSlotUnavailable after
+        COMMAND_SLOT_WAIT_SECONDS from arrival, CallerHungUp when `caller`,
+        the route's connection, hangs up.
         """
         helper = self._forge_helper(provider)
         forge = _provider_forge(provider)
@@ -5414,7 +5417,20 @@ class CommandExecutor:
             request_budget, "exempt", False
         )
         if covered or getattr(self, "children_budget_bytes", None) is None:
-            self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+            # Marked only when no refresh of this provider is marked already;
+            # the covered caller queues on the lock either way, as before.
+            with self._refresh_in_flight_lock:
+                mine = None
+                if provider not in self._refresh_in_flight:
+                    mine = threading.Event()
+                    self._refresh_in_flight[provider] = mine
+            try:
+                self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+            finally:
+                if mine is not None:
+                    with self._refresh_in_flight_lock:
+                        self._refresh_in_flight.pop(provider, None)
+                    mine.set()
             return
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         while True:
@@ -5432,7 +5448,10 @@ class CommandExecutor:
             self._await_refresh_in_flight(provider, running, deadline, caller)
         try:
             with self.reserve_child_memory(caller=caller):
-                self._refresh_under_lock(provider, helper, repository, clean_repo, failure_key, queued_at)
+                self._refresh_under_lock(
+                    provider, helper, repository, clean_repo, failure_key, queued_at,
+                    lock_deadline=deadline, caller=caller,
+                )
         finally:
             with self._refresh_in_flight_lock:
                 self._refresh_in_flight.pop(provider, None)
@@ -5454,6 +5473,32 @@ class CommandExecutor:
             if caller is not None and _caller_has_gone(caller):
                 raise CallerHungUp("the caller disconnected while waiting for a credential refresh")
 
+    @contextlib.contextmanager
+    def _holding_refresh_lock(
+        self, provider: str, deadline: float | None, caller: socket.socket | None
+    ) -> Iterator[None]:
+        """Hold `_refresh_lock`. Without a deadline, wait as long as it takes;
+        with one -- the route, which holds a reservation by now -- wait in
+        COMMAND_SLOT_POLL_SECONDS pieces, raise CallerHungUp if `caller` hangs
+        up, and CommandSlotUnavailable once the deadline has passed."""
+        if deadline is None:
+            self._refresh_lock.acquire()
+        else:
+            while not self._refresh_lock.acquire(
+                timeout=max(0.0, min(COMMAND_SLOT_POLL_SECONDS, deadline - time.monotonic()))
+            ):
+                if time.monotonic() >= deadline:
+                    raise CommandSlotUnavailable(
+                        f"a {provider} credential refresh waited "
+                        f"{COMMAND_SLOT_WAIT_SECONDS}s for another refresh to finish; retry shortly"
+                    )
+                if caller is not None and _caller_has_gone(caller):
+                    raise CallerHungUp("the caller disconnected while waiting for a credential refresh")
+        try:
+            yield
+        finally:
+            self._refresh_lock.release()
+
     def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
         """The coalesce check, readable without the lock: the cache entry is a
         tuple replaced whole, so a reader sees the old one or the new one."""
@@ -5472,10 +5517,13 @@ class CommandExecutor:
         clean_repo: str,
         failure_key: tuple[str, str],
         queued_at: float,
+        lock_deadline: float | None = None,
+        caller: socket.socket | None = None,
     ) -> None:
         """The serialised part of `refresh_forge_credential`: re-check the
-        coalesce cache, honour the failure memo, and run the helper."""
-        with self._refresh_lock:
+        coalesce cache, honour the failure memo, and run the helper.
+        `lock_deadline` bounds the wait for the lock (`_holding_refresh_lock`)."""
+        with self._holding_refresh_lock(provider, lock_deadline, caller):
             if self._refresh_is_current(provider, clean_repo):
                 return
             failure = self._refresh_failure_cache.get(failure_key)
