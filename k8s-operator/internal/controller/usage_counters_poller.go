@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,6 +91,11 @@ type UsageCounterPoller struct {
 	r      *PlatformAgentReconciler
 	source usageSource
 	now    func() time.Time
+	// pollBudget bounds one pollOnce: a poll that has not finished within it
+	// leaves the rest of the CRs to the next interval rather than stretching
+	// past it, so an unreachable listener holding a dial open does not freeze
+	// the CRs behind it. A seam so a test need not wait a real interval.
+	pollBudget func() time.Duration
 
 	// streaks is the in-memory failure record per pod, for the one log line
 	// when a listener first fails, the one when it recovers, and the Warning
@@ -116,10 +123,11 @@ type usageTarget struct {
 // the pods' listeners over the pod network.
 func NewUsageCounterPoller(r *PlatformAgentReconciler) *UsageCounterPoller {
 	return &UsageCounterPoller{
-		r:       r,
-		source:  newPodUsageSource(),
-		now:     time.Now,
-		streaks: map[types.UID]*usageScrapeStreak{},
+		r:          r,
+		source:     newPodUsageSource(),
+		now:        time.Now,
+		pollBudget: func() time.Duration { return usageCountersPollInterval },
+		streaks:    map[types.UID]*usageScrapeStreak{},
 	}
 }
 
@@ -145,8 +153,11 @@ func (p *UsageCounterPoller) NeedLeaderElection() bool { return true }
 // pollOnce runs one poll over every PlatformAgent, then drops the failure
 // streaks of pods that no CR listed, once over all of them: the streak map is
 // per process, not per CR.
-func (p *UsageCounterPoller) pollOnce(ctx context.Context) {
-	log := logf.FromContext(ctx).WithName(usagePollerLogName)
+func (p *UsageCounterPoller) pollOnce(parent context.Context) {
+	log := logf.FromContext(parent).WithName(usagePollerLogName)
+	budget := p.pollBudget()
+	ctx, cancel := context.WithTimeout(parent, budget)
+	defer cancel()
 	var list agentv1alpha1.PlatformAgentList
 	if err := p.r.List(ctx, &list); err != nil {
 		if ctx.Err() == nil {
@@ -157,11 +168,24 @@ func (p *UsageCounterPoller) pollOnce(ctx context.Context) {
 	seen := map[string]bool{}
 	for i := range list.Items {
 		agent := &list.Items[i]
-		if err := p.pollAgent(ctx, agent, seen); err != nil && ctx.Err() == nil {
+		if err := p.pollAgent(ctx, agent, seen); err != nil {
+			if ctx.Err() != nil {
+				// The poll hit its budget: the CRs left this interval are read
+				// next interval. Logged, not counted as a failure, so an
+				// unreachable listener holding its dial open does not freeze the
+				// CRs behind it without a word.
+				log.Info("usage counters poll did not finish within its budget; the remaining CRs are read next interval", "budget", budget.String())
+				break
+			}
 			log.Error(err, "usage counters poll failed; the totals are where they were", "platformagent", client.ObjectKeyFromObject(agent).String())
 		}
 	}
-	p.forgetDepartedStreaks(seen)
+	// Prune only after a poll that reached every CR: seen is partial when the
+	// budget cut the poll short, and pruning on it would drop the streaks of
+	// CRs this poll never got to.
+	if ctx.Err() == nil {
+		p.forgetDepartedStreaks(seen)
+	}
 }
 
 // pollAgent is one poll of one CR: scrape, fold, write the ConfigMap when the
@@ -180,15 +204,19 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 		seen[uid] = true
 	}
 	scraped := make([]usageScrapedPod, 0, len(targets))
+	var failing []usageScrapeFailure
 	for _, target := range targets {
 		reading, err := p.source.Scrape(ctx, target.addr, target.counter)
 		if err != nil {
 			if ctx.Err() != nil {
-				// A poll cut short by shutdown or a leader change is not a
-				// listener failure; the next leader polls afresh.
+				// A poll cut short by shutdown, a leader change, or the poll
+				// budget is not a listener failure; the next leader polls
+				// afresh and the budget's remainder is read next interval.
 				return ctx.Err()
 			}
-			p.noteScrapeFailure(log, cached, target, err)
+			if failure, report := p.noteScrapeFailure(log, target, err); report {
+				failing = append(failing, failure)
+			}
 			continue
 		}
 		p.noteScrapeRecovery(log, target)
@@ -200,6 +228,13 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			Sample:    reading.Sample,
 			StartTime: reading.StartTime,
 		})
+	}
+	// One Warning per CR per poll, however many of its listeners are failing:
+	// the event recorder's spam filter keys its token bucket on the CR, so a
+	// Warning per failing pod would drain it and drop the rest of the CR's
+	// events (the other pods' causes, and anything else recorded between polls).
+	if len(failing) > 0 {
+		p.recordScrapeFailures(cached, failing)
 	}
 
 	// Live reads, not the cache: the ConfigMap is the source of truth and the
@@ -233,8 +268,8 @@ func (p *UsageCounterPoller) reader() client.Reader {
 }
 
 // targets lists the pods the two policies select and returns the running ones
-// whose listener the poll reads, with every pod that exists and is not
-// terminating, scraped or not, in live. When the CR switches the watcher off the gateway pods stay live, so
+// whose listener the poll reads, with every pod that exists and is neither
+// terminating nor in a terminal phase, scraped or not, in live. When the CR switches the watcher off the gateway pods stay live, so
 // their entries persist, and are not read: the entrypoint starts no watcher,
 // so nothing listens on the port, and a refused connection there would be the
 // install's choice.
@@ -258,12 +293,17 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		}
 		for i := range pods.Items {
 			pod := &pods.Items[i]
-			if !pod.DeletionTimestamp.IsZero() {
-				// A terminating pod is never read again, so it is not live:
-				// its entry is dropped, with its streak, and its marker
-				// suppresses no sibling's advance during a rollout. What it
-				// counted after its last read is lost, as for any pod that
-				// leaves.
+			if !pod.DeletionTimestamp.IsZero() || pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+				// A terminating pod, or one in a terminal phase, is never read
+				// again, so it is not live: its entry is dropped, with its
+				// streak, and its marker suppresses no sibling's advance during a
+				// rollout. A pod evicted under node pressure, preempted, or whose
+				// node was lost is left in Failed with no deletion timestamp --
+				// the ReplicaSet replaces it without deleting it and pod GC
+				// removes it only past terminated-pod-gc-threshold, hours to days
+				// later -- so the deletion-timestamp test alone would keep it
+				// live and resetting the new replica. What it counted after its
+				// last read is lost, as for any pod that leaves.
 				continue
 			}
 			live[string(pod.UID)] = true
@@ -507,20 +547,24 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	return nil
 }
 
-// noteScrapeFailure records a failed scrape of target: one log line when the
-// streak starts, naming the pod and the error kind and never the body, and a
-// Warning event on the CR from usageScrapeFailureEventStreak polls onward,
-// re-recorded every failing poll so that a live cause stays in `kubectl
-// describe` beside the symptom -- a stalled lastActiveTime, or on an HA family
-// whose sibling still advances, a counter that has quietly dropped this pod. The
-// message carries no per-poll count on purpose: a standing failure writes the
-// same (reason, message) every poll, which the event recorder folds into one
-// Event with a rising count and a refreshed LastTimestamp, so the cause
-// outlives the API server's one-hour Event retention instead of vanishing an
-// hour after the single record the old streak-threshold write left. The
-// recorder's own spam filter bounds the writes to roughly one per five
-// minutes, so re-recording every poll is not an event storm.
-func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1alpha1.PlatformAgent, target usageTarget, err error) {
+// usageScrapeFailure is one pod whose listener failed a scrape this poll, at or
+// past the streak threshold: what recordScrapeFailures needs to name it in the
+// CR's one Warning and to pick the guidance its kind points at.
+type usageScrapeFailure struct {
+	name    string
+	counter string
+	detail  string
+	err     error
+}
+
+// noteScrapeFailure records target's failed scrape in its streak and, on the
+// first failure of a run, logs one line naming the pod and the error kind and
+// never the body. It returns the pod's failure descriptor and whether the
+// streak has reached usageScrapeFailureEventStreak, the point from which the
+// poll reports the pod in the CR's one Warning (recordScrapeFailures). A
+// shorter streak reports nothing, so an upgrade's gap -- listeners moving
+// before the policies admit the operator -- leaves no Warning on a healthy CR.
+func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarget, err error) (usageScrapeFailure, bool) {
 	p.mu.Lock()
 	streak := p.streaks[target.uid]
 	if streak == nil {
@@ -540,11 +584,39 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, agent *agentv1al
 		log.Info("a metrics listener could not be read; this pod is not counted and its baseline is not advanced until it recovers",
 			"pod", target.name, "counter", target.counter, "error", detail)
 	}
-	if count >= usageScrapeFailureEventStreak {
-		p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason,
-			fmt.Sprintf("status.usage.%s is not counting pod %s: its metrics listener cannot be scraped (%s). The total stops advancing unless another pod carries it. %s",
-				target.counter, target.name, detail, usageScrapeGuidance(err)))
+	return usageScrapeFailure{name: target.name, counter: target.counter, detail: detail, err: err}, count >= usageScrapeFailureEventStreak
+}
+
+// recordScrapeFailures records one Warning on the CR for every listener that
+// failed this poll past its streak, naming each pod and ending with the
+// distinct guidance their kinds point at. One event per CR per poll, not one
+// per pod: the event recorder keys its spam filter on source+involvedObject, so
+// a Warning per pod would drain the CR's token bucket (burst 25, one refill per
+// poll interval) and drop the rest -- the other pods' causes this poll, and
+// anything the CR records before the bucket refills. The message is byte-stable
+// across polls for a stable failing set: the pods are sorted by name and the
+// guidance deduplicated in a fixed order, and it carries no per-poll count, so
+// the recorder folds the repeats into one live Event with a rising count and a
+// refreshed LastTimestamp, and the cause outlives the API server's one-hour
+// Event retention instead of standing alone beside a frozen lastActiveTime the
+// morning after a NetworkPolicy started blocking the scrape.
+func (p *UsageCounterPoller) recordScrapeFailures(agent *agentv1alpha1.PlatformAgent, failures []usageScrapeFailure) {
+	sort.Slice(failures, func(i, j int) bool { return failures[i].name < failures[j].name })
+	perPod := make([]string, 0, len(failures))
+	picked := map[string]bool{}
+	for _, f := range failures {
+		perPod = append(perPod, fmt.Sprintf("pod %s (status.usage.%s): %s", f.name, f.counter, f.detail))
+		picked[usageScrapeGuidance(f.err)] = true
 	}
+	var guidance []string
+	for _, g := range []string{usageScrapeConnectGuidance, usageScrapeResponseGuidance} {
+		if picked[g] {
+			guidance = append(guidance, g)
+		}
+	}
+	p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason,
+		fmt.Sprintf("Metrics listeners cannot be scraped, so the totals they feed stop advancing unless another pod carries them: %s. %s",
+			strings.Join(perPod, "; "), strings.Join(guidance, " ")))
 }
 
 // usageScrapeGuidance is the sentence the Warning event ends with, chosen by

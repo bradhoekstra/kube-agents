@@ -30,6 +30,12 @@ const policyTestOperatorNamespace = "operator-ns"
 // reject a NetworkPolicy that carried it in a selector.
 const policyTestMalformedNamespace = "Not A Valid NS!"
 
+// policyTestNonDNS1123Namespace is a valid label value but not a DNS-1123 label
+// (uppercase). The selector would carry it, but the API server only ever sets
+// kubernetes.io/metadata.name to a namespace's own DNS-1123 name, so it matches
+// no namespace on any cluster.
+const policyTestNonDNS1123Namespace = "Kubeagents-System"
+
 // operatorPeerRules is every ingress rule of np whose peer is the operator's
 // pods, keyed by the ports it opens.
 func operatorPeerRules(np *networkingv1.NetworkPolicy) map[int32]networkingv1.NetworkPolicyPeer {
@@ -44,6 +50,23 @@ func operatorPeerRules(np *networkingv1.NetworkPolicy) map[int32]networkingv1.Ne
 		}
 	}
 	return found
+}
+
+// operatorRules is every ingress rule of np that admits a peer carrying the
+// operator's pod label -- the whole rule, so a test can see what else the rule
+// opens beside that peer (a second peer, an empty or wider Ports list), which
+// operatorPeerRules drops.
+func operatorRules(np *networkingv1.NetworkPolicy) []networkingv1.NetworkPolicyIngressRule {
+	var rules []networkingv1.NetworkPolicyIngressRule
+	for _, rule := range np.Spec.Ingress {
+		for _, peer := range rule.From {
+			if peer.PodSelector != nil && peer.PodSelector.MatchLabels[operatorPodNameLabel] == operatorPodNameValue {
+				rules = append(rules, rule)
+				break
+			}
+		}
+	}
+	return rules
 }
 
 // With the operator's namespace known, the gateway and broker policies each
@@ -89,6 +112,42 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	}
 	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestMalformedNamespace))); n != 0 {
 		t.Errorf("the broker policy renders %d operator rule(s) with a malformed namespace, want 0", n)
+	}
+	// A namespace that is a valid label value but not a DNS-1123 label is treated
+	// the same: the selector would carry it, but it matches no namespace, so
+	// neither policy renders the operator rule.
+	nonDNS := defaultTestNetpolProfile()
+	nonDNS.OperatorNamespace = policyTestNonDNS1123Namespace
+	if n := len(operatorPeerRules(buildNetworkPolicy(agent, nil, nonDNS, false, "", false))); n != 0 {
+		t.Errorf("the gateway policy renders %d operator rule(s) with a non-DNS-1123 namespace, want 0", n)
+	}
+	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestNonDNS1123Namespace))); n != 0 {
+		t.Errorf("the broker policy renders %d operator rule(s) with a non-DNS-1123 namespace, want 0", n)
+	}
+	// The operator rule admits nothing besides the operator peer on the metrics
+	// port: exactly one rule, equal to operatorMetricsIngressRule's output. A
+	// second peer in the rule's From, or an empty or wider Ports list, passes the
+	// port-and-selector checks above (operatorPeerRules keeps only the labelled
+	// peer and nothing when Ports is empty) but is caught here.
+	for name, np := range map[string]*networkingv1.NetworkPolicy{
+		"gateway": buildNetworkPolicy(agent, nil, profile, false, "", false),
+		"broker":  credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace),
+	} {
+		port := eventWatcherMetricsPort
+		if name == "broker" {
+			port = credentialProxyMetricsPort
+		}
+		want, ok := operatorMetricsIngressRule(policyTestOperatorNamespace, port)
+		if !ok {
+			t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace")
+		}
+		rules := operatorRules(np)
+		if len(rules) != 1 {
+			t.Fatalf("%s policy: %d rules admit the operator peer, want exactly 1: %+v", name, len(rules), rules)
+		}
+		if !equality.Semantic.DeepEqual(rules[0], want) {
+			t.Errorf("%s policy: the operator rule admits more than the operator peer on the metrics port:\n got %+v\nwant %+v", name, rules[0], want)
+		}
 	}
 	// The builder itself is unchanged: no operator rule, whatever the caller knows.
 	if n := len(operatorPeerRules(buildCredentialProxyNetworkPolicy(agent))); n != 0 {

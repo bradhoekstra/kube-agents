@@ -118,17 +118,27 @@ type stubUsageSource struct {
 	mu       sync.Mutex
 	readings map[string]usageReading
 	errs     map[string]error
+	blocking map[string]bool
 	calls    []string
 }
 
-func (s *stubUsageSource) Scrape(_ context.Context, addr, _ string) (usageReading, error) {
+func (s *stubUsageSource) Scrape(ctx context.Context, addr, _ string) (usageReading, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.calls = append(s.calls, addr)
-	if err := s.errs[addr]; err != nil {
+	block := s.blocking[addr]
+	err := s.errs[addr]
+	reading, ok := s.readings[addr]
+	s.mu.Unlock()
+	// A blocking address models a listener that accepts the dial and never
+	// answers: the real source holds here until its own deadline, so the stub
+	// holds until the context the poll bounds it with is done.
+	if block {
+		<-ctx.Done()
+		return usageReading{}, ctx.Err()
+	}
+	if err != nil {
 		return usageReading{}, err
 	}
-	reading, ok := s.readings[addr]
 	if !ok {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindConnect}
 	}
@@ -146,6 +156,12 @@ func (s *stubUsageSource) fail(addr string, kind string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.errs[addr] = &usageScrapeError{Kind: kind}
+}
+
+func (s *stubUsageSource) block(addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blocking[addr] = true
 }
 
 func (s *stubUsageSource) scraped(addr string) bool {
@@ -181,7 +197,7 @@ type usageHarness struct {
 
 func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...client.Object) *usageHarness {
 	t.Helper()
-	h := &usageHarness{t: t, stub: &stubUsageSource{readings: map[string]usageReading{}, errs: map[string]error{}}}
+	h := &usageHarness{t: t, stub: &stubUsageSource{readings: map[string]usageReading{}, errs: map[string]error{}, blocking: map[string]bool{}}}
 	funcs := interceptor.Funcs{
 		SubResourcePatch: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 			h.patches++
@@ -217,10 +233,11 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 	h.recorder = record.NewFakeRecorder(16)
 	h.r = &PlatformAgentReconciler{Client: h.cl, APIReader: h.cl, Scheme: scheme, Recorder: h.recorder}
 	h.p = &UsageCounterPoller{
-		r:       h.r,
-		source:  h.stub,
-		now:     func() time.Time { return h.clock },
-		streaks: map[types.UID]*usageScrapeStreak{},
+		r:          h.r,
+		source:     h.stub,
+		now:        func() time.Time { return h.clock },
+		pollBudget: func() time.Duration { return usageCountersPollInterval },
+		streaks:    map[types.UID]*usageScrapeStreak{},
 	}
 	return h
 }
@@ -708,6 +725,74 @@ func TestUsagePoller_AStandingFailureReRecordsAStableWarning(t *testing.T) {
 	}
 }
 
+// Several listeners failing in one poll share a single Warning on the CR, not
+// one each. The event recorder keys its spam filter on source+involvedObject
+// (the CR), so a Warning per failing pod would drain that bucket and drop the
+// causes behind it -- the other pods this poll, and anything the CR records
+// before the bucket refills a poll later. The poll records one event naming
+// every failing pod instead.
+func TestUsagePoller_FailingListenersShareOneWarningPerPoll(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+	h.stub.fail(brokerAddr(), usageScrapeKindConnect)
+	h.poll(5)  // first failure of each: a log line only, no event
+	h.poll(10) // second: past the streak, the Warning
+
+	var events []string
+drain:
+	for {
+		select {
+		case ev := <-h.recorder.Events:
+			events = append(events, ev)
+		default:
+			break drain
+		}
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d Warning(s) for one poll with two failing listeners, want exactly 1: %q", len(events), events)
+	}
+	for _, pod := range []string{"agent-gateway-aaa", "agent-credential-proxy-bbb"} {
+		if !strings.Contains(events[0], pod) {
+			t.Errorf("the shared Warning does not name %s: %q", pod, events[0])
+		}
+	}
+	if !strings.Contains(events[0], usageScrapeFailingReason) {
+		t.Errorf("the shared Warning is not a %s event: %q", usageScrapeFailingReason, events[0])
+	}
+}
+
+// A poll is bounded by its budget: a listener that accepts the dial and never
+// answers cannot freeze the poll, and the CRs behind it, past the interval. The
+// poll returns when its context deadline fires and records nothing for the pod
+// whose scrape it abandoned. Without the deadline the blocking scrape never
+// returns and the 10s guard below fails the test.
+func TestUsagePoller_APollIsBoundedByItsBudget(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	const budget = 50 * time.Millisecond
+	h.p.pollBudget = func() time.Duration { return budget }
+	h.stub.block(gatewayAddr())
+	h.stub.set(brokerAddr(), 10, nil)
+
+	done := make(chan struct{})
+	go func() {
+		h.poll(5)
+		close(done)
+	}()
+	const guard = 10 * time.Second
+	select {
+	case <-done:
+	case <-time.After(guard):
+		t.Fatalf("pollOnce did not return within %s of a listener that never answers; its budget does not bound it", guard)
+	}
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a poll cut short by its budget recorded an event: %q", ev)
+	default:
+	}
+}
+
 // Two gateway replicas on the poller end to end: the total takes the largest
 // delta, and the replica reset against its sibling's marker persists through
 // the ConfigMap.
@@ -957,6 +1042,53 @@ func TestUsagePoller_ATerminatingSiblingSuppressesNoAdvance(t *testing.T) {
 	h.poll(20)
 	if status := h.status(); status.EventsIngestedTotal != 21 {
 		t.Fatalf("after the old pod left: %+v, want 21", status)
+	}
+}
+
+// A rollout where the old replica is evicted rather than gracefully deleted:
+// node pressure, preemption, or node loss leaves it in phase Failed with no
+// deletion timestamp, the ReplicaSet replaces it without deleting it, and pod
+// GC removes it only hours later. Like a terminating pod it is never read
+// again, so it must leave the live set; otherwise its marker keeps resetting
+// the new replica's advance and its entry never drops.
+func TestUsagePoller_AnEvictedSiblingSuppressesNoAdvance(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	old := usageGatewayPod("agent-gateway-old", "gw-old", usageTestGatewayIP, created)
+	fresh := usageGatewayPod("agent-gateway-new", "gw-new", usageTestGatewayB, usageClock(3))
+	broker := usageBrokerPod("agent-credential-proxy-bbb", "broker-b", usageTestBrokerIP, created)
+	h := newUsageHarness(t, usageTestAgent(created), old, fresh, broker)
+	newAddr := usageTestGatewayB + ":9095"
+	h.stub.set(brokerAddr(), 0, nil)
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.fail(newAddr, usageScrapeKindRefused)
+	h.poll(0)
+	h.stub.set(gatewayAddr(), 110, ptr.To(1.0))
+	h.poll(5)
+	// The new replica's first read: recorded against the old pod's marker.
+	h.stub.set(gatewayAddr(), 115, ptr.To(1.0))
+	h.stub.set(newAddr, 12, ptr.To(9.0))
+	h.poll(10)
+	if status := h.status(); status.EventsIngestedTotal != 15 {
+		t.Fatalf("after the late read: %+v, want 15", status)
+	}
+	// The old pod is evicted: phase Failed, no deletion timestamp. It is listed,
+	// not read, and must no longer be live.
+	ctx := context.Background()
+	stored := &corev1.Pod{}
+	if err := h.cl.Get(ctx, client.ObjectKeyFromObject(old), stored); err != nil {
+		t.Fatal(err)
+	}
+	stored.Status.Phase = corev1.PodFailed
+	if err := h.cl.Status().Update(ctx, stored); err != nil {
+		t.Fatal(err)
+	}
+	h.stub.set(newAddr, 15, ptr.To(9.0))
+	h.poll(15)
+	if status := h.status(); status.EventsIngestedTotal != 18 {
+		t.Fatalf("with the old pod evicted: %+v, want 18: the new replica's advance was reset against a pod that is never read again", status)
+	}
+	if doc := h.document(); doc.Pods["gw-old"] != nil {
+		t.Fatalf("the evicted pod's entry was kept: %+v", doc.Pods)
 	}
 }
 

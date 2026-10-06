@@ -138,6 +138,68 @@ func TestFoldUsage_FirstPollRecordsEveryPodAndAddsNothing(t *testing.T) {
 	}
 }
 
+// A re-seed with two gateway replicas whose samples differ at the seed instant
+// (informer skew on the shared stream): the leader is recorded at the seed
+// poll's marker, the trailing replica one interval behind it. Without the
+// behind marker the trailing replica's catch-up is counted on top of the
+// leader's on the next poll -- thirteen for ten events; with it the next poll's
+// reset absorbs the catch-up. The re-seed half of the design's Max resets.
+func TestFoldUsage_AReseedRecordsATrailingReplicaBehindTheLeader(t *testing.T) {
+	t0 := foldClock(0)
+	old := t0.Add(-time.Hour)
+	res := foldUsage(nil, foldTestAgentUID, usageSeed{}, map[string]bool{foldPodA: true, foldPodB: true}, []usageScrapedPod{
+		scrapedPod(foldPodA, usageCounterEventsIngested, old, 100, ptr.To(1.0)),
+		scrapedPod(foldPodB, usageCounterEventsIngested, old, 97, ptr.To(1.0)),
+	}, t0)
+	doc := res.Document
+	if doc.Totals[usageCounterEventsIngested] != 0 || doc.LastMoved != nil {
+		t.Fatalf("re-seed added: totals=%v lastMoved=%v", doc.Totals, doc.LastMoved)
+	}
+	if a := doc.Pods[foldPodA]; a == nil || !a.Marker.Time.Equal(t0) {
+		t.Fatalf("leader not recorded at the seed poll: %+v", a)
+	}
+	behind := t0.Add(-usageCountersPollInterval)
+	if b := doc.Pods[foldPodB]; b == nil || !b.Marker.Time.Equal(behind) {
+		t.Fatalf("trailing replica not recorded behind the seed poll: %+v", b)
+	}
+	// Both catch up to 110 at minute 5: ten distinct events. The leader adds its
+	// ten; the trailing replica's thirteen (three of catch-up over the same ten)
+	// is reset against the leader's marker, not counted on top.
+	res = foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodA, usageCounterEventsIngested, old, 110, ptr.To(1.0)),
+		scrapedPod(foldPodB, usageCounterEventsIngested, old, 110, ptr.To(1.0)),
+	}, foldClock(5))
+	if got := res.Document.Totals[usageCounterEventsIngested]; got != 10 {
+		t.Fatalf("after the catch-up: eventsIngested = %d, want 10 (trailing replica's catch-up counted on top)", got)
+	}
+}
+
+// A broker marker ahead of a gateway's must not reset the gateway. The broker's
+// Sum branch stamps its marker on every poll it adds, so on an ordinary
+// single-replica install a gateway quiet while commands ran is "behind" the
+// broker on its next advance. latestSiblingMarker's counter filter keeps the
+// broker out of the gateway's sibling set; without it the gateway's events are
+// dropped. This pins the "another gateway pod's" qualifier of the reset branch,
+// which no other test in the package exercises.
+func TestFoldUsage_ABrokerMarkerAheadDoesNotResetTheGateway(t *testing.T) {
+	first := foldClock(0)
+	doc := foldDoc(first,
+		foldEntry(foldPodA, usageCounterEventsIngested, 100, ptr.To(1.0), first),
+		foldEntry(foldPodBroker, usageCounterToolExecutions, 200, nil, foldClock(5)),
+	)
+	// Only the gateway advances at minute 10; the broker is quiet, its marker
+	// one poll ahead of the gateway's.
+	res := foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
+		scrapedPod(foldPodA, usageCounterEventsIngested, first.Add(-time.Hour), 105, ptr.To(1.0)),
+	}, foldClock(10))
+	if got := res.Document.Totals[usageCounterEventsIngested]; got != 5 {
+		t.Fatalf("eventsIngested = %d, want 5: the gateway's lone advance was reset against the broker's marker", got)
+	}
+	if g := res.Document.Pods[foldPodA]; g == nil || !g.Marker.Time.Equal(foldClock(10)) {
+		t.Fatalf("gateway marker = %v, want minute 10 (it advanced alone)", g.Marker)
+	}
+}
+
 // Baseline absent with counters present: something removed the state after
 // the counters were written. The totals start from the status, every pod is
 // recorded, and the time the status carries is kept rather than zeroed.

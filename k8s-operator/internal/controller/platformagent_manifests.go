@@ -5922,14 +5922,16 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 // the listener reaches the collector and the operator, both readers of
 // counters, and nothing else in either namespace. False when the namespace is
 // unknown, off the cluster, where nothing could reach a pod IP in any case, and
-// when it is not a valid label value: written verbatim into the selector it
-// would have the API server reject the whole policy, failing every reconcile.
+// when it is not a DNS-1123 label: the value becomes kubernetes.io/metadata.name,
+// which the API server only ever sets to a namespace's own (DNS-1123) name, so a
+// value carrying anything else matches no namespace -- and one the selector
+// cannot even carry would have the API server reject the whole policy.
 func operatorMetricsIngressRule(operatorNamespace string, port int32) (networkingv1.NetworkPolicyIngressRule, bool) {
 	if operatorNamespace == "" {
 		return networkingv1.NetworkPolicyIngressRule{}, false
 	}
-	if errs := validation.IsValidLabelValue(operatorNamespace); len(errs) > 0 {
-		manifestsLog.Info("the operator's namespace is not a valid label value; the agent policy will not admit the operator on the metrics port", "value", operatorNamespace)
+	if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
+		manifestsLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policy will not admit the operator on the metrics port", "value", operatorNamespace)
 		return networkingv1.NetworkPolicyIngressRule{}, false
 	}
 	return networkingv1.NetworkPolicyIngressRule{

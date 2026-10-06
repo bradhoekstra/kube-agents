@@ -286,12 +286,15 @@ func main() {
 	if operatorNamespace == "" {
 		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
 			"variable", controller.OperatorNamespaceEnv)
-	} else if errs := validation.IsValidLabelValue(operatorNamespace); len(errs) > 0 {
-		// A value the selector cannot carry is treated as unknown: written into
-		// the NetworkPolicy it would have the API server reject the policy on
-		// every reconcile. Clear it so the rule is not rendered and the poller,
-		// which could reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid label value; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
+		// The value becomes kubernetes.io/metadata.name in the metrics rule's
+		// selector, which the API server only ever sets to a namespace's own
+		// (DNS-1123) name, so a value that is not a DNS-1123 label matches no
+		// namespace on any cluster -- and one the selector cannot even carry
+		// would have the API server reject the policy on every reconcile. Clear
+		// it either way, so the rule is not rendered and the poller, which could
+		// reach no pod without it, is not started.
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
 			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
 		operatorNamespace = ""
 	}

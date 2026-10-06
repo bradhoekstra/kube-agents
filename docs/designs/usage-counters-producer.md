@@ -364,6 +364,14 @@ is first stamped by a poll in which something ran. What a fresh install loses is
 between each pod's start and the first poll after it, the under-count this document prefers
 everywhere else.
 
+Recording every pod level is right only where the replicas are level. A re-seed that scrapes two
+gateway replicas at different samples -- informer skew on the shared stream -- records the one
+furthest along at the seed poll's own time and any replica behind it one interval earlier, so the
+next poll resets the trailing replica's catch-up against the leader's marker rather than adding its
+lag at the seed instant on top. That is the re-seed's own would-be over-count, folded back into the
+under-count preferred everywhere else; the terminating-leader straddle in the resets section stays
+the one place this layout over-counts rather than under-counts.
+
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
 status is behind the ConfigMap, not only when this poll moved a total; the repair stamps the
