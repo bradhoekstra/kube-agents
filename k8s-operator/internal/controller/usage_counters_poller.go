@@ -60,7 +60,10 @@ const (
 	usageScrapeFailureEventStreak = 2
 	// usageScrapeFailingReason is the Warning event's reason.
 	usageScrapeFailingReason = "UsageScrapeFailing"
-	usagePollerLogName       = "usage-counters"
+	// usageConfigMapImmutableReason is the Warning event's reason when the
+	// counters ConfigMap cannot be updated because it is immutable.
+	usageConfigMapImmutableReason = "UsageConfigMapImmutable"
+	usagePollerLogName            = "usage-counters"
 	// The two sentences the Warning event can end with; usageScrapeGuidance
 	// picks one by the failure's class.
 	usageScrapeConnectGuidance  = "Check that the pod's NetworkPolicy admits the operator's pods on the metrics port and that the listener is up."
@@ -458,6 +461,14 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 		return nil
 	}
 	if err := p.r.Update(ctx, cm); err != nil {
+		if apierrors.IsInvalid(err) || (existing.Immutable != nil && *existing.Immutable) {
+			// An immutable ConfigMap -- hand-edited, or a foreign copy left in
+			// place -- rejects every update, so the counters would freeze with
+			// nothing but a log line to say why. Surface the cause where the
+			// design promises it: in `kubectl describe` on the CR.
+			p.r.recordEvent(agent, corev1.EventTypeWarning, usageConfigMapImmutableReason,
+				fmt.Sprintf("the usage counters ConfigMap %s is immutable: status.usage will not advance until it is deleted so the operator can recreate it", cm.Name))
+		}
 		return fmt.Errorf("updating the usage counters ConfigMap: %w", err)
 	}
 	return nil

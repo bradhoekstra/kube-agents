@@ -24,6 +24,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -170,6 +171,9 @@ type usageHarness struct {
 	clock    time.Time
 	patches  int
 	cmWrites int
+	// cmUpdateErr, when set, is what the Update interceptor returns for a
+	// ConfigMap write, standing in for an API server that rejects it.
+	cmUpdateErr error
 	// pruning makes the fake behave like a served CRD without status.usage:
 	// the echo of a status patch comes back with the field empty.
 	pruning bool
@@ -196,6 +200,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 		Update: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
 			if _, ok := obj.(*corev1.ConfigMap); ok {
 				h.cmWrites++
+				if h.cmUpdateErr != nil {
+					return h.cmUpdateErr
+				}
 			}
 			return c.Update(ctx, obj, opts...)
 		},
@@ -950,5 +957,41 @@ func TestUsagePoller_ATerminatingSiblingSuppressesNoAdvance(t *testing.T) {
 	h.poll(20)
 	if status := h.status(); status.EventsIngestedTotal != 21 {
 		t.Fatalf("after the old pod left: %+v, want 21", status)
+	}
+}
+
+// An immutable counters ConfigMap -- hand-edited, or a foreign copy left in
+// place -- makes every update fail with 422 Invalid, so without a signal the
+// counters would freeze with nothing but a log line. The poller records a
+// Warning on the CR naming the ConfigMap, and leaves the status untouched: the
+// failed write returns before the status projection.
+func TestUsagePoller_AnImmutableConfigMapRecordsAWarning(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+	h.poll(5) // Creates the ConfigMap and records the baseline.
+
+	// The API server now rejects every update of the ConfigMap as Invalid, as it
+	// does for an immutable one.
+	cmName := usageTestAgentName + usageCountersConfigMapSuffix
+	h.cmUpdateErr = apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, cmName, nil)
+
+	h.stub.set(gatewayAddr(), 512, ptr.To(100.0))
+	h.stub.set(brokerAddr(), 73, ptr.To(200.0))
+	h.poll(10) // Would update the ConfigMap; the update is rejected.
+
+	select {
+	case ev := <-h.recorder.Events:
+		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapImmutableReason) ||
+			!strings.Contains(ev, cmName) || !strings.Contains(ev, "immutable") {
+			t.Fatalf("event %q, want a Warning naming the immutable ConfigMap %s", ev, cmName)
+		}
+	default:
+		t.Fatal("no Warning event was recorded for the immutable ConfigMap")
+	}
+
+	if status := h.status(); status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("status.usage advanced despite the rejected write: %+v", status)
 	}
 }
