@@ -337,6 +337,12 @@ PROCESS_START_TIME_SECONDS = time.time()
 TOOL_DURATION_METRIC = "kubeagents_tool_execution_duration_seconds"
 PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
+# The label key the operator's usage poller filters outcomes on
+# (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
+# without the matching one there folds every invocation out and freezes
+# toolExecutionsTotal with the scrape still green. Held in step by
+# tests/test_usage_counters_series_names.py.
+TOOL_STATUS_LABEL = "status"
 TOOL_STATUS_SUCCESS = "success"
 TOOL_STATUS_ERROR = "error"
 TOOL_STATUS_BLOCKED = "blocked"
@@ -5912,7 +5918,7 @@ class ProxyMetrics:
         for (tool, subcommand, status), count in invocations:
             lines.append(
                 f'{TOOL_INVOCATIONS_METRIC}{{tool="{_escape_label_value(tool)}",'
-                f'subcommand="{_escape_label_value(subcommand)}",status="{_escape_label_value(status)}"}} {count}'
+                f'subcommand="{_escape_label_value(subcommand)}",{TOOL_STATUS_LABEL}="{_escape_label_value(status)}"}} {count}'
             )
         lines += [
             f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool.",
