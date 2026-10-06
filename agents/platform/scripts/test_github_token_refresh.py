@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import credential_proxy
 import github_token_refresh
 from github_token_refresh import (
     get_current_git_repo,
@@ -201,6 +202,39 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             {"provider": "github", "repository": "https://github.com/owner/repository"},
             json.loads(request.data),
         )
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_waits_out_the_brokers_admission_and_the_helper(self, urlopen, run):
+        # The broker may queue a refresh behind its child memory budget for
+        # COMMAND_SLOT_WAIT_SECONDS before the helper starts; a client that gives
+        # up sooner reports a token that landed as a failed refresh.
+        response = MagicMock()
+        response.__enter__.return_value.status = 200
+        urlopen.return_value = response
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            refresh_git_credentials("owner/repository")
+
+        timeout = urlopen.call_args.kwargs["timeout"]
+        self.assertEqual(github_token_refresh.SIDECAR_REFRESH_TIMEOUT_SECONDS, timeout)
+        # 60 s of admission wait, 81.5 s of helper (20 identity, 16.5 Minty,
+        # 3 x 15 CLI), 10 s of margin.
+        self.assertEqual(151.5, timeout)
+        self.assertGreater(
+            timeout,
+            credential_proxy.COMMAND_SLOT_WAIT_SECONDS
+            + github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS,
+        )
+        self.assertEqual(
+            credential_proxy.COMMAND_SLOT_WAIT_SECONDS,
+            github_token_refresh.BROKER_ADMISSION_WAIT_SECONDS,
+        )
+        self.assertGreater(github_token_refresh.SANDBOX_REFRESH_TIMEOUT_SECONDS, timeout)
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
     @patch("github_token_refresh.subprocess.run")
