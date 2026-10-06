@@ -81,6 +81,7 @@ const (
 	usageScrapeKindMalformed   = "malformed response"
 	usageScrapeKindStatus      = "status"
 	usageScrapeKindRead        = "read"
+	usageScrapeKindBodyTimeout = "timeout reading body"
 	usageScrapeKindLine        = "line too long"
 	usageScrapeKindParse       = "unparsable line"
 	usageScrapeKindSample      = "sample out of range"
@@ -269,8 +270,11 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
 		}
 		if usageTimedOut(err) {
-			// The client's timeout firing mid-body: a slow listener, not a broken one.
-			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindTimeout}
+			// The client's timeout firing mid-body: the listener answered and the
+			// read stalled, a slow listener rather than a broken one, so this is
+			// its own kind with response guidance -- not the dial timeout's
+			// connect guidance, which would point at the NetworkPolicy.
+			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindBodyTimeout}
 		}
 		// The body's read error can quote a trailer line; the kind is enough.
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead}

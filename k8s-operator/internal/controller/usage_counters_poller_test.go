@@ -764,9 +764,12 @@ drain:
 
 // A poll is bounded by its budget: a listener that accepts the dial and never
 // answers cannot freeze the poll, and the CRs behind it, past the interval. The
-// poll returns when its context deadline fires and records nothing for the pod
-// whose scrape it abandoned. Without the deadline the blocking scrape never
-// returns and the 10s guard below fails the test.
+// poll returns when its context deadline fires, and the abandonment is quiet: it
+// records no failure streak for the pod it abandoned, writes no ConfigMap, and --
+// because it did not reach every CR -- prunes no streak it never got to, so a
+// streak standing behind the hung listener survives to be read next interval.
+// Without the deadline the blocking scrape never returns and the 10s guard below
+// fails the test.
 func TestUsagePoller_APollIsBoundedByItsBudget(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
@@ -774,6 +777,11 @@ func TestUsagePoller_APollIsBoundedByItsBudget(t *testing.T) {
 	h.p.pollBudget = func() time.Duration { return budget }
 	h.stub.block(gatewayAddr())
 	h.stub.set(brokerAddr(), 10, nil)
+	// A streak the budget-cut poll must leave alone: its UID is in no CR this
+	// poll lists, so a poll that reached every CR would prune it, but a poll cut
+	// short must not -- it never got to the CRs behind the hung listener.
+	const behindUID = types.UID("behind-the-hung-listener")
+	h.p.streaks[behindUID] = &usageScrapeStreak{count: 1}
 
 	done := make(chan struct{})
 	go func() {
@@ -790,6 +798,16 @@ func TestUsagePoller_APollIsBoundedByItsBudget(t *testing.T) {
 	case ev := <-h.recorder.Events:
 		t.Fatalf("a poll cut short by its budget recorded an event: %q", ev)
 	default:
+	}
+	if h.cmWrites != 0 {
+		t.Errorf("a poll cut short by its budget wrote the ConfigMap %d time(s), want 0", h.cmWrites)
+	}
+	gotCount := -1
+	if s := h.p.streaks[behindUID]; s != nil {
+		gotCount = s.count
+	}
+	if len(h.p.streaks) != 1 || gotCount != 1 {
+		t.Errorf("after a budget-cut poll: %d streak(s), the pre-seeded one at count %d; want 1 streak at count 1 (the abandoned scrape added a streak, or the cut-short poll pruned the one behind it)", len(h.p.streaks), gotCount)
 	}
 }
 
@@ -959,11 +977,12 @@ func TestUsagePoller_EventGuidanceFollowsTheFailureClass(t *testing.T) {
 		kind string
 		want string
 	}{
-		"a refused connection":    {usageScrapeKindRefused, usageScrapeConnectGuidance},
-		"a timeout":               {usageScrapeKindTimeout, usageScrapeConnectGuidance},
-		"a line past the bound":   {usageScrapeKindLine, usageScrapeResponseGuidance},
-		"a malformed response":    {usageScrapeKindMalformed, usageScrapeResponseGuidance},
-		"a status other than 200": {usageScrapeKindStatus, usageScrapeResponseGuidance},
+		"a refused connection":       {usageScrapeKindRefused, usageScrapeConnectGuidance},
+		"a timeout":                  {usageScrapeKindTimeout, usageScrapeConnectGuidance},
+		"a line past the bound":      {usageScrapeKindLine, usageScrapeResponseGuidance},
+		"a malformed response":       {usageScrapeKindMalformed, usageScrapeResponseGuidance},
+		"a status other than 200":    {usageScrapeKindStatus, usageScrapeResponseGuidance},
+		"a timeout reading the body": {usageScrapeKindBodyTimeout, usageScrapeResponseGuidance},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

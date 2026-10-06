@@ -20,6 +20,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -53,19 +54,30 @@ func operatorPeerRules(np *networkingv1.NetworkPolicy) map[int32]networkingv1.Ne
 }
 
 // operatorRules is every ingress rule of np that names the operator -- a peer
-// carrying the operator's pod label, or one whose namespace selector names the
-// operator's namespace -- returning the whole rule, so a test can see what else
-// the rule opens beside that peer (a second peer, an empty or wider Ports list)
-// and whether a second rule reaches the operator at all, both of which
-// operatorPeerRules drops. Keying on the namespace selector as well as the pod
-// label is what catches a sibling rule that widens the operator's reach through
-// a namespace-only peer, which the pod label alone would miss.
+// carrying the operator's pod label, a peer whose namespace selector names the
+// operator's namespace, or an empty From that admits every source -- returning
+// the whole rule, so a test can see what else the rule opens beside that peer (a
+// second peer, an empty or wider Ports list) and whether a second rule reaches
+// the operator at all, both of which operatorPeerRules drops. The namespace
+// selector is evaluated the way a CNI evaluates it (selectorMatches), not read
+// off MatchLabels: an empty selector that matches every namespace or a
+// MatchExpressions clause naming the operator's is caught as surely as a
+// MatchLabels entry, and an empty From -- which has no peer to read at all --
+// is caught before the peer loop. Reading MatchLabels alone saw none of the
+// three. Keying on the namespace selector as well as the pod label is what
+// catches a sibling rule that widens the operator's reach through a
+// namespace-only peer, which the pod label alone would miss.
 func operatorRules(np *networkingv1.NetworkPolicy, operatorNamespace string) []networkingv1.NetworkPolicyIngressRule {
+	operatorNS := labels.Set{labelMetadataName: operatorNamespace}
 	var rules []networkingv1.NetworkPolicyIngressRule
 	for _, rule := range np.Spec.Ingress {
+		if len(rule.From) == 0 {
+			rules = append(rules, rule)
+			continue
+		}
 		for _, peer := range rule.From {
 			byPod := peer.PodSelector != nil && peer.PodSelector.MatchLabels[operatorPodNameLabel] == operatorPodNameValue
-			byNamespace := peer.NamespaceSelector != nil && peer.NamespaceSelector.MatchLabels[labelMetadataName] == operatorNamespace
+			byNamespace := peer.NamespaceSelector != nil && selectorMatches(peer.NamespaceSelector, operatorNS)
 			if byPod || byNamespace {
 				rules = append(rules, rule)
 				break
@@ -73,6 +85,18 @@ func operatorRules(np *networkingv1.NetworkPolicy, operatorNamespace string) []n
 		}
 	}
 	return rules
+}
+
+// selectorMatches reports whether sel, evaluated the way a CNI evaluates a
+// metav1.LabelSelector -- an empty selector matches everything, and
+// MatchExpressions as well as MatchLabels -- selects set. A selector the API
+// server would reject matches nothing.
+func selectorMatches(sel *metav1.LabelSelector, set labels.Set) bool {
+	s, err := metav1.LabelSelectorAsSelector(sel)
+	if err != nil {
+		return false
+	}
+	return s.Matches(set)
 }
 
 // With the operator's namespace known, the gateway and broker policies each
@@ -207,5 +231,61 @@ func TestOperatorRulesSeeASiblingNamespaceOnlyRule(t *testing.T) {
 	// this is the gap operatorRules closes.
 	if n := len(operatorPeerRules(np)); n != 1 {
 		t.Errorf("operatorPeerRules saw %d operator peers, want 1 (the sibling has no pod label)", n)
+	}
+}
+
+// operatorRules must count every ingress rule that names the operator, whatever
+// selector shape names it: a CNI admits a source through an empty selector that
+// matches every namespace, a MatchExpressions clause, or an empty From that
+// admits everything, and a helper that reads MatchLabels off the selectors sees
+// none of the three. Each "names" case is a single rule operatorRules must
+// count; each "does not" case is one it must not, or the "exactly one rule"
+// guard in TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly would fire on a
+// correctly scoped policy.
+func TestOperatorRulesCountEveryShapeNamingTheOperator(t *testing.T) {
+	ns := policyTestOperatorNamespace
+	names := map[string]networkingv1.NetworkPolicyIngressRule{
+		"the operator namespace by MatchLabels": {From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelMetadataName: ns}},
+		}}},
+		"the operator pod label": {From: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{operatorPodNameLabel: operatorPodNameValue}},
+		}}},
+		"the operator namespace by MatchExpressions": {From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchExpressions: []metav1.LabelSelectorRequirement{{
+				Key: labelMetadataName, Operator: metav1.LabelSelectorOpIn, Values: []string{ns},
+			}}},
+		}}},
+		"an empty namespace selector, which matches every namespace": {From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{},
+		}}},
+		"an empty From, which admits every source": {},
+	}
+	for name, rule := range names {
+		np := &networkingv1.NetworkPolicy{Spec: networkingv1.NetworkPolicySpec{Ingress: []networkingv1.NetworkPolicyIngressRule{rule}}}
+		if n := len(operatorRules(np, ns)); n != 1 {
+			t.Errorf("operatorRules saw %d rules naming the operator through %s, want 1", n, name)
+		}
+	}
+
+	notNames := map[string]networkingv1.NetworkPolicyIngressRule{
+		"a different namespace": {From: []networkingv1.NetworkPolicyPeer{{
+			NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{labelMetadataName: gmpNamespace}},
+		}}},
+		"a different pod label": {From: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "someone-else"}},
+		}}},
+		// The baseline in-namespace rule the gateway policy carries: an empty pod
+		// selector, no namespace selector, which a CNI scopes to the policy's own
+		// namespace rather than the operator's.
+		"the baseline in-namespace rule": {From: []networkingv1.NetworkPolicyPeer{{
+			PodSelector: &metav1.LabelSelector{},
+		}}},
+	}
+	for name, rule := range notNames {
+		np := &networkingv1.NetworkPolicy{Spec: networkingv1.NetworkPolicySpec{Ingress: []networkingv1.NetworkPolicyIngressRule{rule}}}
+		if n := len(operatorRules(np, ns)); n != 0 {
+			t.Errorf("operatorRules saw %d rules for %s, want 0", n, name)
+		}
 	}
 }

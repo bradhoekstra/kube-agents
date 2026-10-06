@@ -238,7 +238,8 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 	})
 	t.Run("a listener that stalls mid-body", func(t *testing.T) {
 		// Headers promptly, then nothing: the client's timeout fires on the
-		// body read, and the kind says timeout, not read.
+		// body read, and the kind says it was the body's -- not a dial timeout,
+		// and not a read.
 		release := make(chan struct{})
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -251,8 +252,8 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		source := newPodUsageSource()
 		source.client.Timeout = scrapeTestStallTimeout
 		_, err := source.Scrape(context.Background(), strings.TrimPrefix(srv.URL, "http://"), usageCounterEventsIngested)
-		if err == nil || scrapeKind(t, err) != usageScrapeKindTimeout {
-			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindTimeout)
+		if err == nil || scrapeKind(t, err) != usageScrapeKindBodyTimeout {
+			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindBodyTimeout)
 		}
 	})
 }
