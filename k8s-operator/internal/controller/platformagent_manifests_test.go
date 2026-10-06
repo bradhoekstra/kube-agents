@@ -2466,6 +2466,17 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	fbConf := cm.Data["fluent-bit.conf"]
 	parsers := cm.Data["parsers.conf"]
 
+	// [SERVICE] names this parsers.conf and only this one: the mount replaces the
+	// sidecar's built-in parsers file, so a second Parsers_File line would pull in
+	// another that audit_json or gchat_event could resolve against instead.
+	services := fluentBitSections(fbConf, "[SERVICE]")
+	if len(services) != 1 {
+		t.Fatalf("fluent-bit.conf has %d [SERVICE] sections, want 1:\n%s", len(services), fbConf)
+	}
+	if pf := fluentBitValues(services[0], "Parsers_File"); len(pf) != 1 || pf[0] != "parsers.conf" {
+		t.Errorf("[SERVICE] Parsers_File is %v, want exactly [parsers.conf]:\n%s", pf, services[0])
+	}
+
 	inputs := fluentBitSections(fbConf, "[INPUT]")
 	if len(inputs) != 2 {
 		t.Fatalf("fluent-bit.conf has %d [INPUT] sections, want 2 (Hermes' logs and the audit file):\n%s", len(inputs), fbConf)
@@ -2492,6 +2503,9 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 		if got := fluentBitField(audit, want.key); got != want.val {
 			t.Errorf("the audit input's %s is %q, want %q:\n%s", want.key, got, want.val, audit)
 		}
+	}
+	if ps := fluentBitValues(audit, "Parser"); len(ps) != 1 {
+		t.Errorf("the audit input has %d Parser lines %v, want exactly 1 (audit_json); a second would override it:\n%s", len(ps), ps, audit)
 	}
 	if p := fluentBitField(logs, "Parser"); p != "" {
 		t.Errorf("the agent.logs input parses its lines with parser %q; Hermes' log stays text:\n%s", p, logs)
@@ -2584,22 +2598,34 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 	// regex is Hermes' own log line. Assert the class over every [FILTER], by
 	// Name -- an unexpected Name is a section this test has not vetted and
 	// fails closed, not a continue that hides a lift.
+	parserFilters, recordModifierFilters := 0, 0
 	for _, section := range fluentBitSections(fbConf, "[FILTER]") {
 		switch name := fluentBitField(section, "Name"); name {
 		case "parser":
+			parserFilters++
 			if match := fluentBitField(section, "Match"); match != "agent.logs" {
 				t.Errorf("a parser FILTER matches %q; a regex parser must not reach the audit records:\n%s", match, section)
 			}
-			if p := fluentBitField(section, "Parser"); p != "gchat_event" {
-				t.Errorf("a parser FILTER names parser %q, not gchat_event; the audit lift must not return:\n%s", p, section)
+			if ps := fluentBitValues(section, "Parser"); len(ps) != 1 || ps[0] != "gchat_event" {
+				t.Errorf("a parser FILTER has Parser lines %v, want exactly [gchat_event]; a second parser would run over the stream and the audit lift must not return:\n%s", ps, section)
 			}
 		case "record_modifier":
+			recordModifierFilters++
 			if match := fluentBitField(section, "Match"); match != "agent.*" {
 				t.Errorf("the record_modifier FILTER matches %q, want agent.* (both streams stamped):\n%s", match, section)
 			}
 		default:
 			t.Errorf("unexpected [FILTER] Name %q; a new filter must be vetted here -- is it a regex lift on the audit stream?:\n%s", name, section)
 		}
+	}
+	// Exactly one of each: the [FILTER] count is 2, but that alone allows two
+	// parser filters and no record_modifier -- a second gchat_event parser retagged
+	// onto agent.audit among them. Pin the split.
+	if parserFilters != 1 {
+		t.Errorf("fluent-bit.conf has %d parser [FILTER]s, want exactly 1 (gchat_event over agent.logs)", parserFilters)
+	}
+	if recordModifierFilters != 1 {
+		t.Errorf("fluent-bit.conf has %d record_modifier [FILTER]s, want exactly 1 (stamping agent.*)", recordModifierFilters)
 	}
 	// gchat_event is the only regex-format parser; every other [PARSER] decodes
 	// rather than lifts.
@@ -2625,11 +2651,13 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 		t.Errorf("gchat_event Regex is %q, want %q; a change to the one trusted regex must be re-vetted here", got, want)
 	}
 
-	// No parser merges a decoded field back into the record. Decode_Field /
-	// Decode_Field_As json <field> takes a JSON object a line carries and lifts
-	// its keys into the record -- the audit lift by another name. The records are
-	// decoded whole by the json-format audit_json parser on the input; nothing
-	// else decodes a field. Fail closed on the key across every ConfigMap value.
+	// No parser merges a decoded field back into the record, and nothing selects a
+	// stream by regex. Decode_Field / Decode_Field_As json <field> takes a JSON
+	// object a line carries and lifts its keys into the record -- the audit lift by
+	// another name; Match_Regex selects streams by pattern where this config matches
+	// by exact tag, so it could reach the audit stream a plain Match does not. The
+	// records are decoded whole by the json-format audit_json parser on the input.
+	// Fail closed on either key across every ConfigMap value.
 	for name, data := range cm.Data {
 		for _, line := range strings.Split(data, "\n") {
 			if strings.HasPrefix(strings.TrimSpace(line), "#") {
@@ -2639,6 +2667,8 @@ func TestFluentBitTailsTheAuditFileAsJSON(t *testing.T) {
 				switch strings.ToLower(f[0]) {
 				case "decode_field", "decode_field_as":
 					t.Errorf("%s carries %q; a Decode_Field merge lifts a field into the record, the audit records are JSON on the input:\n%s", name, strings.TrimSpace(line), data)
+				case "match_regex":
+					t.Errorf("%s carries %q; a Match_Regex selects streams by regex and this config matches by exact tag -- it could reach the audit stream a plain Match does not:\n%s", name, strings.TrimSpace(line), data)
 				}
 			}
 		}
@@ -2705,19 +2735,32 @@ func fluentBitCount(data map[string]string, header string) int {
 	return n
 }
 
-// fluentBitField returns the value of the first `Key value` line in a
-// fluent-bit section, whatever whitespace separates them and whatever case the
-// key is written in, or "" if absent. Comment lines are skipped. fluent-bit's
-// classic-format keys are case-insensitive, so the test reads them that way.
-func fluentBitField(section, key string) string {
+// fluentBitValues returns every value set for key in a fluent-bit section, in
+// order, whatever whitespace separates key and value and whatever case the key
+// is written in. Comment lines are skipped. A repeated key -- a second Parser on
+// an input, a second Parsers_File in [SERVICE] -- yields more than one value, so
+// a caller pinning a single-valued key can assert there is exactly one rather
+// than read only the first and miss a duplicate fluent-bit would honour.
+func fluentBitValues(section, key string) []string {
+	var values []string
 	for _, line := range strings.Split(section, "\n") {
 		if strings.HasPrefix(strings.TrimSpace(line), "#") {
 			continue
 		}
 		fields := strings.Fields(line)
 		if len(fields) >= 2 && strings.EqualFold(fields[0], key) {
-			return strings.Join(fields[1:], " ")
+			values = append(values, strings.Join(fields[1:], " "))
 		}
+	}
+	return values
+}
+
+// fluentBitField returns the first value fluentBitValues finds for key in a
+// fluent-bit section, or "" if the key is absent. fluent-bit's classic-format
+// keys are case-insensitive, so the test reads them that way.
+func fluentBitField(section, key string) string {
+	if values := fluentBitValues(section, key); len(values) > 0 {
+		return values[0]
 	}
 	return ""
 }
