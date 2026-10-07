@@ -51,18 +51,6 @@ infrastructure:
 validated: false
 owner: bradhoekstra
 verification_spec:
-  # The front door holds no infrastructure tools, so the question is answered
-  # by a delegated worker; worker_commands reads that worker's terminal log and
-  # returns an error, not a pass, when nothing was delegated, which this
-  # objective makes a stated failure rather than a surprise.
-  - name: the-question-was-delegated
-    role: objective
-    mode: assert
-    check:
-      type: tool_called
-      tool_names: ["kanban_create"]
-      # An errored kanban_create delegated nothing.
-      require_success: true
   # The route: some delegated worker command both invokes kubectl and names the
   # PodMonitoring. This check is deliberately loose -- two lookaheads,
   # `(?=.*kubectl)(?=.*podmonitoring)`, confirm only that `kubectl` and
@@ -86,7 +74,11 @@ verification_spec:
   # Deployment-annotation path (`kubectl get deployment ... -o yaml`).
   # worker_commands sees terminal commands only, so a read through an MCP tool is
   # invisible to it; the skill's step spells the kubectl command and every recorded
-  # run used it. The corpus is pinned in
+  # run used it. It also fails closed on no delegation at all: the front door holds
+  # no infrastructure tools, so worker_commands reads the delegated worker's
+  # terminal log and returns an error -- which blocks the repetition -- not a pass,
+  # when nothing was delegated, so an undelegated run reds here without a separate
+  # delegation objective. The corpus is pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py.
   - name: the-worker-read-the-podmonitoring
     role: objective
@@ -136,21 +128,25 @@ verification_spec:
   # the space dropped still affirms where a literal `Scraped: yes` substring would
   # red a compliant answer. The negative is a forbidden_patterns regex run on the
   # line-preserving normalization
-  # (`(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*|\w+:\s*)?scraped:\s*no\b`), so it fires on a
-  # line whose verdict is `Scraped: no` through the Markdown prefixes the
-  # normalizer leaves -- a `-` bullet, a `#` heading, a `>` quote, a `1.` list
-  # item, a `Verdict:` label -- not just a bare line. It still does not fire on
-  # `scraped: nothing`/`not yet`/`none` (the word boundary), nor on an affirmative
-  # that mentions "scraped: no" in a later clause or multi-token aside (the line
-  # anchor and the single-prefix limit): `- the credential-proxy is scraped: no`
-  # carries two tokens before the verdict and does not match. The nuance a
-  # substring could not carry -- a correct answer may note the credential-proxy
-  # PodMonitoring is unscraped while the watcher is -- is left to the judge against
-  # expected_output. The token survives the normalizer: `**Scraped: Yes**` folds to
-  # `scraped: yes` (emphasis dropped, lowercased). One residual stands, contrived
-  # against a compliant answer: a negative that omits the verdict line but carries
-  # the substring "scraped: yes" inline false-greens. It is pinned in
-  # bench/tests/test_observability_watcher_scrape_patterns.py.
+  # (`(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*)?scraped:\s*no\b`), so it fires on a line
+  # whose verdict is `Scraped: no` through the Markdown prefixes the normalizer
+  # leaves -- a `-`/`*` bullet, a `#` heading, a `>` quote, a `1.` list item -- not
+  # just a bare line. It deliberately does not accept a `word:` label prefix: that
+  # alternative would also match a per-component line in a correct answer
+  # (`Broker: scraped: no` beside a `Scraped: yes` watcher verdict), false-redding
+  # the very nuance expected_output invites -- a correct answer may note the
+  # credential-proxy PodMonitoring is unscraped while the watcher is. It still does
+  # not fire on `scraped: nothing`/`not yet`/`none` (the word boundary) nor on an
+  # affirmative that mentions "scraped: no" in a later clause (the line anchor):
+  # `- the credential-proxy is scraped: no` carries two tokens before the verdict
+  # and does not match. The token survives the normalizer: `**Scraped: Yes**` folds
+  # to `scraped: yes` (emphasis dropped, lowercased). Two residuals stand, both
+  # contrived against a compliant answer and pinned in
+  # bench/tests/test_observability_watcher_scrape_patterns.py: a negative that omits
+  # the verdict line but carries the substring "scraped: yes" inline, and a negative
+  # whose verdict sits behind a `word:` label or two prefixes (`Verdict: Scraped: no`,
+  # `- Verdict: Scraped: no`) while a stray "scraped: yes" satisfies the affirmative
+  # -- the price of dropping the label prefix to spare the component line.
   - name: the-answer-affirms-the-watcher-is-scraped
     role: objective
     mode: assert
@@ -159,4 +155,4 @@ verification_spec:
       any_of_patterns:
         - 'scraped:\s*yes\b'
       forbidden_patterns:
-        - '(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*|\w+:\s*)?scraped:\s*no\b'
+        - '(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*)?scraped:\s*no\b'

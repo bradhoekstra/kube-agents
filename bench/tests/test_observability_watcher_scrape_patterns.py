@@ -25,12 +25,13 @@ regex tweak that reads fine but shifts what matches:
   prose. Both tokens use one grammar. The affirmative is an ``any_of_patterns``
   regex ``scraped:\s*yes\b`` (``re.search``ed against the flat normalization), so a
   space-less ``Scraped:yes`` still affirms. The negative is a ``forbidden_patterns``
-  regex ``(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*|\w+:\s*)?scraped:\s*no\b`` (``re.search``ed
-  against the line-preserving normalization), so it fires on a line whose verdict
-  is ``Scraped: no`` through a Markdown bullet, heading, quote, list item or label
-  prefix -- not on ``scraped: nothing``/``not yet`` (word boundary) or an
-  affirmative that mentions ``scraped: no`` in a later multi-token aside (line
-  anchor plus the single-prefix limit). The nuance (a correct answer may note the
+  regex ``(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*)?scraped:\s*no\b`` (``re.search``ed against
+  the line-preserving normalization), so it fires on a line whose verdict is
+  ``Scraped: no`` through a Markdown bullet, heading, quote or list-item prefix --
+  not on ``scraped: nothing``/``not yet`` (word boundary), an affirmative that
+  mentions ``scraped: no`` in a later aside (line anchor), or a correct answer's
+  per-component ``Broker: scraped: no`` line (no ``word:`` label prefix, dropped so
+  that line does not false-red). The nuance (a correct answer may note the
   credential-proxy PodMonitoring is unscraped while the watcher is) is left to the
   judge. ``ReportContainsVerifier`` tests ``any_of_patterns`` against
   ``_normalize(text)`` and ``forbidden_patterns`` against ``_normalize_lines(text)``,
@@ -39,9 +40,10 @@ regex tweak that reads fine but shifts what matches:
 
 The checks are read from task.yaml, not duplicated here, so the test pins the
 file rather than a copy of it. The residuals each check accepts -- the route's
-co-occurrence false-greens, the polarity's one inline false-green -- are asserted
-as known cases, so a future tightening that refuses one trips this test and
-updates the task.yaml comment with it.
+co-occurrence false-greens, the polarity's two false-greens (an inline
+``scraped: yes`` with no verdict line, and a ``word:``-labelled negative with a
+stray affirmative) -- are asserted as known cases, so a future tightening that
+refuses one trips this test and updates the task.yaml comment with it.
 
 Run:
   python3 -m pytest bench/tests/test_observability_watcher_scrape_patterns.py -v
@@ -208,7 +210,10 @@ ROUTE_KNOWN_RESIDUALS = [
 # the bare-substring affirmative used to false-red and the line anchor now admits;
 # the fifth bullets its verdict; the sixth drops the space after the colon
 # (`Scraped:yes`), which the flat any_of regex affirms where a literal
-# `Scraped: yes` substring red-ed.
+# `Scraped: yes` substring red-ed. The seventh breaks the verdict out per component
+# -- a `Scraped: yes` headline over a `Watcher: scraped: yes` line and a
+# `Broker: scraped: no` line -- which the dropped `word:` label prefix now admits;
+# it false-red under the old `\w+:` alternative, which matched the `Broker:` line.
 POLARITY_CORRECT = [
     "Scraped: yes. The watcher metrics are scraped through the "
     '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
@@ -223,6 +228,9 @@ POLARITY_CORRECT = [
     "9095 listener.",
     'Scraped:yes. up{job="platform-agent-gateway-monitoring"} proves the '
     "collector scrapes 9095.",
+    "Scraped: yes.\n"
+    "Watcher: scraped: yes (9095, gateway-monitoring PodMonitoring).\n"
+    "Broker: scraped: no (no credential-proxy PodMonitoring).",
 ]
 
 # Incorrect answers: the watcher is NOT scraped. Each carries a `Scraped: no`
@@ -230,12 +238,15 @@ POLARITY_CORRECT = [
 # any_of_patterns), even though some name the same mechanism, port and series the
 # other objective checks. Three in the middle are shapes the earlier
 # enumerated-negation regex false-greened -- a contraction, perfect tense, active
-# voice -- that the token reds on the verdict alone. The last two are the
-# false-green the bare line anchor `^\s*scraped:` let escape: a `Scraped: no`
-# verdict written behind a Markdown prefix -- a `-` bullet, a `Verdict:` label --
-# while a stray `scraped: yes` (here the answer format the worker echoes back)
+# voice -- that the token reds on the verdict alone. The last is the false-green the
+# bare line anchor `^\s*scraped:` let escape: a `Scraped: no` verdict behind a `-`
+# bullet while a stray `scraped: yes` (the answer format the worker echoes back)
 # satisfied the affirmative, so the anchor missed the `no` and an unscraped install
-# passed. The prefix-tolerant pattern reds both.
+# passed. The prefix-tolerant pattern reds the bullet. A `Verdict:`-style `word:`
+# label prefix is no longer redded -- dropping that alternative is what spares a
+# correct answer's `Broker: scraped: no` component line (POLARITY_CORRECT's last
+# entry) -- so a `word:`-labelled negative with a stray affirmative is a documented
+# residual (see POLARITY_KNOWN_FALSE_GREEN).
 POLARITY_INCORRECT = [
     "Scraped: no. The event watcher's metrics are not scraped: the "
     "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
@@ -248,19 +259,26 @@ POLARITY_INCORRECT = [
     "Scraped: no. Prometheus is not scraping 9095.",
     "- Scraped: no (you asked for `Scraped: yes` / `Scraped: no`). The "
     "gateway-monitoring PodMonitoring is absent; nothing scrapes 9095.",
-    "**Verdict:** Scraped: no. (Format: `Scraped: yes` / `Scraped: no`.) The "
-    "gateway-monitoring PodMonitoring is absent.",
 ]
 
-# Polarity residual, documented in the task.yaml comment and accepted: a negative
-# that ignores the verdict-line instruction, omitting the line but carrying the
-# "scraped: yes" substring inline, false-greens -- no substring fix leaves the
-# compliant token alone. (The old false-red -- an affirmative that writes
-# "scraped: no" in a later clause -- is fixed by the line anchor and now sits in
-# POLARITY_CORRECT.) Asserted so a future tightening that fixes it trips this test.
+# Polarity residuals, documented in the task.yaml comment and accepted. Both carry
+# the "scraped: yes" substring where any_of matches and no forbidden line fires, so
+# a negative answer false-greens:
+#   1. a negative that ignores the verdict-line instruction, omitting the line but
+#      carrying the "scraped: yes" substring inline -- no substring fix leaves the
+#      compliant token alone;
+#   2. a negative whose verdict sits behind a `word:` label (`**Verdict:** Scraped:
+#      no`) while a stray `scraped: yes` (the echoed answer format) satisfies the
+#      affirmative -- the price of dropping the `\w+:` label prefix so a correct
+#      answer's `Broker: scraped: no` component line does not false-red.
+# Asserted so a future tightening that fixes either trips this test. (The old
+# false-red -- an affirmative that writes "scraped: no" in a later clause -- is
+# fixed by the line anchor and now sits in POLARITY_CORRECT.)
 POLARITY_KNOWN_FALSE_GREEN = (
     "Is it scraped: yes it has a gateway-monitoring PodMonitoring, but nothing "
-    "scrapes 9095."
+    "scrapes 9095.",
+    "**Verdict:** Scraped: no. (Format: `Scraped: yes` / `Scraped: no`.) The "
+    "gateway-monitoring PodMonitoring is absent.",
 )
 
 
@@ -330,11 +348,14 @@ class ObservabilityWatcherPolarity(unittest.TestCase):
                     self._affirms(answer), "a not-scraped answer affirmed"
                 )
 
-    def test_known_residual_false_green_still_affirms(self):
-        # Documented in the task.yaml polarity comment: a negative that ignores the
-        # verdict-line instruction and carries the "scraped: yes" substring inline
-        # has no substring fix that leaves the compliant token alone.
-        self.assertTrue(self._affirms(POLARITY_KNOWN_FALSE_GREEN))
+    def test_known_residual_false_greens_still_affirm(self):
+        # Documented in the task.yaml polarity comment: a negative that carries the
+        # "scraped: yes" substring where no forbidden line fires -- an inline token
+        # with no verdict line, or a `word:`-labelled verdict with a stray
+        # affirmative -- has no fix that leaves a compliant answer alone.
+        for answer in POLARITY_KNOWN_FALSE_GREEN:
+            with self.subTest(answer=answer[:60]):
+                self.assertTrue(self._affirms(answer))
 
 
 class NormalizeMatchesTheVerifier(unittest.TestCase):
@@ -349,8 +370,8 @@ class NormalizeMatchesTheVerifier(unittest.TestCase):
         samples = (
             POLARITY_CORRECT
             + POLARITY_INCORRECT
+            + list(POLARITY_KNOWN_FALSE_GREEN)
             + [
-                POLARITY_KNOWN_FALSE_GREEN,
                 " boundary space ",
                 "MixED **Case** `code`",
                 "typographic’s apostrophe",

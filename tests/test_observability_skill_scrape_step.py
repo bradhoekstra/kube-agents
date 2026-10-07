@@ -10,12 +10,13 @@ reported "not scraped" (gke-labs/kube-agents#2141). The step now names the
 The bench case `observability-watcher-scrape-state` grades the agent's behaviour,
 and on the live-test install the worker read the PodMonitoring without the skill's
 help, so the case does not red against the old step. Nothing executes the skill
-prose, so this test pins the phrases the fix is made of: a rewording that keeps
-the fix keeps them; one that sends the agent back to the Deployment annotations
-fails here before it fails a nightly run a day later. Per
-`.agents/rules/eval_driven_development.md` this stand-in does not replace the
-case; it is the guard the case cannot be, because the agent's behaviour was
-already correct.
+prose, so this test pins the phrases the fix is made of and the invariant it
+preserves -- step 1 names annotations only to forbid reading them. A rewording
+that keeps the fix keeps the phrases; one that sends the agent back to annotations,
+in any words and off any resource, fails here before it fails a nightly run a day
+later. Per `.agents/rules/eval_driven_development.md` this stand-in does not
+replace the case; it is the guard the case cannot be, because the agent's
+behaviour was already correct.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_observability_skill_scrape_step.py' -v
@@ -71,6 +72,17 @@ PROM_SCRAPE_ANNOTATION = re.compile(r"(?i)prometheus\.io/scrape")
 SCRAPE_ANNOTATION_PROSE = re.compile(
     r"(?i)annotations?\s+for\s+prometheus\s+scrap|scrap\w*\s+annotations?"
 )
+# The three patterns above are a denylist -- each keyed to one spelling of the
+# revert (a deployment read, the literal annotation key, the prose "scrape
+# annotations"). A revert spelled in none of them ("read the gateway pod's
+# Prometheus annotations", a jsonpath over `.annotations`) slips all three. This
+# last check is the non-enumerable backstop: step 1 names annotations exactly once,
+# in the sentence that forbids reading them (READ_OFF_PODMONITORING). Strip that
+# sentence and any surviving mention of annotations -- in any words, off any
+# resource -- is the regression. The cost is that a future non-revert mention would
+# also trip it and have to update this guard; for a step whose only correct mention
+# of annotations is to forbid them, that is the right default.
+ANY_ANNOTATION = re.compile(r"(?i)annotat")
 
 
 def _read(path: Path) -> str:
@@ -115,6 +127,19 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
             step,
             SCRAPE_ANNOTATION_PROSE,
             "step 1 describes reading scrape annotations in prose (the #2141 regression, without the literal key or a deployment read)",
+        )
+
+    def test_step_one_mentions_annotations_only_to_forbid_reading_them(self):
+        # The invariant behind the three patterns above: step 1 names annotations
+        # only in the sentence that forbids reading them. Strip that sentence and any
+        # surviving "annotat" is an annotation read the denylist patterns may not
+        # enumerate -- the #2141 regression in any words, off any resource.
+        step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
+        residue = step.replace(READ_OFF_PODMONITORING, "")
+        self.assertNotRegex(
+            residue,
+            ANY_ANNOTATION,
+            "step 1 mentions annotations outside the sentence that forbids reading them (the #2141 regression, in any words)",
         )
 
 
