@@ -934,6 +934,33 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* "true" when a byte quantity's value is at or past 2^63, which parseBytes saturates
+       to math.MaxInt64 and the operator refuses as unrepresentable. The quota sums want
+       the saturation; the credential-proxy render check wants the refusal, so it asks
+       this first. The arithmetic is parseBytes', so a value float64 rounds up to 2^63
+       from just below it (within 1024 of it) is refused too. Reads only what
+       parseBytes reads; call it after the quantity has passed the CRD's grammar. */ -}}
+{{- define "kube-agents.bytesExceedInt64" -}}
+{{- $raw := include "kube-agents.normalizeQuantity" . -}}
+{{- $scaled := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- $divided := dict "m" 1000.0 "u" 1000000.0 "n" 1000000000.0 -}}
+{{- $v := "" -}}
+{{- range $unit, $mult := $scaled -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = mulf (float64 (trimSuffix $unit $raw)) $mult -}}
+{{- end -}}
+{{- end -}}
+{{- range $unit, $div := $divided -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = divf (float64 (trimSuffix $unit $raw)) $div -}}
+{{- end -}}
+{{- end -}}
+{{- if kindIs "string" $v -}}
+{{- $v = float64 $raw -}}
+{{- end -}}
+{{- if ge (float64 $v) 9223372036854775808.0 -}}true{{- end -}}
+{{- end }}
+
 {{/*
 Count quotas (`pods`, `persistentvolumeclaims`) go through the same parser.
 

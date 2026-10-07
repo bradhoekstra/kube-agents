@@ -211,6 +211,25 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         err = self._render_error([f"{_VALUE_PATH}.limits.cpu=0"])
         self.assertIn(f"{_VALUE_PATH}.limits.cpu is 0", err)
 
+    def test_a_byte_count_past_int64_fails_naming_the_key(self):
+        # parseBytes saturates at math.MaxInt64 for the quota sums; this check has to
+        # see the overflow, or 10E would render and the operator refuse it.
+        for value in ("10E", "8Ei"):
+            err = self._render_error([f"{_VALUE_PATH}.limits.memory={value}"])
+            self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, which is not a representable byte count", err)
+        err = self._render_error([f"{_VALUE_PATH}.limits.ephemeral-storage=8Ei"])
+        self.assertIn(f"{_VALUE_PATH}.limits.ephemeral-storage is 8Ei, which is not a representable byte count", err)
+
+    def test_an_integer_past_int64_from_a_values_file_fails_naming_the_key(self):
+        # Helm reads an integer above 2^63 as a float64, written 1e+19.
+        err = self._render_error(values=_proxy_values({"limits": {"memory": 10**19}}))
+        self.assertIn(f"{_VALUE_PATH}.limits.memory is 1e+19, which is not a representable byte count", err)
+
+    def test_a_byte_count_under_int64_renders(self):
+        # 7Ei is under 2^63, so the operator reads it; as a limit it passes every check.
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=7Ei"])
+        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "7Ei"}})
+
     def test_a_two_gi_limit_renders(self):
         cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=2Gi"])
         self.assertEqual(_cr_resources(cr), {"limits": {"memory": "2Gi"}})
