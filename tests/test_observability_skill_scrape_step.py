@@ -10,13 +10,17 @@ reported "not scraped" (gke-labs/kube-agents#2141). The step now names the
 The bench case `observability-watcher-scrape-state` grades the agent's behaviour,
 and on the live-test install the worker read the PodMonitoring without the skill's
 help, so the case does not red against the old step. Nothing executes the skill
-prose, so this test pins the phrases the fix is made of and the invariant it
-preserves -- step 1 names annotations only to forbid reading them. A rewording
-that keeps the fix keeps the phrases; one that sends the agent back to annotations,
-in any words and off any resource, fails here before it fails a nightly run a day
-later. Per `.agents/rules/eval_driven_development.md` this stand-in does not
-replace the case; it is the guard the case cannot be, because the agent's
-behaviour was already correct.
+prose, so this test pins the phrases the fix is made of and the invariant that
+guards it: every `kubectl` command step 1 issues reads the `PodMonitoring` (or the
+`gmp-system` collector namespace), so a revert that points a command at the
+Deployment or any other resource fails here, whatever nouns the surrounding prose
+uses. Four denylist patterns back that up for a revert written as prose rather than
+a command, but each keys on an annotation word, so they catch an annotation-worded
+revert, not one phrased in entirely other words -- the kubectl allowlist, not the
+denylist, is what makes the "off any resource" guarantee hold. Per
+`.agents/rules/eval_driven_development.md` this stand-in does not replace the case;
+it is the guard the case cannot be, because the agent's behaviour was already
+correct.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_observability_skill_scrape_step.py' -v
@@ -76,13 +80,29 @@ SCRAPE_ANNOTATION_PROSE = re.compile(
 # revert (a deployment read, the literal annotation key, the prose "scrape
 # annotations"). A revert spelled in none of them ("read the gateway pod's
 # Prometheus annotations", a jsonpath over `.annotations`) slips all three. This
-# last check is the non-enumerable backstop: step 1 names annotations exactly once,
-# in the sentence that forbids reading them (READ_OFF_PODMONITORING). Strip that
-# sentence and any surviving mention of annotations -- in any words, off any
-# resource -- is the regression. The cost is that a future non-revert mention would
-# also trip it and have to update this guard; for a step whose only correct mention
-# of annotations is to forbid them, that is the right default.
+# last check widens the net to the annotation word itself: step 1 names annotations
+# exactly once, in the sentence that forbids reading them (READ_OFF_PODMONITORING);
+# strip that sentence and any surviving `annotat` is an annotation read the three
+# patterns above may not spell out. It is not the "in any words" backstop it reads
+# like -- it keys on the substring `annotat`, so a revert phrased without that word
+# slips it too; the step-1 kubectl allowlist below is what catches a revert off any
+# resource whatever words it uses. The cost of this one is that a future non-revert
+# mention of the word would also trip it and have to update the guard; for a step
+# whose only correct mention of annotations is to forbid them, that is the right
+# default.
 ANY_ANNOTATION = re.compile(r"(?i)annotat")
+# The positive guard the "off any resource" claim actually rests on, where the
+# denylist above (every pattern keyed on an annotation word) cannot. Collect every
+# `kubectl` command step 1 issues and require each to name the PodMonitoring read --
+# the `podmonitoring` kind, or the `gmp-system` namespace the managed collector's
+# pods live in. Step 1's three reads all do; a revert that points a `kubectl get`/
+# `describe` at the Deployment, the gateway pod template or any other resource names
+# neither and fails here, whatever nouns the surrounding prose uses. The one gap it
+# leaves -- a revert that issues no kubectl command and uses no annotation word -- is
+# not reachable by a substring check and is the accepted residual: a step that runs
+# no command to read the wrong resource has not reverted what the agent does.
+KUBECTL_IN_STEP = re.compile(r"kubectl[^\n`]*")
+STEP_ONE_KUBECTL_ALLOW = re.compile(r"(?i)\bpodmonitoring\b|\bgmp-system\b")
 
 
 def _read(path: Path) -> str:
@@ -133,14 +153,35 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
         # The invariant behind the three patterns above: step 1 names annotations
         # only in the sentence that forbids reading them. Strip that sentence and any
         # surviving "annotat" is an annotation read the denylist patterns may not
-        # enumerate -- the #2141 regression in any words, off any resource.
+        # enumerate -- the #2141 regression wherever the word `annotation` appears.
+        # This keys on that word, not on any wording of the revert; the kubectl
+        # allowlist test below is the guard that holds off any resource in any words.
         step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
         residue = step.replace(READ_OFF_PODMONITORING, "")
         self.assertNotRegex(
             residue,
             ANY_ANNOTATION,
-            "step 1 mentions annotations outside the sentence that forbids reading them (the #2141 regression, in any words)",
+            "step 1 mentions annotations outside the sentence that forbids reading them (the #2141 regression, by the annotation word)",
         )
+
+    def test_step_one_kubectl_commands_all_read_the_podmonitoring(self):
+        # The positive guard: every kubectl command step 1 issues must name the
+        # PodMonitoring read (the `podmonitoring` kind or the `gmp-system` collector
+        # namespace). This is what makes "off any resource" hold where the denylist
+        # patterns, each keyed on an annotation word, cannot: a revert that points a
+        # command at the Deployment or any other resource names neither and fails
+        # here, whatever words the prose around it uses.
+        step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
+        commands = KUBECTL_IN_STEP.findall(step)
+        self.assertTrue(commands, "step 1 issues no kubectl command to guard")
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertRegex(
+                    command,
+                    STEP_ONE_KUBECTL_ALLOW,
+                    f"step 1 runs a kubectl command off a resource other than the "
+                    f"PodMonitoring (the #2141 regression, off any resource): {command!r}",
+                )
 
 
 if __name__ == "__main__":

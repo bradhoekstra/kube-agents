@@ -128,25 +128,31 @@ verification_spec:
   # the space dropped still affirms where a literal `Scraped: yes` substring would
   # red a compliant answer. The negative is a forbidden_patterns regex run on the
   # line-preserving normalization
-  # (`(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*)?scraped:\s*no\b`), so it fires on a line
-  # whose verdict is `Scraped: no` through the Markdown prefixes the normalizer
-  # leaves -- a `-`/`*` bullet, a `#` heading, a `>` quote, a `1.` list item -- not
-  # just a bare line. It deliberately does not accept a `word:` label prefix: that
-  # alternative would also match a per-component line in a correct answer
-  # (`Broker: scraped: no` beside a `Scraped: yes` watcher verdict), false-redding
-  # the very nuance expected_output invites -- a correct answer may note the
-  # credential-proxy PodMonitoring is unscraped while the watcher is. It still does
-  # not fire on `scraped: nothing`/`not yet`/`none` (the word boundary) nor on an
-  # affirmative that mentions "scraped: no" in a later clause (the line anchor):
-  # `- the credential-proxy is scraped: no` carries two tokens before the verdict
-  # and does not match. The token survives the normalizer: `**Scraped: Yes**` folds
-  # to `scraped: yes` (emphasis dropped, lowercased). Two residuals stand, both
-  # contrived against a compliant answer and pinned in
+  # (`(?m)^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b`), so it fires on a line whose
+  # verdict is `Scraped: no` behind any run of non-word punctuation the normalizer
+  # leaves. `[^\w\n]*` is the complement of a word character, not a list of markers:
+  # it clears a `-` or `+` bullet, a `#` heading, a `>` quote, a `|` table cell, a
+  # `- [ ]` checkbox, a leading emoji, or any mix of them -- the shapes an
+  # enumerated `[-*#>]+` prefix missed one at a time. The one prefix the complement
+  # cannot cross is an ordered-list marker, whose digits are word characters, so
+  # `(?:\d+[.)]\s*)?` admits `1.` and `1)` explicitly. The pattern stops at the
+  # first letter, and that is what spares a `word:` label: a per-component line in a
+  # correct answer (`Broker: scraped: no` beside a `Scraped: yes` watcher verdict)
+  # begins with a letter, `[^\w\n]*` matches nothing, the `scraped:` anchor fails
+  # against `broker:`, and the line does not red -- the nuance expected_output
+  # invites, where a correct answer may note the credential-proxy PodMonitoring is
+  # unscraped while the watcher is. It still does not fire on
+  # `scraped: nothing`/`not yet`/`none` (the word boundary) nor on an affirmative
+  # that mentions "scraped: no" mid-sentence or in a later clause (the line's first
+  # word is not `scraped`): `- the credential-proxy is scraped: no` does not match.
+  # The token survives the normalizer: `**Scraped: Yes**` folds to `scraped: yes`
+  # (emphasis dropped, lowercased). Two residuals stand, both beginning with a word
+  # the complement will not cross and pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py: a negative that omits
   # the verdict line but carries the substring "scraped: yes" inline, and a negative
-  # whose verdict sits behind a `word:` label or two prefixes (`Verdict: Scraped: no`,
-  # `- Verdict: Scraped: no`) while a stray "scraped: yes" satisfies the affirmative
-  # -- the price of dropping the label prefix to spare the component line.
+  # whose verdict sits behind a `word:` label (`Verdict: Scraped: no`, a
+  # `| Verdict | Scraped: no |` table row) while a stray "scraped: yes" satisfies
+  # the affirmative -- the price of sparing the component line.
   - name: the-answer-affirms-the-watcher-is-scraped
     role: objective
     mode: assert
@@ -155,4 +161,4 @@ verification_spec:
       any_of_patterns:
         - 'scraped:\s*yes\b'
       forbidden_patterns:
-        - '(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*)?scraped:\s*no\b'
+        - '(?m)^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b'
