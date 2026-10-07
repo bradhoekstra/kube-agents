@@ -488,8 +488,9 @@ func (j *joiner) noteCluster(counts map[string]int, identity clusterIdentity) {
 func (j *joiner) UnreachableClusters() []string { return renderClusterCounts(j.unreachable) }
 
 // OutOfScopeClusters is UnreachableClusters for the held set: the clusters no
-// profile names, whose records were logged and not escalated. These are the
-// ones to onboard or exclude.
+// readable profile names, whose records were logged and not escalated. These
+// are the ones to onboard, to exclude, or whose profile the scope's log named
+// as not reading.
 func (j *joiner) OutOfScopeClusters() []string { return renderClusterCounts(j.held) }
 
 func renderClusterCounts(counts map[string]int) []string {

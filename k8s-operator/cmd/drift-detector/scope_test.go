@@ -16,6 +16,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -79,10 +80,12 @@ func TestProfileScopeReportsAnUnreadableDirectoryAsUnknown(t *testing.T) {
 	}
 }
 
-// A profile that does not parse names no cluster, so its cluster is held as
-// outside the scope -- and the scope says so once, by profile name, because the
-// hold line alone would send the operator to write a profile that exists.
+// A profile that does not parse and has never named a cluster leaves its
+// cluster held as outside the scope -- and the scope says so once per streak,
+// by profile name, in the log, because the hold line alone would send the
+// operator to write a profile that exists.
 func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
+	logs := captureLog(t)
 	dir := t.TempDir()
 	broken := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-c"}
 	if err := os.MkdirAll(filepath.Join(dir, "prod-c"), 0o700); err != nil {
@@ -97,45 +100,78 @@ func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
 	if profiled, known := s.Profiled(broken); profiled || !known {
 		t.Errorf("Profiled(prod-c) = (%v, %v) for an unparsable profile, want (false, true): it names nothing, and the directory was read", profiled, known)
 	}
-	if _, ok := s.skipped["prod-c"]; !ok {
-		t.Errorf("skipped = %v, want prod-c recorded so the drop is logged by name", s.skipped)
+	now = now.Add(profileScopeRescanInterval)
+	s.Profiled(broken) // a second read in the same streak
+	const heldLine = "profile prod-c names no readable cluster for the install's scope"
+	if got := strings.Count(logs.String(), heldLine); got != 1 {
+		t.Errorf("logged %q %d time(s) over two broken reads, want once per streak:\n%s", heldLine, got, logs.String())
 	}
+	if strings.Contains(logs.String(), "keeping") {
+		t.Errorf("log says an identity is kept for a profile that never named one:\n%s", logs.String())
+	}
+
 	writeScopeProfile(t, dir, "prod-c", broken)
 	now = now.Add(profileScopeRescanInterval)
 	if profiled, _ := s.Profiled(broken); !profiled {
 		t.Error("Profiled(prod-c) = false after the profile was rewritten, want true")
 	}
-	if len(s.skipped) != 0 {
-		t.Errorf("skipped = %v after a clean read, want empty so a profile that breaks again is logged again", s.skipped)
+	if err := os.WriteFile(filepath.Join(dir, "prod-c", "config.yaml"), []byte("model: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	s.Profiled(broken)
+	// A new streak, and a different one: the profile has named a cluster since.
+	if got := strings.Count(logs.String(), "profile prod-c names no cluster on this read"); got != 1 {
+		t.Errorf("want the profile logged again, as kept, when it breaks after a clean read; log:\n%s", logs.String())
 	}
 }
 
 // A cluster profile whose config names nothing on this read -- the scaffold
 // stamps the identity last, in place, so a read can land before it -- keeps the
 // identity it last carried while its directory exists, so a re-scaffold of an
-// onboarded cluster does not hold that cluster for an interval; and a cluster
-// profile that has never named a cluster is reported, not passed over as a
-// non-cluster profile, so the hold has a line pointing at the file.
+// onboarded cluster does not hold that cluster for an interval. The keep is
+// keyed on the directory and not on the profile's name or on ReadIdentities
+// reporting the drop: a profile without the cluster- prefix whose whole block
+// is gone is the drop the read cannot report, and it is kept the same way. A
+// cluster profile that has never named a cluster is reported, not passed over
+// as a non-cluster profile, so the hold has a line pointing at the file.
 func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testing.T) {
+	logs := captureLog(t)
 	dir := t.TempDir()
 	prodD := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-d"}
+	prodF := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-f"}
 	writeScopeProfile(t, dir, "cluster-p1-prod-d-us-central1", prodD)
+	writeScopeProfile(t, dir, "prod-f", prodF)
 	now := time.Now()
 	s := testProfileScope(dir, &now)
-	if profiled, _ := s.Profiled(prodD); !profiled {
-		t.Fatal("Profiled(prod-d) = false with its profile written")
+	for _, id := range []clusterIdentity{prodD, prodF} {
+		if profiled, _ := s.Profiled(id); !profiled {
+			t.Fatalf("Profiled(%s) = false with its profile written", id.Cluster)
+		}
 	}
 
-	// Mid-rewrite: the template config, no identity block yet.
-	if err := os.WriteFile(filepath.Join(dir, "cluster-p1-prod-d-us-central1", "config.yaml"), []byte("model:\n  provider: custom\n"), 0o600); err != nil {
-		t.Fatal(err)
+	// Mid-rewrite: the template config, no identity block -- under both names.
+	for _, profile := range []string{"cluster-p1-prod-d-us-central1", "prod-f"} {
+		if err := os.WriteFile(filepath.Join(dir, profile, "config.yaml"), []byte("model:\n  provider: custom\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
 	now = now.Add(profileScopeRescanInterval)
-	if profiled, known := s.Profiled(prodD); !profiled || !known {
-		t.Errorf("Profiled(prod-d) = (%v, %v) while its config names nothing, want (true, true): the last identity is kept", profiled, known)
+	for _, id := range []clusterIdentity{prodD, prodF} {
+		if profiled, known := s.Profiled(id); !profiled || !known {
+			t.Errorf("Profiled(%s) = (%v, %v) while its config names nothing, want (true, true): the last identity is kept", id.Cluster, profiled, known)
+		}
 	}
-	if _, ok := s.skipped["cluster-p1-prod-d-us-central1"]; !ok {
-		t.Errorf("skipped = %v, want the profile recorded so the kept identity is logged by name", s.skipped)
+	for _, want := range []string{
+		"profile cluster-p1-prod-d-us-central1 names no cluster on this read (config.yaml carries no cluster_identity); keeping p1/us-central1/prod-d inside the install's scope",
+		"profile prod-f names no cluster on this read (config.yaml carries no cluster_identity); keeping p1/us-central1/prod-f inside the install's scope",
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log lacks %q:\n%s", want, logs.String())
+		}
+	}
+	if strings.Contains(logs.String(), "held out of the inject") {
+		t.Errorf("log says a kept cluster is held:\n%s", logs.String())
 	}
 
 	// Gone: the reconcile offboarded it, and the identity goes with the directory.
@@ -156,8 +192,9 @@ func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testin
 	if profiled, known := s.Profiled(prodE); profiled || !known {
 		t.Errorf("Profiled(prod-e) = (%v, %v) for a cluster profile with no config yet, want (false, true)", profiled, known)
 	}
-	if _, ok := s.skipped["cluster-p1-prod-e-us-central1"]; !ok {
-		t.Errorf("skipped = %v, want the identityless cluster profile recorded so the hold is explained by name", s.skipped)
+	const heldLine = "profile cluster-p1-prod-e-us-central1 names no readable cluster for the install's scope (config.yaml is absent); records from its cluster are held"
+	if !strings.Contains(logs.String(), heldLine) {
+		t.Errorf("log lacks %q:\n%s", heldLine, logs.String())
 	}
 }
 

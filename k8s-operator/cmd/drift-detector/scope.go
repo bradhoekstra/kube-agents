@@ -15,7 +15,10 @@
 package main
 
 import (
+	"errors"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -54,16 +57,19 @@ type scopeIndex interface {
 // and never addresses a cluster: clusterprofiles.ReadIdentities reads config
 // files only.
 //
-// A profile the read drops -- its config unreadable, unparsable, or naming no
-// complete identity on this read -- is logged by name once per streak, and
-// keeps the identity it last carried for as long as its directory exists. The
-// second half is what closes the scaffold window: cluster_agent_profile.py
-// writes a profile's config in stages and stamps the identity last, in place,
-// so a read landing mid-write sees a cluster profile that names nothing; a
-// first scaffold was unprofiled an instant earlier and loses nothing, but a
-// re-scaffold of an existing profile would otherwise hold an in-scope cluster
-// for up to an interval. The identity is dropped only with the directory, which
-// is how the reconcile offboards a cluster.
+// A profile that named a cluster on an earlier read and does not on this one
+// -- its config unreadable, unparsable, truncated, or stripped of its identity
+// block, reported by ReadIdentities or not -- keeps that identity for as long
+// as its directory exists, and the keep is logged by name once per streak. That
+// is what closes the scaffold window: cluster_agent_profile.py writes a
+// profile's config in stages and stamps the identity last, in place, so a read
+// landing mid-write sees a cluster profile that names nothing; a first scaffold
+// was unprofiled an instant earlier and loses nothing, but a re-scaffold of an
+// existing profile would otherwise hold an in-scope cluster for up to an
+// interval. The identity is dropped only with the directory, which is how the
+// reconcile offboards a cluster. A profile the read drops that has never named
+// a cluster here is logged by name once per streak too, as held, so the hold
+// line is not the only statement in the log.
 //
 // Safe for concurrent use. The joiner that asks it is single-threaded today,
 // but the lock costs nothing and the rescan writes state, so the type does not
@@ -83,9 +89,10 @@ type profileScope struct {
 	// once per record; it resets on the next successful read so a directory
 	// that breaks again is reported again.
 	unreadableLogged bool
-	// skipped is the profiles the last read dropped, by directory name, so
-	// each is logged once per streak rather than once per rescan: the hold
-	// line alone would send the operator to write a profile that exists.
+	// skipped is the profiles the last read did not read complete, by
+	// directory name -- kept or held -- so each is logged once per streak
+	// rather than once per rescan: the hold line alone would send the
+	// operator to write a profile that exists.
 	skipped map[string]struct{}
 }
 
@@ -116,22 +123,9 @@ func (s *profileScope) Profiled(identity clusterIdentity) (bool, bool) {
 // rescan replaces the profiled set from the directory. Caller holds mu.
 func (s *profileScope) rescan() {
 	s.scannedAt = s.now()
-	byProfile := map[string]clusterIdentity{}
-	skipped := map[string]struct{}{}
+	dropped := map[string]error{}
 	ids, err := clusterprofiles.ReadIdentities(s.dir, func(profile string, err error) {
-		skipped[profile] = struct{}{}
-		kept, known := s.byProfile[profile]
-		if known {
-			byProfile[profile] = kept
-		}
-		if _, logged := s.skipped[profile]; logged {
-			return
-		}
-		if known {
-			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, err, kept)
-			return
-		}
-		log.Printf("%s: profile %s names no readable cluster for the install's scope (%v); records from its cluster are held out of the inject as outside the scope until it does", commandName, profile, err)
+		dropped[profile] = err
 	})
 	if err != nil {
 		s.readable = false
@@ -141,9 +135,39 @@ func (s *profileScope) rescan() {
 		}
 		return
 	}
+
+	byProfile := make(map[string]clusterIdentity, len(ids))
 	for _, p := range ids {
 		byProfile[p.Profile] = identityFromProfile(p.Identity)
 	}
+	skipped := map[string]struct{}{}
+	// The keep is keyed on the directory, not on the read having reported the
+	// drop: a profile this scope saw complete is a cluster profile whatever
+	// its name, and a config stripped of its whole block is the one drop
+	// ReadIdentities cannot tell from a profile that was never a cluster's.
+	for profile, kept := range s.byProfile {
+		if _, complete := byProfile[profile]; complete {
+			continue
+		}
+		if _, statErr := os.Stat(filepath.Join(s.dir, profile)); errors.Is(statErr, os.ErrNotExist) {
+			continue
+		}
+		byProfile[profile] = kept
+		skipped[profile] = struct{}{}
+		if _, logged := s.skipped[profile]; !logged {
+			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, dropReason(dropped[profile]), kept)
+		}
+	}
+	for profile, reason := range dropped {
+		if _, kept := skipped[profile]; kept {
+			continue
+		}
+		skipped[profile] = struct{}{}
+		if _, logged := s.skipped[profile]; !logged {
+			log.Printf("%s: profile %s names no readable cluster for the install's scope (%v); records from its cluster are held out of the inject as outside the scope until it does", commandName, profile, reason)
+		}
+	}
+
 	set := make(map[clusterIdentity]struct{}, len(byProfile))
 	for _, id := range byProfile {
 		set[id] = struct{}{}
@@ -153,4 +177,14 @@ func (s *profileScope) rescan() {
 	s.skipped = skipped
 	s.byProfile = byProfile
 	s.profiled = set
+}
+
+// dropReason is the reason ReadIdentities gave for a profile it dropped, or
+// the one case it reports nothing for: a config that reads cleanly and carries
+// no cluster_identity block under a name without the cluster- prefix.
+func dropReason(err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New("config.yaml carries no cluster_identity")
 }

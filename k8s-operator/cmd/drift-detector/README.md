@@ -76,13 +76,14 @@ cluster as one to profile, exclude, or fix the profile of. A record from a clust
 — every profile skipped at discovery for a missing grant, or a profile the reconcile wrote after
 discovery ran, since discovery runs once — is inside the scope, and is forwarded `unreachable` and
 injected as before; so is every record when the scope is unknown, because `--profiles-dir` was not
-given or the directory cannot be read. A profile whose `config.yaml` cannot be read or parsed, or
-names no complete cluster on a read, is logged by name once until it reads cleanly; it keeps the
-identity it last carried for as long as its directory exists, because the scaffold stamps the
-identity last and in place, so a read landing mid-write must not hold a cluster that was onboarded
-a second earlier, and a profile that has never named a cluster leaves its cluster held as outside
-the scope with that line saying why. The scope is re-read from the directory at most once a minute,
-when an `unreachable` record arrives, and never addresses a cluster.
+given or the directory cannot be read. A profile that named a cluster on an earlier read and does
+not on this one — its `config.yaml` unreadable, unparsable, truncated or stripped of its identity
+block — keeps that identity for as long as its directory exists, and the keep is logged by name once
+per streak: the scaffold stamps the identity last and in place, so a read landing mid-write must not
+hold a cluster that was onboarded a second earlier. A cluster profile that has never named a cluster
+here leaves its cluster held as outside the scope, with a line naming the profile and why it reads
+as nothing. The scope is re-read from the directory at most once a minute, when an `unreachable`
+record arrives, and never addresses a cluster.
 
 The split is deliberate on both sides. Each out-of-scope card is thin by construction — no owners,
 no lookup error — and spends a unit of the fleet-wide daily drift budget that the profiled clusters
