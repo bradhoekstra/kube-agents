@@ -2434,6 +2434,41 @@ class ExecRouteCapacityTest(unittest.TestCase):
         self.assertEqual("CREDENTIAL_PROXY_BUSY", body["code"])
         self.assertIn("limit of 8 concurrent commands and this request waited 60s without reaching a free slot", body["error"])
 
+    def test_a_caller_that_hangs_up_while_queued_is_logged_with_what_it_waited_for(self):
+        # The exec route's abandon line carries the hang-up's own text, as
+        # the vcs and refresh routes' do, so it names the memory budget when
+        # that is what held the request rather than always saying "a slot".
+        why = "the caller disconnected while queued for the memory budget"
+
+        @contextlib.contextmanager
+        def gone(caller=None):
+            raise credential_proxy.CallerHungUp(why)
+            yield  # pragma: no cover -- makes this a generator, as a context manager needs
+
+        with (
+            mock.patch.object(CredentialProxyHandler.executor, "request_slot", gone),
+            self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs,
+        ):
+            connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port)
+            self.addCleanup(connection.close)
+            connection.request(
+                "POST",
+                "/v1/exec",
+                body=json.dumps({"argv": ["kubectl", "get", "pods"]}),
+                headers={"Content-Type": "application/json"},
+            )
+            # The route writes nothing for a caller that has gone.
+            with self.assertRaises((http.client.HTTPException, ConnectionError)):
+                connection.getresponse()
+        self.assertTrue(
+            any(
+                "command abandoned request_id=" in line
+                and why + "; the command was not started" in line
+                for line in logs.output
+            ),
+            logs.output,
+        )
+
     def test_the_exec_route_holds_its_slot_until_the_response_is_written(self):
         # The slot covers the response as well as the command: released when
         # the command exits, a slow reader keeps its body alive while the next
