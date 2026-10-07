@@ -2267,8 +2267,15 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// egress env keep flowing, and updateStatusReady reports the refusal as
 	// Degraded.
 	refusal, warnings := credentialProxyResourcesRefusal(agent)
-	for _, warning := range warnings {
-		logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+	// The warnings are logged once per spec generation: on the first pass after
+	// the spec changed, before a status write records the generation as
+	// observed. Every pass that follows reads the same spec and would repeat
+	// them indefinitely, with no way to acknowledge one, and the webhook, where
+	// it is on, has already said each once at apply.
+	if agent.Generation != agent.Status.ObservedGeneration {
+		for _, warning := range warnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
 	}
 	rendered := agent
 	if refusal != "" {
