@@ -178,9 +178,15 @@ check_literal_from() {
   local name=$1 dockerfile=$2
   local want got
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  # Docker's grammar: optional leading blanks, a case-insensitive keyword, then
-  # any number of `--flag` words (`--platform=…`) before the reference.
-  got="$(normalise "$(sed -n 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]\{1,\}\(--[^[:space:]]*[[:space:]]\{1,\}\)*\([^[:space:]]*\).*$/\2/p' "$dockerfile" | tail -n1)")"
+  # Docker's grammar, as far as a plugin Dockerfile (FROM + COPY by design,
+  # agentplugins/lib/plugin_image.sh) can use it: a line ending in `\` joins
+  # the next before instructions are split, so the first sed does that join
+  # (which also keeps a `from …` continuation inside a RUN from reading as a
+  # stage); then optional leading blanks, a case-insensitive keyword and any
+  # number of `--flag` words (`--platform=…`) before the reference. Heredoc
+  # bodies are not parsed; a plugin Dockerfile has no RUN to carry one.
+  got="$(normalise "$(sed -e ':join' -e '/\\$/{N' -e 's/\\\n//' -e 'b join' -e '}' "$dockerfile" |
+    sed -n 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]\{1,\}\(--[^[:space:]]*[[:space:]]\{1,\}\)*\([^[:space:]]*\).*$/\2/p' | tail -n1)")"
   [ "$got" = "$want" ] ||
     fail "$dockerfile: FROM pins '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
 }

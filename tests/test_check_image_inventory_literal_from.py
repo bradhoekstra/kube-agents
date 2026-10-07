@@ -107,6 +107,25 @@ class CheckLiteralFromTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(_OTHER_PIN, result.stderr)
 
+    def test_backslash_continuations_are_joined(self):
+        # A line ending in `\` is one instruction with the next in Docker's
+        # grammar: a wrapped FROM is read whole, and a `from …` continuation
+        # inside a RUN is part of the RUN, not a stage.
+        wrapped = f"FROM --platform=linux/amd64 \\\n    busybox:{_PIN}\nCOPY files/ /\n"
+        result = _run_check(wrapped)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapped_drift = f"FROM \\\n  busybox:{_OTHER_PIN}\n"
+        result = _run_check(wrapped_drift)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(_OTHER_PIN, result.stderr)
+        run_continuation = (
+            f"FROM busybox:{_PIN}\n"
+            'RUN python3 -c "import json; \\\n'
+            'from pathlib import Path; print(Path.cwd())"\n'
+        )
+        result = _run_check(run_continuation)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_missing_from_fails(self):
         result = _run_check("COPY files/ /\n")
         self.assertNotEqual(result.returncode, 0)
