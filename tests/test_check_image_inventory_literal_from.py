@@ -126,6 +126,27 @@ class CheckLiteralFromTest(unittest.TestCase):
         result = _run_check(run_continuation)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_comment_lines_and_trailing_blanks_follow_docker(self):
+        # Docker strips comment lines before joining and accepts blanks after
+        # the backslash; a comment ending in `\` continues nothing.
+        passing = (
+            f"FROM --platform=linux/amd64 \\ \n    busybox:{_PIN}\n",
+            f"FROM --platform=linux/amd64 \\\n  # amd64 is the only platform the operator schedules\n  busybox:{_PIN}\n",
+            f"# docker build --platform linux/amd64 \\\n#   -t plugin .\nFROM busybox:{_PIN}\nCOPY files/ /\n",
+        )
+        for text in passing:
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        hidden_drift = (
+            f"FROM busybox:{_PIN} AS base\n"
+            "# keep the shipping stage last \\\n"
+            f"FROM busybox:{_OTHER_PIN}\nCOPY files/ /\n"
+        )
+        result = _run_check(hidden_drift)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(_OTHER_PIN, result.stderr)
+
     def test_missing_from_fails(self):
         result = _run_check("COPY files/ /\n")
         self.assertNotEqual(result.returncode, 0)
