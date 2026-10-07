@@ -293,6 +293,23 @@ func (h *usageHarness) configMap() *corev1.ConfigMap {
 	return cm
 }
 
+// markUsageConfigMapImmutable sets Immutable on the counters ConfigMap the poller
+// created, so a later live read sees it. The branch keys on the object's field,
+// not on the 422; the fake client does not enforce immutability, so a test still
+// sets cmUpdateErr to make the Update fail as the API server would.
+func markUsageConfigMapImmutable(t *testing.T, h *usageHarness, cmName string) {
+	t.Helper()
+	cm := &corev1.ConfigMap{}
+	key := client.ObjectKey{Namespace: usageTestNamespace, Name: cmName}
+	if err := h.cl.Get(context.Background(), key, cm); err != nil {
+		t.Fatalf("reading the created ConfigMap to mark it immutable: %v", err)
+	}
+	cm.Immutable = ptr.To(true)
+	if err := h.cl.Update(context.Background(), cm); err != nil {
+		t.Fatalf("marking the ConfigMap immutable: %v", err)
+	}
+}
+
 func (h *usageHarness) status() agentv1alpha1.AgentUsageStatus {
 	h.t.Helper()
 	agent := &agentv1alpha1.PlatformAgent{}
@@ -1153,9 +1170,12 @@ func TestUsagePoller_AnImmutableConfigMapRecordsAWarning(t *testing.T) {
 	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
 	h.poll(5) // Creates the ConfigMap and records the baseline.
 
-	// The API server now rejects every update of the ConfigMap as Invalid, as it
-	// does for an immutable one.
+	// Mark the created ConfigMap immutable so the live read sees it; the branch
+	// keys on the object's Immutable field, not on the 422. The fake client does
+	// not enforce immutability, so the Update is still forced to fail with
+	// cmUpdateErr, as the API server would for an immutable object.
 	cmName := usageTestAgentName + usageCountersConfigMapSuffix
+	markUsageConfigMapImmutable(t, h, cmName)
 	h.cmUpdateErr = apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, cmName, nil)
 
 	h.stub.set(gatewayAddr(), 512, ptr.To(100.0))
@@ -1177,36 +1197,61 @@ func TestUsagePoller_AnImmutableConfigMapRecordsAWarning(t *testing.T) {
 	}
 }
 
-// A ConfigMap Create the namespace refuses for a standing reason other than
-// immutability -- a count/configmaps quota at its cap, an admission policy that
-// denies it -- records a Warning on the CR naming the ConfigMap and leaves the
-// status untouched, rather than freezing status.usage with only a log line.
-func TestUsagePoller_AWriteRefusedByAQuotaRecordsAWarning(t *testing.T) {
-	created := usageClock(0).Add(-time.Hour)
-	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
-	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
-	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
-
-	// No document exists yet, so the first poll would Create the ConfigMap; the
-	// namespace's count/configmaps quota is at its cap and the API server refuses
-	// it with Forbidden on this poll and every later one.
+// A write the namespace refuses for a standing reason other than immutability --
+// a count/configmaps quota at its cap, or an admission policy that denies the
+// write -- records a Warning on the CR naming the ConfigMap and leaves the status
+// untouched, rather than freezing status.usage with only a log line. Every route
+// the fault is raised on: a Create answered Forbidden (a quota) or Invalid (a
+// validating policy), and an Update answered Forbidden (a policy denying updates)
+// or Invalid where the object is not immutable (so it is a refused write, not the
+// immutable instruction to delete it). The Update rows poll once to create the
+// ConfigMap, then fail the next poll's write.
+func TestUsagePoller_AWriteRefusedForAStandingReasonRecordsAWarning(t *testing.T) {
 	cmName := usageTestAgentName + usageCountersConfigMapSuffix
-	h.cmCreateErr = apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, cmName, errors.New("exceeded quota: count/configmaps"))
-
-	h.poll(5) // Would create the ConfigMap; the create is refused.
-
-	select {
-	case ev := <-h.recorder.Events:
-		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapRefusedReason) ||
-			!strings.Contains(ev, cmName) || !strings.Contains(ev, "refused") {
-			t.Fatalf("event %q, want a Warning naming the refused ConfigMap %s", ev, cmName)
-		}
-	default:
-		t.Fatal("no Warning event was recorded for the refused ConfigMap write")
+	forbidden := func() error {
+		return apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, cmName, errors.New("exceeded quota: count/configmaps"))
 	}
+	invalid := func() error { return apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, cmName, nil) }
+	for _, tc := range []struct {
+		name     string
+		onCreate bool // inject on the first (Create) poll; otherwise create first, fail the Update
+		err      func() error
+	}{
+		{"a Forbidden Create", true, forbidden},
+		{"an Invalid Create", true, invalid},
+		{"a Forbidden Update", false, forbidden},
+		{"an Invalid Update of a mutable ConfigMap", false, invalid},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			created := usageClock(0).Add(-time.Hour)
+			h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+			h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+			h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+			if tc.onCreate {
+				h.cmCreateErr = tc.err()
+				h.poll(5) // Would create the ConfigMap; the create is refused.
+			} else {
+				h.poll(5) // Creates the ConfigMap and records the baseline.
+				h.cmUpdateErr = tc.err()
+				h.stub.set(gatewayAddr(), 512, ptr.To(100.0)) // move the counters so the write runs
+				h.stub.set(brokerAddr(), 73, ptr.To(200.0))
+				h.poll(10) // Would update the ConfigMap; the update is refused.
+			}
 
-	if status := h.status(); status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
-		t.Fatalf("status.usage advanced despite the refused write: %+v", status)
+			select {
+			case ev := <-h.recorder.Events:
+				if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapRefusedReason) ||
+					!strings.Contains(ev, cmName) || !strings.Contains(ev, "refused") {
+					t.Fatalf("event %q, want a Warning naming the refused ConfigMap %s", ev, cmName)
+				}
+			default:
+				t.Fatal("no Warning event was recorded for the refused ConfigMap write")
+			}
+
+			if status := h.status(); status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
+				t.Fatalf("status.usage advanced despite the refused write: %+v", status)
+			}
+		})
 	}
 }
 
@@ -1320,7 +1365,9 @@ func TestUsagePoller_AScrapeFailureAndAConfigMapFaultShareOneWarning(t *testing.
 	h.stub.set(brokerAddr(), 10, nil)
 	h.poll(5) // Creates the ConfigMap; the gateway's first failure is a log line only.
 
-	// The API server now rejects every update as Invalid, as for an immutable one.
+	// Mark the ConfigMap immutable so the live read sees it, then fail the Update
+	// as the API server would for an immutable object.
+	markUsageConfigMapImmutable(t, h, cmName)
 	h.cmUpdateErr = apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, cmName, nil)
 	h.stub.set(brokerAddr(), 20, nil) // the broker moves, so the write runs and is rejected
 	h.poll(10)                        // the gateway is now past its streak; both causes stand at once

@@ -696,10 +696,14 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 		return nil, nil
 	}
 	if err := p.r.Update(ctx, cm); err != nil {
-		if apierrors.IsInvalid(err) || (existing.Immutable != nil && *existing.Immutable) {
+		if existing.Immutable != nil && *existing.Immutable {
 			// An immutable ConfigMap -- hand-edited, or a foreign copy left in
 			// place -- rejects every update, so the counters would freeze with
-			// nothing but a log line to say why. Return the cause so the caller
+			// nothing but a log line to say why. The immutability is read off the
+			// live object, not inferred from the 422: an Invalid the API server
+			// returns for some other reason (a validating admission policy, say)
+			// is a refused write below, not a standing instruction to delete a
+			// ConfigMap that was never immutable. Return the cause so the caller
 			// surfaces it where the design promises: `kubectl describe` on the CR.
 			return &usageConfigMapFault{
 					reason:  usageConfigMapImmutableReason,
