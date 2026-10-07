@@ -25,15 +25,18 @@ regex tweak that reads fine but shifts what matches:
   prose. Both tokens use one grammar. The affirmative is an ``any_of_patterns``
   regex ``scraped:\s*yes\b`` (``re.search``ed against the flat normalization), so a
   space-less ``Scraped:yes`` still affirms. The negative is a ``forbidden_patterns``
-  regex ``(?m)^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b`` (``re.search``ed against
-  the line-preserving normalization), so it fires on a line whose verdict is
-  ``Scraped: no`` behind any run of non-word punctuation -- a bullet, heading,
-  quote, table cell, checkbox or leading emoji -- plus an explicit ``1.``/``1)``
-  ordered-list marker, not on ``scraped: nothing``/``not yet`` (word boundary), an
-  affirmative that mentions ``scraped: no`` in a later aside (the line's first word
-  is not ``scraped``), or a correct answer's per-component ``Broker: scraped: no``
-  line (the complement stops at the leading letter, so that line does not
-  false-red). The nuance (a correct answer may note the
+  regex ``(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b``
+  (``re.search``ed against the line-preserving normalization): the tail fires on a
+  line whose verdict is ``Scraped: no`` behind any run of non-word punctuation -- a
+  bullet, heading, quote, table cell, checkbox or leading emoji -- plus an explicit
+  ``1.``/``1)`` ordered-list marker, and the ``\A...*?`` prefix lets it fire only
+  where no ``Scraped: yes`` precedes the line (the first verdict decides). It does not
+  fire on ``scraped: nothing``/``not yet`` (word boundary), an affirmative that
+  mentions ``scraped: no`` in a later aside (the line's first word is not
+  ``scraped``), or a correct answer's per-component negative under an affirmative
+  headline -- a ``Broker: scraped: no`` label line, a bare ``- scraped: no`` bullet,
+  or a nested ``  - scraped: no`` -- which the first-verdict prefix spares in any
+  layout. The nuance (a correct answer may note the
   credential-proxy PodMonitoring is unscraped while the watcher is) is left to the
   judge. ``ReportContainsVerifier`` tests ``any_of_patterns`` against
   ``_normalize(text)`` and ``forbidden_patterns`` against ``_normalize_lines(text)``,
@@ -42,11 +45,12 @@ regex tweak that reads fine but shifts what matches:
 
 The checks are read from task.yaml, not duplicated here, so the test pins the
 file rather than a copy of it. The residuals each check accepts -- the route's
-co-occurrence false-greens, the polarity's three false-greens (an inline
-``scraped: yes`` with no verdict line, and a ``word:``-labelled negative -- as
+co-occurrence false-greens, the polarity's four false-greens (an inline
+``scraped: yes`` with no verdict line; a ``word:``-labelled negative -- as
 ``**Verdict:**`` prose or a ``| Verdict | ... |`` table row -- with a stray
-affirmative) -- are asserted as known cases, so a future tightening that refuses
-one trips this test and updates the task.yaml comment with it.
+affirmative; and a negative that echoes the ``Scraped: yes`` option before its own
+``Scraped: no`` verdict line) -- are asserted as known cases, so a future tightening
+that refuses one trips this test and updates the task.yaml comment with it.
 
 Run:
   python3 -m pytest bench/tests/test_observability_watcher_scrape_patterns.py -v
@@ -217,6 +221,11 @@ ROUTE_KNOWN_RESIDUALS = [
 # -- a `Scraped: yes` headline over a `Watcher: scraped: yes` line and a
 # `Broker: scraped: no` line -- which the dropped `word:` label prefix now admits;
 # it false-red under the old `\w+:` alternative, which matched the `Broker:` line.
+# The eighth and ninth put a bare `scraped: no` component line -- a `- scraped: no`
+# bullet and a nested `  - scraped: no` -- under a `Scraped: yes` headline; the bare
+# line anchor false-red both (`[^\w\n]*` clears the bullet, then `scraped: no`
+# matches), and the first-verdict prefix now admits them because a `Scraped: yes`
+# precedes the negative line.
 POLARITY_CORRECT = [
     "Scraped: yes. The watcher metrics are scraped through the "
     '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
@@ -234,6 +243,12 @@ POLARITY_CORRECT = [
     "Scraped: yes.\n"
     "Watcher: scraped: yes (9095, gateway-monitoring PodMonitoring).\n"
     "Broker: scraped: no (no credential-proxy PodMonitoring).",
+    "Scraped: yes.\n"
+    "- Watcher: scraped: yes on the gateway-monitoring PodMonitoring (9095).\n"
+    "- scraped: no for the credential-proxy; it has no PodMonitoring yet.",
+    "- Scraped: yes.\n"
+    "  - Watcher: scraped: yes (9095, gateway-monitoring PodMonitoring).\n"
+    "  - scraped: no -- the credential-proxy has no PodMonitoring.",
 ]
 
 # Incorrect answers: the watcher is NOT scraped. Each carries a `Scraped: no`
@@ -248,11 +263,12 @@ POLARITY_CORRECT = [
 # `- [ ]` checkbox, a leading emoji, and a bare `| ... |` table cell. The old
 # enumerated `[-*#>]+`/`\d+\.` prefix caught only the `-` bullet and false-greened
 # the other five; the complement prefix `[^\w\n]*` (plus the explicit `\d+[.)]` for
-# the ordered-list marker) reds all six. A `word:` label prefix is still not redded
-# -- the complement stops at the leading letter, which is what spares a correct
-# answer's `Broker: scraped: no` component line (POLARITY_CORRECT's last entry) --
-# so a `word:`-labelled negative with a stray affirmative stays a documented
-# residual (see POLARITY_KNOWN_FALSE_GREEN).
+# the ordered-list marker) reds all six. The stray `scraped: yes` sits after the
+# `Scraped: no` verdict in each, so first-verdict-decides still reds them: the
+# verdict is the first token reached and the `\A...*?` prefix stops at the no. A
+# `word:`-labelled negative is still not redded -- its `scraped: no` sits mid-line
+# behind the label, never at a line start -- so a `word:`-labelled negative with a
+# stray affirmative stays a documented residual (see POLARITY_KNOWN_FALSE_GREEN).
 POLARITY_INCORRECT = [
     "Scraped: no. The event watcher's metrics are not scraped: the "
     "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
@@ -284,13 +300,16 @@ POLARITY_INCORRECT = [
 #      compliant token alone;
 #   2. a negative whose verdict sits behind a `word:` label (`**Verdict:** Scraped:
 #      no`) while a stray `scraped: yes` (the echoed answer format) satisfies the
-#      affirmative -- the price of the complement prefix stopping at the leading
-#      letter so a correct answer's `Broker: scraped: no` component line does not
-#      false-red;
+#      affirmative -- the `scraped: no` sits mid-line behind the label, never at a
+#      line start, so the forbidden tail never anchors on it;
 #   3. the same `word:`-label residual as a table row (`| Verdict | Scraped: no |`):
-#      the first cell is a word, so the complement matches nothing and the `scraped:`
-#      anchor never reaches the second cell. A bare `| Scraped: no |` cell with no
-#      label column is caught (POLARITY_INCORRECT); a label column is what escapes.
+#      the `scraped: no` sits in the second cell, mid-line behind `| verdict | `, so
+#      the tail never anchors. A bare `| Scraped: no |` cell with no label column is
+#      caught (POLARITY_INCORRECT); a label column is what escapes;
+#   4. a negative that echoes the `Scraped: yes` option before its own `Scraped: no`
+#      verdict line: first-verdict-decides reads the echoed affirmative as the verdict
+#      and the `\A...*?` prefix stops there, sparing the real negative -- the price of
+#      that prefix sparing a component negative under an affirmative headline.
 # Asserted so a future tightening that fixes any trips this test. (The old
 # false-red -- an affirmative that writes "scraped: no" in a later clause -- is
 # fixed by the line anchor and now sits in POLARITY_CORRECT.)
@@ -301,6 +320,9 @@ POLARITY_KNOWN_FALSE_GREEN = (
     "gateway-monitoring PodMonitoring is absent.",
     "| Verdict | Scraped: no | (format was `Scraped: yes` / `Scraped: no`; the "
     "stray affirmative sits in this aside).",
+    "You asked me to answer `Scraped: yes` or `Scraped: no`.\n"
+    "Scraped: no -- the watcher is not scraped; the gateway-monitoring "
+    "PodMonitoring is absent.",
 )
 
 
