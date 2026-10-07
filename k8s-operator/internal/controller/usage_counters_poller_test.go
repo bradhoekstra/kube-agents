@@ -987,6 +987,43 @@ func TestUsagePoller_ACancelledPollRecordsNoFailure(t *testing.T) {
 	}
 }
 
+// A CR deleted between the poll's cached List and pollAgent's live read records
+// no Warning: the standing scrape failure has nothing to attach to, and an Event
+// written against the gone CR's name and UID would dangle in the namespace for
+// the retention hour pointing at an object kubectl describe can no longer
+// resolve. The NotFound returns before recordStandingFailures, as the
+// cancelled-context guard does; a transient Get error below still records, so a
+// standing cause outlives an API blip.
+func TestUsagePoller_RecordsNoWarningForACRDeletedDuringThePoll(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+
+	// The gateway listener is one failure past its first, so this poll's failure
+	// crosses the streak and builds a standing failure -- the precondition for the
+	// Warning the pre-fix code recorded against the deleted CR.
+	h.p.streaks["gw-a"] = &usageScrapeStreak{count: 1}
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+	h.stub.set(brokerAddr(), 10, nil)
+
+	// Delete the CR after the harness seeded it: the pods stay, so targets still
+	// builds the failing gateway target, but pollAgent's live Get now returns
+	// NotFound -- the cached-List-then-deleted window the finding describes.
+	if err := h.cl.Delete(context.Background(), agent); err != nil {
+		t.Fatalf("deleting the CR mid-setup: %v", err)
+	}
+
+	h.clock = usageClock(5)
+	if err := h.p.pollAgent(context.Background(), agent, map[string]bool{}); err != nil {
+		t.Fatalf("pollAgent on a CR deleted mid-poll returned %v, want nil", err)
+	}
+	select {
+	case ev := <-h.recorder.Events:
+		t.Fatalf("a poll whose CR was deleted mid-poll recorded a Warning against the gone CR: %s", ev)
+	default:
+	}
+}
+
 // A status lastActiveTime after the poll's clock, a hand patch or a
 // predecessor leader's faster clock, is not seeded: the document is written
 // once with no last-moved time and left alone, and the next move stamps its
@@ -1469,7 +1506,10 @@ func TestUsagePoller_ABudgetCutResumesAtTheCutCRNextPoll(t *testing.T) {
 // hung one: poll 1 sweeps A (streak 1) and is cut on Z; poll 2 resumes at Z, is
 // cut on it at the head of the poll, and steps the cursor past the budget-eater
 // -- completing the sweep without revisiting A; poll 3 wraps back to A, whose
-// streak must still stand to reach the threshold on this second failure.
+// streak must still stand to reach the threshold on this second failure. The
+// same completed sweep prunes a streak for a pod no current CR lists, keyed on
+// sweepSeen (which still holds A's gw-a from poll 1) rather than the completing
+// poll's partial view -- so the departed streak goes while A's stays.
 func TestUsagePoller_AStreakSurvivesASweepThatCompletesWithoutRevisitingTheCR(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	a := usageTestAgent(created) // usage-test/agent sorts first
@@ -1480,6 +1520,12 @@ func TestUsagePoller_AStreakSurvivesASweepThatCompletesWithoutRevisitingTheCR(t 
 	h := newUsageHarness(t, a, append(usageDefaultObjects(created), z, zGateway)...)
 	const budget = 50 * time.Millisecond
 	h.p.pollBudget = func() time.Duration { return budget }
+
+	// A streak for a pod no current CR lists: the sweep that completes in poll 2
+	// must prune it, on sweepSeen (holding A's gw-a from poll 1), while A's own
+	// streak survives. A prune keyed on the completing poll's partial seen would
+	// drop gw-a instead.
+	h.p.streaks["departed"] = &usageScrapeStreak{count: 3}
 
 	// A's gateway fails fast every poll, so its pod builds a streak, while A's
 	// broker answers so A finishes and is swept. Z's gateway hangs, so every poll
@@ -1521,6 +1567,12 @@ drain:
 	}
 	if !strings.Contains(events[0], "agent-gateway-aaa") || !strings.Contains(events[0], usageScrapeFailingReason) {
 		t.Errorf("the Warning is not A's scrape-failing event: %q", events[0])
+	}
+	if h.p.streaks["departed"] != nil {
+		t.Errorf("the departed pod's streak survived the completed sweep: forgetDepartedStreaks did not run, or not on sweepSeen")
+	}
+	if h.p.streaks["gw-a"] == nil {
+		t.Errorf("A's streak was pruned: the completed sweep pruned on its partial view, not sweepSeen, which holds gw-a from poll 1")
 	}
 }
 

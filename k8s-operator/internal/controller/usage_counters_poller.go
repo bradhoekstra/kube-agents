@@ -359,10 +359,20 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	// interval's deltas a second time.
 	agent := &agentv1alpha1.PlatformAgent{}
 	if err := p.reader().Get(ctx, key, agent); err != nil {
+		if apierrors.IsNotFound(err) {
+			// The CR was deleted between this poll's cached List and this live
+			// read. There is nothing to record a standing failure against, and a
+			// Warning recorded here would dangle in the namespace for the
+			// retention hour pointing at a name and UID `kubectl describe` can no
+			// longer resolve -- and a CR re-applied under the same name would not
+			// show it, since the Event carries the old UID. A transient read error
+			// below still records, so a standing cause outlives a blip.
+			return nil
+		}
 		if ctx.Err() == nil {
 			p.recordStandingFailures(cached, failing, nil)
 		}
-		return client.IgnoreNotFound(err)
+		return err
 	}
 	existing, doc, err := p.readDocument(ctx, log, agent, now)
 	if err != nil {
