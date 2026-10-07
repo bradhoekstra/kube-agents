@@ -1037,9 +1037,10 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyRequestAboveTheLimitIs
 
 // An undeclared resource name is the author's and unbounded in length; quoted
 // whole, a 33,000-character one would push the Degraded message past the CRD's
-// 32768-character cap and fail every status write. The refusal is cut to the
-// budget, so the status write succeeds (the helper reads the condition back)
-// and the message stays bounded.
+// 32768-character cap and fail every status write. The name is cut where it
+// enters the field path, so the status write succeeds (the helper reads the
+// condition back), the message stays bounded, and the reason after the path
+// survives the cut.
 func TestPlatformAgentReconciler_Reconcile_CredentialProxyRefusalOfALongNameIsBounded(t *testing.T) {
 	name := corev1.ResourceName("example.com/" + strings.Repeat("x", 33000))
 	msg := reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
@@ -1049,8 +1050,11 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyRefusalOfALongNameIsBo
 	if len(msg) > credentialProxyRefusalMessageBudget+fixed {
 		t.Errorf("Degraded message is %d characters, want at most %d", len(msg), credentialProxyRefusalMessageBudget+fixed)
 	}
-	if !strings.Contains(msg, credentialProxyRefusalEllipsis+")") {
-		t.Errorf("Degraded message does not mark the cut refusal: %q", msg[len(msg)-200:])
+	if !strings.Contains(msg, credentialProxyRefusalEllipsis+": ") {
+		t.Errorf("Degraded message does not mark the cut name: %q", msg)
+	}
+	if !strings.Contains(msg, credentialProxyResourceNameRefusal) {
+		t.Errorf("Degraded message dropped the reason: %q", msg)
 	}
 }
 

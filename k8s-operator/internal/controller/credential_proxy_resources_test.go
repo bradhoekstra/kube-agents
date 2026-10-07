@@ -23,6 +23,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation/field"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -163,15 +164,39 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	}
 }
 
-// The count of further refusals survives the cut: the first refusal gives way
-// to it, and the whole stays within the budget.
-func TestCredentialProxyRefusalKeepsTheCountWithinTheBudget(t *testing.T) {
+// A long resource name is cut where it enters the field path, so the refusal
+// keeps the reason that follows the path, and the count of further refusals.
+func TestCredentialProxyRefusalOfALongNameKeepsTheReason(t *testing.T) {
 	long := corev1.ResourceName("example.com/" + strings.Repeat("y", 2*credentialProxyRefusalMessageBudget))
 	agent := proxyAgentWithResources(&corev1.ResourceRequirements{
 		Limits:   corev1.ResourceList{long: resource.MustParse("1")},
 		Requests: corev1.ResourceList{long: resource.MustParse("1")},
 	})
 	refusal, _ := credentialProxyResourcesRefusal(agent)
+	if len(refusal) > credentialProxyRefusalMessageBudget {
+		t.Errorf("refusal is %d characters, want at most %d", len(refusal), credentialProxyRefusalMessageBudget)
+	}
+	if !strings.Contains(refusal, credentialProxyRefusalEllipsis+": ") {
+		t.Errorf("refusal does not mark the cut name: %q", refusal)
+	}
+	if !strings.Contains(refusal, credentialProxyResourceNameRefusal) {
+		t.Errorf("refusal dropped the reason: %q", refusal)
+	}
+	if !strings.HasSuffix(refusal, " (and 1 more)") {
+		t.Errorf("refusal %q does not end with the count", refusal)
+	}
+}
+
+// The whole-message budget is the backstop for a refusal that is long for any
+// other reason: the first refusal gives way to the count of the rest, and the
+// whole stays within the budget.
+func TestCredentialProxyRefusalKeepsTheCountWithinTheBudget(t *testing.T) {
+	path := field.NewPath("spec")
+	errs := field.ErrorList{
+		field.Invalid(path, "x", strings.Repeat("z", 2*credentialProxyRefusalMessageBudget)),
+		field.Invalid(path, "x", "second"),
+	}
+	refusal := boundCredentialProxyRefusal(errs)
 	if len(refusal) > credentialProxyRefusalMessageBudget {
 		t.Errorf("refusal is %d characters, want at most %d", len(refusal), credentialProxyRefusalMessageBudget)
 	}

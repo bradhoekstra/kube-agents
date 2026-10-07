@@ -91,6 +91,13 @@ const (
 	credentialProxyRefusalEllipsis      = "..."
 )
 
+// credentialProxyResourceNameBudget bounds a resource name where it enters a
+// field path. A field.Error renders as "<path>: <reason>", so a name cut only
+// with the whole message would keep the author's key and drop the reason that
+// says what is wrong with it. Cut here, the reason survives and the message
+// budget above is the backstop.
+const credentialProxyResourceNameBudget = 128
+
 // credentialProxyResourcesPath is where the override sits on the CR.
 var credentialProxyResourcesPath = field.NewPath("spec", "deployment", "credentialProxy", "resources")
 
@@ -104,6 +111,16 @@ var credentialProxyResourceNames = []corev1.ResourceName{corev1.ResourceCPU, cor
 // byteCountResources are the names whose quantity is a count of bytes, and so
 // has to fit the int64 the Downward API and the kubelet carry it in.
 var byteCountResources = []corev1.ResourceName{corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
+
+// credentialProxyResourcePath is path.side.name with name cut to
+// credentialProxyResourceNameBudget, marked with credentialProxyRefusalEllipsis.
+func credentialProxyResourcePath(path *field.Path, side string, name corev1.ResourceName) *field.Path {
+	key := string(name)
+	if len(key) > credentialProxyResourceNameBudget {
+		key = truncateToValidUTF8(key, credentialProxyResourceNameBudget-len(credentialProxyRefusalEllipsis)) + credentialProxyRefusalEllipsis
+	}
+	return path.Child(side, key)
+}
 
 // maxByteCount is the largest byte count an int64 carries, as a quantity.
 var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
@@ -169,7 +186,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	for _, side := range sides {
 		for _, name := range sortedResourceNames(side.list) {
 			quantity := side.list[name]
-			at := path.Child(side.name, string(name))
+			at := credentialProxyResourcePath(path, side.name, name)
 			if !slices.Contains(credentialProxyResourceNames, name) {
 				errs = append(errs, field.Forbidden(at, credentialProxyResourceNameRefusal))
 				refused[at.String()] = true
@@ -191,7 +208,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		}
 	}
 
-	limitPath := path.Child(credentialProxyLimitsField, string(corev1.ResourceMemory))
+	limitPath := credentialProxyResourcePath(path, credentialProxyLimitsField, corev1.ResourceMemory)
 	limit := merged.Limits[corev1.ResourceMemory]
 	floor := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes)
 	if !refused[limitPath.String()] && limit.CmpInt64(floor) < 0 {
@@ -203,8 +220,8 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	for _, name := range sortedResourceNames(merged.Requests) {
 		request := merged.Requests[name]
 		limit, hasLimit := merged.Limits[name]
-		requestPath := path.Child(credentialProxyRequestsField, string(name))
-		limitPath := path.Child(credentialProxyLimitsField, string(name))
+		requestPath := credentialProxyResourcePath(path, credentialProxyRequestsField, name)
+		limitPath := credentialProxyResourcePath(path, credentialProxyLimitsField, name)
 		if !hasLimit || refused[requestPath.String()] || refused[limitPath.String()] || request.Cmp(limit) <= 0 {
 			continue
 		}
@@ -231,8 +248,8 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 	// The band applies to the requests pair only.
 	cpu, hasCPU := merged.Requests[corev1.ResourceCPU]
 	memory, hasMemory := merged.Requests[corev1.ResourceMemory]
-	cpuPath := path.Child(credentialProxyRequestsField, string(corev1.ResourceCPU))
-	memoryPath := path.Child(credentialProxyRequestsField, string(corev1.ResourceMemory))
+	cpuPath := credentialProxyResourcePath(path, credentialProxyRequestsField, corev1.ResourceCPU)
+	memoryPath := credentialProxyResourcePath(path, credentialProxyRequestsField, corev1.ResourceMemory)
 	// A quantity already refused, alone or as half of a crossed pair, draws
 	// no band warning: the warning would restate the refusal.
 	if hasCPU && hasMemory && cpu.Sign() > 0 && memory.Sign() > 0 &&
@@ -259,7 +276,7 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		if _, hasRequest := override.Requests[name]; !hasLimit || hasRequest {
 			continue
 		}
-		limitPath := path.Child(credentialProxyLimitsField, string(name))
+		limitPath := credentialProxyResourcePath(path, credentialProxyLimitsField, name)
 		request := merged.Requests[name]
 		if refused[limitPath.String()] || limit.Cmp(request) == 0 {
 			continue
@@ -289,8 +306,16 @@ func sortedResourceNames(list corev1.ResourceList) []corev1.ResourceName {
 // caller logs them.
 func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string, admission.Warnings) {
 	errs, warnings := ValidateCredentialProxyResources(agent.Spec.Deployment, credentialProxyResourcesPath)
+	return boundCredentialProxyRefusal(errs), warnings
+}
+
+// boundCredentialProxyRefusal is errs' first refusal with the count of the
+// rest, cut to credentialProxyRefusalMessageBudget, or "" for none. The cut is
+// a backstop: credentialProxyResourcePath already bounds the one part of a
+// refusal the author controls the length of.
+func boundCredentialProxyRefusal(errs field.ErrorList) string {
 	if len(errs) == 0 {
-		return "", warnings
+		return ""
 	}
 	refusal := errs[0].Error()
 	more := ""
@@ -300,5 +325,5 @@ func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string
 	if room := credentialProxyRefusalMessageBudget - len(more); len(refusal) > room {
 		refusal = truncateToValidUTF8(refusal, room-len(credentialProxyRefusalEllipsis)) + credentialProxyRefusalEllipsis
 	}
-	return refusal + more, warnings
+	return refusal + more
 }

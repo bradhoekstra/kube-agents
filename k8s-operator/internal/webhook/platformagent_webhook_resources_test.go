@@ -406,3 +406,26 @@ func TestCredentialProxyUnrepresentableMemoryLimitIsRefused(t *testing.T) {
 		t.Errorf("message %q should refuse 10E as unrepresentable and nothing else", msg)
 	}
 }
+
+// A resource name is cut where it enters the field path, so the ErrorList the
+// webhook returns keeps each refusal's reason rather than 33,000 characters of
+// the author's key.
+func TestCredentialProxyLongResourceNameKeepsTheReason(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	name := corev1.ResourceName("example.com/" + strings.Repeat("x", 33000))
+	_, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{name: resource.MustParse("1")},
+	}))
+	if err == nil {
+		t.Fatal("an undeclared resource name was admitted")
+	}
+	msg := err.Error()
+	if len(msg) > len(name) {
+		t.Errorf("the refusal is %d characters, longer than the name it should have cut", len(msg))
+	}
+	for _, want := range []string{"...: Forbidden", "accepts cpu, memory and ephemeral-storage only"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("the refusal does not say %q: %q", want, msg)
+		}
+	}
+}
