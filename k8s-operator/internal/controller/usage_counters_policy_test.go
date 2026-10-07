@@ -202,6 +202,37 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 	if !equality.Semantic.DeepEqual(built.Spec.PodSelector, applied.Spec.PodSelector) || !equality.Semantic.DeepEqual(built.Spec.PolicyTypes, applied.Spec.PolicyTypes) {
 		t.Error("the applied broker policy differs from the builder's beyond the appended rule")
 	}
+	// The same whole-rule-set diff for the gateway, which adds its operator rule
+	// inline in the builder when the namespace is known rather than through a
+	// separate wrapper: render it with the namespace unset and set -- the only
+	// field that differs between the two profiles -- and the set rendering has
+	// exactly one more ingress rule, every rule they share is DeepEqual, and the
+	// extra rule is operatorMetricsIngressRule's output. The operatorRules count
+	// check above already pins "exactly one operator rule" for the gateway, but it
+	// projects a rule onto the operator by its pod label or namespace selector and
+	// so cannot see a rule whose only peer is an IPBlock -- a CIDR covering the
+	// operator's pod IP names the operator to a CNI yet carries neither selector.
+	// Only a diff of the full rule set catches an extra rule of any peer shape.
+	gatewayWant, ok := operatorMetricsIngressRule(policyTestOperatorNamespace, eventWatcherMetricsPort)
+	if !ok {
+		t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace")
+	}
+	builtGateway := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+	appliedGateway := buildNetworkPolicy(agent, nil, profile, false, "", false)
+	if len(appliedGateway.Spec.Ingress) != len(builtGateway.Spec.Ingress)+1 {
+		t.Fatalf("the gateway policy with the operator namespace known has %d ingress rules, without it %d; want exactly one more", len(appliedGateway.Spec.Ingress), len(builtGateway.Spec.Ingress))
+	}
+	for i := range builtGateway.Spec.Ingress {
+		if !equality.Semantic.DeepEqual(builtGateway.Spec.Ingress[i], appliedGateway.Spec.Ingress[i]) {
+			t.Errorf("gateway ingress rule %d changed when the operator namespace became known", i)
+		}
+	}
+	if extra := appliedGateway.Spec.Ingress[len(appliedGateway.Spec.Ingress)-1]; !equality.Semantic.DeepEqual(extra, gatewayWant) {
+		t.Errorf("the gateway's extra rule is not exactly the operator metrics rule:\n got %+v\nwant %+v", extra, gatewayWant)
+	}
+	if !equality.Semantic.DeepEqual(builtGateway.Spec.PodSelector, appliedGateway.Spec.PodSelector) || !equality.Semantic.DeepEqual(builtGateway.Spec.PolicyTypes, appliedGateway.Spec.PolicyTypes) || !equality.Semantic.DeepEqual(builtGateway.Spec.Egress, appliedGateway.Spec.Egress) {
+		t.Error("the gateway policy changed beyond the appended operator rule when the operator namespace became known")
+	}
 }
 
 // A rule that reaches the operator through a namespace-only peer -- the operator
