@@ -7443,12 +7443,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 if result.kubeconfig:
                     response["kubeconfig"] = result.kubeconfig
                 self._json(HTTPStatus.OK, response)
-        except CallerHungUp:
+        except CallerHungUp as exc:
+            # The exception names what the request was queued for: a slot, or
+            # the child memory budget.
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_ABANDONED)
             LOGGER.info(
-                "command abandoned request_id=%s: the caller disconnected while queued "
-                "for a slot; the command was not started",
+                "command abandoned request_id=%s: %s; the command was not started",
                 request_id,
+                exc,
                 extra=audit(AUDIT_STATUS_ABANDONED),
             )
             return
@@ -8101,10 +8103,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                         return
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
-        except CallerHungUp:
-            LOGGER.info(
-                "vcs %s abandoned: the caller disconnected while queued for a slot", verb
-            )
+        except CallerHungUp as exc:
+            # The exception names what the request was queued for.
+            LOGGER.info("vcs %s abandoned: %s", verb, exc)
             return
         except PermissionError:
             # `BrokeredCredential.ensure` lets this one through, and

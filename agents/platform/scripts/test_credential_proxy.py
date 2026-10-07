@@ -7889,6 +7889,28 @@ class VcsRouteTest(unittest.TestCase):
         self.assertEqual(HTTPStatus.NOT_FOUND, status)
         self.assertEqual("VCS_UNAVAILABLE", payload["code"])
 
+    def test_a_caller_that_hangs_up_while_queued_is_logged_with_what_it_waited_for(self):
+        why = "the caller disconnected while queued for the memory budget"
+
+        @contextlib.contextmanager
+        def gone():
+            raise credential_proxy.CallerHungUp(why)
+            yield  # pragma: no cover - a generator, never reached
+
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.vcs = self.broker()
+        handler.max_request_bytes = 1 << 20
+        handler.headers = {"Content-Length": "2"}
+        handler.rfile = io.BytesIO(b"{}")
+        handler.path = "/v1/vcs/capabilities"
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._request_slot = gone
+        with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+            handler._handle_vcs_post()
+        self.assertEqual([], replies)
+        self.assertTrue(any("abandoned: " + why in line for line in logs.output), logs.output)
+
     def test_an_unknown_verb_is_a_404_and_not_a_fall_through(self):
         status, _ = self._handler("/v1/vcs/rm-rf", {}, self.broker())
         self.assertEqual(HTTPStatus.NOT_FOUND, status)
