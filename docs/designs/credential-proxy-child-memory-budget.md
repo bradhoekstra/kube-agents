@@ -112,21 +112,21 @@ Where each route reserves, and why there:
   scoped set and that refresh is inside `FORGE_REFRESH_COALESCE_SECONDS`, which is the common
   case for the sandbox `gh` wrapper and the fleet-audit skill, both of which call it before every
   credentialed step. So the route reads the coalesce cache first, without the refresh lock, and
-  reserves only when it will run the helper itself. A caller that finds a refresh for the same
-  provider already in flight -- the route's, or a vcs verb's, which marks itself without a
-  reservation of its own -- waits for it without a reservation, then repeats the lock-free
-  checks: the coalesce cache, and a failure recorded since it arrived, which it
-  re-raises. Only a caller that finds none in flight marks itself as the next refresher, reserves,
-  takes `_refresh_lock`, repeats the coalesce check under it as the function does, and runs the
-  helper under the reservation. So the route holds one reservation per provider however many
-  callers queue behind it, a cache hit never waits for the budget, and the refresh lock is never
-  held across a budget wait. The route's waits for an in-flight refresh and for the lock share
-  one bound, the admission wait counted from arrival, and are refused busy past it. The route
-  hands its connection to the wait, as the exec and
-  vcs routes hand theirs to the slot wait, so a caller that hangs up while queued is dropped
-  before the helper runs, and the route has a handler for that drop (a log line and no
-  response, as the exec route has) beside the busy handler. Called from inside a vcs request,
-  the function runs under that request's reservation and takes none; from the content-workspace
+  re-raises a failure recorded since it arrived. Otherwise it takes `_refresh_lock` first, under
+  the admission wait counted from arrival: refused busy past it, whether or not the budget is on.
+  Under the lock it repeats both checks, and only then, with the budget on, reserves for the
+  helper it is about to run, on the reservation's own admission wait, and releases the
+  reservation with the helper. So only the caller that runs the helper ever holds a reservation:
+  every other refresher waits on the lock holding none, and a cache hit never waits for either.
+  The lock can be held across its holder's wait for the budget; that blocks only other
+  refreshers, which would coalesce on the holder's result. A refresher behind a helper that runs
+  past the bound is told busy although that helper lands the token seconds later; the client
+  reports a failed refresh, and its next call coalesces. The route hands its connection to both
+  waits, as the exec and vcs routes hand theirs to the slot wait, so a caller that hangs up while
+  queued is dropped before the helper runs, and the route has a handler for that drop (a log line
+  and no response, as the exec route has) beside the busy handler. Called from inside a vcs
+  request, the function runs under that request's reservation, takes none, and waits for the lock
+  as long as it takes; from the content-workspace
   `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
 - The content-workspace verbs take no reservation at all. The store serves one verb at a time
   under its single lock, across every open workspace, so at most one of its process trees exists
@@ -361,8 +361,9 @@ its body; the output term is charged for slots in use, not the cap; a
 `kubectl` request's cold-path `gcloud`s spawn under the request's reservation and take no second
 one; no content-workspace verb reserves and the store's fixed term is subtracted whether or not a
 workspace is open; a forge refresh that coalesces reserves nothing, one that runs the helper
-reserves before taking the refresh lock, and the route drops a caller that hangs up while queued
-and answers a refusal with the 503; a spawn on a thread with no reservation takes a transient one; the
+reserves under the refresh lock, a refresher waiting on the lock holds no reservation and is
+refused at the bound with the budget on or off, and the route drops a caller that hangs up while
+queued and answers a refusal with the 503; a spawn on a thread with no reservation takes a transient one; the
 degenerate case admits and logs once; a reservation is released with its slot, including after a
 timed-out command and a caller hang-up; an executor constructed without a limit has no budget
 whatever the process's cgroup says.

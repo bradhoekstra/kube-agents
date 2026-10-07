@@ -168,27 +168,26 @@ REFRESH_HELPER_BUDGET_SECONDS = (
     + CLI_SETUP_STEPS * CLI_SETUP_TIMEOUT_SECONDS
 )
 
-#: How long the broker may hold a refresh before the helper starts: it queues
-#: behind the child memory budget for up to `COMMAND_SLOT_WAIT_SECONDS` in
-#: credential_proxy.py, which this mirrors. Declared here rather than imported
-#: because this script also runs in the sandbox image, which does not carry the
-#: broker.
+#: How long the broker may hold a refresh at each of its two waits before the
+#: helper starts -- for the refresh lock, then for the child memory budget --
+#: each bounded by `COMMAND_SLOT_WAIT_SECONDS` in credential_proxy.py, which this
+#: mirrors. Declared here rather than imported because this script also runs in
+#: the sandbox image, which does not carry the broker.
 BROKER_ADMISSION_WAIT_SECONDS = 60
 
 #: Room for the connection and the response on top of the waits.
 SIDECAR_REFRESH_MARGIN_SECONDS = 10
 
 #: The client's socket timeout on the refresh POST. Before its own helper
-#: starts, the broker may hold a refresh twice: waiting, without a reservation,
-#: for another caller's refresh of the same forge already in flight (and then
-#: for the refresh lock), both inside one bound of COMMAND_SLOT_WAIT_SECONDS
-#: from arrival, and then queueing for admission under a bound of its own. A
-#: refresh admitted late still runs the whole helper and answers 200 once the
-#: token has landed, so a client that gives up sooner reports a refresh that
-#: succeeded as failed. A second refresher behind a helper that runs past that
-#: first bound is told busy even though the first helper lands the token seconds
-#: later; this client reports that as a failed refresh, and the next call
-#: coalesces on the fresh token.
+#: starts, the broker may hold a refresh twice: waiting for the refresh lock
+#: behind another refresh, under a bound of COMMAND_SLOT_WAIT_SECONDS from
+#: arrival, and then, holding the lock, queueing for admission under a bound of
+#: its own. A refresh admitted late still runs the whole helper and answers 200
+#: once the token has landed, so a client that gives up sooner reports a refresh
+#: that succeeded as failed. A refresher behind a helper that runs past the lock
+#: bound is told busy even though that helper lands the token seconds later;
+#: this client reports that as a failed refresh, and the next call coalesces on
+#: the fresh token.
 SIDECAR_REFRESH_TIMEOUT_SECONDS = (
     BROKER_ADMISSION_WAIT_SECONDS
     + BROKER_ADMISSION_WAIT_SECONDS
@@ -714,10 +713,10 @@ def refresh_git_credentials(
     if proxy_url:
         # In the agent sandbox: delegate to the credential sidecar.
         # The sidecar manages bounded retries against Minty internally. The
-        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers a
-        # refresh already in flight, the broker's admission wait and the
-        # helper's budget after it, and fails
-        # fast on any error without re-triggering retries.
+        # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers the
+        # broker's wait for the refresh lock, its admission wait and the
+        # helper's budget after it, and fails fast on any error without
+        # re-triggering retries.
         # The forge-neutral route, naming the provider and the repository by
         # its URL rather than as a bare slug: a broker serving more than one
         # forge refuses a name without a host. `/v1/github/refresh` is kept on

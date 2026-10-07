@@ -5664,14 +5664,14 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 timed_out=False,
             )
         )
-        # Call 1 at 100.0: runs helper (reads: queued_at=100.0, check=100.0, record=100.0)
-        # Call 2 at 120.0: within 30s window (reads: queued_at=120.0, check=120.0; coalesces and returns)
-        # Call 3 at 140.0: 40s after Call 1, 20s after Call 2 (reads: queued_at=140.0, check=140.0, record=140.0)
+        # Call 1 at 100.0: runs helper (reads: queued_at, lock-free check, check under the lock, record)
+        # Call 2 at 120.0: within 30s window (reads: queued_at, lock-free check; coalesces and returns)
+        # Call 3 at 140.0: 40s after Call 1, 20s after Call 2 (reads: queued_at, lock-free check, check, record)
         # A fixed window runs the helper on Call 1 and Call 3 (len(calls) == 2).
         # A sliding window (if cache write was hoisted above the coalesce return) would record 120.0 on Call 2,
         # causing Call 3 (140.0 - 120.0 = 20s < 30s) to coalesce (len(calls) == 1).
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
-             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 120.0, 120.0, 140.0, 140.0, 140.0]):
+             mock.patch.object(credential_proxy.time, "monotonic", side_effect=[100.0, 100.0, 100.0, 100.0, 120.0, 120.0, 140.0, 140.0, 140.0, 140.0]):
             executor.refresh_forge_credential("github", "gke-agentic/infra")
             executor.refresh_forge_credential("github", "gke-agentic/infra")
             executor.refresh_forge_credential("github", "gke-agentic/infra")
@@ -5756,9 +5756,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         # If L4501 is deleted, Call 3 finds Call 1's memo (100.0 >= 50.0) and raises RuntimeError.
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True), \
              mock.patch.object(credential_proxy.time, "monotonic", side_effect=[
-                 100.0, 100.0, 100.0,  # Call 1: queued_at, now, failed_at
-                 101.0, 101.0, 101.0,  # Call 2: queued_at, now, success_at
-                 50.0, 102.0, 102.0,   # Call 3: queued_at, now, success_at
+                 100.0, 100.0, 100.0, 100.0,  # Call 1: queued_at, lock-free now, now, failed_at
+                 101.0, 101.0, 101.0, 101.0,  # Call 2: queued_at, lock-free now, now, success_at
+                 50.0, 102.0, 102.0, 102.0,   # Call 3: queued_at, lock-free now, now, success_at
              ]):
             with self.assertRaises(RuntimeError):
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
@@ -5826,7 +5826,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 0.5)
         self.assertEqual(held, executor.reserved_bytes)
 
-    def test_a_refresh_that_runs_the_helper_reserves_before_taking_the_lock(self):
+    def test_a_refresh_that_runs_the_helper_reserves_under_the_lock(self):
         executor = self._budgeted_executor(admits=1)
         seen = []
         real_run = executor._run_forge_helper
@@ -5861,14 +5861,20 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 self.fail("condition not reached before the deadline")
             time.sleep(0.01)
 
-    def test_the_refresh_lock_is_free_while_a_refresher_waits_for_the_budget(self):
+    def test_the_lock_is_held_while_its_holder_waits_for_the_budget_and_a_second_refresher_waits_on_it_unreserved(self):
         executor = self._budgeted_executor(admits=1)
+        entered = threading.Event()
+        finish = threading.Event()
+        self.addCleanup(finish.set)
         calls = []
-        real_run = executor._run_forge_helper
+        reserved_during_helper = []
 
-        def record(*args, **kwargs):
+        def blocking_helper(*args, **kwargs):
             calls.append(args)
-            return real_run(*args, **kwargs)
+            reserved_during_helper.append(executor.reserved_bytes)
+            entered.set()
+            finish.wait(5)
+            return subprocess.CompletedProcess([], 0, "", "")
 
         release = threading.Event()
         held = threading.Event()
@@ -5883,26 +5889,34 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.addCleanup(holder.join)
         self.addCleanup(release.set)
         self.assertTrue(held.wait(5))
-        errors = []
+        one_reservation = executor.reserved_bytes
 
-        def refresh():
-            try:
-                executor.refresh_forge_credential("github", "gke-agentic/infra")
-            except Exception as exc:  # surfaced by the assertion below
-                errors.append(exc)
-
-        with mock.patch.object(executor, "_run_forge_helper", record), \
-             mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2):
-            refresher = threading.Thread(target=refresh)
-            refresher.start()
+        with mock.patch.object(executor, "_run_forge_helper", blocking_helper), \
+             mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 5):
+            first_results = []
+            first = self._refresh_in_thread(executor, first_results)
             self._wait_until(lambda: executor.queued_requests > 0)
-            self.assertFalse(executor._refresh_lock.locked())
+            self.assertTrue(executor._refresh_lock.locked())
+            second_results = []
+            second = self._refresh_in_thread(executor, second_results)
+            time.sleep(3 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
+            # The second refresher is on the lock, not in the admission queue.
+            self.assertTrue(second.is_alive())
+            self.assertEqual(1, executor.queued_requests)
+            self.assertEqual(one_reservation, executor.reserved_bytes)
             release.set()
-            refresher.join(5)
-        self.assertFalse(refresher.is_alive())
-        self.assertEqual([], errors)
+            holder.join(5)
+            self.assertTrue(entered.wait(5))
+            self.assertTrue(second.is_alive())
+            self.assertEqual(0, executor.queued_requests)
+            self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+            finish.set()
+            first.join(5)
+            second.join(5)
+        self.assertEqual(["ok"], first_results)
+        self.assertEqual(["ok"], second_results)
         self.assertEqual(1, len(calls))
-        holder.join(5)
+        self.assertEqual([credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES], reserved_during_helper)
         self.assertEqual(0, executor.reserved_bytes)
 
     def _start_blocking_refresh(self, executor, results, outcome=None):
@@ -5942,14 +5956,14 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         thread.start()
         return thread
 
-    def test_a_second_refresher_waits_for_the_in_flight_refresh_without_reserving(self):
+    def test_late_refreshers_wait_on_the_lock_without_reserving_and_coalesce(self):
         executor = self._budgeted_executor(admits=2)
         results = []
         first, finish, calls = self._start_blocking_refresh(executor, results)
         late_results = []
         second = self._refresh_in_thread(executor, late_results)
         third = self._refresh_in_thread(executor, late_results)
-        # Both late arrivals are parked on the in-flight refresh, not on the lock.
+        # Both late arrivals are parked on the lock, holding no reservation.
         time.sleep(3 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
         self.assertTrue(second.is_alive() and third.is_alive())
         self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
@@ -5961,7 +5975,6 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(["ok", "ok"], late_results)
         self.assertEqual(1, len(calls))
         self.assertEqual(0, executor.reserved_bytes)
-        self.assertEqual({}, executor._refresh_in_flight)
 
     def test_a_waiter_whose_refresh_ended_stale_reserves_and_runs_the_helper_itself(self):
         # A timeout is not memoised, so the cache is still stale when the wait
@@ -6003,7 +6016,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertIs(results[0], second_results[0])
         self.assertEqual(1, len(calls))
 
-    def test_a_route_refresher_waits_on_a_vcs_verbs_refresh_without_reserving(self):
+    def test_a_route_refresher_holds_no_reservation_while_a_vcs_verbs_refresh_runs(self):
         executor = self._budgeted_executor(admits=2)
         entered = threading.Event()
         finish = threading.Event()
@@ -6034,7 +6047,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
             route = self._refresh_in_thread(executor, route_results)
             time.sleep(3 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
             self.assertTrue(route.is_alive())
+            # The vcs verb's reservation alone; the route caller is on the lock.
             self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
+            self.assertEqual(0, executor.queued_requests)
             finish.set()
             covered.join(5)
             route.join(5)
@@ -6042,21 +6057,37 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(["ok"], route_results)
         self.assertEqual(1, len(calls))
         self.assertEqual(0, executor.reserved_bytes)
-        self.assertEqual({}, executor._refresh_in_flight)
 
     def test_a_route_refresher_gives_up_on_a_held_refresh_lock_at_the_bound(self):
-        # The lock held by something no marker names -- another provider's
-        # helper -- bounds the route's wait for it like admission.
+        # Whoever holds the lock -- here, another provider's helper -- the
+        # route's wait for it is bounded like admission.
         executor = self._budgeted_executor(admits=2)
         executor._refresh_lock.acquire()
         self.addCleanup(executor._refresh_lock.release)
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
-            with self.assertRaises(credential_proxy.CommandSlotUnavailable):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
+        self.assertIn("for another refresh to finish", str(refused.exception))
         self.assertEqual(0, executor.reserved_bytes)
-        self.assertEqual({}, executor._refresh_in_flight)
 
-    def test_a_waiter_that_hangs_up_raises_and_reserves_nothing(self):
+    def test_with_the_budget_off_a_route_refresher_behind_a_running_helper_is_refused_at_the_bound(self):
+        executor = self._budgeted_executor(admits=2)
+        executor.children_budget_bytes = None
+        results = []
+        first, finish, calls = self._start_blocking_refresh(executor, results)
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.3):
+            with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+        self.assertEqual(
+            "a github credential refresh waited 0.3s for another refresh to finish; retry shortly",
+            str(refused.exception),
+        )
+        finish.set()
+        first.join(5)
+        self.assertEqual(["ok"], results)
+        self.assertEqual(1, len(calls))
+
+    def test_a_refresher_that_hangs_up_waiting_for_the_lock_raises_and_reserves_nothing(self):
         executor = self._budgeted_executor(admits=2)
         results = []
         first, finish, calls = self._start_blocking_refresh(executor, results)
@@ -6070,7 +6101,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertFalse(second.is_alive())
         self.assertIsInstance(second_results[0], credential_proxy.CallerHungUp)
         self.assertEqual(
-            "the caller disconnected while waiting for a refresh already in flight",
+            "the caller disconnected while waiting for the refresh lock",
             str(second_results[0]),
         )
         self.assertEqual(credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES, executor.reserved_bytes)
@@ -6171,7 +6202,7 @@ class ForgeRefreshRouteTest(unittest.TestCase):
         self.assertIn("child memory budget", payload["error"])
 
     def test_a_caller_that_hangs_up_while_queued_gets_no_response(self):
-        why = "the caller disconnected while waiting for a refresh already in flight"
+        why = "the caller disconnected while waiting for the refresh lock"
 
         def gone(provider, repository, caller=None):
             raise credential_proxy.CallerHungUp(why)
