@@ -6484,8 +6484,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
 
     def test_a_route_caller_still_stale_after_its_yield_reserves_on_the_yield_bound_without_yielding(self):
         # Structural, not timed: the reservation after the yield is handed the
-        # deadline the wait for the verb and the re-take ran on, and no
-        # `yield_when`; the budget stays held, so that wait is refused.
+        # deadline the wait for the verb and the re-take ran on, and still
+        # watches the covered count (a verb counting itself ends the attempt,
+        # the test above); the budget stays held, so that wait is refused.
         executor = self._budgeted_executor(admits=1)
         calls = []
         reservations = []
@@ -6513,7 +6514,7 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertIsNotNone(reservations[0]["yield_when"])
         self.assertEqual(1, len(yield_deadlines))
         self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
-        self.assertIsNone(reservations[1]["yield_when"])
+        self.assertIsNotNone(reservations[1]["yield_when"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
         # Reworded for the leg it ran on: stepped aside, with the budget's
         # figures, never `_admit`'s text naming the full wait bound.
