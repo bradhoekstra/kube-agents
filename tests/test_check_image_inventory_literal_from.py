@@ -135,27 +135,34 @@ class CheckLiteralFromTest(unittest.TestCase):
                 self.assertIn(_SHAPE, result.stderr)
                 self.assertNotIn("FROM pins", result.stderr)
 
-    def test_invisible_bytes_are_shown_in_the_failure(self):
+    def test_invisible_bytes_are_shown_in_the_failure_unfolded(self):
         result = _run_check(f"FROM\tbusybox:{_PIN}\nCOPY {_SRC} /\r\n")
-        self.assertIn("FROM\\tbusybox", result.stderr)
-        self.assertIn("\\r$", result.stderr)
+        self.assertIn(f"FROM^Ibusybox:{_PIN}$", result.stderr)
+        self.assertIn("COPY files/ /^M$", result.stderr)
 
-    def test_parser_directives_in_the_leading_comments_fail_closed(self):
-        # `# syntax=` names a frontend image BuildKit pulls and runs, unpinned.
-        # The fence refuses any `# word=` line in the leading run of comments
-        # by name, before comments are dropped, so it cannot vanish as one.
-        # That run is wider than Docker's directive window on purpose (a
-        # directive behind a shebang line is live), so a note of that shape
-        # above a plain comment is refused too, and belongs below the FROM.
+    def test_equals_in_the_leading_comments_fails_closed(self):
+        # `# syntax=` names a frontend image BuildKit pulls and runs, unpinned,
+        # and BuildKit reads the blanks around the key wider than any class
+        # worth transcribing (a form feed or a mid-line CR counts), so the
+        # fence refuses any `=` in the leading run of comments by name, before
+        # comments are dropped. That run is wider than Docker's directive
+        # window on purpose (a directive behind a shebang line is live), so a
+        # comment with `=` above a plain comment is refused too, and belongs
+        # below the FROM, where test_the_one_shape_passes accepts it.
         for text, line in (
             (f"# syntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# syntax=docker/dockerfile:1"),
+            (f"#\x0csyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#\x0csyntax=docker/dockerfile:1"),
+            (f"#\rsyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#\rsyntax=docker/dockerfile:1"),
             (f"#!/usr/bin/env -S docker build -f\n# syntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# syntax=docker/dockerfile:1"),
             (f"# a note first\n#escape=`\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#escape=`"),
+            (f"# digest=ea2b9914 is what the tag resolved to\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# digest=ea2b9914 is what the tag resolved to"),
         ):
             with self.subTest(text=text):
                 result = _run_check(text)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(f"line '{line}' has the shape of a parser directive", result.stderr)
+                # text-mode pipes translate a CR to a newline, so match the
+                # part of the line after it.
+                self.assertIn(f"{line.rsplit(chr(13), 1)[-1]}' holds '=' in the leading run of comments", result.stderr)
                 self.assertNotIn("FROM pins", result.stderr)
 
     def test_script_calls_the_check_for_plugin_dockerfiles(self):

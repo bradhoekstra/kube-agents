@@ -178,21 +178,23 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # -- an indented or lowercase keyword, a flag, a tab, a CR, a stage name, a
 # continuation, a second stage, a RUN, a heredoc, another COPY destination --
 # fails closed with the expected lines and the lines found, printed through
-# `sed l` so an invisible byte shows. One rule runs before the strip: a
-# `# word=` line in the leading run of comments is refused by name, because
-# `# syntax=` there names a frontend image BuildKit pulls and runs that
-# nothing pins or mirrors. That run is wider than Docker's directive window
+# `cat -vet` so an invisible byte shows. One rule runs before the strip: a
+# comment line holding `=` anywhere in the leading run of comments is refused
+# by name, because `# syntax=<image>` there is a parser directive naming a
+# frontend image BuildKit pulls and runs that nothing pins or mirrors, and
+# BuildKit's own notion of the blanks around the key is wider than any class
+# worth transcribing here. That run is wider than Docker's directive window
 # (which closes at the first non-directive line) on purpose: a shebang first
 # line is discarded by BuildKit, so a directive behind one is live, and a
-# `# word=` note belongs below the first instruction, where it is a comment
-# to Docker and to this fence alike.
+# comment with `=` in it belongs below the first instruction, where it is a
+# comment to Docker and to this fence alike.
 check_literal_from() {
   local name=$1 dockerfile=$2 src=$3
   local want body other first second ref got
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  other="$(sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#[[:blank:]]*[A-Za-z][A-Za-z]*[[:blank:]]*=/p' "$dockerfile" | head -n1)"
+  other="$(sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#.*=/p' "$dockerfile" | head -n1)"
   if [ -n "$other" ]; then
-    fail "$dockerfile: line '$other' has the shape of a parser directive (# word=) in the leading run of comments; the plugin pin fence allows none there, because a syntax= frontend is a second image that nothing pins or mirrors. Put a note like it below the FROM line (agentplugins/lib/plugin_image.sh)."
+    fail "$dockerfile: line '$other' holds '=' in the leading run of comments, where a parser directive such as syntax= names a second image that nothing pins or mirrors; the plugin pin fence refuses any '=' there. Put a comment like it below the FROM line (agentplugins/lib/plugin_image.sh)."
     return
   fi
   body="$(sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d' "$dockerfile")"
@@ -202,7 +204,7 @@ check_literal_from() {
   if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] ||
     [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src /" ] ||
     printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:]]'; then
-    fail "$dockerfile: after comment and blank lines, a plugin Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src /', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C sed -n 'l' | tr '\n' ' ')"
+    fail "$dockerfile: after comment and blank lines, a plugin Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src /', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
     return
   fi
   got="$(normalise "$ref")"
