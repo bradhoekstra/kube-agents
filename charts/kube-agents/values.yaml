@@ -778,14 +778,14 @@ platformAgent:
     # staying Ready, and the webhook, where enabled, refuses the override at
     # apply. The chart fails the render on the same override first, and on any
     # key under resources other than requests, limits and claims, which the CRD
-    # would prune silently. The operator warns when memory per CPU, on the requests pair and on the
-    # limits pair, leaves the 1 to 6.5 GiB per vCPU band Autopilot admits
-    # unchanged: on the requests pair, that Autopilot raises the smaller request
-    # into the band; on the limits pair, that Autopilot without bursting sets
-    # the limits equal to the requests, so a limit raised without its request
-    # takes no effect there (the warning names the request to raise) and one
-    # lowered without its request follows the request. With bursting the
-    # declared limits stand. On an existing install the chart fails the upgrade
+    # would prune silently. The operator warns when memory per CPU on the
+    # requests pair leaves the 1 to 6.5 GiB per vCPU band Autopilot admits
+    # unchanged, because Autopilot then raises the smaller request into the
+    # band, and for each of cpu and memory set under limits without the same
+    # key under requests, because Autopilot without bursting sets the limits
+    # equal to the requests: the limits.memory example above runs at the 512Mi
+    # request there unless requests.memory is set to match or bursting is on.
+    # On an existing install the chart fails the upgrade
     # when the installed CRD predates the field; apply crds/ first (upgrade.sh
     # does).
     credentialProxy:

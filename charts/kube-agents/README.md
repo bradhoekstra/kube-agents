@@ -523,7 +523,7 @@ key is set, and the operator merges it over its defaults per key, so
 `limits: {memory: 2Gi}` raises the memory limit and keeps the rest. The
 [`spec.deployment` section of the CRD reference](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specdeployment)
 is canonical for the defaults, what the operator refuses and how it reports it,
-and the Autopilot band warnings;
+and the Autopilot warnings;
 [the child memory budget design](../../docs/designs/credential-proxy-child-memory-budget.md)
 has the arithmetic behind the memory floor. The chart fails the render on an
 override the operator would refuse, on a quantity it cannot read, and on any key

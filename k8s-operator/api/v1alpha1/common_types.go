@@ -931,13 +931,13 @@ type CredentialProxySpec struct {
 	// renders the proxy Deployment at the operator's defaults and reports
 	// Degraded with reason InvalidCredentialProxyResources, the agent staying
 	// Ready, whether or not the validating webhook is enabled, and the webhook, where
-	// it is, refuses the override at apply. The webhook warns when memory per CPU, on the requests
-	// pair and on the limits pair, leaves the band GKE Autopilot admits
-	// unchanged: on the requests pair, that Autopilot raises the smaller request
-	// into the band; on the limits pair, that Autopilot without bursting sets
-	// the limits equal to the requests, so a limit raised without its request
-	// takes no effect there and the warning names the request to raise, and a
-	// limit lowered without its request follows that request. With bursting the
+	// it is, refuses the override at apply. The webhook warns when memory per
+	// CPU on the requests pair leaves the band GKE Autopilot admits unchanged,
+	// because Autopilot then raises the smaller request into the band; it
+	// applies the band to requests only. It also warns for each of cpu and
+	// memory set under limits without the same key under requests: Autopilot
+	// without bursting sets the limits equal to the requests, so there the
+	// proxy runs at the request and the limit has no effect. With bursting the
 	// declared limits stand.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`

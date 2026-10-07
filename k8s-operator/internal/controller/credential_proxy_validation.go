@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -31,15 +30,16 @@ import (
 )
 
 // GKE Autopilot's general-purpose compute class admits a container unchanged
-// only while its memory sits between 1 GiB and 6.5 GiB per vCPU, and raises the
-// smaller request of the pair to reach the band otherwise; limits it either
-// sets equal to the requests (no bursting) or keeps as declared (bursting).
-// The operator declares the proxy's defaults at the lower edge of that band
-// (500m and 512Mi) so the manifest it writes is the pod Autopilot admits; an override that leaves the
-// band is admitted at figures the CR does not show, and the chart's quota
-// preflight, which sums the CR's figures, is short by the difference. A
-// warning rather than a refusal: the pod still runs, and on Standard nothing
-// is resized at all.
+// only while its requested memory sits between 1 GiB and 6.5 GiB per requested
+// vCPU, and raises the smaller request of the pair to reach the band
+// otherwise. The band applies to requests alone; limits Autopilot either sets
+// equal to the requests (no bursting) or keeps as declared (bursting),
+// whatever their ratio. The operator declares the proxy's default requests at
+// the lower edge of the band (500m and 512Mi) so the manifest it writes is the
+// pod Autopilot admits; a requests override that leaves the band is admitted
+// at figures the CR does not show, and the chart's quota preflight, which sums
+// the CR's figures, is short by the difference. A warning rather than a
+// refusal: the pod still runs, and on Standard nothing is resized at all.
 const (
 	autopilotMinMemoryBytesPerVCPU int64 = 1 << 30
 	autopilotMaxMemoryBytesPerVCPU int64 = 6656 << 20 // 6.5 GiB
@@ -66,25 +66,11 @@ const (
 	credentialProxyCrossedDefLimitFmt     = "exceeds the operator's default %s %s limit, which this override does not raise; set limits.%s as well"                                                                                                                                                                                                                         // #nosec G101 -- Error message, not a credential
 	credentialProxyCrossedDefRequestFmt   = "is below the operator's default %s %s request, which this override does not lower; set requests.%s as well"                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
 	credentialProxyRequestsBandWarningFmt = "%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot raises the smaller side into that band, so the pod it admits is larger than this CR declares and the chart's quota preflight, which sums the CR's figures, is short by the difference" // #nosec G101 -- Error message, not a credential
-	credentialProxyLimitsBandWarningFmt   = "%s: %s of memory per %s of CPU is %.2f GiB per vCPU, outside the %d to %.1f GiB per vCPU that GKE Autopilot admits unchanged; Autopilot sizes a pod from its requests, and without bursting sets the limits equal to the requests, so %s; with bursting the declared limits stand"                                             // #nosec G101 -- Error message, not a credential
+	credentialProxyLimitWithoutRequestFmt = "%s is set without %s; GKE Autopilot without bursting sets a container's limits equal to its requests, so there the proxy runs at the %s request and this limit has no effect — set %s to the same value, or enable bursting"                                                                                                   // #nosec G101 -- Warning text, not a credential
 )
 
-// What the limits-pair warning says about the keys: a limit the override raised
-// without the matching request takes no effect without bursting (raise the
-// request instead), one it lowered is replaced by the request, and when every
-// limit key in the pair has its request beside it the limits are the requests.
-const (
-	credentialProxyLimitsRaisedFmt  = "%s %s no effect there (raise %s instead)"      // #nosec G101 -- Warning text, not a credential
-	credentialProxyLimitsLoweredFmt = "%s %s %s there rather than the value set here" // #nosec G101 -- Warning text, not a credential
-	credentialProxyLimitsMatched    = "the limits follow the requests there"          // #nosec G101 -- Warning text, not a credential
-	credentialProxyAdviceJoin       = ", and "
-	credentialProxyKeyJoin          = " and "
-	credentialProxyKeySeparator     = "."
-	credentialProxyVerbHasOne       = "has"
-	credentialProxyVerbHasMany      = "have"
-	credentialProxyVerbFollowsOne   = "follows"
-	credentialProxyVerbFollowsMany  = "follow"
-)
+// credentialProxyKeySeparator joins a side and a resource name: "requests.memory".
+const credentialProxyKeySeparator = "."
 
 // credentialProxyRefusalMoreFmt counts the refusals past the first, which the
 // condition and the event leave out: the override's keys are the author's and
@@ -134,11 +120,14 @@ var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 //     that has the problem, and names which side is the operator's default
 //     when the CR set only the other one.
 //
-// And a warning per pair that leaves the memory-per-vCPU band Autopilot admits
-// unchanged (the constants above): on the requests pair, that Autopilot
-// resizes the pod; on the limits pair, that without bursting Autopilot sets
-// the limits equal to the requests, naming the request to raise for each limit
-// the override raised alone (credentialProxyLimitsBandAdvice).
+// And two kinds of warning, for GKE Autopilot (the constants above): when
+// the requests pair leaves the memory-per-vCPU band, that Autopilot resizes
+// the pod; and for each of cpu and memory the override sets under limits
+// without the same key under requests, that Autopilot without bursting sets
+// the limit equal to the request, so the limit has no effect there. The
+// second is about shape, not ratio: Autopilot applies the band to requests
+// only, and clamps the limits to them unconditionally. A refused quantity, or
+// either half of a crossed pair, draws neither.
 //
 // Nothing runs when the CR carries no override: the defaults satisfy every
 // check by construction, and the sizing test pins that.
@@ -225,92 +214,47 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 		}
 	}
 
-	for _, side := range sides {
-		cpu, hasCPU := side.list[corev1.ResourceCPU]
-		memory, hasMemory := side.list[corev1.ResourceMemory]
-		// A quantity already refused, alone or as half of a crossed pair,
-		// draws no band advice: the warning would restate the refusal.
-		if !hasCPU || !hasMemory || cpu.Sign() <= 0 || memory.Sign() <= 0 ||
-			refused[path.Child(side.name, string(corev1.ResourceMemory)).String()] ||
-			refused[path.Child(side.name, string(corev1.ResourceCPU)).String()] {
-			continue
-		}
+	// The band applies to the requests pair only.
+	cpu, hasCPU := merged.Requests[corev1.ResourceCPU]
+	memory, hasMemory := merged.Requests[corev1.ResourceMemory]
+	cpuPath := path.Child(credentialProxyRequestsField, string(corev1.ResourceCPU))
+	memoryPath := path.Child(credentialProxyRequestsField, string(corev1.ResourceMemory))
+	// A quantity already refused, alone or as half of a crossed pair, draws
+	// no band warning: the warning would restate the refusal.
+	if hasCPU && hasMemory && cpu.Sign() > 0 && memory.Sign() > 0 &&
+		!refused[cpuPath.String()] && !refused[memoryPath.String()] {
 		// memory against cpu × each edge, in Quantity arithmetic, which falls
 		// back to arbitrary precision rather than wrapping: memory × 1000 / cpu
 		// in int64 overflows above about 8 PiB.
 		low, high := cpu.DeepCopy(), cpu.DeepCopy()
 		low.Mul(autopilotMinMemoryBytesPerVCPU)
 		high.Mul(autopilotMaxMemoryBytesPerVCPU)
-		if memory.Cmp(low) >= 0 && memory.Cmp(high) <= 0 {
-			continue
+		if memory.Cmp(low) < 0 || memory.Cmp(high) > 0 {
+			gibPerVCPU := memory.AsApproximateFloat64() / cpu.AsApproximateFloat64() / float64(bytesPerGiB)
+			warnings = append(warnings, fmt.Sprintf(credentialProxyRequestsBandWarningFmt,
+				path.Child(credentialProxyRequestsField), memory.String(), cpu.String(), gibPerVCPU,
+				autopilotMinMemoryBytesPerVCPU/bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU)/float64(bytesPerGiB)))
 		}
-		gibPerVCPU := memory.AsApproximateFloat64() / cpu.AsApproximateFloat64() / float64(bytesPerGiB)
-		args := []any{path.Child(side.name), memory.String(), cpu.String(), gibPerVCPU,
-			autopilotMinMemoryBytesPerVCPU / bytesPerGiB, float64(autopilotMaxMemoryBytesPerVCPU) / float64(bytesPerGiB)}
-		format := credentialProxyRequestsBandWarningFmt
-		if side.name == credentialProxyLimitsField {
-			format = credentialProxyLimitsBandWarningFmt
-			args = append(args, credentialProxyLimitsBandAdvice(override))
-		}
-		warnings = append(warnings, fmt.Sprintf(format, args...))
 	}
-	return errs, warnings
-}
 
-// credentialProxyLimitsBandAdvice is the limits-pair warning's clause about
-// the override's own keys: each of cpu and memory it set under limits without
-// the same key under requests is either raised past the operator's default
-// limit, which takes no effect on Autopilot without bursting, or lowered under
-// it, where Autopilot puts the request in its place. A limit equal to the
-// default is neither, and is not named; with none named, the clause is the
-// generic one.
-func credentialProxyLimitsBandAdvice(override *corev1.ResourceRequirements) string {
-	defaults := resolveCredentialProxyResources(nil)
-	var raised, lowered []corev1.ResourceName
+	// A limit the override sets without its request: Autopilot without
+	// bursting replaces it with the request. One equal to the request it
+	// would be replaced by changes nothing, and is not named.
 	for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
 		limit, hasLimit := override.Limits[name]
 		if _, hasRequest := override.Requests[name]; !hasLimit || hasRequest {
 			continue
 		}
-		// A limit equal to the default is one the override did not move, so
-		// the advice does not name it.
-		switch limit.Cmp(defaults.Limits[name]) {
-		case -1:
-			lowered = append(lowered, name)
-		case 1:
-			raised = append(raised, name)
+		limitPath := path.Child(credentialProxyLimitsField, string(name))
+		request := merged.Requests[name]
+		if refused[limitPath.String()] || limit.Cmp(request) == 0 {
+			continue
 		}
+		requestKey := credentialProxyRequestsField + credentialProxyKeySeparator + string(name)
+		warnings = append(warnings, fmt.Sprintf(credentialProxyLimitWithoutRequestFmt,
+			limitPath, requestKey, request.String(), requestKey))
 	}
-	var clauses []string
-	if len(raised) > 0 {
-		verb := credentialProxyVerbHasOne
-		if len(raised) > 1 {
-			verb = credentialProxyVerbHasMany
-		}
-		clauses = append(clauses, fmt.Sprintf(credentialProxyLimitsRaisedFmt,
-			qualifiedNames(credentialProxyLimitsField, raised), verb, qualifiedNames(credentialProxyRequestsField, raised)))
-	}
-	if len(lowered) > 0 {
-		verb := credentialProxyVerbFollowsOne
-		if len(lowered) > 1 {
-			verb = credentialProxyVerbFollowsMany
-		}
-		clauses = append(clauses, fmt.Sprintf(credentialProxyLimitsLoweredFmt,
-			qualifiedNames(credentialProxyLimitsField, lowered), verb, qualifiedNames(credentialProxyRequestsField, lowered)))
-	}
-	if len(clauses) == 0 {
-		return credentialProxyLimitsMatched
-	}
-	return strings.Join(clauses, credentialProxyAdviceJoin)
-}
-
-// qualifiedNames is names as side.name, joined: "limits.cpu and limits.memory".
-func qualifiedNames(side string, names []corev1.ResourceName) string {
-	qualified := make([]string, 0, len(names))
-	for _, name := range names {
-		qualified = append(qualified, side+credentialProxyKeySeparator+string(name))
-	}
-	return strings.Join(qualified, credentialProxyKeyJoin)
+	return errs, warnings
 }
 
 // sortedResourceNames is list's keys in order, so the errors a CR gets back

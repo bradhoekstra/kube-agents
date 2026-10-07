@@ -161,20 +161,3 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 		t.Errorf("a limit below the fixed reserves admits %d requests, want 0", got)
 	}
 }
-
-// A limit equal to the operator's default is not one the override moved: alone
-// it draws the generic clause, beside a raised one only the raised one is named.
-func TestCredentialProxyLimitsBandAdviceSkipsALimitEqualToTheDefault(t *testing.T) {
-	alone := credentialProxyLimitsBandAdvice(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
-	})
-	if alone != credentialProxyLimitsMatched {
-		t.Errorf("advice for limits.cpu at the default = %q, want %q", alone, credentialProxyLimitsMatched)
-	}
-	beside := credentialProxyLimitsBandAdvice(&corev1.ResourceRequirements{
-		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("8Gi")},
-	})
-	if want := "limits.memory has no effect there (raise requests.memory instead)"; beside != want {
-		t.Errorf("advice = %q, want %q", beside, want)
-	}
-}
