@@ -124,7 +124,9 @@ Where each route reserves, and why there:
   waits for budget the verb holds. The yielded caller's wait for the verb has a bound of its own,
   `COMMAND_SLOT_WAIT_SECONDS` from the yield, because the budget wait ran on its own clock and may
   have spent the arrival bound; refused past it, the caller is told it stepped aside, with the
-  time it spent since arrival. Another route refresher waits on the lock as before. A
+  time it spent since arrival. It yields once: a caller whose re-check is still stale after the
+  yield (the verb refreshed another org, or its helper timed out) reserves on what remains of the
+  yield bound and does not yield again. Another route refresher waits on the lock as before. A
   refresher behind a helper that runs past the bound is told busy although that helper lands the
   token seconds later; the client
   reports a failed refresh, and its next call coalesces. The route hands its connection to both

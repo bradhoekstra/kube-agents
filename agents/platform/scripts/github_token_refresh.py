@@ -175,10 +175,12 @@ REFRESH_HELPER_BUDGET_SECONDS = (
 #: the sandbox image, which does not carry the broker.
 BROKER_ADMISSION_WAIT_SECONDS = 60
 
-#: The broker's wait for a vcs verb's refresh it stepped aside for: a route
-#: refresh holding the lock while it waits for the budget yields the lock to a
-#: vcs request that needs a refresh, then waits for that request's result under
-#: a bound of `COMMAND_SLOT_WAIT_SECONDS` from the yield, which this mirrors.
+#: The broker's wait after a refresh steps aside for a vcs verb's refresh: a
+#: route refresh holding the lock while it waits for the budget yields the lock,
+#: once, to a vcs request that needs a refresh, then waits for that request,
+#: re-takes the lock and, if its re-check is still stale, waits for the budget
+#: a second time without yielding -- all under one bound of
+#: `COMMAND_SLOT_WAIT_SECONDS` from the yield, which this mirrors.
 BROKER_YIELDED_WAIT_SECONDS = 60
 
 #: Room for the connection and the response on top of the waits.
@@ -189,8 +191,9 @@ SIDECAR_REFRESH_MARGIN_SECONDS = 10
 #: behind another refresh, under a bound of COMMAND_SLOT_WAIT_SECONDS from
 #: arrival, and then, holding the lock, queueing for admission under a bound of
 #: its own. A refresh that steps aside for a vcs verb's refresh during that
-#: second wait then waits for the verb under a third bound, counted from the
-#: yield. A refresh admitted late still runs the whole helper and answers 200
+#: second wait does so once, and the third bound, counted from the yield,
+#: covers its wait for the verb, re-taking the lock and any second budget wait.
+#: A refresh admitted late still runs the whole helper and answers 200
 #: once the token has landed, so a client that gives up sooner reports a refresh
 #: that succeeded as failed. A refresher behind a helper that runs past the lock
 #: bound is told busy even though that helper lands the token seconds later;

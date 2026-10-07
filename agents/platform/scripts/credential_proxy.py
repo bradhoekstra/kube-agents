@@ -4815,6 +4815,7 @@ class CommandExecutor:
         self,
         caller: socket.socket | None = None,
         yield_when: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> Iterator[None]:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
@@ -4822,9 +4823,11 @@ class CommandExecutor:
         budget is on, except that it is admitted past slot-takers the full
         slot cap holds (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
-        reservation; `caller` and `yield_when` are then unused. `yield_when`
-        is passed to `_admit`."""
-        with self._admit(takes_slot=False, caller=caller, yield_when=yield_when):
+        reservation; `caller`, `yield_when` and `deadline` are then unused.
+        `yield_when` and `deadline` are passed to `_admit`."""
+        with self._admit(
+            takes_slot=False, caller=caller, yield_when=yield_when, deadline=deadline
+        ):
             yield
 
     def _fits_budget(self, takes_slot: bool) -> bool:
@@ -4939,6 +4942,7 @@ class CommandExecutor:
         takes_slot: bool,
         caller: socket.socket | None,
         yield_when: Callable[[], bool] | None = None,
+        deadline: float | None = None,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
@@ -4952,7 +4956,10 @@ class CommandExecutor:
 
         `yield_when`, if given, is called under `_slot_condition` each time the
         wait wakes; when it returns true the request leaves the queue
-        unadmitted with AdmissionYielded, before anything is reserved."""
+        unadmitted with AdmissionYielded, before anything is reserved.
+        `deadline`, if given, is the monotonic time the wait is refused at, in
+        place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
+        same."""
         if not takes_slot and self.children_budget_bytes is None:
             previously_reserved = getattr(self._request_budget, "reserved", False)
             try:
@@ -4962,7 +4969,8 @@ class CommandExecutor:
                 self._request_budget.reserved = previously_reserved
             return
         queued_at = time.monotonic()
-        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        if deadline is None:
+            deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         ticket = _AdmissionTicket(takes_slot)
         # Set if this slot-taking request ever found the slot cap full while it
         # waited. The wait log names the slot cap only then; otherwise, with the
@@ -5442,7 +5450,10 @@ class CommandExecutor:
         COMMAND_SLOT_WAIT_SECONDS from the yield, since the budget wait ran on
         its own clock and may have spent the arrival bound. Otherwise the knot would hold until the route
         caller's refusal: the verb waits on the lock, and the holder waits for
-        budget the verb holds. A second route refresher still waits on the lock
+        budget the verb holds. It yields once: a caller whose re-check is
+        still stale after the yield (the verb refreshed another org, or its
+        helper timed out) reserves on what remains of the yield bound and does
+        not yield again. A second route refresher still waits on the lock
         unreserved. A route caller refused past that bound is told it stepped
         aside, with the seconds it spent since arrival, not the lock-wait
         text. A refresher behind a
@@ -5498,7 +5509,7 @@ class CommandExecutor:
         self._acquire_refresh_lock(provider, queued_at + COMMAND_SLOT_WAIT_SECONDS, caller)
         holding = True
         try:
-            while self._refresh_under_lock(
+            if self._refresh_under_lock(
                 provider, helper, repository, clean_repo, failure_key, queued_at,
                 reserve=budget_on, caller=caller,
             ):
@@ -5509,12 +5520,24 @@ class CommandExecutor:
                 # its own clock and may have spent the arrival bound.
                 self._refresh_lock.release()
                 holding = False
-                deadline = time.monotonic() + COMMAND_SLOT_WAIT_SECONDS
+                yield_deadline = time.monotonic() + COMMAND_SLOT_WAIT_SECONDS
                 self._await_covered_refreshers(
-                    provider, deadline, caller, yielded_since=queued_at
+                    provider, yield_deadline, caller, yielded_since=queued_at
                 )
-                self._acquire_refresh_lock(provider, deadline, caller, yielded_since=queued_at)
+                self._acquire_refresh_lock(
+                    provider, yield_deadline, caller, yielded_since=queued_at
+                )
                 holding = True
+                # One yield. If the re-check is still stale -- the verb
+                # refreshed another org, or its helper timed out -- the second
+                # budget wait runs on what remains of the yield bound and does
+                # not yield again, so the whole wait stays inside the three
+                # bounds the client's timeout is derived from.
+                self._refresh_under_lock(
+                    provider, helper, repository, clean_repo, failure_key, queued_at,
+                    reserve=budget_on, caller=caller,
+                    deadline=yield_deadline, allow_yield=False,
+                )
         finally:
             if holding:
                 self._refresh_lock.release()
@@ -5597,15 +5620,18 @@ class CommandExecutor:
         queued_at: float,
         reserve: bool = False,
         caller: socket.socket | None = None,
+        deadline: float | None = None,
+        allow_yield: bool = True,
     ) -> bool:
         """The serialised part of `refresh_forge_credential`, called with
         `_refresh_lock` held: re-check the coalesce cache, honour the failure
         memo, and run the helper -- under a child memory reservation taken
-        here, after both checks, when `reserve` is set.
+        here, after both checks, when `reserve` is set, refused at `deadline`
+        when given.
 
         True when the reservation wait yielded to a vcs verb waiting for the
         lock and the helper did not run; the caller hands that verb the lock.
-        False otherwise."""
+        Never with `allow_yield` false. False otherwise."""
         if self._refresh_is_current(provider, clean_repo):
             return False
         failure = self._refresh_failure_cache.get(failure_key)
@@ -5618,7 +5644,13 @@ class CommandExecutor:
                 try:
                     admission.enter_context(
                         self.reserve_child_memory(
-                            caller=caller, yield_when=lambda: self._covered_refresh_waiters > 0
+                            caller=caller,
+                            yield_when=(
+                                (lambda: self._covered_refresh_waiters > 0)
+                                if allow_yield
+                                else None
+                            ),
+                            deadline=deadline,
                         )
                     )
                 except AdmissionYielded:
