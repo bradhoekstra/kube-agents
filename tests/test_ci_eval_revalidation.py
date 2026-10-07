@@ -606,8 +606,8 @@ class RevalidationTest(unittest.TestCase):
     def test_an_admin_override_at_this_head_is_reused_whatever_main_did(self):
         """The retest Tide starts after main moves, for a pull request an
         admin overrode: the only green on the head is the override plugin's
-        status, there is no passed build in GCS at all, and the reuse needs
-        none -- the history is never read."""
+        status, and the reuse needs no passed build in GCS -- the history is
+        read first and yields nothing, then the override holds."""
         self._plant_history([("300", False, self.c5, self.c3)])
         self._plant_statuses(self.c3, [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"BENCH_GITHUB_TOKEN": "t-shell"})
@@ -868,14 +868,17 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertIn("/override by (unnamed)", proc.stdout)
 
-    def test_a_network_error_on_the_override_read_is_noted_and_the_run_falls_through_once(self):
+    def test_a_network_error_on_the_status_read_is_noted_once_and_the_run_falls_through_once(self):
+        """The attestation of the green at this head is the read that fails;
+        the override check then consults the cache for the same head, notes
+        the failure once, and asks GitHub nothing more."""
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_STATUS_ERROR": "URLError"})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn(f"Step 0: could not read GitHub statuses for {self.c3} for an /override (URLError); none is reused", proc.stdout)
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
         reads = [r for r in self._requests() if "/statuses" in r["url"]]
-        self.assertEqual(1, len(reads), "the refused head is cached, not asked again for the attestation")
+        self.assertEqual(1, len(reads), "the failed head is cached; the override check does not ask again")
 
     def test_an_override_at_an_earlier_head_is_not_reused(self):
         """An override is given to a head; a push clears it, as the plugin
@@ -910,6 +913,7 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"/override by {_ADMIN}", proc.stdout)
         reads = [r["url"] for r in self._requests() if "/statuses" in r["url"]]
         self.assertEqual(3, len(reads), reads)
+        self.assertIn("per_page=100", reads[0])
         self.assertIn("page=3", reads[-1])
 
     def test_a_failed_later_page_keeps_the_pages_already_read(self):
@@ -1433,13 +1437,21 @@ class RevalidationBashFloorTest(unittest.TestCase):
     macOS contributor at source time. Pinned statically, the way
     tests/test_upgrade_script.py pins `mapfile` out of its harness."""
 
+    # Associative arrays, globals-from-functions, namerefs and case flags on
+    # any of the three declaring words; mapfile/readarray; case-modifying
+    # expansions in either form; appending redirections and |&; case
+    # fall-through; [[ -v ]]; coproc; read -i; negative subscripts.
     _BASH4_CONSTRUCTS = (
-        r"declare\s+-[a-zA-Z]*[gA]",
+        r"\b(declare|local|typeset)\s+-[a-zA-Z]*[gAnlu]",
         r"\bmapfile\b",
         r"\breadarray\b",
-        r"\$\{[A-Za-z_][A-Za-z_0-9]*(,,|\^\^)",
+        r"\$\{[A-Za-z_][A-Za-z_0-9]*(,|\^)",
         r"&>>",
         r"\|&",
+        r";;?&",
+        r"\[\[\s+-v\s",
+        r"\bcoproc\b",
+        r"\bread\s+-[a-zA-Z]*i",
         r"\[-1\]",
     )
 
