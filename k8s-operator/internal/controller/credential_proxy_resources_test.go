@@ -106,6 +106,51 @@ func TestCredentialProxyFullOverrideReplacesEveryKey(t *testing.T) {
 	assertQuantity(t, got.Limits, corev1.ResourceEphemeralStorage, "8Gi")
 }
 
+func emptyDirSizeLimits(volumes []corev1.Volume) map[string]string {
+	sizes := map[string]string{}
+	for _, vol := range volumes {
+		if vol.EmptyDir != nil && vol.EmptyDir.SizeLimit != nil {
+			sizes[vol.Name] = vol.EmptyDir.SizeLimit.String()
+		}
+	}
+	return sizes
+}
+
+// TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit: the kubelet
+// evicts the pod when an emptyDir passes its sizeLimit, so a limit raised past
+// the /tmp (2Gi) and state (5Gi) defaults widens both, a limit under them moves
+// neither, and the gateway pod's /tmp, which shares the volume's definition but
+// not the broker's container, keeps its default.
+func TestCredentialProxyEmptyDirsFollowARaisedEphemeralStorageLimit(t *testing.T) {
+	cases := []struct {
+		limit, tmp, state string
+	}{
+		{"", "2Gi", "5Gi"},
+		{"1Gi", "2Gi", "5Gi"},
+		{"3Gi", "3Gi", "5Gi"},
+		{"8Gi", "8Gi", "8Gi"},
+	}
+	for _, tc := range cases {
+		var override *corev1.ResourceRequirements
+		if tc.limit != "" {
+			override = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{corev1.ResourceEphemeralStorage: resource.MustParse(tc.limit)},
+			}
+		}
+		agent := proxyAgentWithResources(override)
+		got := emptyDirSizeLimits(buildCredentialProxyRuntimeVolumes(agent))
+		if got["credential-proxy-tmp"] != tc.tmp || got["credential-proxy-state"] != tc.state {
+			t.Errorf("limit %q: tmp %s, state %s; want %s and %s", tc.limit, got["credential-proxy-tmp"], got["credential-proxy-state"], tc.tmp, tc.state)
+		}
+		if got["credential-proxy-runtime"] != "16Mi" {
+			t.Errorf("limit %q: runtime %s, want the 16Mi default", tc.limit, got["credential-proxy-runtime"])
+		}
+		if gateway := emptyDirSizeLimits(buildAgentAPIAuthVolumes(agent))["credential-proxy-tmp"]; gateway != "2Gi" {
+			t.Errorf("limit %q: gateway /tmp %s, want the 2Gi default", tc.limit, gateway)
+		}
+	}
+}
+
 // TestCredentialProxyOverrideDoesNotAliasTheCR: the render builds maps of its
 // own rather than handing back the CR's, and copies each quantity, so writing
 // to the rendered Requests or Limits, or to a rendered quantity in place,

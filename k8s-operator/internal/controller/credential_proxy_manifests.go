@@ -129,6 +129,17 @@ const (
 	credentialProxyCPULimit              = "1"
 	credentialProxyMemoryLimit           = "1Gi"
 	credentialProxyEphemeralStorageLimit = "2Gi"
+	// The emptyDir sizeLimits of the broker's /tmp and of its state volume (the
+	// content workspace and vcs scratch). The kubelet evicts the pod when either
+	// fills, whatever the container's ephemeral-storage limit, so each is sized
+	// as the larger of its default here and that merged limit
+	// (credentialProxyEmptyDirSizeLimit): an override that raises the limit past
+	// a volume's default widens the volume with it, and the default render keeps
+	// these figures.
+	credentialProxyTmpSizeLimit    = "2Gi"
+	credentialProxyStateSizeLimit  = "5Gi"
+	credentialProxyTmpVolumeName   = "credential-proxy-tmp"   // #nosec G101 -- Volume name, not a credential
+	credentialProxyStateVolumeName = "credential-proxy-state" // #nosec G101 -- Volume name, not a credential
 	// credentialProxyMemoryLimitEnv carries the container's own memory limit
 	// in bytes to the broker, which derives its child memory budget from it
 	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef the
@@ -696,10 +707,35 @@ var (
 // broker Deployment's volume list. The 0400 mode the projections carry is
 // readable because that pod sets an fsGroup, which is what makes kubelet apply
 // group ownership to a projected file.
+//
+// The /tmp and state emptyDirs are widened here, not in
+// buildCredentialProxyVolumes, because the gateway pod shares the /tmp volume's
+// definition and sizes its own container independently of the broker's
+// override.
 func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	volumes := filterVolumes(buildCredentialProxyVolumes(agent), credentialProxyRuntimeVolumeNames)
+	ephemeralLimit := resolveCredentialProxyResources(agent.Spec.Deployment).Limits[corev1.ResourceEphemeralStorage]
+	for i := range volumes {
+		emptyDir := volumes[i].EmptyDir
+		switch volumes[i].Name {
+		case credentialProxyTmpVolumeName:
+			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyTmpSizeLimit, ephemeralLimit)
+		case credentialProxyStateVolumeName:
+			emptyDir.SizeLimit = credentialProxyEmptyDirSizeLimit(credentialProxyStateSizeLimit, ephemeralLimit)
+		}
+	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
+}
+
+// credentialProxyEmptyDirSizeLimit is the larger of a volume's default
+// sizeLimit and the container's merged ephemeral-storage limit.
+func credentialProxyEmptyDirSizeLimit(defaultSize string, ephemeralLimit resource.Quantity) *resource.Quantity {
+	size := resource.MustParse(defaultSize)
+	if ephemeralLimit.Cmp(size) > 0 {
+		size = ephemeralLimit.DeepCopy()
+	}
+	return &size
 }
 
 // buildAgentAPIAuthVolumes is the gateway pod's remaining share. The data volume

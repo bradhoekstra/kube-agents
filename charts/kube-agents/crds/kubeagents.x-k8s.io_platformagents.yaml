@@ -1092,7 +1092,10 @@ spec:
                             limit. The broker sizes how many commands it admits at once from the
                             memory limit, so raising the limit is the one knob for an install whose
                             fleet outgrows the default; the ephemeral-storage limit bounds the content
-                            workspace the broker clones into. Only cpu, memory and ephemeral-storage
+                            workspace the broker clones into; the proxy's state and /tmp emptyDirs
+                            (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
+                            defaults, so the kubelet does not evict the pod at the smaller figure.
+                            Only cpu, memory and ephemeral-storage
                             are accepted, the quantities the container declares. The operator
                             refuses a memory limit below what admits two commands at once, a request
                             above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
