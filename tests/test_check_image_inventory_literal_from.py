@@ -1,5 +1,7 @@
 """`check_literal_from` in hack/check-image-inventory.sh fails when an agent
-plugin Dockerfile's literal `FROM` pin and the inventory's entry move apart.
+plugin Dockerfile's literal `FROM` pin and the inventory's entry move apart,
+and fails closed, saying why, on a Dockerfile that is not one single-line FROM
+plus COPY lines.
 
 The plugin images pin `busybox:musl` by digest in a literal FROM rather than an
 ARG pair, so `check_base_image` never reaches them. CI only ever runs the script
@@ -79,78 +81,54 @@ class CheckLiteralFromTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(_OTHER_PIN, result.stderr)
 
-    def test_last_from_is_the_one_compared(self):
-        multi_stage = f"FROM golang:1.27-alpine AS build\nRUN true\nFROM busybox:{_PIN}\nCOPY --from=build /x /\n"
-        self.assertEqual(_run_check(multi_stage).returncode, 0)
-        wrong_last = f"FROM busybox:{_PIN} AS unused\nFROM busybox:{_OTHER_PIN}\n"
-        self.assertNotEqual(_run_check(wrong_last).returncode, 0)
-
-    def test_docker_grammar_variants_are_read(self):
-        # Docker accepts a lowercase keyword, leading blanks and --flag words
-        # before the reference; a last stage written any of those ways must be
-        # the one compared, and a flag must never be taken for the image.
+    def test_docker_grammar_of_one_from_line_is_read(self):
+        # What Docker accepts on a single FROM line is accepted here: a
+        # lowercase keyword, leading blanks, --flag words before the reference,
+        # a CR before the newline, and comment lines anywhere, including ones
+        # that end in a backslash (a commented-out `docker build \` block).
         for text in (
             f"from busybox:{_PIN}\n",
             f"  FROM busybox:{_PIN}\n",
             f"FROM --platform=linux/amd64 busybox:{_PIN}\n",
             f"FROM --platform=linux/amd64 --no-cache busybox:{_PIN}\n",
+            f"FROM busybox:{_PIN}\r\nCOPY files/ /\r\n",
+            f"# docker build --platform linux/amd64 \\\n#   -t plugin .\nFROM busybox:{_PIN}\nCOPY files/ /\n",
         ):
             with self.subTest(text=text):
                 result = _run_check(text)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_continuations_fail_closed_with_the_reason(self):
+        # The fence does not join lines, so any instruction line ending in a
+        # backslash -- a wrapped FROM, a comment inside it, an escaped escape
+        # above a second stage -- is refused for that stated reason, never
+        # reported as a drifted or an in-step pin.
         for text in (
-            f"FROM busybox:{_PIN} AS build\nfrom busybox:{_OTHER_PIN}\n",
-            f"FROM busybox:{_PIN} AS build\n  FROM busybox:{_OTHER_PIN}\n",
+            f"FROM --platform=linux/amd64 \\\n    busybox:{_PIN}\n",
+            f"FROM --platform=linux/amd64 \\ \n    busybox:{_PIN}\n",
+            f"FROM --platform=linux/amd64 \\\n  # amd64 only\n  busybox:{_PIN}\n",
+            f"FROM busybox:{_PIN} AS base\nRUN echo \\\\\nFROM busybox:{_OTHER_PIN}\nCOPY files/ /\n",
         ):
             with self.subTest(text=text):
                 result = _run_check(text)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn(_OTHER_PIN, result.stderr)
+                self.assertIn("ends in a backslash", result.stderr)
+                self.assertNotIn("FROM pins", result.stderr)
 
-    def test_backslash_continuations_are_joined(self):
-        # A line ending in `\` is one instruction with the next in Docker's
-        # grammar: a wrapped FROM is read whole, and a `from …` continuation
-        # inside a RUN is part of the RUN, not a stage.
-        wrapped = f"FROM --platform=linux/amd64 \\\n    busybox:{_PIN}\nCOPY files/ /\n"
-        result = _run_check(wrapped)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        wrapped_drift = f"FROM \\\n  busybox:{_OTHER_PIN}\n"
-        result = _run_check(wrapped_drift)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(_OTHER_PIN, result.stderr)
-        run_continuation = (
-            f"FROM busybox:{_PIN}\n"
-            'RUN python3 -c "import json; \\\n'
-            'from pathlib import Path; print(Path.cwd())"\n'
-        )
-        result = _run_check(run_continuation)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_comment_lines_and_trailing_blanks_follow_docker(self):
-        # Docker strips comment lines before joining and accepts blanks after
-        # the backslash; a comment ending in `\` continues nothing.
-        passing = (
-            f"FROM --platform=linux/amd64 \\ \n    busybox:{_PIN}\n",
-            f"FROM --platform=linux/amd64 \\\n  # amd64 is the only platform the operator schedules\n  busybox:{_PIN}\n",
-            f"# docker build --platform linux/amd64 \\\n#   -t plugin .\nFROM busybox:{_PIN}\nCOPY files/ /\n",
-        )
-        for text in passing:
+    def test_more_or_fewer_than_one_from_fails_closed(self):
+        # A second stage, a FROM inside a heredoc body, or no FROM at all: the
+        # fence names the count and what to write instead of guessing a stage.
+        for text, count in (
+            (f"FROM golang:1.27-alpine AS build\nRUN true\nFROM busybox:{_PIN}\n", "2"),
+            (f"FROM busybox:{_PIN} AS unused\nfrom busybox:{_OTHER_PIN}\n", "2"),
+            (f"FROM busybox:{_PIN}\nCOPY <<EOF /x\nFROM busybox:{_OTHER_PIN}\nEOF\n", "2"),
+            ("COPY files/ /\n", "0"),
+        ):
             with self.subTest(text=text):
                 result = _run_check(text)
-                self.assertEqual(result.returncode, 0, result.stderr)
-        hidden_drift = (
-            f"FROM busybox:{_PIN} AS base\n"
-            "# keep the shipping stage last \\\n"
-            f"FROM busybox:{_OTHER_PIN}\nCOPY files/ /\n"
-        )
-        result = _run_check(hidden_drift)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn(_OTHER_PIN, result.stderr)
-
-    def test_missing_from_fails(self):
-        result = _run_check("COPY files/ /\n")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("<unset>", result.stderr)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"{count} FROM lines", result.stderr)
+                self.assertNotIn("FROM pins", result.stderr)
 
     def test_script_calls_the_check_for_plugin_dockerfiles(self):
         text = _SCRIPT.read_text()

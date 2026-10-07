@@ -167,27 +167,31 @@ check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTR
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
 # The agent plugin images pin their base with a literal `FROM repo:tag@digest`
-# rather than an ARG pair, so the ARG check above never reaches them. Compare
-# the last FROM line's reference against the inventory entry instead -- the
-# last, because that is the stage the image ships and the one the crane path in
-# agentplugins/lib/plugin_image.sh appends onto. The two Dockerfiles and the
-# `busybox` entry are otherwise kept in step by hand, and a bump that moves one
-# and not the others passes every other check while the docs and
-# `make mirror-images` describe a digest the build does not pull.
+# rather than an ARG pair, so the ARG check above never reaches them. This
+# fence does not parse Dockerfiles: a plugin Dockerfile is one FROM and COPY
+# lines by design (agentplugins/lib/plugin_image.sh), so it reads exactly one
+# single-line FROM and fails closed, saying so, on anything else -- a second
+# FROM (a build stage, or a FROM inside a heredoc body), or any line that ends
+# in a backslash (a continuation, or an escaped one). Comment lines are dropped
+# and a CR before the newline is ignored, the two things Docker does before it
+# reads an instruction. The FROM line itself may be indented, lowercase, and
+# carry `--flag` words (`--platform=…`) before the reference.
 check_literal_from() {
   local name=$1 dockerfile=$2
-  local want got
+  local want got body continued froms
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  # Read FROM the way Docker's parser splits instructions: comment lines are
-  # dropped first (anywhere, continuation or not), then a line ending in `\`
-  # plus optional blanks joins the next, then an instruction is optional
-  # leading blanks, a case-insensitive keyword and any number of `--flag`
-  # words (`--platform=…`) before the reference. Heredoc bodies are the one
-  # construct not modelled: a `FROM` line inside a `COPY <<EOF` body would be
-  # read as a stage. No plugin Dockerfile carries a heredoc.
-  got="$(normalise "$(sed -e '/^[[:space:]]*#/d' "$dockerfile" |
-    sed -e ':join' -e '/\\[[:blank:]]*$/{N' -e 's/\\[[:blank:]]*\n//' -e 'b join' -e '}' |
-    sed -n 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]\{1,\}\(--[^[:space:]]*[[:space:]]\{1,\}\)*\([^[:space:]]*\).*$/\2/p' | tail -n1)")"
+  body="$(tr -d '\r' <"$dockerfile" | sed '/^[[:space:]]*#/d')"
+  continued="$(printf '%s\n' "$body" | sed -n '/\\[[:blank:]]*$/p' | wc -l | tr -d ' ')"
+  froms="$(printf '%s\n' "$body" | sed -n '/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]/p' | wc -l | tr -d ' ')"
+  if [ "$continued" != 0 ]; then
+    fail "$dockerfile: a line ends in a backslash; the plugin pin fence reads single-line instructions only, so put the whole FROM on one line and keep the file to FROM and COPY (agentplugins/lib/plugin_image.sh)."
+    return
+  fi
+  if [ "$froms" != 1 ]; then
+    fail "$dockerfile: $froms FROM lines; the plugin pin fence reads exactly one single-line FROM stage, so keep the file to one FROM and COPY lines (agentplugins/lib/plugin_image.sh)."
+    return
+  fi
+  got="$(normalise "$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]\{1,\}\(--[^[:space:]]*[[:space:]]\{1,\}\)*\([^[:space:]]*\).*$/\2/p' | head -n1)")"
   [ "$got" = "$want" ] ||
     fail "$dockerfile: FROM pins '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
 }
