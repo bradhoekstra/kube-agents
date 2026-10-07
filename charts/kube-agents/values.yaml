@@ -774,7 +774,8 @@ platformAgent:
     # limit, claims, and any resource name other than cpu, memory and
     # ephemeral-storage, whether or not its webhook is enabled: the reconciler
     # ignores the override, renders the proxy Deployment at its defaults and
-    # reports Degraded, and the webhook, where enabled, refuses the override at
+    # reports Degraded with reason InvalidCredentialProxyResources, the agent
+    # staying Ready, and the webhook, where enabled, refuses the override at
     # apply. The chart fails the render on the same override first, and on any
     # key under resources other than requests, limits and claims, which the CRD
     # would prune silently. The operator warns when memory per CPU, on the requests pair and on the

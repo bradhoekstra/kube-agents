@@ -875,8 +875,9 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 // reconcileInvalidCredentialProxyResources reconciles a CR whose
 // credential-proxy override the shared validation refuses, against an install
 // whose running proxy Deployment is stale (an older image), and asserts the
-// operator's refusal: Degraded with InvalidCredentialProxyResources, a Warning
-// event that names the field, and the Deployment applied regardless, at the
+// operator's refusal: the Degraded condition with InvalidCredentialProxyResources
+// while Ready and the phase keep what the workloads say, a Warning event that
+// names the field, and the Deployment applied regardless, at the
 // operator's default resources, so the rest of what it carries keeps flowing.
 // The webhook is not in the loop, as on a chart install, which leaves it off.
 func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.ResourceRequirements, wantField string) {
@@ -918,8 +919,10 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
 		t.Fatalf("failed to get agent: %v", err)
 	}
-	if updated.Status.Phase != "Degraded" {
-		t.Errorf("Status.Phase = %q, want Degraded", updated.Status.Phase)
+	// Degraded only: the proxy runs at the defaults, so the phase and Ready
+	// keep what the workloads say (here, not yet ready).
+	if updated.Status.Phase == "Degraded" {
+		t.Errorf("Status.Phase = Degraded; the refusal is reported on the Degraded condition only")
 	}
 	degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded")
 	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidCredentialProxyResources {
@@ -928,9 +931,47 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if !strings.Contains(degraded.Message, wantField) {
 		t.Errorf("Degraded message %q does not name %s", degraded.Message, wantField)
 	}
-	ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
-	if ready == nil || ready.Status != metav1.ConditionFalse || ready.Reason != conditionReasonInvalidCredentialProxyResources {
-		t.Errorf("Ready condition = %v, want False/%s", ready, conditionReasonInvalidCredentialProxyResources)
+	if ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready"); ready == nil || ready.Reason == conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Ready condition = %v; the refusal is reported on Degraded only", ready)
+	}
+
+	// With every workload ready, Ready is True and the phase Ready while
+	// Degraded still carries the refusal. The workloads' status is written
+	// after the reconciles, and the status writer is driven directly.
+	for _, key := range []client.ObjectKey{
+		{Name: agent.Name + "-gateway", Namespace: agent.Namespace},
+		{Name: credentialBrokerName(agent), Namespace: agent.Namespace},
+	} {
+		d := &appsv1.Deployment{}
+		if err := cl.Get(ctx, key, d); err != nil {
+			t.Fatalf("get %s: %v", key.Name, err)
+		}
+		d.Status.ReadyReplicas = 1
+		if err := cl.Status().Update(ctx, d); err != nil {
+			t.Fatalf("mark %s ready: %v", key.Name, err)
+		}
+	}
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: shellSandboxName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		t.Fatalf("get shell sandbox: %v", err)
+	}
+	sts.Status.ReadyReplicas = 1
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatalf("mark shell sandbox ready: %v", err)
+	}
+	r.APIReader = cl
+	phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+	if err != nil {
+		t.Fatalf("updateStatusReady failed: %v", err)
+	}
+	if phase != "Ready" {
+		t.Errorf("phase with every workload ready = %q, want Ready", phase)
+	}
+	if ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready"); ready == nil || ready.Status != metav1.ConditionTrue {
+		t.Errorf("Ready condition with every workload ready = %v, want True", ready)
+	}
+	if degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidCredentialProxyResources {
+		t.Errorf("Degraded condition with every workload ready = %v, want True/%s", degraded, conditionReasonInvalidCredentialProxyResources)
 	}
 
 	dep := &appsv1.Deployment{}

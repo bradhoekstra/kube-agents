@@ -3597,15 +3597,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	} else if proxyResourcesRefusal != "" {
 		// Same shape as the git refusal above: the spec is read here, on
 		// every pass, rather than carried from reconcileCredentialProxy, so
-		// the condition clears on the pass the override is corrected. Last,
-		// because the proxy runs at the operator's defaults meanwhile: the
-		// reasons above report lost function and must not be masked by it.
-		newPhase = "Degraded"
-		condStatus = metav1.ConditionFalse
-		condReason = conditionReasonInvalidCredentialProxyResources
-		degradedReason = conditionReasonInvalidCredentialProxyResources
-		condMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
+		// the condition clears on the pass the override is corrected.
+		// Degraded only, as the held minter entry above: the proxy runs at
+		// the operator's defaults, so Ready and the phase keep what the
+		// workload says. Last, because the reasons above report lost
+		// function and must not be masked by it.
 		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonInvalidCredentialProxyResources
+		degradedMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg

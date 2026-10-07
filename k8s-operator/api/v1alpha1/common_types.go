@@ -928,8 +928,9 @@ type CredentialProxySpec struct {
 	// refuses a memory limit below what admits two commands at once, a request
 	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
 	// pod declares no resourceClaims. The reconciler ignores a refused override,
-	// renders the proxy Deployment at the operator's defaults and sets Degraded
-	// whether or not the validating webhook is enabled, and the webhook, where
+	// renders the proxy Deployment at the operator's defaults and reports
+	// Degraded with reason InvalidCredentialProxyResources, the agent staying
+	// Ready, whether or not the validating webhook is enabled, and the webhook, where
 	// it is, refuses the override at apply. The webhook warns when memory per CPU, on the requests
 	// pair and on the limits pair, leaves the band GKE Autopilot admits
 	// unchanged: on the requests pair, that Autopilot raises the smaller request
