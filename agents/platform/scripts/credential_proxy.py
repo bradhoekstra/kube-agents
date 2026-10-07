@@ -5203,8 +5203,9 @@ class CommandExecutor:
         the cron behind it, inside none. A call that no reservation covers
         takes a transient one in `_execute` for the helper's lifetime; on the
         refresh route, which the cron reaches over HTTP
-        (github_token_refresh.py), `refresh_forge_credential` reserves before
-        it takes the refresh lock, so no budget wait happens under the lock.
+        (github_token_refresh.py), `refresh_forge_credential` takes the
+        refresh lock first, reserves under it for the helper it will run, and
+        yields the lock to a vcs verb that needs a refresh while it waits.
         It is a short call to the minter either way, not a listing.
         """
         return self._execute(argv, cwd=cwd)
@@ -6223,7 +6224,9 @@ class CommandExecutor:
         # and the same refusal, so a route that forgets to reserve is throttled
         # rather than uncounted. A caller that reaches this point uncovered
         # while holding a lock would wait for the budget under that lock,
-        # which is why every route reserves before it takes one.
+        # which is why every route reserves before it takes one -- except the
+        # refresh route, which reserves under the refresh lock and yields the
+        # lock to a vcs verb that needs it (`refresh_forge_credential`).
         covered = getattr(self._request_budget, "reserved", False) or getattr(
             self._request_budget, "exempt", False
         )
