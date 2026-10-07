@@ -45,8 +45,12 @@ LEASE_NAME = "kube-agents-evals-4"
 LEASE_STATE = "busy"
 # A command or process substitution, which bash re-parses at expansion time
 # (see test_no_command_substitution_while_the_trap_is_armed). `$((` is
-# arithmetic and does not re-enter the parser, so it is allowed.
+# arithmetic and does not re-enter the parser, so it is allowed -- but only
+# when the same line closes it with `))`: bash reads a `$((` that does not,
+# as in `$((cd "$d" && ls) 2>&1)`, as a command substitution holding a
+# subshell.
 SUBSTITUTION_RE = re.compile(r"\$\((?!\()|`|<\(|>\(")
+UNCLOSED_ARITHMETIC_RE = re.compile(r"\$\(\((?!.*\)\))")
 # One beat in the detail log; curl's stderr shares the file, so only lines
 # that carry a status are held to it.
 DETAIL_LINE_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ) (ok|fail) http=\d{3}")
@@ -161,6 +165,12 @@ class BoskosHeartbeatTest(unittest.TestCase):
             proc.kill()
             return proc.communicate()[0]
 
+    def _logged_beats(self):
+        """Detail-log lines that record a beat; curl's stderr shares the file."""
+        if not self.beat_log.exists():
+            return []
+        return [ln for ln in self.beat_log.read_text().splitlines() if " http=" in ln]
+
     def _await_beats(self, n):
         count = wait_until(lambda: len(_FakeBoskos.updates) >= n)
         self.assertGreaterEqual(
@@ -190,11 +200,13 @@ class BoskosHeartbeatTest(unittest.TestCase):
 
     def test_detail_log_stamps_are_utc(self):
         proc = self._spawn(TZ=FAR_FROM_UTC_TZ)
-        self._await_beats(2)
+        # Wait on the log itself, not the server's count: the daemon appends
+        # a line only after curl returns, and a SIGTERM in between stops it
+        # before the line lands.
+        wait_until(lambda: len(self._logged_beats()) >= 2)
         self._stop(proc)
-        detail = wait_until(lambda: self.beat_log.read_text().splitlines())
-        beat_lines = [ln for ln in detail if " http=" in ln]
-        self.assertGreaterEqual(len(beat_lines), 2, detail)
+        beat_lines = self._logged_beats()
+        self.assertGreaterEqual(len(beat_lines), 2, beat_lines)
         now = datetime.now(timezone.utc)
         for line in beat_lines:
             match = DETAIL_LINE_RE.fullmatch(line)
@@ -290,7 +302,7 @@ class BoskosHeartbeatTest(unittest.TestCase):
         for number, line in enumerate(lines, 1):
             if line.lstrip().startswith("#"):
                 continue
-            if SUBSTITUTION_RE.search(line):
+            if SUBSTITUTION_RE.search(line) or UNCLOSED_ARITHMETIC_RE.search(line):
                 offenders.append(f"{number}: {line.strip()}")
         self.assertEqual(offenders, [], "command substitution under an armed trap:\n"
                          + "\n".join(offenders))
