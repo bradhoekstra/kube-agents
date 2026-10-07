@@ -116,8 +116,11 @@ type UsageCounterPoller struct {
 	// poll sorts the CRs and resumes after it, wrapping, so a poll the budget
 	// cut short leaves the CRs it did not reach at the front of the next one
 	// rather than at the mercy of the informer store's map order: a standing
-	// blockage then delays every CR by at most ceil(N/k) intervals instead of
-	// lagging a random multiple of the interval. In memory only, like streaks.
+	// blockage that still lets k >= 1 CRs through an interval delays every CR by
+	// at most ceil(N/k) intervals instead of a random multiple. The degenerate
+	// k == 0 -- a single CR that exhausts the whole budget by itself -- is
+	// stepped over in pollOnce rather than pinning the cursor, so the CRs behind
+	// it still advance. In memory only, like streaks.
 	cursor string
 	// sweepSeen and sweptKeys accumulate across the polls of one sweep -- one
 	// full pass over the CR set, which a standing budget cut spreads over
@@ -229,14 +232,28 @@ func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 		if err := p.pollAgent(ctx, agent, seen); err != nil {
 			if ctx.Err() != nil {
 				// The poll hit its budget, or the manager is stopping. Only the
-				// first is worth a line: the CRs left this interval are read
-				// first next interval (the cursor stays on the CR this poll
-				// stopped at), logged rather than counted as a failure, so an
-				// unreachable listener holding its dial open does not freeze the
-				// CRs behind it without a word. A cancelled parent is a shutdown
-				// or a leader change, and the next leader polls afresh.
+				// first is worth a line, and only it steps the cursor: the CRs
+				// left this interval are read first next interval, logged rather
+				// than counted as a failure, so an unreachable listener holding
+				// its dial open does not freeze the CRs behind it without a word.
+				// A cancelled parent is a shutdown or a leader change, and the
+				// next leader polls afresh, so it touches neither.
 				if parent.Err() == nil {
 					log.Info("usage counters poll did not finish within its budget; the remaining CRs are read first next interval", "budget", budget.String())
+					// off == 0 means the cut landed on the first CR this poll
+					// read, so no CR finished. Leaving the cursor where it is
+					// resumes here again next interval, and a CR that exhausts the
+					// whole budget by itself would then freeze every CR behind it
+					// for good. Step the cursor past it and mark it swept so the
+					// next interval makes progress on the rest and the sweep still
+					// completes; this CR is retried once the cursor wraps back to
+					// it. A cut after at least one CR finished leaves the cursor on
+					// the last that did, so the cut CR is read first next interval
+					// -- the bounded progress the stable order buys.
+					if off == 0 {
+						p.cursor = usagePollKey(agent)
+						p.sweptKeys[usagePollKey(agent)] = true
+					}
 				}
 				break
 			}
@@ -244,8 +261,9 @@ func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 		}
 		// The CR was processed -- polled, or a per-CR error that is not a cut.
 		// Advance the cursor past it so the next poll resumes after it, and mark
-		// it swept. A cut breaks above without reaching here, leaving the cursor
-		// on the CR it stopped at so that one is retried first next interval.
+		// it swept. A cut breaks above without reaching here; it leaves the
+		// cursor on the last CR that finished, except the no-progress cut handled
+		// above, which steps past the CR that stopped the poll.
 		p.cursor = usagePollKey(agent)
 		p.sweptKeys[usagePollKey(agent)] = true
 	}

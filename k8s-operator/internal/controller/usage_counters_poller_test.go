@@ -782,20 +782,27 @@ drain:
 // answers cannot freeze the poll, and the CRs behind it, past the interval. The
 // poll returns when its context deadline fires, and the abandonment is quiet: it
 // records no failure streak for the pod it abandoned, writes no ConfigMap, and --
-// because it did not reach every CR -- prunes no streak it never got to, so a
-// streak standing behind the hung listener survives to be read next interval.
-// Without the deadline the blocking scrape never returns and the 10s guard below
-// fails the test.
+// because it was cut on the first CR's hung listener before it reached the second
+// -- completes no sweep and so prunes no streak, leaving one that stands behind
+// the unreached CR to be read next interval. Without the deadline the blocking
+// scrape never returns and the 10s guard below fails the test.
 func TestUsagePoller_APollIsBoundedByItsBudget(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
-	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	a := usageTestAgent(created) // usage-test/agent sorts first; its gateway hangs
+	b := usageTestAgent(created)
+	b.Name, b.UID = "agent-zzz", "agent-uid-2" // usage-test/agent-zzz sorts last, unreached this poll
+	bGateway := usageGatewayPod("agent-zzz-gateway-aaa", "gw-b", usageTestGatewayB, created)
+	bGateway.Labels = map[string]string{"app": "agent-zzz-gateway"}
+	h := newUsageHarness(t, a, append(usageDefaultObjects(created), b, bGateway)...)
 	const budget = 50 * time.Millisecond
 	h.p.pollBudget = func() time.Duration { return budget }
 	h.stub.block(gatewayAddr())
 	h.stub.set(brokerAddr(), 10, nil)
-	// A streak the budget-cut poll must leave alone: its UID is in no CR this
-	// poll lists, so a poll that reached every CR would prune it, but a poll cut
-	// short must not -- it never got to the CRs behind the hung listener.
+	// A streak the budget-cut poll must leave alone: its UID is in no CR this poll
+	// reaches, so a poll that swept every CR would prune it. This poll is cut on
+	// A's hung listener before it reaches B, so the sweep does not complete and
+	// nothing is pruned -- stepping the cursor past the budget-eater marks A swept,
+	// but B is still outstanding.
 	const behindUID = types.UID("behind-the-hung-listener")
 	h.p.streaks[behindUID] = &usageScrapeStreak{count: 1}
 
@@ -1361,6 +1368,72 @@ func TestUsagePoller_ABudgetCutResumesAtTheCutCRNextPoll(t *testing.T) {
 	}
 	if len(h.p.sweptKeys) != 0 {
 		t.Errorf("after a poll that reached every CR, the sweep did not reset: %v", h.p.sweptKeys)
+	}
+}
+
+// A failure streak built on a CR swept early in a sweep survives the sweep
+// completing on a later poll that does not revisit that CR. The streaks are
+// pruned once a sweep -- a full pass, which a standing budget cut spreads over
+// several polls -- has reached every CR, on the pods it saw across the whole
+// sweep (sweepSeen), not the pods of the one poll that happened to complete it.
+// Pruning on that last poll's partial view would reset an early CR's streak
+// every sweep, so a standing scrape failure there would never cross the Warning
+// threshold. Two CRs, A sorting first with a failing listener and Z last with a
+// hung one: poll 1 sweeps A (streak 1) and is cut on Z; poll 2 resumes at Z, is
+// cut on it at the head of the poll, and steps the cursor past the budget-eater
+// -- completing the sweep without revisiting A; poll 3 wraps back to A, whose
+// streak must still stand to reach the threshold on this second failure.
+func TestUsagePoller_AStreakSurvivesASweepThatCompletesWithoutRevisitingTheCR(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	a := usageTestAgent(created) // usage-test/agent sorts first
+	z := usageTestAgent(created)
+	z.Name, z.UID = "agent-zzz", "agent-uid-2" // usage-test/agent-zzz sorts last
+	zGateway := usageGatewayPod("agent-zzz-gateway-aaa", "gw-z", usageTestGatewayB, created)
+	zGateway.Labels = map[string]string{"app": "agent-zzz-gateway"}
+	h := newUsageHarness(t, a, append(usageDefaultObjects(created), z, zGateway)...)
+	const budget = 50 * time.Millisecond
+	h.p.pollBudget = func() time.Duration { return budget }
+
+	// A's gateway fails fast every poll, so its pod builds a streak, while A's
+	// broker answers so A finishes and is swept. Z's gateway hangs, so every poll
+	// that reaches Z is cut there.
+	zAddr := usageTestGatewayB + ":9095"
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.block(zAddr)
+
+	// Every poll is cut on Z's hang, so guard against a budget that does not
+	// bound them.
+	done := make(chan struct{})
+	go func() {
+		h.poll(5)  // sweeps A (streak 1), cut on Z
+		h.poll(10) // resumes at Z, cut at the head, completes the sweep past Z
+		h.poll(15) // wraps to A: its second failure, streak 2, one Warning
+		close(done)
+	}()
+	const guard = 10 * time.Second
+	select {
+	case <-done:
+	case <-time.After(guard):
+		t.Fatalf("three budget-cut polls did not return within %s; the budget does not bound them", guard)
+	}
+
+	var events []string
+drain:
+	for {
+		select {
+		case ev := <-h.recorder.Events:
+			events = append(events, ev)
+		default:
+			break drain
+		}
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d Warning(s), want exactly 1 once A's streak crosses the threshold on its second failure; "+
+			"a streak pruned on the sweep-completing poll's partial view never crosses it: %q", len(events), events)
+	}
+	if !strings.Contains(events[0], "agent-gateway-aaa") || !strings.Contains(events[0], usageScrapeFailingReason) {
+		t.Errorf("the Warning is not A's scrape-failing event: %q", events[0])
 	}
 }
 
