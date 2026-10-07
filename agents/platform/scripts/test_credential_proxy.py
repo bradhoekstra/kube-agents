@@ -8440,7 +8440,7 @@ class TwoForgeInstallTest(unittest.TestCase):
         handler.rfile = io.BytesIO(encoded)
         calls = []
         handler.executor = types.SimpleNamespace(
-            refresh_forge_credential=lambda provider, repository: calls.append((provider, repository))
+            refresh_forge_credential=lambda provider, repository, caller=None: calls.append((provider, repository))
         )
         replies = []
         handler._json = lambda status, payload: replies.append((status, payload))
@@ -8459,7 +8459,7 @@ class TwoForgeInstallTest(unittest.TestCase):
         handler.rfile = io.BytesIO(encoded)
         calls = []
         handler.executor = types.SimpleNamespace(
-            refresh_forge_credential=lambda provider, repository: calls.append((provider, repository))
+            refresh_forge_credential=lambda provider, repository, caller=None: calls.append((provider, repository))
         )
         replies = []
         handler._json = lambda status, payload: replies.append((status, payload))
