@@ -206,6 +206,10 @@ type usageHarness struct {
 	// cmUpdateErr, when set, is what the Update interceptor returns for a
 	// ConfigMap write, standing in for an API server that rejects it.
 	cmUpdateErr error
+	// cmCreateErr, when set, is what the Create interceptor returns for a
+	// ConfigMap write, standing in for an API server that refuses it -- a
+	// count/configmaps quota at its cap, or an admission policy that denies it.
+	cmCreateErr error
 	// pruning makes the fake behave like a served CRD without status.usage:
 	// the echo of a status patch comes back with the field empty.
 	pruning bool
@@ -226,6 +230,9 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 		Create: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
 			if _, ok := obj.(*corev1.ConfigMap); ok {
 				h.cmWrites++
+				if h.cmCreateErr != nil {
+					return h.cmCreateErr
+				}
 			}
 			return c.Create(ctx, obj, opts...)
 		},
@@ -1167,6 +1174,39 @@ func TestUsagePoller_AnImmutableConfigMapRecordsAWarning(t *testing.T) {
 
 	if status := h.status(); status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
 		t.Fatalf("status.usage advanced despite the rejected write: %+v", status)
+	}
+}
+
+// A ConfigMap Create the namespace refuses for a standing reason other than
+// immutability -- a count/configmaps quota at its cap, an admission policy that
+// denies it -- records a Warning on the CR naming the ConfigMap and leaves the
+// status untouched, rather than freezing status.usage with only a log line.
+func TestUsagePoller_AWriteRefusedByAQuotaRecordsAWarning(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+
+	// No document exists yet, so the first poll would Create the ConfigMap; the
+	// namespace's count/configmaps quota is at its cap and the API server refuses
+	// it with Forbidden on this poll and every later one.
+	cmName := usageTestAgentName + usageCountersConfigMapSuffix
+	h.cmCreateErr = apierrors.NewForbidden(schema.GroupResource{Resource: "configmaps"}, cmName, errors.New("exceeded quota: count/configmaps"))
+
+	h.poll(5) // Would create the ConfigMap; the create is refused.
+
+	select {
+	case ev := <-h.recorder.Events:
+		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapWriteRefusedReason) ||
+			!strings.Contains(ev, cmName) || !strings.Contains(ev, "refused") {
+			t.Fatalf("event %q, want a Warning naming the refused ConfigMap %s", ev, cmName)
+		}
+	default:
+		t.Fatal("no Warning event was recorded for the refused ConfigMap write")
+	}
+
+	if status := h.status(); status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("status.usage advanced despite the refused write: %+v", status)
 	}
 }
 

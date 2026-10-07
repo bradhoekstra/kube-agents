@@ -68,6 +68,12 @@ const (
 	// usageConfigMapForeignReason is the Warning event's reason when a ConfigMap
 	// under the counters name is not the operator's and is left untouched.
 	usageConfigMapForeignReason = "UsageConfigMapForeign"
+	// usageConfigMapWriteRefusedReason is the Warning event's reason when the API
+	// server refuses the counters ConfigMap write for a standing cause that is
+	// not immutability -- a count/configmaps quota at its cap, or an admission
+	// policy that denies it -- so the cause sits on the CR rather than only in a
+	// log line that recurs every poll.
+	usageConfigMapWriteRefusedReason = "UsageConfigMapWriteRefused"
 	// usageOwnerKindPlatformAgent is the owner-reference Kind that names a
 	// PlatformAgent, so a counters ConfigMap the operator owns is recognised by
 	// owner when its instance label is absent.
@@ -628,6 +634,24 @@ type usageConfigMapFault struct {
 	message string
 }
 
+// usageWriteRefused classifies a ConfigMap Create or Update error the API server
+// will return on every poll until an operator or a human clears it -- a
+// count/configmaps quota at its cap or an admission policy that denies the write
+// (both IsForbidden), or a validation rejection a Create meets (IsInvalid) -- as
+// a standing fault, so the caller surfaces the cause on the CR where the design
+// promises rather than leaving status.usage frozen with only a log line. A
+// transient class (conflict, timeout, server error) returns nil and is left to
+// the retry the next poll is.
+func usageWriteRefused(err error, name string) *usageConfigMapFault {
+	if !apierrors.IsForbidden(err) && !apierrors.IsInvalid(err) {
+		return nil
+	}
+	return &usageConfigMapFault{
+		reason:  usageConfigMapWriteRefusedReason,
+		message: fmt.Sprintf("the usage counters ConfigMap %s was refused (%s): status.usage will not advance until the namespace accepts the write", name, apierrors.ReasonForError(err)),
+	}
+}
+
 // writeDocument writes doc to the CR's ConfigMap, creating it with a
 // non-controller owner reference to the CR: collected with the CR, but not
 // re-enqueueing it, since the controller Owns ConfigMaps with no predicate and
@@ -646,9 +670,10 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 		if !usageConfigMapIsOurs(existing, agent) {
 			// Someone else parked a ConfigMap under our name. Taking it over
 			// would stamp our labels and an owner reference onto an object we
-			// do not own, which the finalizer would then delete; a CR deleted
-			// and re-applied under the same name is still ours by name, so that
-			// case is unaffected. Leave it, and return the cause so the caller
+			// do not own, coupling its lifecycle to the CR -- Kubernetes
+			// garbage-collects it once the CR it now references is gone; a CR
+			// deleted and re-applied under the same name is still ours by name,
+			// so that case is unaffected. Leave it, and return the cause so the caller
 			// surfaces why status.usage is frozen where the design promises --
 			// kubectl describe on the CR -- in the CR's one Warning this poll.
 			return &usageConfigMapFault{
@@ -666,7 +691,7 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 	cm.Data = map[string]string{usageCountersDocumentKey: string(raw)}
 	if existing == nil {
 		if err := p.r.Create(ctx, cm); err != nil {
-			return nil, fmt.Errorf("creating the usage counters ConfigMap: %w", err)
+			return usageWriteRefused(err, cm.Name), fmt.Errorf("creating the usage counters ConfigMap: %w", err)
 		}
 		return nil, nil
 	}
@@ -681,6 +706,9 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 					message: fmt.Sprintf("the usage counters ConfigMap %s is immutable: status.usage will not advance until it is deleted so the operator can recreate it", cm.Name),
 				},
 				fmt.Errorf("updating the usage counters ConfigMap: %w", err)
+		}
+		if fault := usageWriteRefused(err, cm.Name); fault != nil {
+			return fault, fmt.Errorf("updating the usage counters ConfigMap: %w", err)
 		}
 		return nil, fmt.Errorf("updating the usage counters ConfigMap: %w", err)
 	}
