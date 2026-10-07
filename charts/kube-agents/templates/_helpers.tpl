@@ -1215,6 +1215,67 @@ without it installs with `--set quotaPreflight.enabled=false`. Nothing here can 
 a Go template cannot catch the error `lookup` raises.
 */}}
 {{/*
+The checks on platformAgent.deployment.credentialProxy.resources that need no parsed value:
+the keys under resources, the shape of limits and requests, each resource name, and each
+quantity's sign, grammar and range. Takes the resources map and renders nothing; a value
+that fails one fails the render naming its key. Both readers of the value call it first,
+the CR template (templates/platform-agent-cr.yaml) and kube-agents.credentialProxyFootprint
+for the quota preflight, because Helm renders quota-preflight.yaml before the CR template:
+without it the preflight's parseBytes refused `-1Gi` or `2GB` with a "cannot parse ...
+please report it" message before the CR template could name the key. The checks that
+compare parsed values (zero limit, floor, crossed pair) stay in the CR template, after
+these have passed.
+*/}}
+{{- define "kube-agents.credentialProxyResourcesCheck" -}}
+{{- $proxyResources := . | default dict -}}
+{{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" -}}
+{{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha -}}
+{{- if $proxyUnknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) -}}
+{{- end -}}
+{{- if index $proxyResources "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) -}}
+{{- end -}}
+{{- $proxyNames := list "cpu" "memory" "ephemeral-storage" -}}
+{{- /* The CRD's quantity grammar, the sign already stripped, with the
+       exponent narrowed to the integer form resource.ParseQuantity reads.
+       parseCpuMillis and parseBytes read every form this admits. */ -}}
+{{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- range $side := list "limits" "requests" -}}
+{{- $quantities := index $proxyResources $side -}}
+{{- /* `--set ...limits=2Gi` hands range a string, which it cannot walk, and a list
+       gives it integer names; either is a shape the CRD refuses. */ -}}
+{{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 2Gi}`" $proxyPrefix $side $quantities) -}}
+{{- end -}}
+{{- range $name, $quantity := $quantities | default dict -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- if not (has $name $proxyNames) -}}
+{{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) -}}
+{{- end -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
+{{- if eq $name "cpu" -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" $proxyPrefix $side $name $raw) -}}
+{{- else -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 The credential proxy's footprint entry with platformAgent.deployment.credentialProxy.resources
 merged over it, per key, as resolveCredentialProxyResources does in the operator
 (k8s-operator/internal/controller/credential_proxy_manifests.go): a key the override
@@ -1234,6 +1295,7 @@ returns the entry's six numbers and pod count as JSON.
 {{- define "kube-agents.credentialProxyFootprint" -}}
 {{- $workload := .workload | default dict -}}
 {{- $override := .override | default dict -}}
+{{- include "kube-agents.credentialProxyResourcesCheck" $override -}}
 {{- $req := (index $override "requests") | default dict -}}
 {{- $lim := (index $override "limits") | default dict -}}
 {{- $cpuReq := $workload.cpuMillisRequest | default 0 | int64 -}}

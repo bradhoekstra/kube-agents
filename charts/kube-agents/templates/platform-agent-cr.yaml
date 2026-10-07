@@ -176,34 +176,6 @@ spec:
       {{- end }}
     {{- end }}
     {{- /*
-      Rendered only when a key is set. An empty block would write
-      `credentialProxy: {resources: {}}` onto every CR, which an API server
-      serving a CRD from before the field prunes silently and a reader mistakes
-      for an override. The operator merges what is here over its defaults per
-      key, so a block carrying only limits.memory is complete as written.
-
-      Each quantity is quoted rather than passed through toYaml, for the reason
-      env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
-      the CRD types a quantity as int-or-string, so the API server refuses the
-      bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
-      null (`memory: null`, Helm's way to drop a key) or the empty string, which
-      the CRD's quantity pattern refuses. A map holding nothing else writes no
-      block either.
-    */}}
-    {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
-    {{- $proxyQuantities := dict }}
-    {{- range $side := list "limits" "requests" }}
-      {{- $set := dict }}
-      {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
-        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
-          {{- $_ := set $set $name $quantity }}
-        {{- end }}
-      {{- end }}
-      {{- if $set }}
-        {{- $_ := set $proxyQuantities $side $set }}
-      {{- end }}
-    {{- end }}
-    {{- /*
       Checked here, on the operator's defaults with the override merged over
       them, for the reason the shell sandbox's guard above gives: an override
       the operator refuses would install cleanly and sit Degraded, the proxy at
@@ -222,21 +194,40 @@ spec:
       kube-agents.credentialProxyMemoryFloorBytes. A quantity outside the
       CRD's grammar, or inside it in a form resource.ParseQuantity does not read
       (a fractional exponent), fails the render naming the key: dropping it
-      would skip the checks above while the CRD admitted it.
+      would skip the checks above while the CRD admitted it. The checks that
+      read no parsed value live in kube-agents.credentialProxyResourcesCheck,
+      which the quota preflight calls too; the rest follow here.
     */}}
     {{- $proxyPrefix := "platformAgent.deployment.credentialProxy.resources" }}
-    {{- $proxyUnknown := keys (omit $proxyResources "limits" "requests" "claims") | sortAlpha }}
-    {{- if $proxyUnknown }}
-    {{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $proxyPrefix (join ", " $proxyUnknown)) }}
+    {{- $proxyResources := ((.Values.platformAgent.deployment.credentialProxy | default dict).resources) | default dict }}
+    {{- include "kube-agents.credentialProxyResourcesCheck" $proxyResources }}
+    {{- /*
+      Rendered only when a key is set. An empty block would write
+      `credentialProxy: {resources: {}}` onto every CR, which an API server
+      serving a CRD from before the field prunes silently and a reader mistakes
+      for an override. The operator merges what is here over its defaults per
+      key, so a block carrying only limits.memory is complete as written.
+
+      Each quantity is quoted rather than passed through toYaml, for the reason
+      env[].value is above: a values file's `cpu: 1.5` arrives as a float, and
+      the CRD types a quantity as int-or-string, so the API server refuses the
+      bare number. An unset leaf is skipped by kube-agents.compactFields' rule:
+      null (`memory: null`, Helm's way to drop a key) or the empty string, which
+      the CRD's quantity pattern refuses. A map holding nothing else writes no
+      block either.
+    */}}
+    {{- $proxyQuantities := dict }}
+    {{- range $side := list "limits" "requests" }}
+      {{- $set := dict }}
+      {{- range $name, $quantity := (index $proxyResources $side) | default dict }}
+        {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
+          {{- $_ := set $set $name $quantity }}
+        {{- end }}
+      {{- end }}
+      {{- if $set }}
+        {{- $_ := set $proxyQuantities $side $set }}
+      {{- end }}
     {{- end }}
-    {{- if index $proxyResources "claims" }}
-    {{- fail (printf "%s.claims is not supported -- the credential-proxy pod declares no resourceClaims, so the operator refuses the key. Remove it." $proxyPrefix) }}
-    {{- end }}
-    {{- $proxyNames := list "cpu" "memory" "ephemeral-storage" }}
-    {{- /* The CRD's quantity grammar, the sign already stripped, with the
-           exponent narrowed to the integer form resource.ParseQuantity reads.
-           parseCpuMillis and parseBytes read every form this admits. */}}
-    {{- $proxyQuantityPattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" }}
     {{- $proxyDefaults := include "kube-agents.credentialProxyDefaults" . | fromJson }}
     {{- $proxyFloor := include "kube-agents.credentialProxyMemoryFloorBytes" . | int64 }}
     {{- $proxyMerged := dict "requests" (dict) "limits" (dict) }}
@@ -249,25 +240,6 @@ spec:
     {{- range $side, $set := $proxyQuantities }}
       {{- range $name, $quantity := $set }}
         {{- $raw := toString $quantity | trim }}
-        {{- if not (has $name $proxyNames) }}
-        {{- fail (printf "%s.%s.%s: the credential-proxy container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $proxyPrefix $side $name) }}
-        {{- end }}
-        {{- if hasPrefix "-" $raw }}
-        {{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $proxyPrefix $side $name $raw) }}
-        {{- end }}
-        {{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) }}
-        {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) }}
-        {{- end }}
-        {{- if include "kube-agents.quantityOverflowsFloat64" $raw }}
-        {{- if eq $name "cpu" }}
-        {{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" $proxyPrefix $side $name $raw) }}
-        {{- else }}
-        {{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) }}
-        {{- end }}
-        {{- end }}
-        {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) }}
-        {{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) }}
-        {{- end }}
         {{- $_ := set (index $proxyMerged $side) $name $raw }}
         {{- $_ := set (index $proxyRendered $side) $name $raw }}
       {{- end }}

@@ -174,6 +174,13 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertIn(f"{_VALUE_PATH} carries limit", err)
         self.assertIn("the accepted keys are requests, limits and claims", err)
 
+    def test_a_scalar_or_list_side_fails_naming_the_key(self):
+        # range cannot walk a string, and a list hands it integer names.
+        err = self._render_error([f"{_VALUE_PATH}.limits=2Gi"])
+        self.assertIn(f"{_VALUE_PATH}.limits is 2Gi, which is not a map of resource name to quantity", err)
+        err = self._render_error(values=_proxy_values({"requests": ["2Gi"]}))
+        self.assertIn(f"{_VALUE_PATH}.requests is [2Gi], which is not a map of resource name to quantity", err)
+
     def test_claims_fail(self):
         err = self._render_error([f"{_VALUE_PATH}.claims[0].name=gpu"])
         self.assertIn(f"{_VALUE_PATH}.claims is not supported", err)

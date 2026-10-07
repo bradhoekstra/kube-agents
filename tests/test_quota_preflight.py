@@ -300,6 +300,27 @@ class PreflightDecisionTest(unittest.TestCase):
         nulled = self._requirements([f"{_PROXY_VALUE}.limits.memory=null"])
         self.assertEqual(nulled, base)
 
+    def test_credential_proxy_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # Helm renders quota-preflight.yaml before the CR template, so the preflight's own
+        # read of the override is the first to see it. The CR template is removed from this
+        # copy, so the message can only come from kube-agents.credentialProxyFootprint.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(self.chart, chart)
+            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            original, self.chart = self.chart, chart
+            try:
+                for value in ("-1Gi", "abc", "2GB"):
+                    res = self._render({"probe": {"emitRequirements": True}},
+                                       [f"{_PROXY_VALUE}.limits.memory={value}"])
+                    self.assertNotEqual(res.returncode, 0, res.stdout)
+                    self.assertIn(f"{_PROXY_VALUE}.limits.memory is", res.stderr)
+                    self.assertNotIn("cannot parse quantity", res.stderr)
+                res = self._render({"probe": {"emitRequirements": True}}, [f"{_PROXY_VALUE}.limits=2Gi"])
+                self.assertIn(f"{_PROXY_VALUE}.limits is 2Gi, which is not a map", res.stderr)
+            finally:
+                self.chart = original
+
     def test_disabling_the_dashboard_drops_it_from_the_total(self) -> None:
         """The flag is harness.hermes.dashboardEnabled, one level deeper than harness.
 
