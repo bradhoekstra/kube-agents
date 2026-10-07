@@ -138,7 +138,7 @@ class CheckLiteralFromTest(unittest.TestCase):
         for text, line in (
             (f"FROM busybox:{_PIN}\nRUN rm -rf /bin\nCOPY files/ /\n", "RUN rm -rf /bin"),
             (f"FROM busybox:{_PIN}\nCOPY <<EOF /x\nFROM busybox:{_OTHER_PIN}\nEOF\n", "EOF"),
-            (f"# escape=`\nFROM --platform=linux/amd64 `\n  busybox:{_PIN}\n", f"  busybox:{_PIN}"),
+            (f"# a note, not a directive\nFROM --platform=linux/amd64 `\n  busybox:{_PIN}\n", f"  busybox:{_PIN}"),
         ):
             with self.subTest(text=text):
                 result = _run_check(text)
@@ -160,10 +160,27 @@ class CheckLiteralFromTest(unittest.TestCase):
                 self.assertIn(f"line '{line}' gives COPY a flag", result.stderr)
                 self.assertNotIn("FROM pins", result.stderr)
 
+    def test_parser_directives_fail_closed_naming_the_line(self):
+        # `# syntax=` names a frontend image BuildKit pulls and runs, unpinned;
+        # the fence refuses any `# word=` directive by name before it drops
+        # comments, so the line cannot vanish as one.
+        for text, line in (
+            (f"# syntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY files/ /\n", "# syntax=docker/dockerfile:1"),
+            (f"#escape=`\nFROM busybox:{_PIN}\n", "#escape=`"),
+        ):
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"line '{line}' is a parser directive", result.stderr)
+                self.assertNotIn("FROM pins", result.stderr)
+
     def test_non_ascii_bytes_fail_closed(self):
         # Docker strips a BOM and trims Unicode space before reading a
         # keyword; the fence does not try to, and refuses the file by reason,
         # so a second stage behind a non-breaking space cannot pass as drift.
+        # Comment lines are dropped first, so a comment may hold any text.
+        ok = _run_check(f"# Pinned by digest \u2014 see images.json \u2026\nFROM busybox:{_PIN}\nCOPY files/ /\n")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
         for text in (
             f"\ufeffFROM busybox:{_PIN}\nCOPY files/ /\n",
             f"FROM busybox:{_PIN} AS base\n\u00a0FROM busybox:{_OTHER_PIN}\nCOPY files/ /\n",

@@ -170,10 +170,13 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # rather than an ARG pair, so the ARG check above never reaches them. This
 # fence does not parse Dockerfiles. A plugin Dockerfile is one FROM and COPY
 # lines by design (agentplugins/lib/plugin_image.sh), and that is the whole
-# rule enforced, in this order, each failing closed with the reason: the file
-# is printable ASCII (no BOM, no non-breaking space -- Docker trims Unicode
-# space and this check does not try to); comment lines and blank lines are
-# dropped; no remaining line ends in a backslash (a continuation, or an
+# rule enforced, in this order, each failing closed with the reason: no
+# parser directive (`# syntax=` names a frontend image BuildKit pulls and runs,
+# unpinned and unmirrored; `# escape=` is moot under the no-backslash rule
+# below); comment lines and blank lines are dropped; what remains is printable
+# ASCII (no BOM, no non-breaking space -- Docker trims Unicode space before
+# reading a keyword and this check does not try to; a comment may say what it
+# likes); no remaining line ends in a backslash (a continuation, or an
 # escaped one); every remaining line begins, after ASCII blanks, with FROM or
 # COPY in any case (so a RUN, a heredoc body or a backtick continuation is
 # refused by name); no COPY carries a `--flag` (`--from=` names a second image
@@ -184,11 +187,16 @@ check_literal_from() {
   local name=$1 dockerfile=$2
   local want got body continued other froms
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  if LC_ALL=C grep -q '[^[:print:][:space:]]' "$dockerfile"; then
-    fail "$dockerfile: holds a byte outside printable ASCII (a BOM or a non-breaking space, say); the plugin pin fence reads plain ASCII only, so save the file as such."
+  other="$(sed -n '/^[[:blank:]]*#[[:blank:]]*[A-Za-z][A-Za-z]*[[:blank:]]*=/p' "$dockerfile" | head -n1)"
+  if [ -n "$other" ]; then
+    fail "$dockerfile: line '$other' is a parser directive; the plugin pin fence allows none, because a syntax= frontend is a second image that nothing pins or mirrors (agentplugins/lib/plugin_image.sh)."
     return
   fi
   body="$(tr -d '\r' <"$dockerfile" | sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d')"
+  if printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
+    fail "$dockerfile: an instruction line holds a byte outside printable ASCII (a BOM or a non-breaking space, say); the plugin pin fence reads plain ASCII instructions only, so save the file as such."
+    return
+  fi
   continued="$(printf '%s\n' "$body" | sed -n '/\\[[:blank:]]*$/p' | wc -l | tr -d ' ')"
   if [ "$continued" != 0 ]; then
     fail "$dockerfile: a line ends in a backslash; the plugin pin fence reads single-line instructions only, so put the whole FROM on one line and keep the file to FROM and COPY (agentplugins/lib/plugin_image.sh)."
