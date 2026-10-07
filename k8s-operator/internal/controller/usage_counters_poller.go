@@ -68,12 +68,12 @@ const (
 	// usageConfigMapForeignReason is the Warning event's reason when a ConfigMap
 	// under the counters name is not the operator's and is left untouched.
 	usageConfigMapForeignReason = "UsageConfigMapForeign"
-	// usageConfigMapWriteRefusedReason is the Warning event's reason when the API
+	// usageConfigMapRefusedReason is the Warning event's reason when the API
 	// server refuses the counters ConfigMap write for a standing cause that is
 	// not immutability -- a count/configmaps quota at its cap, or an admission
 	// policy that denies it -- so the cause sits on the CR rather than only in a
 	// log line that recurs every poll.
-	usageConfigMapWriteRefusedReason = "UsageConfigMapWriteRefused"
+	usageConfigMapRefusedReason = "UsageConfigMapWriteRefused"
 	// usageOwnerKindPlatformAgent is the owner-reference Kind that names a
 	// PlatformAgent, so a counters ConfigMap the operator owns is recognised by
 	// owner when its instance label is absent.
@@ -647,7 +647,7 @@ func usageWriteRefused(err error, name string) *usageConfigMapFault {
 		return nil
 	}
 	return &usageConfigMapFault{
-		reason:  usageConfigMapWriteRefusedReason,
+		reason:  usageConfigMapRefusedReason,
 		message: fmt.Sprintf("the usage counters ConfigMap %s was refused (%s): status.usage will not advance until the namespace accepts the write", name, apierrors.ReasonForError(err)),
 	}
 }

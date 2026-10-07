@@ -1197,7 +1197,7 @@ func TestUsagePoller_AWriteRefusedByAQuotaRecordsAWarning(t *testing.T) {
 
 	select {
 	case ev := <-h.recorder.Events:
-		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapWriteRefusedReason) ||
+		if !strings.Contains(ev, "Warning") || !strings.Contains(ev, usageConfigMapRefusedReason) ||
 			!strings.Contains(ev, cmName) || !strings.Contains(ev, "refused") {
 			t.Fatalf("event %q, want a Warning naming the refused ConfigMap %s", ev, cmName)
 		}
