@@ -4418,7 +4418,8 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_a_slot_less_reservation_joins_the_same_queue(self):
         # The forge refresh route reserves without a slot (§2.1); it waits in
-        # arrival order behind slot takers and is released with the block.
+        # arrival order behind slot takers, except past those that only the
+        # full slot cap holds, and is released with the block.
         executor = self.budgeted(admits=1)
         self.hold_a_slot(executor, seconds=1)
         started = time.monotonic()

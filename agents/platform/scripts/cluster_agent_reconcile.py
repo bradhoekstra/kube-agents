@@ -157,10 +157,9 @@ _api_disabled_this_run: set[str] = set()
 # bootstrap gate runs this script under its own ceiling (bootstrap_scan_gate.py: the listing
 # and prune budgets for the declared cap and the profiles on the volume, plus its settle
 # time; 390s at the default cap with few profiles) and kills it on expiry
-# with nothing written. At LIST_TIMEOUT_SECONDS (120s) each, four hanging projects in one
-# wave spend 120s of the 300s listing budget; the gate's ceiling is overrun only when hangs
-# chain across waves (three in sequence, 360s, plus settle time). Creates still run in the
-# fixed order.
+# with nothing written. The listing budget caps the phase at LIST_BUDGET_SECONDS whatever
+# hangs, with the rest recorded unlisted, and the gate's 390s ceiling leaves the prune and
+# settle time after it. Creates still run in the fixed order.
 # Every lookup is a gcloud process the credential proxy runs, and the proxy admits four
 # requests at once under its child memory budget at the operator's default limit
 # (docs/designs/credential-proxy-child-memory-budget.md §2.2): credential_proxy.py's

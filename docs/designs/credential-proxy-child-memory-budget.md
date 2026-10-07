@@ -382,8 +382,9 @@ two caps' existing checks. Goldens under `k8s-operator/internal/testing/testdata
 the new env entry; `make chart-check` confirms the footprint is unchanged.
 
 Live, on the 143-cluster install (#2324's): build the agent and operator images from the branch,
-deploy, and observe three Controller Stall Watch ticks. Expected: the broker log shows budget
-waits during each listing phase (the second wave), every listing completes (no `CREDENTIAL_PROXY_BUSY` in the
+deploy, and observe three Controller Stall Watch ticks. Expected: at four wide a listing phase alone
+produces no second wave, so the broker log shows budget waits only when the hourly reconcile and a
+stall-watch tick coincide or long execs hold the budget; every listing completes (no `CREDENTIAL_PROXY_BUSY` in the
 stall-watch output), the container's cgroup `memory.peak` stays under the limit, the container
 does not restart, and the tick's wall time is within a minute of what it was before the change.
 

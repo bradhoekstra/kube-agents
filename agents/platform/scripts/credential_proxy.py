@@ -6190,8 +6190,10 @@ class CommandExecutor:
         request's, held by the route from admission until the response is
         written (`request_slot`), so every command a request runs -- the
         kubeconfig cache-fill made under `_kubeconfig_lock` included -- is
-        covered by the one its request holds, and no lock is ever held while
-        waiting for admission. While the budget is on, a thread that holds no
+        covered by the one its request holds, and no lock is held while waiting
+        for admission. The one exception is the refresh route, which holds
+        `_refresh_lock` across its budget wait and yields it to a vcs verb that
+        needs a refresh (`refresh_forge_credential`). While the budget is on, a thread that holds no
         reservation and is not the store's takes a transient one for the
         child's lifetime.
         """
