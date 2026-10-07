@@ -475,16 +475,15 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 		"broken":                       "parse ",
 		"partial":                      "cluster_identity is incomplete",
 		"cluster-p1-new-us-central1":   ErrNoClusterIdentity.Error(),
-		"cluster-p1-newer-us-central1": "config.yaml is absent",
+		"cluster-p1-newer-us-central1": ErrNoProfileConfig.Error(),
 		"cluster-p1-gone-us-central1":  "symlink cannot be followed",
-		"scratch":                      "config.yaml is absent",
 	} {
 		if !strings.Contains(skipped[profile], want) {
 			t.Errorf("skipped[%s] = %q, want it reported with %q", profile, skipped[profile], want)
 		}
 	}
-	if len(skipped) != 6 {
-		t.Errorf("skipped = %v, want exactly six reports: the platform profile, the broken default profile, the dot-directory and the plain file are silent", skipped)
+	if len(skipped) != 5 {
+		t.Errorf("skipped = %v, want exactly five reports: the platform profile, the broken default profile, the dot-directory, the plain file and the empty unprefixed directory are silent", skipped)
 	}
 	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod", "prod-c=p1/asia-east1/prod"}
 	names := make([]string, 0, len(got))

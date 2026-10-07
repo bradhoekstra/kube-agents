@@ -505,6 +505,34 @@ func TestInjectHoldsAnOutOfScopeRecord(t *testing.T) {
 // against, and it still goes out as it always has. The thin card is the
 // detector staying loud about a cluster it was meant to reach, which is better
 // than a Ready pod that injects nothing.
+// The order of the hold and the seen set, both ways. A record injected while
+// its cluster was inside the scope and redelivered after the scope dropped it
+// is a duplicate, not a hold: a card for that id was sent. And a held record is
+// not remembered, so the same id arriving later inside the scope is injected
+// rather than read as a duplicate of a card that never existed.
+func TestInjectOrdersTheHoldBetweenTheSeenCheckAndTheSeenMark(t *testing.T) {
+	daemon, url := newFakeDaemon(t)
+	handler := handlerAgainst(t, url)
+
+	handler.Handle(context.Background(), driftEvent("insert-1")) // in scope: sent
+	redelivered := driftEvent("insert-1")
+	redelivered.OutOfScope = true
+	handler.Handle(context.Background(), redelivered)
+
+	held := driftEvent("insert-2")
+	held.OutOfScope = true
+	handler.Handle(context.Background(), held)
+	handler.Handle(context.Background(), driftEvent("insert-2")) // now in scope: sent
+
+	sessions, injects := daemon.counts()
+	if sessions != 2 || injects != 2 {
+		t.Errorf("sessions=%d injects=%d, want 2 and 2: insert-1 once, insert-2 once", sessions, injects)
+	}
+	if got := handler.Counts(); got.Injected != 2 || got.Duplicate != 1 || got.OutOfScope != 1 {
+		t.Errorf("counts = %+v, want injected=2 duplicate=1 out_of_scope=1", got)
+	}
+}
+
 func TestInjectStillSendsAnUnreachableRecordTheJoinDidNotMark(t *testing.T) {
 	daemon, url := newFakeDaemon(t)
 	handler := handlerAgainst(t, url)

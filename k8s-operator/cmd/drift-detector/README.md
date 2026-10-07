@@ -82,10 +82,11 @@ block — keeps that identity for as long as its directory exists, and the keep 
 per streak: the scaffold stamps the identity last and in place, so a read landing mid-write must not
 hold a cluster that was onboarded a second earlier. A profile that has never named a cluster here
 leaves its cluster held as outside the scope, with a line naming the profile and why it reads as
-nothing — a symlink that leads nowhere, a config absent, unreadable, unparsable or incomplete, or a
-`cluster-` directory whose config carries no identity block; silent are only the reserved `platform`
-and `default` profiles and a config with no block under a name without the prefix, the one shape the
-read cannot tell from a non-cluster profile. The scope is re-read from the directory at most once a minute, when an `unreachable`
+nothing — a symlink that leads nowhere, a config unreadable, unparsable or incomplete, or a
+`cluster-` directory whose config is absent or carries no identity block; silent are only the
+reserved `platform` and `default` profiles and a directory without the prefix that has no config or
+a config with no block, the shapes the read cannot tell from a non-cluster profile or a directory
+that was never one. The scope is re-read from the directory at most once a minute, when an `unreachable`
 record arrives, and never addresses a cluster. Startup logs which mode the hold is in — the
 directory and how many cluster profiles it names, none yet (a fresh install holds every record off
 the joined clusters until the first reconcile tick), or unknown — because nothing later says so but

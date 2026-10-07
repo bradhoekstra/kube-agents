@@ -59,11 +59,15 @@ const (
 // so ReadIdentities says nothing about them whatever state they are in.
 var reservedProfiles = map[string]bool{"default": true, "platform": true}
 
-// ErrNoClusterIdentity is the reason ReadIdentities reports for a cluster-
-// prefixed profile whose config reads cleanly and carries no cluster_identity
-// block, and the reason a caller supplies for the one drop it does not report:
-// the same config under a name without the prefix.
-var ErrNoClusterIdentity = errors.New(profileConfigFile + " carries no cluster_identity")
+// ErrNoClusterIdentity and ErrNoProfileConfig are the reasons ReadIdentities
+// reports for a cluster- prefixed profile whose config reads cleanly and
+// carries no cluster_identity block, or is absent -- and the reasons a caller
+// supplies for the two drops it does not report: the same two shapes under a
+// name without the prefix.
+var (
+	ErrNoClusterIdentity = errors.New(profileConfigFile + " carries no cluster_identity")
+	ErrNoProfileConfig   = errors.New(profileConfigFile + " is absent")
+)
 
 // ProfileIdentity is one cluster profile's directory name with the identity
 // its config carries, as ReadIdentities lists them.
@@ -163,14 +167,15 @@ func (d Discoverer) skip(profile string, err error) {
 // Reported to onSkip (nil to ignore), with the directory name and why, is
 // every entry dropped for a reason that could be a cluster profile naming
 // nothing on this read: a symlink that does not lead to a directory, a config
-// that cannot be read or parsed, a config that is absent, a cluster_identity
-// that is present but incomplete, and a cluster- prefixed profile whose config
-// carries no block at all (the scaffold writes the identity last, so a read
-// landing before that sees exactly this). Silent are hidden entries, plain
-// files, the reserved profiles (default and platform, never a cluster's), and a
-// profile without the prefix whose config reads cleanly and carries no block --
-// the one shape the read cannot tell from a non-cluster profile, which a caller
-// that saw it name a cluster keeps on its own record. A listing that failed on
+// that cannot be read or parsed, a cluster_identity that is present but
+// incomplete, and a cluster- prefixed profile whose config is absent or carries
+// no block at all (the scaffold writes the identity last, so a read landing
+// before that sees exactly this). Silent are hidden entries, plain files, the
+// reserved profiles (default and platform, never a cluster's), and a directory
+// without the prefix that has no config or a config with no block -- the two
+// shapes the read cannot tell from a non-cluster profile or a directory that
+// was never a profile (the old plugin-mount layout left one per plugin on the
+// volume), which a caller that saw it name a cluster keeps on its own record. A listing that failed on
 // any of these would make one broken profile hide the whole fleet, but a
 // profile dropped here is a cluster the caller will treat as unnamed, and the
 // caller has to be able to say so. Only a directory that cannot be read at all
@@ -212,8 +217,11 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 			skip(name, err)
 			continue
 		}
+		clusterProfile := strings.HasPrefix(name, clusterProfilePrefix)
 		if cfg == nil {
-			skip(name, fmt.Errorf("%s is absent", profileConfigFile))
+			if clusterProfile {
+				skip(name, ErrNoProfileConfig)
+			}
 			continue
 		}
 		id := cfg.ClusterIdentity
@@ -222,7 +230,7 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 			ids = append(ids, ProfileIdentity{Profile: name, Identity: id})
 		case id != (Identity{}):
 			skip(name, fmt.Errorf("cluster_identity is incomplete: %q", id.String()))
-		case strings.HasPrefix(name, clusterProfilePrefix):
+		case clusterProfile:
 			skip(name, ErrNoClusterIdentity)
 		}
 	}

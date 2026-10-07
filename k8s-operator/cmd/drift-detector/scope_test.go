@@ -272,7 +272,7 @@ func TestProfileScopeIsSilentAboutABrokenNonClusterProfile(t *testing.T) {
 	now := time.Now()
 	s := testProfileScope(dir, &now)
 	s.Profiled(prodG)
-	if strings.Contains(logs.String(), "platform") {
+	if strings.Contains(logs.String(), "profile platform ") {
 		t.Errorf("log mentions the platform profile, which names no cluster and holds nothing:\n%s", logs.String())
 	}
 
@@ -286,7 +286,7 @@ func TestProfileScopeIsSilentAboutABrokenNonClusterProfile(t *testing.T) {
 	if !strings.Contains(logs.String(), "profile prod-g names no cluster on this read (parse ") {
 		t.Errorf("log lacks the kept line with the parse error as its reason:\n%s", logs.String())
 	}
-	if strings.Contains(logs.String(), "platform") {
+	if strings.Contains(logs.String(), "profile platform ") {
 		t.Errorf("log mentions the platform profile:\n%s", logs.String())
 	}
 }

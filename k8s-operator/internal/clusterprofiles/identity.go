@@ -44,6 +44,11 @@ import (
 // this package and the Python side that writes the profiles.
 const profileConfigFile = "config.yaml"
 
+// ProfileConfigFile is profileConfigFile for a caller that needs to look at
+// the file itself, as the drift detector's scope does to word a drop the
+// listing does not report.
+const ProfileConfigFile = profileConfigFile
+
 // Identity is the cluster_identity block the Platform Agent writes into each
 // Cluster Agent profile's config.yaml. sigs.k8s.io/yaml converts YAML to JSON,
 // hence the json tags.

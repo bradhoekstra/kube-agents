@@ -173,8 +173,9 @@ func (s *profileScope) rescan() {
 	skipped := map[string]struct{}{}
 	// The keep is keyed on the directory, not on the read having reported the
 	// drop: a profile this scope saw complete is a cluster profile whatever
-	// its name, and a config stripped of its whole block under a name without
-	// the cluster- prefix is the one drop ReadIdentities does not report.
+	// its name, and a config removed or stripped of its whole block under a
+	// name without the cluster- prefix are the drops ReadIdentities does not
+	// report.
 	for profile, kept := range s.byProfile {
 		if _, complete := byProfile[profile]; complete {
 			continue
@@ -185,7 +186,7 @@ func (s *profileScope) rescan() {
 		byProfile[profile] = kept
 		skipped[profile] = struct{}{}
 		if _, logged := s.skipped[profile]; !logged {
-			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, dropReason(dropped[profile]), kept)
+			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, s.dropReason(profile, dropped[profile]), kept)
 		}
 	}
 	for profile, reason := range dropped {
@@ -210,11 +211,15 @@ func (s *profileScope) rescan() {
 }
 
 // dropReason is the reason ReadIdentities gave for a profile it dropped, or
-// the one case it reports nothing for: a config that reads cleanly and carries
-// no cluster_identity block under a name without the cluster- prefix.
-func dropReason(reported error) error {
+// for the drops it does not report under a name without the cluster- prefix
+// -- a config that is absent, or reads cleanly with no cluster_identity block
+// -- which of the two, told apart by a stat.
+func (s *profileScope) dropReason(profile string, reported error) error {
 	if reported != nil {
 		return reported
+	}
+	if _, err := os.Stat(filepath.Join(s.dir, profile, clusterprofiles.ProfileConfigFile)); errors.Is(err, os.ErrNotExist) {
+		return clusterprofiles.ErrNoProfileConfig
 	}
 	return clusterprofiles.ErrNoClusterIdentity
 }
