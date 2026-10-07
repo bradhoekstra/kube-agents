@@ -217,12 +217,11 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=4Gi", f"{_VALUE_PATH}.limits.memory=2Gi"])
         self.assertIn(f"{_VALUE_PATH}.requests.memory (4Gi) exceeds limits.memory (2Gi)", err)
 
-    def test_a_crossed_pair_is_compared_to_within_float64_rounding(self):
+    def test_a_crossed_pair_is_compared_exactly(self):
         # The operator compares exact quantities; parseCpuMillis and parseBytes truncate
-        # or ceil, which would admit these or (499.5m) compare them the wrong way. The
-        # chart's float64 comparison allows a relative 5e-16 for rounding, which the
-        # 15-digit cap keeps below the gap between any two distinct values: the last
-        # case is 15 digits, one unit apart.
+        # or ceil, which would admit these or (499.5m) compare them the wrong way.
+        # quantityExact scales in Sprig's decimal arithmetic, so a strict comparison
+        # separates two 15-digit values one unit apart (the second case).
         cases = (
             ([f"{_VALUE_PATH}.requests.cpu=1.0004"], "requests.cpu (1.0004) exceeds the operator's default limits.cpu (1)"),
             ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
@@ -238,8 +237,9 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
             self.assertIn(f"{_VALUE_PATH}.{want}", err, sets)
 
     def test_an_equal_pair_scaled_differently_renders(self):
-        # 1.005 cores scales to 1004.9999999999999 millicores and 1005m reads as 1005;
-        # 1.005G and 1005M likewise. The operator and the API server admit both pairs.
+        # A regression pin on Sprig's decimal mulf and divf: in float64 arithmetic
+        # 1.005 × 1000 is 1004.9999999999999, which a strict comparison would refuse
+        # against 1005m; 1.005G against 1005M likewise. The operator admits both pairs.
         cases = (
             {"requests": {"cpu": "1005m"}, "limits": {"cpu": "1.005"}},
             {"requests": {"memory": "1005M"}, "limits": {"memory": "1.005G"}},

@@ -185,14 +185,13 @@ spec:
       key the CRD does not declare, which the API server would prune silently
       (`limit:` for `limits:`), claims, a resource name the container does not
       declare, a negative quantity, a zero limit, a memory limit under the
-      floor, and a request above its limit. The zero check is exact; the floor
-      and crossed-pair checks compare float64 values (kube-agents.quantityExact)
-      within kube-agents.quantityCompareTolerance, which absorbs the rounding of
-      reading and scaling a decimal (1005m against 1.005). That matches the
-      operator's exact resource.Quantity comparison for every value the chart
-      admits on one decimal grid: a quantity with more than 15 significant
-      digits is refused before these run, which keeps distinct values farther
-      apart than the tolerance. The
+      floor, and a request above its limit. The zero, floor and crossed-pair
+      checks compare float64 figures strictly (kube-agents.quantityExact), which
+      Sprig scales in decimal arithmetic, so 1005m equals 1.005. That matches
+      the operator's Quantity.Cmp for every decimal value the chart admits: a
+      quantity with more than 15 significant digits is refused before these
+      run. The residues, a binary-suffixed value within float64 rounding of a
+      decimal one and digits below a nano-unit, are in quantityExact's comment. The
       defaults and the floor are kube-agents.credentialProxyDefaults and
       kube-agents.credentialProxyMemoryFloorBytes. A quantity outside the
       CRD's grammar, or inside it in a form resource.ParseQuantity does not read
@@ -262,13 +261,12 @@ spec:
            integers above: parseCpuMillis and parseBytes round (a milli-byte limit
            half a byte under the floor rounds up onto it), and the operator
            compares the quantities themselves. */}}
-    {{- $proxyTolerance := include "kube-agents.quantityCompareTolerance" . | float64 }}
     {{- range $name, $rawLimit := $proxyMerged.limits }}
       {{- if eq (include "kube-agents.quantityExact" (dict "raw" $rawLimit "cpu" (eq $name "cpu") "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64) 0.0 }}
       {{- fail (printf "%s.limits.%s is %s; a limit of zero leaves the container none, and the operator refuses it. Omit the key to keep the default (%s)" $proxyPrefix $name $rawLimit (index $proxyDefaults.limits $name)) }}
       {{- end }}
     {{- end }}
-    {{- if and (hasKey $proxyMerged.limits "memory") (lt (include "kube-agents.quantityExact" (dict "raw" $proxyMerged.limits.memory "cpu" false "key" (printf "%s.limits.memory" $proxyPrefix)) | float64) (mulf (float64 $proxyFloor) (subf 1.0 $proxyTolerance))) }}
+    {{- if and (hasKey $proxyMerged.limits "memory") (lt (include "kube-agents.quantityExact" (dict "raw" $proxyMerged.limits.memory "cpu" false "key" (printf "%s.limits.memory" $proxyPrefix)) | float64) (float64 $proxyFloor)) }}
     {{- fail (printf "%s.limits.memory is %s, under the %dMi floor at which the credential proxy's child memory budget admits two commands at once; below it the broker turns the budget off, and the operator refuses it. Set at least %dMi" $proxyPrefix $proxyMerged.limits.memory (div $proxyFloor 1048576) (div $proxyFloor 1048576)) }}
     {{- end }}
     {{- range $name, $rawRequest := $proxyMerged.requests }}
@@ -276,7 +274,7 @@ spec:
       {{- $isCpu := eq $name "cpu" }}
       {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
       {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
-      {{- if gt $request (mulf $limit (addf 1.0 $proxyTolerance)) }}
+      {{- if gt $request $limit }}
       {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
       {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
       {{- $req := index $proxyMerged.requests $name }}
