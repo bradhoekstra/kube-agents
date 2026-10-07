@@ -961,6 +961,37 @@ honest — a quota that large cannot constrain this release either way.
 {{- if ge (float64 $v) 9223372036854775808.0 -}}true{{- end -}}
 {{- end }}
 
+{{- /* A quantity's value as a float64, in millicores when "cpu" is true and bytes otherwise,
+       with no rounding of its own: parseCpuMillis and parseBytes truncate a bare or
+       suffixed value and ceil an m, u or n one, which suits the quota sums and would let
+       the credential-proxy crossed-pair check disagree with the operator's exact
+       resource.Quantity comparison (1.0004 against 1 would compare equal). float64 holds
+       every integer under 2^53 exactly, and every real override's value in these units is
+       one; past that, or for a fraction that float64 cannot write, two values a few parts in
+       10^16 apart can still compare equal. Takes (dict "raw" <quantity> "cpu" <bool>);
+       call it after the quantity has passed the CRD's grammar. */ -}}
+{{- define "kube-agents.quantityExact" -}}
+{{- $raw := include "kube-agents.normalizeQuantity" .raw -}}
+{{- $scale := ternary 1000.0 1.0 (eq .cpu true) -}}
+{{- $scaled := dict "Ki" 1024.0 "Mi" 1048576.0 "Gi" 1073741824.0 "Ti" 1099511627776.0 "Pi" 1125899906842624.0 "Ei" 1152921504606846976.0 "k" 1000.0 "M" 1000000.0 "G" 1000000000.0 "T" 1000000000000.0 "P" 1000000000000000.0 "E" 1000000000000000000.0 -}}
+{{- $divided := dict "m" 1000.0 "u" 1000000.0 "n" 1000000000.0 -}}
+{{- $v := "" -}}
+{{- range $unit, $mult := $scaled -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = mulf (float64 (trimSuffix $unit $raw)) $mult $scale -}}
+{{- end -}}
+{{- end -}}
+{{- range $unit, $div := $divided -}}
+{{- if and (kindIs "string" $v) (hasSuffix $unit $raw) -}}
+{{- $v = divf (mulf (float64 (trimSuffix $unit $raw)) $scale) $div -}}
+{{- end -}}
+{{- end -}}
+{{- if kindIs "string" $v -}}
+{{- $v = mulf (float64 $raw) $scale -}}
+{{- end -}}
+{{- $v | toJson -}}
+{{- end }}
+
 {{/*
 Count quotas (`pods`, `persistentvolumeclaims`) go through the same parser.
 

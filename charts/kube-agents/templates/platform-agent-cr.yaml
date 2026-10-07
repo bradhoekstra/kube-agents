@@ -213,7 +213,11 @@ spec:
       key the CRD does not declare, which the API server would prune silently
       (`limit:` for `limits:`), claims, a resource name the container does not
       declare, a negative quantity, a zero limit, a memory limit under the
-      floor, and a request above its limit. The defaults and the floor are
+      floor, and a request above its limit. The request and its limit are
+      compared as float64 values with no rounding (kube-agents.quantityExact),
+      which matches the operator's exact resource.Quantity comparison for every
+      value float64 holds exactly: every integer count of millicores or bytes
+      under 2^53, which covers every real override. The defaults and the floor are
       kube-agents.credentialProxyDefaults and
       kube-agents.credentialProxyMemoryFloorBytes. A quantity outside the
       CRD's grammar, or inside it in a form resource.ParseQuantity does not read
@@ -280,9 +284,14 @@ spec:
     {{- if and (hasKey $proxyParsed.limits "memory") (lt $proxyParsed.limits.memory $proxyFloor) }}
     {{- fail (printf "%s.limits.memory is %s, under the %dMi floor at which the credential proxy's child memory budget admits two commands at once; below it the broker turns the budget off, and the operator refuses it. Set at least %dMi" $proxyPrefix $proxyMerged.limits.memory (div $proxyFloor 1048576) (div $proxyFloor 1048576)) }}
     {{- end }}
-    {{- range $name, $request := $proxyParsed.requests }}
-      {{- $limit := index $proxyParsed.limits $name }}
-      {{- if and (hasKey $proxyParsed.limits $name) (gt $request $limit) }}
+    {{- /* Compared exactly, not on the integers above: parseCpuMillis and parseBytes
+           round, and the operator compares the quantities themselves. */}}
+    {{- range $name, $rawRequest := $proxyMerged.requests }}
+      {{- if hasKey $proxyMerged.limits $name }}
+      {{- $isCpu := eq $name "cpu" }}
+      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu) | float64 }}
+      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu) | float64 }}
+      {{- if gt $request $limit }}
       {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
       {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
       {{- $req := index $proxyMerged.requests $name }}
@@ -293,6 +302,7 @@ spec:
       {{- fail (printf "%s.requests.%s (%s) exceeds the operator's default limits.%s (%s), which the override does not raise; set limits.%s as well" $proxyPrefix $name $req $name $lim $name) }}
       {{- else }}
       {{- fail (printf "%s.limits.%s (%s) is below the operator's default requests.%s (%s), which the override does not lower; set requests.%s as well" $proxyPrefix $name $lim $name $req $name) }}
+      {{- end }}
       {{- end }}
       {{- end }}
     {{- end }}

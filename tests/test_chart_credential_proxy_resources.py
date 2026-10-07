@@ -199,6 +199,28 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=4Gi", f"{_VALUE_PATH}.limits.memory=2Gi"])
         self.assertIn(f"{_VALUE_PATH}.requests.memory (4Gi) exceeds limits.memory (2Gi)", err)
 
+    def test_a_crossed_pair_is_compared_without_rounding(self):
+        # The operator compares exact quantities; parseCpuMillis and parseBytes truncate
+        # or ceil, which would admit these or (499.5m) compare them the wrong way.
+        cases = (
+            ([f"{_VALUE_PATH}.requests.cpu=1.0004"], "requests.cpu (1.0004) exceeds the operator's default limits.cpu (1)"),
+            ([f"{_VALUE_PATH}.requests.memory=1073741824.5"],
+             "requests.memory (1073741824.5) exceeds the operator's default limits.memory (1Gi)"),
+            ([f"{_VALUE_PATH}.limits.cpu=499.5m"], "limits.cpu (499.5m) is below the operator's default requests.cpu (500m)"),
+            ([f"{_VALUE_PATH}.requests.cpu=1999u", f"{_VALUE_PATH}.limits.cpu=1001u"],
+             "requests.cpu (1999u) exceeds limits.cpu (1001u)"),
+        )
+        for sets, want in cases:
+            err = self._render_error(sets)
+            self.assertIn(f"{_VALUE_PATH}.{want}", err, sets)
+
+    def test_a_request_equal_to_the_default_limit_renders(self):
+        for value in ("1", "1000m"):
+            cr = self._render_cr([f"{_VALUE_PATH}.requests.cpu={value}"])
+            self.assertEqual(_cr_resources(cr), {"requests": {"cpu": value}})
+        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=1Gi"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "1Gi"}})
+
     def test_an_ephemeral_storage_request_above_the_default_limit_fails(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.ephemeral-storage=3Gi"])
         self.assertIn("limits.ephemeral-storage (2Gi)", err)
