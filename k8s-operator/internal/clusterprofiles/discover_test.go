@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -457,26 +456,35 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Symlink(filepath.Join(linked, "vanished"), filepath.Join(dir, "cluster-p1-gone-us-central1")); err != nil {
+		t.Fatal(err)
+	}
+	writeProfile(t, dir, "default", "model: [")
+	if err := os.MkdirAll(filepath.Join(dir, "scratch"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 
 	skipped := map[string]string{}
-	got, err := ReadIdentities(dir, func(profile string, clusterProfile bool, err error) {
-		skipped[profile] = fmt.Sprintf("cluster=%t %v", clusterProfile, err)
+	got, err := ReadIdentities(dir, func(profile string, err error) {
+		skipped[profile] = err.Error()
 	})
 	if err != nil {
 		t.Fatalf("ReadIdentities: %v", err)
 	}
 	for profile, want := range map[string]string{
-		"broken":                       "cluster=false parse ",
-		"partial":                      "cluster=true cluster_identity is incomplete",
-		"cluster-p1-new-us-central1":   "cluster=true config.yaml carries no cluster_identity",
-		"cluster-p1-newer-us-central1": "cluster=true config.yaml is absent",
+		"broken":                       "parse ",
+		"partial":                      "cluster_identity is incomplete",
+		"cluster-p1-new-us-central1":   ErrNoClusterIdentity.Error(),
+		"cluster-p1-newer-us-central1": "config.yaml is absent",
+		"cluster-p1-gone-us-central1":  "symlink cannot be followed",
+		"scratch":                      "config.yaml is absent",
 	} {
-		if !strings.HasPrefix(skipped[profile], want) {
-			t.Errorf("skipped[%s] = %q, want it reported as %q…", profile, skipped[profile], want)
+		if !strings.Contains(skipped[profile], want) {
+			t.Errorf("skipped[%s] = %q, want it reported with %q", profile, skipped[profile], want)
 		}
 	}
-	if len(skipped) != 4 {
-		t.Errorf("skipped = %v, want exactly four reports: the platform profile and the dot-directory are silent, and the unparsable unprefixed one is reported as not a cluster profile so the caller can decide", skipped)
+	if len(skipped) != 6 {
+		t.Errorf("skipped = %v, want exactly six reports: the platform profile, the broken default profile, the dot-directory and the plain file are silent", skipped)
 	}
 	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod", "prod-c=p1/asia-east1/prod"}
 	names := make([]string, 0, len(got))

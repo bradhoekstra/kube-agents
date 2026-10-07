@@ -70,7 +70,8 @@ type scopeIndex interface {
 // interval. The identity is dropped only with the directory, which is how the
 // reconcile offboards a cluster. A profile the read drops that has never named
 // a cluster here is logged by name once per streak too, as held, so the hold
-// line is not the only statement in the log.
+// line is not the only statement in the log; the reserved platform and default
+// profiles are the read's to keep quiet about, whatever state they are in.
 //
 // Safe for concurrent use. The joiner that asks it is single-threaded today,
 // but the lock costs nothing and the rescan writes state, so the type does not
@@ -152,17 +153,9 @@ func (s *profileScope) Profiled(identity clusterIdentity) (bool, bool) {
 // rescan replaces the profiled set from the directory. Caller holds mu.
 func (s *profileScope) rescan() {
 	s.scannedAt = s.now()
-	unparsable := map[string]error{}
 	dropped := map[string]error{}
-	ids, err := clusterprofiles.ReadIdentities(s.dir, func(profile string, clusterProfile bool, err error) {
-		// A non-cluster profile that will not parse -- the platform profile
-		// with a bad edit -- is nobody's held cluster, unless this scope saw
-		// it name one, which the keep below decides from its own record.
-		if clusterProfile {
-			dropped[profile] = err
-		} else {
-			unparsable[profile] = err
-		}
+	ids, err := clusterprofiles.ReadIdentities(s.dir, func(profile string, err error) {
+		dropped[profile] = err
 	})
 	if err != nil {
 		s.readable = false
@@ -180,8 +173,8 @@ func (s *profileScope) rescan() {
 	skipped := map[string]struct{}{}
 	// The keep is keyed on the directory, not on the read having reported the
 	// drop: a profile this scope saw complete is a cluster profile whatever
-	// its name, and a config stripped of its whole block is the one drop
-	// ReadIdentities cannot tell from a profile that was never a cluster's.
+	// its name, and a config stripped of its whole block under a name without
+	// the cluster- prefix is the one drop ReadIdentities does not report.
 	for profile, kept := range s.byProfile {
 		if _, complete := byProfile[profile]; complete {
 			continue
@@ -192,7 +185,7 @@ func (s *profileScope) rescan() {
 		byProfile[profile] = kept
 		skipped[profile] = struct{}{}
 		if _, logged := s.skipped[profile]; !logged {
-			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, dropReason(dropped[profile], unparsable[profile]), kept)
+			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, dropReason(dropped[profile]), kept)
 		}
 	}
 	for profile, reason := range dropped {
@@ -216,16 +209,12 @@ func (s *profileScope) rescan() {
 	s.profiled = set
 }
 
-// dropReason is the reason ReadIdentities gave for a profile it dropped, as a
-// cluster profile or not, or the one case it reports nothing for: a config that
-// reads cleanly and carries no cluster_identity block under a name without the
-// cluster- prefix.
-func dropReason(reported, unparsable error) error {
+// dropReason is the reason ReadIdentities gave for a profile it dropped, or
+// the one case it reports nothing for: a config that reads cleanly and carries
+// no cluster_identity block under a name without the cluster- prefix.
+func dropReason(reported error) error {
 	if reported != nil {
 		return reported
 	}
-	if unparsable != nil {
-		return unparsable
-	}
-	return errors.New("config.yaml carries no cluster_identity")
+	return clusterprofiles.ErrNoClusterIdentity
 }
