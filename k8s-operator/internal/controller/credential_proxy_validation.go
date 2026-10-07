@@ -261,7 +261,9 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 // the override's own keys: each of cpu and memory it set under limits without
 // the same key under requests is either raised past the operator's default
 // limit, which takes no effect on Autopilot without bursting, or lowered under
-// it, where Autopilot puts the request in its place.
+// it, where Autopilot puts the request in its place. A limit equal to the
+// default is neither, and is not named; with none named, the clause is the
+// generic one.
 func credentialProxyLimitsBandAdvice(override *corev1.ResourceRequirements) string {
 	defaults := resolveCredentialProxyResources(nil)
 	var raised, lowered []corev1.ResourceName
@@ -270,9 +272,12 @@ func credentialProxyLimitsBandAdvice(override *corev1.ResourceRequirements) stri
 		if _, hasRequest := override.Requests[name]; !hasLimit || hasRequest {
 			continue
 		}
-		if limit.Cmp(defaults.Limits[name]) < 0 {
+		// A limit equal to the default is one the override did not move, so
+		// the advice does not name it.
+		switch limit.Cmp(defaults.Limits[name]) {
+		case -1:
 			lowered = append(lowered, name)
-		} else {
+		case 1:
 			raised = append(raised, name)
 		}
 	}

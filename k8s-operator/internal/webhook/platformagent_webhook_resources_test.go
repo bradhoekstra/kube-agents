@@ -246,6 +246,36 @@ func TestCredentialProxyLimitsBandWarningNamesBothRequestsWhenBothLimitsAreRaise
 	}
 }
 
+// A CPU limit equal to the operator's default is one the override did not
+// move: only the memory limit it raised is named.
+func TestCredentialProxyLimitsBandWarningDoesNotNameALimitEqualToTheDefault(t *testing.T) {
+	warning := limitsBandWarning(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1"), corev1.ResourceMemory: resource.MustParse("8Gi")},
+	})
+	if !strings.Contains(warning, "limits.memory has no effect there (raise requests.memory instead)") {
+		t.Errorf("warning %q does not name requests.memory", warning)
+	}
+	if strings.Contains(warning, "limits.cpu") || strings.Contains(warning, "requests.cpu") {
+		t.Errorf("warning %q names cpu, whose limit equals the default", warning)
+	}
+}
+
+// A CPU limit alone, equal to the default, draws no advice naming cpu.
+func TestCredentialProxyLimitAtTheDefaultDrawsNoCPUAdvice(t *testing.T) {
+	val := &PlatformAgentCustomValidator{}
+	warnings, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")},
+	}))
+	if err != nil {
+		t.Fatalf("a limit at the default must be admitted: %v", err)
+	}
+	for _, w := range warnings {
+		if strings.Contains(w, "limits.cpu") || strings.Contains(w, "requests.cpu") {
+			t.Errorf("warning %q names cpu, whose limit equals the default", w)
+		}
+	}
+}
+
 // A lowered limit is not one to raise a request for: without bursting the
 // request replaces it.
 func TestCredentialProxyLimitsBandWarningSaysALoweredLimitFollowsTheRequest(t *testing.T) {
