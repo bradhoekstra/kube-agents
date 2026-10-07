@@ -166,16 +166,17 @@ func (d Discoverer) skip(profile string, err error) {
 //
 // Reported to onSkip (nil to ignore), with the directory name and why, is
 // every entry dropped for a reason that could be a cluster profile naming
-// nothing on this read: a symlink that does not lead to a directory, a config
-// that cannot be read or parsed, a cluster_identity that is present but
-// incomplete, and a cluster- prefixed profile whose config is absent or carries
-// no block at all (the scaffold writes the identity last, so a read landing
-// before that sees exactly this). Silent are hidden entries, plain files, the
-// reserved profiles (default and platform, never a cluster's), and a directory
-// without the prefix that has no config or a config with no block -- the two
-// shapes the read cannot tell from a non-cluster profile or a directory that
-// was never a profile (the old plugin-mount layout left one per plugin on the
-// volume), which a caller that saw it name a cluster keeps on its own record. A listing that failed on
+// nothing on this read: a config that cannot be read or parsed, a
+// cluster_identity that is present but incomplete, and a cluster- prefixed
+// entry whose config is absent or carries no block at all (the scaffold writes
+// the identity after the template copy, so a read landing between sees exactly
+// this) or which is a symlink leading nowhere. Silent are hidden entries, plain
+// files, the reserved profiles (default and platform, never a cluster's), and
+// an entry without the prefix that has no config, a config with no block, or
+// is a symlink leading nowhere -- the shapes the read cannot tell from a
+// non-cluster profile or an entry that was never a profile (the old
+// plugin-mount layout left one directory per plugin on the volume), which a
+// caller that saw it name a cluster keeps on its own record. A listing that failed on
 // any of these would make one broken profile hide the whole fleet, but a
 // profile dropped here is a cluster the caller will treat as unnamed, and the
 // caller has to be able to say so. Only a directory that cannot be read at all
@@ -196,19 +197,26 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 		if strings.HasPrefix(name, hiddenPrefix) || reservedProfiles[name] {
 			continue
 		}
+		clusterProfile := strings.HasPrefix(name, clusterProfilePrefix)
 		if !e.IsDir() {
 			// os.ReadDir types an entry from its own bits, so a profile
-			// reached through a link reports IsDir false; follow it.
+			// reached through a link reports IsDir false; follow it. A link
+			// that leads nowhere is reported under the prefix only, like the
+			// other shapes that could as well be no profile at all.
 			if e.Type()&os.ModeSymlink == 0 {
 				continue
 			}
 			info, err := os.Stat(filepath.Join(dir, name))
 			if err != nil {
-				skip(name, fmt.Errorf("symlink cannot be followed: %w", err))
+				if clusterProfile {
+					skip(name, fmt.Errorf("symlink cannot be followed: %w", err))
+				}
 				continue
 			}
 			if !info.IsDir() {
-				skip(name, errors.New("symlink does not lead to a directory"))
+				if clusterProfile {
+					skip(name, errors.New("symlink does not lead to a directory"))
+				}
 				continue
 			}
 		}
@@ -217,7 +225,6 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 			skip(name, err)
 			continue
 		}
-		clusterProfile := strings.HasPrefix(name, clusterProfilePrefix)
 		if cfg == nil {
 			if clusterProfile {
 				skip(name, ErrNoProfileConfig)

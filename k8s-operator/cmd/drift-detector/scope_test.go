@@ -284,7 +284,7 @@ func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testin
 	if profiled, known := s.Profiled(prodE); profiled || !known {
 		t.Errorf("Profiled(prod-e) = (%v, %v) for a cluster profile with no config yet, want (false, true)", profiled, known)
 	}
-	const heldLine = "profile cluster-p1-prod-e-us-central1 names no readable cluster for the install's scope (config.yaml is absent); records from its cluster are held"
+	const heldLine = "profile cluster-p1-prod-e-us-central1 names no readable cluster for the install's scope (config.yaml is absent); an unreachable record from its cluster is held"
 	if !strings.Contains(logs.String(), heldLine) {
 		t.Errorf("log lacks %q:\n%s", heldLine, logs.String())
 	}

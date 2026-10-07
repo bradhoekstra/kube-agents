@@ -208,7 +208,7 @@ func (s *profileScope) rescan() {
 		}
 		skipped[profile] = struct{}{}
 		if _, logged := s.skipped[profile]; !logged {
-			log.Printf("%s: profile %s names no readable cluster for the install's scope (%v); records from its cluster are held out of the inject as outside the scope until it does", commandName, profile, reason)
+			log.Printf("%s: profile %s names no readable cluster for the install's scope (%v); an unreachable record from its cluster is held out of the inject as outside the scope until it does", commandName, profile, reason)
 		}
 	}
 

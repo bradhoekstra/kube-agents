@@ -459,6 +459,9 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 	if err := os.Symlink(filepath.Join(linked, "vanished"), filepath.Join(dir, "cluster-p1-gone-us-central1")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Symlink(filepath.Join(linked, "vanished"), filepath.Join(dir, "notes")); err != nil {
+		t.Fatal(err)
+	}
 	writeProfile(t, dir, "default", "model: [")
 	if err := os.MkdirAll(filepath.Join(dir, "scratch"), 0o700); err != nil {
 		t.Fatal(err)
@@ -483,7 +486,7 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 		}
 	}
 	if len(skipped) != 5 {
-		t.Errorf("skipped = %v, want exactly five reports: the platform profile, the broken default profile, the dot-directory, the plain file and the empty unprefixed directory are silent", skipped)
+		t.Errorf("skipped = %v, want exactly five reports: the platform profile, the broken default profile, the dot-directory, the plain file, the empty unprefixed directory and the unprefixed dangling symlink are silent", skipped)
 	}
 	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod", "prod-c=p1/asia-east1/prod"}
 	names := make([]string, 0, len(got))

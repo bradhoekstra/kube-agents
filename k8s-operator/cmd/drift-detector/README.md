@@ -83,11 +83,11 @@ logged by name once per streak: the scaffold copies the template config in and s
 after it, in place, so a read landing between the two must not hold a cluster that was onboarded a
 second earlier. A profile that has never named a cluster here
 leaves its cluster held as outside the scope, with a line naming the profile and why it reads as
-nothing — a symlink that leads nowhere, a config unreadable, unparsable or incomplete, or a
-`cluster-` directory whose config is absent or carries no identity block; silent, besides hidden
-entries and plain files, are only the reserved `platform` and `default` profiles and a directory
-without the prefix that has no config or a config with no block, the shapes the read cannot tell
-from a non-cluster profile or a directory that was never one. The match is the exact triple: a profile naming the record's project and cluster
+nothing — a config unreadable, unparsable or incomplete, or a `cluster-` entry whose config is absent
+or carries no identity block or which is a symlink leading nowhere; silent, besides hidden entries
+and plain files, are only the reserved `platform` and `default` profiles and an entry without the
+prefix that has no config, a config with no block, or is a symlink leading nowhere, the shapes the
+read cannot tell from a non-cluster profile or an entry that was never one. The match is the exact triple: a profile naming the record's project and cluster
 under another location — a zone written for a regional cluster, which the scaffold admits and
 discovery then skips because the GKE API finds nothing there — names nothing a record carries, and
 that cluster's records are held until the profile is corrected; the startup skip line says so, and a
