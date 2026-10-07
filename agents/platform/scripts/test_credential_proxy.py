@@ -6306,11 +6306,21 @@ class ForgeRefreshRouteTest(unittest.TestCase):
                 "128 MiB reserved for children, 0 MiB of output allowance for 0 requests)"
             )
 
-        replies = self._post({"repository": "gke-agentic/infra"}, refresh_forge_credential=busy)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            replies = self._post({"repository": "gke-agentic/infra"}, refresh_forge_credential=busy)
         status, payload = replies[0]
         self.assertEqual(HTTPStatus.SERVICE_UNAVAILABLE, status)
         self.assertEqual("CREDENTIAL_PROXY_BUSY", payload["code"])
         self.assertIn("child memory budget", payload["error"])
+        # The log line carries the refusal, so it says what held the refresh.
+        self.assertTrue(
+            any(
+                "credential refresh queued too long: the credential proxy is at its child memory budget"
+                in line
+                for line in logs.output
+            ),
+            logs.output,
+        )
 
     def test_a_caller_that_hangs_up_while_queued_gets_no_response(self):
         why = "the caller disconnected while waiting for the refresh lock"

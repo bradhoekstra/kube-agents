@@ -203,6 +203,40 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             json.loads(request.data),
         )
 
+    def _refused(self, urlopen, body):
+        urlopen.side_effect = urllib.error.HTTPError(
+            "http://127.0.0.1:8765/v1/forge/refresh",
+            503,
+            "Service Unavailable",
+            email.message.Message(),
+            io.BytesIO(body),
+        )
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository")
+        return str(cm.exception)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_reports_the_brokers_refusal_text_after_the_code(self, urlopen, run):
+        why = "the credential proxy is at its child memory budget (512 MiB in use of 512 MiB)"
+        message = self._refused(
+            urlopen, json.dumps({"error": why, "code": "CREDENTIAL_PROXY_BUSY"}).encode()
+        )
+        self.assertEqual(
+            f"Credential sidecar failed to refresh GitHub auth: HTTP 503: {why}", message
+        )
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_reports_the_bare_code_for_a_body_that_is_not_json(self, urlopen, run):
+        message = self._refused(urlopen, b"<html>upstream connect error</html>")
+        self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
+
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_waits_out_the_brokers_admission_and_the_helper(self, urlopen, run):

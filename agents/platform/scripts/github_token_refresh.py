@@ -689,6 +689,22 @@ class RefreshToken(str):
         return obj
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    """`: <error>` from the broker's JSON refusal body, or nothing.
+
+    The broker's busy 503 says what held the request (the slot cap, the child
+    memory budget, another refresh); without it the cron log reads only the
+    code. A body that is empty, not JSON, or names no error adds nothing.
+    """
+    try:
+        raw = exc.read()
+        body = json.loads(raw) if raw else None
+    except (OSError, ValueError):
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    return f": {error}" if isinstance(error, str) and error else ""
+
+
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
@@ -748,6 +764,7 @@ def refresh_git_credentials(
         except urllib.error.HTTPError as exc:
             raise RuntimeError(
                 f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
+                f"{_http_error_detail(exc)}"
             ) from exc
         except Exception as exc:
             raise RuntimeError(

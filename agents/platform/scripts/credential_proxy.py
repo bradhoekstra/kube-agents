@@ -7571,7 +7571,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         except CommandSlotUnavailable as exc:
             self.metrics.record_tool(tool_label, subcommand_label, TOOL_STATUS_BUSY)
             LOGGER.warning(
-                "command queued too long request_id=%s", request_id,
+                "command queued too long request_id=%s: %s", request_id, exc,
                 extra=audit(AUDIT_STATUS_BUSY),
             )
             self._busy(exc)
@@ -8104,7 +8104,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # (§2.3): the same 503 the exec and vcs routes answer, rather than
             # the generic branch's 502 that would read as a failed mint. The
             # exception names which.
-            LOGGER.warning("%s credential refresh queued too long", forge.name)
+            LOGGER.warning("%s credential refresh queued too long: %s", forge.name, exc)
             self._busy(exc)
             return
         except PermissionError:
@@ -8259,7 +8259,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # and the body is drained before the answer, or a caller still
             # sending a large one would see the connection reset in place of
             # the 503.
-            LOGGER.warning("command queued too long verb=%s", verb)
+            LOGGER.warning("command queued too long verb=%s: %s", verb, exc)
             drain_request_body(self, body_limit)
             self._busy(exc)
             return
