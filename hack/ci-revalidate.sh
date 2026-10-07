@@ -440,13 +440,23 @@ revalidate_override_at_head() {
 import json
 import sys
 
+import re
+
 context, poster, prefix, cancel_prefix, comment_url = sys.argv[1:6]
 statuses = json.load(sys.stdin)
 
 
 def first_word(text):
     words = text.split()
-    return words[0] if words else "(unnamed)"
+    return words[0] if words else ""
+
+
+# The plugin writes "Overridden by <login>"; a GitHub login is letters,
+# digits and hyphens. A description with nothing or something else after
+# the prefix (the BaseSHA suffix alone, say) is not the plugin'"'"'s and is not
+# read as an override -- an unparsable record is a fall-through, never a
+# verdict.
+LOGIN = re.compile(r"[A-Za-z0-9-]+")
 
 
 # The plugin'"'"'s own events only: this context, posted by the Prow bot.
@@ -464,6 +474,8 @@ for status in events:
         continue
     if not (status.get("target_url") or "").startswith(comment_url):
         continue
+    if not LOGIN.fullmatch(first_word(description[len(prefix):])):
+        continue
     if override is None or (status.get("created_at") or "") > (override.get("created_at") or ""):
         override = status
 if override is None:
@@ -475,7 +487,7 @@ when = override.get("created_at") or ""
 for status in events:
     description = status.get("description") or ""
     if status.get("state") == "failure" and description.startswith(cancel_prefix) and (status.get("created_at") or "") > when:
-        print("cancelled", cancel_prefix, first_word(description[len(cancel_prefix):]))
+        print("cancelled", cancel_prefix, first_word(description[len(cancel_prefix):]) or "(unnamed)")
         sys.exit(0)
 print("overridden", first_word((override.get("description") or "")[len(prefix):]), when, override.get("target_url") or "")
 ' "${REVALIDATION_JOB_NAME}" "${REVALIDATION_STATUS_POSTER}" "${REVALIDATION_OVERRIDE_PREFIX}" "${REVALIDATION_OVERRIDE_CANCEL_PREFIX}" "${comment_url_prefix}" 2>/dev/null)" || found="unparsable"

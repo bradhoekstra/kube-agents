@@ -806,10 +806,11 @@ class RevalidationTest(unittest.TestCase):
         self.assertNotIn("holds a reusable verdict", proc.stdout)
 
     def test_a_prow_success_status_that_is_not_an_override_is_not_one(self):
-        """A crier success for a build GCS has no passed record of (the status
-        an override's ProwJob gets, or any stray success) is neither kind of
-        verdict: the override rule reads the description, and the green rule
-        still demands the record."""
+        """A Prow-bot success with an ordinary description (`Job succeeded.`)
+        naming a build GCS holds no record of is neither kind of verdict:
+        the override rule wants the plugin's description, and the green rule
+        never reaches an attestation for a build the history does not list
+        as passed."""
         self._plant_statuses(self.c3, [self._prow_event("success", "Job succeeded.", "2026-10-06T20:14:06Z", build="900")])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
@@ -863,11 +864,18 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
 
-    def test_an_override_description_without_a_user_does_not_crash_the_parse(self):
-        self._plant_statuses(self.c3, [self._override_event(description="Overridden by ")])
-        proc = self._run(cur_head=self.c3, cur_base=self.c5)
-        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
-        self.assertIn("/override by (unnamed)", proc.stdout)
+    def test_an_override_description_without_a_login_is_not_an_override(self):
+        """The plugin writes `Overridden by <login>`; a description with
+        nothing, or the BaseSHA suffix alone, after the prefix is not the
+        plugin's and is a fall-through, not a verdict with a placeholder."""
+        for description in ("Overridden by ", f"Overridden by                   BaseSHA:{self.c5}"):
+            with self.subTest(description=description):
+                (self.statuses / f"{self.c3}.json").unlink(missing_ok=True)
+                self._plant_statuses(self.c3, [self._override_event(description=description)])
+                proc = self._run(cur_head=self.c3, cur_base=self.c5)
+                self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+                self.assertNotIn("holds a reusable verdict", proc.stdout)
+                self.assertEqual([], list(self.artifacts.iterdir()))
 
     def test_a_network_error_on_the_status_read_is_noted_once_and_the_run_falls_through_once(self):
         """The attestation of the green at this head is the read that fails;
