@@ -258,6 +258,13 @@ spec:
         {{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) }}
         {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) }}
         {{- end }}
+        {{- if include "kube-agents.quantityOverflowsFloat64" $raw }}
+        {{- if eq $name "cpu" }}
+        {{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" $proxyPrefix $side $name $raw) }}
+        {{- else }}
+        {{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) }}
+        {{- end }}
+        {{- end }}
         {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) }}
         {{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) }}
         {{- end }}

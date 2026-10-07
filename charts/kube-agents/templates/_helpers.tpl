@@ -961,6 +961,40 @@ honest — a quota that large cannot constrain this release either way.
 {{- if ge (float64 $v) 9223372036854775808.0 -}}true{{- end -}}
 {{- end }}
 
+{{- /* "true" when a quantity's number is past float64's range. Sprig's float64 answers 0
+       for it rather than failing (strconv reports +Inf with ErrRange, and the cast drops
+       both), so `1e400` would read as zero and pass every check after it. The number
+       reads as 0 for one other reason, an underflow (1e-400), which is a real positive
+       quantity the operator rounds up rather than refuses; the two are told apart by the
+       number's order of magnitude: its integer digits, or minus the zeros leading its
+       fraction, plus its exponent. Call it after the quantity has passed the CRD's
+       grammar. */ -}}
+{{- define "kube-agents.quantityOverflowsFloat64" -}}
+{{- $num := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (include "kube-agents.normalizeQuantity" .) "" -}}
+{{- $mantissa := regexReplaceAll "[eE].*$" $num "" -}}
+{{- if and (regexMatch "[1-9]" $mantissa) (eq (float64 $num) 0.0) -}}
+{{- $intDigits := regexReplaceAll "^0+" (regexReplaceAll "\\..*$" $mantissa "") "" -}}
+{{- $magnitude := len $intDigits -}}
+{{- if eq $magnitude 0 -}}
+{{- $fraction := regexReplaceAll "^[^.]*\\.?" $mantissa "" -}}
+{{- $magnitude = sub (len (regexReplaceAll "^0+" $fraction "")) (len $fraction) -}}
+{{- end -}}
+{{- $exponent := regexReplaceAll "^[^eE]*[eE]?" $num "" -}}
+{{- $negative := hasPrefix "-" $exponent -}}
+{{- $digits := regexReplaceAll "^0+" (trimPrefix "+" (trimPrefix "-" $exponent)) "" -}}
+{{- /* An exponent past 18 digits does not fit the int64 below, and decides alone. */ -}}
+{{- if gt (len $digits) 18 -}}
+{{- if not $negative -}}true{{- end -}}
+{{- else -}}
+{{- $e := $digits | default "0" | int64 -}}
+{{- if $negative -}}
+{{- $e = sub 0 $e -}}
+{{- end -}}
+{{- if gt (add $magnitude $e) 0 -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- /* A quantity's value as a float64, in millicores when "cpu" is true and bytes otherwise,
        with no rounding of its own: parseCpuMillis and parseBytes truncate a bare or
        suffixed value and ceil an m, u or n one, which suits the quota sums and would let

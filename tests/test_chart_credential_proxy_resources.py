@@ -241,6 +241,12 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
             self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, which is not a representable byte count", err)
         err = self._render_error([f"{_VALUE_PATH}.limits.ephemeral-storage=8Ei"])
         self.assertIn(f"{_VALUE_PATH}.limits.ephemeral-storage is 8Ei, which is not a representable byte count", err)
+        # Past float64's range Sprig's float64 answers 0; read that way 1e400 would render,
+        # or draw the zero-limit refusal, while the operator refuses it as unrepresentable.
+        for key in ("requests.memory", "requests.cpu", "limits.memory"):
+            err = self._render_error([f"{_VALUE_PATH}.{key}=1e400"])
+            self.assertIn(f"{_VALUE_PATH}.{key} is 1e400, which is not a representable", err)
+            self.assertNotIn("a limit of zero", err)
 
     def test_an_integer_past_int64_from_a_values_file_fails_naming_the_key(self):
         # Helm reads an integer above 2^63 as a float64, written 1e+19.
