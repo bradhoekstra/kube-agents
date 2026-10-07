@@ -275,8 +275,8 @@ def _owners_entries(owners_file, aliases, key):
     return entries, no_parent_owners
 
 
-def _applicable_logins(changed_files, root, key):
-    """Prow's walk over one OWNERS list, per changed file, unioned.
+def _logins_by_file(changed_files, root, key):
+    """Prow's walk over one OWNERS list, as {changed file: logins}.
 
     `entriesForFile` in Prow's `repoowners` package: from the file's directory
     up to the repository root, collecting the logins of each OWNERS file whose
@@ -289,7 +289,7 @@ def _applicable_logins(changed_files, root, key):
     root = pathlib.Path(root)
     aliases = load_owners_aliases(root)
     cache = {}
-    logins = set()
+    by_file = {}
 
     for changed in changed_files:
         path = pathlib.PurePosixPath(changed)
@@ -308,9 +308,14 @@ def _applicable_logins(changed_files, root, key):
             if (collected and no_parent_owners) or directory == pathlib.PurePosixPath("."):
                 break
             directory = directory.parent
-        logins.update(collected)
+        by_file[changed] = collected
 
-    return logins
+    return by_file
+
+
+def _applicable_logins(changed_files, root, key):
+    """The union of `_logins_by_file` over the change."""
+    return set().union(*_logins_by_file(changed_files, root, key).values())
 
 
 def applicable_approvers(changed_files, root=DEFAULT_OWNERS_ROOT):
@@ -346,7 +351,7 @@ def author_approves(changed_files, author, root=DEFAULT_OWNERS_ROOT):
     if not changed_files:
         return False
     author = author.lower()
-    return all(author in applicable_approvers([changed], root) for changed in changed_files)
+    return all(author in approvers for approvers in _logins_by_file(changed_files, root, OWNERS_APPROVERS_KEY).values())
 
 
 # --------------------------------------------------------------------------- #

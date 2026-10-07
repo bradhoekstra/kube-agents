@@ -547,10 +547,11 @@ class OwnersTest(unittest.TestCase):
             self.assertEqual(rr.applicable_approvers(["README.md"], empty), set())
 
     def test_the_live_tree_agrees_with_the_bots_config(self):
-        # The same property docs/pull-request-workflow.md states of the config:
-        # everyone the bot can assign is an approver for what it assigns them.
-        # If this fails, one of OWNERS, OWNERS_ALIASES, hack/OWNERS or the
-        # config moved and the other did not.
+        # The properties docs/pull-request-workflow.md states of the config:
+        # repository-owners and eval-crew are approvers for what the config
+        # assigns them, and repository-reviewers may lgtm and not approve. If
+        # this fails, one of OWNERS, OWNERS_ALIASES, hack/OWNERS or the config
+        # moved and the other did not.
         root_approvers = rr.applicable_approvers(["README.md"], REPO_ROOT)
         self.assertTrue(set(OWNERS) <= root_approvers, root_approvers)
         self.assertEqual(rr.applicable_approvers(["hack/eval/presubmit-cases.txt"], REPO_ROOT), set(EVAL_CREW))

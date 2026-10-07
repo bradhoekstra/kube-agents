@@ -458,11 +458,11 @@ The two labels are the two people:
   on the `lgtm` (#1075).
 
 Who to ask about a particular area, as opposed to who may approve, is
-[`docs/ownership.md`](ownership.md). Whoever `.github/auto_request_review.yml` assigns can finish
-what the pull request still needs. Its pool for an ordinary change is the root approvers plus
-`repository-reviewers`, people `OWNERS`
-lists under `reviewers` alone, and the script decides between them by what the author's own
-approval already covers (#1075): an approver's own change opens with `approved` on it and needs
+[`docs/ownership.md`](ownership.md).
+Whoever `.github/auto_request_review.yml` assigns can give the pull request the label it was drawn
+for. Its pool for an ordinary change is the `repository-owners` group, five of the root approvers,
+plus `repository-reviewers`, people `OWNERS` lists under `reviewers` alone, and the script decides
+between them by what the author's own approval already covers (#1075): an approver's own change opens with `approved` on it and needs
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
 same test decides what counts as already reviewed — an approval from a `reviewers`-only account
@@ -473,8 +473,8 @@ member is a root approver, so a change that also touches root-owned paths still 
 approver's `/approve` after that review. The bot never requests the author, so a member's own case
 or roster change goes to the rest of the group, with the author's `approved` already on it. That
 is a property of the lists agreeing today — the alias in `OWNERS_ALIASES`, the `reviewers` list in
-`OWNERS` and the groups in the bot's config — which `scripts/test_request_reviewers.py` pins rather
-than either file guarantees.
+`OWNERS` and the groups in the bot's config — which `scripts/test_request_reviewers.py` pins; none
+of the files guarantees it.
 
 Before any of that, a pull request from an author Prow does not already trust is labelled
 `needs-ok-to-test`, and its Prow presubmits hold until a member comments `/ok-to-test`. It gates
@@ -675,16 +675,18 @@ Four states that look like somebody else's problem and are not:
 [`scripts/request_reviewers.py`](../scripts/request_reviewers.py) are the same rule in code for the
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
 carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
-the changed files has submitted `APPROVED`, and when a human other than the author has submitted
-`CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+the changed files has submitted `APPROVED` (or, on a pull request the author's own approval already
+covers, anyone `OWNERS` lists under `reviewers` for them), and when a human other than the author
+has submitted `CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
 `.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
 robot that reviews under a user account re-reviews every push and files its follow-ups as
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull
 request and the check-run path would never request a human, and a review request outstanding to it
-is answered by the robot and cleared, so it counts as nobody asked. An approval from outside
-`approvers` is not a hand-off unless the author's own approval already covers the change: on any
-other pull request it cannot produce the `approved` label, so the auto-request counts it no more
-than a comment and still asks someone who can `/approve`. Of these reasons, `/request-review`
+is answered by the robot and cleared, so it counts as nobody asked. An approval from an account in
+neither `OWNERS` list is never a hand-off, and one from `reviewers` alone is a hand-off only when
+the author's own approval already covers the change: on any other pull request it cannot produce
+the `approved` label, so the auto-request counts it no more than a comment and still asks someone
+who can `/approve`. Of these reasons, `/request-review`
 skips the verdict check alone (it also bypasses the
 `AI Review` gate, per `AGENTS.md`) — a person has already read the pull request and asked — and when
 one of the other reasons still declines it, the comment gets 😕 and the run a warning annotation
