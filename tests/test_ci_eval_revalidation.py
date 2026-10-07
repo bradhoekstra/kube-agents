@@ -104,9 +104,9 @@ esac
 # GITHUB_FAKE_STATUS_ERROR a network error, and GITHUB_FAKE_MINT_HTTP an HTTP
 # error on the mint. GITHUB_FAKE_PAGE_SIZE serves the
 # file a page at a time with GitHub's `Link: <...>; rel="next"` header and a
-# `page=` query, the way the real API pages, and GITHUB_FAKE_STATUS_HTTP_PAGE
-# fails that one page with a 502; GITHUB_REQUEST_LOG then shows every page
-# asked for.
+# `page=` query, the way the real API pages, GITHUB_FAKE_STATUS_HTTP_PAGE
+# fails that one page with a 502, and GITHUB_FAKE_LINK_REL replaces the
+# `rel="next"` parameter; GITHUB_REQUEST_LOG then shows every page asked for.
 _FAKE_GITHUB = textwrap.dedent(
     '''
     import email.message
@@ -147,7 +147,8 @@ _FAKE_GITHUB = textwrap.dedent(
         link = None
         if start + size < len(events):
             query["page"] = str(page + 1)
-            link = "<" + urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query))) + '>; rel="next"'
+            rel = os.environ.get("GITHUB_FAKE_LINK_REL") or 'rel="next"'
+            link = "<" + urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query))) + ">; " + rel
         return _Response(events[start:start + size], link)
 
 
@@ -563,8 +564,8 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("this head already passed", proc.stdout)
         self.assertIn(f"base {self.c1} then, {self.c5} now", proc.stdout)
         self.assertNotIn("code.py", proc.stdout)
-        # The head's statuses are read once, for the /override check and the
-        # attestation both; the retest is the common path and pays one read.
+        # The head's statuses are read once, for the attestation; the green
+        # holds, so the override check never runs and nothing is read twice.
         reads = [r for r in self._requests() if "/statuses" in r["url"]]
         self.assertEqual([self.c3], [r["url"].split("/commits/")[1].split("/")[0] for r in reads])
 
@@ -934,6 +935,18 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "3"})
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+
+    def test_an_unparsed_link_header_ends_the_walk_and_says_so(self):
+        """RFC 8288 permits an unquoted rel; GitHub quotes it. A Link value
+        the walk does not read is a stopped read, reported as one, not the
+        last page: the page-one verdict is still reused, with the note."""
+        pins = [self._override_event(creator="github-actions[bot]") for _ in range(150)]
+        self._plant_statuses(self.c3, [self._override_event()] + pins)
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_LINK_REL": "rel=next"})
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertIn(f"Step 0: the statuses read for {self.c3} stopped at an unparsed Link header on page 1 after 100 events; the newer events already read are searched", proc.stdout)
+        reads = [r["url"] for r in self._requests() if "/statuses" in r["url"]]
+        self.assertEqual(1, len(reads), reads)
 
     def test_the_page_walk_stops_at_its_cap_and_falls_through(self):
         """A head with more pages than the cap is a full run, not an unbounded
@@ -1459,54 +1472,79 @@ class RevalidationBashFloorTest(unittest.TestCase):
     and the embedded Python programs are cut out before the scan so their
     own syntax (`words[-1]`) cannot red it."""
 
-    # A bash-4 flag (A, g, n, l, u) in any flag group after any declaring
-    # word; mapfile/readarray; case-modifying expansions in either form on
-    # any parameter; appending redirections and |&; case fall-through;
-    # [[ -v ]] and [ -v ]; coproc; read -i in any flag group; negative
-    # subscripts and lengths; $BASHPID; wait -n; globstar.
+    # A bash-4 flag (A, g, n, l, u) in any flag group after a declaring
+    # word, and `local -`; mapfile/readarray; case-modifying and @-operator
+    # expansions on any parameter; appending redirections and |&; case
+    # fall-through; [[ -v ]] and [ -v ]; coproc; read -i, -N and a
+    # fractional -t; exec {fd}; printf %()T; negative subscripts and
+    # lengths; $BASHPID and $EPOCHSECONDS; wait -n; the bash-4 shopts.
     _BASH4_CONSTRUCTS = (
-        r"\b(declare|local|typeset|readonly|export)\s+(-\S+\s+)*-[a-zA-Z]*[gAnlu]\b",
+        r"\b(declare|local|typeset|readonly)\s+(-\S+\s+)*-[a-zA-Z]*[gAnlu]\b",
+        r"\blocal\s+-(\s|$)",
         r"\bmapfile\b",
         r"\breadarray\b",
-        r"\$\{[^}]*[,^]\}",
+        r"\$\{[A-Za-z_@*#0-9][A-Za-z_0-9]*(\[[^]]*\])?(,,?|\^\^?|@[A-Za-z])\}",
         r"&>>",
         r"\|&",
         r";;?&",
         r"\[\[?\s+-v\s",
         r"\bcoproc\b",
-        r"\bread\s+(-\S+(\s+\S+)?\s+)*-[a-zA-Z]*i\b",
+        r"\bread\s+(-\S+(\s+[^-\s]\S*)?\s+)*-[a-zA-Z]*[iN]\b",
+        r"\bread\s+(-\S+(\s+[^-\s]\S*)?\s+)*-t\s+[0-9]*\.[0-9]",
+        r"\bexec\s+\{[A-Za-z_]",
+        r"%\([^)]*\)T",
         r"\[-[0-9]+\]",
         r":-?[0-9]*:-[0-9]",
-        r"\$BASHPID\b",
+        r"\$(BASHPID|EPOCHSECONDS|EPOCHREALTIME)\b",
         r"\bwait\s+-n\b",
-        r"\bglobstar\b",
+        r"\b(globstar|lastpipe|inherit_errexit|compat4[0-9])\b",
     )
 
-    @staticmethod
-    def _bash_source(text):
+    _PYTHON_OPEN = "python3 -c '"
+
+    @classmethod
+    def _bash_source(cls, text):
         """The script's bash lines: comments dropped, and each embedded
         `python3 -c '...'` program (opened by a line ending in `python3 -c '`
-        and closed by the line that starts with `'`) cut out."""
+        and closed by the line that starts with `'`) cut out. Fails closed:
+        a block left open at the end of the file, or a program spelled any
+        other way, is an error rather than a shorter scan."""
         lines = []
         in_python = False
-        for line in text.splitlines():
+        opened = 0
+        for number, line in enumerate(text.splitlines(), 1):
             if in_python:
                 if line.startswith("'"):
                     in_python = False
                     lines.append(line)
                 continue
-            if line.rstrip().endswith("python3 -c '"):
+            if line.rstrip().endswith(cls._PYTHON_OPEN):
                 in_python = True
+                opened += 1
                 lines.append(line.rstrip()[: -len("'")])
                 continue
+            if "python3 -c" in line or "python3 - " in line or "python3 <<" in line:
+                raise AssertionError(f"line {number}: an embedded program not in the one shape the cutter reads")
             if not line.lstrip().startswith("#"):
                 lines.append(line)
+        if in_python:
+            raise AssertionError("the last embedded program never closed on a line starting with a quote")
+        if opened != text.count(cls._PYTHON_OPEN):
+            raise AssertionError("an embedded program opened mid-line was not cut out")
         return "\n".join(lines)
 
     def test_the_embedded_python_is_cut_out_of_the_scan(self):
         text = _CI_REVALIDATE.read_text(encoding="utf-8")
-        self.assertIn("python3 -c '", text)
-        self.assertNotIn("import json", self._bash_source(text))
+        self.assertGreaterEqual(text.count(self._PYTHON_OPEN), 7)
+        cut = self._bash_source(text)
+        for marker in ("import json", "import sys", "sys.argv", "json.load("):
+            self.assertNotIn(marker, cut)
+
+    def test_the_cutter_fails_closed_on_an_unterminated_program(self):
+        with self.assertRaises(AssertionError):
+            self._bash_source("x=1\nfoo=\"$(python3 -c '\nimport sys\n")
+        with self.assertRaises(AssertionError):
+            self._bash_source("x=1\nfoo=\"$(python3 -c \"print(1)\")\"\n")
 
     def test_the_script_uses_no_bash_4_construct(self):
         code = self._bash_source(_CI_REVALIDATE.read_text(encoding="utf-8"))
@@ -1515,11 +1553,19 @@ class RevalidationBashFloorTest(unittest.TestCase):
                 self.assertIsNone(re.search(pattern, code), f"{pattern} needs bash 4+")
 
     def test_the_scanner_catches_the_spellings_a_relapse_takes(self):
-        for relapse in ("local -r -A seen", "readonly -A cache", "typeset -i -l name", "declare -n ref",
-                        "read -r -i default x", '${arr[0],,}', "${1^}", "${s:1:-1}", "${arr[-2]}",
-                        "[ -v x ]", "wait -n", "shopt -s globstar"):
+        for relapse in ("local -r -A seen", "readonly -A cache", "typeset -i -l name", "declare -n ref", "local -",
+                        "read -r -i default x", "read -N 4 x", "read -p 'x' -i default y", "read -t 0.5 x",
+                        '${arr[0],,}', "${1^}", "${line@Q}", "${s:1:-1}", "${arr[-2]}", 'exec {fd}>"$lock"',
+                        "printf '%(%Y)T'", "[ -v x ]", "wait -n", "shopt -s globstar", "shopt -s lastpipe",
+                        "shopt -s inherit_errexit", "$EPOCHSECONDS", "$BASHPID"):
             with self.subTest(relapse=relapse):
                 self.assertTrue(any(re.search(p, relapse) for p in self._BASH4_CONSTRUCTS), relapse)
+
+    def test_the_scanner_passes_the_bash_3_idioms_the_script_uses(self):
+        for fine in ("export -n VAR", '"${sep:-,}"', '"${x%,}"', '"${reused%, }"', "read -r line", "local x",
+                     'date -u +"%Y-%m-%dT%H:%M:%SZ"', "exec 3>&1", "${#arr[@]}", "${fetched%%$'\\n'*}"):
+            with self.subTest(fine=fine):
+                self.assertFalse(any(re.search(p, fine) for p in self._BASH4_CONSTRUCTS), fine)
 
 
 class RevalidationEntrypointTest(unittest.TestCase):

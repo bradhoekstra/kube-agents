@@ -338,8 +338,16 @@ while url and pages < page_limit:
         partial = "%s on page %d" % (type(exc).__name__, pages + 1)
         break
     pages += 1
+    # GitHub quotes rel; a Link value in a shape this does not read ends
+    # the walk and is reported, not taken for the last page.
     found = re.search(r"<([^>]+)>;\s*rel=\"next\"", link)
-    url = found.group(1) if found else None
+    if found:
+        url = found.group(1)
+    elif "next" in link:
+        partial = "an unparsed Link header on page %d" % pages
+        url = None
+    else:
+        url = None
 if url and not partial:
     partial = "the %d-page cap" % page_limit
 print("ok-partial " + partial + " after " + str(len(statuses)) + " events" if partial else "ok")
