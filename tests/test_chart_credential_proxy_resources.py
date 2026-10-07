@@ -217,11 +217,16 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=4Gi", f"{_VALUE_PATH}.limits.memory=2Gi"])
         self.assertIn(f"{_VALUE_PATH}.requests.memory (4Gi) exceeds limits.memory (2Gi)", err)
 
-    def test_a_crossed_pair_is_compared_without_rounding(self):
+    def test_a_crossed_pair_is_compared_to_within_float64_rounding(self):
         # The operator compares exact quantities; parseCpuMillis and parseBytes truncate
-        # or ceil, which would admit these or (499.5m) compare them the wrong way.
+        # or ceil, which would admit these or (499.5m) compare them the wrong way. The
+        # chart's float64 comparison allows a relative 5e-16 for rounding, which the
+        # 15-digit cap keeps below the gap between any two distinct values: the last
+        # case is 15 digits, one unit apart.
         cases = (
             ([f"{_VALUE_PATH}.requests.cpu=1.0004"], "requests.cpu (1.0004) exceeds the operator's default limits.cpu (1)"),
+            ([f"{_VALUE_PATH}.requests.cpu=100000000000001m", f"{_VALUE_PATH}.limits.cpu=100000000000000m"],
+             "requests.cpu (100000000000001m) exceeds limits.cpu (100000000000000m)"),
             ([f"{_VALUE_PATH}.requests.memory=1073741824.5"],
              "requests.memory (1073741824.5) exceeds the operator's default limits.memory (1Gi)"),
             ([f"{_VALUE_PATH}.limits.cpu=499.5m"], "limits.cpu (499.5m) is below the operator's default requests.cpu (500m)"),
@@ -231,6 +236,17 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         for sets, want in cases:
             err = self._render_error(sets)
             self.assertIn(f"{_VALUE_PATH}.{want}", err, sets)
+
+    def test_an_equal_pair_scaled_differently_renders(self):
+        # 1.005 cores scales to 1004.9999999999999 millicores and 1005m reads as 1005;
+        # 1.005G and 1005M likewise. The operator and the API server admit both pairs.
+        cases = (
+            {"requests": {"cpu": "1005m"}, "limits": {"cpu": "1.005"}},
+            {"requests": {"memory": "1005M"}, "limits": {"memory": "1.005G"}},
+        )
+        for resources in cases:
+            cr = self._render_cr(values=_proxy_values(resources))
+            self.assertEqual(_cr_resources(cr), resources)
 
     def test_a_request_equal_to_the_default_limit_renders(self):
         for value in ("1", "1000m"):

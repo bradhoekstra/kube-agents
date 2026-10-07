@@ -999,15 +999,17 @@ honest — a quota that large cannot constrain this release either way.
        with no rounding of its own: parseCpuMillis and parseBytes truncate a bare or
        suffixed value and ceil an m, u or n one, which suits the quota sums and would let
        the credential-proxy crossed-pair check disagree with the operator's exact
-       resource.Quantity comparison (1.0004 against 1 would compare equal). float64 holds
-       every integer under 2^53 exactly, and every real override's value in these units is
-       one; past that, or for a fraction that float64 cannot write, two values a few parts in
-       10^16 apart can still compare equal, which is why credentialProxyResourcesCheck
-       refuses a quantity with more than 15 significant digits: every value with at most 15
-       reads into float64 exactly and scales by a power of two or ten without losing a digit
-       below 2^53, so the comparisons are exact for every value the chart admits. A value
-       whose scaled figure is past float64's range (a CPU of 1e308, in millicores) fails the
-       render naming "key" rather than answering "", which a caller would read as zero.
+       resource.Quantity comparison (1.0004 against 1 would compare equal). The figure is
+       still a float64, and a float64 product of a decimal and a power of ten can land an
+       ulp off the decimal it stands for (1.005 × 1000 is 1004.9999999999999 in float64
+       arithmetic, against 1005 for 1005m). Sprig's mulf and divf compute in decimal and
+       round once, which avoids that today, but the chart does not lean on it: callers
+       compare these figures within kube-agents.quantityCompareTolerance, never with lt or
+       gt alone, and credentialProxyResourcesCheck refuses a quantity with more than 15
+       significant digits so that distinct values stay farther apart than that tolerance.
+       A value whose scaled figure is past float64's range (a CPU of 1e308, in
+       millicores) fails the render naming "key" rather than answering "", which a caller
+       would read as zero.
        Takes (dict "raw" <quantity> "cpu" <bool> "key" <values path>); call it after the
        quantity has passed the CRD's grammar. */ -}}
 {{- define "kube-agents.quantityExact" -}}
@@ -1034,6 +1036,21 @@ honest — a quota that large cannot constrain this release either way.
 {{- fail (printf "%s is %s, which is not a representable quantity: its value with the suffix applied is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" .key $raw) -}}
 {{- end -}}
 {{- $v | toJson -}}
+{{- end }}
+
+{{- /* The relative tolerance within which two kube-agents.quantityExact figures are
+       equal; the zero check stays exact. Parsing a decimal into float64 and scaling it by
+       one decimal factor costs at most about three units in the last place, under 4e-16
+       relative; two distinct quantities of at most 15 significant digits differ by at
+       least one unit in the fifteenth digit, 1e-15 relative or more; so a tolerance of
+       5e-16 treats every float artefact as equality and never two distinct admitted
+       values. That second bound holds for values on one decimal grid. A binary suffix
+       (Ki to Ei) multiplies the digits by a power of two, and such a value can sit nearer
+       a decimal one than 1e-15 relative (976562500000459Ki is 16 bytes above
+       100000000000047e4); a pair like that compares equal with or without the tolerance,
+       because float64 rounds the decimal one onto the other. */ -}}
+{{- define "kube-agents.quantityCompareTolerance" -}}
+5e-16
 {{- end }}
 
 {{/*
@@ -1228,7 +1245,7 @@ a Go template cannot catch the error `lookup` raises.
 The checks on platformAgent.deployment.credentialProxy.resources that need no parsed value:
 the keys under resources, the shape of limits and requests, each resource name, and each
 quantity's sign, grammar, significant digits (at most 15, the most float64 holds exactly, so
-the comparisons after these are exact for every value admitted) and range: a byte count
+distinct values stay farther apart than kube-agents.quantityCompareTolerance) and range: a byte count
 within an int64, a CPU within an int64 of millicores. Takes the resources map and renders
 nothing; a value that fails one fails the render naming its key. Both readers of the value call it first,
 the CR template (templates/platform-agent-cr.yaml) and kube-agents.credentialProxyFootprint

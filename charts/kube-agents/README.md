@@ -530,7 +530,9 @@ override the operator would refuse, on a quantity it cannot read, and on any key
 under `resources` other than `requests`, `limits` and `claims` (`limit:` for
 `limits:`), which the CRD would prune silently. A quantity with more than 15
 significant digits is refused at render as well: the chart compares quantities as
-float64, which holds 15 exactly. The quota preflight sums the
+float64 within a relative tolerance that absorbs float64 rounding (`1005m` equals
+`1.005`), and the digits cap keeps distinct values farther apart than that
+tolerance. The quota preflight sums the
 override merged over the operator's defaults. On an existing install, apply the
 chart's `crds/` before setting the value (`helm upgrade` does not, `upgrade.sh`
 does): against a CRD that predates `spec.deployment.credentialProxy`, the API
