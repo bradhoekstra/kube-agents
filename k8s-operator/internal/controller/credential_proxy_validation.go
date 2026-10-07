@@ -61,6 +61,7 @@ const (
 	credentialProxyNegativeRefusal        = "must not be negative; the API server refuses a container that declares one"                                                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
 	credentialProxyZeroLimitRefusal       = "a limit of zero leaves the container nothing of this resource; omit the key to keep the operator's default"                                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
 	credentialProxyUnrepresentableFmt     = "is not a representable byte count: it exceeds the %d bytes an int64 holds, which is what the Downward API hands the broker"                                                                                                                                                                                                    // #nosec G101 -- Error message, not a credential
+	credentialProxyUnrepresentableCPUFmt  = "is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the %d an int64 holds, so the scheduler and kubelet would read it as a wrapped figure, zero or negative"                                                                                                                             // #nosec G101 -- Error message, not a credential
 	credentialProxyFloorRefusalFmt        = "a %s memory limit is under the %dMi floor at which the budget admits %d commands; below it the broker turns the budget off and admits by the slot cap alone, which is the exposure the budget exists to remove"                                                                                                                // #nosec G101 -- Error message, not a credential
 	credentialProxyCrossedBesideFmt       = "exceeds the %s %s limit set beside it"                                                                                                                                                                                                                                                                                         // #nosec G101 -- Error message, not a credential
 	credentialProxyCrossedDefLimitFmt     = "exceeds the operator's default %s %s limit, which this override does not raise; set limits.%s as well"                                                                                                                                                                                                                         // #nosec G101 -- Error message, not a credential
@@ -125,6 +126,11 @@ func credentialProxyResourcePath(path *field.Path, side string, name corev1.Reso
 // maxByteCount is the largest byte count an int64 carries, as a quantity.
 var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 
+// maxCPUMilli is the largest CPU quantity whose millicore value an int64
+// carries. The scheduler and kubelet read a CPU quantity through MilliValue,
+// which past this wraps (10E reads as 0, 9223372036854775808m as negative).
+var maxCPUMilli = resource.NewMilliQuantity(math.MaxInt64, resource.DecimalSI)
+
 // ValidateCredentialProxyResources checks spec.deployment.credentialProxy.resources
 // on the result the operator renders: its defaults with the CR's keys merged
 // over them (resolveCredentialProxyResources). The admission webhook calls it
@@ -136,10 +142,12 @@ var maxByteCount = *resource.NewQuantity(math.MaxInt64, resource.BinarySI)
 //     take effect and the render drops it.
 //   - Any resource name other than cpu, memory and ephemeral-storage
 //     (credentialProxyResourceNames).
-//   - A negative quantity on either side, a zero limit, or a byte count
-//     beyond an int64. The API server refuses the first; the second leaves
-//     the container nothing; the third cannot reach the broker as the byte
-//     count it reads its limit as.
+//   - A negative quantity on either side, a zero limit, a byte count beyond
+//     an int64, or a CPU quantity whose millicore value is beyond one. The
+//     API server refuses the first; the second leaves the container nothing;
+//     the third cannot reach the broker as the byte count it reads its limit
+//     as; the fourth the scheduler and kubelet read wrapped, as zero or
+//     negative.
 //   - A memory limit under the floor at which the broker's child memory
 //     budget admits two commands. Below it the broker does not run a smaller
 //     budget: it turns the budget off and admits by the slot cap alone, so a
@@ -200,6 +208,8 @@ func ValidateCredentialProxyResources(deployment *agentv1alpha1.DeploymentSpec, 
 				msg = credentialProxyZeroLimitRefusal
 			case slices.Contains(byteCountResources, name) && quantity.Cmp(maxByteCount) > 0:
 				msg = fmt.Sprintf(credentialProxyUnrepresentableFmt, int64(math.MaxInt64))
+			case name == corev1.ResourceCPU && quantity.Cmp(*maxCPUMilli) > 0:
+				msg = fmt.Sprintf(credentialProxyUnrepresentableCPUFmt, int64(math.MaxInt64))
 			default:
 				continue
 			}

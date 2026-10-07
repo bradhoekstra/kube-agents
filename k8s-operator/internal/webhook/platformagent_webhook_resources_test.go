@@ -407,6 +407,36 @@ func TestCredentialProxyUnrepresentableMemoryLimitIsRefused(t *testing.T) {
 	}
 }
 
+// 10E is a valid CPU quantity whose millicore value an int64 cannot hold, so
+// MilliValue wraps it to 0 and the scheduler would see no CPU request. Both
+// sides are refused as unrepresentable, and the equal pair draws no crossed
+// refusal on top.
+func TestCredentialProxyUnrepresentableCPUIsRefused(t *testing.T) {
+	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
+	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
+	}).Spec.Deployment, path)
+	if len(errs) != 2 {
+		t.Fatalf("expected the two cpu refusals alone, got %v", errs)
+	}
+	for i, want := range []string{"spec.deployment.credentialProxy.resources.requests.cpu", "spec.deployment.credentialProxy.resources.limits.cpu"} {
+		if errs[i].Field != want || !strings.Contains(errs[i].Error(), `Invalid value: "10E": is not a CPU count the scheduler can represent in millicores`) {
+			t.Errorf("error %d = %v, want the CPU unrepresentable refusal on %s", i, errs[i], want)
+		}
+	}
+	if len(warnings) != 0 {
+		t.Errorf("a refused cpu drew warnings: %v", warnings)
+	}
+	val := &PlatformAgentCustomValidator{}
+	if _, err := val.ValidateCreate(context.Background(), proxyResourcesAgent(&corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
+		Limits:   corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("10E")},
+	})); err == nil || !strings.Contains(err.Error(), "not a CPU count the scheduler can represent in millicores") {
+		t.Errorf("the webhook admitted a 10E cpu pair or refused it for another reason: %v", err)
+	}
+}
+
 // A resource name is cut where it enters the field path, so the ErrorList the
 // webhook returns keeps each refusal's reason rather than 33,000 characters of
 // the author's key.
