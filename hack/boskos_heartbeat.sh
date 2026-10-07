@@ -24,8 +24,26 @@
 # Disabled (single notice, exit 0) unless BOSKOS_HOST, BOSKOS_RESOURCE_NAME,
 # and BOSKOS_OWNER_NAME are all set. Pool resource names are DNS-safe, so
 # the query string needs no URL encoding.
+#
+# No command substitution anywhere in this file. bash 5.2 (every patch
+# level; 5.1 and 5.3 are clean, and the Prow image and ubuntu-latest both
+# run 5.2) runs a pending trap from inside the parser when a signal lands
+# while it re-parses a $(...) or <(...) for expansion, and the parser's
+# state leaks into the trap: either the trap string fails to parse
+# ("trap: line 2: unexpected EOF while looking for matching `)'") and the
+# signal is lost, or the enclosing command fails to parse and the shell
+# exits 1 without running summary -- no stop line, no WARNING. The window
+# is microseconds per beat. Builtins stand in instead: printf -v for date,
+# `cmd | read -r var` under lastpipe for capture, read for /proc.
+# tests/test_boskos_heartbeat.py rejects the construct. No `break` either:
+# on every bash version a trapped signal that lands on a `break` out of a
+# loop is dropped rather than deferred (5 of 1000 TERMs in a tight loop),
+# so a loop here runs to its end.
 
 set -uo pipefail
+# The last command of a pipeline runs in this shell (job control is off in
+# a script), so `cmd | read -r var` captures output without a $(...).
+shopt -s lastpipe
 
 BOSKOS_HEARTBEAT_INTERVAL_SECONDS="${BOSKOS_HEARTBEAT_INTERVAL_SECONDS:-30}"
 # State every kube-agents lease is held in while a job owns it; /update 401s
@@ -38,6 +56,8 @@ BOSKOS_HEARTBEAT_LOG="${BOSKOS_HEARTBEAT_LOG:-${ARTIFACTS:-/tmp}/boskos-heartbea
 # under the interval so a timed-out beat still leaves room for the next one.
 CURL_MAX_TIME_SECONDS=10
 LOG_PREFIX="boskos-heartbeat:"
+# Timestamp on each detail-log line, UTC (strftime, via printf's %(...)T).
+readonly BEAT_TIME_FORMAT='%Y-%m-%dT%H:%M:%SZ'
 
 if [ -z "${BOSKOS_HOST:-}" ] || [ -z "${BOSKOS_RESOURCE_NAME:-}" ] || [ -z "${BOSKOS_OWNER_NAME:-}" ]; then
   echo "${LOG_PREFIX} disabled (BOSKOS_HOST/BOSKOS_RESOURCE_NAME/BOSKOS_OWNER_NAME not all set)"
@@ -79,16 +99,20 @@ trap summary TERM INT
 # falls back to ps elsewhere; if neither answers, the caller is assumed
 # alive, so a missing tool can only keep the lease beating, never drop it.
 caller_alive() {
-  local parent_now=""
+  local parent_now="" key value
   if [ -r "/proc/$$/status" ]; then
-    parent_now="$(awk '/^PPid:/ { print $2 }' "/proc/$$/status" 2>/dev/null)"
+    while read -r key value _; do
+      [ "${key}" = "PPid:" ] && parent_now="${value}"
+    done <"/proc/$$/status"
   else
-    parent_now="$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')"
+    ps -o ppid= -p "$$" 2>/dev/null | read -r parent_now
   fi
   [ -z "${parent_now}" ] || [ "${parent_now}" = "${PPID}" ]
 }
 
-mkdir -p "$(dirname "${BOSKOS_HEARTBEAT_LOG}")" 2>/dev/null || true
+log_dir=""
+dirname "${BOSKOS_HEARTBEAT_LOG}" | IFS= read -r log_dir
+mkdir -p "${log_dir}" 2>/dev/null || true
 echo "${LOG_PREFIX} started for ${BOSKOS_RESOURCE_NAME} (owner ${BOSKOS_OWNER_NAME}, every ${BOSKOS_HEARTBEAT_INTERVAL_SECONDS}s, detail: ${BOSKOS_HEARTBEAT_LOG})"
 
 while true; do
@@ -102,8 +126,9 @@ while true; do
   # curl -w emits a code even on failure ("000", or "200000" when the
   # connection dies after headers), so normalise to the LAST three digits
   # rather than appending a fallback that doubles it up.
-  http_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time "${CURL_MAX_TIME_SECONDS}" \
-    -X POST "${UPDATE_URL}" 2>>"${BOSKOS_HEARTBEAT_LOG}")" || true
+  http_code=""
+  curl -sS -o /dev/null -w '%{http_code}\n' --max-time "${CURL_MAX_TIME_SECONDS}" \
+    -X POST "${UPDATE_URL}" 2>>"${BOSKOS_HEARTBEAT_LOG}" | read -r http_code || true
   http_code="${http_code:(-3)}"
   [ -n "${http_code}" ] || http_code="000"
   beats_sent=$((beats_sent + 1))
@@ -114,7 +139,8 @@ while true; do
     beats_failed=$((beats_failed + 1))
     [ "${http_code}" = "401" ] && beats_401=$((beats_401 + 1))
   fi
-  echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ${status} http=${http_code}" >>"${BOSKOS_HEARTBEAT_LOG}"
+  TZ=UTC printf -v beat_at "%(${BEAT_TIME_FORMAT})T" -1
+  echo "${beat_at} ${status} http=${http_code}" >>"${BOSKOS_HEARTBEAT_LOG}"
   if [ "${status}" != "${last_status}" ]; then
     if [ "${status}" = "fail" ]; then
       # 401 here means the lease is already lost (owner mismatch) — the exact
