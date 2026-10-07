@@ -5,31 +5,37 @@ regex tweak that reads fine but shifts what matches:
 
 * ``the-worker-read-the-podmonitoring`` -- a ``worker_commands`` check that must
   match a real ``kubectl get/describe podmonitoring`` however it is wrapped, and
-  is deliberately loose: it requires only that ``kubectl`` and ``podmonitoring``
-  co-occur in one command. A precise regex insisting the kind be the resource
-  argument re-implemented shell grammar and leaked both ways across review rounds,
-  so it was dropped. The loose pattern has no false-reds (every real read matches,
-  however wrapped) and accepts co-occurrence false-greens (a ``can-i`` probe, a
-  CRD read, the kind in a filename or selector, the command quoted inside another);
-  what it still refuses is a command that pairs ``kubectl`` with no
-  ``podmonitoring`` at all -- the old skill's Deployment read, the regression this
-  case guards. ``WorkerCommandsVerifier`` ``re.search``es the pattern against the
-  raw command string, so this test does the same.
+  is deliberately loose: two lookaheads requiring only that ``kubectl`` and
+  ``podmonitoring`` co-occur in one command, in either order. A precise regex
+  insisting the kind be the resource argument re-implemented shell grammar and
+  leaked both ways across review rounds, so it was dropped. Order-free
+  co-occurrence has no false-reds (every real read matches however wrapped, and a
+  read whose kind precedes ``kubectl`` -- a ``for r in podmonitoring; do kubectl
+  get $r`` loop -- matches where an ordered ``kubectl.*podmonitoring`` missed it)
+  and accepts co-occurrence false-greens (a ``can-i`` probe, a CRD read, the kind
+  in a filename or selector, the command quoted inside another); what it still
+  refuses is a command that pairs ``kubectl`` with no ``podmonitoring`` at all --
+  the old skill's Deployment read, the regression this case guards.
+  ``WorkerCommandsVerifier`` ``re.search``es the pattern against the raw command
+  string, so this test does the same.
 
 * ``the-answer-affirms-the-watcher-is-scraped`` -- a ``report_contains`` that
   grades a verdict token the prompt asks the worker to emit, a first line
   ``Scraped: yes`` or ``Scraped: no``, rather than reading polarity out of free
-  prose. ``required_phrases`` pins the affirmative token (a substring of the flat
-  normalization) and ``forbidden_patterns`` reds the negative one with a
-  line-anchored ``(?m)^\s*scraped:\s*no\b`` (``re.search``ed against the
-  line-preserving normalization), so it fires only on a line whose verdict is
-  ``Scraped: no`` -- not on ``scraped: nothing``/``not yet`` (word boundary) or an
-  affirmative that mentions ``scraped: no`` in a later aside (line anchor). The
-  nuance (a correct answer may note the credential-proxy PodMonitoring is
-  unscraped while the watcher is) is left to the judge. ``ReportContainsVerifier``
-  tests the phrase against ``_normalize(text)`` and the pattern against
-  ``_normalize_lines(text)``, so this test reproduces both and cross-checks the
-  normalizer against the real verifier when the bench package imports.
+  prose. Both tokens use one grammar. The affirmative is an ``any_of_patterns``
+  regex ``scraped:\s*yes\b`` (``re.search``ed against the flat normalization), so a
+  space-less ``Scraped:yes`` still affirms. The negative is a ``forbidden_patterns``
+  regex ``(?m)^\s*(?:[-*#>]+\s*|\d+\.\s*|\w+:\s*)?scraped:\s*no\b`` (``re.search``ed
+  against the line-preserving normalization), so it fires on a line whose verdict
+  is ``Scraped: no`` through a Markdown bullet, heading, quote, list item or label
+  prefix -- not on ``scraped: nothing``/``not yet`` (word boundary) or an
+  affirmative that mentions ``scraped: no`` in a later multi-token aside (line
+  anchor plus the single-prefix limit). The nuance (a correct answer may note the
+  credential-proxy PodMonitoring is unscraped while the watcher is) is left to the
+  judge. ``ReportContainsVerifier`` tests ``any_of_patterns`` against
+  ``_normalize(text)`` and ``forbidden_patterns`` against ``_normalize_lines(text)``,
+  so this test reproduces both and cross-checks the normalizer against the real
+  verifier when the bench package imports.
 
 The checks are read from task.yaml, not duplicated here, so the test pins the
 file rather than a copy of it. The residuals each check accepts -- the route's
@@ -128,8 +134,8 @@ ROUTE_POSITIVES = [
     "kubectl get podmonitoring -A | yq .items",
     "/usr/bin/kubectl get podmonitoring -A",
     "kubectl describe PodMonitoring platform-agent-gateway-monitoring",
-    # The noun ends its own segment, before a terminator rather than a space: the
-    # comment says the segment end admits the read, and the lookahead now does.
+    # The noun ends its own segment at a terminator rather than a space; the
+    # co-occurrence check matches regardless of what follows it.
     "kubectl get podmonitoring|yq .items",
     "echo $(kubectl get podmonitoring)",
     "(kubectl get podmonitoring)",
@@ -140,6 +146,12 @@ ROUTE_POSITIVES = [
     'sh -c "kubectl get podmonitoring -n kubeagents-system"',
     # The resource word itself quoted.
     'kubectl get "podmonitoring" -A',
+    # The kind precedes `kubectl` on the line -- a loop over both GMP kinds, an env
+    # assignment, an `xargs` pipe. Order-free co-occurrence matches these; an
+    # ordered `kubectl.*podmonitoring` reads forward from `kubectl` and missed them.
+    "for r in podmonitoring clusterpodmonitoring; do kubectl get $r -A; done",
+    "KIND=podmonitoring; kubectl get $KIND -n kubeagents-system",
+    "echo podmonitoring | xargs kubectl get -A",
 ]
 
 # The loose pattern refuses only a command that does not pair `kubectl` with
@@ -157,11 +169,14 @@ ROUTE_NEGATIVES = [
 
 # Co-occurrence false-greens the loose pattern accepts by design: `kubectl` and
 # `podmonitoring` appear in one command, but the command does not read the
-# PodMonitoring as the resource argument of get/describe. All are caught by the
-# answer objectives (a worker that only did these cannot name port 9095 and the
-# proving series), and refusing them precisely re-implements shell grammar, which
-# leaked across rounds. Asserted so a future tightening that refuses one fails
-# here and the comment is updated with it.
+# PodMonitoring as the resource argument of get/describe. The answer objectives do
+# NOT close these: the required phrases are the skill's own vocabulary (see the
+# docstring), so an answer composed from the skill without a read passes them too.
+# They are accepted because refusing them precisely re-implements shell grammar,
+# which leaked across rounds; what the route check adds is the real read as the
+# expected path and a refusal of a run that names no PodMonitoring at all. Asserted
+# so a future tightening that refuses one fails here and the comment is updated with
+# it.
 ROUTE_KNOWN_RESIDUALS = [
     # The command quoted inside another -- a grep/echo of the string reads nothing.
     'grep "kubectl get podmonitoring" notes.txt',
@@ -185,13 +200,15 @@ ROUTE_KNOWN_RESIDUALS = [
 # --- polarity corpus --------------------------------------------------------
 
 # Correct answers: the watcher IS scraped. Each carries the `Scraped: yes` token
-# and no line whose verdict is `Scraped: no`, so required_phrases is satisfied and
+# and no line whose verdict is `Scraped: no`, so any_of_patterns matches and
 # forbidden_patterns does not fire. The second mixes a scraped watcher with an
 # unscraped credential-proxy -- the token carries the verdict, the prose nuance
 # goes to the judge; the third folds case and markdown the normalizer strips; the
 # fourth writes `scraped: no` in a later clause (not as a line's verdict), which
-# the bare-substring forbidden_phrases used to false-red and the line anchor now
-# admits.
+# the bare-substring affirmative used to false-red and the line anchor now admits;
+# the fifth bullets its verdict; the sixth drops the space after the colon
+# (`Scraped:yes`), which the flat any_of regex affirms where a literal
+# `Scraped: yes` substring red-ed.
 POLARITY_CORRECT = [
     "Scraped: yes. The watcher metrics are scraped through the "
     '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
@@ -202,14 +219,23 @@ POLARITY_CORRECT = [
     "**Scraped: Yes.** k8s_event_watcher_cluster_up confirms port 9095 is "
     "scraped through the gateway-monitoring PodMonitoring.",
     "Scraped: yes. The credential-proxy, by contrast, is scraped: no.",
+    "- Scraped: yes. The gateway-monitoring PodMonitoring scrapes the watcher's "
+    "9095 listener.",
+    'Scraped:yes. up{job="platform-agent-gateway-monitoring"} proves the '
+    "collector scrapes 9095.",
 ]
 
-# Incorrect answers: the watcher is NOT scraped. Each carries the `Scraped: no`
-# token (hitting forbidden_phrases) or omits the verdict line (missing
-# required_phrases), even though some name the same mechanism, port and series the
-# other objective checks. The last three are shapes the earlier enumerated-negation
-# regex false-greened -- a contraction, perfect tense, active voice -- that the
-# token reds on the verdict alone.
+# Incorrect answers: the watcher is NOT scraped. Each carries a `Scraped: no`
+# verdict line (hitting forbidden_patterns) or omits the affirmative (missing
+# any_of_patterns), even though some name the same mechanism, port and series the
+# other objective checks. Three in the middle are shapes the earlier
+# enumerated-negation regex false-greened -- a contraction, perfect tense, active
+# voice -- that the token reds on the verdict alone. The last two are the
+# false-green the bare line anchor `^\s*scraped:` let escape: a `Scraped: no`
+# verdict written behind a Markdown prefix -- a `-` bullet, a `Verdict:` label --
+# while a stray `scraped: yes` (here the answer format the worker echoes back)
+# satisfied the affirmative, so the anchor missed the `no` and an unscraped install
+# passed. The prefix-tolerant pattern reds both.
 POLARITY_INCORRECT = [
     "Scraped: no. The event watcher's metrics are not scraped: the "
     "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
@@ -220,6 +246,10 @@ POLARITY_INCORRECT = [
     "Scraped: no. 9095 isn't scraped.",
     "Scraped: no. The watcher was never scraped on this install.",
     "Scraped: no. Prometheus is not scraping 9095.",
+    "- Scraped: no (you asked for `Scraped: yes` / `Scraped: no`). The "
+    "gateway-monitoring PodMonitoring is absent; nothing scrapes 9095.",
+    "**Verdict:** Scraped: no. (Format: `Scraped: yes` / `Scraped: no`.) The "
+    "gateway-monitoring PodMonitoring is absent.",
 ]
 
 # Polarity residual, documented in the task.yaml comment and accepted: a negative
@@ -261,10 +291,11 @@ class ObservabilityWatcherRouteRegex(unittest.TestCase):
 class ObservabilityWatcherPolarity(unittest.TestCase):
     def setUp(self):
         check = _check_named(POLARITY_OBJECTIVE)
-        self.required = check.get("required_phrases", [])
+        self.any_of_patterns = check.get("any_of_patterns", [])
         self.forbidden_patterns = check.get("forbidden_patterns", [])
         self.assertTrue(
-            self.required, "polarity objective should carry required_phrases"
+            self.any_of_patterns,
+            "polarity objective should carry any_of_patterns",
         )
         self.assertTrue(
             self.forbidden_patterns,
@@ -272,15 +303,18 @@ class ObservabilityWatcherPolarity(unittest.TestCase):
         )
 
     def _affirms(self, answer: str) -> bool:
-        """``ReportContainsVerifier``'s verdict for a required_phrases +
-        forbidden_patterns check: the phrase is a substring of the flat
-        normalization, the pattern is ``re.search``ed against the line-preserving
-        one."""
+        """``ReportContainsVerifier``'s verdict for an any_of_patterns +
+        forbidden_patterns check: an affirmative pattern is ``re.search``ed
+        against the flat normalization, a forbidden pattern against the
+        line-preserving one. The answer affirms when some affirmative matches and
+        no forbidden one does."""
         text = _normalize(answer)
         lines = _normalize_lines(answer)
-        missing = any(_normalize(p) not in text for p in self.required)
+        any_of_miss = bool(self.any_of_patterns) and not any(
+            re.search(p, text) for p in self.any_of_patterns
+        )
         present = any(re.search(p, lines) for p in self.forbidden_patterns)
-        return not missing and not present
+        return not any_of_miss and not present
 
     def test_correct_answers_affirm(self):
         for answer in POLARITY_CORRECT:

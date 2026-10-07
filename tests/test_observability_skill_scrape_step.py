@@ -62,6 +62,15 @@ DEPLOYMENT_READ = re.compile(r"(?i)kubectl\b[^\n]*\b(get|describe)\b[^\n]*\bdepl
 # annotation. A revert that reads it off the pod template instead of the
 # Deployment is the same regression, and no `deploy` pattern would catch it.
 PROM_SCRAPE_ANNOTATION = re.compile(r"(?i)prometheus\.io/scrape")
+# The same bug in prose, naming neither the literal annotation key nor a
+# `kubectl ... deploy`: a step that tells the agent to read "scrape annotations"
+# or "annotations for Prometheus scraping" (off any resource) is the regression
+# the two patterns above miss. The current step names Deployment annotations only
+# to forbid them ("not off Deployment annotations"), which is "deployment", not
+# "scrape", annotations and does not trip this.
+SCRAPE_ANNOTATION_PROSE = re.compile(
+    r"(?i)annotations?\s+for\s+prometheus\s+scrap|scrap\w*\s+annotations?"
+)
 
 
 def _read(path: Path) -> str:
@@ -98,6 +107,14 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
             step,
             PROM_SCRAPE_ANNOTATION,
             "step 1 tells the agent to read the prometheus.io/scrape annotation (the #2141 regression, by any resource)",
+        )
+
+    def test_step_one_does_not_describe_scrape_annotations_in_prose(self):
+        step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
+        self.assertNotRegex(
+            step,
+            SCRAPE_ANNOTATION_PROSE,
+            "step 1 describes reading scrape annotations in prose (the #2141 regression, without the literal key or a deployment read)",
         )
 
 
