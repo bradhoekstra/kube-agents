@@ -111,6 +111,22 @@ type UsageCounterPoller struct {
 	// line.
 	mu      sync.Mutex
 	streaks map[types.UID]*usageScrapeStreak
+
+	// cursor is the namespace/name of the last CR a poll finished. The next
+	// poll sorts the CRs and resumes after it, wrapping, so a poll the budget
+	// cut short leaves the CRs it did not reach at the front of the next one
+	// rather than at the mercy of the informer store's map order: a standing
+	// blockage then delays every CR by at most ceil(N/k) intervals instead of
+	// lagging a random multiple of the interval. In memory only, like streaks.
+	cursor string
+	// sweepSeen and sweptKeys accumulate across the polls of one sweep -- one
+	// full pass over the CR set, which a standing budget cut spreads over
+	// several polls. The streaks are pruned only once a sweep has reached every
+	// current CR, on the pods it saw; pruning on a single cut poll's partial
+	// view would drop the streaks of the CRs it did not reach. Reset when the
+	// sweep completes. Accessed only from pollOnce, which runs serially.
+	sweepSeen map[string]bool
+	sweptKeys map[string]bool
 }
 
 type usageScrapeStreak struct {
@@ -135,6 +151,8 @@ func NewUsageCounterPoller(r *PlatformAgentReconciler) *UsageCounterPoller {
 		now:        time.Now,
 		pollBudget: func() time.Duration { return usageCountersPollInterval },
 		streaks:    map[types.UID]*usageScrapeStreak{},
+		sweepSeen:  map[string]bool{},
+		sweptKeys:  map[string]bool{},
 	}
 }
 
@@ -157,11 +175,21 @@ func (p *UsageCounterPoller) Start(ctx context.Context) error {
 // one operator replica advances them.
 func (p *UsageCounterPoller) NeedLeaderElection() bool { return true }
 
-// pollOnce runs one poll over every PlatformAgent, then drops the failure
-// streaks of pods that no CR listed, once over all of them: the streak map is
-// per process, not per CR.
+// pollOnce runs one poll over the PlatformAgents, in namespace/name order and
+// resuming after the cursor so a budget-cut poll picks up where it stopped, then
+// prunes the failure streaks once a sweep has covered every CR: the streak map
+// is per process, not per CR.
 func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 	log := logf.FromContext(parent).WithName(usagePollerLogName)
+	// A hand-built poller (a test harness) may leave the sweep maps nil; a nil
+	// map read is fine but a write panics, so make them once here rather than in
+	// every construction site.
+	if p.sweepSeen == nil {
+		p.sweepSeen = map[string]bool{}
+	}
+	if p.sweptKeys == nil {
+		p.sweptKeys = map[string]bool{}
+	}
 	// A hand-built poller (the envtest harness) may leave pollBudget nil; fall
 	// back to the interval so a missing seam cannot panic the poll.
 	budget := usageCountersPollInterval
@@ -177,27 +205,81 @@ func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 		}
 		return
 	}
-	seen := map[string]bool{}
+	// Sort by namespace/name and resume after the cursor, wrapping. The informer
+	// store is a Go map, so List's order is a fresh shuffle each call; a stable
+	// order with a cursor is what lets a standing budget cut make deterministic
+	// progress through the list instead of reading the CRs behind the blockage
+	// by chance.
+	ordered := make([]*agentv1alpha1.PlatformAgent, len(list.Items))
 	for i := range list.Items {
-		agent := &list.Items[i]
+		ordered[i] = &list.Items[i]
+	}
+	sort.Slice(ordered, func(i, j int) bool { return usagePollKey(ordered[i]) < usagePollKey(ordered[j]) })
+	start := 0
+	for start < len(ordered) && usagePollKey(ordered[start]) <= p.cursor {
+		start++
+	}
+	if start == len(ordered) {
+		start = 0
+	}
+	seen := map[string]bool{}
+	n := len(ordered)
+	for off := 0; off < n; off++ {
+		agent := ordered[(start+off)%n]
 		if err := p.pollAgent(ctx, agent, seen); err != nil {
 			if ctx.Err() != nil {
-				// The poll hit its budget: the CRs left this interval are read
-				// next interval. Logged, not counted as a failure, so an
+				// The poll hit its budget, or the manager is stopping. Only the
+				// first is worth a line: the CRs left this interval are read
+				// first next interval (the cursor stays on the CR this poll
+				// stopped at), logged rather than counted as a failure, so an
 				// unreachable listener holding its dial open does not freeze the
-				// CRs behind it without a word.
-				log.Info("usage counters poll did not finish within its budget; the remaining CRs are read next interval", "budget", budget.String())
+				// CRs behind it without a word. A cancelled parent is a shutdown
+				// or a leader change, and the next leader polls afresh.
+				if parent.Err() == nil {
+					log.Info("usage counters poll did not finish within its budget; the remaining CRs are read first next interval", "budget", budget.String())
+				}
 				break
 			}
 			log.Error(err, "usage counters poll failed; the totals are where they were", "platformagent", client.ObjectKeyFromObject(agent).String())
 		}
+		// The CR was processed -- polled, or a per-CR error that is not a cut.
+		// Advance the cursor past it so the next poll resumes after it, and mark
+		// it swept. A cut breaks above without reaching here, leaving the cursor
+		// on the CR it stopped at so that one is retried first next interval.
+		p.cursor = usagePollKey(agent)
+		p.sweptKeys[usagePollKey(agent)] = true
 	}
-	// Prune only after a poll that reached every CR: seen is partial when the
-	// budget cut the poll short, and pruning on it would drop the streaks of
-	// CRs this poll never got to.
-	if ctx.Err() == nil {
-		p.forgetDepartedStreaks(seen)
+	// Prune once a sweep -- one full pass over the CR set, spread over several
+	// polls while a budget cut lasts -- has reached every current CR, on the
+	// pods that sweep saw. Pruning on a single cut poll's `seen` would drop the
+	// streaks of the CRs it did not reach; accumulating across the sweep keeps
+	// the map bounded without that.
+	for uid := range seen {
+		p.sweepSeen[uid] = true
 	}
+	if p.sweepComplete(ordered) {
+		p.forgetDepartedStreaks(p.sweepSeen)
+		p.sweepSeen = map[string]bool{}
+		p.sweptKeys = map[string]bool{}
+	}
+}
+
+// usagePollKey orders a CR within a poll and keys the cursor and the sweep:
+// namespace/name, unique and stable across polls.
+func usagePollKey(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Namespace + "/" + agent.Name
+}
+
+// sweepComplete reports whether the current sweep has finished every CR the
+// latest List returned. An empty list is vacuously complete, so a cluster that
+// loses its last CR prunes every streak on the next poll.
+func (p *UsageCounterPoller) sweepComplete(ordered []*agentv1alpha1.PlatformAgent) bool {
+	for _, agent := range ordered {
+		if !p.sweptKeys[usagePollKey(agent)] {
+			return false
+		}
+	}
+	return true
 }
 
 // pollAgent is one poll of one CR: scrape, fold, write the ConfigMap when the
@@ -241,13 +323,11 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			StartTime: reading.StartTime,
 		})
 	}
-	// One Warning per CR per poll, however many of its listeners are failing:
-	// the event recorder's spam filter keys its token bucket on the CR, so a
-	// Warning per failing pod would drain it and drop the rest of the CR's
-	// events (the other pods' causes, and anything else recorded between polls).
-	if len(failing) > 0 {
-		p.recordScrapeFailures(cached, failing)
-	}
+	// The scrape and ConfigMap causes are not recorded here: both are standing
+	// failures that would each spend one of the CR's event-bucket tokens every
+	// poll, and two per poll drains the bucket and starves one of them. They are
+	// collected and emitted once, below, as the CR's single Warning this poll --
+	// recordStandingFailures explains the bucket arithmetic.
 
 	// Live reads, not the cache: the ConfigMap is the source of truth and the
 	// status its projection, and a cache that handed back either as it was
@@ -255,17 +335,31 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	// interval's deltas a second time.
 	agent := &agentv1alpha1.PlatformAgent{}
 	if err := p.reader().Get(ctx, key, agent); err != nil {
+		if ctx.Err() == nil {
+			p.recordStandingFailures(cached, failing, nil)
+		}
 		return client.IgnoreNotFound(err)
 	}
 	existing, doc, err := p.readDocument(ctx, log, agent, now)
 	if err != nil {
+		if ctx.Err() == nil {
+			p.recordStandingFailures(cached, failing, nil)
+		}
 		return err
 	}
 	result := foldUsage(doc, string(agent.UID), usageStatusSeed(agent, now), live, scraped, now)
 	if result.Changed {
-		if err := p.writeDocument(ctx, agent, existing, result.Document); err != nil {
+		if fault, err := p.writeDocument(ctx, agent, existing, result.Document); err != nil {
+			// The write failed: fold the ConfigMap cause, if any, into the CR's
+			// one Warning beside the scrape cause rather than recording a second.
+			if ctx.Err() == nil {
+				p.recordStandingFailures(cached, failing, fault)
+			}
 			return err
 		}
+	}
+	if ctx.Err() == nil {
+		p.recordStandingFailures(cached, failing, nil)
 	}
 	return p.projectStatus(ctx, agent, result.Document)
 }
@@ -506,6 +600,16 @@ func usageConfigMapIsOurs(cm *corev1.ConfigMap, agent *agentv1alpha1.PlatformAge
 	return false
 }
 
+// usageConfigMapFault is a standing reason the fold could not be written to the
+// counters ConfigMap: one parked under the name that is not the operator's, or
+// an immutable one. writeDocument returns it rather than recording it, so the
+// caller spends the CR's one event this poll on a single Warning carrying every
+// standing cause -- see recordStandingFailures.
+type usageConfigMapFault struct {
+	reason  string
+	message string
+}
+
 // writeDocument writes doc to the CR's ConfigMap, creating it with a
 // non-controller owner reference to the CR: collected with the CR, but not
 // re-enqueueing it, since the controller Owns ConfigMaps with no predicate and
@@ -513,11 +617,11 @@ func usageConfigMapIsOurs(cm *corev1.ConfigMap, agent *agentv1alpha1.PlatformAge
 // ConfigMap the operator owns -- by instance label or an owner reference of
 // this name, a predecessor's on a delete-and-recreate included -- is updated in
 // place; one parked under the name that is not the operator's is left untouched,
-// with a Warning on the CR.
-func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.ConfigMap, doc *usageDocument) error {
+// and the cause returned for the caller to record on the CR.
+func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1alpha1.PlatformAgent, existing *corev1.ConfigMap, doc *usageDocument) (*usageConfigMapFault, error) {
 	raw, err := json.Marshal(doc)
 	if err != nil {
-		return fmt.Errorf("serialising the usage counters document: %w", err)
+		return nil, fmt.Errorf("serialising the usage counters document: %w", err)
 	}
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: usageCountersConfigMapName(agent), Namespace: agent.Namespace}}
 	if existing != nil {
@@ -526,37 +630,43 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 			// would stamp our labels and an owner reference onto an object we
 			// do not own, which the finalizer would then delete; a CR deleted
 			// and re-applied under the same name is still ours by name, so that
-			// case is unaffected. Leave it, and surface why status.usage is
-			// frozen where the design promises -- kubectl describe on the CR.
-			p.r.recordEvent(agent, corev1.EventTypeWarning, usageConfigMapForeignReason,
-				fmt.Sprintf("a ConfigMap named %s already exists and is not the operator's: status.usage will not advance until it is removed", cm.Name))
-			return fmt.Errorf("the usage counters ConfigMap %s is not the operator's; refusing to overwrite it", cm.Name)
+			// case is unaffected. Leave it, and return the cause so the caller
+			// surfaces why status.usage is frozen where the design promises --
+			// kubectl describe on the CR -- in the CR's one Warning this poll.
+			return &usageConfigMapFault{
+					reason:  usageConfigMapForeignReason,
+					message: fmt.Sprintf("a ConfigMap named %s already exists and is not the operator's: status.usage will not advance until it is removed", cm.Name),
+				},
+				fmt.Errorf("the usage counters ConfigMap %s is not the operator's; refusing to overwrite it", cm.Name)
 		}
 		cm = existing.DeepCopy()
 	}
 	withCommonLabels(cm, agent)
 	if err := controllerutil.SetOwnerReference(agent, cm, p.r.Scheme); err != nil {
-		return fmt.Errorf("setting the owner reference on the usage counters ConfigMap: %w", err)
+		return nil, fmt.Errorf("setting the owner reference on the usage counters ConfigMap: %w", err)
 	}
 	cm.Data = map[string]string{usageCountersDocumentKey: string(raw)}
 	if existing == nil {
 		if err := p.r.Create(ctx, cm); err != nil {
-			return fmt.Errorf("creating the usage counters ConfigMap: %w", err)
+			return nil, fmt.Errorf("creating the usage counters ConfigMap: %w", err)
 		}
-		return nil
+		return nil, nil
 	}
 	if err := p.r.Update(ctx, cm); err != nil {
 		if apierrors.IsInvalid(err) || (existing.Immutable != nil && *existing.Immutable) {
 			// An immutable ConfigMap -- hand-edited, or a foreign copy left in
 			// place -- rejects every update, so the counters would freeze with
-			// nothing but a log line to say why. Surface the cause where the
-			// design promises it: in `kubectl describe` on the CR.
-			p.r.recordEvent(agent, corev1.EventTypeWarning, usageConfigMapImmutableReason,
-				fmt.Sprintf("the usage counters ConfigMap %s is immutable: status.usage will not advance until it is deleted so the operator can recreate it", cm.Name))
+			// nothing but a log line to say why. Return the cause so the caller
+			// surfaces it where the design promises: `kubectl describe` on the CR.
+			return &usageConfigMapFault{
+					reason:  usageConfigMapImmutableReason,
+					message: fmt.Sprintf("the usage counters ConfigMap %s is immutable: status.usage will not advance until it is deleted so the operator can recreate it", cm.Name),
+				},
+				fmt.Errorf("updating the usage counters ConfigMap: %w", err)
 		}
-		return fmt.Errorf("updating the usage counters ConfigMap: %w", err)
+		return nil, fmt.Errorf("updating the usage counters ConfigMap: %w", err)
 	}
-	return nil
+	return nil, nil
 }
 
 // projectStatus patches status.usage's counters and lastActiveTime from doc
@@ -593,7 +703,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 }
 
 // usageScrapeFailure is one pod whose listener failed a scrape this poll, at or
-// past the streak threshold: what recordScrapeFailures needs to name it in the
+// past the streak threshold: what the CR's one Warning needs to name it in the
 // CR's one Warning and to pick the guidance its kind points at.
 type usageScrapeFailure struct {
 	name    string
@@ -606,7 +716,7 @@ type usageScrapeFailure struct {
 // first failure of a run, logs one line naming the pod and the error kind and
 // never the body. It returns the pod's failure descriptor and whether the
 // streak has reached usageScrapeFailureEventStreak, the point from which the
-// poll reports the pod in the CR's one Warning (recordScrapeFailures). A
+// poll reports the pod in the CR's one Warning (recordStandingFailures). A
 // shorter streak reports nothing, so an upgrade's gap -- listeners moving
 // before the policies admit the operator -- leaves no Warning on a healthy CR.
 func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarget, err error) (usageScrapeFailure, bool) {
@@ -632,20 +742,44 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarg
 	return usageScrapeFailure{name: target.name, counter: target.counter, detail: detail, err: err}, count >= usageScrapeFailureEventStreak
 }
 
-// recordScrapeFailures records one Warning on the CR for every listener that
-// failed this poll past its streak, naming each pod and ending with the
-// distinct guidance their kinds point at. One event per CR per poll, not one
-// per pod: the event recorder keys its spam filter on source+involvedObject, so
-// a Warning per pod would drain the CR's token bucket (burst 25, one refill per
-// poll interval) and drop the rest -- the other pods' causes this poll, and
-// anything the CR records before the bucket refills. The message is byte-stable
-// across polls for a stable failing set: the pods are sorted by name and the
-// guidance deduplicated in a fixed order, and it carries no per-poll count, so
-// the recorder folds the repeats into one live Event with a rising count and a
+// recordStandingFailures records at most one Warning on the CR for this poll,
+// carrying every standing cause: the listeners that failed this poll past their
+// streak, and -- when the fold could not be written -- the ConfigMap fault. The
+// event recorder keys its spam filter on source+involvedObject, so every Warning
+// on the CR draws on one token bucket (burst 25, one refill per poll interval);
+// a second Warning in the same poll, under two standing failures at once, drains
+// it over ~25 polls and then starves whichever is recorded second -- here the
+// ConfigMap cause the counters freeze on, whose last Event the API server's
+// one-hour retention then removes, leaving kubectl describe showing only the
+// scrape. One event with one message keeps every cause where the design puts it.
+func (p *UsageCounterPoller) recordStandingFailures(agent *agentv1alpha1.PlatformAgent, failures []usageScrapeFailure, fault *usageConfigMapFault) {
+	var scrape string
+	if len(failures) > 0 {
+		scrape = usageScrapeFailureMessage(failures)
+	}
+	switch {
+	case fault != nil && scrape != "":
+		// Both causes, one event: the ConfigMap reason -- the cause actually
+		// freezing the totals -- with the scrape cause appended, so neither is
+		// lost and kubectl describe shows both.
+		p.r.recordEvent(agent, corev1.EventTypeWarning, fault.reason, fmt.Sprintf("%s. Also: %s", fault.message, scrape))
+	case fault != nil:
+		p.r.recordEvent(agent, corev1.EventTypeWarning, fault.reason, fault.message)
+	case scrape != "":
+		p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason, scrape)
+	}
+}
+
+// usageScrapeFailureMessage is the body of the Warning the CR gets for the
+// listeners that failed this poll past their streak, naming each pod and ending
+// with the distinct guidance their kinds point at. It is byte-stable across
+// polls for a stable failing set: the pods are sorted by name and the guidance
+// deduplicated in a fixed order, and it carries no per-poll count, so the
+// recorder folds the repeats into one live Event with a rising count and a
 // refreshed LastTimestamp, and the cause outlives the API server's one-hour
 // Event retention instead of standing alone beside a frozen lastActiveTime the
 // morning after a NetworkPolicy started blocking the scrape.
-func (p *UsageCounterPoller) recordScrapeFailures(agent *agentv1alpha1.PlatformAgent, failures []usageScrapeFailure) {
+func usageScrapeFailureMessage(failures []usageScrapeFailure) string {
 	sort.Slice(failures, func(i, j int) bool { return failures[i].name < failures[j].name })
 	perPod := make([]string, 0, len(failures))
 	picked := map[string]bool{}
@@ -659,9 +793,8 @@ func (p *UsageCounterPoller) recordScrapeFailures(agent *agentv1alpha1.PlatformA
 			guidance = append(guidance, g)
 		}
 	}
-	p.r.recordEvent(agent, corev1.EventTypeWarning, usageScrapeFailingReason,
-		fmt.Sprintf("Metrics listeners cannot be scraped, so the totals they feed stop advancing unless another pod carries them: %s. %s",
-			strings.Join(perPod, "; "), strings.Join(guidance, " ")))
+	return fmt.Sprintf("Metrics listeners cannot be scraped, so the totals they feed stop advancing unless another pod carries them: %s. %s",
+		strings.Join(perPod, "; "), strings.Join(guidance, " "))
 }
 
 // usageScrapeGuidance is the sentence the Warning event ends with, chosen by

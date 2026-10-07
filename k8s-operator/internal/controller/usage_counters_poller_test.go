@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -37,6 +38,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -120,6 +122,10 @@ type stubUsageSource struct {
 	errs     map[string]error
 	blocking map[string]bool
 	calls    []string
+	// hook, when set, is called at the start of every Scrape with the address
+	// being scraped, before the blocking wait: a seam for a test that must act
+	// (cancel a parent context, say) while a scrape is in flight.
+	hook func(addr string)
 }
 
 func (s *stubUsageSource) Scrape(ctx context.Context, addr, _ string) (usageReading, error) {
@@ -128,7 +134,11 @@ func (s *stubUsageSource) Scrape(ctx context.Context, addr, _ string) (usageRead
 	block := s.blocking[addr]
 	err := s.errs[addr]
 	reading, ok := s.readings[addr]
+	hook := s.hook
 	s.mu.Unlock()
+	if hook != nil {
+		hook(addr)
+	}
 	// A blocking address models a listener that accepts the dial and never
 	// answers: the real source holds here until its own deadline, so the stub
 	// holds until the context the poll bounds it with is done.
@@ -162,6 +172,12 @@ func (s *stubUsageSource) block(addr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.blocking[addr] = true
+}
+
+func (s *stubUsageSource) unblock(addr string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.blocking, addr)
 }
 
 func (s *stubUsageSource) scraped(addr string) bool {
@@ -291,7 +307,7 @@ func (h *usageHarness) writeDocument(doc *usageDocument) {
 	if err == nil {
 		existing = cm
 	}
-	if err := h.p.writeDocument(context.Background(), agent, existing, doc); err != nil {
+	if _, err := h.p.writeDocument(context.Background(), agent, existing, doc); err != nil {
 		h.t.Fatalf("writing the document: %v", err)
 	}
 	h.cmWrites = 0
@@ -1193,5 +1209,243 @@ func TestUsagePoller_AForeignConfigMapIsLeftUntouched(t *testing.T) {
 	}
 	if cm.Labels[labelInstance] != "" {
 		t.Errorf("an instance label was added to the foreign ConfigMap: %v", cm.Labels)
+	}
+}
+
+// countingReader is a client.Reader that counts Gets by object type, so a test
+// can prove a read went through the uncached APIReader rather than the cached
+// Client. The harness points both readers at one fake client, which hides a
+// regression that routes either of the poller's live reads through the cache;
+// setting a distinct APIReader makes the routing observable.
+type countingReader struct {
+	client.Reader
+	mu        sync.Mutex
+	agentGets int
+	cmGets    int
+}
+
+func (c *countingReader) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	c.mu.Lock()
+	switch obj.(type) {
+	case *agentv1alpha1.PlatformAgent:
+		c.agentGets++
+	case *corev1.ConfigMap:
+		c.cmGets++
+	}
+	c.mu.Unlock()
+	return c.Reader.Get(ctx, key, obj, opts...)
+}
+
+// The CR and its counters ConfigMap are read through the uncached APIReader, not
+// the cached Client: a cached read of either, handed back as it stood before
+// this poller's own last write, would have the next poll add the interval's
+// deltas a second time.
+func TestUsagePoller_ReadsTheCRAndConfigMapThroughTheAPIReader(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	reader := &countingReader{Reader: h.cl}
+	h.r.APIReader = reader // distinct from Client, which stays the cached fake
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+
+	h.poll(5)
+
+	if reader.agentGets == 0 {
+		t.Errorf("the CR was not read through the APIReader; a read routed through the cached Client would double-count the interval next poll")
+	}
+	if reader.cmGets == 0 {
+		t.Errorf("the counters ConfigMap was not read through the APIReader; a cached read would double-count the interval next poll")
+	}
+}
+
+// A scrape failure past its streak and a ConfigMap fault in the same poll share
+// the CR's one Warning: both standing causes land in a single event -- the
+// ConfigMap reason, which is what actually freezes the totals, with the scrape
+// cause appended after "Also:" -- rather than two events draining the CR's one
+// token bucket and starving whichever is recorded second.
+func TestUsagePoller_AScrapeFailureAndAConfigMapFaultShareOneWarning(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	cmName := usageTestAgentName + usageCountersConfigMapSuffix
+	// The gateway's listener is down from the first poll; the broker advances
+	// each poll so the document changes and the write is attempted.
+	h.stub.fail(gatewayAddr(), usageScrapeKindConnect)
+	h.stub.set(brokerAddr(), 10, nil)
+	h.poll(5) // Creates the ConfigMap; the gateway's first failure is a log line only.
+
+	// The API server now rejects every update as Invalid, as for an immutable one.
+	h.cmUpdateErr = apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, cmName, nil)
+	h.stub.set(brokerAddr(), 20, nil) // the broker moves, so the write runs and is rejected
+	h.poll(10)                        // the gateway is now past its streak; both causes stand at once
+
+	var events []string
+drain:
+	for {
+		select {
+		case ev := <-h.recorder.Events:
+			events = append(events, ev)
+		default:
+			break drain
+		}
+	}
+	if len(events) != 1 {
+		t.Fatalf("got %d Warning(s) for a poll with both a scrape failure and a ConfigMap fault, want exactly 1: %q", len(events), events)
+	}
+	for _, want := range []string{usageConfigMapImmutableReason, cmName, "immutable", "agent-gateway-aaa", "Also:"} {
+		if !strings.Contains(events[0], want) {
+			t.Errorf("the shared Warning does not contain %q: %q", want, events[0])
+		}
+	}
+}
+
+// A budget cut leaves the cursor on the CR it stopped at, so that CR is polled
+// first next interval and the CRs already finished are not re-read until the
+// sweep wraps -- the bounded-progress guarantee a stable order with a cursor
+// buys over List's per-call shuffle. Two CRs, the second's listener hung: the
+// first poll finishes CR A and is cut on CR B, leaving the cursor on A; once B
+// is unblocked, the next poll resumes at B before A.
+func TestUsagePoller_ABudgetCutResumesAtTheCutCRNextPoll(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	a := usageTestAgent(created) // usage-test/agent
+	b := usageTestAgent(created)
+	b.Name, b.UID = "agent-zzz", "agent-uid-2" // usage-test/agent-zzz sorts after A
+	bGateway := usageGatewayPod("agent-zzz-gateway-aaa", "gw-b", "10.0.2.10", created)
+	bGateway.Labels = map[string]string{"app": "agent-zzz-gateway"}
+	h := newUsageHarness(t, a, append(usageDefaultObjects(created), b, bGateway)...)
+	const budget = 50 * time.Millisecond
+	h.p.pollBudget = func() time.Duration { return budget }
+	bAddr := "10.0.2.10:9095"
+	h.stub.set(gatewayAddr(), 100, nil) // A's listeners answer fast
+	h.stub.set(brokerAddr(), 10, nil)
+	h.stub.block(bAddr) // B's listener hangs, consuming the rest of the budget
+
+	// Poll 1 blocks for the budget, so guard it as the bounded-poll test does.
+	done := make(chan struct{})
+	go func() { h.poll(5); close(done) }()
+	const guard = 10 * time.Second
+	select {
+	case <-done:
+	case <-time.After(guard):
+		t.Fatalf("poll 1 did not return within %s; its budget does not bound it", guard)
+	}
+
+	const keyA, keyB = usageTestNamespace + "/agent", usageTestNamespace + "/agent-zzz"
+	if h.p.cursor != keyA {
+		t.Fatalf("after a cut on B, the cursor is %q, want %q (the last finished CR)", h.p.cursor, keyA)
+	}
+	if !h.p.sweptKeys[keyA] {
+		t.Errorf("CR A finished but is not marked swept: %v", h.p.sweptKeys)
+	}
+	if h.p.sweptKeys[keyB] {
+		t.Errorf("CR B was cut but is marked swept: %v", h.p.sweptKeys)
+	}
+	if !h.stub.scraped(bAddr) {
+		t.Errorf("CR B's listener was never reached on poll 1: %v", h.stub.calls)
+	}
+
+	// Unblock B and poll again: the cursor sits on A, so B is polled first.
+	h.stub.unblock(bAddr)
+	h.stub.set(bAddr, 50, nil)
+	h.stub.mu.Lock()
+	h.stub.calls = nil
+	h.stub.mu.Unlock()
+	h.poll(10)
+	h.stub.mu.Lock()
+	first := ""
+	if len(h.stub.calls) > 0 {
+		first = h.stub.calls[0]
+	}
+	h.stub.mu.Unlock()
+	if first != bAddr {
+		t.Errorf("poll 2's first scrape was %q, want the cut CR's listener %q (resume after the cursor)", first, bAddr)
+	}
+	if len(h.p.sweptKeys) != 0 {
+		t.Errorf("after a poll that reached every CR, the sweep did not reset: %v", h.p.sweptKeys)
+	}
+}
+
+// When the poll's own budget cuts it short -- a listener that hangs past the
+// interval -- it logs one line, so a hung listener freezing the CRs behind it is
+// not silent. The parent context is live: this is the poll's own deadline.
+func TestUsagePoller_LogsWhenItsOwnBudgetCutsThePoll(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	const budget = 50 * time.Millisecond
+	h.p.pollBudget = func() time.Duration { return budget }
+	h.stub.block(gatewayAddr())
+	h.stub.set(brokerAddr(), 10, nil)
+
+	var mu sync.Mutex
+	var lines []string
+	logger := funcr.New(func(_, args string) {
+		mu.Lock()
+		lines = append(lines, args)
+		mu.Unlock()
+	}, funcr.Options{})
+	ctx := logf.IntoContext(context.Background(), logger)
+	h.clock = usageClock(5)
+
+	done := make(chan struct{})
+	go func() { h.p.pollOnce(ctx); close(done) }()
+	const guard = 10 * time.Second
+	select {
+	case <-done:
+	case <-time.After(guard):
+		t.Fatalf("pollOnce did not return within %s; its budget does not bound it", guard)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	found := false
+	for _, l := range lines {
+		if strings.Contains(l, "did not finish within its budget") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a budget-cut poll logged no budget line: %q", lines)
+	}
+}
+
+// A poll cut short by a cancelled parent -- a shutdown or a leader change, not
+// the poll's own budget -- logs no budget line: the next leader polls afresh,
+// and a spurious "did not finish within its budget" on every leader change would
+// cry wolf about a hung listener that is not there. The parent.Err() guard is
+// what separates the two.
+func TestUsagePoller_DoesNotLogABudgetCutWhenTheParentIsCancelled(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.p.pollBudget = func() time.Duration { return time.Minute } // far longer than the guard below
+	h.stub.block(gatewayAddr())
+	h.stub.set(brokerAddr(), 10, nil)
+
+	var mu sync.Mutex
+	var lines []string
+	logger := funcr.New(func(_, args string) {
+		mu.Lock()
+		lines = append(lines, args)
+		mu.Unlock()
+	}, funcr.Options{})
+	ctx, cancel := context.WithCancel(logf.IntoContext(context.Background(), logger))
+	// Cancel the parent while a scrape is in flight, so the poll is cut by the
+	// cancellation and not by its (far longer) budget.
+	h.stub.hook = func(string) { cancel() }
+	h.clock = usageClock(5)
+
+	done := make(chan struct{})
+	go func() { h.p.pollOnce(ctx); close(done) }()
+	const guard = 10 * time.Second
+	select {
+	case <-done:
+	case <-time.After(guard):
+		t.Fatalf("pollOnce did not return within %s of its parent being cancelled", guard)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, l := range lines {
+		if strings.Contains(l, "did not finish within its budget") {
+			t.Errorf("a poll cut by a cancelled parent logged a budget line: %q", l)
+		}
 	}
 }
