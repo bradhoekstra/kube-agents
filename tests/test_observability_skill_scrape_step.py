@@ -10,17 +10,25 @@ reported "not scraped" (gke-labs/kube-agents#2141). The step now names the
 The bench case `observability-watcher-scrape-state` grades the agent's behaviour,
 and on the live-test install the worker read the PodMonitoring without the skill's
 help, so the case does not red against the old step. Nothing executes the skill
-prose, so this test pins the phrases the fix is made of and the invariant that
-guards it: every `kubectl` command step 1 issues reads the `PodMonitoring` (or the
-`gmp-system` collector namespace), so a revert that points a command at the
-Deployment or any other resource fails here, whatever nouns the surrounding prose
-uses. Four denylist patterns back that up for a revert written as prose rather than
-a command, but each keys on an annotation word, so they catch an annotation-worded
-revert, not one phrased in entirely other words -- the kubectl allowlist, not the
-denylist, is what holds each command's resource read to the PodMonitoring. Per
-`.agents/rules/eval_driven_development.md` this stand-in does not replace the case;
-it is the guard the case cannot be, because the agent's behaviour was already
-correct.
+prose, so this test pins the phrases the fix is made of and the shape of the step:
+step 1 is a fixed three-command recipe, so the kubectl commands in its fenced code
+blocks are pinned verbatim (`STEP_ONE_COMMANDS`). Any edit to that recipe -- a
+command added, removed, reworded, or reverted to read the Deployment, in any shell
+spelling -- changes the collected list and reds this test, forcing a deliberate
+update. Pinning the list rather than parsing each line for a resource kind is what
+earlier rounds kept chasing with one more shell-separator rule: a regex standing in
+for shell grammar leaks both ways (an env-prefixed or continued command it fails to
+collect, a plural kind it false-reds), while an exact list cannot. Four denylist
+patterns back that up for a revert written as prose rather than a fenced command,
+but each keys on an annotation word, so they catch an annotation-worded revert, not
+one phrased in entirely other words. Per `.agents/rules/eval_driven_development.md`
+this stand-in does not replace the case; it is the guard the case cannot be, because
+the agent's behaviour was already correct.
+
+Residual: a command written in an inline span rather than a fenced code block is not
+collected, so it is neither pinned by the recipe nor, unless it names the Deployment
+or an annotation word, caught by the denylist. Step 1's reads are all fenced;
+collecting from inline spans would read a prose `kubectl` mention as a command.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_observability_skill_scrape_step.py' -v
@@ -52,6 +60,21 @@ GATEWAY_READ = "kubectl get podmonitoring <name>-gateway-monitoring"
 WATCHER_PORT = "9095"
 WATCHER_SERIES = 'up{job="<name>-gateway-monitoring"}'
 WATCHER_UP = "k8s_event_watcher_cluster_up"
+
+# Step 1 is a fixed recipe: these exact kubectl commands, in this order, are the
+# only ones its fenced code blocks issue. Pin them verbatim. A revert to the #2141
+# Deployment-annotation read, an added or reworded command, or a second resource
+# hidden behind a chain, a redirect or an env prefix all change the collected list
+# and red `test_step_one_issues_exactly_the_podmonitoring_reads`. This is the
+# structural guard the separator-splitting regex of earlier rounds was reaching
+# for: no shell grammar to parse, so no shape to miss and no benign spelling to
+# false-red. Reword the step on purpose and this list is updated in the same change.
+STEP_ONE_COMMANDS = [
+    "kubectl get pods -n gmp-system",
+    "kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml",
+    "kubectl get podmonitoring <name>-credential-proxy-monitoring -n kubeagents-system -o yaml",
+]
+
 # The #2141 bug, reverted: the Deployment-annotation read must not come back into
 # the step. The operator renders no such annotation, so any `kubectl get`/
 # `describe` of a deployment in step 1 is the regression, in any spelling of the
@@ -61,7 +84,9 @@ WATCHER_UP = "k8s_event_watcher_cluster_up"
 # match describes "a deployment read on one line" rather than one command shape.
 # Held to one line (`[^\n]*`, never `.`), so the prose that names the Deployment
 # only to forbid it ("not off Deployment annotations", "whatever the Deployment
-# says") carries no `kubectl` on its line and does not trip.
+# says") carries no `kubectl` on its line and does not trip. This denylist catches
+# a revert written in prose or an inline span, which the fenced-command recipe does
+# not collect; the recipe catches a revert written as a fenced command.
 DEPLOYMENT_READ = re.compile(r"(?i)kubectl\b[^\n]*\b(get|describe)\b[^\n]*\bdeploy(ments?)?(\.apps)?\b")
 # The same bug by its own noun, not the resource it read: the scrape opt-in
 # annotation. A revert that reads it off the pod template instead of the
@@ -83,43 +108,15 @@ SCRAPE_ANNOTATION_PROSE = re.compile(
 # last check widens the net to the annotation word itself: step 1 names annotations
 # exactly once, in the sentence that forbids reading them (READ_OFF_PODMONITORING);
 # strip that sentence and any surviving `annotat` is an annotation read the three
-# patterns above may not spell out. It is not the "in any words" backstop it reads
-# like -- it keys on the substring `annotat`, so a revert phrased without that word
-# slips it too; the step-1 kubectl allowlist below is what holds each command's
-# resource read to the PodMonitoring, within the residuals documented there. The
-# cost of this one is that a future non-revert mention of the word would also trip
-# it and have to update the guard; for a step whose only correct mention of
-# annotations is to forbid them, that is the right default.
+# patterns above may not spell out. It is not an "in any words" backstop -- it keys
+# on the substring `annotat`, so a revert phrased without that word slips it too;
+# the pinned recipe above is what holds each fenced command's read to the
+# PodMonitoring. The cost of this one is that a future non-revert mention of the
+# word would also trip it and have to update the guard; for a step whose only
+# correct mention of annotations is to forbid them, that is the right default.
 ANY_ANNOTATION = re.compile(r"(?i)annotat")
-# The positive guard the resource-read invariant actually rests on, where the
-# denylist above (every pattern keyed on an annotation word) cannot. Collect every
-# `kubectl` command step 1 issues from its fenced code blocks, and require each to
-# name the PodMonitoring read -- the `podmonitoring` kind, or the `gmp-system`
-# namespace the managed collector's pods live in. The check splits each command at
-# shell separators (`;`, `|`, `&`, `>`, `#`, `$(`) and holds the segment that runs
-# the read to the allowlist, so a revert cannot borrow the word from a chained
-# command (`... && kubectl get podmonitoring -A`), a downstream filter (`| grep
-# podmonitoring`), an output filename (`> podmonitoring.yaml`), a comment or a
-# substitution: each puts `podmonitoring` in a segment that does not run the read,
-# while the read segment names the Deployment. Step 1's three reads each name the
-# kind or namespace in the read segment itself. Three residuals stand, each the
-# price of a substring check over shell grammar rather than a parse of it:
-#   1. a command that names `podmonitoring`/`gmp-system` in a label-selector or
-#      jsonpath value in the same segment as a read of another resource still
-#      passes -- the check cannot tell the resource from an argument;
-#   2. a revert that issues no kubectl command and uses no annotation word -- a
-#      step that runs no command to read the wrong resource has not reverted what
-#      the agent does, so there is nothing here to catch;
-#   3. a command written in an inline span rather than a fenced block is not
-#      collected; step 1's reads are all fenced, and collecting from inline spans
-#      would read a prose `kubectl` mention as a command and false-red the step.
+
 FENCED_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
-# `<name>`/`<namespace>` placeholders, neutralized before the split so their angle
-# brackets are not read as a `>` redirect and fragment a real command short.
-PLACEHOLDER = re.compile(r"<[\w-]+>")
-# The shell separators a one-line command can hide a second resource behind.
-COMMAND_SEPARATORS = re.compile(r"[;|&>#]|\$\(")
-STEP_ONE_KUBECTL_ALLOW = re.compile(r"(?i)\bpodmonitoring\b|\bgmp-system\b")
 
 
 def _read(path: Path) -> str:
@@ -135,40 +132,23 @@ def _metrics_step_one(skill: str) -> str:
     return skill[start:end]
 
 
-def _step_one_kubectl_commands(step: str) -> list[str]:
-    """Every kubectl command step 1 issues, read from its fenced code blocks.
-    Step 1's three reads all sit in ```bash blocks; collecting a line that starts
-    with `kubectl` from the blocks, rather than every `kubectl` substring on any
-    line, is what keeps a prose mention -- an inline `kubectl` span in a sentence
-    -- from reading as a command to guard. The inverse is a documented residual:
-    a command written in an inline span rather than a fenced block is not
-    collected."""
+def _step_one_fenced_commands(step: str) -> list[str]:
+    """Every command line step 1's fenced code blocks issue, in order.
+
+    Collects every non-empty line from the step's ```...``` blocks -- not just the
+    lines that begin with `kubectl`, so a revert written as an env-prefixed
+    (`KUBECONFIG=... kubectl ...`), `sudo`-prefixed or looped command is collected
+    and reds the exact-match rather than being silently skipped. A `kubectl`
+    written in prose (an inline span in a sentence) sits outside any fenced block
+    and is not collected, so it is not mistaken for a command to pin.
+    """
     commands = []
     for block in FENCED_CODE_BLOCK.findall(step):
         for line in block.splitlines():
             line = line.strip()
-            if line.startswith("kubectl"):
+            if line:
                 commands.append(line)
     return commands
-
-
-def _command_reads_podmonitoring(command: str) -> bool:
-    """A kubectl command names the PodMonitoring read when every one of its
-    `kubectl` segments does. Split the command at shell separators (`;`, `|`, `&`,
-    `>`, `#`, `$(`) so a chained or redirected revert -- `kubectl get deployment
-    ... && kubectl get podmonitoring ...`, `... | grep podmonitoring`, `... >
-    podmonitoring.yaml` -- is judged on the segment that runs the read, not on the
-    word a later segment borrows. `<name>`/`<namespace>` placeholders are
-    neutralized first so their angle brackets are not read as a redirect. The
-    residual: a segment that names `podmonitoring` in a label-selector or jsonpath
-    value while reading another resource still passes -- a substring check cannot
-    tell the resource from an argument."""
-    neutralized = PLACEHOLDER.sub("X", command)
-    segments = COMMAND_SEPARATORS.split(neutralized)
-    kubectl_segments = [s for s in segments if "kubectl" in s]
-    return bool(kubectl_segments) and all(
-        STEP_ONE_KUBECTL_ALLOW.search(s) for s in kubectl_segments
-    )
 
 
 class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
@@ -177,6 +157,22 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
         for phrase in (READ_OFF_PODMONITORING, GATEWAY_READ, WATCHER_PORT, WATCHER_SERIES, WATCHER_UP):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, step, f"the observability skill's Prometheus step lost {phrase!r}")
+
+    def test_step_one_issues_exactly_the_podmonitoring_reads(self):
+        # The positive guard the resource-read invariant rests on: step 1's fenced
+        # code blocks issue exactly the three pinned reads, in order. A revert that
+        # points a command at the Deployment or any other resource -- added,
+        # substituted, chained, redirected, env-prefixed or looped -- changes this
+        # list and reds here, whatever nouns the surrounding prose uses. A
+        # deliberate reword of the step updates STEP_ONE_COMMANDS in the same change.
+        step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
+        self.assertEqual(
+            _step_one_fenced_commands(step),
+            STEP_ONE_COMMANDS,
+            "step 1's fenced kubectl recipe changed. If the change is intentional, "
+            "update STEP_ONE_COMMANDS to match; if a command now reads the Deployment "
+            "or another resource, that is the #2141 regression.",
+        )
 
     def test_step_one_does_not_send_the_agent_to_the_deployment_annotations(self):
         step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
@@ -207,9 +203,8 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
         # only in the sentence that forbids reading them. Strip that sentence and any
         # surviving "annotat" is an annotation read the denylist patterns may not
         # enumerate -- the #2141 regression wherever the word `annotation` appears.
-        # This keys on that word, not on any wording of the revert; the kubectl
-        # allowlist test below is the guard that holds each command's read to the
-        # PodMonitoring.
+        # This keys on that word, not on any wording of the revert; the pinned recipe
+        # is the guard that holds each fenced command's read to the PodMonitoring.
         step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
         residue = step.replace(READ_OFF_PODMONITORING, "")
         self.assertNotRegex(
@@ -218,84 +213,30 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
             "step 1 mentions annotations outside the sentence that forbids reading them (the #2141 regression, by the annotation word)",
         )
 
-    def test_step_one_kubectl_commands_all_read_the_podmonitoring(self):
-        # The positive guard the resource-read invariant rests on: every kubectl
-        # command step 1 issues names the PodMonitoring read (the `podmonitoring`
-        # kind or the `gmp-system` collector namespace) in the segment that runs
-        # it. A revert that points a command at the Deployment or any other
-        # resource names neither and fails here, whatever nouns the surrounding
-        # prose uses and wherever on the line it borrows the word from (see the
-        # separator-splitting guard the two injection tests below exercise).
-        step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
-        commands = _step_one_kubectl_commands(step)
-        self.assertTrue(commands, "step 1 issues no kubectl command to guard")
-        for command in commands:
-            with self.subTest(command=command):
-                self.assertTrue(
-                    _command_reads_podmonitoring(command),
-                    f"step 1 runs a kubectl command that names neither the "
-                    f"PodMonitoring kind nor the gmp-system namespace in the "
-                    f"segment that runs the read (the #2141 regression: a read "
-                    f"pointed at the Deployment or another resource): {command!r}",
-                )
-
-    def test_step_one_guard_reds_a_wrong_resource_read_however_it_borrows_the_word(self):
-        # The structural check, exercised against reverts that name `podmonitoring`
-        # somewhere on the command line while reading another resource. Each is
-        # rejected: the guard splits at shell separators and judges the segment
-        # that runs the read, so the word cannot be borrowed from a chained
-        # command, a downstream filter, an output filename, a comment or a
-        # substitution. The old `kubectl[^\n`]*` collector took the whole line and
-        # admitted all six (the finding this replaces).
-        reverts = (
-            "kubectl get deployment <name>-gateway && kubectl get podmonitoring -A",
-            "kubectl get deployment <name>-gateway ; echo podmonitoring",
-            "kubectl get deployment <name>-gateway | grep podmonitoring",
-            "kubectl get deployment <name>-gateway -o yaml > podmonitoring.yaml",
-            "kubectl get deployment <name>-gateway  # read the podmonitoring instead",
-            "kubectl get deployment <name>-gateway $(echo podmonitoring)",
-        )
-        for command in reverts:
-            with self.subTest(command=command):
-                self.assertFalse(
-                    _command_reads_podmonitoring(command),
-                    f"a wrong-resource read borrowed the podmonitoring word and passed: {command!r}",
-                )
-
-    def test_step_one_guard_admits_the_real_podmonitoring_reads(self):
-        reads = (
-            "kubectl get pods -n gmp-system",
-            "kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml",
-            "kubectl get podmonitoring <name>-credential-proxy-monitoring -n kubeagents-system -o yaml",
-            # A podmonitoring read whose output goes to a file named for something
-            # else still passes: the segment that runs the read names the kind.
-            "kubectl get podmonitoring <name>-gateway-monitoring -o yaml > /tmp/out.yaml",
-        )
-        for command in reads:
-            with self.subTest(command=command):
-                self.assertTrue(
-                    _command_reads_podmonitoring(command),
-                    f"a real podmonitoring read was rejected: {command!r}",
-                )
-
-    def test_step_one_collector_ignores_prose_kubectl_mentions(self):
+    def test_the_collector_reads_fenced_commands_not_prose_kubectl_mentions(self):
         # The collector reads commands from fenced code blocks, so a `kubectl`
         # written in prose (an inline span in a sentence) is not mistaken for a
-        # command to guard. Were it collected, a sentence that mentions `kubectl`
-        # without naming the PodMonitoring would false-red the real step.
+        # command to pin -- the reason the exact-match above is safe against step 1's
+        # prose, which names `kubectl` and the Deployment only to steer away from
+        # them. It also collects a command that does not begin with `kubectl` (an
+        # env prefix), so such a revert reds the exact-match rather than slipping it.
         step = (
             "### 1. Verify Cloud Monitoring & Prometheus State\n"
             "- Run `kubectl` against the collector, not the Deployment.\n"
             "  ```bash\n"
+            "  KUBECONFIG=/tmp/kc kubectl get deployment <name>-gateway -o yaml\n"
             "  kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml\n"
             "  ```\n"
             "### 2. Inspect CPU and Memory Metrics\n"
         )
-        commands = _step_one_kubectl_commands(_metrics_step_one(step))
+        commands = _step_one_fenced_commands(_metrics_step_one(step))
         self.assertEqual(
             commands,
-            ["kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml"],
-            "the collector picked up a prose kubectl mention or dropped the real command",
+            [
+                "KUBECONFIG=/tmp/kc kubectl get deployment <name>-gateway -o yaml",
+                "kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml",
+            ],
+            "the collector dropped an env-prefixed command or picked up a prose kubectl mention",
         )
 
 

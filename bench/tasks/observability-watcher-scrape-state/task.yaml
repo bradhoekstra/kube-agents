@@ -157,9 +157,15 @@ verification_spec:
   # `| Verdict | Scraped: no |` table row), its `scraped: no` never at a line start;
   # and (3) a negative that echoes the `Scraped: yes` option before its own
   # `Scraped: no` verdict line, which first-verdict-decides reads as the verdict,
-  # sparing the real one. (2) and (3) each pair with a stray "scraped: yes" that
-  # satisfies the affirmative; (3) is the price of the first-verdict prefix that
-  # spares a component negative under an affirmative headline.
+  # sparing the real one. The echo need not be the worker's own choice: the harness
+  # puts the front door's acknowledgement first in `final_message` (bench's
+  # parsing.py appends later output after it), and an ack that names the asked
+  # `Scraped: yes`/`Scraped: no` format back carries the token on its first line --
+  # so a red install can green here whenever its transcript opens with that ack, not
+  # only when the worker restates the option. (2) and (3) each pair with a stray
+  # "scraped: yes" that satisfies the affirmative; (3) is the price of the
+  # first-verdict prefix that spares a component negative under an affirmative
+  # headline.
   - name: the-answer-affirms-the-watcher-is-scraped
     role: objective
     mode: assert

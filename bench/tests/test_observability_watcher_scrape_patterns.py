@@ -309,7 +309,11 @@ POLARITY_INCORRECT = [
 #   4. a negative that echoes the `Scraped: yes` option before its own `Scraped: no`
 #      verdict line: first-verdict-decides reads the echoed affirmative as the verdict
 #      and the `\A...*?` prefix stops there, sparing the real negative -- the price of
-#      that prefix sparing a component negative under an affirmative headline.
+#      that prefix sparing a component negative under an affirmative headline. The
+#      echo need not be the worker's own: the front door's ack lands first in
+#      `final_message`, and one that names the asked format back (as this corpus
+#      entry opens) carries `Scraped: yes` on line one, so a red install greens here
+#      whenever its transcript opens with that ack.
 # Asserted so a future tightening that fixes any trips this test. (The old
 # false-red -- an affirmative that writes "scraped: no" in a later clause -- is
 # fixed by the line anchor and now sits in POLARITY_CORRECT.)
