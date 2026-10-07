@@ -77,6 +77,20 @@ const credentialProxyKeySeparator = "."
 // unbounded in number, while a condition message is capped.
 const credentialProxyRefusalMoreFmt = " (and %d more)" // #nosec G101 -- Message suffix, not a credential
 
+// credentialProxyRefusalMessageBudget bounds the refusal the condition and the
+// event carry, and credentialProxyRefusalEllipsis marks a refusal cut to fit
+// it. A refusal quotes the field path, and a resource name under limits or
+// requests is the author's and unbounded in length, while the CRD caps a
+// condition message at 32768 characters: an undeclared name longer than that
+// would fail every status write, Ready and every other condition with it, for
+// as long as it stays in the spec. The budget matches
+// hostPathDroppedEntryBudget's, far under the cap, because the message is read
+// in `kubectl describe`.
+const (
+	credentialProxyRefusalMessageBudget = 4096
+	credentialProxyRefusalEllipsis      = "..."
+)
+
 // credentialProxyResourcesPath is where the override sits on the CR.
 var credentialProxyResourcesPath = field.NewPath("spec", "deployment", "credentialProxy", "resources")
 
@@ -270,7 +284,8 @@ func sortedResourceNames(list corev1.ResourceList) []corev1.ResourceName {
 
 // credentialProxyResourcesRefusal is the reconciler's reading of
 // ValidateCredentialProxyResources: the first refusal with the count of the
-// rest, or "" when the override is valid. Warnings are not refusals; the
+// rest, within credentialProxyRefusalMessageBudget, or "" when the override is
+// valid. Warnings are not refusals; the
 // caller logs them.
 func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string, admission.Warnings) {
 	errs, warnings := ValidateCredentialProxyResources(agent.Spec.Deployment, credentialProxyResourcesPath)
@@ -278,8 +293,12 @@ func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string
 		return "", warnings
 	}
 	refusal := errs[0].Error()
+	more := ""
 	if len(errs) > 1 {
-		refusal += fmt.Sprintf(credentialProxyRefusalMoreFmt, len(errs)-1)
+		more = fmt.Sprintf(credentialProxyRefusalMoreFmt, len(errs)-1)
 	}
-	return refusal, warnings
+	if room := credentialProxyRefusalMessageBudget - len(more); len(refusal) > room {
+		refusal = truncateToValidUTF8(refusal, room-len(credentialProxyRefusalEllipsis)) + credentialProxyRefusalEllipsis
+	}
+	return refusal + more, warnings
 }

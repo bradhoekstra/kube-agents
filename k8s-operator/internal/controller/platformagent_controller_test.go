@@ -880,7 +880,7 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 // names the field, and the Deployment applied regardless, at the
 // operator's default resources, so the rest of what it carries keeps flowing.
 // The webhook is not in the loop, as on a chart install, which leaves it off.
-func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.ResourceRequirements, wantField string) {
+func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.ResourceRequirements, wantField string) string {
 	t.Helper()
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -1015,6 +1015,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 	if !warned {
 		t.Errorf("no Warning %s event naming %s", conditionReasonInvalidCredentialProxyResources, wantField)
 	}
+	return degraded.Message
 }
 
 // A memory limit under the floor: rendered, the broker would turn its budget
@@ -1032,6 +1033,25 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyRequestAboveTheLimitIs
 	reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
 		Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
 	}, "spec.deployment.credentialProxy.resources.requests.memory")
+}
+
+// An undeclared resource name is the author's and unbounded in length; quoted
+// whole, a 33,000-character one would push the Degraded message past the CRD's
+// 32768-character cap and fail every status write. The refusal is cut to the
+// budget, so the status write succeeds (the helper reads the condition back)
+// and the message stays bounded.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyRefusalOfALongNameIsBounded(t *testing.T) {
+	name := corev1.ResourceName("example.com/" + strings.Repeat("x", 33000))
+	msg := reconcileInvalidCredentialProxyResources(t, &corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{name: resource.MustParse("1")},
+	}, "spec.deployment.credentialProxy.resources.limits.example.com/xxx")
+	fixed := len(invalidCredentialProxyResourcesMsgFmt) - len("%s")
+	if len(msg) > credentialProxyRefusalMessageBudget+fixed {
+		t.Errorf("Degraded message is %d characters, want at most %d", len(msg), credentialProxyRefusalMessageBudget+fixed)
+	}
+	if !strings.Contains(msg, credentialProxyRefusalEllipsis+")") {
+		t.Errorf("Degraded message does not mark the cut refusal: %q", msg[len(msg)-200:])
+	}
 }
 
 func TestPlatformAgentReconciler_Reconcile_NonGitHubRepo(t *testing.T) {

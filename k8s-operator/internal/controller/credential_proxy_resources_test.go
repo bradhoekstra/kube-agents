@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -159,5 +160,22 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	}
 	if got := credentialProxyAdmittedRequests(credentialProxyResidentReserveBytes, credentialProxyOutputCapBytes); got != 0 {
 		t.Errorf("a limit below the fixed reserves admits %d requests, want 0", got)
+	}
+}
+
+// The count of further refusals survives the cut: the first refusal gives way
+// to it, and the whole stays within the budget.
+func TestCredentialProxyRefusalKeepsTheCountWithinTheBudget(t *testing.T) {
+	long := corev1.ResourceName("example.com/" + strings.Repeat("y", 2*credentialProxyRefusalMessageBudget))
+	agent := proxyAgentWithResources(&corev1.ResourceRequirements{
+		Limits:   corev1.ResourceList{long: resource.MustParse("1")},
+		Requests: corev1.ResourceList{long: resource.MustParse("1")},
+	})
+	refusal, _ := credentialProxyResourcesRefusal(agent)
+	if len(refusal) > credentialProxyRefusalMessageBudget {
+		t.Errorf("refusal is %d characters, want at most %d", len(refusal), credentialProxyRefusalMessageBudget)
+	}
+	if !strings.HasSuffix(refusal, credentialProxyRefusalEllipsis+" (and 1 more)") {
+		t.Errorf("refusal ends %q, want the ellipsis and the count", refusal[len(refusal)-40:])
 	}
 }
