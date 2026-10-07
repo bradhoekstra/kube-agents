@@ -649,9 +649,10 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual([], list(self.artifacts.iterdir()))
 
     def test_an_override_is_not_reused_where_it_cannot_be_recorded(self):
-        """Outside a decorated job, or with the directory gone: the reuse
-        would leave a passed build that reads as a green, so the override is
-        not consulted; the green history, which needs no record, still is."""
+        """Outside a decorated job, with no ARTIFACTS to record the reuse in:
+        the reuse would leave a passed build that reads as a green, so the
+        override is not consulted; the green history, which needs no record,
+        still is."""
         self._plant_statuses(self.c3, [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"ARTIFACTS": None})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
@@ -954,6 +955,23 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("naming build 200 among the events read (the read stopped at the 10-page cap after 1000 events) -- refusing to trust the GCS record alone", proc.stdout)
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
+
+    def test_a_batch_that_falls_through_after_an_override_reuse_leaves_no_record(self):
+        """The record is written only once every pull holds a verdict: a
+        batch whose first pull reuses an override and whose second has
+        nothing runs full, and the run that then happens must not carry the
+        key, or its own passed finished.json would be skipped as a reuse."""
+        self._plant_statuses(self.c3, [self._override_event()])
+        proc = self._run(
+            cur_head="",
+            cur_base=self.c5,
+            env_overrides=self._batch_env([(_PR, self.c3), (_OTHER_PR, self.c4)], self.c5),
+        )
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn(f"PR #{_PR} holds a reusable verdict: /override by {_ADMIN}", proc.stdout)
+        self.assertNotIn("Recorded the reused /override", proc.stdout)
+        self.assertNotIn("Step 0: REVALIDATED", proc.stdout)
+        self.assertEqual([], list(self.artifacts.iterdir()))
 
     def test_a_batch_may_mix_a_green_and_an_override(self):
         self._plant_history([("200", True, self.c1, self.c3)])
@@ -1434,33 +1452,74 @@ class RevalidationBashFloorTest(unittest.TestCase):
     """The suite lifts the script into whatever `bash` is on PATH, 3.2 on a
     stock macOS, and the script says it stays there (its cache comment);
     CI's bash is 5, so a bash-4 construct would pass CI and fail every
-    macOS contributor at source time. Pinned statically, the way
-    tests/test_upgrade_script.py pins `mapfile` out of its harness."""
+    macOS contributor at source time. This is a tripwire over the bash
+    source for the spellings a bash-4 relapse takes, the way
+    tests/test_upgrade_script.py pins `mapfile` out of its harness; it
+    enumerates, so a run of the suite under a bash 3.2 remains the proof,
+    and the embedded Python programs are cut out before the scan so their
+    own syntax (`words[-1]`) cannot red it."""
 
-    # Associative arrays, globals-from-functions, namerefs and case flags on
-    # any of the three declaring words; mapfile/readarray; case-modifying
-    # expansions in either form; appending redirections and |&; case
-    # fall-through; [[ -v ]]; coproc; read -i; negative subscripts.
+    # A bash-4 flag (A, g, n, l, u) in any flag group after any declaring
+    # word; mapfile/readarray; case-modifying expansions in either form on
+    # any parameter; appending redirections and |&; case fall-through;
+    # [[ -v ]] and [ -v ]; coproc; read -i in any flag group; negative
+    # subscripts and lengths; $BASHPID; wait -n; globstar.
     _BASH4_CONSTRUCTS = (
-        r"\b(declare|local|typeset)\s+-[a-zA-Z]*[gAnlu]",
+        r"\b(declare|local|typeset|readonly|export)\s+(-\S+\s+)*-[a-zA-Z]*[gAnlu]\b",
         r"\bmapfile\b",
         r"\breadarray\b",
-        r"\$\{[A-Za-z_][A-Za-z_0-9]*(,|\^)",
+        r"\$\{[^}]*[,^]\}",
         r"&>>",
         r"\|&",
         r";;?&",
-        r"\[\[\s+-v\s",
+        r"\[\[?\s+-v\s",
         r"\bcoproc\b",
-        r"\bread\s+-[a-zA-Z]*i",
-        r"\[-1\]",
+        r"\bread\s+(-\S+(\s+\S+)?\s+)*-[a-zA-Z]*i\b",
+        r"\[-[0-9]+\]",
+        r":-?[0-9]*:-[0-9]",
+        r"\$BASHPID\b",
+        r"\bwait\s+-n\b",
+        r"\bglobstar\b",
     )
 
-    def test_the_script_uses_no_bash_4_construct(self):
+    @staticmethod
+    def _bash_source(text):
+        """The script's bash lines: comments dropped, and each embedded
+        `python3 -c '...'` program (opened by a line ending in `python3 -c '`
+        and closed by the line that starts with `'`) cut out."""
+        lines = []
+        in_python = False
+        for line in text.splitlines():
+            if in_python:
+                if line.startswith("'"):
+                    in_python = False
+                    lines.append(line)
+                continue
+            if line.rstrip().endswith("python3 -c '"):
+                in_python = True
+                lines.append(line.rstrip()[: -len("'")])
+                continue
+            if not line.lstrip().startswith("#"):
+                lines.append(line)
+        return "\n".join(lines)
+
+    def test_the_embedded_python_is_cut_out_of_the_scan(self):
         text = _CI_REVALIDATE.read_text(encoding="utf-8")
-        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        self.assertIn("python3 -c '", text)
+        self.assertNotIn("import json", self._bash_source(text))
+
+    def test_the_script_uses_no_bash_4_construct(self):
+        code = self._bash_source(_CI_REVALIDATE.read_text(encoding="utf-8"))
         for pattern in self._BASH4_CONSTRUCTS:
             with self.subTest(pattern=pattern):
                 self.assertIsNone(re.search(pattern, code), f"{pattern} needs bash 4+")
+
+    def test_the_scanner_catches_the_spellings_a_relapse_takes(self):
+        for relapse in ("local -r -A seen", "readonly -A cache", "typeset -i -l name", "declare -n ref",
+                        "read -r -i default x", '${arr[0],,}', "${1^}", "${s:1:-1}", "${arr[-2]}",
+                        "[ -v x ]", "wait -n", "shopt -s globstar"):
+            with self.subTest(relapse=relapse):
+                self.assertTrue(any(re.search(p, relapse) for p in self._BASH4_CONSTRUCTS), relapse)
 
 
 class RevalidationEntrypointTest(unittest.TestCase):
