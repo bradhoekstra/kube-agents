@@ -193,6 +193,17 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         err = self._render_error([f"{_VALUE_PATH}.limits.memory=512Mi"])
         self.assertIn(f"{_VALUE_PATH}.limits.memory is 512Mi, under the 672Mi floor", err)
 
+    def test_a_memory_limit_a_fraction_under_the_floor_fails(self):
+        # parseBytes ceils a milli-, micro- or nano-byte figure, which would round half a
+        # byte under the 704,643,072-byte floor up onto it; the operator compares exactly.
+        for value in ("704643071500m", "704643071500000u", "704643071500000000n"):
+            err = self._render_error([f"{_VALUE_PATH}.limits.memory={value}"])
+            self.assertIn(f"{_VALUE_PATH}.limits.memory is {value}, under the 672Mi floor", err)
+
+    def test_a_memory_limit_exactly_at_the_floor_in_millibytes_renders(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=704643072000m"])
+        self.assertEqual(_cr_resources(cr)["limits"]["memory"], "704643072000m")
+
     def test_a_request_above_the_default_limit_fails_naming_the_pair(self):
         err = self._render_error([f"{_VALUE_PATH}.requests.memory=2Gi"])
         self.assertIn(f"{_VALUE_PATH}.requests.memory (2Gi) exceeds the operator's default limits.memory (1Gi)", err)

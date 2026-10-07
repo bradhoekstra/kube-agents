@@ -185,8 +185,8 @@ spec:
       key the CRD does not declare, which the API server would prune silently
       (`limit:` for `limits:`), claims, a resource name the container does not
       declare, a negative quantity, a zero limit, a memory limit under the
-      floor, and a request above its limit. The request and its limit are
-      compared as float64 values with no rounding (kube-agents.quantityExact),
+      floor, and a request above its limit. The zero, floor and crossed-pair
+      checks compare float64 values with no rounding (kube-agents.quantityExact),
       which matches the operator's exact resource.Quantity comparison for every
       value float64 holds exactly: every integer count of millicores or bytes
       under 2^53, which covers every real override. The defaults and the floor are
@@ -255,16 +255,18 @@ spec:
         {{- end }}
       {{- end }}
     {{- end }}
-    {{- range $name, $limit := $proxyParsed.limits }}
-      {{- if eq $limit 0 }}
-      {{- fail (printf "%s.limits.%s is %s; a limit of zero leaves the container none, and the operator refuses it. Omit the key to keep the default (%s)" $proxyPrefix $name (index $proxyMerged.limits $name) (index $proxyDefaults.limits $name)) }}
+    {{- /* Every check below compares the quantity exactly, never the integers
+           above: parseCpuMillis and parseBytes round (a milli-byte limit half a
+           byte under the floor rounds up onto it), and the operator compares
+           the quantities themselves. */}}
+    {{- range $name, $rawLimit := $proxyMerged.limits }}
+      {{- if eq (include "kube-agents.quantityExact" (dict "raw" $rawLimit "cpu" (eq $name "cpu")) | float64) 0.0 }}
+      {{- fail (printf "%s.limits.%s is %s; a limit of zero leaves the container none, and the operator refuses it. Omit the key to keep the default (%s)" $proxyPrefix $name $rawLimit (index $proxyDefaults.limits $name)) }}
       {{- end }}
     {{- end }}
-    {{- if and (hasKey $proxyParsed.limits "memory") (lt $proxyParsed.limits.memory $proxyFloor) }}
+    {{- if and (hasKey $proxyMerged.limits "memory") (lt (include "kube-agents.quantityExact" (dict "raw" $proxyMerged.limits.memory "cpu" false) | float64) (float64 $proxyFloor)) }}
     {{- fail (printf "%s.limits.memory is %s, under the %dMi floor at which the credential proxy's child memory budget admits two commands at once; below it the broker turns the budget off, and the operator refuses it. Set at least %dMi" $proxyPrefix $proxyMerged.limits.memory (div $proxyFloor 1048576) (div $proxyFloor 1048576)) }}
     {{- end }}
-    {{- /* Compared exactly, not on the integers above: parseCpuMillis and parseBytes
-           round, and the operator compares the quantities themselves. */}}
     {{- range $name, $rawRequest := $proxyMerged.requests }}
       {{- if hasKey $proxyMerged.limits $name }}
       {{- $isCpu := eq $name "cpu" }}
