@@ -63,9 +63,11 @@ func (i Identity) String() string {
 	return i.Project + "/" + i.Location + "/" + i.Cluster
 }
 
-// complete reports whether all three parts are present. An incomplete block is
-// "not a cluster profile" rather than a broken one, matching what
-// cluster_agent_profile.read_cluster_identity treats as absent.
+// complete reports whether all three parts are present. To ReadIdentity an
+// incomplete block is "not a cluster profile" rather than a broken one,
+// matching what cluster_agent_profile.read_cluster_identity treats as absent;
+// ReadIdentities tells a block with some parts from one with none, and reports
+// the first, because for the scope it is a cluster profile that names nothing.
 func (i Identity) complete() bool {
 	return i.Cluster != "" && i.Project != "" && i.Location != ""
 }

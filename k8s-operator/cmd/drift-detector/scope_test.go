@@ -43,7 +43,7 @@ func TestProfileScopeAnswersFromTheProfilesDirectory(t *testing.T) {
 		t.Errorf("Profiled(prod-a) = (%v, %v), want (true, true): a profile names it", profiled, known)
 	}
 	if profiled, known := s.Profiled(prodB); profiled || !known {
-		t.Errorf("Profiled(prod-b) = (%v, %v), want (false, true): the directory was read and no profile names it", profiled, known)
+		t.Errorf("Profiled(prod-b) = (%v, %v), want (false, true): the directory was read and no readable profile names it", profiled, known)
 	}
 }
 

@@ -333,7 +333,7 @@ func knownScope() stubScope {
 	return stubScope{profiled: map[clusterIdentity]bool{recordIdentity(joinRecord()): true}}
 }
 
-// An unreachable record from a cluster no profile names is out of scope, and
+// An unreachable record from a cluster no readable profile names is out of scope, and
 // the event says so: the inject reads the flag, the DRIFT line is still
 // written, and nothing is dropped here. The join forwards every outcome; what
 // the flag changes is downstream.
@@ -354,7 +354,7 @@ func TestJoinMarksAnUnreachableRecordOutOfScopeWhenNoProfileNamesItsCluster(t *t
 		t.Errorf("Outcome = %q, want %q", got[0].Outcome, joinUnreachable)
 	}
 	if !got[0].OutOfScope {
-		t.Errorf("OutOfScope = false, want true: the scope was read and no profile names prod-b")
+		t.Errorf("OutOfScope = false, want true: the scope was read and no readable profile names prod-b")
 	}
 	if c := j.Counts(); c.Unreachable != 1 || c.OutOfScope != 1 {
 		t.Errorf("counts = %+v, want unreachable=1 out_of_scope=1", c)
