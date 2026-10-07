@@ -17,7 +17,7 @@ Deployment or any other resource fails here, whatever nouns the surrounding pros
 uses. Four denylist patterns back that up for a revert written as prose rather than
 a command, but each keys on an annotation word, so they catch an annotation-worded
 revert, not one phrased in entirely other words -- the kubectl allowlist, not the
-denylist, is what makes the "off any resource" guarantee hold. Per
+denylist, is what holds each command's resource read to the PodMonitoring. Per
 `.agents/rules/eval_driven_development.md` this stand-in does not replace the case;
 it is the guard the case cannot be, because the agent's behaviour was already
 correct.
@@ -91,18 +91,31 @@ SCRAPE_ANNOTATION_PROSE = re.compile(
 # whose only correct mention of annotations is to forbid them, that is the right
 # default.
 ANY_ANNOTATION = re.compile(r"(?i)annotat")
-# The positive guard the "off any resource" claim actually rests on, where the
+# The positive guard the resource-read invariant actually rests on, where the
 # denylist above (every pattern keyed on an annotation word) cannot. Collect every
 # `kubectl` command step 1 issues and require each to name the PodMonitoring read --
 # the `podmonitoring` kind, or the `gmp-system` namespace the managed collector's
-# pods live in. Step 1's three reads all do; a revert that points a `kubectl get`/
-# `describe` at the Deployment, the gateway pod template or any other resource names
-# neither and fails here, whatever nouns the surrounding prose uses. The one gap it
-# leaves -- a revert that issues no kubectl command and uses no annotation word -- is
-# not reachable by a substring check and is the accepted residual: a step that runs
-# no command to read the wrong resource has not reverted what the agent does.
+# pods live in -- in its invocation, the part before any shell redirect, pipe or
+# comment (COMMAND_INVOCATION). Without that cut a revert that reads the Deployment
+# and only writes `> /tmp/podmonitoring.yaml`, pipes `| grep podmonitoring` or trails
+# `# check podmonitoring` would borrow the word from outside the read and pass. Step
+# 1's three reads all name the kind or namespace in the invocation itself; a revert
+# that points a `kubectl get`/`describe` at the Deployment, the gateway pod template
+# or any other resource names neither and fails here, whatever nouns the surrounding
+# prose uses. Two residuals stand, both the price of a substring check over shell: a
+# command that names `podmonitoring`/`gmp-system` in a label-selector or jsonpath
+# value rather than as the resource, and a revert that issues no kubectl command and
+# uses no annotation word -- a step that runs no command to read the wrong resource
+# has not reverted what the agent does.
 KUBECTL_IN_STEP = re.compile(r"kubectl[^\n`]*")
 STEP_ONE_KUBECTL_ALLOW = re.compile(r"(?i)\bpodmonitoring\b|\bgmp-system\b")
+# A kubectl command's invocation ends at the first shell redirect, pipe or comment:
+# everything after names an output file, a downstream filter or a note, not the
+# resource read. Recognize those operators only when whitespace -- and, for a
+# redirect, an optional file-descriptor digit -- precedes them, so the `<name>`/
+# `<namespace>` placeholders, whose `>` follows a letter, never read as a redirect
+# and split a real command short.
+COMMAND_INVOCATION = re.compile(r"\s\d*>|\s\||\s#")
 
 
 def _read(path: Path) -> str:
@@ -167,20 +180,25 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
     def test_step_one_kubectl_commands_all_read_the_podmonitoring(self):
         # The positive guard: every kubectl command step 1 issues must name the
         # PodMonitoring read (the `podmonitoring` kind or the `gmp-system` collector
-        # namespace). This is what makes "off any resource" hold where the denylist
-        # patterns, each keyed on an annotation word, cannot: a revert that points a
-        # command at the Deployment or any other resource names neither and fails
-        # here, whatever words the prose around it uses.
+        # namespace) in its invocation -- the part before any redirect, pipe or
+        # comment, so a revert cannot borrow the word from an output filename or a
+        # downstream grep. This is what makes the resource-read invariant hold where
+        # the denylist patterns, each keyed on an annotation word, cannot: a revert
+        # that points a command at the Deployment or any other resource names neither
+        # and fails here, whatever words the prose around it uses.
         step = _metrics_step_one(_read(OBSERVABILITY_SKILL))
         commands = KUBECTL_IN_STEP.findall(step)
         self.assertTrue(commands, "step 1 issues no kubectl command to guard")
         for command in commands:
+            invocation = COMMAND_INVOCATION.split(command, 1)[0]
             with self.subTest(command=command):
                 self.assertRegex(
-                    command,
+                    invocation,
                     STEP_ONE_KUBECTL_ALLOW,
-                    f"step 1 runs a kubectl command off a resource other than the "
-                    f"PodMonitoring (the #2141 regression, off any resource): {command!r}",
+                    f"step 1 runs a kubectl command whose invocation names neither "
+                    f"the PodMonitoring kind nor the gmp-system namespace (the #2141 "
+                    f"regression: a read pointed at the Deployment or another "
+                    f"resource): {command!r}",
                 )
 
 
