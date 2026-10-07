@@ -168,30 +168,41 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
 # The agent plugin images pin their base with a literal `FROM repo:tag@digest`
 # rather than an ARG pair, so the ARG check above never reaches them. This
-# fence does not parse Dockerfiles: a plugin Dockerfile is one FROM and COPY
-# lines by design (agentplugins/lib/plugin_image.sh), so it reads exactly one
-# single-line FROM and fails closed, saying so, on anything else -- a second
-# FROM (a build stage, or a FROM inside a heredoc body), or any line that ends
-# in a backslash (a continuation, or an escaped one). Comment lines are dropped
-# and a CR before the newline is ignored, the two things Docker does before it
-# reads an instruction. The FROM line itself may be indented, lowercase, and
-# carry `--flag` words (`--platform=…`) before the reference.
+# fence does not parse Dockerfiles. A plugin Dockerfile is one FROM and COPY
+# lines by design (agentplugins/lib/plugin_image.sh), and that is the whole
+# rule enforced, in this order, each failing closed with the reason: the file
+# is printable ASCII (no BOM, no non-breaking space -- Docker trims Unicode
+# space and this check does not try to); comment lines and blank lines are
+# dropped; no remaining line ends in a backslash (a continuation, or an
+# escaped one); every remaining line begins, after ASCII blanks, with FROM or
+# COPY in any case (so a RUN, a heredoc body or a backtick continuation is
+# refused by name); exactly one of them is a FROM; its reference, after any
+# `--flag` words, equals the inventory's. A CR before the newline is ignored.
 check_literal_from() {
   local name=$1 dockerfile=$2
-  local want got body continued froms
+  local want got body continued other froms
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  body="$(tr -d '\r' <"$dockerfile" | sed '/^[[:space:]]*#/d')"
+  if LC_ALL=C grep -q '[^[:print:][:space:]]' "$dockerfile"; then
+    fail "$dockerfile: holds a byte outside printable ASCII (a BOM or a non-breaking space, say); the plugin pin fence reads plain ASCII only, so save the file as such."
+    return
+  fi
+  body="$(tr -d '\r' <"$dockerfile" | sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d')"
   continued="$(printf '%s\n' "$body" | sed -n '/\\[[:blank:]]*$/p' | wc -l | tr -d ' ')"
-  froms="$(printf '%s\n' "$body" | sed -n '/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]/p' | wc -l | tr -d ' ')"
   if [ "$continued" != 0 ]; then
     fail "$dockerfile: a line ends in a backslash; the plugin pin fence reads single-line instructions only, so put the whole FROM on one line and keep the file to FROM and COPY (agentplugins/lib/plugin_image.sh)."
     return
   fi
+  other="$(printf '%s\n' "$body" | sed -n -e '/^[[:blank:]]*[Ff][Rr][Oo][Mm][[:blank:]]/d' -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]/d' -e 'p' | head -n1)"
+  if [ -n "$other" ]; then
+    fail "$dockerfile: line '$other' is neither FROM nor COPY; the plugin pin fence reads a file of one single-line FROM and COPY lines and nothing else (agentplugins/lib/plugin_image.sh)."
+    return
+  fi
+  froms="$(printf '%s\n' "$body" | sed -n '/^[[:blank:]]*[Ff][Rr][Oo][Mm][[:blank:]]/p' | wc -l | tr -d ' ')"
   if [ "$froms" != 1 ]; then
     fail "$dockerfile: $froms FROM lines; the plugin pin fence reads exactly one single-line FROM stage, so keep the file to one FROM and COPY lines (agentplugins/lib/plugin_image.sh)."
     return
   fi
-  got="$(normalise "$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]\{1,\}\(--[^[:space:]]*[[:space:]]\{1,\}\)*\([^[:space:]]*\).*$/\2/p' | head -n1)")"
+  got="$(normalise "$(printf '%s\n' "$body" | sed -n 's/^[[:blank:]]*[Ff][Rr][Oo][Mm][[:blank:]]\{1,\}\(--[^[:blank:]]*[[:blank:]]\{1,\}\)*\([^[:blank:]]*\).*$/\2/p' | head -n1)")"
   [ "$got" = "$want" ] ||
     fail "$dockerfile: FROM pins '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
 }

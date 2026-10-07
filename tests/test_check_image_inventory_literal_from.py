@@ -1,7 +1,8 @@
 """`check_literal_from` in hack/check-image-inventory.sh fails when an agent
 plugin Dockerfile's literal `FROM` pin and the inventory's entry move apart,
-and fails closed, saying why, on a Dockerfile that is not one single-line FROM
-plus COPY lines.
+and fails closed, saying why, on a Dockerfile that is not plain ASCII, or that
+holds anything other than comment lines, blank lines, exactly one single-line
+FROM and COPY lines.
 
 The plugin images pin `busybox:musl` by digest in a literal FROM rather than an
 ARG pair, so `check_base_image` never reaches them. CI only ever runs the script
@@ -48,7 +49,7 @@ def _run_check(dockerfile: str, pin: str = _PIN) -> subprocess.CompletedProcess:
     functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
-        (root / "Dockerfile").write_text(dockerfile)
+        (root / "Dockerfile").write_text(dockerfile, encoding="utf-8")
         script = (
             "set -u\nstatus=0\nINVENTORY=images.json\n"
             f'repo_of() {{ echo "{_REPOSITORY}"; }}\n'
@@ -116,18 +117,46 @@ class CheckLiteralFromTest(unittest.TestCase):
                 self.assertNotIn("FROM pins", result.stderr)
 
     def test_more_or_fewer_than_one_from_fails_closed(self):
-        # A second stage, a FROM inside a heredoc body, or no FROM at all: the
-        # fence names the count and what to write instead of guessing a stage.
+        # A second stage or no FROM at all: the fence names the count and what
+        # to write instead of guessing a stage.
         for text, count in (
-            (f"FROM golang:1.27-alpine AS build\nRUN true\nFROM busybox:{_PIN}\n", "2"),
+            (f"FROM golang:1.27-alpine AS build\nCOPY a /b\nFROM busybox:{_PIN}\n", "2"),
             (f"FROM busybox:{_PIN} AS unused\nfrom busybox:{_OTHER_PIN}\n", "2"),
-            (f"FROM busybox:{_PIN}\nCOPY <<EOF /x\nFROM busybox:{_OTHER_PIN}\nEOF\n", "2"),
             ("COPY files/ /\n", "0"),
         ):
             with self.subTest(text=text):
                 result = _run_check(text)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"{count} FROM lines", result.stderr)
+                self.assertNotIn("FROM pins", result.stderr)
+
+    def test_any_other_instruction_fails_closed_naming_the_line(self):
+        # The shape plugin_image.sh defines is FROM and COPY lines; a RUN, a
+        # heredoc body line or a backtick continuation is refused by name, so
+        # the crane and docker builders never disagree on a file this passes.
+        for text, line in (
+            (f"FROM busybox:{_PIN}\nRUN rm -rf /bin\nCOPY files/ /\n", "RUN rm -rf /bin"),
+            (f"FROM busybox:{_PIN}\nCOPY <<EOF /x\nFROM busybox:{_OTHER_PIN}\nEOF\n", "EOF"),
+            (f"# escape=`\nFROM --platform=linux/amd64 `\n  busybox:{_PIN}\n", f"  busybox:{_PIN}"),
+        ):
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"line '{line}' is neither FROM nor COPY", result.stderr)
+                self.assertNotIn("FROM pins", result.stderr)
+
+    def test_non_ascii_bytes_fail_closed(self):
+        # Docker strips a BOM and trims Unicode space before reading a
+        # keyword; the fence does not try to, and refuses the file by reason,
+        # so a second stage behind a non-breaking space cannot pass as drift.
+        for text in (
+            f"\ufeffFROM busybox:{_PIN}\nCOPY files/ /\n",
+            f"FROM busybox:{_PIN} AS base\n\u00a0FROM busybox:{_OTHER_PIN}\nCOPY files/ /\n",
+        ):
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("outside printable ASCII", result.stderr)
                 self.assertNotIn("FROM pins", result.stderr)
 
     def test_script_calls_the_check_for_plugin_dockerfiles(self):
