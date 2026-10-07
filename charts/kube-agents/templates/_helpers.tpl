@@ -1002,7 +1002,10 @@ honest — a quota that large cannot constrain this release either way.
        resource.Quantity comparison (1.0004 against 1 would compare equal). float64 holds
        every integer under 2^53 exactly, and every real override's value in these units is
        one; past that, or for a fraction that float64 cannot write, two values a few parts in
-       10^16 apart can still compare equal. A value
+       10^16 apart can still compare equal, which is why credentialProxyResourcesCheck
+       refuses a quantity with more than 15 significant digits: every value with at most 15
+       reads into float64 exactly and scales by a power of two or ten without losing a digit
+       below 2^53, so the comparisons are exact for every value the chart admits. A value
        whose scaled figure is past float64's range (a CPU of 1e308, in millicores) fails the
        render naming "key" rather than answering "", which a caller would read as zero.
        Takes (dict "raw" <quantity> "cpu" <bool> "key" <values path>); call it after the
@@ -1224,8 +1227,9 @@ a Go template cannot catch the error `lookup` raises.
 {{/*
 The checks on platformAgent.deployment.credentialProxy.resources that need no parsed value:
 the keys under resources, the shape of limits and requests, each resource name, and each
-quantity's sign, grammar and range: a byte count within an int64, a CPU within an int64 of
-millicores. Takes the resources map and renders
+quantity's sign, grammar, significant digits (at most 15, the most float64 holds exactly, so
+the comparisons after these are exact for every value admitted) and range: a byte count
+within an int64, a CPU within an int64 of millicores. Takes the resources map and renders
 nothing; a value that fails one fails the render naming its key. Both readers of the value call it first,
 the CR template (templates/platform-agent-cr.yaml) and kube-agents.credentialProxyFootprint
 for the quota preflight, because Helm renders quota-preflight.yaml before the CR template:
@@ -1267,6 +1271,16 @@ these have passed.
 {{- end -}}
 {{- if not (regexMatch $proxyQuantityPattern (trimPrefix "+" $raw)) -}}
 {{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity the operator can read (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- /* float64 holds 15 significant decimal digits exactly; a 16th lets two quantities
+       within one part in 10^16 of each other, or of a bound, read as equal, and the
+       render would pass what the operator's exact comparison refuses. Counted on the
+       mantissa: sign, exponent, suffix and dot stripped, then leading and trailing
+       zeros. */ -}}
+{{- $significand := regexReplaceAll "([KMGTPE]i|[numkMGTPE])$" (regexReplaceAll "[eE][-+]?[0-9]+$" (trimPrefix "+" $raw) "") "" -}}
+{{- $significand = regexReplaceAll "0+$" (regexReplaceAll "^0+" (replace "." "" $significand) "") "" -}}
+{{- if gt (len $significand) 15 -}}
+{{- fail (printf "%s.%s.%s is %s, which has more than 15 significant digits: the chart compares quantities as float64, which holds 15 exactly, so it cannot check this one against the operator's rules. Write it with a larger unit or fewer digits" $proxyPrefix $side $name $raw) -}}
 {{- end -}}
 {{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
 {{- if eq $name "cpu" -}}

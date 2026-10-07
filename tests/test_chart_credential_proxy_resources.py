@@ -287,6 +287,29 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
         self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, which is not a representable quantity", err)
         self.assertNotIn("a limit of zero", err)
 
+    def test_more_than_fifteen_significant_digits_fail_naming_the_key(self):
+        # float64 holds 15 significant digits exactly; with a 16th, each of these reads
+        # as its bound (1Gi, the floor, 2^53) and would render while the operator,
+        # comparing exactly, refuses it.
+        cases = (
+            ([f"{_VALUE_PATH}.requests.memory=1073741824.00000001"], "requests.memory", "1073741824.00000001"),
+            ([f"{_VALUE_PATH}.limits.memory=704643071.99999999"], "limits.memory", "704643071.99999999"),
+            ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=9007199254740992"],
+             "limits.memory", "9007199254740992"),
+            ([f"{_VALUE_PATH}.requests.memory=9007199254740993", f"{_VALUE_PATH}.limits.memory=16Pi"],
+             "requests.memory", "9007199254740993"),
+        )
+        for sets, key, value in cases:
+            err = self._render_error(sets)
+            self.assertIn(f"{_VALUE_PATH}.{key} is {value}, which has more than 15 significant digits", err, sets)
+            self.assertIn("larger unit or fewer digits", err)
+
+    def test_fifteen_or_fewer_significant_digits_render(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.requests.memory=1073741824"])
+        self.assertEqual(_cr_resources(cr), {"requests": {"memory": "1073741824"}})
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.memory=1.5Gi"])
+        self.assertEqual(_cr_resources(cr), {"limits": {"memory": "1.5Gi"}})
+
     def test_an_integer_past_int64_from_a_values_file_fails_naming_the_key(self):
         # Helm reads an integer above 2^63 as a float64, written 1e+19.
         err = self._render_error(values=_proxy_values({"limits": {"memory": 10**19}}))

@@ -188,9 +188,9 @@ spec:
       floor, and a request above its limit. The zero, floor and crossed-pair
       checks compare float64 values with no rounding (kube-agents.quantityExact),
       which matches the operator's exact resource.Quantity comparison for every
-      value float64 holds exactly: every integer count of millicores or bytes
-      under 2^53, which covers every real override. The defaults and the floor are
-      kube-agents.credentialProxyDefaults and
+      value the chart admits: a quantity with more than 15 significant digits,
+      the most float64 holds exactly, is refused before these run. The
+      defaults and the floor are kube-agents.credentialProxyDefaults and
       kube-agents.credentialProxyMemoryFloorBytes. A quantity outside the
       CRD's grammar, or inside it in a form resource.ParseQuantity does not read
       (a fractional exponent), fails the render naming the key: dropping it
