@@ -125,6 +125,8 @@ class CheckLiteralFromTest(unittest.TestCase):
             f"FROM busybox:{_PIN}\nCOPY {_SRC} /files/\n",
             f"FROM busybox:{_PIN}\nCOPY other/ /\n",
             f"FROM busybox:{_PIN}\n",
+            f"FROM \nCOPY {_SRC} /\n",
+            f"FROM docker.io/library/\nCOPY {_SRC} /\n",
             f"COPY {_SRC} /\n",
             "",
         )
@@ -151,8 +153,8 @@ class CheckLiteralFromTest(unittest.TestCase):
         # below the FROM, where test_the_one_shape_passes accepts it.
         for text, line in (
             (f"# syntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# syntax=docker/dockerfile:1"),
-            (f"#\x0csyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#\x0csyntax=docker/dockerfile:1"),
-            (f"#\rsyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#\rsyntax=docker/dockerfile:1"),
+            (f"#\x0csyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#^Lsyntax=docker/dockerfile:1"),
+            (f"#\rsyntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#^Msyntax=docker/dockerfile:1"),
             (f"#!/usr/bin/env -S docker build -f\n# syntax=docker/dockerfile:1\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# syntax=docker/dockerfile:1"),
             (f"# a note first\n#escape=`\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "#escape=`"),
             (f"# digest=ea2b9914 is what the tag resolved to\nFROM busybox:{_PIN}\nCOPY {_SRC} /\n", "# digest=ea2b9914 is what the tag resolved to"),
@@ -160,9 +162,9 @@ class CheckLiteralFromTest(unittest.TestCase):
             with self.subTest(text=text):
                 result = _run_check(text)
                 self.assertNotEqual(result.returncode, 0)
-                # text-mode pipes translate a CR to a newline, so match the
-                # part of the line after it.
-                self.assertIn(f"{line.rsplit(chr(13), 1)[-1]}' holds '=' in the leading run of comments", result.stderr)
+                # The offending line is rendered through cat -vt, so a CR or
+                # FF in it shows as ^M or ^L instead of moving the cursor.
+                self.assertIn(f"line '{line}' holds '=' in the leading run of comments", result.stderr)
                 self.assertNotIn("FROM pins", result.stderr)
 
     def test_script_calls_the_check_for_plugin_dockerfiles(self):

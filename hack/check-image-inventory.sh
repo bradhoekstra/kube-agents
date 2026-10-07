@@ -175,8 +175,9 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # as the base and stages the tree at `/`), so once comment and blank lines are
 # dropped the remainder must be exactly those two lines, byte for byte, with
 # the FROM reference normalised and compared to the inventory. Anything else
-# -- an indented or lowercase keyword, a flag, a tab, a CR, a stage name, a
-# continuation, a second stage, a RUN, a heredoc, another COPY destination --
+# -- an indented or lowercase keyword, an empty reference, a flag, a tab, a
+# CR, a stage name, a continuation, a second stage, a RUN, a heredoc, another
+# COPY destination --
 # fails closed with the expected lines and the lines found, printed through
 # `cat -vet` so an invisible byte shows. One rule runs before the strip: a
 # comment line holding `=` anywhere in the leading run of comments is refused
@@ -194,22 +195,22 @@ check_literal_from() {
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
   other="$(sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#.*=/p' "$dockerfile" | head -n1)"
   if [ -n "$other" ]; then
-    fail "$dockerfile: line '$other' holds '=' in the leading run of comments, where a parser directive such as syntax= names a second image that nothing pins or mirrors; the plugin pin fence refuses any '=' there. Put a comment like it below the FROM line (agentplugins/lib/plugin_image.sh)."
+    fail "$dockerfile: line '$(printf '%s' "$other" | LC_ALL=C cat -vt)' holds '=' in the leading run of comments, where a parser directive such as syntax= names a second image that nothing pins or mirrors; the plugin pin fence refuses any '=' there. Put a comment like it below the FROM line (agentplugins/lib/plugin_image.sh)."
     return
   fi
   body="$(sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d' "$dockerfile")"
   first="$(printf '%s\n' "$body" | sed -n '1p')"
   second="$(printf '%s\n' "$body" | sed -n '2p')"
   ref="${first#FROM }"
-  if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] ||
+  got="$(normalise "$ref")"
+  if [ "$(printf '%s\n' "$body" | wc -l | tr -d ' ')" != 2 ] || [ "$ref" = "$first" ] || [ -z "$got" ] ||
     [ "$ref" != "${ref%% *}" ] || [ "$second" != "COPY $src /" ] ||
     printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:]]'; then
     fail "$dockerfile: after comment and blank lines, a plugin Dockerfile must be exactly two lines, 'FROM <ref>' (one space, nothing after the reference) and 'COPY $src /', the shape docker build and the crane reader in agentplugins/lib/plugin_image.sh read alike; found: $(printf '%s\n' "$body" | LC_ALL=C cat -vet | tr '\n' ' ')"
     return
   fi
-  got="$(normalise "$ref")"
   [ "$got" = "$want" ] ||
-    fail "$dockerfile: FROM pins '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
+    fail "$dockerfile: FROM pins '$got', but $INVENTORY has '$want' for '$name'."
 }
 
 check_literal_from busybox agentplugins/pubsub-platform/Dockerfile files/platforms/pubsub/
