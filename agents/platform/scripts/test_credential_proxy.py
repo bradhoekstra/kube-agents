@@ -6058,6 +6058,117 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual(0, executor.reserved_bytes)
 
+    def test_a_vcs_verb_with_a_current_cache_returns_without_the_lock(self):
+        executor = self._budgeted_executor(admits=1)
+        executor._refresh_cache["github"] = (time.monotonic(), frozenset({"gke-agentic/infra"}))
+        executor._refresh_lock.acquire()
+        self.addCleanup(executor._refresh_lock.release)
+        helper = mock.patch.object(executor, "_run_forge_helper", side_effect=AssertionError("ran the helper"))
+        helper.start()
+        self.addCleanup(helper.stop)
+        results = []
+
+        def vcs_verb():
+            try:
+                with executor.request_slot():
+                    executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results.append("ok")
+            except Exception as exc:  # surfaced by the assertions
+                results.append(exc)
+
+        verb = threading.Thread(target=vcs_verb, daemon=True)
+        verb.start()
+        verb.join(5)
+        self.assertFalse(verb.is_alive())
+        self.assertEqual(["ok"], results)
+        self.assertEqual(0, executor._covered_refresh_waiters)
+
+    def _convoy(self, outcome=None):
+        """A route refresher parked in its budget wait with the lock held,
+        then a vcs verb holding the only admission calls the refresh. Returns
+        (verb results, route results, helper calls) once both have finished;
+        the helper's outcome is `outcome`, returned or raised."""
+        executor = self._budgeted_executor(admits=1)
+        entered = threading.Event()
+        finish = threading.Event()
+        self.addCleanup(finish.set)
+        calls = []
+
+        def blocking_helper(*args, **kwargs):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            finish.wait(5)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        held = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        verb_results = []
+
+        def vcs_verb():
+            try:
+                with executor.request_slot():
+                    held.set()
+                    go.wait(5)
+                    executor.refresh_forge_credential("github", "gke-agentic/infra")
+                verb_results.append("ok")
+            except Exception as exc:  # surfaced by the assertions
+                verb_results.append(exc)
+
+        # Long, so the route caller cannot get out of the knot by timing out.
+        with mock.patch.object(executor, "_run_forge_helper", blocking_helper), \
+             mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 120):
+            verb = threading.Thread(target=vcs_verb, name="verb", daemon=True)
+            verb.start()
+            self.assertTrue(held.wait(5))
+            one_reservation = executor.reserved_bytes
+            route_results = []
+            route = self._refresh_in_thread(executor, route_results)
+            # The route caller holds the lock and waits for the budget.
+            self._wait_until(lambda: executor.queued_requests > 0)
+            self.assertTrue(executor._refresh_lock.locked())
+            go.set()
+            # The verb runs the helper under its own reservation while the
+            # route caller, out of the admission queue, waits behind it.
+            self.assertTrue(entered.wait(5))
+            self.assertEqual(["verb"], calls)
+            self.assertTrue(route.is_alive())
+            self.assertEqual(0, executor.queued_requests)
+            self.assertEqual(one_reservation, executor.reserved_bytes)
+            self.assertEqual(0, executor._covered_refresh_waiters)
+            finish.set()
+            verb.join(5)
+            route.join(5)
+            self.assertFalse(verb.is_alive() or route.is_alive())
+        self.assertEqual(1, len(calls))
+        self.assertEqual(0, executor._covered_refresh_waiters)
+        self.assertFalse(executor._refresh_lock.locked())
+        self.assertEqual(0, executor.reserved_bytes)
+        return verb_results, route_results
+
+    def test_a_route_holder_waiting_for_the_budget_yields_the_lock_to_a_vcs_verb_and_coalesces(self):
+        verb_results, route_results = self._convoy()
+        self.assertEqual(["ok"], verb_results)
+        self.assertEqual(["ok"], route_results)
+
+    def test_a_route_holder_that_yielded_raises_the_vcs_verbs_recorded_failure(self):
+        verb_results, route_results = self._convoy(outcome=RuntimeError("Minty unavailable"))
+        self.assertIsInstance(verb_results[0], RuntimeError)
+        self.assertIs(verb_results[0], route_results[0])
+
+    def test_a_slot_less_reserver_asked_to_yield_leaves_no_ticket_and_no_reservation(self):
+        executor = self._budgeted_executor(admits=1)
+        self._hold_the_budget(executor)
+        held = executor.reserved_bytes
+        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 120):
+            with self.assertRaises(credential_proxy.AdmissionYielded):
+                with executor._admit(takes_slot=False, caller=None, yield_when=lambda: True):
+                    self.fail("admitted")
+        self.assertEqual(0, executor.queued_requests)
+        self.assertEqual(held, executor.reserved_bytes)
+
     def test_a_route_refresher_gives_up_on_a_held_refresh_lock_at_the_bound(self):
         # Whoever holds the lock -- here, another provider's helper -- the
         # route's wait for it is bounded like admission.

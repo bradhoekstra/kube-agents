@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterator, Mapping, TextIO
 
 import api_policy
 import command_policy
@@ -925,6 +925,12 @@ MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
 # scope replaces the previous one's coalesce window entirely.
 FORGE_REFRESH_COALESCE_SECONDS = 30.0
 
+# Why a route refresher waiting for the refresh lock stopped waiting.
+REFRESH_LOCK_HUNG_UP_TEXT = "the caller disconnected while waiting for the refresh lock"
+REFRESH_LOCK_WAIT_TEXT = (
+    "a {provider} credential refresh waited {seconds}s for another refresh to finish; retry shortly"
+)
+
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
 # whatever else it is in; `context` is one in `context_repos` alone; the third
 # is neither. Only the content workspace's clone reads the answer.
@@ -1412,6 +1418,15 @@ class CallerHungUp(Exception):
 
     Nothing to run and nobody to answer: the route logs it and returns, and the
     slot goes to a caller that is still there.
+    """
+
+
+class AdmissionYielded(Exception):
+    """A queued request stepped aside for another caller that should go first.
+
+    Raised only to a caller that asked to be woken when that happens
+    (`_admit`'s `yield_when`), before it was admitted; never answered to a
+    client.
     """
 
 
@@ -4562,6 +4577,9 @@ class CommandExecutor:
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
+        # vcs verbs waiting for that lock, guarded by `_slot_condition`: a route
+        # refresher waiting for the budget under the lock yields it to them.
+        self._covered_refresh_waiter_count = 0
         self._last_forge_refresh: dict[str, tuple[float, frozenset[str]]] = {}
         self._last_forge_refresh_failure: dict[tuple[str, str], tuple[float, Exception]] = {}
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -4789,15 +4807,20 @@ class CommandExecutor:
             yield
 
     @contextlib.contextmanager
-    def reserve_child_memory(self, caller: socket.socket | None = None) -> Iterator[None]:
+    def reserve_child_memory(
+        self,
+        caller: socket.socket | None = None,
+        yield_when: Callable[[], bool] | None = None,
+    ) -> Iterator[None]:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
         wait, same refusal and hang-up handling as `request_slot` while the
         budget is on, except that it is admitted past slot-takers the full
         slot cap holds (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
-        reservation; `caller` is then unused."""
-        with self._admit(takes_slot=False, caller=caller):
+        reservation; `caller` and `yield_when` are then unused. `yield_when`
+        is passed to `_admit`."""
+        with self._admit(takes_slot=False, caller=caller, yield_when=yield_when):
             yield
 
     def _fits_budget(self, takes_slot: bool) -> bool:
@@ -4907,7 +4930,12 @@ class CommandExecutor:
         return False
 
     @contextlib.contextmanager
-    def _admit(self, takes_slot: bool, caller: socket.socket | None) -> Iterator[None]:
+    def _admit(
+        self,
+        takes_slot: bool,
+        caller: socket.socket | None,
+        yield_when: Callable[[], bool] | None = None,
+    ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
         both kinds, with one exception: a slot-less reserver that fits the
@@ -4916,7 +4944,11 @@ class CommandExecutor:
         Behind a ticket the budget holds, order is kept, since a reserver
         admitted first would take budget that ticket is waiting for. With the
         budget off a slot-less reserver has nothing to wait for and skips the
-        queue, as the routes that take no slot always have."""
+        queue, as the routes that take no slot always have.
+
+        `yield_when`, if given, is called under `_slot_condition` each time the
+        wait wakes; when it returns true the request leaves the queue
+        unadmitted with AdmissionYielded, before anything is reserved."""
         if not takes_slot and self.children_budget_bytes is None:
             previously_reserved = getattr(self._request_budget, "reserved", False)
             try:
@@ -4957,6 +4989,8 @@ class CommandExecutor:
                             "the caller disconnected while queued for "
                             + ("a slot" if held_by_slots else "the memory budget")
                         )
+                    if yield_when is not None and yield_when():
+                        raise AdmissionYielded("another caller needs to go first")
                 if takes_slot:
                     self._slots_in_use += 1
                 reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
@@ -5335,6 +5369,18 @@ class CommandExecutor:
         return self._forge_refresh_lock
 
     @property
+    def _covered_refresh_waiters(self) -> int:
+        """vcs verbs waiting for `_refresh_lock`; read and written under
+        `_slot_condition`."""
+        if getattr(self, "_covered_refresh_waiter_count", None) is None:
+            self._covered_refresh_waiter_count = 0
+        return self._covered_refresh_waiter_count
+
+    @_covered_refresh_waiters.setter
+    def _covered_refresh_waiters(self, count: int) -> None:
+        self._covered_refresh_waiter_count = count
+
+    @property
     def _refresh_cache(self) -> dict[str, tuple[float, frozenset[str]]]:
         if getattr(self, "_last_forge_refresh", None) is None:
             self._last_forge_refresh = {}
@@ -5370,8 +5416,9 @@ class CommandExecutor:
         spends the token, so it is the call that has to ask.
 
         Where the budget is charged (§2.1): called from inside a vcs request,
-        this runs under that request's reservation, takes none, and waits for
-        the lock as long as it takes. Called from the refresh route, which
+        this runs under that request's reservation and takes none. It reads
+        the coalesce cache first without the lock, and otherwise waits for the
+        lock as long as it takes. Called from the refresh route, which
         holds no slot, it reads the coalesce cache first without the lock --
         the common case for the sandbox `gh` wrapper and the fleet-audit skill,
         which call it before every credentialed step -- and re-raises a failure
@@ -5382,9 +5429,14 @@ class CommandExecutor:
         then, with the budget on, reserves for the helper it is about to run,
         on the reservation's own clock. So only the caller that runs the helper
         ever holds a reservation; every other refresher waits on the lock
-        holding nothing and coalesces on the result. The lock can be held
-        across the holder's wait for the budget, which blocks only other
-        refreshers. A refresher behind a helper that runs past the bound is
+        holding nothing and coalesces on the result. A route holder waiting for
+        the budget yields the lock to a vcs verb that needs a refresh: the
+        verb's reservation already covers the helper, so it runs it, while the
+        route caller waits for the verb to hold the lock, queues behind it, and
+        coalesces on its result. Otherwise the knot would hold until the route
+        caller's refusal: the verb waits on the lock, and the holder waits for
+        budget the verb holds. A second route refresher still waits on the lock
+        unreserved. A refresher behind a helper that runs past the bound is
         told busy even though the helper lands the token seconds later; the
         client reports a failed refresh, and its next call coalesces on the
         fresh token.
@@ -5407,25 +5459,51 @@ class CommandExecutor:
             request_budget, "exempt", False
         )
         if covered:
-            with self._refresh_lock:
+            if self._refresh_is_current(provider, clean_repo):
+                return
+            # Counted while waiting, so a route holder parked in the budget
+            # wait yields the lock; uncounted only once acquired, so a count
+            # of zero means every such verb holds or has held it.
+            with self._slot_condition:
+                self._covered_refresh_waiters += 1
+                self._slot_condition.notify_all()
+            try:
+                self._refresh_lock.acquire()
+            finally:
+                with self._slot_condition:
+                    self._covered_refresh_waiters -= 1
+                    self._slot_condition.notify_all()
+            try:
                 self._refresh_under_lock(
                     provider, helper, repository, clean_repo, failure_key, queued_at
                 )
+            finally:
+                self._refresh_lock.release()
             return
         if self._refresh_is_current(provider, clean_repo):
             return
         failure = self._refresh_failure_cache.get(failure_key)
         if failure is not None and failure[0] >= queued_at:
             raise failure[1]
+        budget_on = getattr(self, "children_budget_bytes", None) is not None
         self._acquire_refresh_lock(provider, queued_at, caller)
+        holding = True
         try:
-            self._refresh_under_lock(
+            while self._refresh_under_lock(
                 provider, helper, repository, clean_repo, failure_key, queued_at,
-                reserve=getattr(self, "children_budget_bytes", None) is not None,
-                caller=caller,
-            )
+                reserve=budget_on, caller=caller,
+            ):
+                # A vcs verb, admitted and covered, needs the lock: it runs the
+                # helper under its own reservation. Hand it the lock, wait until
+                # it holds it, and queue behind it to coalesce on its result.
+                self._refresh_lock.release()
+                holding = False
+                self._await_covered_refreshers(provider, queued_at, caller)
+                self._acquire_refresh_lock(provider, queued_at, caller)
+                holding = True
         finally:
-            self._refresh_lock.release()
+            if holding:
+                self._refresh_lock.release()
 
     def _acquire_refresh_lock(
         self, provider: str, queued_at: float, caller: socket.socket | None
@@ -5441,12 +5519,32 @@ class CommandExecutor:
             timeout=max(0.0, min(COMMAND_SLOT_POLL_SECONDS, deadline - time.monotonic()))
         ):
             if caller is not None and _caller_has_gone(caller):
-                raise CallerHungUp("the caller disconnected while waiting for the refresh lock")
+                raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
             if time.monotonic() >= deadline:
-                raise CommandSlotUnavailable(
-                    f"a {provider} credential refresh waited "
-                    f"{COMMAND_SLOT_WAIT_SECONDS}s for another refresh to finish; retry shortly"
-                )
+                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider))
+
+    @staticmethod
+    def _refresh_lock_wait_text(provider: str) -> str:
+        """The refusal for a route refresher that waited out its bound for the
+        refresh lock, or for the vcs verbs it yielded the lock to."""
+        return REFRESH_LOCK_WAIT_TEXT.format(provider=provider, seconds=COMMAND_SLOT_WAIT_SECONDS)
+
+    def _await_covered_refreshers(
+        self, provider: str, queued_at: float, caller: socket.socket | None
+    ) -> None:
+        """Wait until every vcs verb counted in `_covered_refresh_waiters`
+        holds or has held `_refresh_lock`, so a route caller that yielded it
+        does not re-take it first. Bounded and watched like
+        `_acquire_refresh_lock`."""
+        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
+        with self._slot_condition:
+            while self._covered_refresh_waiters > 0:
+                if caller is not None and _caller_has_gone(caller):
+                    raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider))
+                self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
 
     def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:
         """The coalesce check, readable without the lock: the cache entry is a
@@ -5468,19 +5566,34 @@ class CommandExecutor:
         queued_at: float,
         reserve: bool = False,
         caller: socket.socket | None = None,
-    ) -> None:
+    ) -> bool:
         """The serialised part of `refresh_forge_credential`, called with
         `_refresh_lock` held: re-check the coalesce cache, honour the failure
         memo, and run the helper -- under a child memory reservation taken
-        here, after both checks, when `reserve` is set."""
+        here, after both checks, when `reserve` is set.
+
+        True when the reservation wait yielded to a vcs verb waiting for the
+        lock and the helper did not run; the caller hands that verb the lock.
+        False otherwise."""
         if self._refresh_is_current(provider, clean_repo):
-            return
+            return False
         failure = self._refresh_failure_cache.get(failure_key)
         if failure is not None:
             failed_at, exc = failure
             if failed_at >= queued_at:
                 raise exc
-        with self.reserve_child_memory(caller=caller) if reserve else contextlib.nullcontext():
+        with contextlib.ExitStack() as admission:
+            if reserve:
+                try:
+                    admission.enter_context(
+                        self.reserve_child_memory(
+                            caller=caller, yield_when=lambda: self._covered_refresh_waiters > 0
+                        )
+                    )
+                except AdmissionYielded:
+                    # Raised only by `_admit`, before it admits, so this
+                    # catches the entry and nothing the helper raises.
+                    return True
             try:
                 result = self._run_forge_helper(
                     provider, helper, [repository], "credential refresh", log_success=True
@@ -5502,6 +5615,7 @@ class CommandExecutor:
             if not scoped:
                 scoped = frozenset([clean_repo])
             self._refresh_cache[provider] = (time.monotonic(), scoped)
+        return False
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
