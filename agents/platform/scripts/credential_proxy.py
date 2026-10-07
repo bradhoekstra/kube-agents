@@ -930,6 +930,10 @@ REFRESH_LOCK_HUNG_UP_TEXT = "the caller disconnected while waiting for the refre
 REFRESH_LOCK_WAIT_TEXT = (
     "a {provider} credential refresh waited {seconds}s for another refresh to finish; retry shortly"
 )
+REFRESH_YIELDED_WAIT_TEXT = (
+    "a {provider} credential refresh waited {seconds}s, for the child memory budget and then for "
+    "a vcs request's refresh it stepped aside for; retry shortly"
+)
 
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
 # whatever else it is in; `context` is one in `context_repos` alone; the third
@@ -5437,10 +5441,11 @@ class CommandExecutor:
         coalesces on its result. Otherwise the knot would hold until the route
         caller's refusal: the verb waits on the lock, and the holder waits for
         budget the verb holds. A second route refresher still waits on the lock
-        unreserved. A refresher behind a helper that runs past the bound is
-        told busy even though the helper lands the token seconds later; the
-        client reports a failed refresh, and its next call coalesces on the
-        fresh token.
+        unreserved. A route caller refused after yielding is told so, with
+        the seconds it spent, not the lock-wait text. A refresher behind a
+        helper that runs past the bound is told busy even though the helper
+        lands the token seconds later; the client reports a failed refresh,
+        and its next call coalesces on the fresh token.
         """
         helper = self._forge_helper(provider)
         forge = _provider_forge(provider)
@@ -5499,20 +5504,26 @@ class CommandExecutor:
                 # it holds it, and queue behind it to coalesce on its result.
                 self._refresh_lock.release()
                 holding = False
-                self._await_covered_refreshers(provider, queued_at, caller)
-                self._acquire_refresh_lock(provider, queued_at, caller)
+                self._await_covered_refreshers(provider, queued_at, caller, yielded=True)
+                self._acquire_refresh_lock(provider, queued_at, caller, yielded=True)
                 holding = True
         finally:
             if holding:
                 self._refresh_lock.release()
 
     def _acquire_refresh_lock(
-        self, provider: str, queued_at: float, caller: socket.socket | None
+        self,
+        provider: str,
+        queued_at: float,
+        caller: socket.socket | None,
+        *,
+        yielded: bool = False,
     ) -> None:
         """Take `_refresh_lock` for a route caller: in COMMAND_SLOT_POLL_SECONDS
         pieces, raising CallerHungUp if `caller` hangs up and
         CommandSlotUnavailable once COMMAND_SLOT_WAIT_SECONDS have passed since
-        `queued_at`."""
+        `queued_at` -- with the yielded text when `yielded`, the re-take after
+        stepping aside for a vcs verb."""
         if self._refresh_lock.acquire(blocking=False):
             return
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
@@ -5522,20 +5533,35 @@ class CommandExecutor:
             if caller is not None and _caller_has_gone(caller):
                 raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
             if time.monotonic() >= deadline:
-                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider))
+                raise CommandSlotUnavailable(
+                    self._refresh_lock_wait_text(provider, queued_at, yielded)
+                )
 
     @staticmethod
-    def _refresh_lock_wait_text(provider: str) -> str:
-        """The refusal for a route refresher that waited out its bound for the
-        refresh lock, or for the vcs verbs it yielded the lock to."""
+    def _refresh_lock_wait_text(
+        provider: str, queued_at: float = 0.0, yielded: bool = False
+    ) -> str:
+        """The refusal for a route refresher that waited out its bound: for the
+        refresh lock before reserving, or -- `yielded` -- after stepping aside
+        for a vcs verb, a wait that also spent the budget wait, so it names the
+        seconds actually spent since `queued_at`."""
+        if yielded:
+            return REFRESH_YIELDED_WAIT_TEXT.format(
+                provider=provider, seconds=int(time.monotonic() - queued_at)
+            )
         return REFRESH_LOCK_WAIT_TEXT.format(provider=provider, seconds=COMMAND_SLOT_WAIT_SECONDS)
 
     def _await_covered_refreshers(
-        self, provider: str, queued_at: float, caller: socket.socket | None
+        self,
+        provider: str,
+        queued_at: float,
+        caller: socket.socket | None,
+        *,
+        yielded: bool = False,
     ) -> None:
         """Wait until every vcs verb counted in `_covered_refresh_waiters`
         holds or has held `_refresh_lock`, so a route caller that yielded it
-        does not re-take it first. Bounded and watched like
+        does not re-take it first. Bounded, watched and worded like
         `_acquire_refresh_lock`."""
         deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         with self._slot_condition:
@@ -5544,7 +5570,9 @@ class CommandExecutor:
                     raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider))
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(provider, queued_at, yielded)
+                    )
                 self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
 
     def _refresh_is_current(self, provider: str, clean_repo: str) -> bool:

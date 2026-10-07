@@ -6153,6 +6153,29 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(["ok"], verb_results)
         self.assertEqual(["ok"], route_results)
 
+    def _refused_waiting_for_covered_refreshers(self, yielded):
+        executor = self._budgeted_executor(admits=1)
+        with executor._slot_condition:
+            executor._covered_refresh_waiters = 1
+        queued_at = time.monotonic() - credential_proxy.COMMAND_SLOT_WAIT_SECONDS - 1
+        with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
+            executor._await_covered_refreshers("github", queued_at, None, yielded=yielded)
+        return str(refused.exception)
+
+    def test_a_route_caller_refused_after_yielding_says_so_with_the_time_it_spent(self):
+        text = self._refused_waiting_for_covered_refreshers(yielded=True)
+        self.assertIn("stepped aside", text)
+        self.assertNotIn("for another refresh to finish", text)
+        seconds = int(re.search(r"waited (\d+)s", text).group(1))
+        self.assertGreaterEqual(seconds, 60)
+
+    def test_a_route_caller_refused_before_yielding_keeps_the_lock_wait_text(self):
+        text = self._refused_waiting_for_covered_refreshers(yielded=False)
+        self.assertEqual(
+            "a github credential refresh waited 60s for another refresh to finish; retry shortly",
+            text,
+        )
+
     def test_a_route_holder_that_yielded_raises_the_vcs_verbs_recorded_failure(self):
         verb_results, route_results = self._convoy(outcome=RuntimeError("Minty unavailable"))
         self.assertIsInstance(verb_results[0], RuntimeError)
