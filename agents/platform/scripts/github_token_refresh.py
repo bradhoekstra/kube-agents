@@ -186,19 +186,19 @@ BROKER_YIELDED_WAIT_SECONDS = 60
 #: Room for the connection and the response on top of the waits.
 SIDECAR_REFRESH_MARGIN_SECONDS = 10
 
-#: The client's socket timeout on the refresh POST. Before its own helper
-#: starts, the broker may hold a refresh twice: waiting for the refresh lock
-#: behind another refresh, under a bound of COMMAND_SLOT_WAIT_SECONDS from
-#: arrival, and then, holding the lock, queueing for admission under a bound of
-#: its own. A refresh that steps aside for a vcs verb's refresh during that
-#: second wait does so once, and the third bound, counted from the yield,
-#: covers its wait for the verb, re-taking the lock and any second budget wait.
-#: A refresh admitted late still runs the whole helper and answers 200
-#: once the token has landed, so a client that gives up sooner reports a refresh
-#: that succeeded as failed. A refresher behind a helper that runs past the lock
-#: bound is told busy even though that helper lands the token seconds later;
-#: this client reports that as a failed refresh, and the next call coalesces on
-#: the fresh token.
+#: The client's socket timeout on the refresh POST: every wait the broker may
+#: put a refresh through, then the helper, then the margin. Before its own
+#: helper starts, a refresh waits for the refresh lock behind another refresh,
+#: under a bound of COMMAND_SLOT_WAIT_SECONDS from arrival; then, holding the
+#: lock, for the child memory budget, under a bound of its own; and, if it steps
+#: aside for a vcs verb's refresh during that wait, which it does at most once,
+#: under a third bound counted from the yield, which covers the wait for the
+#: verb, re-taking the lock and any second budget wait. A refresh admitted late
+#: still runs the whole helper and answers 200 once the token has landed, so a
+#: client that gives up sooner reports a refresh that succeeded as failed. A
+#: refresher behind a helper that runs past the lock bound is told busy even
+#: though that helper lands the token seconds later; this client reports that
+#: as a failed refresh, and the next call coalesces on the fresh token.
 SIDECAR_REFRESH_TIMEOUT_SECONDS = (
     BROKER_ADMISSION_WAIT_SECONDS
     + BROKER_ADMISSION_WAIT_SECONDS

@@ -6307,26 +6307,20 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(0, executor.queued_requests)
         self.assertEqual(held, executor.reserved_bytes)
 
-    def _yield_to_a_verb_of_another_org(self, executor, calls, verb_finish=None):
+    def _yield_to_a_verb_of_another_org(self, executor, calls):
         """Start a vcs verb holding the only admission and a route caller
         parked in its budget wait with the lock held; the verb then refreshes
         another org's repository, so the route caller yields to it and its
         re-check stays stale. The helper stub answers the scoped set as the
-        repository it was given, and blocks the verb's call until
-        `verb_finish`, if given, is set. Returns (route thread, route results,
-        route refused-at list, verb results, leave event, verb helper started
-        event, verb helper started-at list)."""
+        repository it was given. Returns (route thread, route results, verb
+        results, leave event); the verb holds its admission until `leave`."""
         verb_started = threading.Event()
-        verb_started_at = []
 
         def helper(provider, helper_path, arguments, action, log_success=False):
             name = threading.current_thread().name
             calls.append(name)
             if name == "verb":
-                verb_started_at.append(time.monotonic())
                 verb_started.set()
-                if verb_finish is not None:
-                    verb_finish.wait(10)
             return subprocess.CompletedProcess([], 0, arguments[0] + "\n", "")
 
         patch = mock.patch.object(executor, "_run_forge_helper", helper)
@@ -6355,14 +6349,12 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 verb_results.append(exc)
 
         route_results = []
-        route_refused_at = []
 
         def route_caller():
             try:
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
                 route_results.append("ok")
             except Exception as exc:  # surfaced by the assertions
-                route_refused_at.append(time.monotonic())
                 route_results.append(exc)
 
         verb = threading.Thread(target=vcs_verb, name="verb", daemon=True)
@@ -6376,14 +6368,14 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertTrue(executor._refresh_lock.locked())
         go.set()
         self.assertTrue(verb_started.wait(5))
-        return route, route_results, route_refused_at, verb_results, leave, verb_started_at
+        return route, route_results, verb_results, leave
 
     def test_a_route_caller_still_stale_after_its_yield_reserves_again_and_does_not_yield_twice(self):
         executor = self._budgeted_executor(admits=1)
         calls = []
         # Long, so nobody gets out by timing out.
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 120):
-            route, route_results, _, verb_results, leave, _ = self._yield_to_a_verb_of_another_org(
+            route, route_results, verb_results, leave = self._yield_to_a_verb_of_another_org(
                 executor, calls
             )
             # The verb's refresh covered another org: the route caller re-takes
@@ -6422,26 +6414,40 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(0, executor._covered_refresh_waiters)
         self.assertFalse(executor._refresh_lock.locked())
 
-    def test_a_route_caller_still_stale_after_its_yield_is_refused_within_the_yield_bound(self):
-        bound = 2.0
+    def test_a_route_caller_still_stale_after_its_yield_reserves_on_the_yield_bound_without_yielding(self):
+        # Structural, not timed: the reservation after the yield is handed the
+        # deadline the wait for the verb and the re-take ran on, and no
+        # `yield_when`; the budget stays held, so that wait is refused.
         executor = self._budgeted_executor(admits=1)
         calls = []
-        verb_finish = threading.Event()
-        self.addCleanup(verb_finish.set)
-        with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", bound):
-            route, route_results, refused_at, _, _, verb_started_at = (
-                self._yield_to_a_verb_of_another_org(executor, calls, verb_finish)
-            )
-            # Margin, one-directional: the verb holds the lock for part of the
-            # yield bound, so a second budget wait on a fresh clock would end
-            # well after the yield bound does.
-            time.sleep(0.5 * bound)
-            verb_finish.set()
-            route.join(5 * bound)
+        reservations = []
+        real_reserve = executor.reserve_child_memory
+
+        def spy_reserve(caller=None, yield_when=None, deadline=None):
+            reservations.append({"yield_when": yield_when, "deadline": deadline})
+            return real_reserve(caller=caller, yield_when=yield_when, deadline=deadline)
+
+        yield_deadlines = []
+        real_await = executor._await_covered_refreshers
+
+        def spy_await(provider, deadline, caller, **kwargs):
+            yield_deadlines.append(deadline)
+            return real_await(provider, deadline, caller, **kwargs)
+
+        with mock.patch.object(executor, "reserve_child_memory", spy_reserve), \
+             mock.patch.object(executor, "_await_covered_refreshers", spy_await), \
+             mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 2.0):
+            route, route_results, _, _ = self._yield_to_a_verb_of_another_org(executor, calls)
+            route.join(10)
             self.assertFalse(route.is_alive())
+        self.assertEqual(2, len(reservations))
+        self.assertIsNone(reservations[0]["deadline"])
+        self.assertIsNotNone(reservations[0]["yield_when"])
+        self.assertEqual(1, len(yield_deadlines))
+        self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
+        self.assertIsNone(reservations[1]["yield_when"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
         self.assertIn("without fitting", str(route_results[0]))
-        self.assertLessEqual(refused_at[0] - verb_started_at[0], 1.25 * bound)
         self.assertEqual(["verb"], calls)
 
     def test_a_route_refresher_gives_up_on_a_held_refresh_lock_at_the_bound(self):
