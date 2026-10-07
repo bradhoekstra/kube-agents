@@ -39,11 +39,16 @@ UNOWNED = "unowned"
 PROSE_FALLBACKS = ("the owner of the area it designs, or its `Author:` line where one exists",)
 
 BACKTICKED_RE = re.compile(r"`([^`]+)`")
-# A backticked token the page means as a path: it has a slash or an extension,
-# and no glob or field punctuation (`gke-*`, `owner:`).
-PATH_SHAPED_RE = re.compile(r"^[\w./-]+$")
-# A top-level Repository Layout bullet: no indent, a backticked path, a colon.
-LAYOUT_ENTRY_RE = re.compile(r"^- `([^`]+)`:")
+# A backticked token in a prose cell that the page means as a repository path:
+# relative, with a directory component or one of the extensions the tree uses,
+# and no glob or field punctuation (`gke-*`, `owner:`). Versions (`3.9.6`),
+# abbreviations (`e.g.`) and slash commands (`/review`) are not paths.
+PROSE_PATH_RE = re.compile(r"^(?!\.\.?(/|$))(?!/)[\w.-]+(/[\w.-]*)+$|^[\w-]+\.(md|py|sh|yaml|yml|json|go|txt|env)$")
+# A top-level Repository Layout bullet: no indent; the backticked paths before
+# the first colon are the entries. Any top-level bullet with none is a shape
+# the test does not read and fails on, rather than one it silently skips.
+LAYOUT_BULLET_PREFIX = "- "
+LAYOUT_ENTRY_SEPARATOR = ":"
 # A GitHub login, as OWNERS writes one.
 LOGIN_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
@@ -77,17 +82,36 @@ def _owners_logins():
     return {login.lower() for login in data.get("approvers", []) + data.get("reviewers", [])}
 
 
-def _layout_entries():
-    entries = []
-    for line in _section(AGENTS_FILE, LAYOUT_HEADING):
-        match = LAYOUT_ENTRY_RE.match(line)
-        if match:
-            entries.append(match.group(1))
+def _layout_entries_in(lines):
+    """Paths named by the top-level bullets in a Repository Layout section."""
+    entries, unreadable = [], []
+    for line in lines:
+        if not line.startswith(LAYOUT_BULLET_PREFIX):
+            continue
+        tokens = BACKTICKED_RE.findall(line.split(LAYOUT_ENTRY_SEPARATOR, 1)[0])
+        if not tokens:
+            unreadable.append(line)
+        entries.extend(tokens)
+    if unreadable:
+        raise AssertionError(
+            "Repository Layout bullets with no backticked path before the colon; "
+            f"the coverage check cannot read them: {unreadable}"
+        )
     return entries
 
 
-def _is_path_shaped(token):
-    return bool(PATH_SHAPED_RE.match(token)) and ("/" in token or "." in token)
+def _layout_entries():
+    return _layout_entries_in(_section(AGENTS_FILE, LAYOUT_HEADING))
+
+
+def _is_prose_path(token):
+    return bool(PROSE_PATH_RE.match(token))
+
+
+def _in_tree(path):
+    """True when `path` resolves to something that exists under the repository root."""
+    target = (REPO / path).resolve()
+    return target.exists() and target.is_relative_to(REPO)
 
 
 class OwnershipDocTest(unittest.TestCase):
@@ -105,17 +129,18 @@ class OwnershipDocTest(unittest.TestCase):
                 raise AssertionError(f"{name} is empty; nothing to check")
 
     def _paths(self):
-        """Every path-shaped backticked token in the table, with the row it is on."""
+        """Every path the table names: all of the key-paths column, and the
+        path-shaped tokens of the other cells."""
         for row in self.rows:
-            for cell in row:
+            for column, cell in enumerate(row):
                 for token in BACKTICKED_RE.findall(cell):
-                    if _is_path_shaped(token):
+                    if column == COL_PATHS or _is_prose_path(token):
                         yield row[COL_SUBJECT], token
 
     def test_every_path_exists(self):
         paths = list(self._paths())
         self.assertTrue(paths, "the table names no paths at all; the scan is broken, not the page")
-        missing = [f"{subject}: {path}" for subject, path in paths if not (REPO / path).exists()]
+        missing = [f"{subject}: {path}" for subject, path in paths if not _in_tree(path)]
         self.assertEqual(missing, [], "the page names paths that are not in the tree")
 
     def test_every_layout_entry_has_its_own_row(self):
@@ -148,6 +173,34 @@ class OwnershipDocTest(unittest.TestCase):
     def test_primary_is_never_blank(self):
         blank = [subject for subject, primary, _ in self._people() if primary == ""]
         self.assertEqual(blank, [], f"rows with no primary (write {UNOWNED!r} if that is the truth)")
+
+
+class HeuristicsTest(unittest.TestCase):
+    """The shapes the table scan reads and the ones it must not."""
+
+    def test_prose_path_shapes(self):
+        for token in ("docs/ci-health.md", "scripts/release/", "bench/tf/fleet/", "OWNERS.md", "a.yaml"):
+            self.assertTrue(_is_prose_path(token), token)
+        for token in ("e.g.", "3.9.6", "/review", "/tmp/x", "../kube-agents-bot/", "./x", "gke-*", "owner:", "OWNERS"):
+            self.assertFalse(_is_prose_path(token), token)
+
+    def test_in_tree_rejects_paths_outside_the_repository(self):
+        self.assertTrue(_in_tree("AGENTS.md"))
+        self.assertFalse(_in_tree("/tmp"))
+        self.assertFalse(_in_tree("../"))
+        self.assertFalse(_in_tree("no/such/path"))
+
+    def test_layout_entries_read_every_bullet_shape(self):
+        lines = [
+            "- `agents/`: Source of truth.",
+            "  - `chat/`: nested, not top level.",
+            "- `hack/` (CI scripts): with an aside.",
+            "- `tests/`, `bench/`: two in one bullet.",
+            "",
+        ]
+        self.assertEqual(_layout_entries_in(lines), ["agents/", "hack/", "tests/", "bench/"])
+        with self.assertRaises(AssertionError):
+            _layout_entries_in(["- hack/: no backticks."])
 
 
 if __name__ == "__main__":
