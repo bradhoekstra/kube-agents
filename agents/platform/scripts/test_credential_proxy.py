@@ -4309,7 +4309,8 @@ class CommandExecutorTest(unittest.TestCase):
         # Same shape, with the head refused at its own bound: the reservation
         # never waits for it and is never refused.
         executor = self.budgeted(admits=8, max_concurrent_commands=1)
-        holder = self.hold_a_slot(executor, seconds=1)
+        release = threading.Event()
+        self.hold_a_slot_until(executor, release)
         refused = []
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 0.6):
             head_thread = self.queue_a_slot_taker(executor, refused)
@@ -4319,7 +4320,8 @@ class CommandExecutorTest(unittest.TestCase):
             head_thread.join()
         self.assertEqual(1, len(refused))
         self.assertIn("1 concurrent commands", refused[0])
-        holder.join()
+        self.assertEqual(1, executor.slots_in_use)
+        release.set()
 
     def test_a_fitting_reservation_keeps_its_place_behind_a_budget_held_head(self):
         # Eight slots, one in flight. The budget is one slot-taker's worth plus
