@@ -178,7 +178,9 @@ check_literal_from() {
   local name=$1 dockerfile=$2
   local want got
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  got="$(normalise "$(sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]*\).*$/\1/p' "$dockerfile" | tail -n1)")"
+  # Docker's grammar: optional leading blanks, a case-insensitive keyword, then
+  # any number of `--flag` words (`--platform=…`) before the reference.
+  got="$(normalise "$(sed -n 's/^[[:space:]]*[Ff][Rr][Oo][Mm][[:space:]]\{1,\}\(--[^[:space:]]*[[:space:]]\{1,\}\)*\([^[:space:]]*\).*$/\2/p' "$dockerfile" | tail -n1)")"
   [ "$got" = "$want" ] ||
     fail "$dockerfile: FROM pins '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
 }

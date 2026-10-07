@@ -9,7 +9,6 @@ against a synthetic inventory and Dockerfile, as
 tests/test_check_image_inventory_go_directive.py does for the Go directive.
 """
 
-import json
 import pathlib
 import subprocess
 import sys
@@ -25,8 +24,10 @@ _REPO_ROOT = _HERE.parent
 _SCRIPT = _REPO_ROOT / "hack" / "check-image-inventory.sh"
 
 # Lifted by name: a rename fails here loudly instead of silently shrinking
-# what is tested.
-_LIFTED_FUNCTIONS = ("fail", "normalise", "pin_of", "repo_of", "check_literal_from")
+# what is tested. repo_of and pin_of read images.json through jq and are
+# stubbed below instead, as test_check_image_inventory_operator_pins.py does:
+# jq is not on the Python test runner's PATH.
+_LIFTED_FUNCTIONS = ("fail", "normalise", "check_literal_from")
 
 # The call sites, asserted present because the lift below supplies its own.
 _CALL_SITES = (
@@ -40,19 +41,16 @@ _PIN = "musl@sha256:" + "a" * 64
 _OTHER_PIN = "musl@sha256:" + "b" * 64
 
 
-def _inventory(pin: str) -> str:
-    return json.dumps({"images": [{"name": _NAME, "repository": _REPOSITORY, "tag": pin}]})
-
-
 def _run_check(dockerfile: str, pin: str = _PIN) -> subprocess.CompletedProcess:
     text = _SCRIPT.read_text()
     functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
-        (root / "images.json").write_text(_inventory(pin))
         (root / "Dockerfile").write_text(dockerfile)
         script = (
             "set -u\nstatus=0\nINVENTORY=images.json\n"
+            f'repo_of() {{ echo "{_REPOSITORY}"; }}\n'
+            f'pin_of() {{ echo "{pin}"; }}\n'
             + functions
             + f"check_literal_from {_NAME} Dockerfile\nexit $status\n"
         )
@@ -86,6 +84,28 @@ class CheckLiteralFromTest(unittest.TestCase):
         self.assertEqual(_run_check(multi_stage).returncode, 0)
         wrong_last = f"FROM busybox:{_PIN} AS unused\nFROM busybox:{_OTHER_PIN}\n"
         self.assertNotEqual(_run_check(wrong_last).returncode, 0)
+
+    def test_docker_grammar_variants_are_read(self):
+        # Docker accepts a lowercase keyword, leading blanks and --flag words
+        # before the reference; a last stage written any of those ways must be
+        # the one compared, and a flag must never be taken for the image.
+        for text in (
+            f"from busybox:{_PIN}\n",
+            f"  FROM busybox:{_PIN}\n",
+            f"FROM --platform=linux/amd64 busybox:{_PIN}\n",
+            f"FROM --platform=linux/amd64 --no-cache busybox:{_PIN}\n",
+        ):
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for text in (
+            f"FROM busybox:{_PIN} AS build\nfrom busybox:{_OTHER_PIN}\n",
+            f"FROM busybox:{_PIN} AS build\n  FROM busybox:{_OTHER_PIN}\n",
+        ):
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(_OTHER_PIN, result.stderr)
 
     def test_missing_from_fails(self):
         result = _run_check("COPY files/ /\n")
