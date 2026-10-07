@@ -171,13 +171,13 @@ sum of live reservations plus its own fits `children_budget` with its slot count
 At the operator's defaults (1Gi limit, 8 MiB output cap) a request costs 128 MiB plus 48 MiB of
 output allowance, 176 MiB, against 704 MiB after the two fixed reserves: four requests that run
 commands are in flight at once (4 × 176 = 704), whatever order they arrive in, where the slot cap
-alone admitted eight. The stall watch's eight
-parallel listings run in two waves. Over two hours on the install above, 414 `gcloud` requests
-took 2 s at the median, 18 s at the 95th percentile and 25 s at most, so the second wave waits one
-listing, within the 60-second bound with room to spare. The reconciler's listing pool is four at
-every `maxProjects` cap (§2.6), the admitted count, so its lookups do not queue at the proxy at
-all; at eight wide its listing budget, sized for eight at a time, would have run out with about
-forty of a hundred projects unlisted at a 10-second listing.
+alone admitted eight. The reconciler's and the stall watch's listing pools are four wide (§2.6),
+the admitted count; at eight wide each listing budget, sized for eight at a time, would have run
+out with about forty of a hundred projects unlisted at a 10-second listing. When the hourly
+reconcile and a stall-watch tick coincide the two pools together submit eight against four
+admitted, and the second wave waits one listing: over two hours on the install above, 414
+`gcloud` requests took 2 s at the median, 18 s at the 95th percentile and 25 s at most, within the
+60-second bound with room to spare.
 
 Four requests at once is the cost of the design at the default limit, and it binds long-running
 commands too: four `kubectl logs --follow` or `kubectl wait` hold the budget for as
@@ -299,16 +299,19 @@ the broker budgeting against a stale number.
 
 The slot cap and output cap, their values and their reservation. The sandbox shim
 (`credential_proxy_client.py`): a 503 is still printed and exit 1 returned; with four heavy
-requests at once an eight-wide listing burst waits one listing, so no retry is added here. The
-stall watch's eight-wide listing pool. The proxy container's requests and limits, and so the
+requests at once the eight-wide burst of both listing pools coinciding waits one listing, so no
+retry is added here. The proxy container's requests and limits, and so the
 chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
 
-The reconciler's listing pool is the one caller setting the change moved. It had been eight at
-the default `maxProjects` cap and up to sixteen when the cap was raised; it is now four, the
-count §2.2 admits, at every cap, and its listing budget doubles to 300 seconds at the default cap
-to keep the 12 seconds per listing the 150-second budget gave at eight wide, growing by that per
-default cap's worth of projects. The bootstrap gate's floor follows the budget, from 240 to 390
-seconds.
+The reconciler's and the stall watch's listing pools are the caller settings the change moved.
+The reconciler's had been eight at the default `maxProjects` cap and up to sixteen when the cap
+was raised; it is now four, the count §2.2 admits, at every cap, and its listing budget doubles to
+300 seconds at the default cap to keep the 12 seconds per listing the 150-second budget gave at
+eight wide, growing by that per default cap's worth of projects. The bootstrap gate's floor
+follows the budget, from 240 to 390 seconds. The stall watch's pool goes from eight to four and
+its listing budget from 150 to 300 seconds, for the same 12 seconds per listing; the listing runs
+inside the tick's 1500-second budget, which does not change, so a tick whose listings use the
+whole budget leaves its scans 150 seconds less.
 
 Prose the change updated because it had become false: in
 [`docs/credential-isolation-design.md`](../credential-isolation-design.md), the CLI-commands
@@ -339,7 +342,7 @@ knob with no correctness risk, which is the only form it is suitable in.
 agent pod resolves `spec.scope` and writes `fleet_scope.json` to the data PVC, which the operator
 never reads. Feeding it back is a new status field and a reconcile that restarts the broker, to
 size on a variable that predicts the burst worse than the broker's own concurrency does: the
-burst is eight wide on any install with eight projects at the default cap, however many
+burst is four wide per listing pool on any install with four projects, however many
 clusters they hold.
 
 **A `gcloud`-only sub-cap.** The smallest diff. It leaves the `kubectl`-plus-helper term, which
