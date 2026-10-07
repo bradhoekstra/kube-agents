@@ -132,8 +132,9 @@ class CheckLiteralFromTest(unittest.TestCase):
 
     def test_any_other_instruction_fails_closed_naming_the_line(self):
         # The shape plugin_image.sh defines is FROM and COPY lines; a RUN, a
-        # heredoc body line or a backtick continuation is refused by name, so
-        # the crane and docker builders never disagree on a file this passes.
+        # heredoc body line or a backtick continuation is refused by name (and a
+        # flagged COPY below), so the crane and docker builders never disagree
+        # on a file this passes.
         for text, line in (
             (f"FROM busybox:{_PIN}\nRUN rm -rf /bin\nCOPY files/ /\n", "RUN rm -rf /bin"),
             (f"FROM busybox:{_PIN}\nCOPY <<EOF /x\nFROM busybox:{_OTHER_PIN}\nEOF\n", "EOF"),
@@ -143,6 +144,20 @@ class CheckLiteralFromTest(unittest.TestCase):
                 result = _run_check(text)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(f"line '{line}' is neither FROM nor COPY", result.stderr)
+                self.assertNotIn("FROM pins", result.stderr)
+
+    def test_copy_flags_fail_closed_naming_the_line(self):
+        # `COPY --from=<image>` is a second image reference that only docker
+        # build honours and nothing pins or mirrors; the crane path ignores
+        # every COPY flag, so any flag is refused by name.
+        for text, line in (
+            (f"FROM busybox:{_PIN}\nCOPY --from=alpine:latest /bin/busybox /bin/busybox\nCOPY files/ /\n", "COPY --from=alpine:latest /bin/busybox /bin/busybox"),
+            (f"FROM busybox:{_PIN}\n  copy --chown=1000:1000 files/ /\n", "  copy --chown=1000:1000 files/ /"),
+        ):
+            with self.subTest(text=text):
+                result = _run_check(text)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"line '{line}' gives COPY a flag", result.stderr)
                 self.assertNotIn("FROM pins", result.stderr)
 
     def test_non_ascii_bytes_fail_closed(self):

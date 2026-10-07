@@ -176,8 +176,10 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # dropped; no remaining line ends in a backslash (a continuation, or an
 # escaped one); every remaining line begins, after ASCII blanks, with FROM or
 # COPY in any case (so a RUN, a heredoc body or a backtick continuation is
-# refused by name); exactly one of them is a FROM; its reference, after any
-# `--flag` words, equals the inventory's. A CR before the newline is ignored.
+# refused by name); no COPY carries a `--flag` (`--from=` names a second image
+# only docker build would pull, and the crane path ignores every COPY flag);
+# exactly one of them is a FROM; its reference, after any `--flag` words,
+# equals the inventory's. A CR before the newline is ignored.
 check_literal_from() {
   local name=$1 dockerfile=$2
   local want got body continued other froms
@@ -195,6 +197,11 @@ check_literal_from() {
   other="$(printf '%s\n' "$body" | sed -n -e '/^[[:blank:]]*[Ff][Rr][Oo][Mm][[:blank:]]/d' -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]/d' -e 'p' | head -n1)"
   if [ -n "$other" ]; then
     fail "$dockerfile: line '$other' is neither FROM nor COPY; the plugin pin fence reads a file of one single-line FROM and COPY lines and nothing else (agentplugins/lib/plugin_image.sh)."
+    return
+  fi
+  other="$(printf '%s\n' "$body" | sed -n '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]\{1,\}--/p' | head -n1)"
+  if [ -n "$other" ]; then
+    fail "$dockerfile: line '$other' gives COPY a flag; the plugin pin fence allows none, because --from names a second image nothing pins or mirrors and the crane build path ignores every COPY flag (agentplugins/lib/plugin_image.sh)."
     return
   fi
   froms="$(printf '%s\n' "$body" | sed -n '/^[[:blank:]]*[Ff][Rr][Oo][Mm][[:blank:]]/p' | wc -l | tr -d ' ')"
