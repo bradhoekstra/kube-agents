@@ -71,7 +71,9 @@ the flip removes the NATS Service and leaves the bridge dialling a host that no 
 resolves. Confirmed live 2026-09-05: the sidecar crash-loops, and because it shares the
 agent's pod the pod never reaches Ready - the whole agent is down, not merely carrying
 an A2A trace. Unset `spec.deployment.sidecars` _before_ flipping to `today`. In any
-flip runbook that step is a blocker, not tidiness.
+flip runbook that step is a blocker, not tidiness. `hack/rollback-roundtrip.sh` follows
+it: it unsets the whole list, not only the sidecars that look like bus clients, flips,
+and declares the saved list again once `next` is back.
 
 **The webhook does not screen sidecar env, on purpose.** The `SensitiveEnvVars`
 refusal applies to `spec.deployment.env` only; a sidecar's own `env` is unscreened (the
@@ -381,6 +383,7 @@ failures name themselves in the status message:
 | `hermes-api-failed`      | a 5xx answer, or a 200 whose turn Hermes marks failed; the message carries the status, session and the error or a body tail       | persona            |
 | `hermes-api-unreadable`  | a 2xx answer that is not a chat completion with at least one choice                                                               | persona            |
 | `hermes-api-read-failed` | the response body broke off mid-read                                                                                              | persona            |
+| `hermes-api-oversize`    | a 2xx body over the 8 MiB read cap (`apiResponseCap` in `api.go`); refused rather than truncated, with the limit named            | persona            |
 | `request-encode-failed`  | the bridge could not encode the request; a bridge fault, not expected in practice                                                 | graded (unlisted)  |
 | `request-build-failed`   | the bridge could not build the request; the URL is checked at start, so likewise                                                  | graded (unlisted)  |
 

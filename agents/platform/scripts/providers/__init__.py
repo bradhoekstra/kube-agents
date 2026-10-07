@@ -27,16 +27,19 @@ from .credentials import (
     Credential,
     MintedReadCredential,
     NoCredential,
+    StaticFileCredential,
 )
 from .errors import GUIDANCE, Guidance, forge_error
 from .registry import AVAILABLE, Registry, build_forges
-from .transport import CliTransport, Transport
+from .transport import CliTransport, HttpTransport, Transport
 from .validate import (
     BRANCH_RE,
     DEFAULT_PAGE_SIZE,
     MAX_PAGE_SIZE,
     SHA_RE,
+    pinned_base,
     repo_segments,
+    short_branch,
     validate_branch,
     validate_labels,
     validate_limit,
@@ -53,6 +56,7 @@ __all__ = [
     "COLLABORATION_VERBS",
     "BrokeredCredential",
     "CliTransport",
+    "HttpTransport",
     "Credential",
     "DEFAULT_PAGE_SIZE",
     "Forge",
@@ -62,6 +66,7 @@ __all__ = [
     "MAX_PAGE_SIZE",
     "MintedReadCredential",
     "NoCredential",
+    "StaticFileCredential",
     "Registry",
     "SHA_RE",
     "StubForge",
@@ -70,7 +75,9 @@ __all__ = [
     "build_forges",
     "forge_error",
     "listing",
+    "pinned_base",
     "repo_segments",
+    "short_branch",
     "validate_branch",
     "validate_labels",
     "validate_limit",

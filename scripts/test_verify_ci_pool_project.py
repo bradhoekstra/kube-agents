@@ -642,6 +642,27 @@ class SeededFleetFixturesTest(unittest.TestCase):
         self.assertEqual("reader@p.iam.gserviceaccount.com", env["FLEET_READONLY_SA"])
         self.assertNotIn("FLEET_ALLOW_RUNNER_CREDENTIAL", env)
 
+    def test_a_role_the_runner_could_not_read_is_unverified_not_a_failure(self):
+        # The runner counts a role whose presence probe failed for a reason
+        # other than NotFound into the unresolved count and says why; the
+        # check reads that line as a cluster it could not reach, so the
+        # project is not failed for a fixture nobody looked at.
+        warning = (
+            "WARNING: deployment/inventory-api could not be read from a.kubeconfig in kube-agents-evals-5 "
+            "(Error from server (Forbidden): deployments.apps is forbidden), so fixture role 'stalled-controller' "
+            "could not be checked. Its checks will report status=error rather than blaming the run."
+        )
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok("v1.30.0"),
+                (0, "", warning + "\n" + self._summary(self._roles() - 1, unresolved=1)),
+                (0, "", self._state(self._roles() - 1, unchecked=1)),
+            ]
+            result = checker.check_seeded_fleet_fixtures("kube-agents-evals-5")
+        self.assertTrue(result.passed, result.details)
+        self.assertIn("not checked", result.message)
+        self.assertTrue(any("could not be reached" in w for w in result.warnings), result.warnings)
+
     def test_a_reader_the_operator_cannot_mint_is_unverified_not_a_failure(self):
         # The runner's exit 3 carries gcloud's own refusal, which the denial
         # patterns read as an unperformed read: the project is not failed for
@@ -1122,7 +1143,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         wrong = checker._FLEET_LOOKED_AND_FOUND_WRONG.pattern.split("|")
         unreachable = checker._FLEET_UNREACHABLE.pattern.split("|")
         self.assertEqual(5, len(wrong))
-        self.assertEqual(3, len(unreachable))
+        self.assertEqual(4, len(unreachable))
         for phrase in [*wrong, *unreachable, checker._FLEET_COULD_NOT_LOOK.pattern]:
             with self.subTest(phrase=phrase):
                 self.assertRegex(text, phrase)
@@ -3096,15 +3117,23 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
     """This check must attest the credential hack/ci-eval-pr.sh actually mints.
 
     The App, its installation, and the variable the token lands in are written
-    in three files that do not read each other -- here, hack/ci-eval-pr.sh, and
+    in four files that do not read each other -- here, hack/ci-eval-pr.sh,
+    hack/ledger_token_mint.py (whose defaults are what step 0 mints with, since
+    hack/ci-revalidate.sh exports neither id), and
     bench/kube_agents_bench/verifiers.py. Change one and this check goes on
     reporting a project healthy against a credential CI no longer uses. Parsed
     rather than imported: the verifier is deliberately dependency-free, bench is
-    an installable package, and the third file is shell.
+    an installable package, one file is shell, and the mint runs at import.
     """
 
     def setUp(self):
         self.script = (checker._ROOT / "hack" / "ci-eval-pr.sh").read_text()
+        self.mint = (checker._ROOT / "hack" / "ledger_token_mint.py").read_text()
+
+    def _module_default(self, name):
+        m = re.search(rf'^{name} = "([^"]+)"$', self.mint, re.M)
+        self.assertIsNotNone(m, f"could not find {name} in hack/ledger_token_mint.py")
+        return m.group(1)
 
     def _default(self, name):
         m = re.search(rf'^export {name}="\$\{{{name}:-([^}}]+)\}}"', self.script, re.M)
@@ -3115,6 +3144,12 @@ class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
         self.assertEqual(str(checker.LEDGER_APP_ID), self._default("EVAL_LEDGER_APP_ID"))
         self.assertEqual(
             str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
+        )
+
+    def test_the_app_and_installation_match_the_mint_modules_defaults(self):
+        self.assertEqual(str(checker.LEDGER_APP_ID), self._module_default("DEFAULT_LEDGER_APP_ID"))
+        self.assertEqual(
+            str(checker.LEDGER_INSTALLATION_ID), self._module_default("DEFAULT_LEDGER_INSTALLATION_ID")
         )
 
     def test_the_probe_asks_for_the_reads_the_grading_mint_asks_for(self):
