@@ -14,13 +14,15 @@ Each side declares its own copy, so nothing but this test stops one moving
 without the others. The files are read as text: importing the broker pulls in
 its runtime dependencies.
 
-The output cap has one source: `credentialProxyMaxOutputBytes` in
-`k8s-operator/internal/controller/platformagent_manifests.go`. The operator
-derives its floor from it and sets it on the broker as
-`CREDENTIAL_PROXY_MAX_OUTPUT_BYTES`, the `max_output_bytes` the broker's
-`OUTPUT_COPIES_PER_COMMAND * max_output_bytes` multiplies (the broker's own
-fallback, used only without the operator, is not the deployed cap). This test
-reads the cap from that constant rather than declaring one.
+The floor at the operator's output cap is declared as a literal on each side:
+`CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP` in the broker,
+`credentialProxyMemoryFloorBytesAtDefaultCap` in the operator, and
+`kube-agents.credentialProxyMemoryFloorBytes` in the chart. This test holds the
+three equal rather than re-deriving the floor, so a change to the shape of
+either side's floor function is not hidden behind a formula of the test's own:
+each side's own test (`test_a_limit_at_the_floor_enables_the_budget_for_two`,
+`TestCredentialProxyBudgetArithmeticAtTheDefaults`) holds its literal to its
+function.
 """
 
 from __future__ import annotations
@@ -33,9 +35,7 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 BROKER = REPO_ROOT / "agents/platform/scripts/credential_proxy.py"
 OPERATOR = REPO_ROOT / "k8s-operator/internal/controller/credential_proxy_manifests.go"
 CHART_HELPERS = REPO_ROOT / "charts/kube-agents/templates/_helpers.tpl"
-OPERATOR_MANIFESTS = REPO_ROOT / "k8s-operator/internal/controller/platformagent_manifests.go"
 MEBIBYTE = 1024 * 1024
-FLOOR_AT_OPERATOR_OUTPUT_CAP_BYTES = 672 * MEBIBYTE
 
 # (broker name, operator name, whether the figure is in MiB on both sides).
 TERMS = (
@@ -78,9 +78,14 @@ def operator_terms() -> dict[str, int]:
     return terms
 
 
-def operator_output_cap_bytes() -> int:
-    text = OPERATOR_MANIFESTS.read_text(encoding="utf-8")
-    return _match(r'^\s*credentialProxyMaxOutputBytes\s*=\s*"(\d+)"', text, OPERATOR_MANIFESTS)
+def broker_floor_bytes() -> int:
+    text = BROKER.read_text(encoding="utf-8")
+    return _match(r"^CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP = (\d+)$", text, BROKER)
+
+
+def operator_floor_bytes() -> int:
+    text = OPERATOR.read_text(encoding="utf-8")
+    return _match(r"^\s*credentialProxyMemoryFloorBytesAtDefaultCap\s+int64\s*=\s*(\d+)\s*$", text, OPERATOR)
 
 
 # (chart side, chart key, operator constant) for the defaults the chart merges over.
@@ -131,11 +136,6 @@ def _quoted(pattern: str, text: str) -> str:
     return found.group(1)
 
 
-def floor_bytes(resident: int, workspace: int, request: int, copies: int, minimum: int, cap: int) -> int:
-    """The smallest limit that admits `minimum` slot-taking requests at once."""
-    return resident + workspace + minimum * (request + copies * cap)
-
-
 class CredentialProxySizingParityTest(unittest.TestCase):
     def test_each_term_is_declared_equal_on_both_sides(self):
         broker = broker_terms()
@@ -149,23 +149,17 @@ class CredentialProxySizingParityTest(unittest.TestCase):
                     "credential_proxy_manifests.go differ; change them together",
                 )
 
-    def test_both_sides_derive_the_same_floor_at_the_operators_output_cap(self):
-        broker = broker_terms()
-        operator = operator_terms()
-        cap = operator_output_cap_bytes()
-        broker_floor = floor_bytes(*(broker[name] for name, _, _ in TERMS), cap)
-        operator_floor = floor_bytes(*(operator[name] for _, name, _ in TERMS), cap)
-        self.assertEqual(FLOOR_AT_OPERATOR_OUTPUT_CAP_BYTES, broker_floor)
-        self.assertEqual(FLOOR_AT_OPERATOR_OUTPUT_CAP_BYTES, operator_floor)
-
-    def test_the_chart_declares_the_same_floor(self):
-        operator = operator_terms()
-        operator_floor = floor_bytes(*(operator[name] for _, name, _ in TERMS), operator_output_cap_bytes())
+    def test_the_three_declared_floors_are_equal(self):
+        floors = {
+            "CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP in credential_proxy.py": broker_floor_bytes(),
+            "credentialProxyMemoryFloorBytesAtDefaultCap in credential_proxy_manifests.go": operator_floor_bytes(),
+            "kube-agents.credentialProxyMemoryFloorBytes in _helpers.tpl": chart_floor_bytes(),
+        }
         self.assertEqual(
-            chart_floor_bytes(),
-            operator_floor,
-            "kube-agents.credentialProxyMemoryFloorBytes in _helpers.tpl and the operator's "
-            "credentialProxyMinimumMemoryLimitBytes differ; change them together",
+            len(set(floors.values())),
+            1,
+            "the declared credential-proxy memory floors differ; change all three together: "
+            + ", ".join(f"{where} = {value}" for where, value in floors.items()),
         )
 
     def test_the_chart_declares_the_operators_defaults(self):

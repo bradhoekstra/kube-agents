@@ -168,6 +168,14 @@ const (
 	// listing phase cannot parallelise at all. The broker's counterpart is
 	// BUDGET_MINIMUM_ADMITTED_REQUESTS in credential_proxy.py.
 	credentialProxyMinimumAdmittedRequests int64 = 2
+	// credentialProxyMemoryFloorBytesAtDefaultCap is
+	// credentialProxyMinimumMemoryLimitBytes at credentialProxyOutputCapBytes,
+	// 672 MiB, declared as a literal so that the copies elsewhere can be
+	// compared with it as text. TestCredentialProxyBudgetArithmeticAtTheDefaults
+	// holds it to the function, and tests/test_credential_proxy_sizing_parity.py
+	// holds it equal to the broker's CHILD_MEMORY_BUDGET_FLOOR_BYTES_AT_DEFAULT_CAP
+	// and the chart's kube-agents.credentialProxyMemoryFloorBytes.
+	credentialProxyMemoryFloorBytesAtDefaultCap int64 = 704643072
 )
 
 // credentialProxyOutputCapBytes is credentialProxyMaxOutputBytes as a count.

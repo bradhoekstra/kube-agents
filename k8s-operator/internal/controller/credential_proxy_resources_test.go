@@ -201,6 +201,9 @@ func TestCredentialProxyBudgetArithmeticAtTheDefaults(t *testing.T) {
 	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != 672*mib {
 		t.Errorf("floor = %d MiB, want 672", got/mib)
 	}
+	if got := credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes); got != credentialProxyMemoryFloorBytesAtDefaultCap {
+		t.Errorf("floor = %d bytes, but credentialProxyMemoryFloorBytesAtDefaultCap declares %d; the declared copy the chart and the broker are compared with has drifted from the function", got, credentialProxyMemoryFloorBytesAtDefaultCap)
+	}
 	if got := credentialProxyAdmittedRequests(credentialProxyMinimumMemoryLimitBytes(credentialProxyOutputCapBytes), credentialProxyOutputCapBytes); got != credentialProxyMinimumAdmittedRequests {
 		t.Errorf("the floor admits %d requests, want %d", got, credentialProxyMinimumAdmittedRequests)
 	}

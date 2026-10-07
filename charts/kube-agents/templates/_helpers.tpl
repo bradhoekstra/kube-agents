@@ -1377,9 +1377,11 @@ operator accepts, for the CR template's static check of
 platformAgent.deployment.credentialProxy.resources. Copies of the operator's:
 credentialProxyCPURequest, credentialProxyMemoryRequest, credentialProxyCPULimit,
 credentialProxyMemoryLimit and credentialProxyEphemeralStorageLimit, and
-credentialProxyMinimumMemoryLimitBytes at the default output cap, 672Mi
-(k8s-operator/internal/controller/credential_proxy_manifests.go).
-tests/test_credential_proxy_sizing_parity.py holds them equal; change both sides together.
+credentialProxyMemoryFloorBytesAtDefaultCap, credentialProxyMinimumMemoryLimitBytes at the
+default output cap, 672Mi (k8s-operator/internal/controller/credential_proxy_manifests.go).
+tests/test_credential_proxy_sizing_parity.py holds them equal, the floor to the operator's and
+the broker's declared copies; each side's own test holds its copy to its formula. Change all
+sides together.
 The defaults carry no ephemeral-storage request because the operator renders none.
 */}}
 {{- define "kube-agents.credentialProxyDefaults" -}}
