@@ -86,11 +86,13 @@ nothing — a symlink that leads nowhere, a config unreadable, unparsable or inc
 `cluster-` directory whose config is absent or carries no identity block; silent are only the
 reserved `platform` and `default` profiles and a directory without the prefix that has no config or
 a config with no block, the shapes the read cannot tell from a non-cluster profile or a directory
-that was never one. A profile naming the record's project and cluster under another location — a
-zone for a regional cluster, which the scaffold admits and discovery then skips because the GKE API
-finds nothing there — still names the cluster, so its records stay loud as the startup skip line
-says. The scope is re-read from the directory at most once a minute, when an `unreachable` record
-arrives, and never addresses a cluster. Startup logs which mode the hold is in — the
+that was never one. The match is the exact triple: a profile naming the record's project and cluster
+under another location — a zone written for a regional cluster, which the scaffold admits and
+discovery then skips because the GKE API finds nothing there — names nothing a record carries, and
+that cluster's records are held until the profile is corrected; the startup skip line says so, and a
+looser match would make a same-named excluded cluster loud again. The scope is re-read from the
+directory at most once a minute, when an `unreachable` record arrives, and never addresses a
+cluster. Startup logs which mode the hold is in — the
 directory and how many cluster profiles it names, none yet (a fresh install holds every record off
 the joined clusters until the first reconcile tick), or unknown — because nothing later says so but
 the hold lines themselves.

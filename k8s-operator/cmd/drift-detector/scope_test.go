@@ -315,23 +315,6 @@ func TestProfileScopeIsSilentAboutABrokenNonClusterProfile(t *testing.T) {
 	}
 }
 
-// A profile naming the right project and cluster under the wrong location is
-// a profile for that cluster: discovery skips it (the GKE API finds nothing
-// there) and the startup skip line says its records are forwarded, so the
-// scope must name the cluster the records actually carry.
-func TestProfileScopeNamesAClusterWhoseProfileHasTheWrongLocation(t *testing.T) {
-	dir := t.TempDir()
-	writeScopeProfile(t, dir, "cluster-p1-prod-a-us-central1-a", clusterIdentity{Project: "p1", Location: "us-central1-a", Cluster: "prod-a"})
-	now := time.Now()
-	s := testProfileScope(dir, &now)
-	if profiled, known := s.Profiled(clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-a"}); !profiled || !known {
-		t.Errorf("Profiled(p1/us-central1/prod-a) = (%v, %v) with a profile at p1/us-central1-a/prod-a, want (true, true)", profiled, known)
-	}
-	if profiled, _ := s.Profiled(clusterIdentity{Project: "p2", Location: "us-central1", Cluster: "prod-a"}); profiled {
-		t.Error("Profiled(p2/us-central1/prod-a) = true, want false: another project's same-named cluster is not this profile's")
-	}
-}
-
 func TestNewProfileScopeIsNilWithoutADirectory(t *testing.T) {
 	if s := newProfileScope(""); s != nil {
 		t.Errorf("newProfileScope(\"\") = %#v, want a nil scopeIndex: no --profiles-dir means the scope was never declared", s)

@@ -233,8 +233,8 @@ func parseFlags(args []string) (*flags, error) {
 // to stay callable from a test that stands up neither. onDrift arrives the same
 // way and for the same reason: building it needs a validated token out of the
 // environment, which a test should not have to set to exercise the wiring.
-func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler) (*driftFilter, *joiner) {
-	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), newProfileScope(f.profilesDir), onDrift)
+func newFilterFromFlags(f *flags, clusters map[clusterIdentity]objectGetter, onDrift driftEventHandler, alreadyInjected func(insertID string) bool) (*driftFilter, *joiner) {
+	join := newJoiner(clusters, parseGitopsManagers(f.gitopsManagers), newProfileScope(f.profilesDir), alreadyInjected, onDrift)
 	return newDriftFilter(NewClassifier(f.automationPrincipals, f.humanDomains), join.Handle, f.logDropped), join
 }
 
@@ -525,7 +525,7 @@ func realMain(argv []string) error {
 	}
 
 	injectHandler := newDriftInjectHandler(inject)
-	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle)
+	filter, join := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected)
 
 	// Said at startup, because the difference between the two modes is invisible
 	// in every later line: a run with the inject off emits exactly the DRIFT
@@ -569,7 +569,7 @@ func realMain(argv []string) error {
 	// six and a fleet of seven this run reached six of. The count alone reads
 	// identically either way.
 	if scan.Skipped > 0 {
-		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable and forwarded without ownership, since a skipped profile still names its cluster -- except one whose config could not be read or parsed, which names nothing, so its cluster's records are held as outside the install's scope until it reads", commandName, scan.Skipped)
+		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable and forwarded without ownership where the skipped profile names the cluster the records carry -- a profile whose config could not be read or parsed, or whose identity the GKE API found no cluster at (a zone for a regional cluster), names nothing a record carries, and that cluster's records are held as outside the install's scope until the profile is corrected", commandName, scan.Skipped)
 	}
 	// Not a skip: the cluster is joined, through the direct credentials instead.
 	// Logged so that a profile count that does not match the cluster count has

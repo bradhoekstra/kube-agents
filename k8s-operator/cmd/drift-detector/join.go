@@ -359,6 +359,14 @@ type joiner struct {
 	// started without --profiles-dir, and then nothing is ever held.
 	scope scopeIndex
 
+	// injected reports whether the inject already sent a card for an insertId,
+	// so a record redelivered after its cluster left the scope is not marked
+	// held -- the inject would count it a duplicate and send nothing, and a
+	// DRIFT line carrying the hold marker, a held count and a named cluster
+	// would all say a card was withheld that was in fact sent. nil with the
+	// inject off, when nothing is ever sent or deduplicated.
+	injected func(insertID string) bool
+
 	// unreachable counts records per cluster this process cannot read and did
 	// not hold, and held counts the ones it did (DriftEvent.OutOfScope), so
 	// the shutdown report can name each set with what became of its records.
@@ -371,11 +379,12 @@ type joiner struct {
 // newJoiner builds the handler. An empty or nil cluster set is legal and
 // documented on the field: the detector supports running with no cluster access
 // at all. A nil scope is legal for the same reason and documented on its field.
-func newJoiner(clusters map[clusterIdentity]objectGetter, gitopsManagers map[string]bool, scope scopeIndex, next driftEventHandler) *joiner {
+func newJoiner(clusters map[clusterIdentity]objectGetter, gitopsManagers map[string]bool, scope scopeIndex, injected func(insertID string) bool, next driftEventHandler) *joiner {
 	return &joiner{
 		clusters:       clusters,
 		gitopsManagers: gitopsManagers,
 		scope:          scope,
+		injected:       injected,
 		timeout:        joinRequestTimeout,
 		next:           next,
 		unreachable:    map[string]int{},
@@ -425,7 +434,7 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 		// table, and the field's doc comment has the argument for asking it
 		// this way.
 		identity := recordIdentity(record)
-		if j.outOfScope(identity) {
+		if j.outOfScope(identity) && !j.alreadyInjected(record.InsertID) {
 			event.OutOfScope = true
 			j.counts.OutOfScope++
 			j.noteCluster(j.held, identity)
@@ -437,6 +446,11 @@ func (j *joiner) Handle(ctx context.Context, record AuditRecord) {
 	}
 
 	j.next(ctx, event)
+}
+
+// alreadyInjected is the injected hook with nil meaning never.
+func (j *joiner) alreadyInjected(insertID string) bool {
+	return j.injected != nil && j.injected(insertID)
 }
 
 // outOfScope decides the hold for one unreachable record: true only when the

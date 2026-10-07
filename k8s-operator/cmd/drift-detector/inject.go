@@ -659,6 +659,12 @@ func newDriftInjectHandler(inject *driftInjector) *driftInjectHandler {
 	return &driftInjectHandler{inject: inject, seen: newInsertIDSet(seenInsertIDsCap)}
 }
 
+// AlreadyInjected reports whether a card was already sent for an insertId, for
+// the joiner to ask before it marks a record held: see joiner.injected.
+func (h *driftInjectHandler) AlreadyInjected(insertID string) bool {
+	return h.inject != nil && h.seen.Has(insertID)
+}
+
 // Handle logs the event, then injects it -- unless there is no injector, the
 // joiner marked it out of scope, or its insertId was already sent.
 //

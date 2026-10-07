@@ -99,7 +99,7 @@ func TestNewFilterFromFlagsWiring(t *testing.T) {
 	}
 	// nil getter: this test is about the flags reaching the classifier, and a
 	// nil getter keeps the join from being the thing under test.
-	filter, _ := newFilterFromFlags(f, nil, logDriftEvent)
+	filter, _ := newFilterFromFlags(f, nil, logDriftEvent, nil)
 
 	if !filter.logDropped {
 		t.Error("logDropped did not reach the filter")
@@ -158,7 +158,7 @@ func TestNewFilterFromFlagsWiresTheJoin(t *testing.T) {
 	// takes rather than a shortcut around buildClusterSet.
 	stub := &stubGetter{obj: managedFieldsObject()}
 	clusters := buildClusterSet(stub, directClusterIdentity(f), nil)
-	filter, join := newFilterFromFlags(f, clusters, logDriftEvent)
+	filter, join := newFilterFromFlags(f, clusters, logDriftEvent, nil)
 
 	if got := join.Clusters(); got != 1 {
 		t.Errorf("joiner.Clusters() = %d, want 1 -- the getter did not reach the joiner", got)
@@ -210,10 +210,15 @@ func TestNewFilterFromFlagsWiresTheScope(t *testing.T) {
 	}
 	clusters := buildClusterSet(&stubGetter{obj: managedFieldsObject()}, directClusterIdentity(f), nil)
 	var got []DriftEvent
-	filter, join := newFilterFromFlags(f, clusters, func(_ context.Context, e DriftEvent) { got = append(got, e) })
+	filter, join := newFilterFromFlags(f, clusters, func(_ context.Context, e DriftEvent) { got = append(got, e) }, nil)
 
 	if join.scope == nil {
 		t.Fatal("joiner.scope = nil with --profiles-dir set -- the scope did not reach the joiner, and nothing is ever held")
+	}
+	// The inject's seen set reaches the joiner through the same call.
+	injectHandler := newDriftInjectHandler(nil)
+	if _, j := newFilterFromFlags(f, clusters, injectHandler.Handle, injectHandler.AlreadyInjected); j.injected == nil {
+		t.Error("joiner.injected = nil when the inject handler's hook was passed")
 	}
 	// One record from the cluster the directory names and one from a cluster
 	// it does not; the join reaches neither. Only the second is held.
@@ -246,7 +251,7 @@ func TestNewFilterFromFlagsWiresTheScope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseFlags returned error: %v", err)
 	}
-	if _, join := newFilterFromFlags(f, clusters, logDriftEvent); join.scope != nil {
+	if _, join := newFilterFromFlags(f, clusters, logDriftEvent, nil); join.scope != nil {
 		t.Errorf("joiner.scope = %#v without --profiles-dir, want nil", join.scope)
 	}
 }

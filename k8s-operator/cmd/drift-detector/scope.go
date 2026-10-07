@@ -47,11 +47,9 @@ const (
 // profile at all -- excluded, or never onboarded -- is outside.
 type scopeIndex interface {
 	// Profiled reports whether a readable Cluster Agent profile names
-	// identity: its exact triple, or its project and cluster name under
-	// another location, which is a profile for that cluster with the location
-	// wrong. known is false when there is no answer: the profiles directory
-	// could not be read, so the scope is unknown rather than empty, and the
-	// caller holds nothing.
+	// identity, by its exact triple. known is false when there is no answer:
+	// the profiles directory could not be read, so the scope is unknown
+	// rather than empty, and the caller holds nothing.
 	Profiled(identity clusterIdentity) (profiled, known bool)
 }
 
@@ -85,12 +83,9 @@ type profileScope struct {
 	mu        sync.Mutex
 	scannedAt time.Time
 	// byProfile is each cluster profile's identity by directory name, the
-	// last one read for it; profiled is the same set keyed for the answer,
-	// and named the same set keyed on project and cluster name alone, for a
-	// profile whose location is wrong (see Profiled).
+	// last one read for it; profiled is the same set keyed for the answer.
 	byProfile map[string]clusterIdentity
 	profiled  map[clusterIdentity]struct{}
-	named     map[clusterIdentity]struct{}
 	readable  bool
 	// unreadableLogged keeps a directory that stays unreadable from logging
 	// once per record; it resets on the next successful read so a directory
@@ -154,19 +149,14 @@ func (s *profileScope) Profiled(identity clusterIdentity) (bool, bool) {
 	if !s.readable {
 		return false, false
 	}
-	if _, ok := s.profiled[identity]; ok {
-		return true, true
-	}
-	// A profile naming this project and cluster under another location is a
-	// profile for this cluster with its location wrong -- a zone for a
-	// regional cluster, say, which the scaffold admits and discovery then
-	// reports as skipped because the GKE API finds nothing there. The
-	// install meant to reach the cluster, so its records stay loud, as the
-	// startup skip line promises; an exact-triple scope would hold them while
-	// that line said they were forwarded. A same-named cluster in another
-	// location is therefore loud rather than held when its sibling is
-	// profiled, which is the pre-existing thin card, not a lost record.
-	_, ok := s.named[clusterIdentity{Project: identity.Project, Cluster: identity.Cluster}]
+	// The exact triple, and nothing looser: a fleet legitimately runs "prod"
+	// in two locations, and one of them may be the excluded cluster this hold
+	// exists for, so a profile naming the same project and cluster under
+	// another location names nothing a record carries. Such a profile -- a
+	// zone written for a regional cluster -- is one discovery reports as
+	// skipped with the GKE API's answer, and the startup skip line says what
+	// becomes of its cluster's records.
+	_, ok := s.profiled[identity]
 	return ok, true
 }
 
@@ -220,17 +210,14 @@ func (s *profileScope) rescan() {
 	}
 
 	set := make(map[clusterIdentity]struct{}, len(byProfile))
-	named := make(map[clusterIdentity]struct{}, len(byProfile))
 	for _, id := range byProfile {
 		set[id] = struct{}{}
-		named[clusterIdentity{Project: id.Project, Cluster: id.Cluster}] = struct{}{}
 	}
 	s.readable = true
 	s.unreadableLogged = false
 	s.skipped = skipped
 	s.byProfile = byProfile
 	s.profiled = set
-	s.named = named
 }
 
 // dropReason is the reason ReadIdentities gave for a profile it dropped, or
