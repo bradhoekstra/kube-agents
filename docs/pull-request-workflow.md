@@ -567,9 +567,9 @@ can ask for — a non-inert push is, and `EVAL_SKIP_REVALIDATION=1` in the job's
 green at the head, so a newer red at the same head is overridden on the next trigger, and the
 script's header says why to read such a red as flake or as a real break, not as noise. An admin
 `/override` is carried by the re-pin the same way as a green, because crier stamps the same
-`BaseSHA:` suffix on it, and by step 0 as the third kind of verdict: the override plugin's own
-success status at the head, posted by the Prow bot for a repository admin, counts (a later
-`/override-cancel` would withdraw it, where a Prow build has that command), so a retest or a batch
+`BaseSHA:` suffix on it, and by step 0 as the third kind of verdict: the success status the Prow bot
+posts at the head for an admin's `/override`, pointing at that comment on this pull request, counts
+(a later `/override-cancel` would withdraw it, where a Prow build has that command), so a retest or a batch
 after an override reuses it in seconds, and so does the retest Tide starts on a pull request it has
 just merged by override. The reused run reports as an ordinary `Job succeeded.`, so from then on the
 check and the re-pin read like a green; the `/override` comment, the build log's `REVALIDATED` line
