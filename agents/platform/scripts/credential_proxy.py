@@ -5460,8 +5460,10 @@ class CommandExecutor:
         budget the verb holds. It yields once: a caller whose re-check is
         still stale after the yield (the verb refreshed another org, or its
         helper timed out) reserves on what remains of the yield bound and does
-        not yield again. A second route refresher still waits on the lock
-        unreserved. A route caller refused past that bound is told it stepped
+        not yield again: a vcs verb that counts itself during that second wait
+        holds the budget the wait needs, so the caller steps aside for good,
+        told busy, and the verb runs the helper under its own reservation.
+        A second route refresher still waits on the lock unreserved. A route caller refused past that bound is told it stepped
         aside, with the seconds it spent since arrival, not the lock-wait
         text. A refresher behind a
         helper that runs past the bound is told busy even though the helper
@@ -5537,9 +5539,12 @@ class CommandExecutor:
                 holding = True
                 # One yield. If the re-check is still stale -- the verb
                 # refreshed another org, or its helper timed out -- the second
-                # budget wait runs on what remains of the yield bound and does
-                # not yield again, so the whole wait stays inside the three
-                # bounds the client's timeout is derived from.
+                # budget wait runs on what remains of the yield bound, so the
+                # whole wait stays inside the three bounds the client's timeout
+                # is derived from; and it does not yield again: a verb that
+                # counts itself during it holds the budget it needs, so the
+                # caller is refused as stepped aside and the lock goes to the
+                # verb, rather than being held against it to the deadline.
                 self._refresh_under_lock(
                     provider, helper, repository, clean_repo, failure_key, queued_at,
                     reserve=budget_on, caller=caller,
@@ -5626,6 +5631,12 @@ class CommandExecutor:
         last_refresh, cached_scoped = current
         return clean_repo in cached_scoped and (now - last_refresh) < FORGE_REFRESH_COALESCE_SECONDS
 
+    def _budget_in_use_text_locked(self) -> str:
+        """`_budget_in_use_text` taken under `_slot_condition`, for a refusal
+        built outside it."""
+        with self._slot_condition:
+            return self._budget_in_use_text()
+
     def _refresh_under_lock(
         self,
         provider: str,
@@ -5647,7 +5658,10 @@ class CommandExecutor:
 
         True when the reservation wait yielded to a vcs verb waiting for the
         lock and the helper did not run; the caller hands that verb the lock.
-        Never with `allow_yield` false. False otherwise.
+        With `allow_yield` false -- the reservation after the one yield -- a
+        verb counting itself ends the attempt instead: CommandSlotUnavailable,
+        the stepped-aside text, so the lock is never held across a budget
+        wait against a verb that holds the budget. False otherwise.
 
         With `deadline` given -- the reservation after a yield -- a refusal
         says the caller stepped aside, with the seconds since `queued_at` and
@@ -5666,26 +5680,38 @@ class CommandExecutor:
                     admission.enter_context(
                         self.reserve_child_memory(
                             caller=caller,
-                            yield_when=(
-                                (lambda: self._covered_refresh_waiters > 0)
-                                if allow_yield
-                                else None
-                            ),
+                            yield_when=lambda: self._covered_refresh_waiters > 0,
                             deadline=deadline,
                         )
                     )
-                except AdmissionYielded:
+                except AdmissionYielded as exc:
                     # Raised only by `_admit`, before it admits, so this
                     # catches the entry and nothing the helper raises.
-                    return True
+                    if allow_yield:
+                        return True
+                    # After the one yield: a vcs verb that holds the budget
+                    # this wait needs is waiting on the lock this caller
+                    # holds. Holding it to the deadline would be the knot the
+                    # yield exists to untie, so the caller steps aside for
+                    # good: the lock is released by the route, the verb runs
+                    # the helper under its own reservation, and the client is
+                    # told busy and retries, coalescing if the verb's token
+                    # was its own.
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(
+                            provider,
+                            yielded_since=queued_at,
+                            budget_in_use=self._budget_in_use_text_locked(),
+                        )
+                    ) from exc
                 except CommandSlotUnavailable as exc:
                     if deadline is None:
                         raise
-                    with self._slot_condition:
-                        budget_in_use = self._budget_in_use_text()
                     raise CommandSlotUnavailable(
                         self._refresh_lock_wait_text(
-                            provider, yielded_since=queued_at, budget_in_use=budget_in_use
+                            provider,
+                            yielded_since=queued_at,
+                            budget_in_use=self._budget_in_use_text_locked(),
                         )
                     ) from exc
             try:

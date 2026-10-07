@@ -6370,47 +6370,115 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertTrue(verb_started.wait(5))
         return route, route_results, verb_results, leave
 
-    def test_a_route_caller_still_stale_after_its_yield_reserves_again_and_does_not_yield_twice(self):
-        executor = self._budgeted_executor(admits=1)
+    def test_a_route_caller_still_stale_after_its_yield_gives_the_lock_up_to_a_verb_that_holds_the_budget(self):
+        # After its one yield the route caller re-takes the lock and waits for
+        # the budget again. A second vcs verb, admitted meanwhile and so
+        # holding the budget it waits for, needs that lock: the route caller
+        # gives it up at once, told it stepped aside, rather than holding it
+        # to the yield bound against the verb.
+        executor = self._budgeted_executor(admits=2)
         calls = []
+        helper_gate = threading.Event()
+        verb_started = threading.Event()
+
+        def helper(provider, helper_path, arguments, action, log_success=False):
+            name = threading.current_thread().name
+            calls.append(name)
+            if name == "verb":
+                verb_started.set()
+                helper_gate.wait(10)
+            return subprocess.CompletedProcess([], 0, arguments[0] + "\n", "")
+
+        patch = mock.patch.object(executor, "_run_forge_helper", helper)
+        patch.start()
+        self.addCleanup(patch.stop)
+        events = {name: threading.Event() for name in (
+            "exec_held", "exec_leave", "verb_held", "verb_go", "verb_leave",
+            "second_held", "second_go", "second_leave",
+        )}
+        threads = []
+        self.addCleanup(lambda: [thread.join(10) for thread in threads])
+        for name in ("exec_leave", "verb_go", "verb_leave", "second_go", "second_leave"):
+            self.addCleanup(events[name].set)
+        self.addCleanup(helper_gate.set)
+        results = {"verb": [], "route": [], "second": []}
+
+        def exec_holder():
+            with executor.request_slot():
+                events["exec_held"].set()
+                events["exec_leave"].wait(10)
+
+        def vcs_verb(name, repository, go, leave):
+            def run():
+                try:
+                    with executor.request_slot():
+                        events[name + "_held"].set()
+                        go.wait(10)
+                        executor.refresh_forge_credential("github", repository)
+                        results[name].append("ok")
+                        leave.wait(10)
+                except Exception as exc:  # surfaced by the assertions
+                    results[name].append(exc)
+            return run
+
+        def route_caller():
+            try:
+                executor.refresh_forge_credential("github", "gke-agentic/infra")
+                results["route"].append("ok")
+            except Exception as exc:  # surfaced by the assertions
+                results["route"].append(exc)
+
+        def start(name, target):
+            thread = threading.Thread(target=target, name=name, daemon=True)
+            threads.append(thread)
+            thread.start()
+            return thread
+
         # Long, so nobody gets out by timing out.
         with mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", 120):
-            route, route_results, verb_results, leave = self._yield_to_a_verb_of_another_org(
-                executor, calls
-            )
-            # The verb's refresh covered another org: the route caller re-takes
-            # the lock and waits for the budget a second time.
-            self._wait_until(lambda: verb_results == ["ok"])
+            start("exec", exec_holder)
+            self.assertTrue(events["exec_held"].wait(5))
+            start("verb", vcs_verb("verb", "other-org/infra", events["verb_go"], events["verb_leave"]))
+            self.assertTrue(events["verb_held"].wait(5))
+            # Both admissions held: the route caller takes the free lock and
+            # parks in its budget wait.
+            route = start("route", route_caller)
             self._wait_until(lambda: executor.queued_requests > 0)
             self.assertTrue(executor._refresh_lock.locked())
+            # The first verb needs a refresh: the route caller yields, the
+            # verb's helper starts and is held open.
+            events["verb_go"].set()
+            self.assertTrue(verb_started.wait(5))
+            # While the route caller is out of the admission queue (waiting
+            # to re-take the lock), the exec leaves and a second verb takes
+            # its admission: the budget is full again, held by the two verbs.
+            second = start("second", vcs_verb("second", "third-org/infra", events["second_go"], events["second_leave"]))
+            events["exec_leave"].set()
+            self.assertTrue(events["second_held"].wait(5))
+            # The first verb's helper finishes (another org's token), and the
+            # route caller, the only waiter, re-takes the lock and reserves
+            # again: still stale, budget full, so it parks with the lock held.
+            helper_gate.set()
+            self._wait_until(lambda: results["verb"] == ["ok"])
+            self._wait_until(lambda: executor.queued_requests > 0 and executor._refresh_lock.locked())
             self.assertEqual(["verb"], calls)
-            second_results = []
-
-            def second_verb():
-                try:
-                    with executor._outside_budget():
-                        executor.refresh_forge_credential("github", "third-org/infra")
-                    second_results.append("ok")
-                except Exception as exc:  # surfaced by the assertions
-                    second_results.append(exc)
-
-            second = threading.Thread(target=second_verb, name="verb2", daemon=True)
-            second.start()
-            self._wait_until(lambda: executor._covered_refresh_waiters == 1)
-            # Margin, one-directional: the route caller's admission wait has
-            # woken on the count by now, and would have left the queue had it
-            # been allowed to yield again.
-            time.sleep(2 * credential_proxy.COMMAND_SLOT_POLL_SECONDS)
-            self.assertEqual(1, executor.queued_requests)
-            self.assertEqual(["verb"], calls)
-            self.assertTrue(route.is_alive())
-            leave.set()
+            # The second verb now needs a refresh and counts itself: the route
+            # caller steps aside for good and the verb runs its helper under
+            # the budget it already holds, well inside the route caller's
+            # yield bound.
+            events["second_go"].set()
+            self._wait_until(lambda: results["second"] == ["ok"])
             route.join(5)
-            second.join(5)
-            self.assertFalse(route.is_alive() or second.is_alive())
-        self.assertEqual(["ok"], route_results)
-        self.assertEqual(["ok"], second_results)
-        self.assertEqual(["verb", "route", "verb2"], calls)
+            self.assertFalse(route.is_alive())
+            events["verb_leave"].set()
+            events["second_leave"].set()
+        self.assertEqual(["verb", "second"], calls)
+        self.assertEqual(1, len(results["route"]))
+        refusal = results["route"][0]
+        self.assertIsInstance(refusal, credential_proxy.CommandSlotUnavailable)
+        self.assertIn("stepped aside", str(refusal))
+        self.assertIn("child memory budget", str(refusal))
+        self.assertNotIn("without fitting", str(refusal))
         self.assertEqual(0, executor._covered_refresh_waiters)
         self.assertFalse(executor._refresh_lock.locked())
 
