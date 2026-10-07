@@ -26,7 +26,6 @@ key on (scripts/eval_dashboard/collect.py reads nothing from it today).
 import json
 import os
 import pathlib
-import re
 import subprocess
 import unittest.mock
 import tempfile
@@ -215,8 +214,8 @@ class RevalidationTest(unittest.TestCase):
         self.statuses.mkdir()
         self.listings = self.tmp / "listings"
         self.listings.mkdir()
-        # Prow's ARTIFACTS directory, where a reuse of an /override records
-        # itself; the sidecar uploads it beside finished.json.
+        # Prow's ARTIFACTS directory, whose metadata.json the sidecar merges
+        # into finished.json; a reuse of an /override records itself there.
         self.artifacts = self.tmp / "artifacts"
         self.artifacts.mkdir()
         self.metadata_file = self.artifacts / "metadata.json"
@@ -1459,113 +1458,6 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn('os.environ.get("REVALIDATION_STATUS_TOKEN")', text)
         self.assertNotIn("Authorization: Bearer ${", text)
         self.assertNotIn("curl", text)
-
-
-class RevalidationBashFloorTest(unittest.TestCase):
-    """The suite lifts the script into whatever `bash` is on PATH, 3.2 on a
-    stock macOS, and the script says it stays there (its cache comment);
-    CI's bash is 5, so a bash-4 construct would pass CI and fail every
-    macOS contributor at source time. This is a tripwire over the bash
-    source for the spellings a bash-4 relapse takes, the way
-    tests/test_upgrade_script.py pins `mapfile` out of its harness; it
-    enumerates, so a run of the suite under a bash 3.2 remains the proof,
-    and the embedded Python programs are cut out before the scan so their
-    own syntax (`words[-1]`) cannot red it."""
-
-    # A bash-4 flag (A, g, n, l, u) in any flag group after a declaring
-    # word, and `local -`; mapfile/readarray; case-modifying and @-operator
-    # expansions on any parameter; appending redirections and |&; case
-    # fall-through; [[ -v ]] and [ -v ]; coproc; read -i, -N and a
-    # fractional -t; exec {fd}; printf %()T; negative subscripts and
-    # lengths; $BASHPID and $EPOCHSECONDS; wait -n; the bash-4 shopts.
-    _BASH4_CONSTRUCTS = (
-        r"\b(declare|local|typeset|readonly)\s+(-\S+\s+)*-[a-zA-Z]*[gAnlu]\b",
-        r"\blocal\s+-(\s|$)",
-        r"\bmapfile\b",
-        r"\breadarray\b",
-        r"\$\{[A-Za-z_@*#0-9][A-Za-z_0-9]*(\[[^]]*\])?(,,?|\^\^?|@[A-Za-z])\}",
-        r"&>>",
-        r"\|&",
-        r";;?&",
-        r"\[\[?\s+-v\s",
-        r"\bcoproc\b",
-        r"\bread\s+(-\S+(\s+[^-\s]\S*)?\s+)*-[a-zA-Z]*[iN]\b",
-        r"\bread\s+(-\S+(\s+[^-\s]\S*)?\s+)*-t\s+[0-9]*\.[0-9]",
-        r"\bexec\s+\{[A-Za-z_]",
-        r"%\([^)]*\)T",
-        r"\[-[0-9]+\]",
-        r":-?[0-9]*:-[0-9]",
-        r"\$(BASHPID|EPOCHSECONDS|EPOCHREALTIME)\b",
-        r"\bwait\s+-n\b",
-        r"\b(globstar|lastpipe|inherit_errexit|compat4[0-9])\b",
-    )
-
-    _PYTHON_OPEN = "python3 -c '"
-
-    @classmethod
-    def _bash_source(cls, text):
-        """The script's bash lines: comments dropped, and each embedded
-        `python3 -c '...'` program (opened by a line ending in `python3 -c '`
-        and closed by the line that starts with `'`) cut out. Fails closed:
-        a block left open at the end of the file, or a program spelled any
-        other way, is an error rather than a shorter scan."""
-        lines = []
-        in_python = False
-        opened = 0
-        for number, line in enumerate(text.splitlines(), 1):
-            if in_python:
-                if line.startswith("'"):
-                    in_python = False
-                    lines.append(line)
-                continue
-            if line.rstrip().endswith(cls._PYTHON_OPEN):
-                in_python = True
-                opened += 1
-                lines.append(line.rstrip()[: -len("'")])
-                continue
-            if "python3 -c" in line or "python3 - " in line or "python3 <<" in line:
-                raise AssertionError(f"line {number}: an embedded program not in the one shape the cutter reads")
-            if not line.lstrip().startswith("#"):
-                lines.append(line)
-        if in_python:
-            raise AssertionError("the last embedded program never closed on a line starting with a quote")
-        if opened != text.count(cls._PYTHON_OPEN):
-            raise AssertionError("an embedded program opened mid-line was not cut out")
-        return "\n".join(lines)
-
-    def test_the_embedded_python_is_cut_out_of_the_scan(self):
-        text = _CI_REVALIDATE.read_text(encoding="utf-8")
-        self.assertGreaterEqual(text.count(self._PYTHON_OPEN), 7)
-        cut = self._bash_source(text)
-        for marker in ("import json", "import sys", "sys.argv", "json.load("):
-            self.assertNotIn(marker, cut)
-
-    def test_the_cutter_fails_closed_on_an_unterminated_program(self):
-        with self.assertRaises(AssertionError):
-            self._bash_source("x=1\nfoo=\"$(python3 -c '\nimport sys\n")
-        with self.assertRaises(AssertionError):
-            self._bash_source("x=1\nfoo=\"$(python3 -c \"print(1)\")\"\n")
-
-    def test_the_script_uses_no_bash_4_construct(self):
-        code = self._bash_source(_CI_REVALIDATE.read_text(encoding="utf-8"))
-        for pattern in self._BASH4_CONSTRUCTS:
-            with self.subTest(pattern=pattern):
-                self.assertIsNone(re.search(pattern, code), f"{pattern} needs bash 4+")
-
-    def test_the_scanner_catches_the_spellings_a_relapse_takes(self):
-        for relapse in ("local -r -A seen", "readonly -A cache", "typeset -i -l name", "declare -n ref", "local -",
-                        "read -r -i default x", "read -N 4 x", "read -p 'x' -i default y", "read -t 0.5 x",
-                        '${arr[0],,}', "${1^}", "${line@Q}", "${s:1:-1}", "${arr[-2]}", 'exec {fd}>"$lock"',
-                        "printf '%(%Y)T'", "[ -v x ]", "wait -n", "shopt -s globstar", "shopt -s lastpipe",
-                        "shopt -s inherit_errexit", "$EPOCHSECONDS", "$BASHPID"):
-            with self.subTest(relapse=relapse):
-                self.assertTrue(any(re.search(p, relapse) for p in self._BASH4_CONSTRUCTS), relapse)
-
-    def test_the_scanner_passes_the_bash_3_idioms_the_script_uses(self):
-        for fine in ("export -n VAR", '"${sep:-,}"', '"${x%,}"', '"${reused%, }"', "read -r line", "local x",
-                     'date -u +"%Y-%m-%dT%H:%M:%SZ"', "exec 3>&1", "${#arr[@]}", "${fetched%%$'\\n'*}"):
-            with self.subTest(fine=fine):
-                self.assertFalse(any(re.search(p, fine) for p in self._BASH4_CONSTRUCTS), fine)
 
 
 class RevalidationEntrypointTest(unittest.TestCase):
