@@ -682,7 +682,7 @@ func (h *driftInjectHandler) Handle(ctx context.Context, event DriftEvent) {
 	// detector that was meant to reach a cluster stays loud about it.
 	if event.OutOfScope {
 		h.counts.OutOfScope++
-		log.Printf("%s: inject held for insert_id=%s cluster=%s (outside the install's scope: no Cluster Agent profile names it); the %s card was not sent and no alert budget was spent",
+		log.Printf("%s: inject held for insert_id=%s cluster=%s (outside the install's scope: no readable Cluster Agent profile names it); the %s card was not sent and no alert budget was spent",
 			commandName, event.Record.InsertID, event.Record.Cluster, injectKindDrift)
 		return
 	}

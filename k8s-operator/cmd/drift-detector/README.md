@@ -76,8 +76,10 @@ cluster as one to profile or exclude. A record from a cluster a profile _does_ n
 — every profile skipped at discovery for a missing grant, or a profile the reconcile wrote after
 discovery ran, since discovery runs once — is inside the scope, and is forwarded `unreachable` and
 injected as before; so is every record when the scope is unknown, because `--profiles-dir` was not
-given or the directory cannot be read. The scope is re-read from the directory at most once a
-minute, when an `unreachable` record arrives, and never addresses a cluster.
+given or the directory cannot be read. A profile whose `config.yaml` cannot be read or parsed names
+no cluster, so its cluster is held as outside the scope; the scope logs that profile by name, once,
+until it reads cleanly. The scope is re-read from the directory at most once a minute, when an
+`unreachable` record arrives, and never addresses a cluster.
 
 The split is deliberate on both sides. Each out-of-scope card is thin by construction — no owners,
 no lookup error — and spends a unit of the fleet-wide daily drift budget that the profiled clusters

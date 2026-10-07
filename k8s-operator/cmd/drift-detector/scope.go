@@ -66,6 +66,11 @@ type profileScope struct {
 	// once per record; it resets on the next successful read so a directory
 	// that breaks again is reported again.
 	unreadableLogged bool
+	// skipped is the profiles the last reads could not parse, by directory
+	// name, so each is logged once per streak rather than once per rescan:
+	// such a profile names no cluster, its cluster's records are held, and the
+	// hold line alone would send the operator to write a profile that exists.
+	skipped map[string]struct{}
 }
 
 // newProfileScope returns the scope over dir, or nil when dir is empty: a
@@ -95,7 +100,13 @@ func (s *profileScope) Profiled(identity clusterIdentity) (bool, bool) {
 // rescan replaces the profiled set from the directory. Caller holds mu.
 func (s *profileScope) rescan() {
 	s.scannedAt = s.now()
-	ids, err := clusterprofiles.ReadIdentities(s.dir)
+	skipped := map[string]struct{}{}
+	ids, err := clusterprofiles.ReadIdentities(s.dir, func(profile string, err error) {
+		skipped[profile] = struct{}{}
+		if _, logged := s.skipped[profile]; !logged {
+			log.Printf("%s: profile %s names no cluster for the install's scope, so its cluster's records are held out of the inject as outside it until the profile reads: %v", commandName, profile, err)
+		}
+	})
 	if err != nil {
 		s.readable = false
 		if !s.unreadableLogged {
@@ -106,6 +117,7 @@ func (s *profileScope) rescan() {
 	}
 	s.readable = true
 	s.unreadableLogged = false
+	s.skipped = skipped
 	set := make(map[clusterIdentity]struct{}, len(ids))
 	for _, id := range ids {
 		set[identityFromProfile(id)] = struct{}{}

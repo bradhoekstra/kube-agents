@@ -442,9 +442,15 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 	writeProfile(t, dir, "broken", "model: [")
 	writeProfile(t, dir, ".swap", "cluster_identity:\n  project: p1\n  cluster: hidden\n  location: us-central1\n")
 
-	got, err := ReadIdentities(dir)
+	var skipped []string
+	got, err := ReadIdentities(dir, func(profile string, err error) {
+		skipped = append(skipped, profile+": "+err.Error())
+	})
 	if err != nil {
 		t.Fatalf("ReadIdentities: %v", err)
+	}
+	if len(skipped) != 1 || !strings.HasPrefix(skipped[0], "broken: ") {
+		t.Errorf("skipped = %v, want the unparsable profile reported once by name and nothing else", skipped)
 	}
 	want := []string{"p1/europe-west1/prod", "p1/us-central1/prod"}
 	names := make([]string, 0, len(got))
@@ -458,7 +464,7 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 }
 
 func TestReadIdentitiesReportsAnUnreadableDirectory(t *testing.T) {
-	if _, err := ReadIdentities(filepath.Join(t.TempDir(), "absent")); err == nil {
+	if _, err := ReadIdentities(filepath.Join(t.TempDir(), "absent"), nil); err == nil {
 		t.Fatal("ReadIdentities on a missing directory returned nil error, want one: the caller treats this as scope unknown")
 	}
 }

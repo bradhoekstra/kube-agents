@@ -134,12 +134,14 @@ func (d Discoverer) skip(profile string, err error) {
 // the two answers differ for every profile Discover skips.
 //
 // Entries that are not cluster profiles (no cluster_identity block, a hidden
-// directory, a file) are left out, and so is a profile whose config does not
-// parse: Discover already reports that one at startup, and a scope listing
-// that failed on it would make one broken profile hide the whole fleet. Only a
-// directory that cannot be read at all is an error, because then the scope is
-// unknown rather than empty.
-func ReadIdentities(dir string) ([]Identity, error) {
+// directory, a file) are left out silently. A profile whose config cannot be
+// read or parsed is left out too, and reported to onSkip (nil to ignore) with
+// the profile's directory name: a scope listing that failed on it would make
+// one broken profile hide the whole fleet, but a profile that names a cluster
+// and is dropped here is a cluster the caller will treat as unnamed, and the
+// caller has to be able to say so. Only a directory that cannot be read at all
+// is an error, because then the scope is unknown rather than empty.
+func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Identity, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
@@ -150,7 +152,13 @@ func ReadIdentities(dir string) ([]Identity, error) {
 			continue
 		}
 		identity, err := ReadIdentity(filepath.Join(dir, e.Name(), profileConfigFile))
-		if err != nil || identity == nil {
+		if err != nil {
+			if onSkip != nil {
+				onSkip(e.Name(), err)
+			}
+			continue
+		}
+		if identity == nil {
 			continue
 		}
 		ids = append(ids, *identity)

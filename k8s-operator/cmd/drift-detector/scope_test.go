@@ -89,6 +89,37 @@ func TestProfileScopeReportsAnUnreadableDirectoryAsUnknown(t *testing.T) {
 	}
 }
 
+// A profile that does not parse names no cluster, so its cluster is held as
+// outside the scope -- and the scope says so once, by profile name, because the
+// hold line alone would send the operator to write a profile that exists.
+func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
+	dir := t.TempDir()
+	broken := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-c"}
+	if err := os.MkdirAll(filepath.Join(dir, "prod-c"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prod-c", "config.yaml"), []byte("model: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s := testProfileScope(dir, &now)
+
+	if profiled, known := s.Profiled(broken); profiled || !known {
+		t.Errorf("Profiled(prod-c) = (%v, %v) for an unparsable profile, want (false, true): it names nothing, and the directory was read", profiled, known)
+	}
+	if _, ok := s.skipped["prod-c"]; !ok {
+		t.Errorf("skipped = %v, want prod-c recorded so the drop is logged by name", s.skipped)
+	}
+	writeScopeProfile(t, dir, "prod-c", broken)
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, _ := s.Profiled(broken); !profiled {
+		t.Error("Profiled(prod-c) = false after the profile was rewritten, want true")
+	}
+	if len(s.skipped) != 0 {
+		t.Errorf("skipped = %v after a clean read, want empty so a profile that breaks again is logged again", s.skipped)
+	}
+}
+
 func TestNewProfileScopeIsNilWithoutADirectory(t *testing.T) {
 	if s := newProfileScope(""); s != nil {
 		t.Errorf("newProfileScope(\"\") = %#v, want a nil scopeIndex: no --profiles-dir means the scope was never declared", s)
