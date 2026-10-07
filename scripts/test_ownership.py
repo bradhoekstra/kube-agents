@@ -17,7 +17,16 @@ from pathlib import Path
 
 import yaml
 
-REPO = Path(__file__).resolve().parent.parent
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+# The same answer to "is this path in the tree" that the docs link checker
+# gives: tracked by git, not merely present on disk, so a generated or ignored
+# file is not in it.
+from check_docs_links import tracked_paths
+
+REPO = _HERE.parent
 OWNERSHIP_DOC = REPO / "docs" / "ownership.md"
 OWNERS_FILE = REPO / "OWNERS"
 AGENTS_FILE = REPO / "AGENTS.md"
@@ -49,8 +58,6 @@ PROSE_PATH_RE = re.compile(r"^(?!\.\.?(/|$))(?!/)[\w.-]+(/[\w.-]*)+$|^[\w-]+\.(m
 # the test does not read and fails on, rather than one it silently skips.
 LAYOUT_BULLET_PREFIX = "- "
 LAYOUT_ENTRY_SEPARATOR = ":"
-# A GitHub login, as OWNERS writes one.
-LOGIN_RE = re.compile(r"^[A-Za-z0-9-]+$")
 
 
 def _section(path, heading):
@@ -108,10 +115,22 @@ def _is_prose_path(token):
     return bool(PROSE_PATH_RE.match(token))
 
 
+_TRACKED = None
+
+
+def _tracked():
+    global _TRACKED
+    if _TRACKED is None:
+        _TRACKED = tracked_paths()
+    return _TRACKED
+
+
 def _in_tree(path):
-    """True when `path` resolves to something that exists under the repository root."""
+    """True when `path` is a tracked file, or a directory some tracked file sits under."""
     target = (REPO / path).resolve()
-    return target.exists() and target.is_relative_to(REPO)
+    if not target.is_relative_to(REPO):
+        return False
+    return target in _tracked() or any(target in tracked.parents for tracked in _tracked())
 
 
 class OwnershipDocTest(unittest.TestCase):
@@ -153,7 +172,7 @@ class OwnershipDocTest(unittest.TestCase):
     def _check_person(self, cell, subject, column, problems):
         if cell in ("", UNOWNED) or cell in PROSE_FALLBACKS:
             return
-        if not LOGIN_RE.match(cell) or cell.lower() not in self.logins:
+        if cell.lower() not in self.logins:
             problems.append(
                 f"{subject} / {column}: {cell!r} is not a login in OWNERS "
                 f"(one login per cell, {UNOWNED!r}, or a fallback from PROSE_FALLBACKS)"
@@ -184,11 +203,14 @@ class HeuristicsTest(unittest.TestCase):
         for token in ("e.g.", "3.9.6", "/review", "/tmp/x", "../kube-agents-bot/", "./x", "gke-*", "owner:", "OWNERS"):
             self.assertFalse(_is_prose_path(token), token)
 
-    def test_in_tree_rejects_paths_outside_the_repository(self):
+    def test_in_tree_means_tracked(self):
         self.assertTrue(_in_tree("AGENTS.md"))
+        self.assertTrue(_in_tree("docs/"))
         self.assertFalse(_in_tree("/tmp"))
         self.assertFalse(_in_tree("../"))
         self.assertFalse(_in_tree("no/such/path"))
+        # Present on disk in a working clone, ignored by git: not in the tree.
+        self.assertFalse(_in_tree(".git/"))
 
     def test_layout_entries_read_every_bullet_shape(self):
         lines = [
