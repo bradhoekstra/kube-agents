@@ -5438,11 +5438,14 @@ class CommandExecutor:
         the budget yields the lock to a vcs verb that needs a refresh: the
         verb's reservation already covers the helper, so it runs it, while the
         route caller waits for the verb to hold the lock, queues behind it, and
-        coalesces on its result. Otherwise the knot would hold until the route
+        coalesces on its result -- both waits on one bound of
+        COMMAND_SLOT_WAIT_SECONDS from the yield, since the budget wait ran on
+        its own clock and may have spent the arrival bound. Otherwise the knot would hold until the route
         caller's refusal: the verb waits on the lock, and the holder waits for
         budget the verb holds. A second route refresher still waits on the lock
-        unreserved. A route caller refused after yielding is told so, with
-        the seconds it spent, not the lock-wait text. A refresher behind a
+        unreserved. A route caller refused past that bound is told it stepped
+        aside, with the seconds it spent since arrival, not the lock-wait
+        text. A refresher behind a
         helper that runs past the bound is told busy even though the helper
         lands the token seconds later; the client reports a failed refresh,
         and its next call coalesces on the fresh token.
@@ -5492,7 +5495,7 @@ class CommandExecutor:
         if failure is not None and failure[0] >= queued_at:
             raise failure[1]
         budget_on = getattr(self, "children_budget_bytes", None) is not None
-        self._acquire_refresh_lock(provider, queued_at, caller)
+        self._acquire_refresh_lock(provider, queued_at + COMMAND_SLOT_WAIT_SECONDS, caller)
         holding = True
         try:
             while self._refresh_under_lock(
@@ -5501,11 +5504,16 @@ class CommandExecutor:
             ):
                 # A vcs verb, admitted and covered, needs the lock: it runs the
                 # helper under its own reservation. Hand it the lock, wait until
-                # it holds it, and queue behind it to coalesce on its result.
+                # it holds it, and queue behind it to coalesce on its result,
+                # on a bound of its own from the yield: the budget wait ran on
+                # its own clock and may have spent the arrival bound.
                 self._refresh_lock.release()
                 holding = False
-                self._await_covered_refreshers(provider, queued_at, caller, yielded=True)
-                self._acquire_refresh_lock(provider, queued_at, caller, yielded=True)
+                deadline = time.monotonic() + COMMAND_SLOT_WAIT_SECONDS
+                self._await_covered_refreshers(
+                    provider, deadline, caller, yielded_since=queued_at
+                )
+                self._acquire_refresh_lock(provider, deadline, caller, yielded_since=queued_at)
                 holding = True
         finally:
             if holding:
@@ -5514,56 +5522,50 @@ class CommandExecutor:
     def _acquire_refresh_lock(
         self,
         provider: str,
-        queued_at: float,
+        deadline: float,
         caller: socket.socket | None,
         *,
-        yielded: bool = False,
+        yielded_since: float | None = None,
     ) -> None:
         """Take `_refresh_lock` for a route caller: in COMMAND_SLOT_POLL_SECONDS
         pieces, raising CallerHungUp if `caller` hangs up and
-        CommandSlotUnavailable once COMMAND_SLOT_WAIT_SECONDS have passed since
-        `queued_at` -- with the yielded text when `yielded`, the re-take after
-        stepping aside for a vcs verb."""
+        CommandSlotUnavailable once `deadline` passes -- with the yielded text
+        when `yielded_since`, the arrival of a caller re-taking the lock after
+        stepping aside for a vcs verb, is set."""
         if self._refresh_lock.acquire(blocking=False):
             return
-        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         while not self._refresh_lock.acquire(
             timeout=max(0.0, min(COMMAND_SLOT_POLL_SECONDS, deadline - time.monotonic()))
         ):
             if caller is not None and _caller_has_gone(caller):
                 raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
             if time.monotonic() >= deadline:
-                raise CommandSlotUnavailable(
-                    self._refresh_lock_wait_text(provider, queued_at, yielded)
-                )
+                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider, yielded_since))
 
     @staticmethod
-    def _refresh_lock_wait_text(
-        provider: str, queued_at: float = 0.0, yielded: bool = False
-    ) -> str:
+    def _refresh_lock_wait_text(provider: str, yielded_since: float | None = None) -> str:
         """The refusal for a route refresher that waited out its bound: for the
-        refresh lock before reserving, or -- `yielded` -- after stepping aside
-        for a vcs verb, a wait that also spent the budget wait, so it names the
-        seconds actually spent since `queued_at`."""
-        if yielded:
+        refresh lock before reserving, or -- `yielded_since` set -- after
+        stepping aside for a vcs verb, a wait that also spent the budget wait,
+        so it names the seconds actually spent since that arrival."""
+        if yielded_since is not None:
             return REFRESH_YIELDED_WAIT_TEXT.format(
-                provider=provider, seconds=int(time.monotonic() - queued_at)
+                provider=provider, seconds=int(time.monotonic() - yielded_since)
             )
         return REFRESH_LOCK_WAIT_TEXT.format(provider=provider, seconds=COMMAND_SLOT_WAIT_SECONDS)
 
     def _await_covered_refreshers(
         self,
         provider: str,
-        queued_at: float,
+        deadline: float,
         caller: socket.socket | None,
         *,
-        yielded: bool = False,
+        yielded_since: float | None = None,
     ) -> None:
         """Wait until every vcs verb counted in `_covered_refresh_waiters`
         holds or has held `_refresh_lock`, so a route caller that yielded it
         does not re-take it first. Bounded, watched and worded like
         `_acquire_refresh_lock`."""
-        deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         with self._slot_condition:
             while self._covered_refresh_waiters > 0:
                 if caller is not None and _caller_has_gone(caller):
@@ -5571,7 +5573,7 @@ class CommandExecutor:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CommandSlotUnavailable(
-                        self._refresh_lock_wait_text(provider, queued_at, yielded)
+                        self._refresh_lock_wait_text(provider, yielded_since)
                     )
                 self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
 

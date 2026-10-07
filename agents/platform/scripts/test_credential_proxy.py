@@ -6154,13 +6154,78 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(["ok"], verb_results)
         self.assertEqual(["ok"], route_results)
 
+    def test_a_route_caller_that_yields_after_its_arrival_bound_still_coalesces(self):
+        # The route caller spends most of its arrival bound waiting for the
+        # lock, then parks in the budget wait on that wait's own clock, and
+        # yields to the vcs verb only after the arrival bound has passed. Its
+        # wait for the verb is bounded from the yield, so it coalesces.
+        bound = 2.0
+        executor = self._budgeted_executor(admits=1)
+        entered = threading.Event()
+        finish = threading.Event()
+        self.addCleanup(finish.set)
+        calls = []
+
+        def blocking_helper(*args, **kwargs):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            finish.wait(5)
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        held = threading.Event()
+        go = threading.Event()
+        self.addCleanup(go.set)
+        verb_results = []
+
+        def vcs_verb():
+            try:
+                with executor.request_slot():
+                    held.set()
+                    go.wait(10)
+                    executor.refresh_forge_credential("github", "gke-agentic/infra")
+                verb_results.append("ok")
+            except Exception as exc:  # surfaced by the assertions
+                verb_results.append(exc)
+
+        with mock.patch.object(executor, "_run_forge_helper", blocking_helper), \
+             mock.patch.object(credential_proxy, "COMMAND_SLOT_WAIT_SECONDS", bound):
+            verb = threading.Thread(target=vcs_verb, name="verb", daemon=True)
+            verb.start()
+            self.assertTrue(held.wait(5))
+            executor._refresh_lock.acquire()
+            started = time.monotonic()
+            route_results = []
+            route = self._refresh_in_thread(executor, route_results)
+            # Margins, one-directional: the lock is released inside the
+            # route caller's arrival bound, and the verb arrives after it.
+            time.sleep(0.75 * bound)
+            executor._refresh_lock.release()
+            self._wait_until(lambda: executor.queued_requests > 0)
+            time.sleep(max(0.0, started + 1.25 * bound - time.monotonic()))
+            self.assertTrue(route.is_alive())
+            go.set()
+            self.assertTrue(entered.wait(5))
+            finish.set()
+            verb.join(5)
+            route.join(5)
+            self.assertFalse(verb.is_alive() or route.is_alive())
+        self.assertEqual(["ok"], verb_results)
+        self.assertEqual(["ok"], route_results)
+        self.assertEqual(["verb"], calls)
+        self.assertEqual(0, executor.reserved_bytes)
+
     def _refused_waiting_for_covered_refreshers(self, yielded):
         executor = self._budgeted_executor(admits=1)
         with executor._slot_condition:
             executor._covered_refresh_waiters = 1
         queued_at = time.monotonic() - credential_proxy.COMMAND_SLOT_WAIT_SECONDS - 1
         with self.assertRaises(credential_proxy.CommandSlotUnavailable) as refused:
-            executor._await_covered_refreshers("github", queued_at, None, yielded=yielded)
+            executor._await_covered_refreshers(
+                "github",
+                queued_at + credential_proxy.COMMAND_SLOT_WAIT_SECONDS,
+                None,
+                yielded_since=queued_at if yielded else None,
+            )
         return str(refused.exception)
 
     def test_a_route_caller_refused_after_yielding_says_so_with_the_time_it_spent(self):

@@ -175,6 +175,12 @@ REFRESH_HELPER_BUDGET_SECONDS = (
 #: the sandbox image, which does not carry the broker.
 BROKER_ADMISSION_WAIT_SECONDS = 60
 
+#: The broker's wait for a vcs verb's refresh it stepped aside for: a route
+#: refresh holding the lock while it waits for the budget yields the lock to a
+#: vcs request that needs a refresh, then waits for that request's result under
+#: a bound of `COMMAND_SLOT_WAIT_SECONDS` from the yield, which this mirrors.
+BROKER_YIELDED_WAIT_SECONDS = 60
+
 #: Room for the connection and the response on top of the waits.
 SIDECAR_REFRESH_MARGIN_SECONDS = 10
 
@@ -182,7 +188,9 @@ SIDECAR_REFRESH_MARGIN_SECONDS = 10
 #: starts, the broker may hold a refresh twice: waiting for the refresh lock
 #: behind another refresh, under a bound of COMMAND_SLOT_WAIT_SECONDS from
 #: arrival, and then, holding the lock, queueing for admission under a bound of
-#: its own. A refresh admitted late still runs the whole helper and answers 200
+#: its own. A refresh that steps aside for a vcs verb's refresh during that
+#: second wait then waits for the verb under a third bound, counted from the
+#: yield. A refresh admitted late still runs the whole helper and answers 200
 #: once the token has landed, so a client that gives up sooner reports a refresh
 #: that succeeded as failed. A refresher behind a helper that runs past the lock
 #: bound is told busy even though that helper lands the token seconds later;
@@ -191,6 +199,7 @@ SIDECAR_REFRESH_MARGIN_SECONDS = 10
 SIDECAR_REFRESH_TIMEOUT_SECONDS = (
     BROKER_ADMISSION_WAIT_SECONDS
     + BROKER_ADMISSION_WAIT_SECONDS
+    + BROKER_YIELDED_WAIT_SECONDS
     + REFRESH_HELPER_BUDGET_SECONDS
     + SIDECAR_REFRESH_MARGIN_SECONDS
 )
@@ -730,8 +739,9 @@ def refresh_git_credentials(
         # In the agent sandbox: delegate to the credential sidecar.
         # The sidecar manages bounded retries against Minty internally. The
         # client waits SIDECAR_REFRESH_TIMEOUT_SECONDS, which covers the
-        # broker's wait for the refresh lock, its admission wait and the
-        # helper's budget after it, and fails fast on any error without
+        # broker's wait for the refresh lock, its admission wait, its wait
+        # for a vcs verb's refresh it stepped aside for, and the helper's
+        # budget after them, and fails fast on any error without
         # re-triggering retries.
         # The forge-neutral route, naming the provider and the repository by
         # its URL rather than as a bare slug: a broker serving more than one

@@ -241,8 +241,9 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_waits_out_the_brokers_admission_and_the_helper(self, urlopen, run):
         # Before the helper starts, the broker may hold a refresh on the
-        # refresh lock behind another refresh, then queue it behind its child
-        # memory budget, each for COMMAND_SLOT_WAIT_SECONDS; a client that
+        # refresh lock behind another refresh, queue it behind its child
+        # memory budget, then, if it stepped aside for a vcs verb, wait for
+        # that verb's refresh, each for COMMAND_SLOT_WAIT_SECONDS; a client that
         # gives up sooner reports a token that landed as a failed refresh.
         response = MagicMock()
         response.__enter__.return_value.status = 200
@@ -257,19 +258,22 @@ class GitHubTokenRefreshTest(unittest.TestCase):
 
         timeout = urlopen.call_args.kwargs["timeout"]
         self.assertEqual(github_token_refresh.SIDECAR_REFRESH_TIMEOUT_SECONDS, timeout)
-        # 60 s bound on the wait for the refresh lock, 60 s of
-        # admission wait, 81.5 s of its own helper (20 identity, 16.5 Minty,
-        # 3 x 15 CLI), 10 s of margin.
-        self.assertEqual(211.5, timeout)
-        self.assertGreater(
-            timeout,
-            2 * credential_proxy.COMMAND_SLOT_WAIT_SECONDS
-            + github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS,
-        )
+        # The bound on the wait for the refresh lock, the admission wait, the
+        # wait for a vcs verb's refresh after stepping aside, each
+        # COMMAND_SLOT_WAIT_SECONDS; then its own helper (20 identity, 16.5
+        # Minty, 3 x 15 CLI) and the margin.
         self.assertEqual(
-            credential_proxy.COMMAND_SLOT_WAIT_SECONDS,
-            github_token_refresh.BROKER_ADMISSION_WAIT_SECONDS,
+            3 * credential_proxy.COMMAND_SLOT_WAIT_SECONDS
+            + github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS
+            + github_token_refresh.SIDECAR_REFRESH_MARGIN_SECONDS,
+            timeout,
         )
+        self.assertEqual(81.5, github_token_refresh.REFRESH_HELPER_BUDGET_SECONDS)
+        for mirrored in (
+            github_token_refresh.BROKER_ADMISSION_WAIT_SECONDS,
+            github_token_refresh.BROKER_YIELDED_WAIT_SECONDS,
+        ):
+            self.assertEqual(credential_proxy.COMMAND_SLOT_WAIT_SECONDS, mirrored)
         self.assertGreater(github_token_refresh.SANDBOX_REFRESH_TIMEOUT_SECONDS, timeout)
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")

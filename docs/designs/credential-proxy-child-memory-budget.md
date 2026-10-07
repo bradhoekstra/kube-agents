@@ -121,7 +121,10 @@ Where each route reserves, and why there:
   A route holder waiting for the budget yields the lock to a vcs verb that needs a refresh: the
   verb runs the helper under its own reservation while the route caller queues behind it and
   coalesces on its result, since otherwise the verb would wait on the lock while the holder
-  waits for budget the verb holds. Another route refresher waits on the lock as before. A
+  waits for budget the verb holds. The yielded caller's wait for the verb has a bound of its own,
+  `COMMAND_SLOT_WAIT_SECONDS` from the yield, because the budget wait ran on its own clock and may
+  have spent the arrival bound; refused past it, the caller is told it stepped aside, with the
+  time it spent since arrival. Another route refresher waits on the lock as before. A
   refresher behind a helper that runs past the bound is told busy although that helper lands the
   token seconds later; the client
   reports a failed refresh, and its next call coalesces. The route hands its connection to both
