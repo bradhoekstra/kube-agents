@@ -123,9 +123,17 @@ func (s *profileScope) Profiled(identity clusterIdentity) (bool, bool) {
 // rescan replaces the profiled set from the directory. Caller holds mu.
 func (s *profileScope) rescan() {
 	s.scannedAt = s.now()
+	unparsable := map[string]error{}
 	dropped := map[string]error{}
-	ids, err := clusterprofiles.ReadIdentities(s.dir, func(profile string, err error) {
-		dropped[profile] = err
+	ids, err := clusterprofiles.ReadIdentities(s.dir, func(profile string, clusterProfile bool, err error) {
+		// A non-cluster profile that will not parse -- the platform profile
+		// with a bad edit -- is nobody's held cluster, unless this scope saw
+		// it name one, which the keep below decides from its own record.
+		if clusterProfile {
+			dropped[profile] = err
+		} else {
+			unparsable[profile] = err
+		}
 	})
 	if err != nil {
 		s.readable = false
@@ -155,7 +163,7 @@ func (s *profileScope) rescan() {
 		byProfile[profile] = kept
 		skipped[profile] = struct{}{}
 		if _, logged := s.skipped[profile]; !logged {
-			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, dropReason(dropped[profile]), kept)
+			log.Printf("%s: profile %s names no cluster on this read (%v); keeping %s inside the install's scope while the profile directory exists", commandName, profile, dropReason(dropped[profile], unparsable[profile]), kept)
 		}
 	}
 	for profile, reason := range dropped {
@@ -179,12 +187,16 @@ func (s *profileScope) rescan() {
 	s.profiled = set
 }
 
-// dropReason is the reason ReadIdentities gave for a profile it dropped, or
-// the one case it reports nothing for: a config that reads cleanly and carries
-// no cluster_identity block under a name without the cluster- prefix.
-func dropReason(err error) error {
-	if err != nil {
-		return err
+// dropReason is the reason ReadIdentities gave for a profile it dropped, as a
+// cluster profile or not, or the one case it reports nothing for: a config that
+// reads cleanly and carries no cluster_identity block under a name without the
+// cluster- prefix.
+func dropReason(reported, unparsable error) error {
+	if reported != nil {
+		return reported
+	}
+	if unparsable != nil {
+		return unparsable
 	}
 	return errors.New("config.yaml carries no cluster_identity")
 }

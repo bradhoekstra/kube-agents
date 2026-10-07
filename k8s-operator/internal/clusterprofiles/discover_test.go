@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -446,28 +447,38 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 		t.Fatal(err)
 	}
 	writeProfile(t, dir, ".swap", "cluster_identity:\n  project: p1\n  cluster: hidden\n  location: us-central1\n")
+	// A profile reached through a symlink is a profile: os.ReadDir types the
+	// link, not its target.
+	linked := t.TempDir()
+	writeClusterProfile(t, linked, "prod-c", "p1", "prod", "asia-east1")
+	if err := os.Symlink(filepath.Join(linked, "prod-c"), filepath.Join(dir, "prod-c")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	skipped := map[string]string{}
-	got, err := ReadIdentities(dir, func(profile string, err error) {
-		skipped[profile] = err.Error()
+	got, err := ReadIdentities(dir, func(profile string, clusterProfile bool, err error) {
+		skipped[profile] = fmt.Sprintf("cluster=%t %v", clusterProfile, err)
 	})
 	if err != nil {
 		t.Fatalf("ReadIdentities: %v", err)
 	}
-	for profile, reason := range map[string]string{
-		"broken":                       "parse ",
-		"partial":                      "cluster_identity is incomplete",
-		"cluster-p1-new-us-central1":   "carries no cluster_identity",
-		"cluster-p1-newer-us-central1": "is absent",
+	for profile, want := range map[string]string{
+		"broken":                       "cluster=false parse ",
+		"partial":                      "cluster=true cluster_identity is incomplete",
+		"cluster-p1-new-us-central1":   "cluster=true config.yaml carries no cluster_identity",
+		"cluster-p1-newer-us-central1": "cluster=true config.yaml is absent",
 	} {
-		if !strings.Contains(skipped[profile], reason) {
-			t.Errorf("skipped[%s] = %q, want it reported with %q", profile, skipped[profile], reason)
+		if !strings.HasPrefix(skipped[profile], want) {
+			t.Errorf("skipped[%s] = %q, want it reported as %q…", profile, skipped[profile], want)
 		}
 	}
 	if len(skipped) != 4 {
-		t.Errorf("skipped = %v, want exactly the four dropped cluster profiles: the platform profile and the dot-directory are not clusters and are silent", skipped)
+		t.Errorf("skipped = %v, want exactly four reports: the platform profile and the dot-directory are silent, and the unparsable unprefixed one is reported as not a cluster profile so the caller can decide", skipped)
 	}
-	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod"}
+	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod", "prod-c=p1/asia-east1/prod"}
 	names := make([]string, 0, len(got))
 	for _, p := range got {
 		names = append(names, p.Profile+"="+p.Identity.String())

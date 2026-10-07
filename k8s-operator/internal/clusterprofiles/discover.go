@@ -53,6 +53,23 @@ const (
 	clusterProfilePrefix = "cluster-"
 )
 
+// isProfileDir reports whether a directory entry is a directory, following a
+// symlink to one: os.ReadDir types an entry from its own bits, so a profile
+// reached through a link reports IsDir false, and a scope that dropped it on
+// that would hold its cluster with no line saying why. Discover keeps the
+// plain IsDir test, so such a profile is inside the scope and not joined --
+// loud, which is the pre-existing behaviour for a profile the join cannot use.
+func isProfileDir(dir string, e os.DirEntry) bool {
+	if e.IsDir() {
+		return true
+	}
+	if e.Type()&os.ModeSymlink == 0 {
+		return false
+	}
+	info, err := os.Stat(filepath.Join(dir, e.Name()))
+	return err == nil && info.IsDir()
+}
+
 // ProfileIdentity is one cluster profile's directory name with the identity
 // its config carries, as ReadIdentities lists them.
 type ProfileIdentity struct {
@@ -148,42 +165,47 @@ func (d Discoverer) skip(profile string, err error) {
 // name this cluster? -- as distinct from Discover's reachability question, and
 // the two answers differ for every profile Discover skips.
 //
-// Entries that are not cluster profiles (a hidden directory, a file, a profile
-// with no cluster_identity block and no cluster- prefix) are left out silently.
-// A profile that is dropped for any other reason is reported to onSkip (nil to
-// ignore) with its directory name and why: its config cannot be read or
-// parsed, its cluster_identity is present but incomplete, or it carries the
-// cluster- prefix and its config is absent or names no cluster on this read --
-// the scaffold writes the identity last, so a read landing before that sees a
-// cluster profile that names nothing. A listing that failed on any of these
-// would make one broken profile hide the whole fleet, but a profile dropped
-// here is a cluster the caller will treat as unnamed, and the caller has to be
-// able to say so. Only a directory that cannot be read at all is an error,
-// because then the scope is unknown rather than empty.
-func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]ProfileIdentity, error) {
+// Hidden directories and files are left out silently, and so is a profile with
+// no cluster- prefix whose config reads cleanly and carries no cluster_identity
+// block: that is what the platform profile looks like. Every other drop is
+// reported to onSkip (nil to ignore) with the directory name, whether the
+// entry reads as a cluster profile -- it carries the prefix, or a partial
+// identity block -- and why: its config cannot be read or parsed, its
+// cluster_identity is present but incomplete, or (a cluster profile) its config
+// is absent or names no cluster on this read, which is what the scaffold
+// window looks like, since the scaffold writes the identity last. The flag is
+// there because an unparsable config under a non-cluster profile is reported
+// too, so a caller that kept an identity for that directory can keep it, and
+// one that did not can stay silent rather than announce a held cluster that
+// never existed. A listing that failed on any of these would make one broken
+// profile hide the whole fleet, but a profile dropped here is a cluster the
+// caller will treat as unnamed, and the caller has to be able to say so. Only
+// a directory that cannot be read at all is an error, because then the scope
+// is unknown rather than empty.
+func ReadIdentities(dir string, onSkip func(profile string, clusterProfile bool, err error)) ([]ProfileIdentity, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
 	}
-	skip := func(profile string, err error) {
+	skip := func(profile string, clusterProfile bool, err error) {
 		if onSkip != nil {
-			onSkip(profile, err)
+			onSkip(profile, clusterProfile, err)
 		}
 	}
 	var ids []ProfileIdentity
 	for _, e := range entries {
-		if !e.IsDir() || strings.HasPrefix(e.Name(), hiddenPrefix) {
+		if strings.HasPrefix(e.Name(), hiddenPrefix) || !isProfileDir(dir, e) {
 			continue
 		}
 		clusterProfile := strings.HasPrefix(e.Name(), clusterProfilePrefix)
 		cfg, err := readProfileConfig(filepath.Join(dir, e.Name(), profileConfigFile))
 		if err != nil {
-			skip(e.Name(), err)
+			skip(e.Name(), clusterProfile, err)
 			continue
 		}
 		if cfg == nil {
 			if clusterProfile {
-				skip(e.Name(), fmt.Errorf("%s is absent", profileConfigFile))
+				skip(e.Name(), true, fmt.Errorf("%s is absent", profileConfigFile))
 			}
 			continue
 		}
@@ -192,9 +214,9 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 		case id.complete():
 			ids = append(ids, ProfileIdentity{Profile: e.Name(), Identity: id})
 		case id != (Identity{}):
-			skip(e.Name(), fmt.Errorf("cluster_identity is incomplete: %q", id.String()))
+			skip(e.Name(), true, fmt.Errorf("cluster_identity is incomplete: %q", id.String()))
 		case clusterProfile:
-			skip(e.Name(), fmt.Errorf("%s carries no cluster_identity", profileConfigFile))
+			skip(e.Name(), true, fmt.Errorf("%s carries no cluster_identity", profileConfigFile))
 		}
 	}
 	return ids, nil

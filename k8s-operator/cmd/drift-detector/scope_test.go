@@ -80,18 +80,18 @@ func TestProfileScopeReportsAnUnreadableDirectoryAsUnknown(t *testing.T) {
 	}
 }
 
-// A profile that does not parse and has never named a cluster leaves its
-// cluster held as outside the scope -- and the scope says so once per streak,
-// by profile name, in the log, because the hold line alone would send the
-// operator to write a profile that exists.
+// A cluster profile that does not parse and has never named a cluster leaves
+// its cluster held as outside the scope -- and the scope says so once per
+// streak, by profile name, in the log, because the hold line alone would send
+// the operator to write a profile that exists.
 func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
 	logs := captureLog(t)
 	dir := t.TempDir()
-	broken := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-c"}
-	if err := os.MkdirAll(filepath.Join(dir, "prod-c"), 0o700); err != nil {
+	broken := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "cluster-p1-prod-c-us-central1"}
+	if err := os.MkdirAll(filepath.Join(dir, "cluster-p1-prod-c-us-central1"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "prod-c", "config.yaml"), []byte("model: ["), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "cluster-p1-prod-c-us-central1", "config.yaml"), []byte("model: ["), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now()
@@ -102,7 +102,7 @@ func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
 	}
 	now = now.Add(profileScopeRescanInterval)
 	s.Profiled(broken) // a second read in the same streak
-	const heldLine = "profile prod-c names no readable cluster for the install's scope"
+	const heldLine = "profile cluster-p1-prod-c-us-central1 names no readable cluster for the install's scope"
 	if got := strings.Count(logs.String(), heldLine); got != 1 {
 		t.Errorf("logged %q %d time(s) over two broken reads, want once per streak:\n%s", heldLine, got, logs.String())
 	}
@@ -110,18 +110,18 @@ func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
 		t.Errorf("log says an identity is kept for a profile that never named one:\n%s", logs.String())
 	}
 
-	writeScopeProfile(t, dir, "prod-c", broken)
+	writeScopeProfile(t, dir, "cluster-p1-prod-c-us-central1", broken)
 	now = now.Add(profileScopeRescanInterval)
 	if profiled, _ := s.Profiled(broken); !profiled {
 		t.Error("Profiled(prod-c) = false after the profile was rewritten, want true")
 	}
-	if err := os.WriteFile(filepath.Join(dir, "prod-c", "config.yaml"), []byte("model: ["), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "cluster-p1-prod-c-us-central1", "config.yaml"), []byte("model: ["), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	now = now.Add(profileScopeRescanInterval)
 	s.Profiled(broken)
 	// A new streak, and a different one: the profile has named a cluster since.
-	if got := strings.Count(logs.String(), "profile prod-c names no cluster on this read"); got != 1 {
+	if got := strings.Count(logs.String(), "profile cluster-p1-prod-c-us-central1 names no cluster on this read"); got != 1 {
 		t.Errorf("want the profile logged again, as kept, when it breaks after a clean read; log:\n%s", logs.String())
 	}
 }
@@ -195,6 +195,43 @@ func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testin
 	const heldLine = "profile cluster-p1-prod-e-us-central1 names no readable cluster for the install's scope (config.yaml is absent); records from its cluster are held"
 	if !strings.Contains(logs.String(), heldLine) {
 		t.Errorf("log lacks %q:\n%s", heldLine, logs.String())
+	}
+}
+
+// The platform profile lives under the same directory and names no cluster, so
+// a bad edit to it is nobody's held cluster and gets no line; the same break in
+// a profile this scope saw name a cluster is kept, with the parse error as the
+// reason.
+func TestProfileScopeIsSilentAboutABrokenNonClusterProfile(t *testing.T) {
+	logs := captureLog(t)
+	dir := t.TempDir()
+	prodG := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-g"}
+	writeScopeProfile(t, dir, "prod-g", prodG)
+	if err := os.MkdirAll(filepath.Join(dir, "platform"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "platform", "config.yaml"), []byte("model: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s := testProfileScope(dir, &now)
+	s.Profiled(prodG)
+	if strings.Contains(logs.String(), "platform") {
+		t.Errorf("log mentions the platform profile, which names no cluster and holds nothing:\n%s", logs.String())
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "prod-g", "config.yaml"), []byte("model: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, _ := s.Profiled(prodG); !profiled {
+		t.Error("Profiled(prod-g) = false after its config broke, want true: the last identity is kept")
+	}
+	if !strings.Contains(logs.String(), "profile prod-g names no cluster on this read (parse ") {
+		t.Errorf("log lacks the kept line with the parse error as its reason:\n%s", logs.String())
+	}
+	if strings.Contains(logs.String(), "platform") {
+		t.Errorf("log mentions the platform profile:\n%s", logs.String())
 	}
 }
 
