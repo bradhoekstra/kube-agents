@@ -126,42 +126,33 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 		}
 	}
 
-	if n := len(operatorPeerRules(buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false))); n != 0 {
-		t.Errorf("the gateway policy renders %d operator rule(s) with no namespace, want 0", n)
-	}
-	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, ""))); n != 0 {
-		t.Errorf("the broker policy renders %d operator rule(s) with no namespace, want 0", n)
-	}
-	// A malformed namespace is treated like an unknown one: written into a
-	// selector it would have the API server reject the whole policy, so neither
-	// policy renders the operator rule.
-	malformed := defaultTestNetpolProfile()
-	malformed.OperatorNamespace = policyTestMalformedNamespace
-	if n := len(operatorPeerRules(buildNetworkPolicy(agent, nil, malformed, false, "", false))); n != 0 {
-		t.Errorf("the gateway policy renders %d operator rule(s) with a malformed namespace, want 0", n)
-	}
-	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestMalformedNamespace))); n != 0 {
-		t.Errorf("the broker policy renders %d operator rule(s) with a malformed namespace, want 0", n)
-	}
-	// A namespace that is a valid label value but not a DNS-1123 label is treated
-	// the same: the selector would carry it, but it matches no namespace, so
-	// neither policy renders the operator rule.
-	nonDNS := defaultTestNetpolProfile()
-	nonDNS.OperatorNamespace = policyTestNonDNS1123Namespace
-	if n := len(operatorPeerRules(buildNetworkPolicy(agent, nil, nonDNS, false, "", false))); n != 0 {
-		t.Errorf("the gateway policy renders %d operator rule(s) with a non-DNS-1123 namespace, want 0", n)
-	}
-	if n := len(operatorPeerRules(credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestNonDNS1123Namespace))); n != 0 {
-		t.Errorf("the broker policy renders %d operator rule(s) with a non-DNS-1123 namespace, want 0", n)
+	// A namespace the operator cannot be admitted under -- unset, malformed (a
+	// selector carrying it would have the API server reject the whole policy), or
+	// a valid label value that is not a DNS-1123 label (it would match no
+	// namespace) -- renders no operator rule of any shape. Diff the whole ingress
+	// against the namespace-unset rendering rather than counting labelled peers,
+	// which a rule carrying the pod label but no Ports, or a namespace-only peer,
+	// slips past.
+	gatewayBaseline := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
+	brokerBaseline := buildCredentialProxyNetworkPolicy(agent)
+	for _, ns := range []string{"", policyTestMalformedNamespace, policyTestNonDNS1123Namespace} {
+		gwProfile := defaultTestNetpolProfile()
+		gwProfile.OperatorNamespace = ns
+		if gw := buildNetworkPolicy(agent, nil, gwProfile, false, "", false); !equality.Semantic.DeepEqual(gw.Spec.Ingress, gatewayBaseline.Spec.Ingress) {
+			t.Errorf("the gateway policy's ingress changes under namespace %q, want no operator rule:\n got %+v\nwant %+v", ns, gw.Spec.Ingress, gatewayBaseline.Spec.Ingress)
+		}
+		if br := credentialProxyNetworkPolicyWithOperatorPeer(agent, ns); !equality.Semantic.DeepEqual(br.Spec.Ingress, brokerBaseline.Spec.Ingress) {
+			t.Errorf("the broker policy's ingress changes under namespace %q, want no operator rule:\n got %+v\nwant %+v", ns, br.Spec.Ingress, brokerBaseline.Spec.Ingress)
+		}
 	}
 	// The operator rule admits nothing besides the operator peer on the metrics
-	// port: exactly one rule, equal to operatorMetricsIngressRule's output. A
-	// second peer in the rule's From, or an empty or wider Ports list, passes the
-	// port-and-selector checks above (operatorPeerRules keeps only the labelled
-	// peer and nothing when Ports is empty) but is caught here. operatorRules
-	// keys on the operator's namespace selector as well as its pod label, so a
-	// second rule that reaches the operator through a namespace-only peer -- one
-	// operatorPeerRules never records -- lands here too and trips the count.
+	// port: exactly one rule, and that rule's shape pinned against literals -- one
+	// peer, one TCP port equal to the metrics port, the peer narrowed by both the
+	// operator namespace label and the operator pod label, and no IPBlock. Pin the
+	// shape directly rather than comparing against operatorMetricsIngressRule's
+	// output, which both policies append verbatim: widening that builder would
+	// widen the comparison with it, so a self-compare passes for the very edit
+	// this guards against.
 	for name, np := range map[string]*networkingv1.NetworkPolicy{
 		"gateway": buildNetworkPolicy(agent, nil, profile, false, "", false),
 		"broker":  credentialProxyNetworkPolicyWithOperatorPeer(agent, policyTestOperatorNamespace),
@@ -170,16 +161,29 @@ func TestThePoliciesAdmitTheOperatorOnTheMetricsPortsOnly(t *testing.T) {
 		if name == "broker" {
 			port = credentialProxyMetricsPort
 		}
-		want, ok := operatorMetricsIngressRule(policyTestOperatorNamespace, port)
-		if !ok {
-			t.Fatalf("operatorMetricsIngressRule returned no rule for a valid namespace")
-		}
 		rules := operatorRules(np, policyTestOperatorNamespace)
 		if len(rules) != 1 {
 			t.Fatalf("%s policy: %d rules admit the operator peer, want exactly 1: %+v", name, len(rules), rules)
 		}
-		if !equality.Semantic.DeepEqual(rules[0], want) {
-			t.Errorf("%s policy: the operator rule admits more than the operator peer on the metrics port:\n got %+v\nwant %+v", name, rules[0], want)
+		rule := rules[0]
+		if len(rule.Ports) != 1 {
+			t.Errorf("%s policy: the operator rule opens %d ports, want exactly 1: %+v", name, len(rule.Ports), rule.Ports)
+		} else if !equality.Semantic.DeepEqual(rule.Ports[0], tcpPort(port)) {
+			t.Errorf("%s policy: the operator rule's port is not TCP %d: %+v", name, port, rule.Ports[0])
+		}
+		if len(rule.From) != 1 {
+			t.Errorf("%s policy: the operator rule has %d peers, want exactly 1: %+v", name, len(rule.From), rule.From)
+			continue
+		}
+		peer := rule.From[0]
+		if peer.IPBlock != nil {
+			t.Errorf("%s policy: the operator rule carries an IPBlock peer: %+v", name, peer.IPBlock)
+		}
+		if peer.NamespaceSelector == nil || peer.NamespaceSelector.MatchLabels[labelMetadataName] != policyTestOperatorNamespace {
+			t.Errorf("%s policy: the operator peer is not narrowed to the operator namespace: %+v", name, peer.NamespaceSelector)
+		}
+		if peer.PodSelector == nil || peer.PodSelector.MatchLabels[operatorPodNameLabel] != operatorPodNameValue {
+			t.Errorf("%s policy: the operator peer is not narrowed to the operator pod: %+v", name, peer.PodSelector)
 		}
 	}
 	// The builder itself is unchanged: no operator rule, whatever the caller knows.
