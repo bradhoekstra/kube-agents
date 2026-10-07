@@ -460,8 +460,8 @@ The two labels are the two people:
 Who to ask about a particular area, as opposed to who may approve, is
 [`docs/ownership.md`](ownership.md).
 Whoever `.github/auto_request_review.yml` assigns can give the pull request the label it was drawn
-for. Its pool for an ordinary change is the `repository-owners` group, five of the root approvers,
-plus `repository-reviewers`, people `OWNERS` lists under `reviewers` alone, and the script decides
+for. Its pool for an ordinary change is the `repository-owners` group, root approvers, plus
+`repository-reviewers`, people `OWNERS` lists under `reviewers` alone, and the script decides
 between them by what the author's own approval already covers (#1075): an approver's own change opens with `approved` on it and needs
 only `lgtm`, so the draw is the whole pool at equal weight; any other change still needs an
 approver's review, so the draw is narrowed to the `OWNERS` approvers for the changed files. The
