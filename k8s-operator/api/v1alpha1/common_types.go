@@ -939,7 +939,8 @@ type CredentialProxySpec struct {
 	// CPU on the requests pair leaves the band GKE Autopilot admits unchanged,
 	// because Autopilot then raises the smaller request into the band; it
 	// applies the band to requests only. It also warns for each of cpu and
-	// memory set under limits without the same key under requests: Autopilot
+	// memory set under limits without the same key under requests, unless the
+	// limit equals the request it would be replaced by: Autopilot
 	// without bursting sets the limits equal to the requests, so there the
 	// proxy runs at the request and the limit has no effect. With bursting the
 	// declared limits stand.

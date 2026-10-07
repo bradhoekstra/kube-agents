@@ -75,9 +75,9 @@ func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedWithTheNumbers(t *testi
 }
 
 // A limit under the floor is refused once. It also sits under the default
-// 512Mi request and, against the default 1 CPU, outside the Autopilot band;
-// neither restates it, because raising requests.memory cannot make it valid
-// and the band warning is advice about a quantity already refused.
+// 512Mi request, and is set without requests.memory; neither restates it,
+// because raising requests.memory cannot make it valid and the
+// limit-without-request note is advice about a quantity already refused.
 func TestCredentialProxyMemoryLimitBelowTheFloorIsRefusedOnce(t *testing.T) {
 	path := field.NewPath("spec", "deployment", "credentialProxy", "resources")
 	errs, warnings := controller.ValidateCredentialProxyResources(proxyResourcesAgent(&corev1.ResourceRequirements{
