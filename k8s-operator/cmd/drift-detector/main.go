@@ -314,9 +314,10 @@ func joinDisabledReason(profilesDir string, scan profileScan) string {
 //
 // The first names the clusters whose records were forwarded without ownership:
 // a profile names them and the join still could not read them (the startup
-// skip lines say why), or the scope was unknown -- no --profiles-dir, or a
+// skip lines say why), the scope was unknown -- no --profiles-dir, or a
 // directory the scope could not read, which it logged -- and so there was
-// nothing to hold against. The second names the clusters no readable profile
+// nothing to hold against, or the record was a redelivery of one the inject had
+// already sent, which is the inject's duplicate rather than a hold. The second names the clusters no readable profile
 // names, whose records the inject held (DriftEvent.OutOfScope); the operator
 // reading it decides between three actions and the line names them: profile
 // the cluster, leave it out, or fix the profile the scope logged by name.
@@ -324,7 +325,7 @@ func joinDisabledReason(profilesDir string, scan profileScan) string {
 // Functions rather than branches at the call site for the reason
 // joinDisabledReason is: the wordings can be asserted without a subscription.
 func unreachableClustersLine(unreachable []string) string {
-	return fmt.Sprintf("unreachable clusters (a Cluster Agent profile names them but this run could not join them, or the scope was unknown because no --profiles-dir declared it or the directory could not be read; their records were forwarded without ownership): %s",
+	return fmt.Sprintf("unreachable clusters (a Cluster Agent profile names them but this run could not join them, the scope was unknown because no --profiles-dir declared it or the directory could not be read, or the record was a redelivery of one already sent; their records were forwarded without ownership): %s",
 		strings.Join(unreachable, unreachableListSeparator))
 }
 

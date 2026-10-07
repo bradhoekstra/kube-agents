@@ -24,8 +24,8 @@ entrypoint launches it, but only where an install has asked for it: see
 The inject is off unless `--daemon-url` is set, and off is the default. With it off the detector
 does everything else and stops at the `DRIFT` log line, which is how it ran before T4 and is what a
 local run against a real subscription wants. With it on, each surviving record opens a session and
-posts one payload into it — except one from a cluster outside the install's scope, which is held
-([The join](#the-join) has the rule); `logDriftEvent` still runs first either way, so the `DRIFT` line is
+posts one payload into it — except one from a cluster outside the install's scope, which is held (the
+rule is a few paragraphs below); `logDriftEvent` still runs first either way, so the `DRIFT` line is
 emitted whether or not a daemon is configured and whether or not the inject lands.
 
 Two things about that are worth knowing before relying on it. A record whose inject fails is
@@ -77,16 +77,17 @@ cluster as one to profile, exclude, or fix the profile of. A record from a clust
 discovery ran, since discovery runs once — is inside the scope, and is forwarded `unreachable` and
 injected as before; so is every record when the scope is unknown, because `--profiles-dir` was not
 given or the directory cannot be read. A profile that named a cluster on an earlier read and does
-not on this one — its `config.yaml` unreadable, unparsable, truncated or stripped of its identity
-block — keeps that identity for as long as its directory exists, and the keep is logged by name once
-per streak: the scaffold stamps the identity last and in place, so a read landing mid-write must not
-hold a cluster that was onboarded a second earlier. A profile that has never named a cluster here
+not on this one — its `config.yaml` removed, unreadable, unparsable, truncated or stripped of its
+identity block — keeps that identity for as long as a directory is at its path, and the keep is
+logged by name once per streak: the scaffold copies the template config in and stamps the identity
+after it, in place, so a read landing between the two must not hold a cluster that was onboarded a
+second earlier. A profile that has never named a cluster here
 leaves its cluster held as outside the scope, with a line naming the profile and why it reads as
 nothing — a symlink that leads nowhere, a config unreadable, unparsable or incomplete, or a
-`cluster-` directory whose config is absent or carries no identity block; silent are only the
-reserved `platform` and `default` profiles and a directory without the prefix that has no config or
-a config with no block, the shapes the read cannot tell from a non-cluster profile or a directory
-that was never one. The match is the exact triple: a profile naming the record's project and cluster
+`cluster-` directory whose config is absent or carries no identity block; silent, besides hidden
+entries and plain files, are only the reserved `platform` and `default` profiles and a directory
+without the prefix that has no config or a config with no block, the shapes the read cannot tell
+from a non-cluster profile or a directory that was never one. The match is the exact triple: a profile naming the record's project and cluster
 under another location — a zone written for a regional cluster, which the scaffold admits and
 discovery then skips because the GKE API finds nothing there — names nothing a record carries, and
 that cluster's records are held until the profile is corrected; the startup skip line says so, and a
@@ -487,8 +488,9 @@ join has a cluster to read. "The join is off" therefore does not mean "everythin
 `unreachable` is the one whose count stopped being self-explanatory when the fan-in landed. With one
 cluster the missing set was inferable — everything else in the project — and with a fan-in it is
 not, so the shutdown report names each unreachable cluster with a count, on one of two lines: the
-clusters a profile names and the run could not join, whose records went out thin, and the clusters
-no readable profile names, whose records were held. Each list is capped at `maxUnreachableClusters` with the
+clusters whose records went out thin — a profile names them and the run could not join them, the
+scope was unknown, or the record was a redelivery already sent — and the clusters no readable
+profile names, whose records were held. Each list is capped at `maxUnreachableClusters` with the
 rest collected under a label. Not every entry is a misconfiguration: a project holding a cluster
 nobody intends to onboard sits on the second line every run, and the detector cannot tell that from
 one whose profile failed to write.

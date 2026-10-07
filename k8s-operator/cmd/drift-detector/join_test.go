@@ -395,6 +395,9 @@ func TestJoinDoesNotMarkARedeliveredRecordAlreadyInjected(t *testing.T) {
 	if held := j.OutOfScopeClusters(); len(held) != 1 || !strings.Contains(held[0], "=1") {
 		t.Errorf("OutOfScopeClusters() = %v, want prod-b held once", held)
 	}
+	if u := j.UnreachableClusters(); len(u) != 1 || !strings.Contains(u[0], "=1") {
+		t.Errorf("UnreachableClusters() = %v, want prod-b once, for the redelivered record the inject will count a duplicate", u)
+	}
 }
 
 // The cases that must not be held, each the deployed shape of a cluster the

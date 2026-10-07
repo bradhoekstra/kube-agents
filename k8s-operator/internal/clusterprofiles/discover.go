@@ -251,6 +251,10 @@ func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Profi
 // carries a complete cluster_identity block. That is how non-cluster profiles
 // ("default", "platform") are skipped: testing for the data we need is more
 // durable than hardcoding a list of names that the Python side may extend.
+// ReadIdentities does name those two, and only to stay silent about them when
+// they are broken: for the scope the question is not "which profiles address a
+// cluster" but "which drops are worth a line", and a reserved profile is never
+// a cluster's whatever state it is in.
 //
 // The identity is also the whole of what a config is built from, and that is a
 // deliberate change of source. Discovery used to require a kubeconfig.yaml

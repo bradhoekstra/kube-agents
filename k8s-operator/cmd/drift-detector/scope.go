@@ -59,12 +59,13 @@ type scopeIndex interface {
 // files only.
 //
 // A profile that named a cluster on an earlier read and does not on this one
-// -- its config unreadable, unparsable, truncated, or stripped of its identity
-// block, reported by ReadIdentities or not -- keeps that identity for as long
-// as its directory exists, and the keep is logged by name once per streak. That
-// is what closes the scaffold window: cluster_agent_profile.py writes a
-// profile's config in stages and stamps the identity last, in place, so a read
-// landing mid-write sees a cluster profile that names nothing; a first scaffold
+// -- its config removed, unreadable, unparsable, truncated, or stripped of its
+// identity block, reported by ReadIdentities or not -- keeps that identity for
+// as long as a directory is at its path, and the keep is logged by name once
+// per streak. That is what closes the scaffold window: cluster_agent_profile.py
+// copies the template config in and stamps the identity after it, in place (the
+// one later rewrite is atomic and keeps the block), so a read landing between
+// the two sees a cluster profile that names nothing; a first scaffold
 // was unprofiled an instant earlier and loses nothing, but a re-scaffold of an
 // existing profile would otherwise hold an in-scope cluster for up to an
 // interval. The identity is dropped only with the directory, which is how the
@@ -122,10 +123,10 @@ func (s *profileScope) startupLine() string {
 		return fmt.Sprintf("install scope unknown: %s cannot be read, so every unreachable record is forwarded and nothing is held until it can be", s.dir)
 	}
 	if len(s.profiled) == 0 && len(s.skipped) > 0 {
-		return fmt.Sprintf("install scope read from %s: %d cluster profile(s) found and none readable (the lines above say why), so until one reads, every unreachable record from a cluster other than the joined one(s) is held out of the inject", s.dir, len(s.skipped))
+		return fmt.Sprintf("install scope read from %s: %d cluster profile(s) found and none readable (the lines above say why), so until one reads, every unreachable record is held out of the inject -- every record naming a live object, if the join reads no cluster", s.dir, len(s.skipped))
 	}
 	if len(s.profiled) == 0 {
-		return fmt.Sprintf("install scope read from %s: no Cluster Agent profile yet, so until the Cluster Agent reconcile writes one, every unreachable record from a cluster other than the joined one(s) is held out of the inject", s.dir)
+		return fmt.Sprintf("install scope read from %s: no Cluster Agent profile yet, so until the Cluster Agent reconcile writes one, every unreachable record is held out of the inject -- every record naming a live object, if the join reads no cluster", s.dir)
 	}
 	return fmt.Sprintf("install scope read from %s: %d cluster profile(s); an unreachable record from a cluster none of them names is held out of the inject (re-read at most once a minute)", s.dir, len(s.profiled))
 }

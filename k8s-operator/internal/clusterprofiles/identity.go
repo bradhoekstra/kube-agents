@@ -24,11 +24,11 @@
 // credential attached.
 //
 // It builds no Kubernetes client. The caller picks the client type, and this
-// package stops at the configuration every client type is built from. Today
-// the only caller is the event watcher, which wants an informer-backed
-// kubernetes.Interface; the drift detector wants a dynamic.Interface from the
-// same scan, and that is the seam this package exists for, but its fan-in is
-// not wired yet (cmd/drift-detector/cluster.go).
+// package stops at the configuration every client type is built from. The
+// event watcher builds an informer-backed kubernetes.Interface from it and the
+// drift detector a dynamic.Interface (cmd/drift-detector/cluster.go); the
+// detector's scope also lists the identities alone, through ReadIdentities,
+// without addressing anything.
 package clusterprofiles
 
 import (
