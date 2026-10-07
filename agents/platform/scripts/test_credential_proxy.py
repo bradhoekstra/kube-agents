@@ -6447,7 +6447,14 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
         self.assertEqual(yield_deadlines[0], reservations[1]["deadline"])
         self.assertIsNone(reservations[1]["yield_when"])
         self.assertIsInstance(route_results[0], credential_proxy.CommandSlotUnavailable)
-        self.assertIn("without fitting", str(route_results[0]))
+        # Reworded for the leg it ran on: stepped aside, with the budget's
+        # figures, never `_admit`'s text naming the full wait bound.
+        refusal = str(route_results[0])
+        self.assertIn("stepped aside for; the child memory budget is ", refusal)
+        self.assertRegex(refusal, r"\d+ MiB in use of \d+ MiB: \d+ MiB reserved for children")
+        self.assertNotIn("without fitting", refusal)
+        self.assertNotIn("waited 2.0s", refusal)
+        self.assertNotIn("waited 60s", refusal)
         self.assertEqual(["verb"], calls)
 
     def test_a_route_refresher_gives_up_on_a_held_refresh_lock_at_the_bound(self):

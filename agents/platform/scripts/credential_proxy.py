@@ -930,9 +930,15 @@ REFRESH_LOCK_HUNG_UP_TEXT = "the caller disconnected while waiting for the refre
 REFRESH_LOCK_WAIT_TEXT = (
     "a {provider} credential refresh waited {seconds}s for another refresh to finish; retry shortly"
 )
-REFRESH_YIELDED_WAIT_TEXT = (
+REFRESH_YIELDED_WAIT_REASON = (
     "a {provider} credential refresh waited {seconds}s, for the child memory budget and then for "
-    "a vcs request's refresh it stepped aside for; retry shortly"
+    "a vcs request's refresh it stepped aside for"
+)
+REFRESH_YIELDED_WAIT_TEXT = REFRESH_YIELDED_WAIT_REASON + "; retry shortly"
+# Refused by the budget on the reservation after the yield: the same reason,
+# with the figures the budget refusal prints.
+REFRESH_YIELDED_BUDGET_WAIT_TEXT = (
+    REFRESH_YIELDED_WAIT_REASON + "; the child memory budget is {budget_in_use}; retry shortly"
 )
 
 # What `repository_role` answers. `managed` is a repository in `managed_repos`,
@@ -1348,7 +1354,7 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
 
 
 class CommandSlotUnavailable(RuntimeError):
-    """A request waited COMMAND_SLOT_WAIT_SECONDS without being admitted.
+    """A request waited out its admission bound without being admitted.
 
     Admission covers the slot cap and the child memory budget alike, and the
     message names whichever held the request. Admission goes in arrival order,
@@ -4959,7 +4965,8 @@ class CommandExecutor:
         unadmitted with AdmissionYielded, before anything is reserved.
         `deadline`, if given, is the monotonic time the wait is refused at, in
         place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
-        same."""
+        same here, and the one caller that passes it, a route refresher's
+        reservation after its yield, rewords it (`_refresh_under_lock`)."""
         if not takes_slot and self.children_budget_bytes is None:
             previously_reserved = getattr(self._request_budget, "reserved", False)
             try:
@@ -5566,15 +5573,24 @@ class CommandExecutor:
                 raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider, yielded_since))
 
     @staticmethod
-    def _refresh_lock_wait_text(provider: str, yielded_since: float | None = None) -> str:
+    def _refresh_lock_wait_text(
+        provider: str,
+        yielded_since: float | None = None,
+        budget_in_use: str | None = None,
+    ) -> str:
         """The refusal for a route refresher that waited out its bound: for the
         refresh lock before reserving, or -- `yielded_since` set -- after
         stepping aside for a vcs verb, a wait that also spent the budget wait,
-        so it names the seconds actually spent since that arrival."""
+        so it names the seconds actually spent since that arrival. With
+        `budget_in_use` too, the post-yield reservation was what refused, and
+        the budget's figures follow."""
         if yielded_since is not None:
-            return REFRESH_YIELDED_WAIT_TEXT.format(
-                provider=provider, seconds=int(time.monotonic() - yielded_since)
-            )
+            seconds = int(time.monotonic() - yielded_since)
+            if budget_in_use is not None:
+                return REFRESH_YIELDED_BUDGET_WAIT_TEXT.format(
+                    provider=provider, seconds=seconds, budget_in_use=budget_in_use
+                )
+            return REFRESH_YIELDED_WAIT_TEXT.format(provider=provider, seconds=seconds)
         return REFRESH_LOCK_WAIT_TEXT.format(provider=provider, seconds=COMMAND_SLOT_WAIT_SECONDS)
 
     def _await_covered_refreshers(
@@ -5631,7 +5647,12 @@ class CommandExecutor:
 
         True when the reservation wait yielded to a vcs verb waiting for the
         lock and the helper did not run; the caller hands that verb the lock.
-        Never with `allow_yield` false. False otherwise."""
+        Never with `allow_yield` false. False otherwise.
+
+        With `deadline` given -- the reservation after a yield -- a refusal
+        says the caller stepped aside, with the seconds since `queued_at` and
+        the budget's figures, rather than `_admit`'s text, which names
+        COMMAND_SLOT_WAIT_SECONDS: the wait on this leg was shorter."""
         if self._refresh_is_current(provider, clean_repo):
             return False
         failure = self._refresh_failure_cache.get(failure_key)
@@ -5657,6 +5678,16 @@ class CommandExecutor:
                     # Raised only by `_admit`, before it admits, so this
                     # catches the entry and nothing the helper raises.
                     return True
+                except CommandSlotUnavailable as exc:
+                    if deadline is None:
+                        raise
+                    with self._slot_condition:
+                        budget_in_use = self._budget_in_use_text()
+                    raise CommandSlotUnavailable(
+                        self._refresh_lock_wait_text(
+                            provider, yielded_since=queued_at, budget_in_use=budget_in_use
+                        )
+                    ) from exc
             try:
                 result = self._run_forge_helper(
                     provider, helper, [repository], "credential refresh", log_success=True
