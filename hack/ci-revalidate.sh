@@ -303,26 +303,42 @@ if token:
     headers["Authorization"] = "Bearer " + token
 statuses = []
 pages = 0
+partial = ""
 # Newest first, a page at a time, following the Link header GitHub sets while
-# there is a next page; the cap bounds a head with years of events.
+# there is a next page; the cap bounds a head with years of events. A page
+# that fails after the first ends the walk the way the cap does: what was
+# read is searched, which cannot admit a wrong verdict -- only real events
+# are searched, and a cancel newer than any override found is on a page
+# already read -- and only the first page'"'"'s refusal is a refused read.
 while url and pages < page_limit:
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
             statuses.extend(json.load(response))
             link = response.headers.get("Link") or ""
     except urllib.error.HTTPError as exc:
-        print("http", exc.code)
-        sys.exit(0)
+        if pages == 0:
+            print("http", exc.code)
+            sys.exit(0)
+        partial = "HTTP %d on page %d" % (exc.code, pages + 1)
+        break
     except Exception as exc:
-        print("error", type(exc).__name__)
-        sys.exit(0)
+        if pages == 0:
+            print("error", type(exc).__name__)
+            sys.exit(0)
+        partial = "%s on page %d" % (type(exc).__name__, pages + 1)
+        break
     pages += 1
     found = re.search(r"<([^>]+)>;\s*rel=\"next\"", link)
     url = found.group(1) if found else None
-print("ok")
+print("ok-partial " + partial + " after " + str(len(statuses)) + " events" if partial else "ok")
 print(json.dumps(statuses))
 ' "${REVALIDATION_STATUS_API}/${sha}/statuses?per_page=${REVALIDATION_STATUS_PAGE_SIZE}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" "${REVALIDATION_USER_AGENT}" "${REVALIDATION_STATUS_PAGE_LIMIT}" 2>/dev/null)" || fetched="error python3"
     REVALIDATION_STATUS_OUTCOME[${sha}]="${fetched%%$'\n'*}"
+    case "${REVALIDATION_STATUS_OUTCOME[${sha}]}" in
+      ok-partial\ *)
+        echo "Step 0: GitHub answered ${REVALIDATION_STATUS_OUTCOME[${sha}]#ok-partial } reading statuses for ${sha}; the newer events already read are searched and older ones are not"
+        REVALIDATION_STATUS_OUTCOME[${sha}]="ok" ;;
+    esac
     if [ "${REVALIDATION_STATUS_OUTCOME[${sha}]}" = "ok" ]; then
       REVALIDATION_STATUS_BODY[${sha}]="${fetched#*$'\n'}"
     fi
@@ -374,8 +390,9 @@ revalidation_read_credential() {
 # read the same head again.
 revalidate_override_at_head() {
   local pull_number="$1" cur_head="$2" cur_base="$3"
-  # Without somewhere to record the reuse (header: the marker), an override
-  # is not consulted at all; the green history, which needs no record, is.
+  # Without somewhere to record the reuse (header: the key in finished.json),
+  # an override is not consulted at all; the green history, which needs no
+  # record, is.
   # Prow's decoration exports ARTIFACTS; step 0 runs before anything else in
   # the job writes there, so the directory is made rather than assumed.
   if [ -z "${ARTIFACTS:-}" ] || ! mkdir -p "${ARTIFACTS}" 2>/dev/null; then

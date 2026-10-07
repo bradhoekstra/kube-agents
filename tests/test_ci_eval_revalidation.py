@@ -103,8 +103,9 @@ esac
 # GITHUB_FAKE_STATUS_ERROR a network error, and GITHUB_FAKE_MINT_HTTP an HTTP
 # error on the mint. GITHUB_FAKE_PAGE_SIZE serves the
 # file a page at a time with GitHub's `Link: <...>; rel="next"` header and a
-# `page=` query, the way the real API pages; GITHUB_REQUEST_LOG then shows
-# every page asked for.
+# `page=` query, the way the real API pages, and GITHUB_FAKE_STATUS_HTTP_PAGE
+# fails that one page with a 502; GITHUB_REQUEST_LOG then shows every page
+# asked for.
 _FAKE_GITHUB = textwrap.dedent(
     '''
     import email.message
@@ -168,6 +169,11 @@ _FAKE_GITHUB = textwrap.dedent(
         forced = os.environ.get("GITHUB_FAKE_STATUS_HTTP")
         if forced:
             return _answer(url, int(forced), {"message": "fake status failure"})
+        failing_page = os.environ.get("GITHUB_FAKE_STATUS_HTTP_PAGE")
+        if failing_page:
+            query = dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+            if int(query.get("page") or 1) == int(failing_page):
+                return _answer(url, 502, {"message": "fake later-page failure"})
         if os.environ.get("GITHUB_FAKE_STATUS_ERROR"):
             raise urllib.error.URLError("fake network failure")
         path = os.path.join(os.environ.get("GITHUB_STATUS_DIR", ""), found.group(1) + ".json")
@@ -890,6 +896,24 @@ class RevalidationTest(unittest.TestCase):
         reads = [r["url"] for r in self._requests() if "/statuses" in r["url"]]
         self.assertEqual(3, len(reads), reads)
         self.assertIn("page=3", reads[-1])
+
+    def test_a_failed_later_page_keeps_the_pages_already_read(self):
+        """The common retest: the verdict is on page one and a later page
+        fails. What was read is searched, with a note; only a refusal of the
+        first page is a refused read."""
+        pins = [self._override_event(creator="github-actions[bot]") for _ in range(250)]
+        self._plant_statuses(self.c3, [self._override_event()] + pins)
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "2"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(f"/override by {_ADMIN}", proc.stdout)
+        self.assertIn(f"Step 0: GitHub answered HTTP 502 on page 2 after 100 events reading statuses for {self.c3}; the newer events already read are searched", proc.stdout)
+        # A green at the head is attested from the same partial read.
+        (self.statuses / f"{self.c3}.json").unlink()
+        self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_statuses(self.c3, pins)
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "3"})
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
 
     def test_the_page_walk_stops_at_its_cap_and_falls_through(self):
         """A head with more pages than the cap is a full run, not an unbounded
