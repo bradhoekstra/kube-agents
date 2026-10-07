@@ -186,20 +186,22 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 				next.Totals[counter] = total
 			}
 		}
-		leaders := usageReseedMaxLeaders(ordered)
-		behind := metav1.NewTime(now.Add(-usageCountersPollInterval))
+		// Every pod is recorded level, at the seed poll's own marker. A re-seed
+		// cannot order its replicas on the shared stream: the lifetime sample a
+		// watcher reports is the count since its own process started, and the
+		// replicas' processes start at different times by construction -- a
+		// rollout replaces them one at a time, and the supervisor restarts each
+		// watcher in place on its own -- so the larger sample is the older
+		// process, not the one that has injected more of the stream. There is no
+		// signal at the seed for which replica's informer trails, so none is
+		// guessed. A replica that trailed and catches up on a later poll than its
+		// sibling is reset against the sibling's marker (the reset in the fold
+		// below); the one case that reset cannot reach -- a trailing replica that
+		// advances in the same poll as a current sibling, markers level -- is the
+		// bounded re-seed over-count the design records, in return for never
+		// guessing from samples that cannot say.
 		for _, s := range ordered {
-			// A Max replica below its counter's leader trails it on the shared
-			// stream at the seed instant. Recorded level (marker this poll) its
-			// catch-up would be counted on top of the leader's on the next poll,
-			// because the known-pod reset has no earlier marker to fire on;
-			// recorded behind the seed poll, that reset absorbs the catch-up
-			// instead. The leader, and any lone pod, keep the seed poll's marker.
-			marker := stamp
-			if leader, ok := leaders[s.Counter]; ok && s.Sample < leader {
-				marker = behind
-			}
-			next.Pods[s.UID] = &usagePodEntry{Name: s.Name, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: marker}
+			next.Pods[s.UID] = &usagePodEntry{Name: s.Name, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 		}
 		return usageFoldResult{Document: next, Changed: true}
 	}
@@ -321,7 +323,12 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 			// pending, and a marker left behind would reset the next lone
 			// advance of a replica whose baseline is current. A smaller
 			// delta keeps its marker, so its catch-up is reset rather than
-			// counted on top of what the total took.
+			// counted on top of what the total took. On the first poll after a
+			// re-seed, a replica that trailed at the seed and advances in the
+			// same poll as a current sibling has a level marker, so this takes
+			// the larger delta, which carries its seed catch-up: the bounded
+			// re-seed over-count the design records, in return for never
+			// guessing which replica trailed from samples that cannot say.
 			best := -1
 			for i, c := range list {
 				if c.delta > 0 && (best < 0 || c.delta > list[best].delta) {
@@ -432,27 +439,6 @@ func addUsageTotal(doc *usageDocument, counter string, delta int64) bool {
 	}
 	doc.Totals[counter] = total + delta
 	return true
-}
-
-// usageReseedMaxLeaders returns, for each Max counter, the largest sample among
-// the pods a re-seed scraped for it -- the replica furthest along the shared
-// stream. A re-seed records every pod and adds nothing, so a replica trailing
-// the leader at the seed instant is recorded behind the seed poll (see the
-// re-seed loop) rather than level, so the next poll's reset absorbs its
-// catch-up. A lone pod is its own leader, never below this, so it keeps the
-// seed poll's marker; a counter only ever has a trailing pod when two or more
-// feed it.
-func usageReseedMaxLeaders(scraped []usageScrapedPod) map[string]int64 {
-	leaders := map[string]int64{}
-	for _, s := range scraped {
-		if usageAggregationFor(s.Counter) != usageAggregateMax {
-			continue
-		}
-		if sample, ok := leaders[s.Counter]; !ok || s.Sample > sample {
-			leaders[s.Counter] = s.Sample
-		}
-	}
-	return leaders
 }
 
 // latestSiblingMarker is the latest marker among the other pods feeding

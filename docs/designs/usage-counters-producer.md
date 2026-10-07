@@ -272,8 +272,9 @@ each pod it scraped:
   intervals. The drop runs before the markers are snapshotted, so it has a cost in the
   mirror case: a replica trailing a leader that then terminates is never reset against the gone
   leader's marker, and its pending catch-up -- the events the leader already counted -- is taken
-  a second time when it next advances, an over-count of one straddle's events and the one place
-  this layout over-counts rather than under-counts. That cost is accepted: snapshotting the
+  a second time when it next advances, an over-count of one straddle's events and one of the two
+  places this layout over-counts rather than under-counts -- the re-seed skew straddle below is the
+  other. That cost is accepted: snapshotting the
   departed markers would close it, but a departed sibling would then suppress a genuinely new
   replica's first advance when it is read late in a rollout, and a real interval would be lost
   for good; a bounded one-time double count is preferred to a permanent loss. A reset that took
@@ -371,12 +372,16 @@ between each pod's start and the first poll after it, the under-count this docum
 everywhere else.
 
 Recording every pod level is right only where the replicas are level. A re-seed that scrapes two
-gateway replicas at different samples -- informer skew on the shared stream -- records the one
-furthest along at the seed poll's own time and any replica behind it one interval earlier, so the
-next poll resets the trailing replica's catch-up against the leader's marker rather than adding its
-lag at the seed instant on top. That is the re-seed's own would-be over-count, folded back into the
-under-count preferred everywhere else; the terminating-leader straddle in the resets section stays
-the one place this layout over-counts rather than under-counts.
+gateway replicas at different samples -- informer skew on the shared stream -- records both at the
+seed poll's own time and takes the larger delta on the next joint advance. Where the larger delta
+belongs to a replica catching up from before the seed, it carries that pre-seed backlog on top of
+the interval's own events, and the maximum counts the backlog once. The fold cannot tell that from
+its mirror -- a smaller delta from a replica lagging after the seed on ordinary skew, where the
+larger delta is the true interval and the maximum is exactly right -- because the two produce the
+same deltas; no rule on the deltas separates them, so the plain maximum is the honest choice,
+counting the backlog in the first case rather than losing a real interval in the second. The
+residual is bounded -- one straddle's backlog, counted once -- and is the second place this layout
+over-counts rather than under-counts, beside the terminating-leader straddle earlier in this section.
 
 The ConfigMap is written before the status. A crash between the two leaves the status one poll
 behind the totals, and the next poll repairs it, because the status patch is issued whenever the
@@ -386,9 +391,9 @@ rather than when the status caught up. That time is in the ConfigMap for this re
 poller's memory alone it would die with the process that took it. The other order would
 leave the totals behind the status after a crash, and the next poll would add the interval's
 deltas a second time. Under-counting until the next poll is the error this document prefers where
-the over-count it trades against would be permanent, as this crash's double-add would be. The
-one exception runs the other way: the terminating-leader case in the resets section accepts a
-bounded over-count because there it is the under-count that would be permanent.
+the over-count it trades against would be permanent, as this crash's double-add would be. Two cases
+run the other way, each accepting a bounded over-count because there it is the under-count that
+would be permanent: the terminating-leader straddle and the re-seed skew straddle, both above.
 
 ## Write cadence and the status writers
 
@@ -574,8 +579,9 @@ that the reset pod takes the sibling's marker and the sibling's next lone advanc
 a partial straddle, both replicas moving by different amounts and the lagger catching up alone
 the poll after, asserting the catch-up is reset and the total took the larger delta once; an in-place restart
 of the lagging replica with a later start time, reset rather than taken whole; the
-largest-delta rule across two gateway pods and its agreement with the sum for one; the
-baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
+largest-delta rule across two gateway pods and its agreement with the sum for one; a re-seed that
+scrapes two replicas at different samples, taking the larger delta on the next advance and counting
+the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one
 below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
 case (no gateway scrape, no log line); the series selection (the `status` values summed and the

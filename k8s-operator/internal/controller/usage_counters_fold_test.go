@@ -138,40 +138,104 @@ func TestFoldUsage_FirstPollRecordsEveryPodAndAddsNothing(t *testing.T) {
 	}
 }
 
-// A re-seed with two gateway replicas whose samples differ at the seed instant
-// (informer skew on the shared stream): the leader is recorded at the seed
-// poll's marker, the trailing replica one interval behind it. Without the
-// behind marker the trailing replica's catch-up is counted on top of the
-// leader's on the next poll -- thirteen for ten events; with it the next poll's
-// reset absorbs the catch-up. The re-seed half of the design's Max resets.
-func TestFoldUsage_AReseedRecordsATrailingReplicaBehindTheLeader(t *testing.T) {
+// A re-seed records both gateway replicas level and, on the first poll they
+// advance together, takes the larger of the two deltas. The replicas share one
+// event stream, so their lifetime samples order by process age, not stream
+// position, and a re-seed cannot tell a replica lagging after the seed (a short
+// first delta, ordinary informer lag) from one catching up from before it (a
+// long first delta carrying a backlog): the deltas are identical. So neither is
+// guessed and the larger, complete delta is taken. Here A and B seed level and
+// B's informer trails by four events on the next poll; taking the smaller would
+// drop the four B had not yet delivered. This is the case
+// TestUsagePoller_TwoGatewayReplicas exercises end to end.
+func TestFoldUsage_ALevelReseedTakesTheLargerDeltaOnTheFirstJointAdvance(t *testing.T) {
 	t0 := foldClock(0)
 	old := t0.Add(-time.Hour)
 	res := foldUsage(nil, foldTestAgentUID, usageSeed{}, map[string]bool{foldPodA: true, foldPodB: true}, []usageScrapedPod{
 		scrapedPod(foldPodA, usageCounterEventsIngested, old, 100, ptr.To(1.0)),
-		scrapedPod(foldPodB, usageCounterEventsIngested, old, 97, ptr.To(1.0)),
+		scrapedPod(foldPodB, usageCounterEventsIngested, old, 100, ptr.To(1.0)),
 	}, t0)
 	doc := res.Document
 	if doc.Totals[usageCounterEventsIngested] != 0 || doc.LastMoved != nil {
 		t.Fatalf("re-seed added: totals=%v lastMoved=%v", doc.Totals, doc.LastMoved)
 	}
-	if a := doc.Pods[foldPodA]; a == nil || !a.Marker.Time.Equal(t0) {
-		t.Fatalf("leader not recorded at the seed poll: %+v", a)
+	for _, uid := range []string{foldPodA, foldPodB} {
+		if e := doc.Pods[uid]; e == nil || !e.Marker.Time.Equal(t0) {
+			t.Fatalf("%s not recorded level at the seed poll: %+v", uid, e)
+		}
 	}
-	behind := t0.Add(-usageCountersPollInterval)
-	if b := doc.Pods[foldPodB]; b == nil || !b.Marker.Time.Equal(behind) {
-		t.Fatalf("trailing replica not recorded behind the seed poll: %+v", b)
-	}
-	// Both catch up to 110 at minute 5: ten distinct events. The leader adds its
-	// ten; the trailing replica's thirteen (three of catch-up over the same ten)
-	// is reset against the leader's marker, not counted on top.
-	res = foldUsage(doc, foldTestAgentUID, usageSeed{}, foldLive(doc), []usageScrapedPod{
-		scrapedPod(foldPodA, usageCounterEventsIngested, old, 110, ptr.To(1.0)),
-		scrapedPod(foldPodB, usageCounterEventsIngested, old, 110, ptr.To(1.0)),
-	}, foldClock(5))
-	if got := res.Document.Totals[usageCounterEventsIngested]; got != 10 {
-		t.Fatalf("after the catch-up: eventsIngested = %d, want 10 (trailing replica's catch-up counted on top)", got)
-	}
+	// Minute 5, both advance: A reads its full +10 while B's informer trails by
+	// four and reads +6. The larger delta is the full interval, so ten is taken;
+	// the smaller would lose the four B had not delivered. Minute 10 is ordinary:
+	// A reads its next +10 and B's +10 catches its lag up, which the reset absorbs
+	// against A's marker, so only A's ten is counted.
+	runFoldSteps(t, doc, usageCounterEventsIngested, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, old, 110, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, old, 106, ptr.To(1.0)),
+		}, want: 10, moved: true},
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, old, 120, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, old, 116, ptr.To(1.0)),
+		}, want: 20, moved: true},
+	})
+}
+
+// The bounded re-seed over-count the design records (its resets section). When a
+// replica that trailed at the seed advances in the same poll as a current
+// sibling, its first delta carries a backlog the shared stream already delivered
+// through the sibling, and plain Max takes that larger delta. Here A seeds at
+// 1000 three events behind the stream and B at 20 current; on the first joint
+// poll A reads +13 (its three-event backlog over the same ten B reads as +10),
+// and thirteen is taken. The residual is bounded by the informer backlog at the
+// seed and is the price of never guessing which replica trailed from samples
+// that cannot say; a trailing replica that advances a poll later is reset
+// instead, not over-counted (the delayed-catch-up test below).
+func TestFoldUsage_AReseedOverCountsASimultaneousCatchUp(t *testing.T) {
+	t0 := foldClock(0)
+	old := t0.Add(-time.Hour)
+	res := foldUsage(nil, foldTestAgentUID, usageSeed{}, map[string]bool{foldPodA: true, foldPodB: true}, []usageScrapedPod{
+		scrapedPod(foldPodA, usageCounterEventsIngested, old, 1000, ptr.To(1.0)),
+		scrapedPod(foldPodB, usageCounterEventsIngested, old, 20, ptr.To(9.0)),
+	}, t0)
+	// Both advance on the first poll after the seed with level markers, so neither
+	// is reset and the larger delta is taken, over-counting by A's three-event
+	// backlog: ten distinct events plus three.
+	runFoldSteps(t, res.Document, usageCounterEventsIngested, []foldStep{
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, old, 1013, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, old, 30, ptr.To(9.0)),
+		}, want: 13, moved: true},
+	})
+}
+
+// A re-seed's trailing replica (A, the larger sample) catches up alone, a poll
+// after its current sibling (B) advanced. B's first interval is its own ten
+// events, counted -- the old leader-by-sample rule recorded B behind and reset
+// that interval to nothing, a permanent loss if the leader then terminated. A's
+// later +23 (twenty distinct events plus its three-event seed catch-up) arrives
+// after B moved its marker, so the ordinary reset absorbs it against B's marker
+// rather than counting it on top.
+func TestFoldUsage_AReseedAbsorbsADelayedCatchUpAgainstAQuietSibling(t *testing.T) {
+	t0 := foldClock(0)
+	old := t0.Add(-time.Hour)
+	res := foldUsage(nil, foldTestAgentUID, usageSeed{}, map[string]bool{foldPodA: true, foldPodB: true}, []usageScrapedPod{
+		scrapedPod(foldPodA, usageCounterEventsIngested, old, 1000, ptr.To(1.0)),
+		scrapedPod(foldPodB, usageCounterEventsIngested, old, 20, ptr.To(9.0)),
+	}, t0)
+	runFoldSteps(t, res.Document, usageCounterEventsIngested, []foldStep{
+		// A is quiet (informer still catching up); only B advances by its ten.
+		{minute: 5, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, old, 1000, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, old, 30, ptr.To(9.0)),
+		}, want: 10, moved: true},
+		// A delivers its backlog and the next ten at once (+23); B reads its ten.
+		// A is reset against B's minute-5 marker, so the total takes B's ten.
+		{minute: 10, scraped: []usageScrapedPod{
+			scrapedPod(foldPodA, usageCounterEventsIngested, old, 1023, ptr.To(1.0)),
+			scrapedPod(foldPodB, usageCounterEventsIngested, old, 40, ptr.To(9.0)),
+		}, want: 20, moved: true},
+	})
 }
 
 // A broker marker ahead of a gateway's must not reset the gateway. The broker's
