@@ -16,6 +16,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -104,6 +105,34 @@ func newProfileScope(dir string) scopeIndex {
 		return nil
 	}
 	return &profileScope{dir: dir, now: time.Now}
+}
+
+// startupLine says at startup which mode the hold is in, for the reason the
+// join and inject lines exist: the difference is invisible in every later line
+// until a record is held. It reads the directory once, so a fresh install --
+// a readable directory with no cluster profile yet, which holds every record
+// off the joined clusters until the first reconcile tick -- says so before
+// the first record rather than only in the hold lines that follow.
+func (s *profileScope) startupLine() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rescan()
+	if !s.readable {
+		return fmt.Sprintf("install scope unknown: %s cannot be read, so every unreachable record is forwarded and nothing is held until it can be", s.dir)
+	}
+	if len(s.profiled) == 0 {
+		return fmt.Sprintf("install scope read from %s: no Cluster Agent profile yet, so until the Cluster Agent reconcile writes one, every unreachable record from a cluster other than the joined one(s) is held out of the inject", s.dir)
+	}
+	return fmt.Sprintf("install scope read from %s: %d cluster profile(s); an unreachable record from a cluster none of them names is held out of the inject (re-read at most once a minute)", s.dir, len(s.profiled))
+}
+
+// scopeStartupLine is startupLine for whatever newProfileScope returned,
+// including the nil of no --profiles-dir.
+func scopeStartupLine(scope scopeIndex) string {
+	if s, ok := scope.(*profileScope); ok {
+		return s.startupLine()
+	}
+	return "install scope unknown: no --profiles-dir, so every unreachable record is forwarded and nothing is held"
 }
 
 // Profiled implements scopeIndex.

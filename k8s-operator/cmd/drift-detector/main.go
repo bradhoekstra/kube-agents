@@ -559,6 +559,10 @@ func realMain(argv []string) error {
 		log.Printf("%s: live-object join enabled for %d cluster(s) (direct=%t profiles=%d gitops-managers=%q)",
 			commandName, join.Clusters(), getter != nil, len(scan.Clusters), f.gitopsManagers)
 	}
+	// The hold's mode, for the reason the two lines above exist: a fresh
+	// install holds every record off the joined clusters until the first
+	// reconcile tick, and nothing later says so but the hold lines themselves.
+	log.Printf("%s: %s", commandName, scopeStartupLine(join.scope))
 
 	// Reported whether or not the join ended up with clusters, and separately
 	// from the count above, because a skip is the difference between a fleet of

@@ -83,7 +83,10 @@ per streak: the scaffold stamps the identity last and in place, so a read landin
 hold a cluster that was onboarded a second earlier. A cluster profile that has never named a cluster
 here leaves its cluster held as outside the scope, with a line naming the profile and why it reads
 as nothing. The scope is re-read from the directory at most once a minute, when an `unreachable`
-record arrives, and never addresses a cluster.
+record arrives, and never addresses a cluster. Startup logs which mode the hold is in — the
+directory and how many cluster profiles it names, none yet (a fresh install holds every record off
+the joined clusters until the first reconcile tick), or unknown — because nothing later says so but
+the hold lines themselves.
 
 The split is deliberate on both sides. Each out-of-scope card is thin by construction — no owners,
 no lookup error — and spends a unit of the fleet-wide daily drift budget that the profiled clusters

@@ -73,10 +73,66 @@ func TestProfileScopeRereadsTheDirectoryAfterTheInterval(t *testing.T) {
 // An unreadable directory is an unknown scope, not an empty one, and the
 // answer says so rather than reporting every cluster as outside it.
 func TestProfileScopeReportsAnUnreadableDirectoryAsUnknown(t *testing.T) {
+	logs := captureLog(t)
+	base := t.TempDir()
+	dir := filepath.Join(base, "absent")
 	now := time.Now()
-	s := testProfileScope(filepath.Join(t.TempDir(), "absent"), &now)
-	if profiled, known := s.Profiled(clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-a"}); profiled || known {
+	s := testProfileScope(dir, &now)
+	prodA := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-a"}
+	if profiled, known := s.Profiled(prodA); profiled || known {
 		t.Errorf("Profiled = (%v, %v) on a missing directory, want (false, false)", profiled, known)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	s.Profiled(prodA)
+	const line = "cannot read " + "%s" + " to tell which clusters are inside the install's scope"
+	want := strings.Replace(line, "%s", dir, 1)
+	if got := strings.Count(logs.String(), want); got != 1 {
+		t.Errorf("logged the unreadable directory %d time(s) over two reads, want once per streak:\n%s", got, logs.String())
+	}
+
+	// It appears, reads clean, then is gone again: a new streak, logged again.
+	writeScopeProfile(t, dir, "prod-a", prodA)
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, known := s.Profiled(prodA); !profiled || !known {
+		t.Errorf("Profiled = (%v, %v) once the directory exists, want (true, true)", profiled, known)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, known := s.Profiled(prodA); profiled || known {
+		t.Errorf("Profiled = (%v, %v) after the directory vanished, want (false, false): scope unknown again", profiled, known)
+	}
+	if got := strings.Count(logs.String(), want); got != 2 {
+		t.Errorf("logged the unreadable directory %d time(s) across two streaks, want 2:\n%s", got, logs.String())
+	}
+}
+
+// The startup line says which mode the hold is in before the first record,
+// for each of the three states a deployed detector can start in.
+func TestScopeStartupLine(t *testing.T) {
+	captureLog(t)
+	empty := t.TempDir()
+	named := t.TempDir()
+	writeScopeProfile(t, named, "cluster-p1-prod-a-us-central1", clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-a"})
+	for _, tc := range []struct {
+		name  string
+		scope scopeIndex
+		want  []string
+	}{
+		{"no --profiles-dir", newProfileScope(""), []string{"install scope unknown", "no --profiles-dir", "nothing is held"}},
+		{"unreadable directory", newProfileScope(filepath.Join(empty, "absent")), []string{"install scope unknown", "cannot be read", "nothing is held"}},
+		{"no cluster profile yet", newProfileScope(empty), []string{"install scope read from " + empty, "no Cluster Agent profile yet", "is held out of the inject"}},
+		{"profiles present", newProfileScope(named), []string{"install scope read from " + named, "1 cluster profile(s)", "is held out of the inject"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scopeStartupLine(tc.scope)
+			for _, want := range tc.want {
+				if !strings.Contains(got, want) {
+					t.Errorf("scopeStartupLine() = %q, want it to contain %q", got, want)
+				}
+			}
+		})
 	}
 }
 
