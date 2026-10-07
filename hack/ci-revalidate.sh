@@ -49,19 +49,28 @@
 # standing instead of the job's. It is read at the current head only -- a
 # push clears an override, as the plugin documents -- and a later
 # `/override-cancel` on the head ("Override cancelled by <user>", a failure
-# status) withdraws it. The override is checked first, before the job
+# status) withdraws it; the cancel is not bound to a pull request, since the
+# plugin re-posts the commit's existing status for it and the URL that
+# status carries names the last reporter, not the decision -- on a shared
+# commit a cancel given to either pull request withdraws both, which is the
+# conservative direction, a full run. The override is checked first, before the job
 # history: it needs no GCS record, and the pull request it answers usually
 # has none that passed. A reuse exits 0, and Prow then writes a passed build
 # at the head that the first two rules would read as a green -- which would
 # carry an override past a cancel and, through the inert rule, onto heads
-# the admin never saw. So a reuse that rests on an override records itself:
-# REVALIDATION_OVERRIDE_MARKER in the build's artifacts, written only once
-# every pull holds a verdict, and a passed build carrying it is skipped by
-# the green scan as an override's standing rather than a run. A reuse of a
-# green is not marked: a build that reused a real green is attested in its
-# own right, and marking it would push the real green past the scan's depth
-# on a pull request Tide retests often. A run that cannot record the marker
-# (no ARTIFACTS directory, an unwritable one) does not reuse an override.
+# the admin never saw. So a reuse that rests on an override records itself
+# in the build's own record: REVALIDATION_REUSED_OVERRIDE_KEY, written to
+# the ARTIFACTS metadata file that Prow's sidecar merges into finished.json's
+# "metadata" (pkg/pod-utils/wrapper: MetadataFile; pkg/sidecar:
+# combineMetadata), only once every pull holds a verdict. The green scan
+# reads that key from the same finished.json it reads "passed" from -- one
+# object, one read, so there is no second object to lose or fail to stat --
+# and skips the build as an override's standing rather than a run. A reuse
+# of a green is not marked: a build that reused a real green is attested in
+# its own right, and marking it would push the real green past the scan's
+# depth on a pull request Tide retests often. A run that cannot write the
+# record (no ARTIFACTS directory, an unwritable file) does not reuse an
+# override.
 #
 # A batch job (Tide testing several pull requests merged together) is
 # revalidated pull by pull: every one must hold a reusable verdict, else the
@@ -118,7 +127,7 @@
 # arguments. An /override has no GCS record to bind to, so its binding is
 # the poster and the pull request: the event must be the Prow bot's own
 # (creator login REVALIDATION_STATUS_POSTER), carry the plugin's
-# description, and name this pull request in its URL
+# description, and point at the /override comment on this pull request
 # (REVALIDATION_PULL_URL_PREFIX), since a commit's statuses are shared by
 # every pull request that contains it. The plugin writes that description
 # only after GitHub confirmed the commenter is a repository admin -- on
@@ -199,12 +208,15 @@ readonly REVALIDATION_STATUS_POSTER="google-oss-prow[bot]"
 readonly REVALIDATION_OVERRIDE_PREFIX="Overridden by"
 readonly REVALIDATION_OVERRIDE_CANCEL_PREFIX="Override cancelled by"
 # A commit's statuses are shared by every pull request that contains it, so
-# an override is bound to THIS pull request through the URL its events
-# carry: crier's report of the override's ProwJob points at the /override
-# comment, "<pull URL prefix>/<number>#issuecomment-<id>", and the plugin's
-# own status keeps the Spyglass URL of the build it overrode, under this
-# pull request's history path. An event naming neither is another pull
-# request's override of the same commit.
+# an override is bound to THIS pull request through the one event that
+# names where it was given: crier's report of the override's ProwJob, whose
+# URL is the /override comment, "<pull URL prefix>/<number>#issuecomment-
+# <id>". The plugin's own status is the commit's existing status re-posted
+# as a success, keeping whatever URL it had -- on a shared commit, the last
+# reporter's, which may be another pull request's history path -- so it
+# binds nothing and is not read as a verdict. The ProwJob is created for
+# every context with a configured presubmit, which this job is, so the
+# comment-URL event is always there (#2464's head carries both).
 readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/pull"
 # How many of the newest builds to inspect for a green one. Each costs one
 # gsutil cat (~1s); an active PR rarely stacks this many pushes between
@@ -222,11 +234,14 @@ readonly REVALIDATION_HISTORY_LIMIT=20
 # unattested green -- and the run falls through to whatever else holds.
 readonly REVALIDATION_STATUS_PAGE_SIZE=100
 readonly REVALIDATION_STATUS_PAGE_LIMIT=10
-# The record a reuse that rests on an /override leaves in the build's
-# artifacts (header, the third kind of verdict): Prow's sidecar uploads the
-# ARTIFACTS directory beside finished.json, so the green scan can tell such
-# a build from a run and skip it. Its content names what was reused.
-readonly REVALIDATION_OVERRIDE_MARKER="step0-reused-override.json"
+# The record a reuse that rests on an /override leaves (header, the third
+# kind of verdict): a key in the ARTIFACTS metadata file, which Prow's
+# sidecar merges into finished.json's "metadata", so the green scan can
+# tell such a build from a run in the record it already reads. Its value
+# names what was reused. The file is merged into, not replaced, in case the
+# job has written metadata of its own.
+readonly REVALIDATION_METADATA_FILE="metadata.json"
+readonly REVALIDATION_REUSED_OVERRIDE_KEY="step0_reused_override"
 # What Prow exports as JOB_TYPE for a Tide batch, whose pulls arrive in
 # PULL_REFS as "<base_ref>:<base_sha>,<number>:<sha>[,...]" (each pull entry
 # may carry a third ":<ref>" field) with no PULL_NUMBER or PULL_PULL_SHA.
@@ -378,14 +393,13 @@ revalidate_override_at_head() {
       echo "Step 0: could not read GitHub statuses for ${cur_head} for an /override (${outcome#error }); the job history is read next"
       return 1 ;;
   esac
-  local found comment_url_prefix history_url_prefix
+  local found comment_url_prefix
   comment_url_prefix="${REVALIDATION_PULL_URL_PREFIX}/${pull_number}#"
-  history_url_prefix="${REVALIDATION_SPYGLASS_PREFIX}/${pull_number}/"
   found="$(printf '%s' "${REVALIDATION_STATUS_BODY[${cur_head}]}" | python3 -c '
 import json
 import sys
 
-context, poster, prefix, cancel_prefix, comment_url, history_url = sys.argv[1:7]
+context, poster, prefix, cancel_prefix, comment_url = sys.argv[1:6]
 statuses = json.load(sys.stdin)
 
 
@@ -399,30 +413,31 @@ events = [
     status for status in statuses
     if status.get("context") == context and (status.get("creator") or {}).get("login") == poster
 ]
-# The newest override that names this pull request; of the two events one
-# /override leaves in the same second, the one pointing at the comment.
+# The newest override given on this pull request: the event pointing at
+# its /override comment. The plugin'"'"'s own re-posted status binds nothing
+# (constants, REVALIDATION_PULL_URL_PREFIX) and is not read.
 override = None
 for status in events:
     description = status.get("description") or ""
-    url = status.get("target_url") or ""
     if status.get("state") != "success" or not description.startswith(prefix + " "):
         continue
-    if not (url.startswith(comment_url) or url.startswith(history_url)):
+    if not (status.get("target_url") or "").startswith(comment_url):
         continue
-    rank = (status.get("created_at") or "", url.startswith(comment_url))
-    if override is None or rank > override[0]:
-        override = (rank, status)
+    if override is None or (status.get("created_at") or "") > (override.get("created_at") or ""):
+        override = status
 if override is None:
     print("absent")
     sys.exit(0)
-when, override = override[0][0], override[1]
+when = override.get("created_at") or ""
+# A cancel is the failure status the plugin posts, newer than the override;
+# it is not bound to a pull request (header).
 for status in events:
     description = status.get("description") or ""
-    if description.startswith(cancel_prefix) and (status.get("created_at") or "") > when:
+    if status.get("state") == "failure" and description.startswith(cancel_prefix) and (status.get("created_at") or "") > when:
         print("cancelled", cancel_prefix, first_word(description[len(cancel_prefix):]))
         sys.exit(0)
 print("overridden", first_word((override.get("description") or "")[len(prefix):]), when, override.get("target_url") or "")
-' "${REVALIDATION_JOB_NAME}" "${REVALIDATION_STATUS_POSTER}" "${REVALIDATION_OVERRIDE_PREFIX}" "${REVALIDATION_OVERRIDE_CANCEL_PREFIX}" "${comment_url_prefix}" "${history_url_prefix}" 2>/dev/null)" || found="unparsable"
+' "${REVALIDATION_JOB_NAME}" "${REVALIDATION_STATUS_POSTER}" "${REVALIDATION_OVERRIDE_PREFIX}" "${REVALIDATION_OVERRIDE_CANCEL_PREFIX}" "${comment_url_prefix}" 2>/dev/null)" || found="unparsable"
   case "${found}" in
     overridden\ *) ;;
     cancelled\ *)
@@ -437,7 +452,7 @@ print("overridden", first_word((override.get("description") or "")[len(prefix):]
   when="${rest%% *}"; url="${rest#* }"
   echo "PR #${pull_number} holds a reusable verdict: /override by ${user} -- this head was overridden"
   echo "Reused verdict: ${url:-(no comment URL on the status)}"
-  echo "Attested by the ${REVALIDATION_STATUS_POSTER} ${REVALIDATION_JOB_NAME} success status on ${cur_head} reading \"${REVALIDATION_OVERRIDE_PREFIX} ${user}\" at ${when} and naming PR #${pull_number}, which the override plugin posts for a repository admin only"
+  echo "Attested by the ${REVALIDATION_STATUS_POSTER} ${REVALIDATION_JOB_NAME} success status on ${cur_head} reading \"${REVALIDATION_OVERRIDE_PREFIX} ${user}\" at ${when} and pointing at PR #${pull_number}'s /override comment, which the override plugin posts for a repository admin only"
   echo "Same head ${cur_head}; base ${cur_base} now -- an override given to this head stands until a push or a cancel"
   REVALIDATION_REUSED+=("/override by ${user} (PR #${pull_number})")
   REVALIDATION_REUSED_OVERRIDE=1
@@ -483,8 +498,10 @@ revalidate_one_pull() {
   # earlier head), so the scan does not stop at the first green unless it is
   # this head's. finished.json's revision is the head a build ran at, and is
   # held to started.json's below for whichever build is chosen.
-  # One parse per candidate: it yields "passed <revision>" or nothing, and the
-  # chosen build's revision is kept for the started.json check below. The
+  # One parse per candidate: it yields "passed <revision>", "reused-override"
+  # for a passed build whose metadata says it only reused an /override
+  # (header: skipped as that override's standing, not a run), or nothing;
+  # the chosen build's revision is kept for the started.json check below. The
   # scan stops only at a same-head green, so every other path reads all of
   # REVALIDATION_HISTORY_LIMIT finished.json records -- a second each, ahead
   # of a run that then spends minutes (an inert reuse) or hours (the matrix).
@@ -497,15 +514,12 @@ import sys
 
 record = json.load(sys.stdin)
 if record.get("passed") is True:
-    print("passed", record.get("revision") or "")
-' 2>/dev/null)" || candidate_parsed=""
+    if (record.get("metadata") or {}).get(sys.argv[1]):
+        print("reused-override")
+    else:
+        print("passed", record.get("revision") or "")
+' "${REVALIDATION_REUSED_OVERRIDE_KEY}" 2>/dev/null)" || candidate_parsed=""
     [ "${candidate_parsed%% *}" = "passed" ] || continue
-    # A passed build that only reused an /override is that override's
-    # standing, not a run (header): skipped, so a cancel or a push is not
-    # carried past by the record the reuse left.
-    if gsutil stat "${history_dir}/${build}/artifacts/${REVALIDATION_OVERRIDE_MARKER}" >/dev/null 2>&1; then
-      continue
-    fi
     candidate_revision="${candidate_parsed#passed}"
     candidate_revision="${candidate_revision# }"
     if [ -z "${prev_green}" ]; then
@@ -759,24 +773,31 @@ for entry in entries[1:]:
 ${pulls}
 EOF_REVALIDATION_PULLS
   # A reuse resting on an /override records itself before anything says the
-  # matrix is skipped (header): the marker is what keeps the passed build
-  # this exit produces out of the green scan. Written only here, once every
-  # pull holds a verdict, so a batch that falls through on a later pull
-  # leaves no marker on a run that then happened.
+  # matrix is skipped (header): the key the sidecar merges into this build's
+  # finished.json is what keeps the passed build this exit produces out of
+  # the green scan. Written only here, once every pull holds a verdict, so a
+  # batch that falls through on a later pull leaves no record on a run that
+  # then happened.
   if [ -n "${REVALIDATION_REUSED_OVERRIDE}" ]; then
     if ! printf '%s\n' "${REVALIDATION_REUSED[@]}" | python3 -c '
 import json
+import os
 import sys
 
-job, out = sys.argv[1], sys.argv[2]
+key, out = sys.argv[1], sys.argv[2]
 reused = [line for line in sys.stdin.read().splitlines() if line]
+metadata = {}
+if os.path.exists(out):
+    with open(out, encoding="utf-8") as fh:
+        metadata = json.load(fh)
+metadata[key] = reused
 with open(out, "w", encoding="utf-8") as fh:
-    json.dump({"job": job, "reused": reused}, fh)
-' "${REVALIDATION_JOB_NAME}" "${ARTIFACTS}/${REVALIDATION_OVERRIDE_MARKER}" 2>/dev/null; then
-      echo "Step 0: full run: could not write ${ARTIFACTS}/${REVALIDATION_OVERRIDE_MARKER} to record the reused /override; a reuse that leaves no record would read as a green"
+    json.dump(metadata, fh)
+' "${REVALIDATION_REUSED_OVERRIDE_KEY}" "${ARTIFACTS}/${REVALIDATION_METADATA_FILE}" 2>/dev/null; then
+      echo "Step 0: full run: could not write ${REVALIDATION_REUSED_OVERRIDE_KEY} to ${ARTIFACTS}/${REVALIDATION_METADATA_FILE} to record the reused /override; a reuse that leaves no record would read as a green"
       return 1
     fi
-    echo "Recorded the reused /override in ${ARTIFACTS}/${REVALIDATION_OVERRIDE_MARKER}, so the green scan reads this build as an override's standing, not a run"
+    echo "Recorded the reused /override as ${REVALIDATION_REUSED_OVERRIDE_KEY} in ${ARTIFACTS}/${REVALIDATION_METADATA_FILE}, which the sidecar merges into this build's finished.json, so the green scan reads the build as an override's standing, not a run"
   fi
   # The one line humans grep for and a collector may key on, so it appears
   # only when every pull holds a verdict and the exit is 0. Serial: one

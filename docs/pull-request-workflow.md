@@ -573,8 +573,8 @@ success status at the head, posted by the Prow bot for a repository admin, count
 after an override reuses it in seconds, and so does the retest Tide starts on a pull request it has
 just merged by override. The reused run reports as an ordinary `Job succeeded.`, so from then on the
 check and the re-pin read like a green; the `/override` comment, the build log's `REVALIDATED` line
-and a marker the run leaves in its artifacts are the record that it was one, and step 0 reads the
-marker so that such a run is never itself taken for a green. What this trades
+and a key the run leaves in its `finished.json` metadata are the record that it was one, and step 0
+reads the key so that such a run is never itself taken for a green. What this trades
 away, on every retest and not only when the sweep wins: the combination of a head with the `main`
 it lands on, and in a batch with the other pulls, is not tested before the merge; the nightly eval
 on `main` is what finds a bad combination, as is the next smoke run that actually starts after it.

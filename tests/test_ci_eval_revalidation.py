@@ -71,10 +71,6 @@ if [ -n "${GSUTIL_CALL_LOG:-}" ]; then
   echo "${cmd} $*" >> "${GSUTIL_CALL_LOG}"
 fi
 case "${cmd}" in
-  stat)
-    object="$(printf '%s' "$1" | sed -n 's|.*/\\([0-9][0-9]*\\)/artifacts/\\(.*\\)$|\\1.\\2|p')"
-    [ -n "${object}" ] && [ -f "${GSUTIL_OBJECT_DIR}/${object}" ] || exit 1
-    ;;
   ls)
     pr="$(printf '%s' "$1" | sed -n 's|.*/gke-labs_kube-agents/\\([0-9]*\\)/.*|\\1|p')"
     if [ -n "${GSUTIL_LS_DIR:-}" ] && [ -f "${GSUTIL_LS_DIR}/${pr}.txt" ]; then
@@ -215,6 +211,7 @@ class RevalidationTest(unittest.TestCase):
         # itself; the sidecar uploads it beside finished.json.
         self.artifacts = self.tmp / "artifacts"
         self.artifacts.mkdir()
+        self.metadata_file = self.artifacts / "metadata.json"
 
         # The fixture checkout. A linear chain is enough: deltas are plain
         # `git diff A B`, so each scenario just picks its four SHAs.
@@ -264,7 +261,8 @@ class RevalidationTest(unittest.TestCase):
         """builds: [(build_id, passed, base_sha, head_sha)], any record None to omit.
 
         reused_override names builds that were a step-0 reuse of an /override:
-        each gets the marker the script leaves in such a build's artifacts.
+        each finished.json carries the metadata key the sidecar merges in from
+        the record the script leaves.
 
         With attest=True (the default), each green build also gets the
         Prow-posted GitHub success status event the script demands; a test
@@ -281,9 +279,14 @@ class RevalidationTest(unittest.TestCase):
             )
             if passed is not None:
                 revision = f', "revision": "{head_sha}"' if head_sha else ""
+                metadata = (
+                    ', "metadata": {"step0_reused_override": ["/override by alice (PR #%s)"]}' % pr
+                    if build_id in reused_override
+                    else ""
+                )
                 (self.objects / f"{build_id}.finished.json").write_text(
-                    '{"passed": %s, "result": "%s"%s}'
-                    % ("true" if passed else "false", "SUCCESS" if passed else "FAILURE", revision)
+                    '{"passed": %s, "result": "%s"%s%s}'
+                    % ("true" if passed else "false", "SUCCESS" if passed else "FAILURE", revision, metadata)
                 )
             if base_sha is not None:
                 (self.objects / f"{build_id}.started.json").write_text(
@@ -300,8 +303,6 @@ class RevalidationTest(unittest.TestCase):
                 )
         for head_sha, events in status_events.items():
             self._plant_statuses(head_sha, events)
-        for build_id in reused_override:
-            (self.objects / f"{build_id}.step0-reused-override.json").write_text('{"job": "%s", "reused": ["/override by alice (PR #%s)"]}' % (_JOB, pr))
         (self.listings / f"{pr}.txt").write_text("\n".join(listing) + "\n")
 
     def _plant_statuses(self, head_sha, events):
@@ -616,15 +617,23 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual([r["url"].split("/commits/")[1].split("/")[0] for r in reads], [self.c3])
         self.assertEqual(reads[0]["authorization"], "Bearer t-shell")
 
-    def test_a_reused_override_records_itself_in_the_artifacts(self):
+    def test_a_reused_override_records_itself_in_the_metadata_file(self):
+        """The record goes where the sidecar merges it into finished.json:
+        the ARTIFACTS metadata file, under the key the scan reads."""
         self._plant_statuses(self.c3, [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
-        marker = json.loads((self.artifacts / "step0-reused-override.json").read_text())
-        self.assertEqual({"job": _JOB, "reused": [f"/override by {_ADMIN} (PR #{_PR})"]}, marker)
-        self.assertIn("Recorded the reused /override in", proc.stdout)
+        self.assertEqual({"step0_reused_override": [f"/override by {_ADMIN} (PR #{_PR})"]}, json.loads(self.metadata_file.read_text()))
+        self.assertIn("Recorded the reused /override as step0_reused_override in", proc.stdout)
 
-    def test_a_reused_green_leaves_no_marker(self):
+    def test_an_existing_metadata_file_is_merged_into_not_replaced(self):
+        self.metadata_file.write_text('{"node_image": "x"}')
+        self._plant_statuses(self.c3, [self._override_event()])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertEqual({"node_image": "x", "step0_reused_override": [f"/override by {_ADMIN} (PR #{_PR})"]}, json.loads(self.metadata_file.read_text()))
+
+    def test_a_reused_green_leaves_no_record(self):
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
@@ -648,14 +657,16 @@ class RevalidationTest(unittest.TestCase):
 
     def test_a_build_that_reused_an_override_is_not_a_green(self):
         """The record a reuse leaves: a passed finished.json and a Prow success
-        status naming the build, exactly a green's shape, plus the marker.
-        The scan skips it, so with nothing else the run is full."""
+        status naming the build, exactly a green's shape, plus the metadata
+        key in that same finished.json. The scan skips it in the one read it
+        already makes, so with nothing else the run is full."""
         self._plant_history([("300", True, self.c5, self.c3)], reused_override=["300"])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("no green build among the newest", proc.stdout)
         calls = self.call_log.read_text().splitlines()
-        self.assertIn(f"stat gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/300/artifacts/step0-reused-override.json", calls)
+        self.assertEqual([c for c in calls if c.startswith("stat")], [], "no second object is consulted")
+        self.assertNotIn(f"cat gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/300/started.json", calls)
 
     def test_an_artifacts_directory_that_does_not_exist_yet_is_created(self):
         """At the hoisted step 0 nothing in the job has written to ARTIFACTS
@@ -664,14 +675,13 @@ class RevalidationTest(unittest.TestCase):
         self._plant_statuses(self.c3, [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"ARTIFACTS": str(fresh)})
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
-        self.assertTrue((fresh / "step0-reused-override.json").is_file())
+        self.assertTrue((fresh / "metadata.json").is_file())
 
-    def test_a_marker_that_cannot_be_written_is_a_full_run(self):
+    def test_a_record_that_cannot_be_written_is_a_full_run(self):
         """ARTIFACTS exists but the write fails: the reuse would leave an
         unmarked passed build, so it is refused, after the verdict lines."""
         self._plant_statuses(self.c3, [self._override_event()])
-        unwritable = self.artifacts / "step0-reused-override.json"
-        unwritable.mkdir()
+        self.metadata_file.mkdir()
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("could not write", proc.stdout)
@@ -785,17 +795,19 @@ class RevalidationTest(unittest.TestCase):
 
     def test_an_override_of_another_pull_request_at_this_commit_is_not_reused(self):
         """A commit's statuses are shared by every pull request containing
-        it; an admin's override of PR 78 at this commit is not a verdict for
-        PR 77, and the events say which one they belong to."""
-        self._plant_statuses(self.c3, [self._override_event(pr=_OTHER_PR), self._override_event(pr=_OTHER_PR, url=f"{_SPYGLASS}/{_OTHER_PR}/{_JOB}/900")])
+        it. An admin overrides PR 78 at this commit while PR 77's build was
+        the commit's newest status: crier's report points at PR 78's
+        comment, and the plugin's re-posted status keeps PR 77's Spyglass
+        URL. Neither is a verdict for PR 77."""
+        self._plant_statuses(self.c3, [self._override_event(pr=_OTHER_PR), self._override_event(pr=_OTHER_PR, url=f"{_SPYGLASS}/{_PR}/{_JOB}/900")])
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertNotIn("holds a reusable verdict", proc.stdout)
 
     def test_the_production_pair_is_reused_and_cites_the_comment_either_order(self):
         """#2464's two same-second events: whichever GitHub lists first, the
-        plugin's Spyglass-URL status binds through the history path, and the
-        Reused verdict line points at the admin's comment."""
+        comment-URL event is the verdict and the Reused verdict line points
+        at the admin's comment."""
         pair = self._production_override_pair()
         for order in (pair, list(reversed(pair))):
             with self.subTest(first=order[0]["target_url"]):
@@ -806,8 +818,26 @@ class RevalidationTest(unittest.TestCase):
                 self.assertIn(f"Reused verdict: https://github.com/gke-labs/kube-agents/pull/{_PR}#issuecomment-1", proc.stdout)
                 self.assertIn(f"/override by {_ADMIN}", proc.stdout)
 
-    def test_a_plugin_status_alone_binds_through_the_history_url(self):
+    def test_the_plugins_own_status_alone_binds_nothing(self):
+        """The re-posted status keeps whatever URL the commit's status had,
+        even one under this pull request's own history path; without the
+        comment-URL event it is not a verdict."""
         self._plant_statuses(self.c3, [self._override_event(url=f"{_SPYGLASS}/{_PR}/{_JOB}/900")])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertNotIn("holds a reusable verdict", proc.stdout)
+
+    def test_a_cancel_shaped_status_that_is_not_a_failure_does_not_withdraw(self):
+        """The plugin posts a cancel as a failure; a success-state status
+        carrying the words -- a re-pin copy gone wrong, a stray post -- is
+        not one."""
+        self._plant_statuses(
+            self.c3,
+            [
+                self._override_event(when="2026-10-06T20:14:06Z"),
+                self._prow_event("success", f"Override cancelled by {_ADMIN}", "2026-10-06T20:15:00Z"),
+            ],
+        )
         proc = self._run(cur_head=self.c3, cur_base=self.c5)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
 
