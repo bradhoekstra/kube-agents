@@ -118,16 +118,19 @@ Where each route reserves, and why there:
   helper it is about to run, on the reservation's own admission wait, and releases the
   reservation with the helper. So only the caller that runs the helper ever holds a reservation:
   every other refresher waits on the lock holding none, and a cache hit never waits for either.
-  The lock can be held across its holder's wait for the budget; that blocks only other
-  refreshers, which would coalesce on the holder's result. A refresher behind a helper that runs
-  past the bound is told busy although that helper lands the token seconds later; the client
+  A route holder waiting for the budget yields the lock to a vcs verb that needs a refresh: the
+  verb runs the helper under its own reservation while the route caller queues behind it and
+  coalesces on its result, since otherwise the verb would wait on the lock while the holder
+  waits for budget the verb holds. Another route refresher waits on the lock as before. A
+  refresher behind a helper that runs past the bound is told busy although that helper lands the
+  token seconds later; the client
   reports a failed refresh, and its next call coalesces. The route hands its connection to both
   waits, as the exec and vcs routes hand theirs to the slot wait, so a caller that hangs up while
   queued is dropped before the helper runs, and the route has a handler for that drop (a log line
   and no response, as the exec route has) beside the busy handler. Called from inside a vcs
-  request, the function runs under that request's reservation, takes none, and waits for the lock
-  as long as it takes; from the content-workspace
-  `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
+  request, the function runs under that request's reservation and takes none; it reads the
+  coalesce cache without the lock, and otherwise waits for the lock as long as it takes; from the
+  content-workspace `open` and `commit`, through `mint_read_credential`, it runs under the store's fixed term.
 - The content-workspace verbs take no reservation at all. The store serves one verb at a time
   under its single lock, across every open workspace, so at most one of its process trees exists
   at any moment, whatever the load; that is a fixed quantity, and the budget carries it as a
