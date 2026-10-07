@@ -171,10 +171,10 @@ commands are in flight at once (4 × 176 = 704), whatever order they arrive in, 
 alone admitted eight. The stall watch's eight
 parallel listings run in two waves. Over two hours on the install above, 414 `gcloud` requests
 took 2 s at the median, 18 s at the 95th percentile and 25 s at most, so the second wave waits one
-listing, within the 60-second bound with room to spare. The reconciler's listing pool is held to
-the same eight at every `maxProjects` cap (§2.6), so its burst also runs in two waves; a wider
-pool would have run in four, with a last wave that could outwait the bound at the slowest listing
-observed.
+listing, within the 60-second bound with room to spare. The reconciler's listing pool is four at
+every `maxProjects` cap (§2.6), the admitted count, so its lookups do not queue at the proxy at
+all; at eight wide its listing budget, sized for eight at a time, would have run out with about
+forty of a hundred projects unlisted at a 10-second listing.
 
 Four requests at once is the cost of the design at the default limit, and it binds long-running
 commands too: four `kubectl logs --follow` or `kubectl wait` hold the budget for as
@@ -301,9 +301,11 @@ stall watch's eight-wide listing pool. The proxy container's requests and limits
 chart's generated footprint and quota preflight. No agent-visible behaviour: no eval case.
 
 The reconciler's listing pool is the one caller setting the change moved. It had been eight at
-the default `maxProjects` cap and up to sixteen when the cap was raised; `LIST_WORKERS_MAX` is
-now the default, eight, at every cap, so its burst runs in two waves like the stall watch's
-(§2.2), and a larger cap is met by a longer listing budget instead of more workers.
+the default `maxProjects` cap and up to sixteen when the cap was raised; it is now four, the
+count §2.2 admits, at every cap, and its listing budget doubles to 300 seconds at the default cap
+to keep the 12 seconds per listing the 150-second budget gave at eight wide, growing by that per
+default cap's worth of projects. The bootstrap gate's floor follows the budget, from 240 to 390
+seconds.
 
 Prose the change updated because it had become false: in
 [`docs/credential-isolation-design.md`](../credential-isolation-design.md), the CLI-commands
