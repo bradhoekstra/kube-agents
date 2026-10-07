@@ -113,9 +113,10 @@ readonly EVAL_INFLIGHT_POLL_STEP_SECONDS=5
 # here too, first, so a job definition that has not yet hoisted it still
 # saves the eval matrix, and so the next-mode lane that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
-# the rules: an admin /override at this head or a green at this head is
-# reused whatever main has done since (#1202), a green at an earlier head
-# when everything since is inert (#1179), and every doubt is a full run. EVAL_SKIP_REVALIDATION=1 is the
+# the rules: a green at this head, or failing that an admin /override of
+# it, is reused whatever main has done since (#1202), a green at an earlier
+# head when everything since is inert (#1179), and every doubt is a full
+# run. EVAL_SKIP_REVALIDATION=1 is the
 # escape hatch. Run through bash rather than by mode: a script that lost its
 # executable bit would otherwise exit 126 with no "Step 0: full run:" line
 # and every run would go full in silence.

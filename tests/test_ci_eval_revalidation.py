@@ -26,6 +26,7 @@ key on (scripts/eval_dashboard/collect.py reads nothing from it today).
 import json
 import os
 import pathlib
+import re
 import subprocess
 import unittest.mock
 import tempfile
@@ -617,8 +618,10 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"Step 0: REVALIDATED against /override by {_ADMIN} -- skipping the eval matrix ===", proc.stdout)
         self.assertEqual(proc.stdout.count("Step 0: REVALIDATED"), 1)
         self.assertNotIn("green build", proc.stdout)
-        self.assertFalse(self.call_log.exists(), "the override needs no GCS record, so none was read")
-        # One read, of this head's statuses, carrying the credential chosen.
+        # The history was read first and held no verdict; its reason is not
+        # printed, since the override holds. One status read, of this head,
+        # carrying the credential chosen.
+        self.assertNotIn("Step 0: full run:", proc.stdout)
         reads = [r for r in self._requests() if "/statuses" in r["url"]]
         self.assertEqual([r["url"].split("/commits/")[1].split("/")[0] for r in reads], [self.c3])
         self.assertEqual(reads[0]["authorization"], "Bearer t-shell")
@@ -731,6 +734,18 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"JOB_NAME": f"{_JOB}-next"})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertNotIn("holds a reusable verdict", proc.stdout)
+
+    def test_a_green_at_the_head_is_preferred_to_an_override_there(self):
+        """A head with both: the green is the stronger verdict and needs no
+        record, so it is the one reused, and recorded reuse builds never
+        accumulate in the scan's window ahead of it."""
+        self._plant_history([("200", True, self.c1, self.c3)])
+        self._plant_statuses(self.c3, [self._override_event()])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5)
+        self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
+        self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
+        self.assertNotIn("/override by", proc.stdout)
+        self.assertEqual([], list(self.artifacts.iterdir()))
 
     def test_an_override_survives_the_retest_tide_started_and_aborted(self):
         """#2464's history: override, then Tide's retest posts pending, then
@@ -857,7 +872,7 @@ class RevalidationTest(unittest.TestCase):
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_STATUS_ERROR": "URLError"})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-        self.assertIn(f"Step 0: could not read GitHub statuses for {self.c3} for an /override (URLError); the job history is read next", proc.stdout)
+        self.assertIn(f"Step 0: could not read GitHub statuses for {self.c3} for an /override (URLError); none is reused", proc.stdout)
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
         reads = [r for r in self._requests() if "/statuses" in r["url"]]
         self.assertEqual(1, len(reads), "the refused head is cached, not asked again for the attestation")
@@ -878,7 +893,7 @@ class RevalidationTest(unittest.TestCase):
         self._plant_statuses(self.c3, [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_STATUS_HTTP": "403"})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
-        self.assertIn(f"Step 0: GitHub answered HTTP 403 reading statuses for {self.c3} for an /override; the job history is read next", proc.stdout)
+        self.assertIn(f"Step 0: GitHub answered HTTP 403 reading statuses for {self.c3} for an /override; none is reused", proc.stdout)
         self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
 
     def test_an_override_behind_days_of_re_pins_is_still_found(self):
@@ -906,7 +921,7 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100", "GITHUB_FAKE_STATUS_HTTP_PAGE": "2"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn(f"/override by {_ADMIN}", proc.stdout)
-        self.assertIn(f"Step 0: GitHub answered HTTP 502 on page 2 after 100 events reading statuses for {self.c3}; the newer events already read are searched", proc.stdout)
+        self.assertIn(f"Step 0: the statuses read for {self.c3} stopped at HTTP 502 on page 2 after 100 events; the newer events already read are searched", proc.stdout)
         # A green at the head is attested from the same partial read.
         (self.statuses / f"{self.c3}.json").unlink()
         self._plant_history([("200", True, self.c1, self.c3)])
@@ -917,13 +932,24 @@ class RevalidationTest(unittest.TestCase):
 
     def test_the_page_walk_stops_at_its_cap_and_falls_through(self):
         """A head with more pages than the cap is a full run, not an unbounded
-        read: the event behind page ten is not found."""
+        read: the event behind page ten is not found, the log says the read
+        stopped at the cap, and a green's attestation that was not reached
+        is reported as not among the events read rather than as absent."""
         pins = [self._override_event(creator="github-actions[bot]") for _ in range(1100)]
         self._plant_statuses(self.c3, pins + [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100"})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn(f"Step 0: the statuses read for {self.c3} stopped at the 10-page cap after 1000 events; the newer events already read are searched and older ones are not", proc.stdout)
         reads = [r["url"] for r in self._requests() if "/statuses" in r["url"]]
         self.assertEqual(10, len([u for u in reads if self.c3 in u]), reads)
+        # The same cap on a green's attestation: planted behind the pins.
+        (self.statuses / f"{self.c3}.json").unlink()
+        self._plant_statuses(self.c3, pins)
+        self._plant_history([("200", True, self.c1, self.c3)])
+        proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"GITHUB_FAKE_PAGE_SIZE": "100"})
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("naming build 200 among the events read (the read stopped at the 10-page cap after 1000 events) -- refusing to trust the GCS record alone", proc.stdout)
+        self.assertEqual(proc.stdout.count("Step 0: full run:"), 1)
 
     def test_a_batch_may_mix_a_green_and_an_override(self):
         self._plant_history([("200", True, self.c1, self.c3)])
@@ -1316,10 +1342,10 @@ class RevalidationTest(unittest.TestCase):
         self.assertEqual(1, len(mints), self._requests())
         self.assertEqual({"permissions": {"metadata": "read"}}, json.loads(mints[0]["data"]))
         self.assertIn("/app/installations/157029058/access_tokens", mints[0]["url"])
-        # Two heads are read -- this one for an /override, the green's for
-        # the attestation -- each once, each with the minted token.
-        self.assertEqual([self.c4, self.c3], [r["url"].split("/commits/")[1].split("/")[0] for r in reads])
-        self.assertEqual(["Bearer ghs_minted"] * 2, [r["authorization"] for r in reads])
+        # One read, of the green's head for the attestation, with the minted
+        # token; the green holds, so no /override is consulted.
+        self.assertEqual([self.c3], [r["url"].split("/commits/")[1].split("/")[0] for r in reads])
+        self.assertEqual(["Bearer ghs_minted"], [r["authorization"] for r in reads])
         self.assertNotIn("the-mounted-pat", proc.stdout + proc.stderr + self.requests_log.read_text())
 
     def test_a_batch_mints_once_for_all_its_pulls(self):
@@ -1363,14 +1389,14 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c4, cur_base=self.c2, env_overrides={"BENCH_GITHUB_TOKEN": "shell-token"})
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertIn("read with the BENCH_GITHUB_TOKEN this shell holds", proc.stdout)
-        self.assertEqual(["Bearer shell-token"] * 2, [r["authorization"] for r in self._requests()])
+        self.assertEqual(["Bearer shell-token"], [r["authorization"] for r in self._requests()])
 
     def test_without_any_credential_the_read_is_anonymous_and_said_so(self):
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(cur_head=self.c4, cur_base=self.c2)
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertIn("GitHub statuses read anonymously", proc.stdout)
-        self.assertEqual([None] * 2, [r["authorization"] for r in self._requests()])
+        self.assertEqual([None], [r["authorization"] for r in self._requests()])
 
     def test_a_refused_status_read_is_a_full_run_with_no_second_attempt(self):
         """What the old curl pair did on any failure was try again
@@ -1385,10 +1411,10 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("GitHub answered HTTP 403 reading statuses", proc.stdout)
         self.assertIn("not retrying anonymously", proc.stdout)
-        # Each head once: the current one for an /override, the green's for
-        # the attestation; a refused head is never asked again.
+        # Each head once: the green's for the attestation, then the current
+        # one for an /override; a refused head is never asked again.
         reads = [r for r in self._requests() if "/statuses" in r["url"]]
-        self.assertEqual([self.c4, self.c3], [r["url"].split("/commits/")[1].split("/")[0] for r in reads])
+        self.assertEqual([self.c3, self.c4], [r["url"].split("/commits/")[1].split("/")[0] for r in reads])
 
     def test_the_token_reaches_python_through_the_environment_not_argv(self):
         """ps shows argv to every process on the node; it does not show the
@@ -1398,6 +1424,31 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn('os.environ.get("REVALIDATION_STATUS_TOKEN")', text)
         self.assertNotIn("Authorization: Bearer ${", text)
         self.assertNotIn("curl", text)
+
+
+class RevalidationBashFloorTest(unittest.TestCase):
+    """The suite lifts the script into whatever `bash` is on PATH, 3.2 on a
+    stock macOS, and the script says it stays there (its cache comment);
+    CI's bash is 5, so a bash-4 construct would pass CI and fail every
+    macOS contributor at source time. Pinned statically, the way
+    tests/test_upgrade_script.py pins `mapfile` out of its harness."""
+
+    _BASH4_CONSTRUCTS = (
+        r"declare\s+-[a-zA-Z]*[gA]",
+        r"\bmapfile\b",
+        r"\breadarray\b",
+        r"\$\{[A-Za-z_][A-Za-z_0-9]*(,,|\^\^)",
+        r"&>>",
+        r"\|&",
+        r"\[-1\]",
+    )
+
+    def test_the_script_uses_no_bash_4_construct(self):
+        text = _CI_REVALIDATE.read_text(encoding="utf-8")
+        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        for pattern in self._BASH4_CONSTRUCTS:
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(re.search(pattern, code), f"{pattern} needs bash 4+")
 
 
 class RevalidationEntrypointTest(unittest.TestCase):

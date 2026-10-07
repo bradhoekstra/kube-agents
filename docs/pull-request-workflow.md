@@ -486,10 +486,12 @@ Tide would re-run the job — which is how an override came to need repeating wh
 before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green,
 and when the re-pin loses its race with Tide's sync, the retest's step 0 reads the override off the
 head and reuses it the way it reuses a green. So an override holds for the head it was given until a
-push. This Prow build has no `/override-cancel` (step 0 would honour one), so what else ends it is a
-run that cannot reuse it — a status read that fails or overruns step 0's page cap, a run with nowhere
-to record the reuse, or the operator's `EVAL_SKIP_REVALIDATION=1` lever below — which runs the matrix
-and comes back needing the override again. Prow's `/override-sticky` would hold it without the race, with the `[prow:skip-retest]`
+push. This Prow build has no `/override-cancel` (step 0 would honour one). A retest that cannot
+reuse it — a status read refused on its first page or stopped (by a failed later page, or by step
+0's page cap) before it reached the override's event, a run with nowhere to record the reuse, or the
+operator's `EVAL_SKIP_REVALIDATION=1` lever below — runs the matrix instead, and its red does not
+withdraw the override. The next retest reads it off the head again when the cause was transient; an
+override that has fallen behind the page cap stays out of reach until a new `/override` or a push. Prow's `/override-sticky` would hold it without the race, with the `[prow:skip-retest]`
 sentinel Tide accepts regardless of base — but it is
 not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
@@ -553,9 +555,10 @@ saying so, and Tide reads the result as current. It is a race against Tide's rou
 sync, and the sweep sometimes loses it; when it does, Tide starts the retest as before (a
 batch, when two or more qualify), crier's `pending` is then the newer status, and the sweep leaves
 it alone. That retest is what [`hack/ci-revalidate.sh`](../hack/ci-revalidate.sh), the job's step 0,
-makes cheap: before the job leases an evaluation project it looks for an admin `/override` of this
-job at the pull request's head, or a green build of this job at that head attested by the Prow-posted
-success status, and reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
+makes cheap: before the job leases an evaluation project it looks for a green build of this job — at
+the pull request's head, or at an earlier head from which every change since is inert — attested by
+the Prow-posted success status, or failing both an admin `/override` of this job at that head, and
+reuses that verdict whatever `main` has done since — a batch pull by pull, every one or none — so a lost race
 costs the minutes of a pod start and a clone rather than the 1.5 to 3.5 hours of the matrix. A push
 still starts a fresh run, and a run it is: step 0 reuses an earlier head's green only when
 everything since, on the pull request's side and on `main`'s, is inert.

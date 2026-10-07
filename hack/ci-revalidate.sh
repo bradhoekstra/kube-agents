@@ -53,9 +53,12 @@
 # plugin re-posts the commit's existing status for it and the URL that
 # status carries names the last reporter, not the decision -- on a shared
 # commit a cancel given to either pull request withdraws both, which is the
-# conservative direction, a full run. The override is checked first, before the job
-# history: it needs no GCS record, and the pull request it answers usually
-# has none that passed. A reuse exits 0, and Prow then writes a passed build
+# conservative direction, a full run. The override is consulted AFTER the
+# job history, only when no green holds: a green is the stronger verdict
+# and needs no record, and a head that has both then never accumulates
+# recorded reuse builds in the scan's window ahead of its real green. The
+# history's reason is printed only when the override does not hold either,
+# so a fall-through is still one line. A reuse exits 0, and Prow then writes a passed build
 # at the head that the first two rules would read as a green -- which would
 # carry an override past a cancel and, through the inert rule, onto heads
 # the admin never saw. So a reuse that rests on an override records itself
@@ -264,28 +267,34 @@ readonly REVALIDATION_MINT_RETRYABLE=75
 readonly REVALIDATION_STATUS_TIMEOUT_SECONDS=30
 readonly REVALIDATION_USER_AGENT="kube-agents-ci-revalidate"
 
-# A head's status events are read once per run and kept here, keyed by SHA:
-# the override check reads the current head, and the attestation reads the
-# green build's head, which on a retest is the same one -- one read, and a
-# refused read is refused once, never asked again under the same credential.
-# Outcome is "ok", "http <code>" or "error <name>"; the body is kept only
-# for "ok". Global so the functions below share them whichever is called
-# first; the driver empties both at the start of a run.
-declare -gA REVALIDATION_STATUS_OUTCOME=()
-declare -gA REVALIDATION_STATUS_BODY=()
+# A head's status events are read once and kept here: the attestation reads
+# the green build's head and the override check reads the current head,
+# which on a retest is the same one -- one read, and a refused read is
+# refused once, never asked again under the same credential. One entry is
+# all that needs (the two reads for a pull come in a row, and a batch's
+# pulls have distinct heads), and scalars keep the script on the bash 3.2
+# the unit tests lift it into on a developer machine, where hack/ci-eval-pr.sh
+# holds the same floor for the same reason. Outcome is "ok", "http <code>"
+# or "error <name>"; the body is kept only for "ok"; PARTIAL names where a
+# read stopped early (a failed later page, or the page cap), empty for a
+# whole read. The driver empties the cache at the start of a run.
+REVALIDATION_STATUS_CACHED_SHA=""
+REVALIDATION_STATUS_OUTCOME=""
+REVALIDATION_STATUS_BODY=""
+REVALIDATION_STATUS_PARTIAL=""
 
-# revalidation_fetch_statuses <sha>: fills the two maps for that head,
-# reading GitHub only the first time; the caller then reads
-# REVALIDATION_STATUS_OUTCOME[<sha>] itself. (Called directly, never in a
-# command substitution: a subshell's cache would be lost on return.) The
-# read carries the credential
+# revalidation_fetch_statuses <sha>: fills the cache for that head, reading
+# GitHub only when the cached head is another; the caller then reads
+# REVALIDATION_STATUS_OUTCOME and the body itself. (Called directly, never
+# in a command substitution: a subshell's cache would be lost on return.)
+# The read carries the credential
 # revalidation_read_credential chose, handed to python through its
 # environment so it is on no argv. One attempt: a read GitHub refuses names
 # its HTTP code, with no second, anonymous try (header, "GitHub read
 # credential").
 revalidation_fetch_statuses() {
   local sha="$1"
-  if [ -z "${REVALIDATION_STATUS_OUTCOME[${sha}]:-}" ]; then
+  if [ "${sha}" != "${REVALIDATION_STATUS_CACHED_SHA}" ]; then
     local fetched
     fetched="$(REVALIDATION_STATUS_TOKEN="${REVALIDATION_STATUS_TOKEN:-}" python3 -c '
 import json
@@ -306,10 +315,11 @@ pages = 0
 partial = ""
 # Newest first, a page at a time, following the Link header GitHub sets while
 # there is a next page; the cap bounds a head with years of events. A page
-# that fails after the first ends the walk the way the cap does: what was
-# read is searched, which cannot admit a wrong verdict -- only real events
-# are searched, and a cancel newer than any override found is on a page
-# already read -- and only the first page'"'"'s refusal is a refused read.
+# that fails after the first ends the walk the way the cap does, and both
+# are reported: what was read is searched, which cannot admit a wrong
+# verdict -- only real events are searched, and a cancel newer than any
+# override found is on a page already read -- and only the first page'"'"'s
+# refusal is a refused read.
 while url and pages < page_limit:
     try:
         with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout) as response:
@@ -330,17 +340,23 @@ while url and pages < page_limit:
     pages += 1
     found = re.search(r"<([^>]+)>;\s*rel=\"next\"", link)
     url = found.group(1) if found else None
+if url and not partial:
+    partial = "the %d-page cap" % page_limit
 print("ok-partial " + partial + " after " + str(len(statuses)) + " events" if partial else "ok")
 print(json.dumps(statuses))
 ' "${REVALIDATION_STATUS_API}/${sha}/statuses?per_page=${REVALIDATION_STATUS_PAGE_SIZE}" "${REVALIDATION_STATUS_TIMEOUT_SECONDS}" "${REVALIDATION_USER_AGENT}" "${REVALIDATION_STATUS_PAGE_LIMIT}" 2>/dev/null)" || fetched="error python3"
-    REVALIDATION_STATUS_OUTCOME[${sha}]="${fetched%%$'\n'*}"
-    case "${REVALIDATION_STATUS_OUTCOME[${sha}]}" in
+    REVALIDATION_STATUS_CACHED_SHA="${sha}"
+    REVALIDATION_STATUS_OUTCOME="${fetched%%$'\n'*}"
+    REVALIDATION_STATUS_BODY=""
+    REVALIDATION_STATUS_PARTIAL=""
+    case "${REVALIDATION_STATUS_OUTCOME}" in
       ok-partial\ *)
-        echo "Step 0: GitHub answered ${REVALIDATION_STATUS_OUTCOME[${sha}]#ok-partial } reading statuses for ${sha}; the newer events already read are searched and older ones are not"
-        REVALIDATION_STATUS_OUTCOME[${sha}]="ok" ;;
+        REVALIDATION_STATUS_PARTIAL="${REVALIDATION_STATUS_OUTCOME#ok-partial }"
+        echo "Step 0: the statuses read for ${sha} stopped at ${REVALIDATION_STATUS_PARTIAL}; the newer events already read are searched and older ones are not"
+        REVALIDATION_STATUS_OUTCOME="ok" ;;
     esac
-    if [ "${REVALIDATION_STATUS_OUTCOME[${sha}]}" = "ok" ]; then
-      REVALIDATION_STATUS_BODY[${sha}]="${fetched#*$'\n'}"
+    if [ "${REVALIDATION_STATUS_OUTCOME}" = "ok" ]; then
+      REVALIDATION_STATUS_BODY="${fetched#*$'\n'}"
     fi
   fi
 }
@@ -382,12 +398,12 @@ revalidation_read_credential() {
 # revalidate_override_at_head <number> <head-sha> <base-sha>
 # The third kind of verdict (header): returns 0 when GitHub holds an
 # /override of this job's context on the head, posted by the Prow bot and
-# not withdrawn by a later cancel, and 1 otherwise. It prints no "Step 0:
-# full run:" line -- the job history is read next and names the reason --
+# not withdrawn by a later cancel, and 1 otherwise. Consulted after the job
+# history has yielded no verdict; it prints no "Step 0: full run:" line --
+# the caller prints the history's reason when this holds nothing either --
 # but a refused read and a cancelled override are each noted, so neither is
-# lost behind the history's reason. The head's events come from the
-# per-run cache, so the attestation that follows a fall-through does not
-# read the same head again.
+# lost behind that reason. The head's events come from the cache, so a
+# same-head attestation and this check share one read.
 revalidate_override_at_head() {
   local pull_number="$1" cur_head="$2" cur_base="$3"
   # Without somewhere to record the reuse (header: the key in finished.json),
@@ -396,23 +412,23 @@ revalidate_override_at_head() {
   # Prow's decoration exports ARTIFACTS; step 0 runs before anything else in
   # the job writes there, so the directory is made rather than assumed.
   if [ -z "${ARTIFACTS:-}" ] || ! mkdir -p "${ARTIFACTS}" 2>/dev/null; then
-    echo "Step 0: no ARTIFACTS directory to record a reused /override in (ARTIFACTS=${ARTIFACTS:-unset}), so no /override is consulted; the job history is read next"
+    echo "Step 0: no ARTIFACTS directory to record a reused /override in (ARTIFACTS=${ARTIFACTS:-unset}), so no /override is consulted"
     return 1
   fi
   revalidation_fetch_statuses "${cur_head}"
-  local outcome="${REVALIDATION_STATUS_OUTCOME[${cur_head}]}"
+  local outcome="${REVALIDATION_STATUS_OUTCOME}"
   case "${outcome}" in
     ok) ;;
     http\ *)
-      echo "Step 0: GitHub answered HTTP ${outcome#http } reading statuses for ${cur_head} for an /override; the job history is read next"
+      echo "Step 0: GitHub answered HTTP ${outcome#http } reading statuses for ${cur_head} for an /override; none is reused"
       return 1 ;;
     *)
-      echo "Step 0: could not read GitHub statuses for ${cur_head} for an /override (${outcome#error }); the job history is read next"
+      echo "Step 0: could not read GitHub statuses for ${cur_head} for an /override (${outcome#error }); none is reused"
       return 1 ;;
   esac
   local found comment_url_prefix
   comment_url_prefix="${REVALIDATION_PULL_URL_PREFIX}/${pull_number}#"
-  found="$(printf '%s' "${REVALIDATION_STATUS_BODY[${cur_head}]}" | python3 -c '
+  found="$(printf '%s' "${REVALIDATION_STATUS_BODY}" | python3 -c '
 import json
 import sys
 
@@ -476,28 +492,50 @@ print("overridden", first_word((override.get("description") or "")[len(prefix):]
   return 0
 }
 
+# Records why the green history yields no verdict, for revalidate_one_pull
+# to print if the override holds nothing either; a second argument is
+# detail printed under the reason.
+_revalidation_no_green() {
+  REVALIDATION_NO_GREEN="$1"
+  if [ -n "${2:-}" ]; then
+    REVALIDATION_NO_GREEN+=$'\n'"$2"
+  fi
+}
+
 # revalidate_one_pull <number> <head-sha> <base-sha>
 # Returns 0 when the pull request holds a verdict this run could only
-# repeat -- an /override at this head, else one from its own green history
+# repeat -- one from its own green history, else an /override at this head
 # -- and 1 for a full run. Every fall-through path logs exactly one
-# "Step 0: full run:" line naming its reason. A reuse logs the pull's record
-# and appends "<kind> <id> (PR #n)" to REVALIDATION_REUSED; the job-level
-# REVALIDATED banner is the caller's, printed only once every pull has one
-# -- a batch whose later pull falls through must not carry a line saying
-# the matrix was skipped.
+# "Step 0: full run:" line naming the history's reason. A reuse logs the
+# pull's record and appends "<kind> <id> (PR #n)" to REVALIDATION_REUSED;
+# the job-level REVALIDATED banner is the caller's, printed only once every
+# pull has one -- a batch whose later pull falls through must not carry a
+# line saying the matrix was skipped.
 revalidate_one_pull() {
+  local pull_number="$1" cur_head="$2" cur_base="$3"
+  REVALIDATION_NO_GREEN=""
+  if revalidate_from_green_history "${pull_number}" "${cur_head}" "${cur_base}"; then
+    return 0
+  fi
+  if revalidate_override_at_head "${pull_number}" "${cur_head}" "${cur_base}"; then
+    return 0
+  fi
+  echo "Step 0: full run: ${REVALIDATION_NO_GREEN}"
+  return 1
+}
+
+# revalidate_from_green_history <number> <head-sha> <base-sha>
+# The first two kinds of verdict (header). Returns 0 on a reuse; 1 with the
+# reason in REVALIDATION_NO_GREEN otherwise.
+revalidate_from_green_history() {
   local pull_number="$1" cur_head="$2" cur_base="$3"
   local repo_dir
   repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-  if revalidate_override_at_head "${pull_number}" "${cur_head}" "${cur_base}"; then
-    return 0
-  fi
-
   local history_dir="${REVALIDATION_HISTORY_PREFIX}/${pull_number}/${REVALIDATION_JOB_NAME}"
   local listing
   if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
-    echo "Step 0: full run: no finished ${REVALIDATION_JOB_NAME} build for PR #${pull_number} (first run on this PR, or GCS unreadable)"
+    _revalidation_no_green "no finished ${REVALIDATION_JOB_NAME} build for PR #${pull_number} (first run on this PR, or GCS unreadable)"
     return 1
   fi
 
@@ -505,7 +543,7 @@ revalidate_one_pull() {
   local candidates
   candidates="$(printf '%s\n' "${listing}" | sed -n 's|.*/\([0-9][0-9]*\)/finished\.json$|\1|p' | sort -rn | head -n "${REVALIDATION_HISTORY_LIMIT}")"
   if [ -z "${candidates}" ]; then
-    echo "Step 0: full run: the job history listing for PR #${pull_number} held no parseable build ids"
+    _revalidation_no_green "the job history listing for PR #${pull_number} held no parseable build ids"
     return 1
   fi
 
@@ -552,7 +590,7 @@ if record.get("passed") is True:
 ${candidates}
 EOF_REVALIDATION_CANDIDATES
   if [ -z "${prev_green}" ]; then
-    echo "Step 0: full run: no green build among the newest ${REVALIDATION_HISTORY_LIMIT} ${REVALIDATION_JOB_NAME} builds for PR #${pull_number}"
+    _revalidation_no_green "no green build among the newest ${REVALIDATION_HISTORY_LIMIT} ${REVALIDATION_JOB_NAME} builds for PR #${pull_number}"
     return 1
   fi
 
@@ -562,7 +600,7 @@ EOF_REVALIDATION_CANDIDATES
   # third ":<ref>" field; only the first two are read.
   local started shas prev_base prev_head
   if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
-    echo "Step 0: full run: green build ${prev_green} of PR #${pull_number} has no readable started.json"
+    _revalidation_no_green "green build ${prev_green} of PR #${pull_number} has no readable started.json"
     return 1
   fi
   if ! shas="$(printf '%s' "${started}" | python3 -c '
@@ -581,7 +619,7 @@ if not base or not head:
     raise SystemExit(1)
 print(base, head)
 ' "${PULL_BASE_REF:-${REVALIDATION_DEFAULT_BASE_REF}}" "${pull_number}" "${REVALIDATION_REPO_KEY}" 2>/dev/null)"; then
-    echo "Step 0: full run: could not recover base/head SHAs from green build ${prev_green}'s started.json (PR #${pull_number})"
+    _revalidation_no_green "could not recover base/head SHAs from green build ${prev_green}'s started.json (PR #${pull_number})"
     return 1
   fi
   prev_base="${shas%% *}"
@@ -596,21 +634,21 @@ print(base, head)
   local sha
   for sha in "${prev_base}" "${prev_head}"; do
     if ! [[ "${sha}" =~ ${REVALIDATION_SHA_RE} ]]; then
-      echo "Step 0: full run: build ${prev_green}'s started.json holds a malformed SHA (PR #${pull_number})"
+      _revalidation_no_green "build ${prev_green}'s started.json holds a malformed SHA (PR #${pull_number})"
       return 1
     fi
   done
   if [ "${finished_revision}" != "${prev_head}" ]; then
-    echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
+    _revalidation_no_green "build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
     return 1
   fi
-  # The head's events come from the per-run cache (revalidation_fetch_statuses):
+  # The head's events come from the cache (revalidation_fetch_statuses):
   # read once, with the credential chosen above, and a refused read is a
   # full run with no second, anonymous try (header, "GitHub read credential").
   revalidation_fetch_statuses "${prev_head}"
-  local attested="${REVALIDATION_STATUS_OUTCOME[${prev_head}]}"
+  local attested="${REVALIDATION_STATUS_OUTCOME}"
   if [ "${attested}" = "ok" ]; then
-    attested="$(printf '%s' "${REVALIDATION_STATUS_BODY[${prev_head}]}" | python3 -c '
+    attested="$(printf '%s' "${REVALIDATION_STATUS_BODY}" | python3 -c '
 import json
 import sys
 
@@ -631,13 +669,13 @@ print("absent")
   case "${attested}" in
     attested) ;;
     absent)
-      echo "Step 0: full run: GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green} -- refusing to trust the GCS record alone"
+      _revalidation_no_green "GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green}${REVALIDATION_STATUS_PARTIAL:+ among the events read (the read stopped at ${REVALIDATION_STATUS_PARTIAL})} -- refusing to trust the GCS record alone"
       return 1 ;;
     http\ *)
-      echo "Step 0: full run: GitHub answered HTTP ${attested#http } reading statuses for ${prev_head} to attest green build ${prev_green}; not retrying anonymously"
+      _revalidation_no_green "GitHub answered HTTP ${attested#http } reading statuses for ${prev_head} to attest green build ${prev_green}; not retrying anonymously"
       return 1 ;;
     *)
-      echo "Step 0: full run: could not read GitHub statuses for ${prev_head} to attest green build ${prev_green} (${attested#error })"
+      _revalidation_no_green "could not read GitHub statuses for ${prev_head} to attest green build ${prev_green} (${attested#error })"
       return 1 ;;
   esac
 
@@ -663,7 +701,7 @@ print("absent")
     if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
       git -C "${repo_dir}" fetch --quiet origin "${sha}" 2>/dev/null || true
       if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
-        echo "Step 0: full run: commit ${sha} from green build ${prev_green} is not in this checkout"
+        _revalidation_no_green "commit ${sha} from green build ${prev_green} is not in this checkout"
         return 1
       fi
     fi
@@ -676,11 +714,11 @@ print("absent")
   # always surfaces.
   local head_delta base_delta
   if ! head_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_head}" "${cur_head}" 2>/dev/null)"; then
-    echo "Step 0: full run: git diff ${prev_head}..${cur_head} failed"
+    _revalidation_no_green "git diff ${prev_head}..${cur_head} failed"
     return 1
   fi
   if ! base_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_base}" "${cur_base}" 2>/dev/null)"; then
-    echo "Step 0: full run: git diff ${prev_base}..${cur_base} failed"
+    _revalidation_no_green "git diff ${prev_base}..${cur_base} failed"
     return 1
   fi
 
@@ -689,8 +727,7 @@ print("absent")
   local survivors
   survivors="$(printf '%s\n%s\n' "${head_delta}" "${base_delta}" | grep -v '^$' | grep -Ev "${REVALIDATION_INERT_PATHS}" || true)"
   if [ -n "${survivors}" ]; then
-    echo "Step 0: full run: files outside REVALIDATION_INERT_PATHS changed since green build ${prev_green}:"
-    printf '%s\n' "${survivors}" | sed 's/^/    /'
+    _revalidation_no_green "files outside REVALIDATION_INERT_PATHS changed since green build ${prev_green}:" "$(printf '%s\n' "${survivors}" | sed 's/^/    /')"
     return 1
   fi
 
@@ -780,8 +817,7 @@ for entry in entries[1:]:
 
   REVALIDATION_REUSED=()
   REVALIDATION_REUSED_OVERRIDE=""
-  REVALIDATION_STATUS_OUTCOME=()
-  REVALIDATION_STATUS_BODY=()
+  REVALIDATION_STATUS_CACHED_SHA=""
   local number head
   while read -r number head; do
     [ -n "${number}" ] || continue
