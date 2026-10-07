@@ -86,12 +86,12 @@ class CheckLiteralFromTest(unittest.TestCase):
     def test_what_both_builders_read_alike_passes(self):
         # The crane reader matches `FROM `/`from ` and `COPY … /files*` after
         # trimming leading blanks; Docker reads the same lines the same way.
-        # Comment lines may hold any text, a CR before the newline is ignored,
-        # and a `# word=` comment below the first instruction is a comment.
+        # Comment lines may hold any text, and a `# word=` comment below the
+        # first instruction is a comment.
         for text in (
             f"from busybox:{_PIN}\nCOPY files/ /\n",
             f"  FROM busybox:{_PIN}\n  copy files/ /files/\n",
-            f"FROM busybox:{_PIN}\r\nCOPY files/ /\r\n",
+            f"FROM busybox:{_PIN}\nCOPY files/ /files\n",
             f"# docker build --platform linux/amd64 \\\n#   -t plugin .\nFROM busybox:{_PIN}\nCOPY files/ /\n",
             f"# Pinned by digest \u2014 see images.json \u2026\nFROM busybox:{_PIN}\nCOPY files/ /\n",
             f"FROM busybox:{_PIN}\n# platform=linux/amd64 is the only one the operator schedules\nCOPY files/ /\n",
@@ -105,8 +105,9 @@ class CheckLiteralFromTest(unittest.TestCase):
         # keyword (crane builds on scratch), a flag before the base (crane
         # takes the flag as the base; --platform lets docker publish another
         # architecture), a RUN, a heredoc body line, a flagged COPY or one
-        # whose destination crane does not honour. Each is refused by name,
-        # never reported as a pin.
+        # whose destination crane does not honour or its /files* glob would
+        # misplace, a tab (crane splits on spaces only) and a CR (crane keeps
+        # it on the reference). Each is refused by name, never as a pin.
         for text, fragment in (
             (f"From busybox:{_PIN}\nCOPY files/ /\n", "is not FROM or COPY"),
             (f"FROM busybox:{_PIN}\nRUN rm -rf /bin\nCOPY files/ /\n", "line 'RUN rm -rf /bin' is not FROM or COPY"),
@@ -117,6 +118,11 @@ class CheckLiteralFromTest(unittest.TestCase):
             (f"FROM busybox:{_PIN}\n  copy --chown=1000:1000 files/ /\n", "is not 'COPY <src> /'"),
             (f"FROM busybox:{_PIN}\nCOPY files/ /opt/plugin\n", "is not 'COPY <src> /'"),
             (f"FROM busybox:{_PIN}\nCOPY <<EOF /\n", "is not 'COPY <src> /'"),
+            (f"FROM busybox:{_PIN}\nCOPY files/ /filesystem\n", "is not 'COPY <src> /'"),
+            (f"FROM busybox:{_PIN}\nCOPY files/ /files/sub\n", "is not 'COPY <src> /'"),
+            (f"FROM\tbusybox:{_PIN}\nCOPY files/ /\n", "holds a tab"),
+            (f"FROM busybox:{_PIN}\tAS base\nCOPY files/ /\n", "holds a tab"),
+            (f"FROM busybox:{_PIN}\r\nCOPY files/ /\r\n", "ends in a carriage return"),
         ):
             with self.subTest(text=text):
                 result = _run_check(text)

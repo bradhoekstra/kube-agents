@@ -180,27 +180,38 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 # window is where Docker reads directives, and a `# word=` comment below the
 # first instruction is a comment); comment and blank lines dropped; a byte
 # outside printable ASCII on what remains (Docker trims Unicode space before
-# reading a keyword; the crane reader and this check do not); a line ending in
+# reading a keyword; the crane reader and this check do not); a tab or a
+# carriage return on what remains (the crane reader splits on spaces only and
+# keeps a CR on the reference, where Docker normalises both); a line ending in
 # a backslash; a line that is not `FROM`/`from` or `COPY`/`copy` followed by a
-# blank (mixed case, RUN, heredoc bodies); a `FROM` whose reference starts
+# space (mixed case, RUN, heredoc bodies); a `FROM` whose reference starts
 # with `--` (crane would take the flag as the base; `--platform` also lets
-# docker publish another architecture); a `COPY` that is not `<src> /` or
-# `<src> /files…` (flags crane ignores, a heredoc source, destinations crane
-# does not honour);
+# docker publish another architecture); a `COPY` that is not `<src> /`,
+# `<src> /files` or `<src> /files/` (flags crane ignores, a heredoc source,
+# and any other destination, including `/filesystem` or `/files/sub`, which
+# crane's `/files*` glob would take for `/files` while Docker honours it);
 # more or fewer than one `FROM`; and finally a reference that is not the
-# inventory's. A CR before the newline is ignored throughout.
+# inventory's.
 check_literal_from() {
   local name=$1 dockerfile=$2
   local want got body other froms
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
-  other="$(tr -d '\r' <"$dockerfile" | sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#[[:blank:]]*[A-Za-z][A-Za-z]*[[:blank:]]*=/p' | head -n1)"
+  other="$(sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#[[:blank:]]*[A-Za-z][A-Za-z]*[[:blank:]]*=/p' "$dockerfile" | head -n1)"
   if [ -n "$other" ]; then
     fail "$dockerfile: line '$other' has the shape of a parser directive (# word=) in the leading comment window; the plugin pin fence allows none, because a syntax= frontend is a second image that nothing pins or mirrors (agentplugins/lib/plugin_image.sh)."
     return
   fi
-  body="$(tr -d '\r' <"$dockerfile" | sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d')"
+  body="$(sed -e '/^[[:blank:]]*#/d' -e '/^[[:blank:]]*$/d' "$dockerfile")"
   if printf '%s\n' "$body" | LC_ALL=C grep -q '[^[:print:][:space:]]'; then
     fail "$dockerfile: an instruction line holds a byte outside printable ASCII (a BOM or a non-breaking space, say); the plugin pin fence reads plain ASCII instructions only, so save the file as such."
+    return
+  fi
+  if printf '%s\n' "$body" | LC_ALL=C grep -q "$(printf '\t')"; then
+    fail "$dockerfile: an instruction line holds a tab; the crane reader splits instructions on spaces only, so the plugin pin fence refuses a tab there (agentplugins/lib/plugin_image.sh)."
+    return
+  fi
+  if printf '%s\n' "$body" | LC_ALL=C grep -q "$(printf '\r')"; then
+    fail "$dockerfile: an instruction line ends in a carriage return; the crane reader keeps it on the image reference, so the plugin pin fence refuses CRLF line endings (agentplugins/lib/plugin_image.sh)."
     return
   fi
   other="$(printf '%s\n' "$body" | sed -n '/\\[[:blank:]]*$/p' | head -n1)"
@@ -218,9 +229,9 @@ check_literal_from() {
     fail "$dockerfile: line '$other' gives FROM a flag; the plugin pin fence allows none, because the crane reader takes the first word after FROM as the base image, and --platform lets docker build publish another architecture under this pin (agentplugins/lib/plugin_image.sh)."
     return
   fi
-  other="$(printf '%s\n' "$body" | sed -n -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]/!d' -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]\{1,\}[^-<][^[:blank:]]*[[:blank:]]\{1,\}\/[[:blank:]]*$/d' -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]\{1,\}[^-<][^[:blank:]]*[[:blank:]]\{1,\}\/files[^[:blank:]]*[[:blank:]]*$/d' -e 'p' | head -n1)"
+  other="$(printf '%s\n' "$body" | sed -n -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]/!d' -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]\{1,\}[^-<][^[:blank:]]*[[:blank:]]\{1,\}\/[[:blank:]]*$/d' -e '/^[[:blank:]]*[Cc][Oo][Pp][Yy][[:blank:]]\{1,\}[^-<][^[:blank:]]*[[:blank:]]\{1,\}\/files\/\{0,1\}[[:blank:]]*$/d' -e 'p' | head -n1)"
   if [ -n "$other" ]; then
-    fail "$dockerfile: line '$other' is not 'COPY <src> /' or 'COPY <src> /files…'; the plugin pin fence allows no COPY flag (the crane reader ignores them, and --from names a second image nothing pins), no heredoc source, and no other destination (the crane reader stages the tree at / and the staging init container skips most other top-level directories) (agentplugins/lib/plugin_image.sh)."
+    fail "$dockerfile: line '$other' is not 'COPY <src> /', 'COPY <src> /files' or 'COPY <src> /files/'; the plugin pin fence allows no COPY flag (the crane reader ignores them, and --from names a second image nothing pins), no heredoc source, and no other destination (the crane reader stages the tree at / and under /files only, and its /files* glob would take /filesystem for /files) (agentplugins/lib/plugin_image.sh)."
     return
   fi
   froms="$(printf '%s\n' "$body" | sed -n '/^[[:blank:]]*[Ff][Rr][Oo][Mm][[:blank:]]/p' | wc -l | tr -d ' ')"
