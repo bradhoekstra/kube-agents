@@ -285,6 +285,35 @@ func TestPodUsageSource_SkipsAnOverLongLineOfAnotherFamily(t *testing.T) {
 	}
 }
 
+// An over-long line of an unwanted family is skipped even when its label value
+// spells a wanted series' name. The watcher copies events_seen_total's reason
+// label verbatim from whatever posted the Event, so the reason is attacker
+// input; deciding an over-long line on a substring would let one such line, with
+// a wanted name in its reason, fail the scrape and freeze the counter -- the
+// round-12 denial the skip closes, by a route the substring left open. The
+// wanted line after it is still folded.
+func TestPodUsageSource_SkipsAnOverLongLineWhoseLabelNamesAWantedSeries(t *testing.T) {
+	hostileReason := processStartTimeSeries + " " + eventsInjectedSeries + " " + strings.Repeat("x", usageScrapeMaxLineBytes)
+	overLongHostile := `k8s_event_watcher_events_seen_total{reason="` + hostileReason + `"} 1`
+	body := strings.Join([]string{
+		overLongHostile,
+		eventsInjectedSeries + `{cluster="c"} 5`,
+		processStartTimeSeries + " 1700000000",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	if err != nil {
+		t.Fatalf("Scrape: %v (an over-long line of another family must be skipped, not fail, however its labels read)", err)
+	}
+	if reading.Sample != 5 {
+		t.Errorf("sample = %d, want 5 (the wanted line after the skipped hostile one)", reading.Sample)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1700000000 {
+		t.Errorf("start time = %v, want 1700000000", reading.StartTime)
+	}
+}
+
 // A redirect is not followed: the target that would answer 200 with a huge
 // sample is never reached.
 func TestPodUsageSource_DoesNotFollowRedirects(t *testing.T) {

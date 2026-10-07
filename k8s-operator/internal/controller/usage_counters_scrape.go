@@ -251,23 +251,25 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 			// The line in hand may be a partial one, so it is not folded.
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead}
 		}
-		// A cheap substring prefilter before the parser is handed the line: a
-		// line mentioning neither name cannot be a wanted series, whatever the
-		// parser would make of it. A line that mentions one still has the parser,
-		// not this read, decide what it is. The prefix of an over-long line is
-		// enough for this: a wanted series' name sits at the start of its line,
-		// so a prefix that does not mention one cannot be that series.
-		candidate := strings.Contains(line, family) || strings.Contains(line, processStartTimeSeries)
 		switch {
-		case overLong && candidate:
-			// A wanted series' line genuinely too long to parse: a failed scrape,
-			// as before. Any other family's over-long line fell through to be
-			// skipped, so one hostile line elsewhere in the body does not freeze
-			// the counter.
-			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
 		case overLong:
-			// Skip the over-long line of another family.
-		case candidate:
+			// No parser runs on an over-long line, so the substring prefilter the
+			// other case uses cannot be trusted to name it: the watcher copies
+			// events_seen_total's reason label verbatim from whatever posted the
+			// Event, so a hostile label value can spell a wanted series' name
+			// inside a line of another family. Decide on the metric name alone --
+			// the leading token, before any `{` or the value, which a label value
+			// sits after and so cannot reach. A genuinely over-long wanted line
+			// still fails the scrape, as before; any other family's is skipped, so
+			// one hostile line does not freeze the counter.
+			if name := usageLeadingName(line); name == family || name == processStartTimeSeries {
+				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
+			}
+		case strings.Contains(line, family) || strings.Contains(line, processStartTimeSeries):
+			// A cheap substring prefilter before the parser is handed the line: a
+			// line mentioning neither name cannot be a wanted series, whatever the
+			// parser would make of it. A line that mentions one still has the
+			// parser, not this read, decide what it is.
 			families, perr := parser.TextToMetricFamilies(strings.NewReader(line + "\n"))
 			if perr != nil {
 				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindParse}
@@ -362,6 +364,17 @@ func usageTrimLineEnd(b []byte) string {
 		b = b[:n-1]
 	}
 	return string(b)
+}
+
+// usageLeadingName is the metric name at the start of a sample line: the leading
+// token before the first '{', space or tab. A label value sits after the '{', so
+// it cannot be mistaken for the name -- which is how an over-long line, with no
+// parser to run on it, is judged a wanted series or not.
+func usageLeadingName(line string) string {
+	if i := strings.IndexAny(line, "{ \t"); i >= 0 {
+		return line[:i]
+	}
+	return line
 }
 
 // usageSampleValue is the sample of a metric parsed from a single line, which
