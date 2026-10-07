@@ -115,6 +115,10 @@ func TestScopeStartupLine(t *testing.T) {
 	empty := t.TempDir()
 	named := t.TempDir()
 	writeScopeProfile(t, named, "cluster-p1-prod-a-us-central1", clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-a"})
+	broken := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(broken, "cluster-p1-prod-b-us-central1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	for _, tc := range []struct {
 		name  string
 		scope scopeIndex
@@ -123,6 +127,7 @@ func TestScopeStartupLine(t *testing.T) {
 		{"no --profiles-dir", newProfileScope(""), []string{"install scope unknown", "no --profiles-dir", "nothing is held"}},
 		{"unreadable directory", newProfileScope(filepath.Join(empty, "absent")), []string{"install scope unknown", "cannot be read", "nothing is held"}},
 		{"no cluster profile yet", newProfileScope(empty), []string{"install scope read from " + empty, "no Cluster Agent profile yet", "is held out of the inject"}},
+		{"profiles present, none readable", newProfileScope(broken), []string{"install scope read from " + broken, "1 cluster profile(s) found and none readable", "is held out of the inject"}},
 		{"profiles present", newProfileScope(named), []string{"install scope read from " + named, "1 cluster profile(s)", "is held out of the inject"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,6 +235,25 @@ func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testin
 		t.Errorf("log says a kept cluster is held:\n%s", logs.String())
 	}
 
+	// The config removed but the directory left: kept, with that as the reason.
+	if err := os.Remove(filepath.Join(dir, "prod-f", "config.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	// A new streak needs a clean read in between, so rewrite then remove.
+	writeScopeProfile(t, dir, "prod-f", prodF)
+	now = now.Add(profileScopeRescanInterval)
+	s.Profiled(prodF)
+	if err := os.Remove(filepath.Join(dir, "prod-f", "config.yaml")); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, _ := s.Profiled(prodF); !profiled {
+		t.Error("Profiled(prod-f) = false with its config removed and its directory present, want true")
+	}
+	if want := "profile prod-f names no cluster on this read (config.yaml is absent); keeping p1/us-central1/prod-f"; !strings.Contains(logs.String(), want) {
+		t.Errorf("log lacks %q:\n%s", want, logs.String())
+	}
+
 	// Gone: the reconcile offboarded it, and the identity goes with the directory.
 	if err := os.RemoveAll(filepath.Join(dir, "cluster-p1-prod-d-us-central1")); err != nil {
 		t.Fatal(err)
@@ -288,6 +312,23 @@ func TestProfileScopeIsSilentAboutABrokenNonClusterProfile(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "profile platform ") {
 		t.Errorf("log mentions the platform profile:\n%s", logs.String())
+	}
+}
+
+// A profile naming the right project and cluster under the wrong location is
+// a profile for that cluster: discovery skips it (the GKE API finds nothing
+// there) and the startup skip line says its records are forwarded, so the
+// scope must name the cluster the records actually carry.
+func TestProfileScopeNamesAClusterWhoseProfileHasTheWrongLocation(t *testing.T) {
+	dir := t.TempDir()
+	writeScopeProfile(t, dir, "cluster-p1-prod-a-us-central1-a", clusterIdentity{Project: "p1", Location: "us-central1-a", Cluster: "prod-a"})
+	now := time.Now()
+	s := testProfileScope(dir, &now)
+	if profiled, known := s.Profiled(clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-a"}); !profiled || !known {
+		t.Errorf("Profiled(p1/us-central1/prod-a) = (%v, %v) with a profile at p1/us-central1-a/prod-a, want (true, true)", profiled, known)
+	}
+	if profiled, _ := s.Profiled(clusterIdentity{Project: "p2", Location: "us-central1", Cluster: "prod-a"}); profiled {
+		t.Error("Profiled(p2/us-central1/prod-a) = true, want false: another project's same-named cluster is not this profile's")
 	}
 }
 
