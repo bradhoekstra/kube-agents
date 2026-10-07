@@ -500,38 +500,40 @@ func TestInjectHoldsAnOutOfScopeRecord(t *testing.T) {
 	}
 }
 
-// An unreachable record the joiner did not mark is one whose cluster a profile
-// names but the join could not read, or one judged with no scope to judge it
-// against, and it still goes out as it always has. The thin card is the
-// detector staying loud about a cluster it was meant to reach, which is better
-// than a Ready pod that injects nothing.
-// The order of the hold and the seen set, both ways. A record injected while
-// its cluster was inside the scope and redelivered after the scope dropped it
-// is a duplicate, not a hold: a card for that id was sent. And a held record is
-// not remembered, so the same id arriving later inside the scope is injected
-// rather than read as a duplicate of a card that never existed.
+// A redelivered record whose card was already sent is a duplicate whatever the
+// scope says now: the seen set is asked before the hold. (The other direction,
+// a held record not being remembered, is TestInjectHoldsAnOutOfScopeRecord's.)
+// AlreadyInjected is the same answer offered to the joiner, and is true only
+// for an id this handler sent.
 func TestInjectOrdersTheHoldBetweenTheSeenCheckAndTheSeenMark(t *testing.T) {
 	daemon, url := newFakeDaemon(t)
 	handler := handlerAgainst(t, url)
 
 	handler.Handle(context.Background(), driftEvent("insert-1")) // in scope: sent
+	if !handler.AlreadyInjected("insert-1") || handler.AlreadyInjected("insert-9") {
+		t.Errorf("AlreadyInjected = (%v, %v) for a sent and an unseen id, want (true, false)", handler.AlreadyInjected("insert-1"), handler.AlreadyInjected("insert-9"))
+	}
 	redelivered := driftEvent("insert-1")
 	redelivered.OutOfScope = true
 	handler.Handle(context.Background(), redelivered)
 
-	held := driftEvent("insert-2")
-	held.OutOfScope = true
-	handler.Handle(context.Background(), held)
-	handler.Handle(context.Background(), driftEvent("insert-2")) // now in scope: sent
-
 	sessions, injects := daemon.counts()
-	if sessions != 2 || injects != 2 {
-		t.Errorf("sessions=%d injects=%d, want 2 and 2: insert-1 once, insert-2 once", sessions, injects)
+	if sessions != 1 || injects != 1 {
+		t.Errorf("sessions=%d injects=%d, want 1 and 1", sessions, injects)
 	}
-	if got := handler.Counts(); got.Injected != 2 || got.Duplicate != 1 || got.OutOfScope != 1 {
-		t.Errorf("counts = %+v, want injected=2 duplicate=1 out_of_scope=1", got)
+	if got := handler.Counts(); got.Injected != 1 || got.Duplicate != 1 || got.OutOfScope != 0 {
+		t.Errorf("counts = %+v, want injected=1 duplicate=1 out_of_scope=0", got)
+	}
+	if off := newDriftInjectHandler(nil); off.AlreadyInjected("insert-1") {
+		t.Error("AlreadyInjected = true with the inject off, want false: nothing is ever sent")
 	}
 }
+
+// An unreachable record the joiner did not mark is one whose cluster a profile
+// names but the join could not read, or one judged with no scope to judge it
+// against, and it still goes out as it always has. The thin card is the
+// detector staying loud about a cluster it was meant to reach, which is better
+// than a Ready pod that injects nothing.
 
 func TestInjectStillSendsAnUnreachableRecordTheJoinDidNotMark(t *testing.T) {
 	daemon, url := newFakeDaemon(t)

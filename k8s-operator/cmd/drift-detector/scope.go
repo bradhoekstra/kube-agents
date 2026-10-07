@@ -190,7 +190,9 @@ func (s *profileScope) rescan() {
 		if _, complete := byProfile[profile]; complete {
 			continue
 		}
-		if _, statErr := os.Stat(filepath.Join(s.dir, profile)); errors.Is(statErr, os.ErrNotExist) {
+		// A directory, through a link or not; a path that is now a file is a
+		// profile that is gone, whatever sits at its name.
+		if info, statErr := os.Stat(filepath.Join(s.dir, profile)); statErr != nil || !info.IsDir() {
 			continue
 		}
 		byProfile[profile] = kept

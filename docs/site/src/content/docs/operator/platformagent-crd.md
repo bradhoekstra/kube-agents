@@ -189,8 +189,8 @@ overwhelming majority of the stream. A change on another cluster in the project 
 Cluster Agent profile names is logged in the sidecar and not reported, while the sidecar can read its
 profiles directory: the install's scope ends at its profiles, so profile the cluster, exclude it
 under `spec.scope.exclude.clusters`, or fix the profile the sidecar's log names. The management
-cluster is always reported, profile or not, and a cluster excluded after the sidecar started stays
-reported until the gateway pod restarts.
+cluster is always reported, profile or not, and a cluster the sidecar had already joined when it
+started stays reported after its exclusion until the gateway pod restarts.
 
 **Through `install.sh` it is on unless you turn it off; the field itself still defaults to
 `false`.** The two layers differ on purpose — the field is what a hand-written CR or a Helm-only

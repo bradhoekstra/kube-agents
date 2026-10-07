@@ -47,10 +47,10 @@ const (
 	// clusterProfilePrefix is what the Platform Agent's profile_name puts in
 	// front of every Cluster Agent profile directory, and nothing else carries
 	// it (deploy/shared/sandbox_mirror.py discriminates on the same prefix).
-	// ReadIdentities uses it for the one drop it cannot otherwise place: a
-	// config that reads cleanly and carries no cluster_identity block is a
-	// cluster profile mid-scaffold under the prefix and a non-cluster profile
-	// without it.
+	// ReadIdentities uses it for the two drops it cannot otherwise place: a
+	// config that is absent, or reads cleanly and carries no cluster_identity
+	// block, is a cluster profile mid-scaffold under the prefix and a
+	// non-cluster profile or a stray directory without it.
 	clusterProfilePrefix = "cluster-"
 )
 

@@ -254,6 +254,18 @@ func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testin
 		t.Errorf("log lacks %q:\n%s", want, logs.String())
 	}
 
+	// Replaced by a file: no directory, so nothing to keep.
+	if err := os.RemoveAll(filepath.Join(dir, "prod-f")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prod-f"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, known := s.Profiled(prodF); profiled || !known {
+		t.Errorf("Profiled(prod-f) = (%v, %v) with a file at the profile's path, want (false, true): the keep is for a directory", profiled, known)
+	}
+
 	// Gone: the reconcile offboarded it, and the identity goes with the directory.
 	if err := os.RemoveAll(filepath.Join(dir, "cluster-p1-prod-d-us-central1")); err != nil {
 		t.Fatal(err)

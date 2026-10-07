@@ -92,9 +92,9 @@ discovery then skips because the GKE API finds nothing there — names nothing a
 that cluster's records are held until the profile is corrected; the startup skip line says so, and a
 looser match would make a same-named excluded cluster loud again. The scope is re-read from the
 directory at most once a minute, when an `unreachable` record arrives, and never addresses a
-cluster. Startup logs which mode the hold is in — the
-directory and how many cluster profiles it names, none yet (a fresh install holds every record off
-the joined clusters until the first reconcile tick), or unknown — because nothing later says so but
+cluster. Startup logs which mode the hold is in — the directory and how many cluster profiles it
+names; cluster profiles found and none readable; none yet (a fresh install holds every record off
+the joined clusters until the first reconcile tick); or unknown — because nothing later says so but
 the hold lines themselves.
 
 The split is deliberate on both sides. Each out-of-scope card is thin by construction — no owners,

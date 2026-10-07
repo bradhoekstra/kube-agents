@@ -363,8 +363,9 @@ type joiner struct {
 	// so a record redelivered after its cluster left the scope is not marked
 	// held -- the inject would count it a duplicate and send nothing, and a
 	// DRIFT line carrying the hold marker, a held count and a named cluster
-	// would all say a card was withheld that was in fact sent. nil with the
-	// inject off, when nothing is ever sent or deduplicated.
+	// would all say a card was withheld that was in fact sent. realMain always
+	// wires the inject handler's hook, which answers false while the inject is
+	// off; nil is the joiner built without one, in tests, and means never.
 	injected func(insertID string) bool
 
 	// unreachable counts records per cluster this process cannot read and did
