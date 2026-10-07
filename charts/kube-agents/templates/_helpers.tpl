@@ -1002,8 +1002,11 @@ honest — a quota that large cannot constrain this release either way.
        resource.Quantity comparison (1.0004 against 1 would compare equal). float64 holds
        every integer under 2^53 exactly, and every real override's value in these units is
        one; past that, or for a fraction that float64 cannot write, two values a few parts in
-       10^16 apart can still compare equal. Takes (dict "raw" <quantity> "cpu" <bool>);
-       call it after the quantity has passed the CRD's grammar. */ -}}
+       10^16 apart can still compare equal. A value
+       whose scaled figure is past float64's range (a CPU of 1e308, in millicores) fails the
+       render naming "key" rather than answering "", which a caller would read as zero.
+       Takes (dict "raw" <quantity> "cpu" <bool> "key" <values path>); call it after the
+       quantity has passed the CRD's grammar. */ -}}
 {{- define "kube-agents.quantityExact" -}}
 {{- $raw := include "kube-agents.normalizeQuantity" .raw -}}
 {{- $scale := ternary 1000.0 1.0 (eq .cpu true) -}}
@@ -1022,6 +1025,10 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- if kindIs "string" $v -}}
 {{- $v = mulf (float64 $raw) $scale -}}
+{{- end -}}
+{{- /* +Inf is the only float64 greater than the largest finite one. */ -}}
+{{- if gt (float64 $v) 1.7976931348623157e308 -}}
+{{- fail (printf "%s is %s, which is not a representable quantity: its value with the suffix applied is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" .key $raw) -}}
 {{- end -}}
 {{- $v | toJson -}}
 {{- end }}
@@ -1217,8 +1224,9 @@ a Go template cannot catch the error `lookup` raises.
 {{/*
 The checks on platformAgent.deployment.credentialProxy.resources that need no parsed value:
 the keys under resources, the shape of limits and requests, each resource name, and each
-quantity's sign, grammar and range. Takes the resources map and renders nothing; a value
-that fails one fails the render naming its key. Both readers of the value call it first,
+quantity's sign, grammar and range: a byte count within an int64, a CPU within an int64 of
+millicores. Takes the resources map and renders
+nothing; a value that fails one fails the render naming its key. Both readers of the value call it first,
 the CR template (templates/platform-agent-cr.yaml) and kube-agents.credentialProxyFootprint
 for the quota preflight, because Helm renders quota-preflight.yaml before the CR template:
 without it the preflight's parseBytes refused `-1Gi` or `2GB` with a "cannot parse ...
@@ -1262,13 +1270,23 @@ these have passed.
 {{- end -}}
 {{- if include "kube-agents.quantityOverflowsFloat64" $raw -}}
 {{- if eq $name "cpu" -}}
-{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero and so could not check against the operator's rules" $proxyPrefix $side $name $raw) -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a representable quantity: it is past the range of a float64, which the chart would read as zero, and its millicore value exceeds the 9223372036854775807 an int64 holds, so the operator refuses it" $proxyPrefix $side $name $raw) -}}
 {{- else -}}
 {{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
 {{- end -}}
 {{- end -}}
 {{- if and (ne $name "cpu") (include "kube-agents.bytesExceedInt64" $raw) -}}
 {{- fail (printf "%s.%s.%s is %s, which is not a representable byte count: it exceeds the 9223372036854775807 bytes an int64 holds, which is what the Downward API hands the broker, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
+{{- /* The operator reads a CPU quantity in millicores (MilliValue), which wraps past
+       2^63; it refuses one there, so the render does too. A suffix that carries a
+       finite number past float64's range (a 1 and 306 zeros, then k) fails inside
+       quantityExact, naming the key. */ -}}
+{{- if eq $name "cpu" -}}
+{{- $cores := include "kube-agents.quantityExact" (dict "raw" $raw "cpu" false "key" (printf "%s.%s.%s" $proxyPrefix $side $name)) | float64 -}}
+{{- if ge (mulf $cores 1000.0) 9223372036854775808.0 -}}
+{{- fail (printf "%s.%s.%s is %s, which is not a CPU count the scheduler can represent in millicores: its millicore value exceeds the 9223372036854775807 an int64 holds, and the operator refuses it" $proxyPrefix $side $name $raw) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

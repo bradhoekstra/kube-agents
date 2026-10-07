@@ -266,6 +266,27 @@ class CredentialProxyResourcesRefusedAtRenderTest(unittest.TestCase):
             self.assertIn(f"{_VALUE_PATH}.{key} is 1e400, which is not a representable", err)
             self.assertNotIn("a limit of zero", err)
 
+    def test_a_cpu_whose_millicores_overflow_fails_naming_the_key(self):
+        # 1e308 is a finite float64, but in millicores it is +Inf, which toJson writes
+        # as "" and the zero-limit check read as 0. 10E fits a float64 in millicores and
+        # not an int64, where the operator's MilliValue wraps it.
+        for key, value in (("requests.cpu", "1e308"), ("limits.cpu", "1e308"), ("requests.cpu", "10E")):
+            err = self._render_error([f"{_VALUE_PATH}.{key}={value}"])
+            self.assertIn(f"{_VALUE_PATH}.{key} is {value}, which is not a CPU count the scheduler can represent in millicores", err)
+            self.assertNotIn("a limit of zero", err)
+
+    def test_a_cpu_just_under_the_millicore_bound_renders(self):
+        cr = self._render_cr([f"{_VALUE_PATH}.limits.cpu=9.22337203685477e15"])
+        self.assertEqual(_cr_resources(cr), {"limits": {"cpu": "9.22337203685477e15"}})
+
+    def test_a_suffixed_cpu_past_float64_fails_naming_the_key(self):
+        # The number before the suffix is finite, so quantityOverflowsFloat64 passes it;
+        # the suffix carries it past float64's range, and quantityExact refuses it.
+        value = "1" + "0" * 306 + "k"
+        err = self._render_error([f"{_VALUE_PATH}.requests.cpu={value}"])
+        self.assertIn(f"{_VALUE_PATH}.requests.cpu is {value}, which is not a representable quantity", err)
+        self.assertNotIn("a limit of zero", err)
+
     def test_an_integer_past_int64_from_a_values_file_fails_naming_the_key(self):
         # Helm reads an integer above 2^63 as a float64, written 1e+19.
         err = self._render_error(values=_proxy_values({"limits": {"memory": 10**19}}))

@@ -260,18 +260,18 @@ spec:
            byte under the floor rounds up onto it), and the operator compares
            the quantities themselves. */}}
     {{- range $name, $rawLimit := $proxyMerged.limits }}
-      {{- if eq (include "kube-agents.quantityExact" (dict "raw" $rawLimit "cpu" (eq $name "cpu")) | float64) 0.0 }}
+      {{- if eq (include "kube-agents.quantityExact" (dict "raw" $rawLimit "cpu" (eq $name "cpu") "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64) 0.0 }}
       {{- fail (printf "%s.limits.%s is %s; a limit of zero leaves the container none, and the operator refuses it. Omit the key to keep the default (%s)" $proxyPrefix $name $rawLimit (index $proxyDefaults.limits $name)) }}
       {{- end }}
     {{- end }}
-    {{- if and (hasKey $proxyMerged.limits "memory") (lt (include "kube-agents.quantityExact" (dict "raw" $proxyMerged.limits.memory "cpu" false) | float64) (float64 $proxyFloor)) }}
+    {{- if and (hasKey $proxyMerged.limits "memory") (lt (include "kube-agents.quantityExact" (dict "raw" $proxyMerged.limits.memory "cpu" false "key" (printf "%s.limits.memory" $proxyPrefix)) | float64) (float64 $proxyFloor)) }}
     {{- fail (printf "%s.limits.memory is %s, under the %dMi floor at which the credential proxy's child memory budget admits two commands at once; below it the broker turns the budget off, and the operator refuses it. Set at least %dMi" $proxyPrefix $proxyMerged.limits.memory (div $proxyFloor 1048576) (div $proxyFloor 1048576)) }}
     {{- end }}
     {{- range $name, $rawRequest := $proxyMerged.requests }}
       {{- if hasKey $proxyMerged.limits $name }}
       {{- $isCpu := eq $name "cpu" }}
-      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu) | float64 }}
-      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu) | float64 }}
+      {{- $request := include "kube-agents.quantityExact" (dict "raw" $rawRequest "cpu" $isCpu "key" (printf "%s.requests.%s" $proxyPrefix $name)) | float64 }}
+      {{- $limit := include "kube-agents.quantityExact" (dict "raw" (index $proxyMerged.limits $name) "cpu" $isCpu "key" (printf "%s.limits.%s" $proxyPrefix $name)) | float64 }}
       {{- if gt $request $limit }}
       {{- $setRequest := hasKey ((index $proxyQuantities "requests") | default dict) $name }}
       {{- $setLimit := hasKey ((index $proxyQuantities "limits") | default dict) $name }}
