@@ -166,6 +166,26 @@ check_base_image distroless-static a2a/Dockerfile.console DISTROLESS_IMAGE DISTR
 # and the operator renders it under next (check 2 holds its compiled name).
 check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 
+# The agent plugin images pin their base with a literal `FROM repo:tag@digest`
+# rather than an ARG pair, so the ARG check above never reaches them. Compare
+# the last FROM line's reference against the inventory entry instead -- the
+# last, because that is the stage the image ships and the one the crane path in
+# agentplugins/lib/plugin_image.sh appends onto. The two Dockerfiles and the
+# `busybox` entry are otherwise kept in step by hand, and a bump that moves one
+# and not the others passes every other check while the docs and
+# `make mirror-images` describe a digest the build does not pull.
+check_literal_from() {
+  local name=$1 dockerfile=$2
+  local want got
+  want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
+  got="$(normalise "$(sed -n 's/^FROM[[:space:]]\{1,\}\([^[:space:]]*\).*$/\1/p' "$dockerfile" | tail -n1)")"
+  [ "$got" = "$want" ] ||
+    fail "$dockerfile: FROM pins '${got:-<unset>}', but $INVENTORY has '$want' for '$name'."
+}
+
+check_literal_from busybox agentplugins/pubsub-platform/Dockerfile
+check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile
+
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
 # official golang image sets GOTOOLCHAIN=local, and the Dockerfiles repeat it so
