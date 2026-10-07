@@ -6388,11 +6388,39 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
+        self.kv_db_path = self.root / "session_kv.db"
+        kv_patcher = patch.object(session_kv_server, "SESSION_KV_DB_PATH", str(self.kv_db_path))
+        kv_patcher.start()
+        self.addCleanup(kv_patcher.stop)
+        session_kv_server.init_db()
+
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
 
-    def _write_profile_store(self, profile: str, rows: list[tuple], *, with_tool_call_id: bool = False):
+    def _record_ledger_session(self, session_id: str, notified: bool = True):
+        return session_kv_server.record_intercepted_event(
+            cluster="prod-us",
+            namespace="default",
+            workload="payments-api",
+            object_uid="uid-1",
+            object_kind="Pod",
+            reason="BackOff",
+            message="Back-off restarting failed container",
+            severity="Warning",
+            occurrences=1,
+            notified=notified,
+            session_id=session_id,
+        )
+
+    def _write_profile_store(
+        self,
+        profile: str,
+        rows: list[tuple],
+        sessions: list[tuple] | None = None,
+        *,
+        with_tool_call_id: bool = False,
+    ):
         import sqlite3
 
         if not profile or profile == "default":
@@ -6402,6 +6430,16 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         db_path.parent.mkdir(parents=True, exist_ok=True)
         id_col = ", tool_call_id TEXT" if with_tool_call_id else ""
         with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS sessions ("
+                "id TEXT PRIMARY KEY, title TEXT, started_at REAL, ended_at REAL)"
+            )
+            if sessions:
+                for sid, title, started_at, ended_at in sessions:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO sessions (id, title, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                        (sid, title, started_at, ended_at),
+                    )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS messages ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, "
@@ -7402,6 +7440,388 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         self.assertEqual(previews[69], "attempt-1-step-79")
         self.assertEqual(previews[70], "attempt-2-step-0")
         self.assertEqual(previews[-1], "attempt-2-step-29")
+
+    def test_pre_kanban_live_session_synthesized_when_no_card_exists_yet(self):
+        import sqlite3
+
+        now = time.time()
+        self._record_ledger_session("k8s-evt-pre")
+        undelivered_id = self._record_ledger_session("k8s-evt-undelivered")
+        session_kv_server.mark_delivery_failed(undelivered_id, "all enabled chat platforms failed")
+        headless_id = self._record_ledger_session("k8s-evt-headless-pre")
+        session_kv_server.mark_delivery_headless(headless_id)
+        self._write_profile_store(
+            "default",
+            [
+                ("k8s-evt-pre", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                (
+                    "k8s-evt-pre",
+                    "assistant",
+                    None,
+                    None,
+                    [{"function": {"name": "kanban_create", "arguments": '{"assignee":"cluster-gke","title":"Triage"}'}}],
+                    now - 1.0,
+                    "Routing the warning event to the cluster specialist.",
+                ),
+                ("k8s-evt-undelivered", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                ("k8s-evt-undelivered", "assistant", None, None, None, now - 1.0, "Triage running despite chat failure."),
+                ("k8s-evt-headless-pre", "user", "A Kubernetes Warning event needs triage...", None, None, now - 2.0, None),
+                ("k8s-evt-headless-pre", "assistant", None, None, None, now - 1.0, "Triage running on headless install."),
+            ],
+            sessions=[
+                ("k8s-evt-pre", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None),
+                ("k8s-evt-undelivered", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None),
+                ("k8s-evt-headless-pre", "Triage default/Pod/payments-api (BackOff)", now - 2.0, None),
+            ],
+        )
+
+        resp = self.client.get("/v1/sessions/k8s-evt-pre/tasks")
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body["board"])
+        self.assertEqual(body["tasks"], [])
+        routing = body["routing"]
+        self.assertNotIn("id", routing)
+        self.assertEqual(routing["title"], "Triage default/Pod/payments-api (BackOff)")
+        self.assertEqual(routing["profile"], "default")
+        self.assertEqual(routing["status"], "in_progress")
+        self.assertEqual(routing["session_id"], "k8s-evt-pre")
+        self.assertIsNone(routing["completed_at"])
+        self.assertEqual([s["kind"] for s in routing["live_steps"]], ["thinking", "tool_call"])
+        self.assertEqual(routing["live_steps"][1]["tool"], "kanban_create")
+        self.assertFalse(routing["steps_truncated"])
+
+        # An undelivered event (`notified = 0, delivery_error != ''`) still runs
+        # autonomous triage and surfaces its pre-kanban routing object.
+        undeliv_resp = self.client.get("/v1/sessions/k8s-evt-undelivered/tasks")
+        self.assertEqual(undeliv_resp.status_code, 200)
+        undeliv_body = undeliv_resp.json()
+        self.assertEqual(undeliv_body["tasks"], [])
+        self.assertEqual(undeliv_body["routing"]["session_id"], "k8s-evt-undelivered")
+        self.assertEqual(undeliv_body["routing"]["profile"], "default")
+
+        # A headless-dispatched event (`notified = NOTIFIED_HEADLESS = 2, delivery_error = ''`)
+        # also surfaces its pre-kanban routing object.
+        with sqlite3.connect(self.kv_db_path) as conn:
+            headless_row = conn.execute(
+                "SELECT notified, delivery_error FROM intercepted_events WHERE session_id = 'k8s-evt-headless-pre'"
+            ).fetchone()
+        self.assertEqual(headless_row, (session_kv_server.NOTIFIED_HEADLESS, ""))
+        headless_resp = self.client.get("/v1/sessions/k8s-evt-headless-pre/tasks")
+        self.assertEqual(headless_resp.status_code, 200)
+        headless_body = headless_resp.json()
+        self.assertEqual(headless_body["tasks"], [])
+        self.assertEqual(headless_body["routing"]["session_id"], "k8s-evt-headless-pre")
+        self.assertEqual(headless_body["routing"]["status"], "in_progress")
+
+        unknown_resp = self.client.get("/v1/sessions/k8s-evt-nonexistent/tasks")
+        self.assertEqual(unknown_resp.status_code, 200)
+        self.assertEqual(unknown_resp.json()["tasks"], [])
+        self.assertNotIn("routing", unknown_resp.json())
+
+    def test_pre_kanban_ended_or_stale_session_reports_terminal_status(self):
+        import sqlite3
+
+        now = time.time()
+        self._record_ledger_session("k8s-evt-ended")
+        self._record_ledger_session("k8s-evt-ended-no-reply")
+        self._record_ledger_session("k8s-evt-stale")
+        self._record_ledger_session("k8s-evt-reused")
+        self._record_ledger_session("k8s-evt-long-mcp")
+        self._record_ledger_session("k8s-evt-row-clipped")
+        self._record_ledger_session("k8s-evt-never-started")
+        self._record_ledger_session("k8s-evt-fresh")
+        sqlite_text_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 1200.0))
+        long_mcp_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(now - 360.0))
+        with sqlite3.connect(self.kv_db_path) as conn:
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ? WHERE session_id IN ('k8s-evt-never-started', 'k8s-evt-stale')",
+                (sqlite_text_ts,),
+            )
+            conn.execute(
+                "UPDATE intercepted_events SET created_at = ? WHERE session_id = 'k8s-evt-long-mcp'",
+                (long_mcp_ts,),
+            )
+        # A later non-dispatched (`notified = 0, delivery_error = ''`) row under the
+        # same session_id must not advance `turn_start_epoch` or un-stale `k8s-evt-stale`.
+        self._record_ledger_session("k8s-evt-stale", notified=False)
+        final_prose = "## What's wrong\n\n" + (
+            "Container failed liveness probe due to port mismatch on readiness check. " * 65
+        )
+        self.assertGreater(len(final_prose), session_kv_server.TASK_STEP_DETAIL_MAX_CHARS)
+
+        ended_rows: list[tuple] = [
+            ("k8s-evt-ended", "user", "A Kubernetes Warning event needs triage...", None, None, now - 30.0, None),
+        ]
+        for idx in range(14):
+            ended_rows.append(
+                (
+                    "k8s-evt-ended",
+                    "assistant",
+                    None,
+                    None,
+                    None,
+                    now - 29.0 + idx,
+                    f"Intermediate routing thought {idx}",
+                )
+            )
+        ended_rows.append(
+            ("k8s-evt-ended", "assistant", final_prose, None, None, now - 5.0, "Diagnosing directly.")
+        )
+
+        clipped_rows: list[tuple] = [
+            ("k8s-evt-row-clipped", "user", "A Kubernetes Warning event needs triage...", None, None, now - 50.0, None),
+        ]
+        for idx in range(25):
+            clipped_rows.append(
+                ("k8s-evt-row-clipped", "user", f"follow-up user note {idx}", None, None, now - 49.0 + idx, None)
+            )
+        clipped_rows.append(
+            ("k8s-evt-row-clipped", "assistant", None, None, None, now - 2.0, "Single surviving step after row clip.")
+        )
+
+        self._write_profile_store(
+            "default",
+            ended_rows
+            + clipped_rows
+            + [
+                (
+                    "k8s-evt-ended-no-reply",
+                    "user",
+                    "A Kubernetes Warning event needs triage...",
+                    None,
+                    None,
+                    now - 10.0,
+                    None,
+                ),
+                (
+                    "k8s-evt-ended-no-reply",
+                    "assistant",
+                    None,
+                    None,
+                    None,
+                    now - 6.0,
+                    "Starting routing turn before upstream abort...",
+                ),
+                ("k8s-evt-stale", "user", "A Kubernetes Warning event needs triage...", None, None, now - 1200.0, None),
+                # Recent message timestamp (`now - 10.0`, younger than 900s) ensures
+                # staleness is measured from turn start (`ledger_created_at` / `started_at`),
+                # not from `updated_at` (which a chat reply or late stream chunk would reset).
+                ("k8s-evt-stale", "assistant", None, None, None, now - 10.0, "Starting routing turn..."),
+                ("k8s-evt-reused", "user", "A Kubernetes Warning event needs triage...", None, None, now - 1200.0, None),
+                ("k8s-evt-reused", "assistant", None, None, None, now - 2.0, "Fresh turn on reused session..."),
+                ("k8s-evt-long-mcp", "user", "A Kubernetes Warning event needs triage...", None, None, now - 360.0, None),
+                ("k8s-evt-long-mcp", "assistant", None, None, None, now - 360.0, "Waiting on 420s MCP tool call..."),
+            ],
+            sessions=[
+                ("k8s-evt-ended", "Triage ended session", now - 30.0, now - 4.0),
+                ("k8s-evt-ended-no-reply", "Triage ended aborted session", now - 10.0, now - 5.0),
+                ("k8s-evt-stale", "Triage stale session", now - 1200.0, None),
+                ("k8s-evt-reused", "Triage reused session", now - 1200.0, None),
+                ("k8s-evt-long-mcp", "Triage long MCP session", now - 360.0, None),
+                ("k8s-evt-row-clipped", "Triage row-clipped session", now - 50.0, None),
+            ],
+        )
+
+        ended_task = self.client.get("/v1/sessions/k8s-evt-ended/tasks").json()["routing"]
+        self.assertEqual(ended_task["status"], "completed")
+        self.assertEqual(ended_task["completed_at"], now - 4.0)
+        self.assertEqual(len(ended_task["live_steps"]), session_kv_server.SESSION_TASK_LIVE_STEPS_MAX)
+        self.assertTrue(ended_task["steps_truncated"])
+        self.assertTrue(all("detail" not in s for s in ended_task["live_steps"]))
+        self.assertTrue(ended_task["summary"].endswith("…"))
+        self.assertEqual(len(ended_task["summary"]), session_kv_server.TASK_STEP_PREVIEW_MAX_CHARS + 1)
+        self.assertEqual(ended_task["result"], final_prose.strip())
+        self.assertGreater(len(ended_task["result"]), session_kv_server.TASK_STEP_DETAIL_MAX_CHARS)
+        self.assertIsNone(ended_task["error"])
+
+        clipped_task = self.client.get("/v1/sessions/k8s-evt-row-clipped/tasks").json()["routing"]
+        self.assertEqual(clipped_task["status"], "in_progress")
+        self.assertEqual(len(clipped_task["live_steps"]), 1)
+        self.assertTrue(clipped_task["steps_truncated"])
+
+        ended_no_reply_task = self.client.get("/v1/sessions/k8s-evt-ended-no-reply/tasks").json()["routing"]
+        self.assertEqual(ended_no_reply_task["status"], "failed")
+        self.assertEqual(ended_no_reply_task["completed_at"], now - 5.0)
+        self.assertIsNone(ended_no_reply_task["result"])
+        self.assertIsNone(ended_no_reply_task["summary"])
+        self.assertEqual(ended_no_reply_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+        stale_task = self.client.get("/v1/sessions/k8s-evt-stale/tasks").json()["routing"]
+        self.assertEqual(stale_task["status"], "failed")
+        self.assertEqual(stale_task["completed_at"], now - 10.0)
+        self.assertEqual(stale_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+        reused_task = self.client.get("/v1/sessions/k8s-evt-reused/tasks").json()["routing"]
+        self.assertEqual(reused_task["status"], "in_progress")
+        self.assertIsNone(reused_task["completed_at"])
+
+        long_mcp_task = self.client.get("/v1/sessions/k8s-evt-long-mcp/tasks").json()["routing"]
+        self.assertEqual(long_mcp_task["status"], "in_progress")
+        self.assertIsNone(long_mcp_task["completed_at"])
+
+        prev_tz = os.environ.get("TZ")
+        try:
+            os.environ["TZ"] = "UTC-2"
+            if hasattr(time, "tzset"):
+                time.tzset()
+            never_started_task = self.client.get("/v1/sessions/k8s-evt-never-started/tasks").json()["routing"]
+        finally:
+            if prev_tz is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = prev_tz
+            if hasattr(time, "tzset"):
+                time.tzset()
+        self.assertEqual(never_started_task["status"], "failed")
+        for ts_field in ("created_at", "started_at", "completed_at", "updated_at"):
+            self.assertIsInstance(never_started_task[ts_field], float)
+            self.assertAlmostEqual(never_started_task[ts_field], now - 1200.0, delta=1.5)
+        self.assertEqual(never_started_task["live_steps"], [])
+        self.assertEqual(never_started_task["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+
+        # A freshly dispatched ledger row whose gateway session has not yet been
+        # written to `state.db` returns `tasks: []` with no `routing` key.
+        fresh_body = self.client.get("/v1/sessions/k8s-evt-fresh/tasks").json()
+        self.assertEqual(fresh_body["tasks"], [])
+        self.assertNotIn("routing", fresh_body)
+
+        # When `<agent_home>/state.db` exists and raises `sqlite3.Error`,
+        # `_read_pre_kanban_session_task` falls back to the ledger-backed object
+        # with `routing_error` rather than collapsing into "not a triage session".
+        real_read_only = session_kv_server._read_only
+
+        def _fail_state_db(path: str):
+            if path.endswith("state.db"):
+                raise sqlite3.OperationalError("database is locked")
+            return real_read_only(path)
+
+        with patch.object(session_kv_server, "_read_only", side_effect=_fail_state_db):
+            locked_active = self.client.get("/v1/sessions/k8s-evt-fresh/tasks").json()["routing"]
+            self.assertEqual(locked_active["status"], "in_progress")
+            self.assertEqual(locked_active["live_steps"], [])
+            self.assertEqual(locked_active["routing_error"], "database is locked")
+            self.assertAlmostEqual(locked_active["created_at"], now, delta=5.0)
+
+            locked_stale = self.client.get("/v1/sessions/k8s-evt-never-started/tasks").json()["routing"]
+            self.assertEqual(locked_stale["status"], "failed")
+            self.assertEqual(locked_stale["error"], session_kv_server.PRE_KANBAN_STALE_ERROR)
+            self.assertEqual(locked_stale["routing_error"], "database is locked")
+            self.assertAlmostEqual(locked_stale["completed_at"], now - 1200.0, delta=1.5)
+
+    def test_pre_kanban_rejects_non_ledger_front_door_chat_session(self):
+        import sqlite3
+
+        now = time.time()
+        secret_tok = "ghp_" + "B" * 36
+        self._write_profile_store(
+            "default",
+            [
+                ("slack-thread-123", "user", "Can you check our staging secret?", None, None, now - 2.0, None),
+                ("slack-thread-123", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "k8s-evt-info-only",
+                    "user",
+                    "A Kubernetes Warning event needs triage...",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("k8s-evt-info-only", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "slack-thread-untitled",
+                    "user",
+                    "Can you triage our staging secret?",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("slack-thread-untitled", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "slack-thread-bad-title",
+                    "user",
+                    "Can you triage our staging secret?",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("slack-thread-bad-title", "assistant", "Here is the chat reply.", None, None, now - 1.0, None),
+                (
+                    "k8s-evt-scrub-title",
+                    "user",
+                    "A Kubernetes Warning event needs triage...",
+                    None,
+                    None,
+                    now - 2.0,
+                    None,
+                ),
+                ("k8s-evt-scrub-title", "assistant", "Routing.", None, None, now - 1.0, None),
+            ],
+            sessions=[
+                ("slack-thread-123", "Triage default/Pod/payments-api", now - 2.0, None),
+                ("k8s-evt-info-only", "Triage default/Pod/payments-api", now - 2.0, None),
+                ("slack-thread-untitled", None, now - 2.0, None),
+                ("slack-thread-bad-title", "Slack conversation", now - 2.0, None),
+                ("k8s-evt-scrub-title", f"Triage token {secret_tok}", now - 2.0, None),
+            ],
+        )
+
+        with sqlite3.connect(self.kv_db_path) as conn:
+            indexes = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'intercepted_events'"
+                )
+            }
+        self.assertIn("idx_intercepted_events_session_id", indexes)
+
+        # 1. Direct query without a ledger row returns empty.
+        resp = self.client.get("/v1/sessions/slack-thread-123/tasks")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["tasks"], [])
+        self.assertNotIn("routing", resp.json())
+
+        # 2. Injecting an Info-graded event onto `slack-thread-123` and onto
+        #    triage-shaped `k8s-evt-info-only` (which passes both content guards)
+        #    records a filtered ledger row (`notified = 0, delivery_error = ''`)
+        #    and is rejected solely by the ledger dispatch predicate.
+        for target_sid in ("slack-thread-123", "k8s-evt-info-only"):
+            info_resp = self.client.post(
+                f"/sessions/{target_sid}/inject",
+                json={"message": json.dumps({"type": "Normal", "reason": "Pulled", "message": "noop"})},
+            )
+            self.assertEqual(info_resp.status_code, 200)
+            self.assertIn(info_resp.json()["status"], ("suppressed", "filtered"))
+            with sqlite3.connect(self.kv_db_path) as conn:
+                ledger_row = conn.execute(
+                    "SELECT notified, delivery_error FROM intercepted_events WHERE session_id = ?",
+                    (target_sid,),
+                ).fetchone()
+            self.assertEqual(ledger_row, (0, ""))
+            self.assertNotIn("routing", self.client.get(f"/v1/sessions/{target_sid}/tasks").json())
+
+        # 3a. Prompt guard alone: `slack-thread-123` has a `"Triage ..."` title (so it
+        #     passes the title guard) and is rejected solely by its non-triage initial prompt.
+        self._record_ledger_session("slack-thread-123")
+        self.assertNotIn("routing", self.client.get("/v1/sessions/slack-thread-123/tasks").json())
+
+        # 3b. Title guard on untitled chat session (`title = None`): passes the prompt
+        #     guard ("triage" in first user prompt) and is rejected by its empty title.
+        self._record_ledger_session("slack-thread-untitled")
+        self.assertNotIn("routing", self.client.get("/v1/sessions/slack-thread-untitled/tasks").json())
+
+        # 3c. Title guard on non-"Triage " titled chat session: passes the prompt
+        #     guard and is rejected solely by its non-"Triage " title.
+        self._record_ledger_session("slack-thread-bad-title")
+        self.assertNotIn("routing", self.client.get("/v1/sessions/slack-thread-bad-title/tasks").json())
+
+        # 4. A legitimate triage session's `sessions.title` is scrubbed before return.
+        self._record_ledger_session("k8s-evt-scrub-title")
+        scrub_routing = self.client.get("/v1/sessions/k8s-evt-scrub-title/tasks").json()["routing"]
+        self.assertNotIn(secret_tok, scrub_routing["title"])
 
 
 

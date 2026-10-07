@@ -131,6 +131,17 @@ HERMES_STATE_DB_FILENAME = "state.db"
 # `tool_call`, `tool_result`, `reply`) and card text field whenever
 # `AuditRedactor` cannot be loaded or structural recursion exceeds Python's limit.
 WORKER_STEP_WITHHELD = "[withheld: redactor unavailable]"
+PRE_KANBAN_STATUS_IN_PROGRESS = "in_progress"
+PRE_KANBAN_STATUS_COMPLETED = "completed"
+PRE_KANBAN_STATUS_FAILED = "failed"
+# Upper bound for an unclosed front-door routing turn before it is treated as
+# stale rather than permanently `in_progress`. `_start_agent_turn` uses a 300s
+# client-side `urlopen` read timeout, but the Hermes gateway turn can continue
+# running server-side (and a single MCP call in `agents/platform/config.yaml`
+# allows up to 420s: `connect_timeout: 120` + `timeout: 300`), so 900s (15m)
+# gives slow multi-step routing turns headroom before marking them stale.
+PRE_KANBAN_STALE_AFTER_SECONDS = 900.0
+PRE_KANBAN_STALE_ERROR = "front-door routing turn ended without creating a kanban task"
 _REDACTOR_CANDIDATES = (
     Path("/opt/defaults/plugins/common/redactor.py"),
     Path(__file__).resolve().parents[2] / "chat" / "defaults" / "plugins" / "common" / "redactor.py",
@@ -990,6 +1001,13 @@ def init_db() -> None:
                     expires_at REAL NOT NULL
                 )
                 """
+            )
+            # `_is_intercepted_event_session` looks a session up by id on every
+            # poll of a card-less session; without this that is the same full
+            # scan, once per second per poller.
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_intercepted_events_session_id "
+                "ON intercepted_events (session_id)"
             )
             # Today's alert budget per severity. In the database rather than in
             # memory because this table's whole job is to survive a restart:
@@ -5157,10 +5175,10 @@ def get_alert_quota(day: str = "") -> Dict[str, Any]:
 # table also carries the claim lock, worker pid and workspace path, which are
 # dispatcher state rather than activity, and a new column upstream does not
 # reach a caller until it is named here. Worker step text (`thinking`,
-# `tool_call`, `tool_result`, `reply`) is scrubbed through `AuditRedactor` (and
-# every step kind and every card text field is withheld if the redactor cannot be loaded)
-# before leaving the pod; callers that render text fields still treat them as
-# untrusted text.
+# `tool_call`, `tool_result`, `reply`) and card text fields are scrubbed through
+# `AuditRedactor` (and every step kind and every card text field is withheld if
+# the redactor cannot be loaded) before leaving the pod; callers that render
+# text fields still treat them as untrusted text.
 # --------------------------------------------------------------------------
 
 
@@ -5376,9 +5394,21 @@ def list_session_tasks(session_id: str, limit: int = FEED_TASKS_DEFAULT_LIMIT) -
     triage the front door filed; later ones are whatever that work spawned
     under the same session. Each card also carries `live_steps` and
     `steps_truncated` from the worker's Hermes session (`state.db`).
+
+    When an intercepted event session has no kanban card yet, a sibling
+    `routing` object (`profile = "default"`) is returned beside `tasks: []`
+    from the default profile's `state.db` (`status = "in_progress"` while the
+    front-door routing turn is active, or terminal `"completed"` / `"failed"`
+    once `sessions.ended_at` is set or the routing turn ages past
+    `PRE_KANBAN_STALE_AFTER_SECONDS` without filing a card).
     """
     limit = _clamp_limit(limit, FEED_TASKS_MAX_LIMIT)
     result = _read_kanban(lambda conn: _session_task_rows(conn, session_id, limit))
+    board_exists = result is not None
+    if result is None or not result["tasks"]:
+        routing = _read_pre_kanban_session_task(session_id)
+        if routing is not None:
+            return {"tasks": [], "truncated": False, "board": board_exists, "routing": routing}
     return {**result, "board": True} if result is not None else _empty_task_feed()
 
 
@@ -6078,6 +6108,7 @@ def _extract_steps_from_conn(
     window_size: int,
     *,
     include_detail: bool = True,
+    raise_on_error: bool = False,
 ) -> tuple[list[Dict[str, Any]], bool]:
     """Read up to `window_size` newest message rows for `session_id` and return `(steps, rows_clipped)`."""
     if not cols:
@@ -6092,6 +6123,8 @@ def _extract_steps_from_conn(
             (session_id, window_size + 1),
         ).fetchall()
     except sqlite3.Error:
+        if raise_on_error:
+            raise
         return [], False
     rows_clipped = len(msg_rows) > window_size
     if rows_clipped:
@@ -6186,6 +6219,253 @@ def _session_first_order_key(
     raw_id = row["id"]
     msg_id = int(raw_id) if isinstance(raw_id, int) else 0
     return (ts, msg_id)
+
+
+def _is_intercepted_event_session(session_id: str) -> Optional[Any]:
+    """Return the ledger row's `created_at` when `session_id` was admitted and
+    dispatched (`notified >= 1` or `delivery_error != ''`), or `None` when no
+    dispatched row exists."""
+    if not session_id or not os.path.isfile(SESSION_KV_DB_PATH):
+        return None
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+            row = conn.execute(
+                "SELECT created_at FROM intercepted_events "
+                "WHERE session_id = ? AND (notified >= 1 OR COALESCE(delivery_error, '') != '') "
+                "ORDER BY id DESC LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            return (row["created_at"] or "") if row is not None else None
+    except sqlite3.Error:
+        return None
+
+
+def _is_triage_first_prompt(prompt_text: str) -> bool:
+    """True when the session's initial user message comes from an autonomous triage turn."""
+    lowered = prompt_text.lower()
+    return "triage" in lowered or "kanban_create" in lowered
+
+
+def _timestamp_epoch_seconds(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _read_pre_kanban_session_task(session_id: str) -> Optional[Dict[str, Any]]:
+    """Read the front-door routing turn from `default` profile `state.db` before `kanban_create` runs.
+
+    Returned as a sibling `routing` object beside `tasks: []` (attributed to
+    `profile = "default"`, with no synthetic kanban task `id`) so portals do not
+    link a non-existent card id against `GET /v1/tasks/{id}`. Scoped strictly to
+    dispatched triage sessions (`notified >= 1` or `delivery_error != ''` in
+    `intercepted_events` whose `state.db` session title and initial prompt match
+    the triage router) so arbitrary chat conversations in the front-door
+    `state.db` cannot be read even if a caller injects their `session_id`. When
+    `sessions.ended_at` is set, or the session was never closed (or never
+    started in `state.db`) and the turn's start timestamp is older than
+    `PRE_KANBAN_STALE_AFTER_SECONDS`, returns a terminal status (`completed`
+    when the front door produced a reply, or `failed` when a routing turn ended,
+    timed out, or failed to open a gateway session) instead of staying
+    `in_progress` or returning `tasks: []` alone. When `<agent_home>/state.db`
+    exists but raises `sqlite3.Error`, falls back to the ledger-backed object
+    with `live_steps: []` and `routing_error` naming the read error.
+    """
+    ledger_created_at = _is_intercepted_event_session(session_id)
+    if ledger_created_at is None:
+        return None
+    db_path = _profile_state_db(_feed_data_root(), DEFAULT_PROFILE)
+    window_size = SESSION_TASK_LIVE_STEPS_MAX * TASK_STEP_ROW_MULTIPLIER
+    steps: list[Dict[str, Any]] = []
+    rows_clipped = False
+    latest_raw_reply: Optional[str] = None
+    title = _scrub_worker_step_text("reply", f"Triage {session_id}")
+    created_at: Any = None
+    ended_at: Any = None
+    has_session = False
+    state_db_error: Optional[str] = None
+    if db_path is not None:
+        try:
+            with closing(_read_only(str(db_path))) as sconn:
+                sess_cols = {r[1] for r in sconn.execute("PRAGMA table_info(sessions)")}
+                if "id" in sess_cols:
+                    title_col = "title" if "title" in sess_cols else "NULL AS title"
+                    started_col = "started_at" if "started_at" in sess_cols else "NULL AS started_at"
+                    ended_col = "ended_at" if "ended_at" in sess_cols else "NULL AS ended_at"
+                    srow = sconn.execute(
+                        f"SELECT {title_col}, {started_col}, {ended_col} FROM sessions WHERE id = ? LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if srow is not None:
+                        has_session = True
+                        if "title" in sess_cols:
+                            raw_title = str(srow["title"] or "")
+                            if not raw_title.startswith("Triage "):
+                                return None
+                            title = _scrub_worker_step_text("reply", raw_title)
+                        created_at = srow["started_at"]
+                        ended_at = srow["ended_at"]
+                msg_cols = {r[1] for r in sconn.execute("PRAGMA table_info(messages)")}
+                if {"session_id", "role", "content"}.issubset(msg_cols):
+                    first_user = sconn.execute(
+                        "SELECT content FROM messages WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if first_user is not None:
+                        first_prompt = _decode_hermes_content(first_user["content"])
+                        if not _is_triage_first_prompt(first_prompt):
+                            return None
+                    active_clause = " AND COALESCE(active, 1) = 1" if "active" in msg_cols else ""
+                    tcalls_col = "tool_calls" if "tool_calls" in msg_cols else "NULL AS tool_calls"
+                    for r in sconn.execute(
+                        f"SELECT content, {tcalls_col} FROM messages "
+                        f"WHERE session_id = ? AND role = 'assistant'{active_clause} "
+                        f"ORDER BY id DESC LIMIT ?",
+                        (session_id, window_size),
+                    ):
+                        if not _parse_tool_calls(r["tool_calls"]):
+                            cand = _decode_hermes_content(r["content"]).strip()
+                            if cand:
+                                latest_raw_reply = cand
+                                break
+                steps, rows_clipped = _extract_steps_from_conn(
+                    sconn,
+                    msg_cols,
+                    session_id,
+                    window_size,
+                    include_detail=False,
+                    raise_on_error=True,
+                )
+                has_session = has_session or bool(steps)
+                if (not has_session or created_at is None) and "session_id" in msg_cols:
+                    mrow = sconn.execute(
+                        "SELECT timestamp FROM messages WHERE session_id = ? ORDER BY id ASC LIMIT 1",
+                        (session_id,),
+                    ).fetchone()
+                    if mrow is not None:
+                        has_session = True
+                        if created_at is None:
+                            created_at = mrow["timestamp"]
+        except sqlite3.Error as exc:
+            state_db_error = _scrub_worker_step_text("reply", str(exc))
+            steps = []
+            rows_clipped = False
+            latest_raw_reply = None
+            title = _scrub_worker_step_text("reply", f"Triage {session_id}")
+            created_at = None
+            ended_at = None
+            has_session = False
+    if not has_session:
+        ledger_epoch = _timestamp_epoch_seconds(ledger_created_at)
+        if (
+            ledger_epoch is not None
+            and (time.time() - ledger_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
+        ):
+            failed_routing: Dict[str, Any] = {
+                "title": title,
+                "profile": DEFAULT_PROFILE,
+                "status": PRE_KANBAN_STATUS_FAILED,
+                "session_id": session_id,
+                "created_at": ledger_epoch,
+                "started_at": ledger_epoch,
+                "completed_at": ledger_epoch,
+                "updated_at": ledger_epoch,
+                "summary": None,
+                "result": None,
+                "error": PRE_KANBAN_STALE_ERROR,
+                "live_steps": [],
+                "steps_truncated": False,
+            }
+            if state_db_error is not None:
+                failed_routing["routing_error"] = state_db_error
+            return failed_routing
+        if state_db_error is not None:
+            return {
+                "title": title,
+                "profile": DEFAULT_PROFILE,
+                "status": PRE_KANBAN_STATUS_IN_PROGRESS,
+                "session_id": session_id,
+                "created_at": ledger_epoch,
+                "started_at": ledger_epoch,
+                "completed_at": None,
+                "updated_at": ledger_epoch,
+                "summary": None,
+                "result": None,
+                "error": None,
+                "routing_error": state_db_error,
+                "live_steps": [],
+                "steps_truncated": False,
+            }
+        return None
+    steps_truncated = rows_clipped or len(steps) > SESSION_TASK_LIVE_STEPS_MAX
+    if len(steps) > SESSION_TASK_LIVE_STEPS_MAX:
+        steps = steps[-SESSION_TASK_LIVE_STEPS_MAX:]
+    updated_at = steps[-1].get("at") if steps else created_at
+    reply_step = next((s for s in reversed(steps) if s.get("kind") == "reply"), None)
+    reply_summary = reply_step.get("preview") if reply_step else None
+    live_steps = steps
+
+    status = PRE_KANBAN_STATUS_IN_PROGRESS
+    completed_at: Any = None
+    summary: Optional[str] = None
+    result: Optional[str] = None
+    error: Optional[str] = None
+
+    has_ended = ended_at is not None and str(ended_at).strip() != ""
+    turn_start_epoch = (
+        _timestamp_epoch_seconds(ledger_created_at)
+        or _timestamp_epoch_seconds(created_at)
+        or _timestamp_epoch_seconds(updated_at)
+    )
+    is_stale = (
+        not has_ended
+        and turn_start_epoch is not None
+        and (time.time() - turn_start_epoch) > PRE_KANBAN_STALE_AFTER_SECONDS
+    )
+    if has_ended or is_stale:
+        completed_at = ended_at if has_ended else (updated_at if updated_at is not None else created_at)
+        if reply_step is not None:
+            status = PRE_KANBAN_STATUS_COMPLETED
+            summary = reply_summary
+            result = (
+                _scrub_worker_step_text("reply", latest_raw_reply).strip()
+                if latest_raw_reply
+                else reply_summary
+            )
+        else:
+            status = PRE_KANBAN_STATUS_FAILED
+            error = PRE_KANBAN_STALE_ERROR
+
+    return {
+        "title": title,
+        "profile": DEFAULT_PROFILE,
+        "status": status,
+        "session_id": session_id,
+        "created_at": created_at,
+        "started_at": created_at,
+        "completed_at": completed_at,
+        "updated_at": completed_at if completed_at is not None else updated_at,
+        "summary": summary,
+        "result": result,
+        "error": error,
+        "live_steps": live_steps,
+        "steps_truncated": steps_truncated,
+    }
 
 
 class _WorkerStepReader:
