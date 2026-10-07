@@ -57,7 +57,8 @@ import (
 
 // credentialProxyContainerName is the broker container, the one that opens the
 // credentialed and the metrics-only listeners; the usage counters poller reads
-// the metrics port off this container and no other.
+// the metrics port off this container and no other, and the Downward API
+// reference that hands the broker its memory limit names it too.
 const credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential.
 
 const (
@@ -116,9 +117,6 @@ const (
 	// Autopilot for the 256Mi the admission added.
 	credentialProxyCPURequest    = "500m"
 	credentialProxyMemoryRequest = "512Mi"
-	// credentialProxyContainerName is the broker container, named exactly
-	// here because the Downward API reference below has to match it.
-	credentialProxyContainerName = "envoy-credential-proxy" // #nosec G101 -- Container name, not a credential
 	// credentialProxyMemoryLimitEnv carries the container's own memory limit
 	// in bytes to the broker, which derives its child memory budget from it
 	// (credential_proxy.py, child_memory_limit_bytes). A resourceFieldRef the
