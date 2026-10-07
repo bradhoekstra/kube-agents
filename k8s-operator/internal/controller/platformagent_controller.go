@@ -313,6 +313,12 @@ type PlatformAgentReconciler struct {
 	// whose echo carries the field, and when the CR is deleted.
 	prunedUsageStatus sync.Map
 
+	// credentialProxyWarningsLogged records, per CR, the spec generation whose
+	// credential-proxy resources warnings reconcileCredentialProxy last logged,
+	// so each generation logs them once. Keyed by ObjectKey, value int64;
+	// cleared when the CR is deleted.
+	credentialProxyWarningsLogged sync.Map
+
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
 	// touches, and a cached read there would have the manager start — and keep — an
@@ -1075,6 +1081,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 
 		// Resource is deleted. Safe to remove finalizer and update.
 		r.forgetUsageStatus(agent)
+		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -2267,15 +2274,21 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 	// egress env keep flowing, and updateStatusReady reports the refusal as
 	// Degraded.
 	refusal, warnings := credentialProxyResourcesRefusal(agent)
-	// The warnings are logged once per spec generation: on the first pass after
-	// the spec changed, before a status write records the generation as
-	// observed. Every pass that follows reads the same spec and would repeat
-	// them indefinitely, with no way to acknowledge one, and the webhook, where
-	// it is on, has already said each once at apply.
-	if agent.Generation != agent.Status.ObservedGeneration {
+	// The warnings are logged once per spec generation: every pass that follows
+	// reads the same spec and would repeat them indefinitely, with no way to
+	// acknowledge one, and the webhook, where it is on, has already said each
+	// once at apply. The gate is held in memory, keyed on the generation this
+	// step last logged, rather than on status.observedGeneration: the
+	// forbidden-mount, shell-sandbox and RuntimeClass refusals run before this
+	// step and record the generation as observed, so a generation that first
+	// went Degraded there would reach this step already observed and never log.
+	// The residue is that an operator restart logs each CR's warnings once more.
+	key := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.credentialProxyWarningsLogged.Load(key); !ok || logged.(int64) != agent.Generation {
 		for _, warning := range warnings {
 			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
 		}
+		r.credentialProxyWarningsLogged.Store(key, agent.Generation)
 	}
 	rendered := agent
 	if refusal != "" {

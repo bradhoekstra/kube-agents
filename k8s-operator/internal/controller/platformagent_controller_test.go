@@ -1117,6 +1117,73 @@ func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedOncePerGe
 	}
 }
 
+// A generation that first went Degraded before the proxy step still logs the
+// note once when it gets there. The RuntimeClass refusal runs earlier and
+// records the generation as observed, so a gate on status.observedGeneration
+// reads the generation as already seen once the RuntimeClass appears.
+func TestPlatformAgentReconciler_Reconcile_CredentialProxyWarningLoggedAfterAnEarlierDegradedPass(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent-proxy-warning-rc", Namespace: "test-ns", Generation: 1},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{Deployment: &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
+				CredentialProxy: &agentv1alpha1.CredentialProxySpec{Resources: &corev1.ResourceRequirements{
+					Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("2Gi")},
+				}},
+			}},
+			Harness: &agentv1alpha1.HarnessSpec{ProjectID: "test-project", Location: "us-central1", ClusterName: "test-cluster"},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(agent)}
+	var logged strings.Builder
+	ctx := logr.NewContext(context.Background(), funcr.New(func(prefix, args string) { logged.WriteString(args + "\n") }, funcr.Options{}))
+	const note = "limits.memory is set without requests.memory"
+
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d failed: %v", i+1, err)
+		}
+	}
+	degraded := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, degraded); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	cond := meta.FindStatusCondition(degraded.Status.Conditions, "Ready")
+	if degraded.Status.Phase != "Degraded" || cond == nil || cond.Reason != reasonRuntimeClassNotFound {
+		t.Fatalf("phase %q, Ready condition %+v; want Degraded on %s", degraded.Status.Phase, cond, reasonRuntimeClassNotFound)
+	}
+	if degraded.Status.ObservedGeneration != 1 {
+		t.Fatalf("status.observedGeneration = %d, want 1 after the RuntimeClass refusal", degraded.Status.ObservedGeneration)
+	}
+	if got := strings.Count(logged.String(), note); got != 0 {
+		t.Fatalf("the note was logged %d times before the proxy step was reached, want none:\n%s", got, logged.String())
+	}
+
+	if err := cl.Create(ctx, &nodev1.RuntimeClass{ObjectMeta: metav1.ObjectMeta{Name: "gvisor"}, Handler: "gvisor"}); err != nil {
+		t.Fatalf("failed to create the RuntimeClass: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after the RuntimeClass appeared failed: %v", err)
+	}
+	if got := strings.Count(logged.String(), note); got != 1 {
+		t.Fatalf("the note was logged %d times on the first pass to reach the proxy step, want once:\n%s", got, logged.String())
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile of the same generation failed: %v", err)
+	}
+	if got := strings.Count(logged.String(), note); got != 1 {
+		t.Errorf("the note was logged %d times in all after a further pass of the same generation, want once:\n%s", got, logged.String())
+	}
+}
+
 func TestPlatformAgentReconciler_Reconcile_NonGitHubRepo(t *testing.T) {
 	scheme := setupScheme()
 
