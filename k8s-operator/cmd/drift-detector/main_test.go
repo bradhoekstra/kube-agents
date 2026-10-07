@@ -517,13 +517,14 @@ func TestJoinDisabledReason(t *testing.T) {
 // The two shutdown lines that name the unreachable clusters tell the operator
 // what became of their records, one line per disposition: the first names the
 // clusters a profile names and the run could not join (or every unreachable
-// cluster when no --profiles-dir declared a scope), whose records went out
-// thin; the second names the clusters no profile names, whose records were
-// held -- profile them or exclude them.
+// cluster when the scope was unknown: no --profiles-dir, or a directory the
+// scope could not read), whose records went out thin; the second names the
+// clusters no readable profile names, whose records were held -- profile them,
+// exclude them, or fix the profile the scope logged.
 func TestUnreachableClustersLine(t *testing.T) {
 	names := []string{`"example-project/us-central1/prod-b"=3`}
 	got := unreachableClustersLine(names)
-	for _, want := range []string{"forwarded without ownership", "Cluster Agent profile names them", names[0]} {
+	for _, want := range []string{"forwarded without ownership", "Cluster Agent profile names them", "could not be read", names[0]} {
 		if !strings.Contains(got, want) {
 			t.Errorf("unreachableClustersLine() = %q, want it to contain %q", got, want)
 		}
@@ -536,7 +537,7 @@ func TestUnreachableClustersLine(t *testing.T) {
 func TestOutOfScopeClustersLine(t *testing.T) {
 	names := []string{`"example-project/us-central1/prod-b"=3`}
 	got := outOfScopeClustersLine(names)
-	for _, want := range []string{"outside the install's scope", "no Cluster Agent profile names them", "held out of the inject", "exclude them", names[0]} {
+	for _, want := range []string{"outside the install's scope", "no readable Cluster Agent profile names them", "held out of the inject", "exclude them", "fix the profile", names[0]} {
 		if !strings.Contains(got, want) {
 			t.Errorf("outOfScopeClustersLine() = %q, want it to contain %q", got, want)
 		}

@@ -29,9 +29,9 @@
 // counted unreachable. With --daemon-url set, what survives is posted to the
 // core-agent daemon as a gitops-drift inject, which is where the pipeline the
 // design describes takes over: session, agent, chat, human approval, GitOps PR
-// -- except an unreachable record from a cluster no Cluster Agent profile
-// names, which is outside the install's scope and is logged and held rather
-// than injected (DriftEvent.OutOfScope).
+// -- except an unreachable record from a cluster no readable Cluster Agent
+// profile names, which is outside the install's scope and is logged and held
+// rather than injected (DriftEvent.OutOfScope).
 //
 // The inject is off unless --daemon-url is set, and off is the default. The
 // agent images carry this binary and the credential proxy's entrypoint starts
@@ -314,21 +314,22 @@ func joinDisabledReason(profilesDir string, scan profileScan) string {
 //
 // The first names the clusters whose records were forwarded without ownership:
 // a profile names them and the join still could not read them (the startup
-// skip lines say why), or the detector ran with no --profiles-dir and so had no
-// scope to hold against. The second names the clusters no profile names, whose
-// records the inject held (DriftEvent.OutOfScope); the operator reading it
-// decides between two actions and the line names both: profile the cluster, or
-// leave it out.
+// skip lines say why), or the scope was unknown -- no --profiles-dir, or a
+// directory the scope could not read, which it logged -- and so there was
+// nothing to hold against. The second names the clusters no readable profile
+// names, whose records the inject held (DriftEvent.OutOfScope); the operator
+// reading it decides between three actions and the line names them: profile
+// the cluster, leave it out, or fix the profile the scope logged by name.
 //
 // Functions rather than branches at the call site for the reason
 // joinDisabledReason is: the wordings can be asserted without a subscription.
 func unreachableClustersLine(unreachable []string) string {
-	return fmt.Sprintf("unreachable clusters (a Cluster Agent profile names them but this run could not join them, or no --profiles-dir declared the scope; their records were forwarded without ownership): %s",
+	return fmt.Sprintf("unreachable clusters (a Cluster Agent profile names them but this run could not join them, or the scope was unknown because no --profiles-dir declared it or the directory could not be read; their records were forwarded without ownership): %s",
 		strings.Join(unreachable, unreachableListSeparator))
 }
 
 func outOfScopeClustersLine(held []string) string {
-	return fmt.Sprintf("clusters outside the install's scope (no Cluster Agent profile names them; their records were logged and held out of the inject -- profile them with the Cluster Agent reconcile, or exclude them): %s",
+	return fmt.Sprintf("clusters outside the install's scope (no readable Cluster Agent profile names them; their records were logged and held out of the inject -- profile them with the Cluster Agent reconcile, exclude them, or fix the profile the scope logged by name): %s",
 		strings.Join(held, unreachableListSeparator))
 }
 
@@ -564,7 +565,7 @@ func realMain(argv []string) error {
 	// six and a fleet of seven this run reached six of. The count alone reads
 	// identically either way.
 	if scan.Skipped > 0 {
-		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable and forwarded without ownership, since a skipped profile still names its cluster -- except one whose config did not parse, which names nothing, so its cluster's records are held as outside the install's scope", commandName, scan.Skipped)
+		log.Printf("%s: %d profile(s) skipped and will NOT be joined; records from their clusters will be counted unreachable and forwarded without ownership, since a skipped profile still names its cluster -- except one whose config could not be read or parsed, which names nothing, so its cluster's records are held as outside the install's scope until it reads", commandName, scan.Skipped)
 	}
 	// Not a skip: the cluster is joined, through the direct credentials instead.
 	// Logged so that a profile count that does not match the cluster count has
@@ -624,9 +625,10 @@ func realMain(argv []string) error {
 	// not.
 	//
 	// The first line is the clusters a profile names and this run could not
-	// join (or every unreachable cluster, when no --profiles-dir declared a
-	// scope); the startup skip lines say why, and their records went out thin.
-	// The second is the clusters no profile names, whose records were held.
+	// join (or every unreachable cluster, when the scope was unknown: no
+	// --profiles-dir, or a directory the scope could not read); the startup
+	// skip lines say why, and their records went out thin. The second is the
+	// clusters no readable profile names, whose records were held.
 	// Neither is necessarily a misconfiguration: a project holding a cluster
 	// nobody intends to onboard sits on the second line every run, which is the
 	// honest answer, and the detector cannot tell that cluster from one whose

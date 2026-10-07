@@ -43,7 +43,22 @@ const (
 	// hiddenPrefix marks a directory entry this scan ignores, so an editor's
 	// or a tool's dot-directory beside the profiles is not read as one.
 	hiddenPrefix = "."
+
+	// clusterProfilePrefix is what the Platform Agent's profile_name puts in
+	// front of every Cluster Agent profile directory, and nothing else carries
+	// it (deploy/shared/sandbox_mirror.py discriminates on the same prefix).
+	// ReadIdentities uses it to tell a cluster profile whose config names no
+	// cluster on this read -- mid-scaffold, or hand-edited -- from a profile
+	// that was never a cluster's, which is silent by contract.
+	clusterProfilePrefix = "cluster-"
 )
+
+// ProfileIdentity is one cluster profile's directory name with the identity
+// its config carries, as ReadIdentities lists them.
+type ProfileIdentity struct {
+	Profile  string
+	Identity Identity
+}
 
 // Cluster is one cluster discovered from a profile, addressable and
 // authenticated. Config carries the control-plane address and this process's
@@ -133,35 +148,54 @@ func (d Discoverer) skip(profile string, err error) {
 // name this cluster? -- as distinct from Discover's reachability question, and
 // the two answers differ for every profile Discover skips.
 //
-// Entries that are not cluster profiles (no cluster_identity block, a hidden
-// directory, a file) are left out silently. A profile whose config cannot be
-// read or parsed is left out too, and reported to onSkip (nil to ignore) with
-// the profile's directory name: a scope listing that failed on it would make
-// one broken profile hide the whole fleet, but a profile that names a cluster
-// and is dropped here is a cluster the caller will treat as unnamed, and the
-// caller has to be able to say so. Only a directory that cannot be read at all
-// is an error, because then the scope is unknown rather than empty.
-func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]Identity, error) {
+// Entries that are not cluster profiles (a hidden directory, a file, a profile
+// with no cluster_identity block and no cluster- prefix) are left out silently.
+// A profile that is dropped for any other reason is reported to onSkip (nil to
+// ignore) with its directory name and why: its config cannot be read or
+// parsed, its cluster_identity is present but incomplete, or it carries the
+// cluster- prefix and its config is absent or names no cluster on this read --
+// the scaffold writes the identity last, so a read landing before that sees a
+// cluster profile that names nothing. A listing that failed on any of these
+// would make one broken profile hide the whole fleet, but a profile dropped
+// here is a cluster the caller will treat as unnamed, and the caller has to be
+// able to say so. Only a directory that cannot be read at all is an error,
+// because then the scope is unknown rather than empty.
+func ReadIdentities(dir string, onSkip func(profile string, err error)) ([]ProfileIdentity, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("read profiles dir %s: %w", dir, err)
 	}
-	var ids []Identity
+	skip := func(profile string, err error) {
+		if onSkip != nil {
+			onSkip(profile, err)
+		}
+	}
+	var ids []ProfileIdentity
 	for _, e := range entries {
 		if !e.IsDir() || strings.HasPrefix(e.Name(), hiddenPrefix) {
 			continue
 		}
-		identity, err := ReadIdentity(filepath.Join(dir, e.Name(), profileConfigFile))
+		clusterProfile := strings.HasPrefix(e.Name(), clusterProfilePrefix)
+		cfg, err := readProfileConfig(filepath.Join(dir, e.Name(), profileConfigFile))
 		if err != nil {
-			if onSkip != nil {
-				onSkip(e.Name(), err)
+			skip(e.Name(), err)
+			continue
+		}
+		if cfg == nil {
+			if clusterProfile {
+				skip(e.Name(), fmt.Errorf("%s is absent", profileConfigFile))
 			}
 			continue
 		}
-		if identity == nil {
-			continue
+		id := cfg.ClusterIdentity
+		switch {
+		case id.complete():
+			ids = append(ids, ProfileIdentity{Profile: e.Name(), Identity: id})
+		case id != (Identity{}):
+			skip(e.Name(), fmt.Errorf("cluster_identity is incomplete: %q", id.String()))
+		case clusterProfile:
+			skip(e.Name(), fmt.Errorf("%s carries no cluster_identity", profileConfigFile))
 		}
-		ids = append(ids, *identity)
 	}
 	return ids, nil
 }

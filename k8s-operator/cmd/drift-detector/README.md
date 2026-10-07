@@ -72,14 +72,17 @@ identity? The reconcile writes one for every cluster it onboards, so a cluster i
 no profile is one the install excluded or never onboarded. Its records are outside the install's
 scope: each is logged as a `DRIFT` line carrying `inject=held_out_of_scope`, counted `out_of_scope=`
 on both the join and inject tallies, and not escalated, and the second shutdown line names the
-cluster as one to profile or exclude. A record from a cluster a profile _does_ name but the join could not read
+cluster as one to profile, exclude, or fix the profile of. A record from a cluster a profile _does_ name but the join could not read
 — every profile skipped at discovery for a missing grant, or a profile the reconcile wrote after
 discovery ran, since discovery runs once — is inside the scope, and is forwarded `unreachable` and
 injected as before; so is every record when the scope is unknown, because `--profiles-dir` was not
-given or the directory cannot be read. A profile whose `config.yaml` cannot be read or parsed names
-no cluster, so its cluster is held as outside the scope; the scope logs that profile by name, once,
-until it reads cleanly. The scope is re-read from the directory at most once a minute, when an
-`unreachable` record arrives, and never addresses a cluster.
+given or the directory cannot be read. A profile whose `config.yaml` cannot be read or parsed, or
+names no complete cluster on a read, is logged by name once until it reads cleanly; it keeps the
+identity it last carried for as long as its directory exists, because the scaffold stamps the
+identity last and in place, so a read landing mid-write must not hold a cluster that was onboarded
+a second earlier, and a profile that has never named a cluster leaves its cluster held as outside
+the scope with that line saying why. The scope is re-read from the directory at most once a minute,
+when an `unreachable` record arrives, and never addresses a cluster.
 
 The split is deliberate on both sides. Each out-of-scope card is thin by construction — no owners,
 no lookup error — and spends a unit of the fleet-wide daily drift budget that the profiled clusters

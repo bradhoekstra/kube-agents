@@ -20,25 +20,15 @@ import (
 	"time"
 )
 
-// writeScopeProfile writes a Cluster Agent profile the way cluster_agent_profile.py
-// does, carrying only what the scope reads: the cluster_identity block.
+// writeScopeProfile is writeClusterProfile (profiles_test.go) taking the
+// identity the scope is then asked about.
 func writeScopeProfile(t *testing.T, dir, profile string, identity clusterIdentity) {
 	t.Helper()
-	home := filepath.Join(dir, profile)
-	if err := os.MkdirAll(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	config := "model:\n  provider: custom\ncluster_identity:\n" +
-		"  project: " + identity.Project + "\n" +
-		"  cluster: " + identity.Cluster + "\n" +
-		"  location: " + identity.Location + "\n"
-	if err := os.WriteFile(filepath.Join(home, "config.yaml"), []byte(config), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeClusterProfile(t, dir, profile, identity.Project, identity.Cluster, identity.Location)
 }
 
 func testProfileScope(dir string, now *time.Time) *profileScope {
-	return &profileScope{dir: dir, rescanAfter: profileScopeRescanInterval, now: func() time.Time { return *now }}
+	return &profileScope{dir: dir, now: func() time.Time { return *now }}
 }
 
 func TestProfileScopeAnswersFromTheProfilesDirectory(t *testing.T) {
@@ -117,6 +107,57 @@ func TestProfileScopeReportsAProfileItCouldNotRead(t *testing.T) {
 	}
 	if len(s.skipped) != 0 {
 		t.Errorf("skipped = %v after a clean read, want empty so a profile that breaks again is logged again", s.skipped)
+	}
+}
+
+// A cluster profile whose config names nothing on this read -- the scaffold
+// stamps the identity last, in place, so a read can land before it -- keeps the
+// identity it last carried while its directory exists, so a re-scaffold of an
+// onboarded cluster does not hold that cluster for an interval; and a cluster
+// profile that has never named a cluster is reported, not passed over as a
+// non-cluster profile, so the hold has a line pointing at the file.
+func TestProfileScopeKeepsAProfilesLastIdentityWhileItsDirectoryExists(t *testing.T) {
+	dir := t.TempDir()
+	prodD := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-d"}
+	writeScopeProfile(t, dir, "cluster-p1-prod-d-us-central1", prodD)
+	now := time.Now()
+	s := testProfileScope(dir, &now)
+	if profiled, _ := s.Profiled(prodD); !profiled {
+		t.Fatal("Profiled(prod-d) = false with its profile written")
+	}
+
+	// Mid-rewrite: the template config, no identity block yet.
+	if err := os.WriteFile(filepath.Join(dir, "cluster-p1-prod-d-us-central1", "config.yaml"), []byte("model:\n  provider: custom\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, known := s.Profiled(prodD); !profiled || !known {
+		t.Errorf("Profiled(prod-d) = (%v, %v) while its config names nothing, want (true, true): the last identity is kept", profiled, known)
+	}
+	if _, ok := s.skipped["cluster-p1-prod-d-us-central1"]; !ok {
+		t.Errorf("skipped = %v, want the profile recorded so the kept identity is logged by name", s.skipped)
+	}
+
+	// Gone: the reconcile offboarded it, and the identity goes with the directory.
+	if err := os.RemoveAll(filepath.Join(dir, "cluster-p1-prod-d-us-central1")); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	if profiled, known := s.Profiled(prodD); profiled || !known {
+		t.Errorf("Profiled(prod-d) = (%v, %v) after the directory was removed, want (false, true)", profiled, known)
+	}
+
+	// Never named a cluster: a cluster- directory the scope has not seen complete.
+	if err := os.MkdirAll(filepath.Join(dir, "cluster-p1-prod-e-us-central1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(profileScopeRescanInterval)
+	prodE := clusterIdentity{Project: "p1", Location: "us-central1", Cluster: "prod-e"}
+	if profiled, known := s.Profiled(prodE); profiled || !known {
+		t.Errorf("Profiled(prod-e) = (%v, %v) for a cluster profile with no config yet, want (false, true)", profiled, known)
+	}
+	if _, ok := s.skipped["cluster-p1-prod-e-us-central1"]; !ok {
+		t.Errorf("skipped = %v, want the identityless cluster profile recorded so the hold is explained by name", s.skipped)
 	}
 }
 

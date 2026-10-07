@@ -137,9 +137,9 @@ const (
 	// alone no longer says which.
 	//
 	// Still forwarded, and whether it is then injected is not decided here:
-	// DriftEvent.OutOfScope carries that, set when no Cluster Agent profile
-	// names the cluster, so a detector stays loud about a cluster it was meant
-	// to reach and quiet about the rest of the project.
+	// DriftEvent.OutOfScope carries that, set when no readable Cluster Agent
+	// profile names the cluster, so a detector stays loud about a cluster it
+	// was meant to reach and quiet about the rest of the project.
 	joinUnreachable joinOutcome = "unreachable"
 
 	// joinFailed is any other lookup error: RBAC, a network fault, a timeout,
@@ -205,7 +205,8 @@ type DriftEvent struct {
 
 	// OutOfScope is set by the joiner on a joinUnreachable record whose
 	// cluster the install's scope does not name: the profiles directory was
-	// read and no Cluster Agent profile in it carries this identity. The
+	// read and no readable Cluster Agent profile in it carries this identity
+	// (scopeIndex says what "readable" covers and how a drop is logged). The
 	// record is logged and not escalated: driftInjectHandler.Handle writes
 	// the DRIFT line with injectHeldOutOfScopeMarker, counts the hold, and
 	// sends nothing.

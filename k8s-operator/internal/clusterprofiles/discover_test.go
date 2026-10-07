@@ -440,26 +440,41 @@ func TestReadIdentitiesListsEveryClusterProfileWithoutAddressingIt(t *testing.T)
 	writeClusterProfile(t, dir, "prod-b", "p1", "prod", "europe-west1")
 	writeNonClusterProfile(t, dir, "platform")
 	writeProfile(t, dir, "broken", "model: [")
+	writeProfile(t, dir, "partial", "cluster_identity:\n  project: p1\n  cluster: half\n")
+	writeProfile(t, dir, "cluster-p1-new-us-central1", "model:\n  provider: custom\n")
+	if err := os.MkdirAll(filepath.Join(dir, "cluster-p1-newer-us-central1"), 0o700); err != nil {
+		t.Fatal(err)
+	}
 	writeProfile(t, dir, ".swap", "cluster_identity:\n  project: p1\n  cluster: hidden\n  location: us-central1\n")
 
-	var skipped []string
+	skipped := map[string]string{}
 	got, err := ReadIdentities(dir, func(profile string, err error) {
-		skipped = append(skipped, profile+": "+err.Error())
+		skipped[profile] = err.Error()
 	})
 	if err != nil {
 		t.Fatalf("ReadIdentities: %v", err)
 	}
-	if len(skipped) != 1 || !strings.HasPrefix(skipped[0], "broken: ") {
-		t.Errorf("skipped = %v, want the unparsable profile reported once by name and nothing else", skipped)
+	for profile, reason := range map[string]string{
+		"broken":                       "parse ",
+		"partial":                      "cluster_identity is incomplete",
+		"cluster-p1-new-us-central1":   "carries no cluster_identity",
+		"cluster-p1-newer-us-central1": "is absent",
+	} {
+		if !strings.Contains(skipped[profile], reason) {
+			t.Errorf("skipped[%s] = %q, want it reported with %q", profile, skipped[profile], reason)
+		}
 	}
-	want := []string{"p1/europe-west1/prod", "p1/us-central1/prod"}
+	if len(skipped) != 4 {
+		t.Errorf("skipped = %v, want exactly the four dropped cluster profiles: the platform profile and the dot-directory are not clusters and are silent", skipped)
+	}
+	want := []string{"prod-a=p1/us-central1/prod", "prod-b=p1/europe-west1/prod"}
 	names := make([]string, 0, len(got))
-	for _, id := range got {
-		names = append(names, id.String())
+	for _, p := range got {
+		names = append(names, p.Profile+"="+p.Identity.String())
 	}
 	sort.Strings(names)
 	if strings.Join(names, ",") != strings.Join(want, ",") {
-		t.Errorf("ReadIdentities = %v, want %v (two cluster profiles; the platform profile, the unparsable one and the dot-directory are not clusters)", names, want)
+		t.Errorf("ReadIdentities = %v, want %v", names, want)
 	}
 }
 

@@ -75,11 +75,9 @@ type profileConfig struct {
 	ClusterIdentity Identity `json:"cluster_identity"`
 }
 
-// ReadIdentity parses the cluster_identity block out of a profile's
-// config.yaml. Returns nil (not an error) when the file is absent or the block
-// is missing or incomplete — that means "not a cluster profile". A config.yaml
-// that exists but cannot be parsed is a real error.
-func ReadIdentity(path string) (*Identity, error) {
+// readProfileConfig reads a profile's config.yaml. Returns nil (not an error)
+// when the file is absent; a file that cannot be read or parsed is an error.
+func readProfileConfig(path string) (*profileConfig, error) {
 	data, err := os.ReadFile(path) // #nosec G304 -- Path to profile config file supplied via flag / discovery
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -90,6 +88,18 @@ func ReadIdentity(path string) (*Identity, error) {
 	var cfg profileConfig
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	return &cfg, nil
+}
+
+// ReadIdentity parses the cluster_identity block out of a profile's
+// config.yaml. Returns nil (not an error) when the file is absent or the block
+// is missing or incomplete — that means "not a cluster profile". A config.yaml
+// that exists but cannot be parsed is a real error.
+func ReadIdentity(path string) (*Identity, error) {
+	cfg, err := readProfileConfig(path)
+	if err != nil || cfg == nil {
+		return nil, err
 	}
 	id := cfg.ClusterIdentity
 	if !id.complete() {
