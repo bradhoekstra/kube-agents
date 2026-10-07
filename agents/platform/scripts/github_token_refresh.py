@@ -706,12 +706,13 @@ def _http_error_detail(exc: urllib.error.HTTPError) -> str:
 
     The broker's busy 503 says what held the request (the slot cap, the child
     memory budget, another refresh); without it the cron log reads only the
-    code. A body that is empty, not JSON, or names no error adds nothing.
+    code. A body that is empty, not JSON, names no error, or is cut short by
+    the connection dropping mid-read adds nothing.
     """
     try:
         raw = exc.read()
         body = json.loads(raw) if raw else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, http.client.HTTPException):
         return ""
     error = body.get("error") if isinstance(body, dict) else None
     return f": {error}" if isinstance(error, str) and error else ""

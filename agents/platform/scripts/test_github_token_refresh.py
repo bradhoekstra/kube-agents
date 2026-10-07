@@ -1,4 +1,5 @@
 import email.message
+import http.client
 import io
 import json
 import os
@@ -203,14 +204,17 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             json.loads(request.data),
         )
 
-    def _refused(self, urlopen, body):
-        urlopen.side_effect = urllib.error.HTTPError(
+    def _refused(self, urlopen, body, read_error=None):
+        refusal = urllib.error.HTTPError(
             "http://127.0.0.1:8765/v1/forge/refresh",
             503,
             "Service Unavailable",
             email.message.Message(),
             io.BytesIO(body),
         )
+        if read_error is not None:
+            refusal.read = MagicMock(side_effect=read_error)
+        urlopen.side_effect = refusal
         with patch.dict(
             os.environ,
             {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
@@ -235,6 +239,14 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_reports_the_bare_code_for_a_body_that_is_not_json(self, urlopen, run):
         message = self._refused(urlopen, b"<html>upstream connect error</html>")
+        self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_sandbox_reports_the_bare_code_for_a_body_cut_short(self, urlopen, run):
+        # IncompleteRead is an HTTPException, neither OSError nor ValueError;
+        # escaping the HTTPError clause it would replace the client's message.
+        message = self._refused(urlopen, b"", read_error=http.client.IncompleteRead(b"{"))
         self.assertEqual("Credential sidecar failed to refresh GitHub auth: HTTP 503", message)
 
     @patch("github_token_refresh.subprocess.run")
