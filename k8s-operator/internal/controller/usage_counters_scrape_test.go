@@ -258,6 +258,33 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 	})
 }
 
+// A line past the bound in a family the poller does not read is skipped, not a
+// failed scrape, so a wanted line after it is still counted: the watcher's
+// events_seen_total carries a reason label copied verbatim from whatever posted
+// the Event, which nothing bounds, and one such line must not freeze the counter.
+// An over-long *wanted* line is still a failed scrape; TestPodUsageSource_FailedScrapes
+// pins that.
+func TestPodUsageSource_SkipsAnOverLongLineOfAnotherFamily(t *testing.T) {
+	overLongOther := `k8s_event_watcher_events_seen_total{reason="` + strings.Repeat("x", usageScrapeMaxLineBytes) + `"} 1`
+	body := strings.Join([]string{
+		overLongOther,
+		eventsInjectedSeries + `{cluster="c"} 5`,
+		processStartTimeSeries + " 1700000000",
+		"",
+	}, "\n")
+	addr := serveBody(t, http.StatusOK, body)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	if err != nil {
+		t.Fatalf("Scrape: %v", err)
+	}
+	if reading.Sample != 5 {
+		t.Errorf("sample = %d, want 5 (the wanted line after the skipped over-long one)", reading.Sample)
+	}
+	if reading.StartTime == nil || *reading.StartTime != 1700000000 {
+		t.Errorf("start time = %v, want 1700000000 (the gauge after the skipped over-long line)", reading.StartTime)
+	}
+}
+
 // A redirect is not followed: the target that would answer 200 with a huge
 // sample is never reached.
 func TestPodUsageSource_DoesNotFollowRedirects(t *testing.T) {

@@ -40,15 +40,20 @@ import (
 const (
 	// usageScrapeTimeout bounds one scrape from connect to the last byte.
 	usageScrapeTimeout = 15 * time.Second
-	// usageScrapeMaxLineBytes is the one bound on a body: a line past it is a
-	// failed scrape. Far above any line either listener writes, a name, five
-	// short labels and a number, and the only memory a scrape holds, since
-	// the body is folded as it is read. A bound on the number of lines would
-	// be a bound on the watcher family's cardinality, which grows with the
-	// fleet for the life of the process and cannot be sized.
+	// usageScrapeMaxLineBytes is the one bound on how much of a body is held at
+	// once: no more than this is buffered for a single line, and the only memory
+	// a scrape holds besides it, since the body is folded as it is read. A
+	// wanted series' line past the bound is a failed scrape; a line of any other
+	// family past it is skipped rather than failing the body (foldUsageBody),
+	// because the watcher's events_seen_total carries a reason label copied
+	// verbatim from whatever posted the Event, which nothing bounds -- so no
+	// bound sized for the listeners' own lines can also hold a hostile one. A
+	// bound on the number of lines would be a bound on the watcher family's
+	// cardinality, which grows with the fleet for the life of the process and
+	// cannot be sized.
 	usageScrapeMaxLineBytes = 64 * 1024
-	// usageScrapeLineBuffer is the scanner's initial buffer, grown up to the
-	// line bound as needed.
+	// usageScrapeLineBuffer is the reader's buffer; a line longer than it is
+	// accumulated across reads up to the line bound.
 	usageScrapeLineBuffer = 4 * 1024
 	// usageScrapeMaxHeaderBytes bounds the response headers the transport
 	// buffers before the body is read, for the same reason the body is read
@@ -221,68 +226,142 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usag
 // other line is skipped unread. The substring is only a prefilter: the parser,
 // not a hand-read of the line, names the metric, so the name in a comment or a
 // label value adds nothing and a UTF-8 name the parser accepts is not dropped by
-// a stricter hand-read. A line past the bound, a candidate line that does not
-// parse, or a sample that is negative or not finite is a failed scrape.
+// a stricter hand-read. A candidate line that does not parse, or a sample that
+// is negative or not finite, is a failed scrape; a wanted line past the bound is
+// too, but a line of any other family past the bound is skipped, not a failure
+// (usageReadScrapeLine).
 func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 	family, statuses := usageSeriesFor(counter)
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	var sum float64
 	var start *float64
-	scanner := bufio.NewScanner(body)
-	scanner.Buffer(make([]byte, 0, usageScrapeLineBuffer), usageScrapeMaxLineBytes)
-	for scanner.Scan() {
-		line := scanner.Text()
+	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
+	for {
+		line, overLong, err := usageReadScrapeLine(reader)
+		if err != nil && !errors.Is(err, io.EOF) {
+			if usageTimedOut(err) {
+				// The client's timeout firing mid-body: the listener answered and
+				// the read stalled, a slow listener rather than a broken one, so
+				// this is its own kind with response guidance -- not the dial
+				// timeout's connect guidance, which would point at the
+				// NetworkPolicy.
+				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindBodyTimeout}
+			}
+			// The body's read error can quote a trailer line; the kind is enough.
+			// The line in hand may be a partial one, so it is not folded.
+			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead}
+		}
 		// A cheap substring prefilter before the parser is handed the line: a
 		// line mentioning neither name cannot be a wanted series, whatever the
-		// parser would make of it. A line that mentions one still has the
-		// parser, not this read, decide what it is.
-		if !strings.Contains(line, family) && !strings.Contains(line, processStartTimeSeries) {
-			continue
-		}
-		families, err := parser.TextToMetricFamilies(strings.NewReader(line + "\n"))
-		if err != nil {
-			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindParse}
-		}
-		for _, name := range []string{family, processStartTimeSeries} {
-			mf := families[name]
-			if mf == nil {
-				continue
-			}
-			for _, metric := range mf.GetMetric() {
-				value, ok := usageSampleValue(metric)
-				if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
-					return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
-				}
-				if name == processStartTimeSeries {
-					captured := value
-					start = &captured
-					continue
-				}
-				if statuses != nil && !statuses[usageLabelValue(metric, toolInvocationsStatusLabel)] {
-					continue
-				}
-				sum += value
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
+		// parser would make of it. A line that mentions one still has the parser,
+		// not this read, decide what it is. The prefix of an over-long line is
+		// enough for this: a wanted series' name sits at the start of its line,
+		// so a prefix that does not mention one cannot be that series.
+		candidate := strings.Contains(line, family) || strings.Contains(line, processStartTimeSeries)
+		switch {
+		case overLong && candidate:
+			// A wanted series' line genuinely too long to parse: a failed scrape,
+			// as before. Any other family's over-long line fell through to be
+			// skipped, so one hostile line elsewhere in the body does not freeze
+			// the counter.
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
+		case overLong:
+			// Skip the over-long line of another family.
+		case candidate:
+			families, perr := parser.TextToMetricFamilies(strings.NewReader(line + "\n"))
+			if perr != nil {
+				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindParse}
+			}
+			for _, name := range []string{family, processStartTimeSeries} {
+				mf := families[name]
+				if mf == nil {
+					continue
+				}
+				for _, metric := range mf.GetMetric() {
+					value, ok := usageSampleValue(metric)
+					if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+						return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+					}
+					if name == processStartTimeSeries {
+						captured := value
+						start = &captured
+						continue
+					}
+					if statuses != nil && !statuses[usageLabelValue(metric, toolInvocationsStatusLabel)] {
+						continue
+					}
+					sum += value
+				}
+			}
 		}
-		if usageTimedOut(err) {
-			// The client's timeout firing mid-body: the listener answered and the
-			// read stalled, a slow listener rather than a broken one, so this is
-			// its own kind with response guidance -- not the dial timeout's
-			// connect guidance, which would point at the NetworkPolicy.
-			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindBodyTimeout}
+		if errors.Is(err, io.EOF) {
+			break
 		}
-		// The body's read error can quote a trailer line; the kind is enough.
-		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindRead}
 	}
 	if sum >= float64(math.MaxInt64) {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 	}
 	return usageReading{Sample: int64(sum), StartTime: start}, nil
+}
+
+// usageReadScrapeLine reads one line from r, bounded at usageScrapeMaxLineBytes,
+// returning it without its trailing newline. overLong is true when the line's
+// content ran past the bound: the returned string is its first
+// usageScrapeMaxLineBytes, the rest of the line through the next newline has been
+// discarded, and the next call resumes at the following line. A bufio.Scanner
+// cannot resume past an over-long token, which is why this reads with a
+// bufio.Reader instead. err is io.EOF once the body is exhausted, carrying any
+// final unterminated line alongside it, and the read's error otherwise.
+func usageReadScrapeLine(r *bufio.Reader) (string, bool, error) {
+	var buf []byte
+	for {
+		chunk, err := r.ReadSlice('\n')
+		buf = append(buf, chunk...)
+		full := errors.Is(err, bufio.ErrBufferFull)
+		// The trailing newline, present only when ReadSlice found it, is not line
+		// content and so does not count against the bound.
+		content := buf
+		if !full && len(content) > 0 && content[len(content)-1] == '\n' {
+			content = content[:len(content)-1]
+		}
+		if len(content) > usageScrapeMaxLineBytes {
+			over := string(content[:usageScrapeMaxLineBytes])
+			if full {
+				return over, true, usageDiscardScrapeLine(r)
+			}
+			return over, true, err
+		}
+		if full {
+			continue
+		}
+		return usageTrimLineEnd(buf), false, err
+	}
+}
+
+// usageDiscardScrapeLine reads and drops bytes through the next newline, so a
+// line past the bound is not held. It returns nil once the newline is consumed,
+// io.EOF if the body ends first, and the read's error otherwise.
+func usageDiscardScrapeLine(r *bufio.Reader) error {
+	for {
+		_, err := r.ReadSlice('\n')
+		if errors.Is(err, bufio.ErrBufferFull) {
+			continue
+		}
+		return err
+	}
+}
+
+// usageTrimLineEnd drops the trailing newline, and a single carriage return
+// before it, that bufio.Scanner's line split would have, so a folded line
+// matches what the previous scanner handed the parser.
+func usageTrimLineEnd(b []byte) string {
+	if n := len(b); n > 0 && b[n-1] == '\n' {
+		b = b[:n-1]
+	}
+	if n := len(b); n > 0 && b[n-1] == '\r' {
+		b = b[:n-1]
+	}
+	return string(b)
 }
 
 // usageSampleValue is the sample of a metric parsed from a single line, which
