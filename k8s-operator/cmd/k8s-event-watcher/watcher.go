@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/cache/synctrack"
 )
 
 const (
@@ -121,9 +122,9 @@ const (
 	// cluster's initial list is tens of thousands of events, nearly all of
 	// which the filter drops in microseconds.
 	deliveryQueueDepth = 1024
-	// listedQueueName is what listedQueue reports waiting for, as a
-	// cache.DoneChecker.
-	listedQueueName = "initial Event list"
+	// syncTrackerName names what Run's sync tracker waits for, in the
+	// tracker's own Name().
+	syncTrackerName = "initial Event list delivered"
 )
 
 // preflightVerbs is the order the preflight asks in (see preflightResource).
@@ -231,30 +232,39 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	// delivery channel also blocks the reflector's next Add or Replace. That is
 	// deliberate: the back-pressure of a slow daemon goes to the watch, where
 	// the API server buffers, instead of into an unbounded buffer here.
-	deliveries := make(chan *corev1.Event, deliveryQueueDepth)
-	queue := newListedQueue()
+	//
+	// The sync keeps the shared informer's meaning: it is reported once every
+	// Event of the initial list has been dispatched and the dispatcher has
+	// returned, which is what the handler registration's HasSynced waited for
+	// before. The same client-go tracker does it here — Start as an initial
+	// Event is handed to delivery, Finished once it has been dispatched,
+	// UpstreamHasSynced once the queue has popped its initial batch — so
+	// cluster_up and the no-cluster-synced exit in main.go still say that
+	// events have reached the daemon, not merely this process.
+	deliveries := make(chan delivery, deliveryQueueDepth)
+	queue := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{})
+	tracker := synctrack.NewSingleFileTracker(syncTrackerName)
 	controller := cache.New(&cache.Config{
 		Queue:                        queue,
 		ListerWatcher:                w.newListWatch(),
 		ObjectType:                   &corev1.Event{},
 		WatchErrorHandlerWithContext: w.handleWatchError,
-		Process: func(obj any, _ bool) error {
+		Process: func(obj any, isInInitialList bool) error {
 			deltas, ok := obj.(cache.Deltas)
 			if !ok {
 				log.Printf("watcher: unexpected object type on pop: %T", obj)
 				return nil
 			}
 			for _, delta := range deltas {
-				if delta.Type == cache.Deleted {
+				ev, ok := eventFromDelta(delta)
+				if !ok {
 					continue
 				}
-				ev, ok := delta.Object.(*corev1.Event)
-				if !ok {
-					log.Printf("watcher: unexpected object type on %s: %T", delta.Type, delta.Object)
-					continue
+				if isInInitialList {
+					tracker.Start()
 				}
 				select {
-				case deliveries <- ev:
+				case deliveries <- delivery{event: ev, initial: isInInitialList}:
 				case <-ctx.Done():
 					return nil
 				}
@@ -287,20 +297,38 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 			select {
 			case <-ctx.Done():
 				return
-			case ev := <-deliveries:
-				w.dispatch(ctx, ev)
+			case d := <-deliveries:
+				w.dispatch(ctx, d.event)
+				if d.initial {
+					tracker.Finished()
+				}
 			}
 		}
 	}()
+	// The queue's own checker tells the tracker when the initial batch has
+	// been popped, as the shared informer's listener learns it from the
+	// same checker; process cannot ask the queue itself, because the pop
+	// holds the queue's lock while process runs. The queue counts an item
+	// as popped before process starts it, so there is a moment in which the
+	// last initial Event is neither started nor finished and the tracker
+	// could read as synced one Event early; client-go's listener has the
+	// same moment, and it only matters if every earlier Event has already
+	// been dispatched, which is the state the sync is about to report.
+	go func() {
+		select {
+		case <-queue.HasSyncedChecker().Done():
+			tracker.UpstreamHasSynced()
+		case <-ctx.Done():
+		}
+	}()
 	go controller.RunWithContext(ctx)
-	// WaitForCacheSync blocks until the initial list has reached the queue
-	// (see listedQueue). Nothing downstream depends on the wait — the queue
-	// and the one delivery goroutine fix the order events reach the
-	// dispatcher whether or not Run is still here — but what follows it
-	// does: markSynced, and through it cluster_up and the no-cluster-synced
-	// exit in main.go, which have to report the list completing and not the
-	// daemon keeping up.
-	if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
+	// WaitForCacheSync blocks until the initial list has been delivered in
+	// full (see the tracker above). Nothing downstream depends on the wait —
+	// the queue and the one delivery goroutine fix the order events reach the
+	// dispatcher whether or not Run is still here — but what follows it does:
+	// markSynced, and through it cluster_up and the no-cluster-synced exit in
+	// main.go.
+	if !cache.WaitForCacheSync(ctx.Done(), tracker.HasSynced) {
 		return fmt.Errorf("watcher: cache sync failed (reflector stopped before initial list completed)")
 	}
 	// Only now is this cluster actually being watched. Everything before here
@@ -603,61 +631,31 @@ func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err 
 	holdOrDone(ctx, w.forbiddenHold)
 }
 
-// listedQueue is the controller's queue: a DeltaFIFO whose HasSynced reports
-// the initial list having arrived rather than having been popped. The pop
-// waits on delivery and delivery waits on the daemon, so the DeltaFIFO's own
-// HasSynced would make the sync report — cluster_up, and the no-cluster-synced
-// exit in main.go — depend on the daemon making progress: a single-cluster
-// install whose daemon stalled on a handful of accepted events would miss
-// initialSyncGrace, restart and relist into the same state. The shared
-// informer this replaced buffered without bound, so its sync never waited on
-// a handler; the list reaching the queue is the fact the report has always
-// stood for. Replace is the reflector's one call for a completed list, in
-// the classic mode after the List and in watch-list mode at the bookmark that
-// ends the initial events, and it is called again on every relist, which
-// changes nothing once listed is closed.
-type listedQueue struct {
-	*cache.DeltaFIFO
-	listedOnce sync.Once
-	listed     chan struct{}
-}
-
-func newListedQueue() *listedQueue {
-	return &listedQueue{
-		DeltaFIFO: cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{EmitDeltaTypeReplaced: true}),
-		listed:    make(chan struct{}),
+// eventFromDelta returns the Event a delta should deliver, or ok=false when it
+// carries nothing to dispatch. A Deleted delta is dropped: an Event expiring
+// says nothing about whether its incident is resolved, and dispatching the
+// tombstone would feed the dedup window or open a card for a fault the API
+// server merely stopped remembering (see Run). Anything whose object is not a
+// *corev1.Event — a DeletedFinalStateUnknown, or a type confusion — is logged
+// and dropped too.
+func eventFromDelta(delta cache.Delta) (*corev1.Event, bool) {
+	if delta.Type == cache.Deleted {
+		return nil, false
 	}
-}
-
-// Replace queues the list as the DeltaFIFO does and records that one has
-// arrived.
-func (q *listedQueue) Replace(list []any, resourceVersion string) error {
-	if err := q.DeltaFIFO.Replace(list, resourceVersion); err != nil {
-		return err
+	ev, ok := delta.Object.(*corev1.Event)
+	if !ok {
+		log.Printf("watcher: unexpected object type on %s: %T", delta.Type, delta.Object)
+		return nil, false
 	}
-	q.listedOnce.Do(func() { close(q.listed) })
-	return nil
+	return ev, true
 }
 
-// HasSynced reports whether the initial list has reached the queue.
-func (q *listedQueue) HasSynced() bool {
-	select {
-	case <-q.listed:
-		return true
-	default:
-		return false
-	}
+// delivery is one Event on its way from the controller's pop to the
+// dispatcher, flagged when it belongs to the initial list the sync waits on.
+type delivery struct {
+	event   *corev1.Event
+	initial bool
 }
-
-// HasSyncedChecker is HasSynced for callers that wait on a channel; the
-// queue is its own checker.
-func (q *listedQueue) HasSyncedChecker() cache.DoneChecker { return q }
-
-// Name names what the checker waits for, as cache.DoneChecker asks.
-func (q *listedQueue) Name() string { return listedQueueName }
-
-// Done is closed once the initial list has reached the queue.
-func (q *listedQueue) Done() <-chan struct{} { return q.listed }
 
 // dispatch converts a *corev1.Event to the internal TriageEvent
 // shape and hands it to the dispatcher. Extracted so both AddFunc

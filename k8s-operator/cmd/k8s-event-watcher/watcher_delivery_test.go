@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,7 +27,13 @@ import (
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/cache"
 )
+
+// syncHoldProbe is how long a test watches for a sync report that must not
+// come. WaitForCacheSync polls every 100 ms, so a sync wrongly reported at the
+// list's arrival shows well inside it.
+const syncHoldProbe = 1500 * time.Millisecond
 
 // stallingDispatcher blocks every Dispatch until release is closed, and
 // counts the calls that have entered.
@@ -56,15 +61,14 @@ func listOf(n int) *corev1.EventList {
 	return list
 }
 
-// TestRun_SyncDoesNotWaitOnDelivery pins that the initial sync — and so
-// cluster_up and the no-cluster-synced exit in main.go — depends on the API
-// server's list alone, not on how fast the daemon takes what the list
-// carries. The delivery channel is bounded, so a daemon that stalls on every
-// accepted event holds the pop once the channel is full; the sync has to be
-// reported anyway, as it was when the shared informer buffered without bound,
-// or a single-cluster install with a wedged daemon restarts the watcher every
-// two minutes and relists into the same state.
-func TestRun_SyncDoesNotWaitOnDelivery(t *testing.T) {
+// TestRun_SyncWaitsForTheInitialListToBeDelivered pins the contract the
+// shared informer kept and this pipeline has to keep: the sync — and so
+// cluster_up and the no-cluster-synced exit in main.go — is reported once
+// every Event of the initial list has been handed to the dispatcher and the
+// dispatcher has returned, not when the list has merely been received. The
+// gauge's 1 means events are flowing, and a daemon that is wedged during the
+// initial list is exactly what the two-minute exit exists to expose.
+func TestRun_SyncWaitsForTheInitialListToBeDelivered(t *testing.T) {
 	captureLog(t)
 	client := fake.NewClientset()
 	allowPreflight(client)
@@ -88,120 +92,62 @@ func TestRun_SyncDoesNotWaitOnDelivery(t *testing.T) {
 			}
 		})
 	}()
+	eventually(t, 10*time.Second, func() bool { return rec.entered.Load() >= 1 }, "delivery to begin")
 	select {
 	case <-synced:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("the sync was not reported within 10s while the daemon stalled; %d dispatch(es) entered, %d events listed, channel depth %d",
-			rec.entered.Load(), deliveryQueueDepth+2, deliveryQueueDepth)
+		t.Fatalf("the sync was reported while the daemon stalled on the first of %d listed events", deliveryQueueDepth+2)
+	case <-time.After(syncHoldProbe):
 	}
 	if got := rec.entered.Load(); got != 1 {
 		t.Errorf("%d dispatches entered while the first was stalled; want 1 (one delivery goroutine per cluster)", got)
 	}
 
 	close(rec.release)
-	cancel()
-	if err := <-done; err != nil {
-		t.Errorf("Run returned %v; want nil on shutdown", err)
-	}
-}
-
-// TestRun_DeletedEventsAreNotDispatched pins that an Event expiring is not
-// an observation: a watch Deleted carries the Event's last state, and
-// converting and dispatching it would feed the dedup window — or open a card
-// — for an incident the API server merely stopped remembering.
-//
-// With no store of known objects the DeltaFIFO drops a Deleted for a key it
-// has already popped, so the one shape of Deleted that reaches process is a
-// deletion queued behind an Add of the same key that has not been popped yet.
-// The test builds exactly that: it stalls delivery with a list wider than
-// the channel so pops stop, sends an Add and then a Delete for one new Event,
-// releases delivery, and checks that Event was dispatched once, for the Add.
-func TestRun_DeletedEventsAreNotDispatched(t *testing.T) {
-	captureLog(t)
-	client := fake.NewClientset()
-	allowPreflight(client)
-	client.PrependReactor("list", "events", func(k8stesting.Action) (bool, runtime.Object, error) {
-		return true, listOf(deliveryQueueDepth + 2), nil
-	})
-	var openWatch atomic.Pointer[watch.FakeWatcher]
-	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
-		fw := watch.NewFakeWithChanSize(2, false)
-		openWatch.Store(fw)
-		return true, fw, nil
-	})
-	rec := &recordingStallDispatcher{release: make(chan struct{})}
-	w := newWatcher(client, rec, targetCluster{Name: "expiring"})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	synced := make(chan struct{})
-	go func() {
-		done <- w.Run(ctx, func(watching bool) {
-			if watching {
-				close(synced)
-			}
-		})
-	}()
 	select {
 	case <-synced:
 	case <-time.After(10 * time.Second):
-		t.Fatal("the reflector never synced")
+		t.Fatal("the sync was not reported within 10s of the daemon recovering")
 	}
-	eventually(t, 10*time.Second, func() bool { return openWatch.Load() != nil }, "the reflector to open its watch")
-	// Delivery is stalled on the first listed event and the channel is full
-	// behind it, so these two queue up under one key and are popped together.
-	live := listedEvent("pod-live", "Unhealthy", "api-live.1")
-	live.ResourceVersion = "11"
-	openWatch.Load().Add(&live)
-	expired := live
-	expired.ResourceVersion = "12"
-	openWatch.Load().Delete(&expired)
-	eventually(t, 10*time.Second, func() bool { return rec.entered.Load() >= 1 }, "delivery to begin")
-
-	close(rec.release)
-	eventually(t, 10*time.Second, func() bool { return rec.count("Unhealthy") >= 1 }, "the live event to be dispatched")
-	// Everything queued ahead of it has been delivered by now; give a second
-	// dispatch of the same Event, if there were going to be one, time to show.
-	time.Sleep(200 * time.Millisecond)
-	if got := rec.count("Unhealthy"); got != 1 {
-		t.Errorf("the Event was dispatched %d time(s); want 1 (its deletion must not be dispatched)", got)
-	}
-
 	cancel()
 	if err := <-done; err != nil {
 		t.Errorf("Run returned %v; want nil on shutdown", err)
 	}
 }
 
-// recordingStallDispatcher stalls like stallingDispatcher until released,
-// and once released counts the reasons it is handed.
-type recordingStallDispatcher struct {
-	entered atomic.Int64
-	release chan struct{}
-	mu      sync.Mutex
-	reasons map[string]int
-}
-
-func (d *recordingStallDispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
-	d.entered.Add(1)
-	select {
-	case <-d.release:
-	case <-ctx.Done():
-		return
+// TestEventFromDelta_SkipsDeletions pins that an Event expiring is not an
+// observation: eventFromDelta, which Run's Process loop calls for every delta
+// the queue pops, delivers an Add, Update, Sync or Replaced and drops a
+// Deleted and a tombstone. With no known-objects store the DeltaFIFO already
+// drops a Deleted for a key it has popped, so this is the guard for the one
+// Deleted that still reaches Process: one coalesced behind a queued Add of the
+// same key.
+func TestEventFromDelta_SkipsDeletions(t *testing.T) {
+	ev := listedEvent("pod-1", "BackOff", "api.1")
+	for _, tc := range []struct {
+		name string
+		dt   cache.DeltaType
+		want bool
+	}{
+		{"added", cache.Added, true},
+		{"updated", cache.Updated, true},
+		{"sync", cache.Sync, true},
+		{"replaced", cache.Replaced, true},
+		{"deleted", cache.Deleted, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := eventFromDelta(cache.Delta{Type: tc.dt, Object: &ev})
+			if ok != tc.want {
+				t.Fatalf("eventFromDelta(%s) ok = %v; want %v", tc.dt, ok, tc.want)
+			}
+			if tc.want && got == nil {
+				t.Fatalf("eventFromDelta(%s) returned a nil event with ok=true", tc.dt)
+			}
+		})
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.reasons == nil {
-		d.reasons = map[string]int{}
-	}
-	d.reasons[ev.Key.Reason]++
-}
-
-func (d *recordingStallDispatcher) RecordScaleUpMark(TriageEvent) bool { return false }
-
-func (d *recordingStallDispatcher) count(reason string) int {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.reasons[reason]
+	t.Run("tombstone", func(t *testing.T) {
+		tomb := cache.DeletedFinalStateUnknown{Key: "default/api.1", Obj: &ev}
+		if _, ok := eventFromDelta(cache.Delta{Type: cache.Deleted, Object: tomb}); ok {
+			t.Error("a DeletedFinalStateUnknown tombstone was delivered; want it dropped")
+		}
+	})
 }

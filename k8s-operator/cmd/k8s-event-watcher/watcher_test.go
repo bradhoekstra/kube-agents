@@ -1342,7 +1342,7 @@ func assertMarkRecordedFirst(t *testing.T, got []string, batch ...string) {
 // TestRun_WatchListStreamMarksAreRecordedBeforeTheStreamIsDelivered pins the
 // restart case in the reflector mode a real client runs in: the initial state
 // arrives through the watch call as a stream, with no List, and the reflector
-// hands it to the informer's store only at the bookmark that ends it. The
+// hands it to the reflector's queue only at the bookmark that ends it. The
 // stream serves the FailedScheduling ahead of the TriggeredScaleUp; the mark
 // must be on record before either is dispatched, and a live event after the
 // bookmark is dispatched as it comes.
