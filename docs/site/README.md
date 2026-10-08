@@ -36,11 +36,16 @@ docs/site/
 
 ## Dependency overrides
 
-`package.json` carries an npm `overrides` entry forcing `postcss-selector-parser` to `^7.1.6`.
-Versions below 7.1.6 parse flat selectors in quadratic time (GHSA-rj75-hqrm-r3gf), the 6.x line
-has no fixed release, and the only consumer, `postcss-nested` 6 under `@expressive-code/core`,
-declares `^6.1.1`. Drop the override once `@expressive-code/core` depends on `postcss-nested` 7 or
-later, which pulls a fixed parser on its own.
+`package.json` carries an npm `overrides` entry that pins `postcss-selector-parser` to `^7.1.6`
+under `postcss-nested`. Versions below 7.1.6 parse flat selectors in quadratic time
+(GHSA-rj75-hqrm-r3gf). The 6.x line has no fixed release, and `postcss-nested` 6, which
+`@expressive-code/core` pulls in, declares `^6.1.1`.
+
+An override replaces the declared range rather than checking against it. npm installs the pinned
+version even when the consumer later declares a range that excludes it, and `npm ci` and `npm ls`
+both exit 0. Nothing mechanical flags that conflict, so revisit this entry on every
+`@astrojs/starlight` or expressive-code bump. Drop it once `@expressive-code/core` depends on
+`postcss-nested` 7 or later, which pulls a fixed parser on its own.
 
 ## Adding a page
 
