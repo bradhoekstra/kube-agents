@@ -138,6 +138,27 @@ used only when it matches the profile-name pattern.
 `eod_report_generator.py` reports the event watcher's ledger rows and excludes drift rows by
 `reason`. Stall rows get the same treatment under `reason = 'ControllerStall'`.
 
+### 3.9 Credentials outlive the tick, and a short tick says what it covered
+
+Every `gcloud`, `kubectl` and `stall_report.py` call the watch makes goes through the credential
+proxy, and a `get-credentials` there is a real gcloud run each time, while kubectl is served from
+the proxy's own managed kubeconfig: of the per-cluster file only the context name crosses, and the
+proxy regenerates the rest. So the watch
+fetches a cluster's credentials once, records the time in its ledger (`credentials`), and reuses
+the kubeconfig until the record is a day old or a read the kubeconfig could not serve says the
+sandbox lost the file or the cluster changed, after which it fetches once more and retries that
+one call. On the 143-cluster install
+[`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md) §2 measured,
+that is about 290 gcloud runs fewer per tick (a `describe` through the endpoint helper and the
+`get-credentials` itself, per cluster), and the proxy's heaviest children.
+
+A sweep that stops at its wall-clock budget writes what it covered into the ledger's budget entry,
+the clusters read of the ones listed, the namespaces read and the cluster the next tick resumes at,
+and says it in chat once, on the tick the sweep first falls short, and once more when the fleet
+fits in one tick again. On such a fleet a cluster is read across consecutive ticks, so the
+operator's interval is the ticks a full pass takes rather than the 30-minute schedule; the budget
+entry is where to read it.
+
 ## 4. Work breakdown
 
 1. Daemon: `controller-stall` kind (advertised in `/healthz`), payload validation, ledger row,
@@ -182,6 +203,8 @@ namespace waiting and is said once, at either step; a ledger that cannot be save
 session that files no card is raised again a day later, and keeps its episode when that re-alert is refused or held; the record `stall_payload` builds is the one
 the daemon's route accepts. `test_triage_reply_roundtrip.py` drives a report cut from `_stall_task_body`
 through the real notifier, server and plugin, and shows the pre-inject stall report shape earns no row.
+The `Credentials` tests hold the fetch to the first tick, a day-old record and a refused first read, and
+the `Coverage` tests the budget entry's content and the chat line's cadence (§3.9).
 
 **Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`, covers the
 daemon end of the chain and everything after it, not the stall watch, which its unit tests cover. Its

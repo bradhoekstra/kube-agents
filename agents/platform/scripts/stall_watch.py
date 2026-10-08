@@ -24,8 +24,13 @@ no model. Each tick:
    ``RECONCILE_EXCLUDE`` or has not yet scaffolded, is left unread: the
    exclusion is the operator keeping a model turn off that cluster, and this
    watch follows the same roster;
-2. per cluster, fetches credentials into a per-cluster kubeconfig and lists
-   the namespaces that are not system namespaces;
+2. per cluster, points a per-cluster kubeconfig at the cluster and lists the
+   namespaces that are not system namespaces. The credentials behind that
+   kubeconfig are fetched on the first tick, again after a day, and again
+   when a read the kubeconfig could not serve says the file or the cluster
+   changed; otherwise the kubeconfig is reused, because a ``get-credentials``
+   through the shim is a real gcloud run at the credential proxy every time
+   and the proxy serves kubectl from its own managed kubeconfig regardless;
 3. per namespace, runs the Cluster Agent's ``stall_report.py --json`` over a
    bounded list of controller kinds;
 4. diffs the rows against the ledger the previous tick left, and on a new
@@ -92,9 +97,15 @@ a missing CRD, and every other row in the namespace is judged as usual); one tha
 them at once, because deleting the namespace is how the motivating case
 usually ends. A listing gcloud itself calls incomplete clears no row for a
 cluster absent from it, and a sweep stops at a wall-clock budget short of
-the schedule and reports what it did not reach, because Hermes kills a
-script that runs an hour and a ledger never written is a tick that never
-happened.
+the schedule, because Hermes kills a script that runs an hour and a ledger
+never written is a tick that never happened. A sweep that stops says what it
+covered: the ledger's budget entry carries the clusters read of the ones
+listed, the namespaces read and the cluster the next tick resumes at, every
+tick it falls short, and chat hears it once, on the tick the sweep first falls
+short, and once more when the fleet fits in one tick again. On a fleet the
+budget does not cover, a cluster is read across consecutive ticks, so the
+interval the operator has is the ticks a full pass takes, not the schedule;
+the budget entry is where to read it.
 """
 
 from __future__ import annotations
@@ -114,7 +125,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Siblings in `$HERMES_HOME/scripts`, this script's own directory and therefore
@@ -220,6 +231,23 @@ TICK_BUDGET_SECONDS = 1500
 #: Ledger key for where an exhausted sweep stopped: the cluster and namespace
 #: the next tick starts from.
 CURSOR_KEY = "cursor"
+#: Ledger key for when each swept cluster's credentials were last fetched, by
+#: cluster id, as the tick's own ISO time. The per-cluster kubeconfig outlives
+#: the tick (the sandbox's `.kubeconfigs`, or the agent home's), and what it
+#: holds is a context name the broker resolves from its own managed
+#: kubeconfig, so a fresh `get-credentials` each tick is a real gcloud run at
+#: the broker that buys nothing after the first. A record is reused until it
+#: is this old, or until a read the kubeconfig could not serve, after which
+#: the tick fetches once more and retries that one call.
+CREDENTIALS_KEY = "credentials"
+CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
+#: Ledger flag for a sweep that stopped at its budget, so chat hears the
+#: coverage once, on the tick the sweep first falls short, and once more when
+#: the fleet fits in one tick again; the ledger's budget entry carries it
+#: every tick.
+BUDGET_EXHAUSTED_KEY = "budget_exhausted"
+COVERAGE_EXHAUSTED_PREFIX = "⏳ **Controller stall watch — budget exhausted:**"
+COVERAGE_RECOVERED_LINE = "✅ **Controller stall watch** — the fleet is swept in one tick again."
 
 #: The fleet-wide system-namespace set, spelled as the Workload Reliability
 #: Audit's exclusion S1 spells it. `kubeagents-system` is deliberately absent:
@@ -519,6 +547,19 @@ def fetch_credentials(project: str, cluster: str, location: str) -> str:
     return path
 
 
+def credentials_current(record: str | None, now: str) -> bool:
+    """Whether a cluster's credential record is young enough to reuse: fetched
+    at `record`, less than CREDENTIALS_REFRESH_SECONDS before `now`. A record
+    that does not parse, or one from the future, is not."""
+    if not record:
+        return False
+    try:
+        age = datetime.fromisoformat(now) - datetime.fromisoformat(record)
+    except (TypeError, ValueError):
+        return False
+    return timedelta(0) <= age < timedelta(seconds=CREDENTIALS_REFRESH_SECONDS)
+
+
 def served_kinds(kubeconfig: str) -> set[str] | None:
     """The namespaced, listable resources the cluster serves, as kubectl names
     them (`deployments.apps`) and by bare plural (`deployments`), so a bare
@@ -615,7 +656,18 @@ def scan_namespace(kubeconfig: str, namespace: str, source: str, kinds: str | No
 
 
 def empty_state() -> dict:
-    return {"version": STATE_SCHEMA_VERSION, "stalls": {}, "unreadable": {}, EPISODES_KEY: {}, "sweep_error": None, INJECT_ERROR_KEY: None, "updated_at": None, CURSOR_KEY: None}
+    return {
+        "version": STATE_SCHEMA_VERSION,
+        "stalls": {},
+        "unreadable": {},
+        EPISODES_KEY: {},
+        "sweep_error": None,
+        INJECT_ERROR_KEY: None,
+        "updated_at": None,
+        CURSOR_KEY: None,
+        CREDENTIALS_KEY: {},
+        BUDGET_EXHAUSTED_KEY: False,
+    }
 
 
 def load_state(path: Path, project: str | None = None) -> dict:
@@ -680,6 +732,7 @@ def with_project(data: dict, project: str) -> dict:
         "unreadable": {},
         EPISODES_KEY: {prefix + k: v for k, v in (data.get(EPISODES_KEY) or {}).items()},
         CURSOR_KEY: cursor,
+        CREDENTIALS_KEY: {prefix + k: v for k, v in (data.get(CREDENTIALS_KEY) or {}).items()},
     }
 
 
@@ -728,6 +781,10 @@ class Sweep:
         #: Listed clusters with no Cluster Agent profile: not read, not listed
         #: here, so their rows clear the way a deleted cluster's do.
         self.unmanaged: set[str] = set()
+        #: Listed clusters in a status the sweep reads, and the ones it tried
+        #: this tick and could not read, for the coverage figures.
+        self.sweepable_clusters: set[str] = set()
+        self.failed_clusters: set[str] = set()
         #: Clusters whose namespace listing succeeded, and those namespaces.
         self.read_clusters: set[str] = set()
         self.listed_namespaces: dict[str, set[str]] = {}
@@ -735,6 +792,10 @@ class Sweep:
         self.budget_exhausted = False
         #: Where the budget stopped the sweep, for the next tick to start from.
         self.cursor: dict | None = None
+        #: When each listed cluster's credentials were last fetched, for the
+        #: ledger: the records this tick reused or renewed, less the clusters a
+        #: fresh fetch did not make readable and the ones no longer listed.
+        self.credentials: dict[str, str] = {}
 
     @property
     def clusters(self) -> int:
@@ -785,11 +846,26 @@ class Sweep:
             return False
         self.budget_exhausted = True
         self.cursor = {"cluster": cid, "namespace": namespace}
-        self.unreadable[BUDGET_SCOPE] = (
-            f"sweep budget of {TICK_BUDGET_SECONDS}s exhausted after {self.clusters} clusters and "
-            f"{self.namespaces} namespaces; the rest were not read this tick"
-        )
+        self.unreadable[BUDGET_SCOPE] = self.coverage_text()
         return True
+
+    def coverage_text(self) -> str:
+        """What an exhausted sweep covered and where the next tick picks up:
+        the clusters read of the ones it could sweep (listed, in a status it
+        reads), the namespaces read, the clusters it tried and could not read,
+        and where the cursor stands. Called by `out_of_budget` once it has set
+        the cursor. On a fleet the budget does not cover, a cluster is read
+        across consecutive ticks, so this is the operator's interval, not the
+        schedule."""
+        resume = cluster_label(self.cursor["cluster"])
+        if self.cursor.get("namespace"):
+            resume += f" at namespace `{self.cursor['namespace']}`"
+        failed = f"; {len(self.failed_clusters)} could not be read" if self.failed_clusters else ""
+        return (
+            f"sweep budget of {TICK_BUDGET_SECONDS}s exhausted: read {self.clusters} of "
+            f"{len(self.sweepable_clusters)} clusters ({self.namespaces} namespaces){failed}; "
+            f"the rest were not read this tick; the next tick resumes at {resume}"
+        )
 
 
 #: What one scope may fail with and the sweep carry on. SandboxUnavailable is a
@@ -872,13 +948,22 @@ def list_projects(projects: list[str], first: str, started: float) -> dict[str, 
     return results
 
 
-def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
+def sweep_fleet(
+    management_project: str,
+    cursor: dict | None = None,
+    credentials: dict[str, str] | None = None,
+    now: str | None = None,
+) -> Sweep:
     """Sweep the management project and every project on the roster. One
     project's listing failing holds that project's rows; every listing failing
-    fails the sweep."""
+    fails the sweep. `credentials` is the ledger's record of when each
+    cluster's kubeconfig was last fetched (see CREDENTIALS_KEY) and `now` the
+    tick's time, which a fetch this tick is recorded as."""
     projects, unread_profiles = roster_projects()
     sweep = Sweep({management_project} | projects)
     sweep.unreadable.update(unread_profiles)
+    records = dict(credentials or {})
+    now = now or now_iso()
     started = time.monotonic()
     source = report_source()
     failures: dict[str, Exception] = {}
@@ -906,6 +991,7 @@ def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
             sweep.listed_clusters.add(cid)
             if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
                 sweepable.append((cid, cluster))
+                sweep.sweepable_clusters.add(cid)
             else:
                 sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
     if len(failures) == len(sweep.projects):
@@ -914,15 +1000,37 @@ def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
         project, name, location = split_cluster_id(cid)
         if sweep.out_of_budget(started, cid):
             break
+        fetched = False
         try:
-            kubeconfig = fetch_credentials(project, name, location)
-            namespaces = list_namespaces(kubeconfig)
+            if credentials_current(records.get(cid), now):
+                kubeconfig = kubeconfig_path(project, name, location)
+            else:
+                kubeconfig = fetch_credentials(project, name, location)
+                fetched = True
+            try:
+                namespaces = list_namespaces(kubeconfig)
+            except READ_FAILURES as exc:
+                # A reused kubeconfig the shim or the cluster refused -- the
+                # sandbox restarted and the file is gone, or the cluster was
+                # recreated: fetch once more and retry this one call. A fetch
+                # this tick is not repeated for the same failure.
+                if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable):
+                    raise
+                kubeconfig = fetch_credentials(project, name, location)
+                fetched = True
+                namespaces = list_namespaces(kubeconfig)
             kinds, dropped = kinds_for(served_kinds(kubeconfig))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
             sweep.unreadable[scope_key(cid)] = failure_text(exc)
+            sweep.failed_clusters.add(cid)
+            # A fetch that did not make the cluster readable is no record to
+            # reuse; a reused record the cluster refused is dropped the same way.
+            records.pop(cid, None)
             continue
+        if fetched:
+            records[cid] = now
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
         if cursor and cursor.get("cluster") == cid and cursor.get("namespace") in namespaces:
@@ -960,6 +1068,15 @@ def sweep_fleet(management_project: str, cursor: dict | None = None) -> Sweep:
                     "detail": f.get("detail", ""),
                     "stalled_for": f.get("stalled_for", ""),
                 }
+    # Clusters the budget never reached keep their records, and so do the
+    # clusters of a project whose listing failed this tick, as `verdict` keeps
+    # their rows: a listing that fails once must not cost a project its fetches.
+    # Clusters no longer listed lose theirs, as their rows go.
+    sweep.credentials = {
+        cid: at
+        for cid, at in records.items()
+        if cid in sweep.listed_clusters or split_cluster_id(cid)[0] in sweep.unlisted_projects
+    }
     return sweep
 
 
@@ -1574,7 +1691,7 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
     try:
         if lookup_error:
             raise lookup_error
-        sweep = sweep_fleet(project, state.get(CURSOR_KEY))
+        sweep = sweep_fleet(project, state.get(CURSOR_KEY), state.get(CREDENTIALS_KEY), now)
     except Exception as exc:  # noqa: BLE001 - a failed sweep is reported once, not raised every tick
         text = failure_text(exc)
         if state.get("sweep_error") != text:
@@ -1586,6 +1703,12 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
             lines.append(SWEEP_RECOVERED_LINE)
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
+        state[CREDENTIALS_KEY] = sweep.credentials
+        if sweep.budget_exhausted and not state.get(BUDGET_EXHAUSTED_KEY):
+            lines.append(f"{COVERAGE_EXHAUSTED_PREFIX} {sweep.unreadable[BUDGET_SCOPE]}")
+        elif not sweep.budget_exhausted and state.get(BUDGET_EXHAUSTED_KEY):
+            lines.append(COVERAGE_RECOVERED_LINE)
+        state[BUDGET_EXHAUSTED_KEY] = sweep.budget_exhausted
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
         lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
     if not dry_run:

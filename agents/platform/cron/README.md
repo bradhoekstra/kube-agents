@@ -100,7 +100,11 @@ noticed in `<n>` more namespaces; alerts follow on later ticks, 3 a tick", the
 cleared line naming at most eight objects, and an "alerts not raised" line when the Session
 KV server refuses an alert, said once until the reason changes, with a line
 when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
-every roster entry owes. A new stall's notice is the alert the Session KV server
+every roster entry owes, and the budget lines: "budget exhausted", said once on the
+tick a sweep first stops at its 25-minute budget, carrying the clusters read of the
+ones listed, the namespaces read and the cluster the next tick resumes at, and "the
+fleet is swept in one tick again" once a sweep completes; the ledger's budget entry
+carries the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
@@ -110,9 +114,11 @@ could not be found. The watch saves its ledger before each inject and fails
 the tick, with no alert, when the ledger cannot be saved, so a ledger that keeps failing
 to save cannot raise the same alerts every tick. A clean tick prints nothing. Anything a tick
 could not read (a
-cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists, a sweep that hit its
-25-minute budget) keeps its rows and is recorded in the ledger, not posted, and
-an exhausted sweep resumes where it stopped. One project's listing failing holds
+cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists) keeps its rows and is recorded in the ledger, not posted;
+a sweep that hit its 25-minute budget keeps the rows it did not reach the same way, records
+what it covered, posts it on the first tick it falls short, and resumes where it stopped. A cluster's
+credentials are fetched on its first tick, after a day, and after a read its kubeconfig
+could not serve; otherwise the tick reuses the kubeconfig it has. One project's listing failing holds
 only that project's rows. The sweep fails, and posts the sweep-failed line, when
 every project's listing fails, when no management project resolves, when
 `stall_report.py` cannot be found, or when the sandbox is lost.
