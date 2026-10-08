@@ -26,13 +26,16 @@ regex tweak that reads fine but shifts what matches:
   ``_normalize_lines(text, fold_decoration=True)``: the check sets
   ``fold_decoration: true``, so each line's lead decoration is folded before either
   pattern sees it. The affirmative is an ``any_of_patterns`` regex
-  ``scraped:\s*["'“‘]?yes\b``, so a space-less ``Scraped:yes``, a spaced
-  ``Scraped : yes`` and a quoted ``Scraped: "yes"`` all affirm -- the fold unwraps
-  a quote that ends its line, and the optional quote class admits one that prose
-  follows on the same line, which the fold leaves wrapped. The negative is a
-  ``forbidden_patterns`` regex
-  ``(?m)\A(?:(?!scraped:\s*["'“‘]?yes\b)[\s\S])*?^scraped:\s*["'“‘]?no\b``:
-  the tail fires on a line whose verdict is ``Scraped: no``, quoted or not -- the fold has taken
+  ``scraped:\s*[^\w\n]*yes\b``, so a space-less ``Scraped:yes``, a spaced
+  ``Scraped : yes``, a quoted ``Scraped: "yes"`` and a marked ``Scraped: ✅ yes``
+  all affirm -- the fold settles the spacing and unwraps a quote that ends its
+  line, and the ``[^\w\n]*`` gap admits any non-word run the fold leaves between
+  the colon and the token (a quote prose follows, a check mark), since the fold
+  handles a line's lead and trail only. The negative is a ``forbidden_patterns``
+  regex
+  ``(?m)\A(?:(?!scraped:\s*[^\w\n]*yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b``:
+  the tail fires on a line whose verdict is ``Scraped: no``, however the value is
+  quoted or marked -- the fold has taken
   the bullet, heading, quote, table cell, checkbox, emoji, ``1.``/``1)``, ``a)``,
   ``i.``, ``#1`` or keycap marker in front of it -- and the ``\A...*?`` prefix lets
   it fire only where no ``Scraped: yes`` precedes the line (the first verdict
@@ -217,8 +220,9 @@ ROUTE_KNOWN_RESIDUALS = [
 # settles the separator's spacing, so both read as `scraped: yes`; without the
 # fold neither affirmed. The twelfth quotes the value and keeps writing on the
 # same line (`Scraped: "yes". The watcher ...`), which the fold leaves wrapped --
-# `_VALUE_WRAP` unwraps only at a line's end or before `;` -- and the optional
-# quote class in the affirmative admits.
+# `_VALUE_WRAP` unwraps only at a line's end or before `;` -- and the thirteenth
+# puts a check mark between the colon and the value (`Scraped: ✅ Yes`), which
+# the fold leaves mid-line; the `[^\w\n]*` gap in the affirmative admits both.
 POLARITY_CORRECT = [
     "Scraped: yes. The watcher metrics are scraped through the "
     '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
@@ -249,6 +253,8 @@ POLARITY_CORRECT = [
     "9095 listener.",
     'Scraped: "yes". The watcher is scraped through the gateway-monitoring '
     "PodMonitoring (9095); k8s_event_watcher_cluster_up is present.",
+    "Scraped: ✅ Yes. The gateway-monitoring PodMonitoring scrapes 9095; "
+    'up{job="platform-agent-gateway-monitoring"} reads 1.',
 ]
 
 # Incorrect answers: the watcher is NOT scraped. Each carries a `Scraped: no`
@@ -271,10 +277,10 @@ POLARITY_CORRECT = [
 # `word:`-labelled negative is still not redded -- the fold stops at the label's
 # first word character, so its `scraped: no` sits mid-line, never at a line start
 # -- and a `word:`-labelled negative with a stray affirmative stays a documented
-# residual (see POLARITY_KNOWN_FALSE_GREEN). The last two quote the verdict and
-# keep writing on the same line (`Scraped: "no" -- ...`, `Scraped: 'no'. ...`),
-# which the fold leaves wrapped; the optional quote class in the negative's tail
-# sees them.
+# residual (see POLARITY_KNOWN_FALSE_GREEN). The last three quote or mark the
+# verdict and keep writing on the same line (`Scraped: "no" -- ...`,
+# `Scraped: 'no'. ...`, `Scraped: ❌ no ...`), which the fold leaves in place
+# mid-line; the `[^\w\n]*` gap in the negative's tail sees them.
 POLARITY_INCORRECT = [
     "Scraped: no. The event watcher's metrics are not scraped: the "
     "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
@@ -305,6 +311,8 @@ POLARITY_INCORRECT = [
     'Scraped: "no" -- the gateway-monitoring PodMonitoring is absent (you asked '
     "for `Scraped: yes` / `Scraped: no`).",
     "Scraped: 'no'. Nothing scrapes 9095 (format: `Scraped: yes` / `Scraped: no`).",
+    "Scraped: ❌ no (you asked for `Scraped: yes` / `Scraped: no`). Nothing "
+    "scrapes 9095.",
 ]
 
 # Polarity residuals, documented in the task.yaml comment and accepted. Each carries
