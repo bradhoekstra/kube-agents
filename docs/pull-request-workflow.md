@@ -674,10 +674,12 @@ Four states that look like somebody else's problem and are not:
 `skip_reason()` and `already_reviewed_reason()` in
 [`scripts/request_reviewers.py`](../scripts/request_reviewers.py) are the same rule in code for the
 one decision this repository automates — it declines to request a reviewer for a draft, for a title
-carrying an ignored keyword, when someone is already requested, when an `OWNERS` approver for one of
-the changed files has submitted `APPROVED` (or, on a pull request the author's own approval already
-covers, anyone `OWNERS` lists under `reviewers` for them), and when a human other than the author
-has submitted `CHANGES_REQUESTED` — each person's latest verdict, as GitHub counts them. An account
+carrying an ignored keyword, when someone is already requested, when no `OWNERS` approver covers
+the change and the author's own approval does not either (a pull request with no changed files),
+when an `OWNERS` approver for one of the changed files has submitted `APPROVED` (or, on a pull
+request the author's own approval already covers, anyone `OWNERS` lists under `reviewers` for
+them), and when a human other than the author has submitted `CHANGES_REQUESTED` — each person's
+latest verdict, as GitHub counts them. An account
 `.github/auto_request_review.yml` lists under `options.robot_accounts` is no person to either rule: a
 robot that reviews under a user account re-reviews every push and files its follow-ups as
 `COMMENTED`, so a `CHANGES_REQUESTED` it once filed would otherwise stand for the life of the pull

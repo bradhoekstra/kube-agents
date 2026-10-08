@@ -339,7 +339,13 @@ def applicable_reviewers(changed_files, root=DEFAULT_OWNERS_ROOT):
     return _applicable_logins(changed_files, root, OWNERS_REVIEWERS_KEY)
 
 
-def author_approves(changed_files, author, root=DEFAULT_OWNERS_ROOT):
+def approvers_by_file(changed_files, root=DEFAULT_OWNERS_ROOT):
+    """`applicable_approvers` kept per changed file: one walk answers both the
+    union and `self_approval_covers`."""
+    return _logins_by_file(changed_files, root, OWNERS_APPROVERS_KEY)
+
+
+def self_approval_covers(by_file, author):
     """Whether the author's implicit self-approval covers every changed file.
 
     Prow's `approved` is per file, so an approver's own pull request opens
@@ -347,11 +353,17 @@ def author_approves(changed_files, author, root=DEFAULT_OWNERS_ROOT):
     is, the roster half of their mixed change is not. A pull request this
     returns True for needs `lgtm` alone, which anyone Prow lists as a reviewer
     can give; any other still needs an approver, so only an approver is asked.
+    No changed files is no coverage: nothing is approved on open.
     """
-    if not changed_files:
+    if not by_file:
         return False
     author = author.lower()
-    return all(author in approvers for approvers in _logins_by_file(changed_files, root, OWNERS_APPROVERS_KEY).values())
+    return all(author in approvers for approvers in by_file.values())
+
+
+def author_approves(changed_files, author, root=DEFAULT_OWNERS_ROOT):
+    """`self_approval_covers` over a fresh walk of `root`."""
+    return self_approval_covers(approvers_by_file(changed_files, root), author)
 
 
 # --------------------------------------------------------------------------- #
@@ -469,9 +481,10 @@ def select_reviewers(config, changed_files, author, rng=random, restrict_to=None
     draw: the OWNERS approvers for the change, when the author's own approval
     does not cover it, so that a non-approver in the pool is never asked for
     an `lgtm` that leaves `approved` outstanding with nobody asked. A pool the
-    restriction empties is a config shape rather than a pull-request one, and
-    asking someone who can `lgtm` beats asking nobody, so it is kept whole and
-    the log says so.
+    restriction empties is a config shape rather than a pull-request one --
+    `main` declines before the draw when the approver set itself is empty, as
+    it is for a pull request with no changed files -- and asking someone who
+    can `lgtm` beats asking nobody, so it is kept whole and the log says so.
     """
     reviewers = reviewers_by_changed_files(config, changed_files, author)
 
@@ -827,17 +840,25 @@ def main(argv=None):
         entry["filename"] for entry in api.get_all(f"/repos/{args.repo}/pulls/{number}/files")
     ]
 
-    approvers = applicable_approvers(changed_files, args.owners_root)
+    by_file = approvers_by_file(changed_files, args.owners_root)
+    approvers = set().union(*by_file.values())
     log(f"OWNERS approvers for the changed files: {', '.join(sorted(approvers)) or 'none'}")
     # Whether the pull request opened with `approved` already on it (#1075)
     # decides both what counts as reviewed and who is drawn: needing lgtm
     # alone, anyone Prow takes an lgtm from will do; otherwise only an
     # approver's review finishes it, so only an approver is asked.
-    self_approved = author_approves(changed_files, author, args.owners_root)
+    self_approved = self_approval_covers(by_file, author)
     if self_approved:
         log(f"{author}'s own approval covers every changed file; lgtm is all it needs")
     else:
         log(f"{author}'s own approval does not cover the change; only an approver is drawn")
+    # Nobody to narrow to -- a pull request with no changed files, where the
+    # walk returns nothing and nothing is self-approved. Narrowing to an empty
+    # set would fall back to the whole pool and could hand a non-approver an
+    # `approved` nobody can give, so nobody is asked, on either path.
+    if not self_approved and not approvers:
+        decline(api, args, "no OWNERS approver covers the change")
+        return 0
 
     # `/request-review` is a person who has read the pull request saying "ask
     # someone anyway", so a verdict already on it does not decide for them.

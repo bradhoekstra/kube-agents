@@ -776,10 +776,13 @@ class MainTest(unittest.TestCase):
         # "author" approves nothing in the fixture tree: whoever is asked has
         # to be able to clear `approved`, or the pull request takes an lgtm it
         # cannot use and sits with nobody asked for the rest.
+        # Against the fixture tree's approvers, not the config group's names:
+        # the group holds three logins the tree does not make approvers, and
+        # an implementation that narrowed by group name would hand them out.
         for seed in range(20):
             self.run_main(pull_request(), [], "--seed", str(seed))
             self.assertEqual(self.code, 0)
-            self.assertIn(self.requested()[0], OWNERS, seed)
+            self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
         self.assertIn("author's own approval does not cover", self.stderr.getvalue())
 
     def test_the_override_narrows_the_pool_too(self):
@@ -791,7 +794,7 @@ class MainTest(unittest.TestCase):
         for seed in range(20):
             self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), "--seed", str(seed))
             self.assertEqual(self.code, 0)
-            self.assertIn(self.requested()[0], OWNERS, seed)
+            self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS, seed)
             self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
 
     def test_an_approver_author_draws_from_the_whole_pool(self):
@@ -829,7 +832,22 @@ class MainTest(unittest.TestCase):
         # outstanding, so an approver is still asked, and only an approver.
         posts = self.run_main(pull_request(), [review("stalhaali", "APPROVED")])
         self.assertEqual(posts, [self.REQUESTED])
-        self.assertIn(self.requested()[0], OWNERS)
+        self.assertIn(self.requested()[0].lower(), ROOT_APPROVERS)
+
+    def test_a_change_no_approver_covers_gets_nobody(self):
+        # No changed files -- an empty commit, or a branch reset to its base
+        # while the pull request stays open: the approver walk returns nothing
+        # and the author self-approves nothing, so narrowing to an empty set
+        # would fall back to the whole pool and could hand a non-approver an
+        # `approved` nobody can give. Both paths decline and say why.
+        posts = self.run_main(pull_request(), [], files=())
+        self.assertEqual(posts, [])
+        self.assertIn("no OWNERS approver covers the change", self.stderr.getvalue())
+        self.assertEqual(self.code, 0)
+        posts = self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), files=())
+        self.assertEqual(posts, [self.REACTIONS])
+        self.assertEqual(self.reaction(), [rr.REACTION_DECLINED])
+        self.assertIn("no OWNERS approver covers the change", self.stdout.getvalue())
 
     def test_an_outsiders_approval_covers_nothing_even_for_an_approver(self):
         # Not under `reviewers` either: Prow sets no lgtm for it.
