@@ -38,7 +38,7 @@ from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterator, Mapping, NamedTuple, TextIO
 
 import api_policy
 import command_policy
@@ -394,6 +394,32 @@ PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 TOOL_DURATION_METRIC = "kubeagents_tool_execution_duration_seconds"
 PROXY_REQUESTS_METRIC = "kubeagents_credential_proxy_requests_total"
+# The queue the child memory budget created, made visible (#2639): how long a
+# request waited to be admitted and which bound held it, how many waited out
+# the bound and were refused, and what is in use against each cap. `bound` is
+# a closed vocabulary: the slot cap, the child memory budget, the forge
+# refresh lock, or the session role's own limit; anything else counts as
+# `other`, so no message text ever opens a series.
+ADMISSION_WAIT_METRIC = "kubeagents_credential_proxy_admission_wait_seconds"
+ADMISSION_REFUSALS_METRIC = "kubeagents_credential_proxy_admission_refusals_total"
+SLOTS_IN_USE_METRIC = "kubeagents_credential_proxy_slots_in_use"
+CHILD_MEMORY_RESERVED_METRIC = "kubeagents_credential_proxy_child_memory_reserved_bytes"
+SLOT_CAP_METRIC = "kubeagents_credential_proxy_slot_cap"
+CHILD_MEMORY_BUDGET_METRIC = "kubeagents_credential_proxy_child_memory_budget_bytes"
+ADMISSION_BOUND_LABEL = "bound"
+ADMISSION_BOUND_SLOT = "slot"
+ADMISSION_BOUND_BUDGET = "budget"
+ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
+ADMISSION_BOUND_SESSION = "session"
+ADMISSION_BOUND_OTHER = "other"
+ADMISSION_BOUNDS = frozenset(
+    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION}
+)
+# Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
+# (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
+# cap in the tree, and the last bound is the broker's own refusal, so "how
+# often did a wait cross either" is a bucket ratio.
+ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
 # (toolInvocationsStatusLabel in usage_counters_scrape.go): a rename here
@@ -1478,6 +1504,9 @@ def child_memory_budget_floor_bytes(max_output_bytes: int) -> int:
 class CommandSlotUnavailable(RuntimeError):
     """A request waited out its admission bound without being admitted.
 
+    `bound` names what held it, from ADMISSION_BOUNDS, for the refusal counter;
+    the message names it for the caller.
+
     Admission covers the slot cap and the child memory budget alike, and the
     message names whichever held the request. Admission goes in arrival order,
     so this is the request that has waited longest, whether the slots or the
@@ -1486,6 +1515,20 @@ class CommandSlotUnavailable(RuntimeError):
     would take the container over its memory limit, and an OOM kill fails every
     request in flight for every caller, not just this one.
     """
+
+    def __init__(self, message: str, bound: str = ADMISSION_BOUND_OTHER) -> None:
+        super().__init__(message)
+        self.bound = bound
+
+
+class AdmissionSnapshot(NamedTuple):
+    """What the executor holds against each cap, for the gauges: read under
+    its lock by `admission_snapshot`, rendered by `ProxyMetrics`."""
+
+    slots_in_use: int
+    slot_cap: int
+    reserved_bytes: int
+    budget_bytes: int | None
 
 
 def session_slot_limit_from_env() -> int:
@@ -1534,7 +1577,8 @@ class SessionSlots:
             if self._in_flight >= self.limit:
                 raise CommandSlotUnavailable(
                     f"the session role is limited to {self.limit} concurrent command(s) through the "
-                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes"
+                    f"credential proxy ({ENV_SESSION_MAX_CONCURRENT_COMMANDS}); try again when one finishes",
+                    bound=ADMISSION_BOUND_SESSION,
                 )
             self._in_flight += 1
         try:
@@ -4562,9 +4606,12 @@ class CommandExecutor:
         kubectl_timeout_seconds: int = DEFAULT_KUBECTL_TIMEOUT_SECONDS,
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
+        metrics: "ProxyMetrics | None" = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
         self.kubectl_timeout_seconds = kubectl_timeout_seconds
+        # Where admission waits are observed; None in a test that wants none.
+        self.metrics = metrics
         self.max_output_bytes = max_output_bytes
         # See DEFAULT_MAX_CONCURRENT_COMMANDS; `parse_args` reads the operator's
         # value from the environment, the way it does the other bounds.
@@ -4914,6 +4961,31 @@ class CommandExecutor:
         with self._slot_condition:
             return len(self._slot_queue)
 
+    def admission_snapshot(self) -> "AdmissionSnapshot":
+        """What is in use against each cap, read under the lock at scrape time:
+        the slots held and the cap, the child memory reserved and the budget
+        (None when the budget is off, which the gauge then leaves absent)."""
+        with self._slot_condition:
+            return AdmissionSnapshot(
+                slots_in_use=self._slots_in_use,
+                slot_cap=self.max_concurrent_commands,
+                reserved_bytes=self._reserved_bytes,
+                budget_bytes=self.children_budget_bytes,
+            )
+
+    def _refusal_bound(self, takes_slot: bool) -> str:
+        """Which bound a refusal counts under, by the rule `_refusal_text` words:
+        the budget when the request does not fit it, the slot cap when it takes
+        a slot and none is free, otherwise whatever holds the queue ahead, which
+        is the budget when it is on and the slot cap when it is off. Called
+        under `_slot_condition`."""
+        nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
+        if not (nothing_admitted or self._fits_budget(takes_slot)):
+            return ADMISSION_BOUND_BUDGET
+        if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
+            return ADMISSION_BOUND_SLOT
+        return ADMISSION_BOUND_BUDGET if self.children_budget_bytes is not None else ADMISSION_BOUND_SLOT
+
     @contextlib.contextmanager
     def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
         """Hold one concurrency slot for the whole of a request.
@@ -5139,7 +5211,9 @@ class CommandExecutor:
                         saw_slots_full = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise CommandSlotUnavailable(self._refusal_text(takes_slot))
+                        raise CommandSlotUnavailable(
+                            self._refusal_text(takes_slot), bound=self._refusal_bound(takes_slot)
+                        )
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
                         held_by_slots = takes_slot and (
@@ -5165,7 +5239,16 @@ class CommandExecutor:
             if takes_slot:
                 self._request_budget.deadline = time.monotonic() + self.timeout_seconds
             self._request_budget.reserved = True
-            waited_ms = int((time.monotonic() - queued_at) * MILLISECONDS_PER_SECOND)
+            waited_seconds = time.monotonic() - queued_at
+            waited_ms = int(waited_seconds * MILLISECONDS_PER_SECOND)
+            # Observed on every admission, under the bound the log names when
+            # it writes a line: the histogram is where an idle broker's waits
+            # read as a measured zero rather than an absence.
+            if self.metrics is not None:
+                held_by_budget = self.children_budget_bytes is not None and not saw_slots_full
+                self.metrics.observe_admission_wait(
+                    ADMISSION_BOUND_BUDGET if held_by_budget else ADMISSION_BOUND_SLOT, waited_seconds
+                )
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
                 if self.children_budget_bytes is not None and not saw_slots_full:
                     with self._slot_condition:
@@ -5716,7 +5799,9 @@ class CommandExecutor:
             if caller is not None and _caller_has_gone(caller):
                 raise CallerHungUp(REFRESH_LOCK_HUNG_UP_TEXT)
             if time.monotonic() >= deadline:
-                raise CommandSlotUnavailable(self._refresh_lock_wait_text(provider, yielded_since))
+                raise CommandSlotUnavailable(
+                    self._refresh_lock_wait_text(provider, yielded_since), bound=ADMISSION_BOUND_REFRESH_LOCK
+                )
 
     @staticmethod
     def _refresh_lock_wait_text(
@@ -5758,7 +5843,8 @@ class CommandExecutor:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise CommandSlotUnavailable(
-                        self._refresh_lock_wait_text(provider, yielded_since)
+                        self._refresh_lock_wait_text(provider, yielded_since),
+                        bound=ADMISSION_BOUND_REFRESH_LOCK,
                     )
                 self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
 
@@ -5838,12 +5924,15 @@ class CommandExecutor:
                     # the helper under its own reservation, and the client is
                     # told busy and retries, coalescing if the verb's token
                     # was its own.
+                    # Counted under the budget: what the caller stepped aside
+                    # from, for good, is a vcs verb holding the budget it needs.
                     raise CommandSlotUnavailable(
                         self._refresh_lock_wait_text(
                             provider,
                             yielded_since=queued_at,
                             budget_in_use=self._budget_in_use_text_locked(),
-                        )
+                        ),
+                        bound=ADMISSION_BOUND_BUDGET,
                     ) from exc
                 except CommandSlotUnavailable as exc:
                     if deadline is None:
@@ -5853,7 +5942,8 @@ class CommandExecutor:
                             provider,
                             yielded_since=queued_at,
                             budget_in_use=self._budget_in_use_text_locked(),
-                        )
+                        ),
+                        bound=getattr(exc, "bound", ADMISSION_BOUND_OTHER),
                     ) from exc
             try:
                 result = self._run_forge_helper(
@@ -7077,6 +7167,67 @@ class ProxyMetrics:
         self._duration_buckets: dict[str, list[int]] = {}
         self._duration_sum: dict[str, float] = {}
         self._duration_count: dict[str, int] = {}
+        # Admission waits per bound: cumulative buckets, sum and count, as above.
+        self._admission_buckets: dict[str, list[int]] = {}
+        self._admission_sum: dict[str, float] = {}
+        self._admission_count: dict[str, int] = {}
+        self._refusals: dict[str, int] = {}
+        # The executor's `admission_snapshot`, read at render time; None until
+        # serve() wires one, and the gauges are absent until then.
+        self._admission_gauges: Callable[[], AdmissionSnapshot] | None = None
+
+    @staticmethod
+    def _observe(
+        buckets: dict[str, list[int]],
+        sums: dict[str, float],
+        counts: dict[str, int],
+        edges: tuple[float, ...],
+        key: str,
+        value: float,
+    ) -> None:
+        """One observation into a histogram family: the cumulative bucket
+        counts, the sum and the count, under the caller's lock."""
+        cumulative = buckets.setdefault(key, [0] * len(edges))
+        for index, edge in enumerate(edges):
+            if value <= edge:
+                cumulative[index] += 1
+        sums[key] = sums.get(key, 0.0) + value
+        counts[key] = counts.get(key, 0) + 1
+
+    @staticmethod
+    def _render_histogram(
+        lines: list[str],
+        name: str,
+        label: str,
+        edges: tuple[float, ...],
+        families: dict[str, tuple[list[int], float, int]],
+    ) -> None:
+        """One histogram family in the text exposition, one series set per
+        label value, in the order the caller sorted them."""
+        for value, (buckets, total, count) in families.items():
+            escaped = _escape_label_value(value)
+            for edge, cumulative in zip(edges, buckets):
+                lines.append(f'{name}_bucket{{{label}="{escaped}",le="{edge}"}} {cumulative}')
+            lines.append(f'{name}_bucket{{{label}="{escaped}",le="+Inf"}} {count}')
+            lines.append(f'{name}_sum{{{label}="{escaped}"}} {total:.6f}')
+            lines.append(f'{name}_count{{{label}="{escaped}"}} {count}')
+
+    def observe_admission_wait(self, bound: str, seconds: float) -> None:
+        bound = bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER
+        with self._lock:
+            self._observe(
+                self._admission_buckets, self._admission_sum, self._admission_count,
+                ADMISSION_WAIT_BUCKETS, bound, seconds,
+            )
+
+    def record_refusal(self, bound: str) -> None:
+        bound = bound if bound in ADMISSION_BOUNDS else ADMISSION_BOUND_OTHER
+        with self._lock:
+            self._refusals[bound] = self._refusals.get(bound, 0) + 1
+
+    def set_admission_gauges(self, snapshot: Callable[[], AdmissionSnapshot] | None) -> None:
+        with self._lock:
+            self._admission_gauges = snapshot
 
     def record_tool(self, tool: str, subcommand: str, status: str) -> None:
         key = (tool, subcommand, status)
@@ -7085,12 +7236,10 @@ class ProxyMetrics:
 
     def observe_duration(self, tool: str, seconds: float) -> None:
         with self._lock:
-            buckets = self._duration_buckets.setdefault(tool, [0] * len(TOOL_DURATION_BUCKETS))
-            for index, bound in enumerate(TOOL_DURATION_BUCKETS):
-                if seconds <= bound:
-                    buckets[index] += 1
-            self._duration_sum[tool] = self._duration_sum.get(tool, 0.0) + seconds
-            self._duration_count[tool] = self._duration_count.get(tool, 0) + 1
+            self._observe(
+                self._duration_buckets, self._duration_sum, self._duration_count,
+                TOOL_DURATION_BUCKETS, tool, seconds,
+            )
 
     def record_request(self, endpoint: str, status_code: str) -> None:
         key = (endpoint, status_code)
@@ -7105,6 +7254,14 @@ class ProxyMetrics:
                 tool: (list(self._duration_buckets[tool]), self._duration_sum[tool], self._duration_count[tool])
                 for tool in sorted(self._duration_buckets)
             }
+            admissions = {
+                bound: (list(self._admission_buckets[bound]), self._admission_sum[bound], self._admission_count[bound])
+                for bound in sorted(self._admission_buckets)
+            }
+            refusals = sorted(self._refusals.items())
+            gauges = self._admission_gauges
+        # The snapshot takes the executor's lock, so it is read outside this one.
+        snapshot = gauges() if gauges is not None else None
         lines = [
             f"# HELP {TOOL_INVOCATIONS_METRIC} CLI tool executions brokered, by tool, subcommand and outcome.",
             f"# TYPE {TOOL_INVOCATIONS_METRIC} counter",
@@ -7118,13 +7275,7 @@ class ProxyMetrics:
             f"# HELP {TOOL_DURATION_METRIC} Wall-clock seconds a brokered command ran, by tool.",
             f"# TYPE {TOOL_DURATION_METRIC} histogram",
         ]
-        for tool, (buckets, total, count) in durations.items():
-            label = _escape_label_value(tool)
-            for bound, cumulative in zip(TOOL_DURATION_BUCKETS, buckets):
-                lines.append(f'{TOOL_DURATION_METRIC}_bucket{{tool="{label}",le="{bound}"}} {cumulative}')
-            lines.append(f'{TOOL_DURATION_METRIC}_bucket{{tool="{label}",le="+Inf"}} {count}')
-            lines.append(f'{TOOL_DURATION_METRIC}_sum{{tool="{label}"}} {total:.6f}')
-            lines.append(f'{TOOL_DURATION_METRIC}_count{{tool="{label}"}} {count}')
+        self._render_histogram(lines, TOOL_DURATION_METRIC, "tool", TOOL_DURATION_BUCKETS, durations)
         lines += [
             f"# HELP {PROXY_REQUESTS_METRIC} HTTP requests answered on the credentialed listener, by route family and status code.",
             f"# TYPE {PROXY_REQUESTS_METRIC} counter",
@@ -7134,6 +7285,35 @@ class ProxyMetrics:
                 f'{PROXY_REQUESTS_METRIC}{{endpoint="{_escape_label_value(endpoint)}",'
                 f'status_code="{_escape_label_value(status_code)}"}} {count}'
             )
+        lines += [
+            f"# HELP {ADMISSION_WAIT_METRIC} Seconds a request waited to be admitted, by the bound that held it (slot cap or child memory budget).",
+            f"# TYPE {ADMISSION_WAIT_METRIC} histogram",
+        ]
+        self._render_histogram(lines, ADMISSION_WAIT_METRIC, ADMISSION_BOUND_LABEL, ADMISSION_WAIT_BUCKETS, admissions)
+        lines += [
+            f"# HELP {ADMISSION_REFUSALS_METRIC} Requests answered with the busy 503, by the bound that refused them.",
+            f"# TYPE {ADMISSION_REFUSALS_METRIC} counter",
+        ]
+        for bound, count in refusals:
+            lines.append(f'{ADMISSION_REFUSALS_METRIC}{{{ADMISSION_BOUND_LABEL}="{_escape_label_value(bound)}"}} {count}')
+        if snapshot is not None:
+            lines += [
+                f"# HELP {SLOTS_IN_USE_METRIC} Command slots held right now.",
+                f"# TYPE {SLOTS_IN_USE_METRIC} gauge",
+                f"{SLOTS_IN_USE_METRIC} {snapshot.slots_in_use}",
+                f"# HELP {SLOT_CAP_METRIC} Command slots the broker admits at once.",
+                f"# TYPE {SLOT_CAP_METRIC} gauge",
+                f"{SLOT_CAP_METRIC} {snapshot.slot_cap}",
+                f"# HELP {CHILD_MEMORY_RESERVED_METRIC} Child memory reserved by admitted requests right now, in bytes.",
+                f"# TYPE {CHILD_MEMORY_RESERVED_METRIC} gauge",
+                f"{CHILD_MEMORY_RESERVED_METRIC} {snapshot.reserved_bytes}",
+            ]
+            if snapshot.budget_bytes is not None:
+                lines += [
+                    f"# HELP {CHILD_MEMORY_BUDGET_METRIC} Child memory the budget admits reservations against, in bytes; absent while the budget is off.",
+                    f"# TYPE {CHILD_MEMORY_BUDGET_METRIC} gauge",
+                    f"{CHILD_MEMORY_BUDGET_METRIC} {snapshot.budget_bytes}",
+                ]
         lines += [
             f"# HELP {PROCESS_START_TIME_METRIC} Start time of the process since unix epoch in seconds, captured once at start.",
             f"# TYPE {PROCESS_START_TIME_METRIC} gauge",
@@ -8828,8 +9008,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         either bound is the one that would take the container over its memory limit.
         `error` is the key the shim prints, so the agent reads why rather than
         a bare exit 1, and `code` lets a caller tell "busy, retry" from a
-        failure.
+        failure. Counted here, once per route that answers it, under the bound
+        the exception carries.
         """
+        self.metrics.record_refusal(getattr(exc, "bound", ADMISSION_BOUND_OTHER))
         self._json(
             HTTPStatus.SERVICE_UNAVAILABLE,
             {"status": "busy", "code": "CREDENTIAL_PROXY_BUSY", "error": str(exc)},
@@ -9056,7 +9238,9 @@ def serve(args: argparse.Namespace) -> None:
         # The container's limit, through the operator's Downward API variable
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
+        metrics=CredentialProxyHandler.metrics,
     )
+    CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.session_slots = SessionSlots(session_slot_limit_from_env())
