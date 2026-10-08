@@ -112,6 +112,15 @@ const (
 	// initialEventsEndValue is the value the API server sets on the bookmark
 	// annotation that ends a watch-list stream's initial events.
 	initialEventsEndValue = "true"
+	// deliveryQueueDepth is how many converted events may wait between the
+	// controller that pops them off the reflector's queue and the goroutine
+	// that dispatches them. The pop runs under the queue's lock, so a full
+	// channel holds the reflector until the dispatcher catches up — the
+	// pressure a slow daemon exerts lands on the watch connection rather than
+	// on this process's heap. Sized for a burst, not a backlog: a 1,900-node
+	// cluster's initial list is tens of thousands of events, nearly all of
+	// which the filter drops in microseconds.
+	deliveryQueueDepth = 1024
 )
 
 // preflightVerbs is the order the preflight asks in (see preflightResource).
@@ -137,14 +146,17 @@ type eventDispatcher interface {
 // ever entered concurrently, race on the slice header.
 var errorHandlerOnce sync.Once
 
-// watcher manages the client-go event informer loop. It registers handlers
-// for event creation (Add) and repeats (Update), converts raw Events to
-// TriageEvent payloads, and forwards them to the eventDispatcher.
+// watcher manages one cluster's client-go reflector loop. It converts each
+// Event the reflector lists or watches — a creation or a repeat alike — to a
+// TriageEvent payload, forwards it to the eventDispatcher, and keeps no copy:
+// there is no informer store behind it, because nothing in this binary reads
+// an Event back once it has been dispatched (the dedup and scale-up memos
+// hold their own bounded entries), and a store would otherwise grow with the
+// event backlog of every watched cluster for no reader.
 type watcher struct {
-	client       kubernetes.Interface
-	dispatcher   eventDispatcher
-	cluster      targetCluster
-	resyncPeriod time.Duration
+	client     kubernetes.Interface
+	dispatcher eventDispatcher
+	cluster    targetCluster
 	// forbiddenHold is the wait applied by handleWatchError after a 403 and by
 	// awaitPermitted after a denied preflight; it is forbiddenRetryInterval
 	// everywhere except tests, which shorten it.
@@ -171,23 +183,20 @@ type watcher struct {
 	watching bool
 }
 
-// newWatcher constructs a watcher. resyncPeriod == 0 disables the
-// periodic resync (informer only fires on real API events); non-zero
-// values re-fire every registered event through the handler at that
-// cadence — usually not what you want, so default 0 in main.go.
-func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster, resyncPeriod time.Duration) *watcher {
+// newWatcher constructs a watcher. There is no resync period: a resync
+// re-fires every object a store holds, and this watcher holds none.
+func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster) *watcher {
 	return &watcher{
 		client:        client,
 		dispatcher:    dispatcher,
 		cluster:       cluster,
-		resyncPeriod:  resyncPeriod,
 		forbiddenHold: forbiddenRetryInterval,
 	}
 }
 
 // Run asks whether this identity may list and watch Events on the cluster,
-// holds until it may (see awaitPermitted), then starts the informer + handler
-// goroutines and blocks until ctx is cancelled. Returns any startup error
+// holds until it may (see awaitPermitted), then starts the reflector, the
+// delivery goroutine and blocks until ctx is cancelled. Returns any startup error
 // (e.g., initial list failure, or ctx cancelled while held at preflight);
 // shutdown-path errors are logged but not returned so callers can distinguish
 // "startup failed, restart me" from "clean shutdown."
@@ -197,50 +206,59 @@ func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster
 // handleWatchError), and with true again when a later attempt succeeds. It
 // fires once per transition, never twice with the same value, and never
 // before the initial list has completed: a cluster held at preflight or from
-// its first list never hears anything. The call is made from an informer
+// its first list never hears anything. The call is made from a reflector
 // goroutine, so it must not block.
 func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error {
 	w.onWatching = onWatching
 	if err := w.awaitPermitted(ctx); err != nil {
 		return err
 	}
-	eventInformer := cache.NewSharedIndexInformer(w.newListWatch(), &corev1.Event{}, w.resyncPeriod, cache.Indexers{})
-
-	handler, err := eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			ev, ok := obj.(*corev1.Event)
+	// The reflector lists and watches into a DeltaFIFO, the controller pops
+	// each delta and process hands the Event to the delivery goroutine, which
+	// converts and dispatches it. That is the whole pipeline: no indexer, no
+	// shared informer, so an Event is referenced by this process only between
+	// the reflector receiving it and the dispatcher returning. Add and Update
+	// both reach dispatch — an Update is the API server bumping an Event's
+	// Count / LastTimestamp when the kubelet reports a repeat, and each one is
+	// another observation feeding the dedup window's LastSeen. Deletions are
+	// dropped: an Event expiring says nothing about whether its incident is
+	// resolved, and a tombstone must not trigger an investigation.
+	//
+	// The pop runs under the queue's lock, so a process that blocks on a full
+	// delivery channel also blocks the reflector's next Add or Replace. That is
+	// deliberate: the back-pressure of a slow daemon goes to the watch, where
+	// the API server buffers, instead of into an unbounded buffer here.
+	deliveries := make(chan *corev1.Event, deliveryQueueDepth)
+	queue := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{EmitDeltaTypeReplaced: true})
+	controller := cache.New(&cache.Config{
+		Queue:                        queue,
+		ListerWatcher:                w.newListWatch(),
+		ObjectType:                   &corev1.Event{},
+		WatchErrorHandlerWithContext: w.handleWatchError,
+		Process: func(obj any, _ bool) error {
+			deltas, ok := obj.(cache.Deltas)
 			if !ok {
-				log.Printf("watcher: unexpected object type on Add: %T", obj)
-				return
+				log.Printf("watcher: unexpected object type on pop: %T", obj)
+				return nil
 			}
-			w.dispatch(ctx, ev)
-		},
-		UpdateFunc: func(_, newObj any) {
-			// Update fires when the k8s API bumps the Event's
-			// Count / LastTimestamp (kubelet reports a repeat).
-			// We treat each update as another observation so
-			// persistent failures continue to feed the dedup
-			// window's LastSeen bump.
-			ev, ok := newObj.(*corev1.Event)
-			if !ok {
-				log.Printf("watcher: unexpected object type on Update: %T", newObj)
-				return
+			for _, delta := range deltas {
+				if delta.Type == cache.Deleted {
+					continue
+				}
+				ev, ok := delta.Object.(*corev1.Event)
+				if !ok {
+					log.Printf("watcher: unexpected object type on %s: %T", delta.Type, delta.Object)
+					continue
+				}
+				select {
+				case deliveries <- ev:
+				case <-ctx.Done():
+					return nil
+				}
 			}
-			w.dispatch(ctx, ev)
+			return nil
 		},
-		// No DeleteFunc — event deletion is not a signal we care
-		// about; the underlying incident may or may not be
-		// resolved and we don't want to trigger investigations
-		// on tombstones.
 	})
-	if err != nil {
-		return fmt.Errorf("watcher: register event handler: %w", err)
-	}
-	// Must be registered before RunWithContext: the informer refuses a handler
-	// once it is running.
-	if err := eventInformer.SetWatchErrorHandlerWithContext(w.handleWatchError); err != nil {
-		return fmt.Errorf("watcher: register watch error handler: %w", err)
-	}
 	// Report client-go's internal errors ("unknown object type in
 	// cache" on shutdown, where cache.HandleCrash trips over
 	// ctx.Done races) through our logger too. Note this appends to
@@ -258,13 +276,26 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 		})
 	})
 
-	go eventInformer.RunWithContext(ctx)
-	// WaitForCacheSync blocks until the initial list is done —
-	// without this, the first N events after startup would
-	// arrive without their prior Count/LastTimestamp, breaking
-	// the dedup logic.
-	if !cache.WaitForCacheSync(ctx.Done(), handler.HasSynced) {
-		return fmt.Errorf("watcher: cache sync failed (informer stopped before initial list completed)")
+	// One delivery goroutine per cluster, so a cluster's events reach its
+	// dispatcher in the order the API server handed them over, which the
+	// dedup window and the scale-up marks both rely on.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev := <-deliveries:
+				w.dispatch(ctx, ev)
+			}
+		}
+	}()
+	go controller.RunWithContext(ctx)
+	// WaitForCacheSync blocks until the initial list has been popped in
+	// full — without this, the first N events after startup would be
+	// delivered without their prior Count/LastTimestamp, breaking the
+	// dedup logic.
+	if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
+		return fmt.Errorf("watcher: cache sync failed (reflector stopped before initial list completed)")
 	}
 	// Only now is this cluster actually being watched. Everything before here
 	// is a cluster we are *trying* to watch: WaitForCacheSync has no timeout
@@ -580,7 +611,7 @@ func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
 // a list in an order that puts a pod's FailedScheduling ahead of the
 // TriggeredScaleUp or NotTriggerScaleUp recorded against it: a plain list is
 // served in name order, which for one pod is creation order, and a watch-list
-// stream is handed to the informer's store in map order. Judged as they
+// stream is handed to the reflector's queue in map order. Judged as they
 // arrive, the FailedScheduling would be decided before its mark was on record
 // and open a card for a pod that scheduled while the watcher was not
 // watching. That is true of the initial list and of every relist after a
@@ -589,8 +620,8 @@ func (w *watcher) dispatch(ctx context.Context, ev *corev1.Event) {
 // (handleWatchError) — and client-go flags only the first of those as the
 // initial list, so a guard on delivery would cover the restart and not the
 // relist. The marks are therefore recorded off the list or the stream itself,
-// as the API server hands it to the reflector, which is before the informer's
-// store is replaced and so before any of the batch reaches the handler.
+// as the API server hands it to the reflector, which is before the queue is
+// replaced and so before any of the batch reaches delivery.
 // Recording keeps the latest mark by event time and is idempotent, so the
 // informer delivering the same mark afterwards changes nothing; the
 // dispatcher counts and logs it then, once, as it always did.
@@ -619,7 +650,7 @@ func (w *watcher) recordMarksFromList(list *corev1.EventList) {
 // recordMarksFromStream wraps a watch opened with sendInitialEvents, which is
 // how the reflector's watch-list mode replaces the list, and records each mark
 // as it streams in (see recordMark). The reflector hands the initial events
-// to the informer's store only once the bookmark that ends them has arrived,
+// to the reflector's queue only once the bookmark that ends them has arrived,
 // so every mark is on record before any of the batch is delivered; the count
 // is logged at that bookmark. Events pass through unchanged and in order.
 func (w *watcher) recordMarksFromStream(wi watch.Interface) watch.Interface {
