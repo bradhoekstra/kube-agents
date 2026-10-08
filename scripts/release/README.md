@@ -562,10 +562,10 @@ tag on a commit above main's last release, which needs a fresh validated candida
 matrix on the same night; and because `release-scheduler.yml` dispatches `release-publish.yml`
 only when `should_release=true`, a quiet day leaves no `release-publish.yml` run behind at all, so
 on the scheduler itself a green run can mean either a successful dispatch or a quiet skip, and
-reading the scheduler's job summary is how you tell. And the version number moves with the
-cadence: `calculate_next_version.sh` bumps MINOR on `main` for a range with a `feat:`, and for a
-fix-only range too once the previous minor has its `release/X.Y` branch, so a daily release from
-`main` is close to a minor a day, each with its own release line.
+reading the scheduler's job summary is how you tell. And every release from `main` is a minor:
+`calculate_next_version.sh` bumps MINOR for a range with a `feat:`, and for a fix-only range too
+once the previous minor has its `release/X.Y` branch, so the minor number counts releases from
+`main` rather than measuring how much changed, and each minor gets its own release line.
 
 ## Workflow Mapping
 

@@ -57,6 +57,21 @@ def _steps(doc: dict) -> list[dict]:
     return steps
 
 
+def _dispatches_pipeline(doc: dict, pipeline_display_name: str) -> bool:
+    """Whether any step of this workflow starts the release pipeline.
+
+    Read from the parsed steps' `run` scripts, not the file's text: a comment
+    that cross-references `release-publish.yml` is not a dispatch, and
+    `gh workflow run` accepts the display name as well as the filename, so a
+    dispatch by either has to count.
+    """
+    for step in _steps(doc):
+        run = step.get("run") or ""
+        if _DISPATCH_SCRIPT_NAME in run or _PIPELINE in run or pipeline_display_name in run:
+            return True
+    return False
+
+
 class SchedulerOwnsTheCron(unittest.TestCase):
     def test_the_scheduler_carries_the_release_cron(self) -> None:
         schedule = _workflow(_SCHEDULER)["on"]["schedule"]
@@ -76,18 +91,39 @@ class SchedulerOwnsTheCron(unittest.TestCase):
 
         Matched on what a workflow does rather than on the cron string: a daily
         cron is a value other sweeps share, so sharing it proves nothing, while
-        a second scheduled workflow that runs the dispatch script or names the
-        pipeline is the double dispatch this guards against.
+        a second scheduled workflow with a step that starts the pipeline is the
+        double dispatch this guards against.
         """
+        display_name = _workflow(_PIPELINE)["name"]
         holders = []
         for path in sorted(_WORKFLOWS.glob("*.yml")):
             doc = _workflow(path.name)
             if not (doc.get("on") or {}).get("schedule"):
                 continue
-            source = path.read_text()
-            if _DISPATCH_SCRIPT_NAME in source or _PIPELINE in source:
+            if _dispatches_pipeline(doc, display_name):
                 holders.append(path.name)
         self.assertEqual(holders, [_SCHEDULER])
+
+    def test_the_dispatch_match_reads_steps_not_comments(self) -> None:
+        """A cross-reference in a comment is not a dispatch; a display-name dispatch is."""
+        display_name = "Release & Publish (GA)"
+        commented = yaml.safe_load(
+            "# see release-publish.yml for the gate\n"
+            "on:\n  schedule:\n    - cron: '17 6 * * *'\n"
+            "jobs:\n  sweep:\n    steps:\n      - run: ./scripts/sweep.sh\n"
+        )
+        self.assertFalse(_dispatches_pipeline(commented, display_name))
+        by_display_name = yaml.safe_load(
+            "on:\n  schedule:\n    - cron: '17 6 * * *'\n"
+            "jobs:\n  go:\n    steps:\n"
+            "      - run: gh workflow run 'Release & Publish (GA)' -f schedule_gate=evaluate\n"
+        )
+        self.assertTrue(_dispatches_pipeline(by_display_name, display_name))
+        by_file = yaml.safe_load(
+            "on:\n  schedule:\n    - cron: '17 6 * * *'\n"
+            "jobs:\n  go:\n    steps:\n      - run: gh workflow run release-publish.yml\n"
+        )
+        self.assertTrue(_dispatches_pipeline(by_file, display_name))
 
 
 class SchedulerDispatchWiring(unittest.TestCase):
