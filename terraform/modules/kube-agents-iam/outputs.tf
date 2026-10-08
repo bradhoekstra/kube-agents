@@ -113,3 +113,20 @@ output "scope_lookup_only_hosts" {
   EOT
   value       = sort(tolist(local.scope_lookup_only_hosts))
 }
+
+output "scope_discovered_projects" {
+  description = <<-EOT
+    The projects beyond project_id whose clusters the plan lists in the
+    scope, sorted: scope.projects and the selectors' members, each less an
+    exact exclude.projects entry, and each declared container's listed
+    members while the scoped service account pool lists them
+    (scope_container_members; otherwise a container's members are discovered
+    at runtime and are not here). The pool's own set less the host, so the
+    drift-pubsub module's source_projects, which the composition feeds from
+    this, and the pool follow one list; tests/test_scoped_sa_pool_iam.py pins
+    the pool's half and tests/test_scope_iam.py this one. Known at plan time:
+    it is computed from the module's inputs alone, so the composition's
+    module-level depends_on does not defer it.
+  EOT
+  value       = sort(tolist(setsubtract(local.scoped_pool_projects, toset([var.project_id]))))
+}

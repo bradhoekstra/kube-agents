@@ -654,5 +654,36 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
         self.assertNotIn('"compute.googleapis.com"', re.search(r"base_apis = \[(.*?)\]", self.main_tf, re.DOTALL).group(1))
 
 
+class DriftSinksFollowTheScopeTest(unittest.TestCase):
+    """The drift ingress exports every project the plan lists in the scope (design §8, the
+    drift-pubsub row): the composition feeds the module's source_projects from one IAM-module
+    output, and that output is the pool's own set less the host, so a project cannot be in the
+    scope's listing and out of the drift export, or the reverse."""
+
+    def setUp(self):
+        self.main_tf = (_COMPOSITION / "main.tf").read_text()
+        self.iam_outputs = (_MODULE / "outputs.tf").read_text()
+
+    def test_the_composition_feeds_the_sinks_from_the_iam_modules_listing(self):
+        call = _block(self.main_tf, "module", "drift_pubsub")
+        self.assertIn("source_projects                       = module.kube_agents_iam.scope_discovered_projects", call,
+                      "the drift module's source_projects must come from the IAM module's scope_discovered_projects, the one list the pool is keyed on")
+        self.assertIn("source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides", call)
+        # A JSON string, decoded here, because the front doors reach it through a TF_VAR_ line
+        # and a blanked line exports "", which a map-typed variable refuses as HCL.
+        self.assertIn('drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))', self.main_tf)
+        variable = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_sink_writer_identity_overrides")
+        self.assertIn("type        = string", variable, "the composition's override is a string so a blanked TF_VAR_ line reads as no override")
+
+    def test_the_listing_is_the_pools_set_less_the_host(self):
+        output = _block(self.iam_outputs, "output", "scope_discovered_projects")
+        self.assertIn("value       = sort(tolist(setsubtract(local.scoped_pool_projects, toset([var.project_id]))))", output,
+                      "scope_discovered_projects is no longer the pool's set less the host; tests/test_scoped_sa_pool_iam.py pins what that set is")
+
+    def test_the_source_projects_are_surfaced(self):
+        outputs = (_COMPOSITION / "outputs.tf").read_text()
+        self.assertIn("value       = try(module.drift_pubsub[0].source_projects, null)", outputs)
+
+
 if __name__ == "__main__":
     unittest.main()
