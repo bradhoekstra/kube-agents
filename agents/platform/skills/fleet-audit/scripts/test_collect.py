@@ -423,33 +423,28 @@ class TestSweepPool(unittest.TestCase):
     # limit is the caller's to re-sync (see collect.py and #2639).
     DEFAULT_LIMIT_ADMITTED_COUNT = 4
 
-    def _collector_modules(self):
-        # Every non-test module in this directory that defines both a MAX_WORKERS
-        # pool and a collect_fleet is a sweep collector; discovered rather than
-        # listed, so a collector added here at the wrong width fails this test
-        # instead of sliding in unpinned.
-        here = Path(__file__).resolve().parent
-        found = {}
-        for path in sorted(here.glob("*.py")):
-            if path.name.startswith("test_") or path.name == "__init__.py":
-                continue
-            mod = importlib.import_module(path.stem)
-            if hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"):
-                found[path.name] = mod
-        return found
-
     def test_collector_pools_pin_the_default_limit_admitted_count(self):
         self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
-        mods = self._collector_modules()
-        # The five in this directory; compute_fleet_audit.py in the sibling
-        # gce-compute-fleet-audit skill is pinned by its own test, which ties it
-        # to this same figure.
-        self.assertEqual(
-            set(mods),
-            {"collect.py", "fleet_stockout.py", "fleet_waste.py", "fleet_drift.py", "patch_readiness.py"},
+        here = Path(__file__).resolve().parent
+        # Every module in this directory that runs a worker pool is a sweep
+        # collector and must be pinned. Discovered by the pool it runs
+        # (ThreadPoolExecutor), not by a constant name the diff happens to use, so
+        # a collector added under MAX_WORKERS, LIST_WORKERS, WORKERS or any other
+        # name fails this test rather than slipping through unpinned.
+        pooled = sorted(
+            path
+            for path in here.glob("*.py")
+            if not path.name.startswith("test_") and "ThreadPoolExecutor(" in path.read_text()
         )
-        for name, mod in mods.items():
-            with self.subTest(collector=name):
+        self.assertTrue(pooled, "no pooled collector modules discovered -- did the scan break?")
+        for path in pooled:
+            with self.subTest(collector=path.name):
+                mod = importlib.import_module(path.stem)
+                self.assertTrue(
+                    hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"),
+                    f"{path.name} runs a worker pool but exposes no MAX_WORKERS + collect_fleet to pin; "
+                    "name its pool MAX_WORKERS and its entry collect_fleet, or widen this scan",
+                )
                 self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
                 self.assertEqual(
                     inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
