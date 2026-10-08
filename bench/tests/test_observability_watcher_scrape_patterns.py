@@ -22,26 +22,28 @@ regex tweak that reads fine but shifts what matches:
 * ``the-answer-affirms-the-watcher-is-scraped`` -- a ``report_contains`` that
   grades a verdict token the prompt asks the worker to emit, a first line
   ``Scraped: yes`` or ``Scraped: no``, rather than reading polarity out of free
-  prose. Both tokens use one grammar. The affirmative is an ``any_of_patterns``
-  regex ``scraped:\s*yes\b`` (``re.search``ed against the flat normalization), so a
-  space-less ``Scraped:yes`` still affirms. The negative is a ``forbidden_patterns``
-  regex ``(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b``
-  (``re.search``ed against the line-preserving normalization): the tail fires on a
-  line whose verdict is ``Scraped: no`` behind any run of non-word punctuation -- a
-  bullet, heading, quote, table cell, checkbox or leading emoji -- plus an explicit
-  ``1.``/``1)`` ordered-list marker, and the ``\A...*?`` prefix lets it fire only
-  where no ``Scraped: yes`` precedes the line (the first verdict decides). It does not
-  fire on ``scraped: nothing``/``not yet`` (word boundary), an affirmative that
-  mentions ``scraped: no`` in a later aside (the line's first word is not
-  ``scraped``), or a correct answer's per-component negative under an affirmative
-  headline -- a ``Broker: scraped: no`` label line, a bare ``- scraped: no`` bullet,
-  or a nested ``  - scraped: no`` -- which the first-verdict prefix spares in any
-  layout. The nuance (a correct answer may note the
-  credential-proxy PodMonitoring is unscraped while the watcher is) is left to the
-  judge. ``ReportContainsVerifier`` tests ``any_of_patterns`` against
-  ``_normalize(text)`` and ``forbidden_patterns`` against ``_normalize_lines(text)``,
-  so this test reproduces both and cross-checks the normalizer against the real
-  verifier when the bench package imports.
+  prose. Both tokens use one grammar, run against the verifier's
+  ``_normalize_lines(text, fold_decoration=True)``: the check sets
+  ``fold_decoration: true``, so each line's lead decoration is folded before either
+  pattern sees it. The affirmative is an ``any_of_patterns`` regex
+  ``scraped:\s*yes\b``, so a space-less ``Scraped:yes``, a spaced ``Scraped : yes``
+  and a whole-value-wrapped ``Scraped: "yes"`` all affirm. The negative is a
+  ``forbidden_patterns`` regex ``(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^scraped:\s*no\b``:
+  the tail fires on a line whose verdict is ``Scraped: no`` -- the fold has taken
+  the bullet, heading, quote, table cell, checkbox, emoji, ``1.``/``1)``, ``a)``,
+  ``i.``, ``#1`` or keycap marker in front of it -- and the ``\A...*?`` prefix lets
+  it fire only where no ``Scraped: yes`` precedes the line (the first verdict
+  decides). It does not fire on ``scraped: nothing``/``not yet`` (word boundary), an
+  affirmative that mentions ``scraped: no`` in a later aside (the line's first word
+  is not ``scraped``), or a correct answer's per-component negative under an
+  affirmative headline -- a ``Broker: scraped: no`` label line, a bare
+  ``- scraped: no`` bullet, or a nested ``  - scraped: no`` -- which the
+  first-verdict prefix spares in any layout. The nuance (a correct answer may note
+  the credential-proxy PodMonitoring is unscraped while the watcher is) is left to
+  the judge. ``ReportContainsVerifier`` ``re.search``es both pattern lists against
+  the same folded lines, so this test imports the real ``_normalize_lines`` and
+  drives it with the check's own ``fold_decoration`` rather than carrying a copy
+  of the fold.
 
 The checks are read from task.yaml, not duplicated here, so the test pins the
 file rather than a copy of it. The residuals each check accepts -- the route's
@@ -63,6 +65,8 @@ import unittest
 from pathlib import Path
 
 import yaml
+
+from kube_agents_bench.verifiers import _normalize_lines
 
 CASE = (
     Path(__file__).resolve().parents[1]
@@ -95,27 +99,6 @@ def _check_named(name):
         if objective.get("name") == name:
             return objective["check"]
     raise AssertionError(f"{CASE} has no objective named {name!r}")
-
-
-# Faithful copies of kube_agents_bench.verifiers._normalize and _normalize_lines,
-# so this test runs without the bench package's runtime dependencies (as the
-# sibling pattern tests do). test_normalize_matches_the_verifier pins them to the
-# real ones whenever the package does import.
-_MARKDOWN_NOISE = str.maketrans({"*": None, "_": None, "`": None, "’": "'"})
-
-
-def _normalize(text: str) -> str:
-    stripped = text.translate(_MARKDOWN_NOISE)
-    collapsed = " ".join(stripped.split())
-    if stripped[:1].isspace():
-        collapsed = " " + collapsed
-    if stripped[-1:].isspace():
-        collapsed += " "
-    return collapsed.lower()
-
-
-def _normalize_lines(text: str) -> str:
-    return "\n".join(_normalize(line) for line in text.splitlines())
 
 
 # --- route corpus -----------------------------------------------------------
@@ -216,16 +199,20 @@ ROUTE_KNOWN_RESIDUALS = [
 # fourth writes `scraped: no` in a later clause (not as a line's verdict), which
 # the bare-substring affirmative used to false-red and the line anchor now admits;
 # the fifth bullets its verdict; the sixth drops the space after the colon
-# (`Scraped:yes`), which the flat any_of regex affirms where a literal
-# `Scraped: yes` substring red-ed. The seventh breaks the verdict out per component
-# -- a `Scraped: yes` headline over a `Watcher: scraped: yes` line and a
+# (`Scraped:yes`), which the any_of regex affirms where a literal `Scraped: yes`
+# substring red-ed. The seventh breaks the verdict out per component -- a
+# `Scraped: yes` headline over a `Watcher: scraped: yes` line and a
 # `Broker: scraped: no` line -- which the dropped `word:` label prefix now admits;
 # it false-red under the old `\w+:` alternative, which matched the `Broker:` line.
 # The eighth and ninth put a bare `scraped: no` component line -- a `- scraped: no`
 # bullet and a nested `  - scraped: no` -- under a `Scraped: yes` headline; the bare
-# line anchor false-red both (`[^\w\n]*` clears the bullet, then `scraped: no`
+# line anchor false-red both (the fold clears the bullet, then `scraped: no`
 # matches), and the first-verdict prefix now admits them because a `Scraped: yes`
-# precedes the negative line.
+# precedes the negative line. The tenth wraps the verdict value in quotes on its
+# own line (`Scraped: "yes"`), and the eleventh puts a space before the colon
+# (`Scraped : yes`): the fold unwraps a whole-value quote at a line's end and
+# settles the separator's spacing, so both read as `scraped: yes`; without the
+# fold neither affirmed.
 POLARITY_CORRECT = [
     "Scraped: yes. The watcher metrics are scraped through the "
     '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
@@ -249,6 +236,11 @@ POLARITY_CORRECT = [
     "- Scraped: yes.\n"
     "  - Watcher: scraped: yes (9095, gateway-monitoring PodMonitoring).\n"
     "  - scraped: no -- the credential-proxy has no PodMonitoring.",
+    'Scraped: "yes"\n'
+    "The watcher is scraped on the gateway-monitoring PodMonitoring (9095); "
+    'up{job="platform-agent-gateway-monitoring"} reads 1.',
+    "Scraped : yes. The gateway-monitoring PodMonitoring scrapes the watcher's "
+    "9095 listener.",
 ]
 
 # Incorrect answers: the watcher is NOT scraped. Each carries a `Scraped: no`
@@ -256,19 +248,22 @@ POLARITY_CORRECT = [
 # any_of_patterns), even though some name the same mechanism, port and series the
 # other objective checks. Three in the middle are shapes the earlier
 # enumerated-negation regex false-greened -- a contraction, perfect tense, active
-# voice -- that the token reds on the verdict alone. The last six are `Scraped: no`
-# verdicts behind a prefix, each paired with a stray `scraped: yes` (the answer
+# voice -- that the token reds on the verdict alone. The last nine are `Scraped: no`
+# verdicts behind a marker, each paired with a stray `scraped: yes` (the answer
 # format the worker echoes back) so only the forbidden line, not the affirmative,
 # can catch the verdict: a `-` bullet, a `+` bullet, a `1)` ordered-list marker, a
-# `- [ ]` checkbox, a leading emoji, and a bare `| ... |` table cell. The old
-# enumerated `[-*#>]+`/`\d+\.` prefix caught only the `-` bullet and false-greened
-# the other five; the complement prefix `[^\w\n]*` (plus the explicit `\d+[.)]` for
-# the ordered-list marker) reds all six. The stray `scraped: yes` sits after the
+# `- [ ]` checkbox, a leading emoji, a bare `| ... |` table cell, a lettered `a)`,
+# a roman `i.` and a `#1`. The old enumerated `[-*#>]+`/`\d+\.` prefix caught only
+# the `-` bullet; the hand-rolled complement `[^\w\n]*(?:\d+[.)]\s*)?` that replaced
+# it caught the next five and still false-greened the last three, whose markers
+# are word characters it could not cross; the fold takes every one of them off,
+# so `^scraped: no` anchors on all nine. The stray `scraped: yes` sits after the
 # `Scraped: no` verdict in each, so first-verdict-decides still reds them: the
 # verdict is the first token reached and the `\A...*?` prefix stops at the no. A
-# `word:`-labelled negative is still not redded -- its `scraped: no` sits mid-line
-# behind the label, never at a line start -- so a `word:`-labelled negative with a
-# stray affirmative stays a documented residual (see POLARITY_KNOWN_FALSE_GREEN).
+# `word:`-labelled negative is still not redded -- the fold stops at the label's
+# first word character, so its `scraped: no` sits mid-line, never at a line start
+# -- and a `word:`-labelled negative with a stray affirmative stays a documented
+# residual (see POLARITY_KNOWN_FALSE_GREEN).
 POLARITY_INCORRECT = [
     "Scraped: no. The event watcher's metrics are not scraped: the "
     "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
@@ -290,6 +285,12 @@ POLARITY_INCORRECT = [
     "❌ Scraped: no (you asked for `Scraped: yes` / `Scraped: no`). Nothing "
     "scrapes 9095.",
     "| Scraped: no | (you asked for `Scraped: yes` / `Scraped: no`).",
+    "a) Scraped: no (you asked for `Scraped: yes` / `Scraped: no`). The "
+    "gateway-monitoring PodMonitoring is absent.",
+    "i. Scraped: no (you asked for `Scraped: yes` / `Scraped: no`). Nothing "
+    "scrapes 9095.",
+    "#1 Scraped: no (you asked for `Scraped: yes` / `Scraped: no`). Nothing "
+    "scrapes 9095.",
 ]
 
 # Polarity residuals, documented in the task.yaml comment and accepted. Each carries
@@ -300,12 +301,14 @@ POLARITY_INCORRECT = [
 #      compliant token alone;
 #   2. a negative whose verdict sits behind a `word:` label (`**Verdict:** Scraped:
 #      no`) while a stray `scraped: yes` (the echoed answer format) satisfies the
-#      affirmative -- the `scraped: no` sits mid-line behind the label, never at a
-#      line start, so the forbidden tail never anchors on it;
+#      affirmative -- the fold stops at `verdict`'s first letter, so the
+#      `scraped: no` sits mid-line behind the label, never at a line start, and
+#      the forbidden tail never anchors on it;
 #   3. the same `word:`-label residual as a table row (`| Verdict | Scraped: no |`):
-#      the `scraped: no` sits in the second cell, mid-line behind `| verdict | `, so
-#      the tail never anchors. A bare `| Scraped: no |` cell with no label column is
-#      caught (POLARITY_INCORRECT); a label column is what escapes;
+#      the fold takes the leading pipe and stops at `verdict`, so the `scraped: no`
+#      sits in the second cell, mid-line, and the tail never anchors. A bare
+#      `| Scraped: no |` cell with no label column is caught (POLARITY_INCORRECT);
+#      a label column is what escapes;
 #   4. a negative that echoes the `Scraped: yes` option before its own `Scraped: no`
 #      verdict line: first-verdict-decides reads the echoed affirmative as the verdict
 #      and the `\A...*?` prefix stops there, sparing the real negative -- the price of
@@ -359,6 +362,7 @@ class ObservabilityWatcherPolarity(unittest.TestCase):
         check = _check_named(POLARITY_OBJECTIVE)
         self.any_of_patterns = check.get("any_of_patterns", [])
         self.forbidden_patterns = check.get("forbidden_patterns", [])
+        self.fold_decoration = check.get("fold_decoration", False)
         self.assertTrue(
             self.any_of_patterns,
             "polarity objective should carry any_of_patterns",
@@ -367,17 +371,20 @@ class ObservabilityWatcherPolarity(unittest.TestCase):
             self.forbidden_patterns,
             "polarity objective should carry forbidden_patterns",
         )
+        self.assertTrue(
+            self.fold_decoration,
+            "polarity objective should fold decoration: the grammar's marker"
+            " handling rests on it",
+        )
 
     def _affirms(self, answer: str) -> bool:
         """``ReportContainsVerifier``'s verdict for an any_of_patterns +
-        forbidden_patterns check: an affirmative pattern is ``re.search``ed
-        against the flat normalization, a forbidden pattern against the
-        line-preserving one. The answer affirms when some affirmative matches and
-        no forbidden one does."""
-        text = _normalize(answer)
-        lines = _normalize_lines(answer)
+        forbidden_patterns check: both pattern lists are ``re.search``ed against
+        the line-preserving normalization, folded as the check asks. The answer
+        affirms when some affirmative matches and no forbidden one does."""
+        lines = _normalize_lines(answer, fold_decoration=self.fold_decoration)
         any_of_miss = bool(self.any_of_patterns) and not any(
-            re.search(p, text) for p in self.any_of_patterns
+            re.search(p, lines) for p in self.any_of_patterns
         )
         present = any(re.search(p, lines) for p in self.forbidden_patterns)
         return not any_of_miss and not present
@@ -404,32 +411,6 @@ class ObservabilityWatcherPolarity(unittest.TestCase):
         for answer in POLARITY_KNOWN_FALSE_GREEN:
             with self.subTest(answer=answer[:60]):
                 self.assertTrue(self._affirms(answer))
-
-
-class NormalizeMatchesTheVerifier(unittest.TestCase):
-    def test_normalize_matches_the_verifier(self):
-        try:
-            from kube_agents_bench.verifiers import (
-                _normalize as real_normalize,
-                _normalize_lines as real_normalize_lines,
-            )
-        except ImportError:
-            self.skipTest("bench package not importable; local copies are the reference")
-        samples = (
-            POLARITY_CORRECT
-            + POLARITY_INCORRECT
-            + list(POLARITY_KNOWN_FALSE_GREEN)
-            + [
-                " boundary space ",
-                "MixED **Case** `code`",
-                "typographic’s apostrophe",
-                "first line\nsecond not scraped line",
-            ]
-        )
-        for text in samples:
-            with self.subTest(text=text[:40]):
-                self.assertEqual(_normalize(text), real_normalize(text))
-                self.assertEqual(_normalize_lines(text), real_normalize_lines(text))
 
 
 if __name__ == "__main__":

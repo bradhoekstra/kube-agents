@@ -40,6 +40,8 @@ import re
 import unittest
 from pathlib import Path
 
+from markdown_it import MarkdownIt
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OBSERVABILITY_SKILL = REPO_ROOT / "agents/platform/skills/kube-agents-observability/SKILL.md"
 
@@ -116,7 +118,12 @@ SCRAPE_ANNOTATION_PROSE = re.compile(
 # correct mention of annotations is to forbid them, that is the right default.
 ANY_ANNOTATION = re.compile(r"(?i)annotat")
 
-FENCED_CODE_BLOCK = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+# Step 1's code blocks, parsed rather than regex-matched: CommonMark collects ```
+# and ~~~ fences and indented blocks alike, so a revert in any of those shapes is
+# seen, while an inline `kubectl` span is a `code_inline` child, not a block, and
+# stays out by design.
+MARKDOWN = MarkdownIt("commonmark")
+CODE_BLOCK_TOKENS = ("fence", "code_block")
 
 
 def _read(path: Path) -> str:
@@ -133,21 +140,22 @@ def _metrics_step_one(skill: str) -> str:
 
 
 def _step_one_fenced_commands(step: str) -> list[str]:
-    """Every command line step 1's fenced code blocks issue, in order.
+    """Every command line step 1's code blocks issue, in order.
 
-    Collects every non-empty line from the step's ```...``` blocks -- not just the
-    lines that begin with `kubectl`, so a revert written as an env-prefixed
-    (`KUBECONFIG=... kubectl ...`), `sudo`-prefixed or looped command is collected
-    and reds the exact-match rather than being silently skipped. A `kubectl`
-    written in prose (an inline span in a sentence) sits outside any fenced block
-    and is not collected, so it is not mistaken for a command to pin.
+    Collects every non-empty line from the step's fenced (``` or ~~~) and indented
+    code blocks -- not just the lines that begin with `kubectl`, so a revert written
+    as an env-prefixed (`KUBECONFIG=... kubectl ...`), `sudo`-prefixed or looped
+    command is collected and reds the exact-match rather than being silently skipped.
+    A `kubectl` written in prose (an inline span in a sentence) is a `code_inline`,
+    not a code block, so it is not collected and not mistaken for a command to pin.
     """
     commands = []
-    for block in FENCED_CODE_BLOCK.findall(step):
-        for line in block.splitlines():
-            line = line.strip()
-            if line:
-                commands.append(line)
+    for token in MARKDOWN.parse(step):
+        if token.type in CODE_BLOCK_TOKENS:
+            for line in token.content.splitlines():
+                line = line.strip()
+                if line:
+                    commands.append(line)
     return commands
 
 
@@ -214,19 +222,28 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
         )
 
     def test_the_collector_reads_fenced_commands_not_prose_kubectl_mentions(self):
-        # The collector reads commands from fenced code blocks, so a `kubectl`
-        # written in prose (an inline span in a sentence) is not mistaken for a
-        # command to pin -- the reason the exact-match above is safe against step 1's
-        # prose, which names `kubectl` and the Deployment only to steer away from
-        # them. It also collects a command that does not begin with `kubectl` (an
-        # env prefix), so such a revert reds the exact-match rather than slipping it.
+        # The collector reads commands from fenced (``` and ~~~) and indented code
+        # blocks, so a revert in any of those shapes reds the exact-match, while a
+        # `kubectl` written in prose (an inline span in a sentence) is not mistaken
+        # for a command to pin -- the reason the exact-match above is safe against
+        # step 1's prose, which names `kubectl` and the Deployment only to steer away
+        # from them. It also collects a command that does not begin with `kubectl`
+        # (an env prefix), so such a revert reds the exact-match rather than slipping.
         step = (
             "### 1. Verify Cloud Monitoring & Prometheus State\n"
-            "- Run `kubectl` against the collector, not the Deployment.\n"
-            "  ```bash\n"
-            "  KUBECONFIG=/tmp/kc kubectl get deployment <name>-gateway -o yaml\n"
-            "  kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml\n"
-            "  ```\n"
+            "\n"
+            "Run `kubectl` against the collector, not the Deployment.\n"
+            "\n"
+            "```bash\n"
+            "KUBECONFIG=/tmp/kc kubectl get deployment <name>-gateway -o yaml\n"
+            "```\n"
+            "\n"
+            "~~~bash\n"
+            "kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml\n"
+            "~~~\n"
+            "\n"
+            "    kubectl get deployment <name>-credential-proxy -o yaml\n"
+            "\n"
             "### 2. Inspect CPU and Memory Metrics\n"
         )
         commands = _step_one_fenced_commands(_metrics_step_one(step))
@@ -235,8 +252,10 @@ class ObservabilitySkillReadsThePodMonitoring(unittest.TestCase):
             [
                 "KUBECONFIG=/tmp/kc kubectl get deployment <name>-gateway -o yaml",
                 "kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml",
+                "kubectl get deployment <name>-credential-proxy -o yaml",
             ],
-            "the collector dropped an env-prefixed command or picked up a prose kubectl mention",
+            "the collector dropped a ~~~ fence, an indented block or an env-prefixed "
+            "command, or picked up a prose kubectl mention",
         )
 
 

@@ -123,39 +123,41 @@ verification_spec:
   # leaked on contractions, perfect tense, active voice, bulleted negations and
   # "unscraped" -- negation is not finitely enumerable, so each round patched one
   # shape and missed the next. Both tokens are graded by one grammar, so the two
-  # halves agree on what a verdict line is. The affirmative is an any_of_patterns
-  # regex (`scraped:\s*yes\b`) run on the flat normalization, so `Scraped:yes` with
-  # the space dropped still affirms where a literal `Scraped: yes` substring would
-  # red a compliant answer. The negative is a forbidden_patterns regex run on the
-  # line-preserving normalization
-  # (`(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b`):
-  # the `^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b` tail matches a line whose verdict
-  # is `Scraped: no` behind any run of non-word punctuation the normalizer leaves,
-  # and the `\A...*?` prefix lets that match land only where no `Scraped: yes`
-  # precedes it -- the first verdict decides. `[^\w\n]*` is the complement of a word
-  # character, not a list of markers: it clears a `-` or `+` bullet, a `#` heading, a
-  # `>` quote, a `|` table cell, a `- [ ]` checkbox, a leading emoji, or any mix of
-  # them -- the shapes an enumerated `[-*#>]+` prefix missed one at a time. The one
-  # prefix the complement cannot cross is an ordered-list marker, whose digits are
-  # word characters, so `(?:\d+[.)]\s*)?` admits `1.` and `1)` explicitly. The
-  # first-verdict prefix is what spares a per-component negative under an affirmative
-  # headline, in any layout: once a `Scraped: yes` is seen the lookahead blocks the
-  # match from reaching a later `scraped: no`, so a `Broker: scraped: no` label line,
-  # a bare `- scraped: no` bullet, or a nested `  - scraped: no` all survive beneath
-  # a `Scraped: yes` -- the nuance expected_output invites, where a correct answer
+  # halves agree on what a verdict line is, against the verifier's
+  # `_normalize_lines(raw, fold_decoration=True)`: `fold_decoration` folds each
+  # line's lead decoration before the patterns run, so the grammar describes the
+  # verdict once rather than enumerating the markers a verdict line can wear. The
+  # affirmative is an any_of_patterns regex `scraped:\s*yes\b`, so `Scraped:yes`
+  # with the space dropped, `Scraped : yes` with one added, and a
+  # whole-value-wrapped `Scraped: "yes"` all affirm where a literal `Scraped: yes`
+  # substring would red a compliant answer -- the fold settles the spacing and
+  # unwraps the quote. The negative is a forbidden_patterns regex
+  # `(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^scraped:\s*no\b`: the `^scraped:\s*no\b`
+  # tail matches a line whose verdict is `Scraped: no`, and the `\A...*?` prefix
+  # lets that match land only where no `Scraped: yes` precedes it -- the first
+  # verdict decides. The fold is what the tail rests on: the lead of a `-`/`+`
+  # bullet, a `#` heading, a `>` quote, a `|` table cell, a `- [ ]` checkbox, a
+  # leading emoji, an ordered `1.`/`1)`/`(1)`, a lettered `a)`, a roman `ii.`, a
+  # `#1` or a keycap `1️⃣` all come off, so `^scraped: no` anchors on the verdict
+  # under any of them -- the shapes a hand-rolled `[^\w\n]*(?:\d+[.)]\s*)?` prefix
+  # enumerated and missed one at a time (it cleared the punctuation bullets but not
+  # the lettered, roman, keycap or `#`-number markers). The first-verdict prefix is
+  # what spares a per-component negative under an affirmative headline, in any
+  # layout: once a `Scraped: yes` is seen the lookahead blocks the match from
+  # reaching a later `scraped: no`, so a `Broker: scraped: no` label line, a bare
+  # `- scraped: no` bullet, or a nested `  - scraped: no` all survive beneath a
+  # `Scraped: yes` -- the nuance expected_output invites, where a correct answer
   # may note the credential-proxy PodMonitoring is unscraped while the watcher is.
-  # (The bare line anchor alone spared only the `word:`-label shape; the prefix also
-  # spares the bulleted ones that anchor false-red.) It still does not fire on
-  # `scraped: nothing`/`not yet`/`none` (the word boundary) nor on an affirmative
-  # that mentions "scraped: no" mid-sentence or in a later clause (the line's first
-  # word is not `scraped`): `- the credential-proxy is scraped: no` does not match.
-  # The token survives the normalizer: `**Scraped: Yes**` folds to `scraped: yes`
-  # (emphasis dropped, lowercased). Three residuals stand, pinned in
+  # It still does not fire on `scraped: nothing`/`not yet`/`none` (the word
+  # boundary) nor on an affirmative that mentions "scraped: no" mid-sentence or in
+  # a later clause (the line's first word is not `scraped`): `the credential-proxy
+  # is scraped: no` does not match. Three residuals stand, pinned in
   # bench/tests/test_observability_watcher_scrape_patterns.py: (1) a negative that
   # omits the verdict line but carries the substring "scraped: yes" inline; (2) a
   # negative whose verdict sits behind a `word:` label (`Verdict: Scraped: no`, a
-  # `| Verdict | Scraped: no |` table row), its `scraped: no` never at a line start;
-  # and (3) a negative that echoes the `Scraped: yes` option before its own
+  # `| Verdict | Scraped: no |` table row), its `scraped: no` behind a word the
+  # lead fold stops at, never at a line start; and (3) a negative that echoes the
+  # `Scraped: yes` option before its own
   # `Scraped: no` verdict line, which first-verdict-decides reads as the verdict,
   # sparing the real one. The echo need not be the worker's own choice: the harness
   # puts the front door's acknowledgement first in `final_message` (bench's
@@ -171,7 +173,8 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
+      fold_decoration: true
       any_of_patterns:
         - 'scraped:\s*yes\b'
       forbidden_patterns:
-        - '(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^[^\w\n]*(?:\d+[.)]\s*)?scraped:\s*no\b'
+        - '(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^scraped:\s*no\b'
