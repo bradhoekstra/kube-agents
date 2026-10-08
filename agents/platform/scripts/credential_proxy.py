@@ -417,8 +417,11 @@ ADMISSION_BOUNDS = frozenset(
 )
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
-# cap in the tree, and the last bound is the broker's own refusal, so "how
-# often did a wait cross either" is a bucket ratio.
+# cap in the tree, so "how often did a wait outlast a caller's cap" is a
+# bucket ratio; the last edge is the broker's own refusal bound, which no
+# observation crosses, because a request refused at it was never admitted
+# and is counted by ADMISSION_REFUSALS_METRIC instead. The top bucket holds
+# the waits that were answered just under it.
 ADMISSION_WAIT_BUCKETS = (0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0, float(COMMAND_SLOT_WAIT_SECONDS))
 TOOL_DURATION_BUCKETS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0)
 # The label key the operator's usage poller filters outcomes on
@@ -4973,16 +4976,20 @@ class CommandExecutor:
                 budget_bytes=self.children_budget_bytes,
             )
 
-    def _refusal_bound(self, takes_slot: bool) -> str:
+    def _refusal_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
         """Which bound a refusal counts under, by the rule `_refusal_text` words:
         the budget when the request does not fit it, the slot cap when it takes
-        a slot and none is free, otherwise whatever holds the queue ahead, which
-        is the budget when it is on and the slot cap when it is off. Called
-        under `_slot_condition`."""
+        a slot and none is free, otherwise whatever holds the queue ahead. For
+        that last case the instant's state is not enough: a slot freed in the
+        refusal's wake reads as a free slot while the request spent its whole
+        wait behind the cap, so a slot-taker that ever saw the cap full
+        (`saw_slots_full`, the same memory the wait log and the histogram
+        label use) counts under the slot cap; otherwise the budget when it is
+        on and the slot cap when it is off. Called under `_slot_condition`."""
         nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
         if not (nothing_admitted or self._fits_budget(takes_slot)):
             return ADMISSION_BOUND_BUDGET
-        if takes_slot and self._slots_in_use >= self.max_concurrent_commands:
+        if takes_slot and (saw_slots_full or self._slots_in_use >= self.max_concurrent_commands):
             return ADMISSION_BOUND_SLOT
         return ADMISSION_BOUND_BUDGET if self.children_budget_bytes is not None else ADMISSION_BOUND_SLOT
 
@@ -5212,7 +5219,8 @@ class CommandExecutor:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise CommandSlotUnavailable(
-                            self._refusal_text(takes_slot), bound=self._refusal_bound(takes_slot)
+                            self._refusal_text(takes_slot),
+                            bound=self._refusal_bound(takes_slot, saw_slots_full),
                         )
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
@@ -5244,13 +5252,13 @@ class CommandExecutor:
             # Observed on every admission, under the bound the log names when
             # it writes a line: the histogram is where an idle broker's waits
             # read as a measured zero rather than an absence.
+            held_by_budget = self.children_budget_bytes is not None and not saw_slots_full
             if self.metrics is not None:
-                held_by_budget = self.children_budget_bytes is not None and not saw_slots_full
                 self.metrics.observe_admission_wait(
                     ADMISSION_BOUND_BUDGET if held_by_budget else ADMISSION_BOUND_SLOT, waited_seconds
                 )
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                if self.children_budget_bytes is not None and not saw_slots_full:
+                if held_by_budget:
                     with self._slot_condition:
                         in_use = self._budget_in_use_text()
                     LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
@@ -7148,7 +7156,10 @@ def _escape_label_value(value: str) -> str:
 
 
 class ProxyMetrics:
-    """Two counters and a latency histogram, in the Prometheus text exposition.
+    """The broker's series in the Prometheus text exposition: the tool
+    invocations counter and their latency histogram, the request counter, the
+    admission wait histogram and refusals counter by bound, and the slot and
+    child-memory gauges beside their caps when an executor is wired.
 
     Hand-rolled: prometheus_client is not in the image, and what is needed is
     small enough that adding a dependency to the one container holding every

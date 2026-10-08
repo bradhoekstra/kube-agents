@@ -1,8 +1,10 @@
 """The credential broker's Prometheus surface.
 
-A metrics-only listener serves three families: brokered tool invocations by
-tool, subcommand and outcome; their wall-clock latency; and the credentialed
-listener's requests by route family and status code. Two properties carry the
+A metrics-only listener serves the brokered tool invocations by tool,
+subcommand and outcome; their wall-clock latency; the credentialed listener's
+requests by route family and status code; the admission queue, as a histogram
+of waits and a counter of refusals by the bound that held the request; and the
+slots and child memory in use beside their caps. Two properties carry the
 security argument and are what these tests hold: nothing a caller sends reaches
 a label value, and the listener serves nothing but the exposition.
 
@@ -458,8 +460,8 @@ class AdmissionMetricsTest(unittest.TestCase):
         self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.5)
 
     def test_the_buckets_put_the_preflight_cap_and_the_refusal_bound_on_an_edge(self):
-        # 15 s is the cap the Cluster Agent preflight put on a brokered call
-        # before #2632; 60 s is COMMAND_SLOT_WAIT_SECONDS, past which the
+        # 15 s is the cap the Cluster Agent preflight puts on one brokered
+        # call; 60 s is COMMAND_SLOT_WAIT_SECONDS, past which the
         # broker refuses. A dashboard reads "how often did a wait cross
         # either" off a bucket ratio only if both are bucket bounds.
         self.assertIn(15.0, credential_proxy.ADMISSION_WAIT_BUCKETS)
@@ -492,7 +494,7 @@ class AdmissionMetricsTest(unittest.TestCase):
         executor = self.executor(max_concurrent_commands=2, memory_limit_bytes=None)
         with executor._slot_condition:
             executor._slots_in_use = 1
-            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, executor._refusal_bound(takes_slot=True))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, executor._refusal_bound(takes_slot=True, saw_slots_full=False))
             self.assertIn("concurrent commands", executor._refusal_text(takes_slot=True))
             executor._slots_in_use = 0
 
@@ -501,8 +503,23 @@ class AdmissionMetricsTest(unittest.TestCase):
         with executor._slot_condition:
             executor._slots_in_use = 1
             executor._reserved_bytes = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
-            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._refusal_bound(takes_slot=True))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._refusal_bound(takes_slot=True, saw_slots_full=False))
             self.assertIn("memory budget", executor._refusal_text(takes_slot=True))
+            executor._slots_in_use = 0
+            executor._reserved_bytes = 0
+
+    def test_a_refusal_in_the_wake_of_a_freed_slot_counts_under_the_cap_it_waited_behind(self):
+        # Budget admitting more than the slot cap, so the cap is the binding
+        # bound. At the instant of refusal a slot has just freed (the waiter
+        # woke on that notify) and the request fits, yet it spent its wait
+        # behind the cap: the counter must say so, as the histogram would.
+        executor = _budgeted_executor(self, admits=4, metrics=self.metrics)
+        executor.max_concurrent_commands = 2
+        with executor._slot_condition:
+            executor._slots_in_use = 1
+            executor._reserved_bytes = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, executor._refusal_bound(takes_slot=True, saw_slots_full=True))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._refusal_bound(takes_slot=True, saw_slots_full=False))
             executor._slots_in_use = 0
             executor._reserved_bytes = 0
 
