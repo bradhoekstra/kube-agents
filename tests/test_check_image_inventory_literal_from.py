@@ -41,6 +41,15 @@ _CALL_SITES = (
     "check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/",
 )
 
+# The sweep after the call sites: a plugin Dockerfile the fence never saw is
+# a failure, so a third plugin copied from the pair cannot drift unnoticed.
+# Its invocation is asserted as a whole line, because the bare name also
+# occurs in the function's definition and in a comment.
+_SWEEP = "check_plugin_dockerfiles_are_fenced"
+_SWEEP_INVOCATION = f"\n{_SWEEP}\n"
+_PLUGIN_DIR_DECLARATION = "readonly PLUGIN_DIR=agentplugins"
+_UNFENCED = "has no check_literal_from call"
+
 _NAME = "busybox"
 _REPOSITORY = "docker.io/library/busybox"
 _PIN = "musl@sha256:" + "a" * 64
@@ -61,6 +70,33 @@ def _run_check(dockerfile: str, pin: str = _PIN) -> subprocess.CompletedProcess:
             f'pin_of() {{ echo "{pin}"; }}\n'
             + functions
             + f"check_literal_from {_NAME} Dockerfile {_SRC}\nexit $status\n"
+        )
+        return subprocess.run(
+            ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
+        )
+
+
+def _run_sweep(present: tuple, fenced: tuple, body: str = None) -> subprocess.CompletedProcess:
+    """Plant `body` (default: the shape, pinned as the inventory) as the Dockerfile
+    of every plugin in `present`, fence those in `fenced`, then sweep."""
+    if body is None:
+        body = f"FROM busybox:{_PIN}\nCOPY {_SRC} /\n"
+    text = _SCRIPT.read_text()
+    functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS + (_SWEEP,))
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        for plugin in present:
+            plugin_dir = root / "agentplugins" / plugin
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / "Dockerfile").write_text(body, encoding="utf-8")
+        calls = "".join(f"check_literal_from {_NAME} agentplugins/{plugin}/Dockerfile {_SRC}\n" for plugin in fenced)
+        script = (
+            f"set -u\nstatus=0\nINVENTORY=images.json\n{_PLUGIN_DIR_DECLARATION}\n"
+            f'repo_of() {{ echo "{_REPOSITORY}"; }}\n'
+            f'pin_of() {{ echo "{_PIN}"; }}\n'
+            + functions
+            + calls
+            + f"{_SWEEP}\nexit $status\n"
         )
         return subprocess.run(
             ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
@@ -171,6 +207,34 @@ class CheckLiteralFromTest(unittest.TestCase):
         text = _SCRIPT.read_text()
         for call in _CALL_SITES:
             self.assertIn(call, text)
+        self.assertIn(_PLUGIN_DIR_DECLARATION, text)
+        self.assertIn(_SWEEP_INVOCATION, text)
+
+    def test_a_plugin_dockerfile_without_a_fence_call_fails_naming_it(self):
+        result = _run_sweep(present=("alpha", "beta"), fenced=("alpha",))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"agentplugins/beta/Dockerfile {_UNFENCED}", result.stderr)
+        self.assertNotIn("agentplugins/alpha/Dockerfile", result.stderr)
+
+    def test_every_plugin_dockerfile_fenced_passes(self):
+        result = _run_sweep(present=("alpha", "beta"), fenced=("alpha", "beta"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+
+    def test_a_fenced_dockerfile_that_fails_the_fence_counts_as_fenced(self):
+        # The fence records the file before it judges it, so a file it refuses
+        # is reported once, as drift or as the shape, and not a second time as
+        # unfenced. Both exits are covered: drift is the function's last
+        # statement, the shape fault returns early.
+        for body, reported in (
+            (f"FROM busybox:{_OTHER_PIN}\nCOPY {_SRC} /\n", "FROM pins"),
+            (f"FROM busybox:{_PIN}\nRUN rm -rf /bin\nCOPY {_SRC} /\n", _SHAPE),
+        ):
+            with self.subTest(body=body):
+                result = _run_sweep(present=("alpha",), fenced=("alpha",), body=body)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reported, result.stderr)
+                self.assertNotIn(_UNFENCED, result.stderr)
 
 
 if __name__ == "__main__":

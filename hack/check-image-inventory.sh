@@ -21,6 +21,9 @@ INVENTORY=images.json
 readonly GO_MOD=k8s-operator/go.mod
 readonly GOLANG_IMAGE_ARG=GOLANG_IMAGE
 readonly GOTOOLCHAIN_PIN='ENV GOTOOLCHAIN=local'
+# Where the agent plugins live; every <plugin>/Dockerfile under it must go
+# through check_literal_from, which check_plugin_dockerfiles_are_fenced enforces.
+readonly PLUGIN_DIR=agentplugins
 MIRROR=registry.example.invalid/mirror
 
 # githubMinter.org and githubMinter.repo are required when the minter is
@@ -192,6 +195,7 @@ check_base_image golang a2a/Dockerfile.hermes-bridge GOLANG_IMAGE GOLANG_VERSION
 check_literal_from() {
   local name=$1 dockerfile=$2 src=$3
   local want body other first second ref got
+  fenced_plugin_dockerfiles="${fenced_plugin_dockerfiles:-}$dockerfile"$'\n'
   want="$(normalise "$(repo_of "$name")"):$(pin_of "$name")"
   other="$(sed -n -e '/^[[:blank:]]*#/!q' -e '/^[[:blank:]]*#.*=/p' "$dockerfile" | head -n1)"
   if [ -n "$other" ]; then
@@ -215,6 +219,22 @@ check_literal_from() {
 
 check_literal_from busybox agentplugins/pubsub-platform/Dockerfile files/platforms/pubsub/
 check_literal_from busybox agentplugins/gke-stockout-investigator/Dockerfile files/
+
+# The two calls above name their files, so a third plugin copied from the pair
+# (agentplugins/README.md, "Adding a plugin") would carry a pin nothing
+# compares to the inventory while this check stayed green. Every Dockerfile
+# under PLUGIN_DIR must have been through check_literal_from, which records
+# each file it is given before judging it, so a file that failed the fence is
+# reported once, as drift or shape, not again here.
+check_plugin_dockerfiles_are_fenced() {
+  local dockerfile
+  for dockerfile in "$PLUGIN_DIR"/*/Dockerfile; do
+    [ -e "$dockerfile" ] || continue
+    grep -qxF "$dockerfile" <<<"${fenced_plugin_dockerfiles:-}" ||
+      fail "$dockerfile has no check_literal_from call in hack/check-image-inventory.sh, so its FROM pin is not held in step with $INVENTORY. Add one beside the existing calls, naming the inventory entry and the COPY source (agentplugins/README.md, \"Adding a plugin\")."
+  done
+}
+check_plugin_dockerfiles_are_fenced
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
