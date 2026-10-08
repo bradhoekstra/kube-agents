@@ -34,6 +34,14 @@ docs/site/
 └── public/                  # static assets
 ```
 
+## Dependency overrides
+
+`package.json` carries an npm `overrides` entry forcing `postcss-selector-parser` to `^7.1.6`.
+Versions below 7.1.6 parse flat selectors in quadratic time (GHSA-rj75-hqrm-r3gf), the 6.x line
+has no fixed release, and the only consumer, `postcss-nested` 6 under `@expressive-code/core`,
+declares `^6.1.1`. Drop the override once `@expressive-code/core` depends on `postcss-nested` 7 or
+later, which pulls a fixed parser on its own.
+
 ## Adding a page
 
 1. Create a `.md` or `.mdx` file under `src/content/docs/<section>/`.
