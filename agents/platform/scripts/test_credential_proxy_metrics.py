@@ -487,15 +487,16 @@ class AdmissionMetricsTest(unittest.TestCase):
         self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, raised.exception.bound)
 
     def test_with_the_budget_off_a_refusal_behind_the_queue_head_is_the_slot_cap(self):
-        # The third branch of the rule: the request fits and no slot is full at
-        # the instant of refusal, so the queue ahead is what held it. With the
-        # budget off that queue can only be waiting for a slot; `budget` here
-        # would send the operator to raise a limit the broker is not using.
+        # The request fits and no slot is full at the instant of refusal, so
+        # the queue ahead is what held it. With the budget off that queue can
+        # only be waiting for a slot; `budget` here would send the operator to
+        # raise a limit the broker is not using. The text agrees.
         executor = self.executor(max_concurrent_commands=2, memory_limit_bytes=None)
         with executor._slot_condition:
             executor._slots_in_use = 1
-            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, executor._refusal_bound(takes_slot=True, saw_slots_full=False))
-            self.assertIn("concurrent commands", executor._refusal_text(takes_slot=True))
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=False)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, bound)
+            self.assertIn("waiting on its limit of 2 concurrent commands", executor._refusal_text(True, bound))
             executor._slots_in_use = 0
 
     def test_with_the_budget_on_a_refusal_behind_the_queue_head_is_the_budget(self):
@@ -503,25 +504,72 @@ class AdmissionMetricsTest(unittest.TestCase):
         with executor._slot_condition:
             executor._slots_in_use = 1
             executor._reserved_bytes = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
-            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._refusal_bound(takes_slot=True, saw_slots_full=False))
-            self.assertIn("memory budget", executor._refusal_text(takes_slot=True))
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=False)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, bound)
+            self.assertIn("waiting for its child memory budget", executor._refusal_text(True, bound))
             executor._slots_in_use = 0
             executor._reserved_bytes = 0
 
-    def test_a_refusal_in_the_wake_of_a_freed_slot_counts_under_the_cap_it_waited_behind(self):
+    def test_a_refusal_in_the_wake_of_a_freed_slot_counts_under_the_cap_it_waited_behind_and_says_so(self):
         # Budget admitting more than the slot cap, so the cap is the binding
         # bound. At the instant of refusal a slot has just freed (the waiter
         # woke on that notify) and the request fits, yet it spent its wait
-        # behind the cap: the counter must say so, as the histogram would.
+        # behind the cap: the counter and the 503 text must both say so, as
+        # the histogram would.
         executor = _budgeted_executor(self, admits=4, metrics=self.metrics)
         executor.max_concurrent_commands = 2
         with executor._slot_condition:
             executor._slots_in_use = 1
             executor._reserved_bytes = credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
-            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, executor._refusal_bound(takes_slot=True, saw_slots_full=True))
-            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._refusal_bound(takes_slot=True, saw_slots_full=False))
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=True)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, bound)
+            self.assertIn("concurrent commands", executor._refusal_text(True, bound))
+            self.assertNotIn("memory budget", executor._refusal_text(True, bound))
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._held_bound(takes_slot=True, saw_slots_full=False))
             executor._slots_in_use = 0
             executor._reserved_bytes = 0
+
+    def test_a_budget_sized_to_the_slot_cap_counts_a_convoy_refusal_under_the_cap_like_its_waits(self):
+        # Both bounds bind at once: two slots, a budget for exactly two, both
+        # held. The ninth-of-eight shape on an install whose limit admits the
+        # cap exactly. The waits in that convoy are observed under `slot`
+        # (the cap was full); a refusal must count the same way, not under
+        # `budget` because the budget also happens to be full at the instant.
+        executor = _budgeted_executor(self, admits=2, metrics=self.metrics)
+        executor.max_concurrent_commands = 2
+        with executor._slot_condition:
+            executor._slots_in_use = 2
+            executor._reserved_bytes = 2 * credential_proxy.REQUEST_CHILD_MEMORY_RESERVE_BYTES
+            self.assertFalse(executor._fits_budget(True), "the budget is full too")
+            bound = executor._held_bound(takes_slot=True, saw_slots_full=True)
+            self.assertEqual(credential_proxy.ADMISSION_BOUND_SLOT, bound)
+            self.assertIn("without reaching a free slot", executor._refusal_text(True, bound))
+            executor._slots_in_use = 0
+            executor._reserved_bytes = 0
+
+    def test_a_slot_less_reserver_is_held_by_the_budget_whatever_the_cap_did(self):
+        executor = _budgeted_executor(self, admits=2, metrics=self.metrics)
+        self.assertEqual(credential_proxy.ADMISSION_BOUND_BUDGET, executor._held_bound(takes_slot=False, saw_slots_full=True))
+
+    def test_a_reservation_that_yielded_is_observed_once_from_its_first_arrival(self):
+        # A route refresher that steps aside for a vcs verb leaves `_admit` by
+        # AdmissionYielded, which carries its arrival, and re-enters with a
+        # deadline on the same thread handing the arrival back: one
+        # admission, observed once, from the first leg's arrival.
+        executor = _budgeted_executor(self, admits=1, metrics=self.metrics)
+        holder = _hold_a_slot(self, executor, 0.4)  # the one admission the budget has
+        with self.assertRaises(credential_proxy.AdmissionYielded) as raised:
+            with executor.reserve_child_memory(yield_when=lambda: True):
+                self.fail("admitted instead of yielding")
+        arrival = raised.exception.queued_at
+        # Only the holder's own (unwaited) admission is observed so far.
+        self.assertEqual(1, _series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        holder.join()
+        with executor.reserve_child_memory(deadline=time.monotonic() + 5, queued_at=arrival):
+            pass
+        families = _parse(self.metrics.render())
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.4)
 
     def test_the_snapshot_is_typed_and_the_render_reads_its_fields(self):
         snapshot = self.executor(max_concurrent_commands=3).admission_snapshot()

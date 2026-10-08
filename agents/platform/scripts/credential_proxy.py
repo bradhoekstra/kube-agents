@@ -1605,8 +1605,14 @@ class AdmissionYielded(Exception):
 
     Raised only to a caller that asked to be woken when that happens
     (`_admit`'s `yield_when`), before it was admitted; never answered to a
-    client.
+    client. `queued_at` is the monotonic time the request joined the queue,
+    for the caller to hand back when it re-enters, so the one admission is
+    observed once, from arrival.
     """
+
+    def __init__(self, message: str, queued_at: float) -> None:
+        super().__init__(message)
+        self.queued_at = queued_at
 
 
 @dataclass(frozen=True)
@@ -4976,22 +4982,20 @@ class CommandExecutor:
                 budget_bytes=self.children_budget_bytes,
             )
 
-    def _refusal_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
-        """Which bound a refusal counts under, by the rule `_refusal_text` words:
-        the budget when the request does not fit it, the slot cap when it takes
-        a slot and none is free, otherwise whatever holds the queue ahead. For
-        that last case the instant's state is not enough: a slot freed in the
-        refusal's wake reads as a free slot while the request spent its whole
-        wait behind the cap, so a slot-taker that ever saw the cap full
-        (`saw_slots_full`, the same memory the wait log and the histogram
-        label use) counts under the slot cap; otherwise the budget when it is
-        on and the slot cap when it is off. Called under `_slot_condition`."""
-        nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
-        if not (nothing_admitted or self._fits_budget(takes_slot)):
-            return ADMISSION_BOUND_BUDGET
-        if takes_slot and (saw_slots_full or self._slots_in_use >= self.max_concurrent_commands):
+    def _held_bound(self, takes_slot: bool, saw_slots_full: bool) -> str:
+        """Which bound held a request through its wait: the one rule behind
+        the wait log, the histogram label, the hang-up text, the refusal's
+        bound and the refusal's text, so none of them can split from another.
+        A slot-taker that ever found the slot cap full (`saw_slots_full`), or
+        that waits with the budget off, was held by the slot cap; any other
+        wait, a slot-taker's behind a budget-held queue or a slot-less
+        reserver's, was held by the budget. The instant's state is not asked:
+        a slot freed in a refusal's wake reads as a free slot, and a budget
+        sized to admit exactly the cap reads as full, while the request spent
+        its wait behind the cap either way."""
+        if takes_slot and (saw_slots_full or self.children_budget_bytes is None):
             return ADMISSION_BOUND_SLOT
-        return ADMISSION_BOUND_BUDGET if self.children_budget_bytes is not None else ADMISSION_BOUND_SLOT
+        return ADMISSION_BOUND_BUDGET
 
     @contextlib.contextmanager
     def request_slot(self, caller: socket.socket | None = None) -> Iterator[None]:
@@ -5042,6 +5046,7 @@ class CommandExecutor:
         caller: socket.socket | None = None,
         yield_when: Callable[[], bool] | None = None,
         deadline: float | None = None,
+        queued_at: float | None = None,
     ) -> Iterator[None]:
         """Hold a child memory reservation without a slot, for a route that
         spawns but holds no output (the forge refresh, §2.1). Same queue, same
@@ -5049,10 +5054,14 @@ class CommandExecutor:
         budget is on, except that it is admitted past slot-takers the full
         slot cap holds (`_admit`). With the budget off it takes no queue at all and only
         marks the thread as covered, so `_execute` takes no transient
-        reservation; `caller`, `yield_when` and `deadline` are then unused.
-        `yield_when` and `deadline` are passed to `_admit`."""
+        reservation; `caller`, `yield_when`, `deadline` and `queued_at` are
+        then unused. All three are passed to `_admit`."""
         with self._admit(
-            takes_slot=False, caller=caller, yield_when=yield_when, deadline=deadline
+            takes_slot=False,
+            caller=caller,
+            yield_when=yield_when,
+            deadline=deadline,
+            queued_at=queued_at,
         ):
             yield
 
@@ -5092,45 +5101,46 @@ class CommandExecutor:
             return True
         return False
 
-    def _refusal_text(self, takes_slot: bool) -> str:
-        """Why a request still queued at the bound is refused, named for what
-        holds it now. Called under `_slot_condition`.
+    def _refusal_text(self, takes_slot: bool, bound: str) -> str:
+        """Why a request still queued at the bound is refused, worded for the
+        bound `_held_bound` named, so the text and the refusals counter agree
+        by construction. Called under `_slot_condition`.
 
-        The budget when this request does not fit it; the slot cap when it
-        takes a slot and none is free. Otherwise this request fits and is
-        clear of the slot cap, and only the queue ahead of it holds it. With
-        the budget on, that queue is held by the budget: a slot-taker here has
-        a free slot, so what is ahead of it lacks only budget, and a slot-less
-        reserver is admitted past tickets the slot cap alone holds (`_admit`).
-        The text says so, and never that this request waited without fitting.
-        """
-        slots_full = self._slots_in_use >= self.max_concurrent_commands
+        Under the slot cap: the cap is full now, or slots have freed and gone
+        to earlier arrivals and the queue ahead holds this request. Under the
+        budget: this request does not fit it now, or it fits and the queue
+        ahead, held by the budget, holds it (a slot-less reserver is admitted
+        past tickets the slot cap alone holds, `_admit`). The text never says
+        a request waited without fitting when it fits."""
+        if bound == ADMISSION_BOUND_SLOT:
+            if self._slots_in_use >= self.max_concurrent_commands:
+                # Worded for the queue: slots may well have freed in the
+                # meantime and gone to earlier arrivals, so "none finished"
+                # would be false for a request that was overtaken rather
+                # than starved.
+                return (
+                    f"the credential proxy is at its limit of "
+                    f"{self.max_concurrent_commands} concurrent commands and this "
+                    f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
+                    f"free slot; retry shortly"
+                )
+            return (
+                f"the credential proxy's admission queue is held by requests waiting on its "
+                f"limit of {self.max_concurrent_commands} concurrent commands and this "
+                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
+            )
         # With nothing admitted `_fits_budget` would take its degenerate
         # branch and log; this request fits trivially then anyway.
         nothing_admitted = self._reserved_bytes == 0 and self._slots_in_use == 0
-        fits = nothing_admitted or self._fits_budget(takes_slot)
-        if not fits:
+        if not (nothing_admitted or self._fits_budget(takes_slot)):
             return (
                 f"the credential proxy is at its child memory budget "
                 f"({self._budget_in_use_text()}) and this request "
                 f"waited {COMMAND_SLOT_WAIT_SECONDS}s without fitting; retry shortly"
             )
-        if takes_slot and slots_full:
-            # Worded for the queue: slots may well have freed in the meantime
-            # and gone to earlier arrivals, so "none finished" would be false
-            # for a request that was overtaken rather than starved.
-            return (
-                f"the credential proxy is at its limit of "
-                f"{self.max_concurrent_commands} concurrent commands and this "
-                f"request waited {COMMAND_SLOT_WAIT_SECONDS}s without reaching a "
-                f"free slot; retry shortly"
-            )
-        if self.children_budget_bytes is not None:
-            holder = f"waiting for its child memory budget ({self._budget_in_use_text()})"
-        else:
-            holder = f"waiting on its limit of {self.max_concurrent_commands} concurrent commands"
         return (
-            f"the credential proxy's admission queue is held by requests {holder} and this "
+            f"the credential proxy's admission queue is held by requests waiting for its "
+            f"child memory budget ({self._budget_in_use_text()}) and this "
             f"request waited {COMMAND_SLOT_WAIT_SECONDS}s behind them; retry shortly"
         )
 
@@ -5169,6 +5179,7 @@ class CommandExecutor:
         caller: socket.socket | None,
         yield_when: Callable[[], bool] | None = None,
         deadline: float | None = None,
+        queued_at: float | None = None,
     ) -> Iterator[None]:
         """Admit one request: a slot if `takes_slot`, and a child memory
         reservation whenever the budget is on. One arrival-order queue for
@@ -5182,7 +5193,11 @@ class CommandExecutor:
 
         `yield_when`, if given, is called under `_slot_condition` each time the
         wait wakes; when it returns true the request leaves the queue
-        unadmitted with AdmissionYielded, before anything is reserved.
+        unadmitted with AdmissionYielded, before anything is reserved and
+        before its wait is observed; the exception carries the arrival, and a
+        caller that re-enters passes it back as `queued_at` so the wait the
+        histogram and the log record runs from the first arrival, not from
+        the re-entry.
         `deadline`, if given, is the monotonic time the wait is refused at, in
         place of COMMAND_SLOT_WAIT_SECONDS from entry; the refusal text is the
         same here, and the one caller that passes it, a route refresher's
@@ -5195,7 +5210,8 @@ class CommandExecutor:
             finally:
                 self._request_budget.reserved = previously_reserved
             return
-        queued_at = time.monotonic()
+        if queued_at is None:
+            queued_at = time.monotonic()
         if deadline is None:
             deadline = queued_at + COMMAND_SLOT_WAIT_SECONDS
         ticket = _AdmissionTicket(takes_slot)
@@ -5218,21 +5234,17 @@ class CommandExecutor:
                         saw_slots_full = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        raise CommandSlotUnavailable(
-                            self._refusal_text(takes_slot),
-                            bound=self._refusal_bound(takes_slot, saw_slots_full),
-                        )
+                        bound = self._held_bound(takes_slot, saw_slots_full)
+                        raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound), bound=bound)
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
-                        held_by_slots = takes_slot and (
-                            saw_slots_full or self.children_budget_bytes is None
-                        )
+                        held_by_slots = self._held_bound(takes_slot, saw_slots_full) == ADMISSION_BOUND_SLOT
                         raise CallerHungUp(
                             "the caller disconnected while queued for "
                             + ("a slot" if held_by_slots else "the memory budget")
                         )
                     if yield_when is not None and yield_when():
-                        raise AdmissionYielded("another caller needs to go first")
+                        raise AdmissionYielded("another caller needs to go first", queued_at)
                 if takes_slot:
                     self._slots_in_use += 1
                 reserved = REQUEST_CHILD_MEMORY_RESERVE_BYTES if self.children_budget_bytes is not None else 0
@@ -5252,13 +5264,11 @@ class CommandExecutor:
             # Observed on every admission, under the bound the log names when
             # it writes a line: the histogram is where an idle broker's waits
             # read as a measured zero rather than an absence.
-            held_by_budget = self.children_budget_bytes is not None and not saw_slots_full
+            held = self._held_bound(takes_slot, saw_slots_full)
             if self.metrics is not None:
-                self.metrics.observe_admission_wait(
-                    ADMISSION_BOUND_BUDGET if held_by_budget else ADMISSION_BOUND_SLOT, waited_seconds
-                )
+                self.metrics.observe_admission_wait(held, waited_seconds)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
-                if held_by_budget:
+                if held == ADMISSION_BOUND_BUDGET:
                     with self._slot_condition:
                         in_use = self._budget_in_use_text()
                     LOGGER.info("request waited %dms for memory budget (%s)", waited_ms, in_use)
@@ -5750,10 +5760,11 @@ class CommandExecutor:
         self._acquire_refresh_lock(provider, queued_at + COMMAND_SLOT_WAIT_SECONDS, caller)
         holding = True
         try:
-            if self._refresh_under_lock(
+            yielded_at = self._refresh_under_lock(
                 provider, helper, repository, clean_repo, failure_key, queued_at,
                 reserve=budget_on, caller=caller,
-            ):
+            )
+            if yielded_at is not None:
                 # A vcs verb, admitted and covered, needs the lock: it runs the
                 # helper under its own reservation. Hand it the lock, wait until
                 # it holds it, and queue behind it to coalesce on its result,
@@ -5781,6 +5792,7 @@ class CommandExecutor:
                     provider, helper, repository, clean_repo, failure_key, queued_at,
                     reserve=budget_on, caller=caller,
                     deadline=yield_deadline, allow_yield=False,
+                    admission_queued_at=yielded_at,
                 )
         finally:
             if holding:
@@ -5884,26 +5896,31 @@ class CommandExecutor:
         caller: socket.socket | None = None,
         deadline: float | None = None,
         allow_yield: bool = True,
-    ) -> bool:
+        admission_queued_at: float | None = None,
+    ) -> float | None:
         """The serialised part of `refresh_forge_credential`, called with
         `_refresh_lock` held: re-check the coalesce cache, honour the failure
         memo, and run the helper -- under a child memory reservation taken
         here, after both checks, when `reserve` is set, refused at `deadline`
         when given.
 
-        True when the reservation wait yielded to a vcs verb waiting for the
-        lock and the helper did not run; the caller hands that verb the lock.
-        With `allow_yield` false -- the reservation after the one yield -- a
-        verb counting itself ends the attempt instead: CommandSlotUnavailable,
-        the stepped-aside text, so the lock is never held across a budget
-        wait against a verb that holds the budget. False otherwise.
+        The time the reservation joined the admission queue when its wait
+        yielded to a vcs verb waiting for the lock and the helper did not run;
+        the caller hands that verb the lock, and hands the time back as
+        `admission_queued_at` on its second reservation, so the two legs are
+        observed as the one wait they are, from the first arrival. With
+        `allow_yield` false -- that second reservation -- a verb counting
+        itself ends the attempt instead: CommandSlotUnavailable, the
+        stepped-aside text, so the lock is never held across a budget wait
+        against a verb that holds the budget. None when the helper ran or
+        the cache answered.
 
         With `deadline` given -- the reservation after a yield -- a refusal
         says the caller stepped aside, with the seconds since `queued_at` and
         the budget's figures, rather than `_admit`'s text, which names
         COMMAND_SLOT_WAIT_SECONDS: the wait on this leg was shorter."""
         if self._refresh_is_current(provider, clean_repo):
-            return False
+            return None
         failure = self._refresh_failure_cache.get(failure_key)
         if failure is not None:
             failed_at, exc = failure
@@ -5917,13 +5934,14 @@ class CommandExecutor:
                             caller=caller,
                             yield_when=lambda: self._covered_refresh_waiters > 0,
                             deadline=deadline,
+                            queued_at=admission_queued_at,
                         )
                     )
                 except AdmissionYielded as exc:
                     # Raised only by `_admit`, before it admits, so this
                     # catches the entry and nothing the helper raises.
                     if allow_yield:
-                        return True
+                        return exc.queued_at
                     # After the one yield: a vcs verb that holds the budget
                     # this wait needs is waiting on the lock this caller
                     # holds. Holding it to the deadline would be the knot the
@@ -5974,7 +5992,7 @@ class CommandExecutor:
             if not scoped:
                 scoped = frozenset([clean_repo])
             self._refresh_cache[provider] = (time.monotonic(), scoped)
-        return False
+        return None
 
     @staticmethod
     def _forge_helper(provider: str) -> Path:
