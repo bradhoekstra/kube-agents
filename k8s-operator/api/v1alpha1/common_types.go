@@ -666,9 +666,10 @@ type TuningSpec struct {
 	// stream is too small for the configured cap makes the provision Job
 	// fail rather than letting the shortfall surface later as a legitimate
 	// session's consumer create being refused and reported as a task
-	// failure. What that refusal names is the ways out - two, or three for
-	// a CR that declares a bridge sidecar with more workers than the
-	// bridge's default of 2, where declaring it with fewer is offered too -
+	// failure. What that refusal names is the ways out - two, or three when
+	// the bridge runs more workers than its default of 2, where fewer is
+	// offered too (the operator's A2A_BRIDGE_CONCURRENCY for the bridge it
+	// renders, BRIDGE_CONCURRENCY for a bridge sidecar the CR declares) -
 	// and none is a stream edit, because max_consumers is the one limit
 	// nats-server will not change on a stream that already exists: lower
 	// this number (or that worker count) until it fits the stream, or
@@ -897,6 +898,11 @@ type DeploymentSpec struct {
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 
+	// CredentialProxy configures the credential-proxy container, the broker that
+	// runs every credentialed command on the agent's behalf in a pod of its own.
+	// +optional
+	CredentialProxy *CredentialProxySpec `json:"credentialProxy,omitempty"`
+
 	// DefaultStorageClassName specifies the default storage class to use for the system and data PVCs.
 	// +optional
 	DefaultStorageClassName *string `json:"defaultStorageClassName,omitempty"`
@@ -906,6 +912,44 @@ type DeploymentSpec struct {
 	// +listMapKey=name
 	// +optional
 	Storages []StorageSpec `json:"storages,omitempty"`
+}
+
+// CredentialProxySpec configures the credential-proxy container.
+type CredentialProxySpec struct {
+	// Resources overrides the credential-proxy container's requests and limits.
+	// Each key set here replaces the operator's default for that key and the
+	// rest keep their defaults, unlike spec.deployment.resources, which replaces
+	// the agent container's block wholesale: a CR that sets only limits.memory
+	// keeps the default 500m CPU request, 1 CPU limit and 2Gi ephemeral-storage
+	// limit. The broker sizes how many commands it admits at once from the
+	// memory limit, so raising the limit is the one knob for an install whose
+	// fleet outgrows the default; the ephemeral-storage limit bounds the content
+	// workspace the broker clones into; the proxy's state and /tmp emptyDirs
+	// (sizeLimits 5Gi and 2Gi) follow it when it is raised above their
+	// defaults, so the kubelet does not evict the pod at the smaller figure.
+	// Only cpu, memory and ephemeral-storage
+	// are accepted, the quantities the container declares. The operator
+	// refuses a memory limit below what admits two commands at once, a request
+	// above its limit, a negative quantity and a zero limit; `claims` is refused, because the proxy
+	// pod declares no resourceClaims. A refused override, including an edit of
+	// one that was valid, renders the proxy Deployment at the operator's
+	// defaults, not at the last accepted override, until it is corrected,
+	// which on the proxy's Recreate Deployment restarts the proxy once; the
+	// operator reports Degraded with reason InvalidCredentialProxyResources
+	// when no higher-ranked Degraded cause is present, the agent staying
+	// Ready, whether or not the validating webhook is enabled. Where the
+	// webhook is on, it refuses the edit at apply and the running proxy is
+	// untouched. The webhook warns when memory per
+	// CPU on the requests pair leaves the band GKE Autopilot admits unchanged,
+	// because Autopilot then raises the smaller request into the band; it
+	// applies the band to requests only. It also warns for each of cpu and
+	// memory set under limits without the same key under requests, unless the
+	// limit equals the request it would be replaced by: Autopilot
+	// without bursting sets the limits equal to the requests, so there the
+	// proxy runs at the request and the limit has no effect. With bursting the
+	// declared limits stand.
+	// +optional
+	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 // StorageSpec defines custom PersistentVolumeClaim and volume mount configuration.

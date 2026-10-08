@@ -73,7 +73,11 @@ const (
 	// The paragraph above their use ties the two to the proxy container's
 	// memory limit, and the cap test asserts the three from the rendered env.
 	// Both are set there and so reserved in mergeCredentialProxyEnv: a CR can
-	// move neither, because the limit they are sized against is not a CR field.
+	// move neither. The limit they are sized against is a CR field
+	// (spec.deployment.credentialProxy.resources), and the broker derives what
+	// it admits from that limit, so the limit is the CR's knob and the admitted
+	// count follows it; the two caps stay the operator's constants, and a CR
+	// override of either would detach them from the limit again.
 	credentialProxyMaxOutputBytes        = "8388608"
 	credentialProxyMaxConcurrentCommands = "8"
 	// hermesHomeMode is what HERMES_HOME_MODE carries into every container that runs
@@ -1744,13 +1748,18 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // reaper from firing at all. Hermes gives every task its own SSHEnvironment but
 // derives the ssh ControlPath from sha256(user@host:port) — all three fixed by
 // this block — so every concurrent task multiplexes over ONE master connection.
-// Teardown is per environment and not per connection: cleanup() runs
-// `ssh -O exit` on that shared path, which drops the master and kills every
-// session riding it. A sibling task loses its in-flight command with exit 255
-// and an empty stderr. At the 300s default and delegation.max_concurrent_children
-// of 3, the reaper reaches that state whenever one child idles while another
-// works. Nothing is reclaimed by reaping here — the far side is a StatefulSet pod
-// that stays up either way — so the timeout buys nothing and costs the race.
+// Teardown is per environment and not per connection: cleanup() ran
+// `ssh -O exit` on that shared path, which dropped the master and killed every
+// session riding it. A sibling task lost its in-flight command with exit 255
+// and an empty stderr. At the 300s default the reaper reached that state whenever
+// one session's environment idled while another's worked. Nothing is reclaimed by
+// reaping here — the far side is a StatefulSet pod
+// that stays up either way — so the timeout bought nothing and cost the race.
+// The agent image now patches cleanup() so it no longer closes the shared
+// master at all (deploy/docker/patches/apply_ssh_shared_master.py, #2174): a
+// worker process exiting normally was the frequent caller, and the reaper's
+// cleanup() no longer reaches the master either. The value stays because
+// reaping reclaims nothing here.
 //
 // `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for
@@ -1858,8 +1867,9 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// the volume with.
 		Database *managedDatabaseConfig `json:"database,omitempty"`
 		// Hooks carries the bridge activity door's pod-wide entry under
-		// mode next with a bridge declared (a2aActivityHook); absent
-		// otherwise, so a default install's config is unchanged.
+		// mode next with an api-executor bridge in the pod, rendered or
+		// declared (a2aActivityHook); absent otherwise, so a today
+		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
 	}{}
 
@@ -3169,6 +3179,18 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	if a2aAgentSurface(agent) {
 		mountIntoContainer(containers, "platform-agent", a2aBusTokenVolumeMount())
 	}
+	// The bridge, rendered from the finished agent container (every mount
+	// above included, the bus token then dropped) when the CR declares none
+	// of its own, once the bus is provisioned (a2aBridgeInPod). It takes the executor environment every task-executing
+	// sidecar gets, like a declared bridge does. See platformagent_a2a_bridge.go.
+	if a2aBridgeInPod(agent) {
+		for _, c := range containers {
+			if c.Name == a2aAgentContainerName {
+				sidecars = append(sidecars, a2aExecutorSidecarEnv([]corev1.Container{buildA2ABridgeContainer(agent, c)})...)
+				break
+			}
+		}
+	}
 
 	defaultAnnotations := map[string]string{
 		"kubeagents.x-k8s.io/config-hash":            configHash,
@@ -4043,7 +4065,10 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// its child process (credential_proxy_manifests.go has the terms).
 		// Raising this cap lowers how many requests the same limit admits,
 		// which is why it is set here and so reserved rather than left to
-		// spec.deployment.env. The cap test asserts the arithmetic from the
+		// spec.deployment.env. The limit itself is a CR field,
+		// spec.deployment.credentialProxy.resources, and the admitted count
+		// follows it; a CR that could also raise a cap would detach the cap
+		// from what holds it. The cap test asserts the arithmetic from the
 		// rendered env, so believe it over this paragraph if they ever
 		// disagree.
 		{Name: "CREDENTIAL_PROXY_MAX_OUTPUT_BYTES", Value: credentialProxyMaxOutputBytes},
@@ -4601,8 +4626,8 @@ func buildEventWatcherTokenVolume() corev1.Volume {
 func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	return []corev1.Volume{
 		{Name: "credential-proxy-policy", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-credential-proxy-policy"}}}},
-		{Name: "credential-proxy-tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("2Gi"))}}},
-		{Name: "credential-proxy-state", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse("5Gi"))}}},
+		{Name: credentialProxyTmpVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyTmpSizeLimit))}}},
+		{Name: credentialProxyStateVolumeName, VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: ptr.To(resource.MustParse(credentialProxyStateSizeLimit))}}},
 		{Name: "credential-proxy-runtime", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory, SizeLimit: ptr.To(resource.MustParse("16Mi"))}}},
 		buildEventWatcherKubeconfigVolume(),
 		{Name: "credential-proxy-ksa-token", VolumeSource: corev1.VolumeSource{Projected: &corev1.ProjectedVolumeSource{
