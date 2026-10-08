@@ -26,14 +26,15 @@ regex tweak that reads fine but shifts what matches:
   ``_normalize_lines(text, fold_decoration=True)``: the check sets
   ``fold_decoration: true``, so each line's lead decoration is folded before either
   pattern sees it. The affirmative is an ``any_of_patterns`` regex
-  ``scraped:\s*[^\w\n]*yes\b``, so a space-less ``Scraped:yes``, a spaced
-  ``Scraped : yes``, a quoted ``Scraped: "yes"`` and a marked ``Scraped: ✅ yes``
-  all affirm -- the fold settles the spacing and unwraps a quote that ends its
-  line, and the ``[^\w\n]*`` gap admits any non-word run the fold leaves between
-  the colon and the token (a quote prose follows, a check mark), since the fold
-  handles a line's lead and trail only. The negative is a ``forbidden_patterns``
+  ``scraped:\s*["'“‘(]?(?:[✅✔✓]\s*)?yes\b``, so a space-less ``Scraped:yes``, a
+  spaced ``Scraped : yes``, a quoted ``Scraped: "yes"`` and a checked
+  ``Scraped: ✅ yes`` all affirm -- the fold settles the spacing and unwraps a quote
+  that ends its line, and the gap admits an opening quote or bracket and the
+  affirming check marks the fold leaves mid-line; a negating mark or a
+  strike-through in that position (``Scraped: ❌ yes``, ``Scraped: ~~yes~~ no``)
+  is not skipped, so neither affirms. The negative is a ``forbidden_patterns``
   regex
-  ``(?m)\A(?:(?!scraped:\s*[^\w\n]*yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b``:
+  ``(?m)\A(?:(?!scraped:\s*["'“‘(]?(?:[✅✔✓]\s*)?yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b``:
   the tail fires on a line whose verdict is ``Scraped: no``, however the value is
   quoted or marked -- the fold has taken
   the bullet, heading, quote, table cell, checkbox, emoji, ``1.``/``1)``, ``a)``,
@@ -222,7 +223,8 @@ ROUTE_KNOWN_RESIDUALS = [
 # same line (`Scraped: "yes". The watcher ...`), which the fold leaves wrapped --
 # `_VALUE_WRAP` unwraps only at a line's end or before `;` -- and the thirteenth
 # puts a check mark between the colon and the value (`Scraped: ✅ Yes`), which
-# the fold leaves mid-line; the `[^\w\n]*` gap in the affirmative admits both.
+# the fold leaves mid-line; the affirmative's gap admits an opening quote and
+# the affirming check marks, and so both.
 POLARITY_CORRECT = [
     "Scraped: yes. The watcher metrics are scraped through the "
     '`platform-agent-gateway-monitoring` PodMonitoring on port 9095; '
@@ -280,7 +282,11 @@ POLARITY_CORRECT = [
 # residual (see POLARITY_KNOWN_FALSE_GREEN). The last three quote or mark the
 # verdict and keep writing on the same line (`Scraped: "no" -- ...`,
 # `Scraped: 'no'. ...`, `Scraped: ❌ no ...`), which the fold leaves in place
-# mid-line; the `[^\w\n]*` gap in the negative's tail sees them.
+# mid-line; the `[^\w\n]*` gap in the negative's tail sees them. Two more red
+# by failing the affirmative rather than hitting the negative: a struck-through
+# self-correction `Scraped: ~~yes~~ no` and a negated `Scraped: ❌ yes`, whose
+# mark the affirmative's gap does not skip -- the trail fold's own rule that a
+# negating mark stays with the word -- so neither reads as a `yes` verdict.
 POLARITY_INCORRECT = [
     "Scraped: no. The event watcher's metrics are not scraped: the "
     "gateway-monitoring PodMonitoring targets 9095 but up{job=...} returns "
@@ -313,6 +319,10 @@ POLARITY_INCORRECT = [
     "Scraped: 'no'. Nothing scrapes 9095 (format: `Scraped: yes` / `Scraped: no`).",
     "Scraped: ❌ no (you asked for `Scraped: yes` / `Scraped: no`). Nothing "
     "scrapes 9095.",
+    "Scraped: ~~yes~~ no. On a second look nothing scrapes 9095; the "
+    "gateway-monitoring PodMonitoring is absent.",
+    "Scraped: ❌ yes -- that is, no: the gateway-monitoring PodMonitoring is "
+    "absent and nothing scrapes 9095.",
 ]
 
 # Polarity residuals, documented in the task.yaml comment and accepted. Each carries

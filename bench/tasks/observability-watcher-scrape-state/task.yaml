@@ -127,20 +127,25 @@ verification_spec:
   # `_normalize_lines(raw, fold_decoration=True)`: `fold_decoration` folds each
   # line's lead decoration before the patterns run, so the grammar describes the
   # verdict once rather than enumerating the markers a verdict line can wear. The
-  # affirmative is an any_of_patterns regex `scraped:\s*[^\w\n]*yes\b`, so
-  # `Scraped:yes` with the space dropped, `Scraped : yes` with one added, a quoted
-  # `Scraped: "yes"` and a marked `Scraped: ✅ yes` all affirm where a literal
-  # `Scraped: yes` substring would red a compliant answer: the fold settles the
-  # spacing and unwraps a quote that ends its line, and the `[^\w\n]*` gap admits
-  # whatever non-word run the fold leaves between the colon and the token -- a
-  # quote prose follows on the same line (`Scraped: "yes". The watcher ...`), a
-  # check mark, a dash -- since the fold handles a line's lead and trail only. The
-  # negative is a forbidden_patterns regex
-  # `(?m)\A(?:(?!scraped:\s*[^\w\n]*yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b`: the
-  # `^scraped:\s*[^\w\n]*no\b` tail matches a line whose verdict is `Scraped: no`,
-  # however the value is quoted or marked, and the `\A...*?` prefix lets that
-  # match land only where no `Scraped: yes` precedes it -- the first verdict
-  # decides. The fold is what the tail rests on: the lead of a `-`/`+`
+  # affirmative is an any_of_patterns regex `scraped:\s*["'“‘(]?(?:[✅✔✓]\s*)?yes\b`,
+  # so `Scraped:yes` with the space dropped, `Scraped : yes` with one added, a
+  # quoted `Scraped: "yes"` and a checked `Scraped: ✅ yes` all affirm where a
+  # literal `Scraped: yes` substring would red a compliant answer: the fold
+  # settles the spacing and unwraps a quote that ends its line, and the gap admits
+  # what the fold leaves between the colon and the token when prose follows on
+  # the same line -- an opening quote or bracket, and the check marks the fold's
+  # own `_TRAIL_CLOSERS` treat as affirming (`✅ ✔ ✓`). The gap is that list and
+  # not the complement of a word character, for the reason the trail fold gives:
+  # a mark that negates the token must stay in front of it, so a struck-through
+  # `Scraped: ~~yes~~ no` or a `Scraped: ❌ yes` does not affirm (and, carrying no
+  # `no` verdict line either, fails the any_of -- red, as a negative or an
+  # unreadable verdict should). The negative is a forbidden_patterns regex
+  # `(?m)\A(?:(?!scraped:\s*["'“‘(]?(?:[✅✔✓]\s*)?yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b`:
+  # the `^scraped:\s*[^\w\n]*no\b` tail matches a line whose verdict is
+  # `Scraped: no` however the value is quoted or marked (`Scraped: ❌ no` reds; the
+  # wide gap is safe on this side, where a mark can only make a `no` more so),
+  # and the `\A...*?` prefix lets that match land only where no `Scraped: yes` --
+  # by the affirmative's own grammar -- precedes it: the first verdict decides. The fold is what the tail rests on: the lead of a `-`/`+`
   # bullet, a `#` heading, a `>` quote, a `|` table cell, a `- [ ]` checkbox, a
   # leading emoji, an ordered `1.`/`1)`/`(1)`, a lettered `a)`, a roman `ii.`, a
   # `#1` or a keycap `1️⃣` all come off, so `^scraped: no` anchors on the verdict
@@ -180,6 +185,6 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - 'scraped:\s*[^\w\n]*yes\b'
+        - 'scraped:\s*["''“‘(]?(?:[✅✔✓]\s*)?yes\b'
       forbidden_patterns:
-        - '(?m)\A(?:(?!scraped:\s*[^\w\n]*yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b'
+        - '(?m)\A(?:(?!scraped:\s*["''“‘(]?(?:[✅✔✓]\s*)?yes\b)[\s\S])*?^scraped:\s*[^\w\n]*no\b'
