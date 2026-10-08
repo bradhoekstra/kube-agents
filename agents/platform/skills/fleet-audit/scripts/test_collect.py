@@ -8,6 +8,7 @@ parallelism, and both never reading as a shorter candidate list.
 """
 
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -409,6 +410,25 @@ def context_of(dump=None, **overrides):
         # else -- pass it outright.
         base["pod_namespaces"] = {wl["ns"] for wl in base["workloads"] if wl["kind"] == "Pod"}
     return base
+
+
+class TestSweepPool(unittest.TestCase):
+    def test_the_sweep_pool_is_the_proxys_admitted_count(self):
+        # Every check is a kubectl or gcloud the credential proxy runs, and the proxy
+        # admits four requests at once at the operator's default limit
+        # (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool
+        # only queues the rest at the proxy, where a check still waiting at its 60 s
+        # admission bound is refused busy, or hits the collector's own 60 s timeout
+        # first and reads the cluster as unreachable. stall_watch.py and
+        # cluster_agent_reconcile.py pin the same figure for their listing pools.
+        self.assertEqual(collect.MAX_WORKERS, 4)
+        self.assertEqual(inspect.signature(collect.collect_fleet).parameters["max_workers"].default, collect.MAX_WORKERS)
+        # The procedural collectors each carry their own pool and sweep the same fleet
+        # through the same proxy; one of them running wider than the broker admits is
+        # the same queue, so they are pinned together here.
+        for name in ("fleet_stockout", "fleet_waste", "fleet_drift", "patch_readiness"):
+            with self.subTest(collector=name):
+                self.assertEqual(importlib.import_module(name).MAX_WORKERS, collect.MAX_WORKERS)
 
 
 class TestNoRequests(unittest.TestCase):
