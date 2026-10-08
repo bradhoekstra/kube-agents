@@ -127,15 +127,18 @@ verification_spec:
   # `_normalize_lines(raw, fold_decoration=True)`: `fold_decoration` folds each
   # line's lead decoration before the patterns run, so the grammar describes the
   # verdict once rather than enumerating the markers a verdict line can wear. The
-  # affirmative is an any_of_patterns regex `scraped:\s*yes\b`, so `Scraped:yes`
-  # with the space dropped, `Scraped : yes` with one added, and a
-  # whole-value-wrapped `Scraped: "yes"` all affirm where a literal `Scraped: yes`
-  # substring would red a compliant answer -- the fold settles the spacing and
-  # unwraps the quote. The negative is a forbidden_patterns regex
-  # `(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^scraped:\s*no\b`: the `^scraped:\s*no\b`
-  # tail matches a line whose verdict is `Scraped: no`, and the `\A...*?` prefix
-  # lets that match land only where no `Scraped: yes` precedes it -- the first
-  # verdict decides. The fold is what the tail rests on: the lead of a `-`/`+`
+  # affirmative is an any_of_patterns regex `scraped:\s*["'“‘]?yes\b`, so
+  # `Scraped:yes` with the space dropped, `Scraped : yes` with one added, and a
+  # quoted `Scraped: "yes"` all affirm where a literal `Scraped: yes` substring
+  # would red a compliant answer -- the fold settles the spacing, and the quote is
+  # admitted twice over: the fold unwraps one that ends its line, and the optional
+  # quote class admits one the fold leaves in place because prose follows it on
+  # the same line (`Scraped: "yes". The watcher ...`). The negative is a
+  # forbidden_patterns regex
+  # `(?m)\A(?:(?!scraped:\s*["'“‘]?yes\b)[\s\S])*?^scraped:\s*["'“‘]?no\b`: the
+  # `^scraped:\s*["'“‘]?no\b` tail matches a line whose verdict is `Scraped: no`,
+  # quoted or not, and the `\A...*?` prefix lets that match land only where no
+  # `Scraped: yes` precedes it -- the first verdict decides. The fold is what the tail rests on: the lead of a `-`/`+`
   # bullet, a `#` heading, a `>` quote, a `|` table cell, a `- [ ]` checkbox, a
   # leading emoji, an ordered `1.`/`1)`/`(1)`, a lettered `a)`, a roman `ii.`, a
   # `#1` or a keycap `1️⃣` all come off, so `^scraped: no` anchors on the verdict
@@ -175,6 +178,6 @@ verification_spec:
       type: report_contains
       fold_decoration: true
       any_of_patterns:
-        - 'scraped:\s*yes\b'
+        - 'scraped:\s*["''“‘]?yes\b'
       forbidden_patterns:
-        - '(?m)\A(?:(?!scraped:\s*yes\b)[\s\S])*?^scraped:\s*no\b'
+        - '(?m)\A(?:(?!scraped:\s*["''“‘]?yes\b)[\s\S])*?^scraped:\s*["''“‘]?no\b'

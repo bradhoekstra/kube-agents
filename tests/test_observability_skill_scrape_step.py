@@ -1,7 +1,7 @@
 """The observability skill reads the scrape config off the PodMonitoring, not the Deployment.
 
 The kube-agents operator renders no Prometheus scrape annotations on the gateway
-Deployment; the managed collector scrapes through the chart's two `PodMonitoring`
+Deployment; the managed collector scrapes through the chart's `PodMonitoring`
 resources instead. Step 1 of the skill's Metrics workflow used to send the agent
 to the Deployment looking for those annotations, so on a scraped install it
 reported "not scraped" (gke-labs/kube-agents#2141). The step now names the
