@@ -413,22 +413,35 @@ def context_of(dump=None, **overrides):
 
 
 class TestSweepPool(unittest.TestCase):
-    def test_the_sweep_pool_is_the_proxys_admitted_count(self):
+    def test_every_collector_pool_is_the_admitted_count(self):
         # Every check is a kubectl or gcloud the credential proxy runs, and the proxy
         # admits four requests at once at the operator's default limit
         # (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool
         # only queues the rest at the proxy, where a check still waiting at its 60 s
         # admission bound is refused busy, or hits the collector's own 60 s timeout
         # first and reads the cluster as unreachable. stall_watch.py and
-        # cluster_agent_reconcile.py pin the same figure for their listing pools.
+        # cluster_agent_reconcile.py pin the same literal for their listing pools; the
+        # broker computes the admitted count at runtime from its container limit, so
+        # there is no constant to import, and this pins the shared figure the three
+        # pools agree on — four at the default limit — not the running count. A
+        # non-default proxy limit is the caller's to re-sync (see collect.py and #2639).
         self.assertEqual(collect.MAX_WORKERS, 4)
-        self.assertEqual(inspect.signature(collect.collect_fleet).parameters["max_workers"].default, collect.MAX_WORKERS)
-        # The procedural collectors each carry their own pool and sweep the same fleet
-        # through the same proxy; one of them running wider than the broker admits is
-        # the same queue, so they are pinned together here.
-        for name in ("fleet_stockout", "fleet_waste", "fleet_drift", "patch_readiness"):
+        # Each collector's pool is its MAX_WORKERS, and collect_fleet's default binds to
+        # it, so a sweep run without an explicit width uses the pinned figure.
+        collectors = {
+            "collect": collect,
+            "fleet_stockout": importlib.import_module("fleet_stockout"),
+            "fleet_waste": importlib.import_module("fleet_waste"),
+            "fleet_drift": importlib.import_module("fleet_drift"),
+            "patch_readiness": importlib.import_module("patch_readiness"),
+        }
+        for name, mod in collectors.items():
             with self.subTest(collector=name):
-                self.assertEqual(importlib.import_module(name).MAX_WORKERS, collect.MAX_WORKERS)
+                self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
+                self.assertEqual(
+                    inspect.signature(mod.collect_fleet).parameters["max_workers"].default,
+                    mod.MAX_WORKERS,
+                )
 
 
 class TestNoRequests(unittest.TestCase):
