@@ -556,7 +556,7 @@ The activation ladder progresses in order:
 
 Three things to know about a daily cadence. There is no rate limiter inside the resolver — the
 cron is the cadence, which is what keeps wall-clock arithmetic out of the decision entirely — so a
-staging-promoted commit ships the morning after the promotion that qualified it, and a day that
+staging-promoted commit ships at the first 06:17 UTC tick after its promotion, and a day that
 produces nothing costs a day. Quiet days are ordinary rather than rare: a release needs a staging
 tag on a commit above main's last release, which needs a fresh validated candidate _and_ a green
 matrix on the same night; and because `release-scheduler.yml` dispatches `release-publish.yml`

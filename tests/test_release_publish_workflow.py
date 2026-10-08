@@ -78,11 +78,8 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
             self.assertEqual(dow, "*", f"'{entry['cron']}' pins a weekday; the cadence is daily")
             self.assertEqual(dom, "*", f"'{entry['cron']}' pins a day of month; the cadence is daily")
             self.assertEqual(month, "*", f"'{entry['cron']}' pins a month; the cadence is daily")
-            self.assertEqual(
-                (hour, minute),
-                ("6", "17"),
-                f"'{entry['cron']}' moved off 06:17 UTC, which the nightly staging promotion finishes before",
-            )
+            # The exact time is test_release_scheduler_wiring.py's _RELEASE_CRON.
+            del minute, hour
 
     def test_the_emergency_bypass_names_the_gate_it_bypasses(self):
         """`skip_rc_validation` names the RC suite, which is no longer the gate."""

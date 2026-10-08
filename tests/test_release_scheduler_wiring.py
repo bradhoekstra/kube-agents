@@ -22,6 +22,10 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 _SCHEDULER = "release-scheduler.yml"
 _PIPELINE = "release-publish.yml"
+# Daily, at 06:17 UTC: after the nightly staging promotion (02:17 UTC) has had
+# time to push its staging_* tag, and off the top of the hour, where GitHub's
+# scheduler queues. test_release_publish_workflow.py asserts the daily shape
+# only; the exact value lives here.
 _RELEASE_CRON = "17 6 * * *"
 
 _DISPATCH_SCRIPT_NAME = "dispatch_release_pipeline.sh"

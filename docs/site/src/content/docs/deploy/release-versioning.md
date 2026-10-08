@@ -56,7 +56,7 @@ with manual dispatches available for overrides and off-schedule releases.
 | :-------------------------- | :----------------------------------------------------------------------------------------------------------------------------------- |
 | RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate on `main` has already been tried.                |
 | Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate on `main`. One already nominated or promoted is re-tested, not re-tagged. |
-| GA release                  | Daily at 06:17 UTC, after the staging promotion, or when a maintainer dispatches it.                                                 |
+| GA release                  | Daily at 06:17 UTC, or when a maintainer dispatches it. A candidate promoted after that tick ships at the next one.                  |
 
 A staging promotion is not finished when its matrix goes green. The eval runs between the
 nomination and the tag and takes hours, so the `staging_*` tag can appear most of a working day
@@ -66,10 +66,10 @@ Scheduled runs start when GitHub's scheduler picks them up, so the minute is a f
 promise. A scheduled GA release ships unattended each day a new staging-promoted
 candidate exists, or maintainers may dispatch the workflow by hand.
 
-Under a daily cadence the minor number advances at close to one a day: a day's range on `main`
-almost always carries a `feat:`, and a fix-only range bumps minor too once the previous minor has
-its release line (see the table below). The minor number therefore tells you how many releases
-from `main` separate two installs, and the release notes tell you what changed between them.
+Every release from `main` bumps the minor number: a day's range almost always carries a `feat:`,
+and a fix-only range bumps minor too once the previous minor has its release line (see the table
+below). So the minor number advances with each release rather than with how much changed, and the
+release notes are where to read what changed between two versions.
 
 ### What the next release contains
 
