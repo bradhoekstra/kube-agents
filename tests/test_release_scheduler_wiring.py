@@ -2,11 +2,11 @@
 
 Following the decoupled trigger pattern established by rc-scheduler.yml and
 staging-promotion-scheduler.yml, release-scheduler.yml holds the cron trigger
-("17 6 * * 5") so that quiet ticks with nothing to release produce no
+("17 6 * * *") so that quiet ticks with nothing to release produce no
 pipeline run at all.
 
 These tests pin the structural invariants:
-- The scheduler holds the cron ("17 6 * * 5"), and release-publish.yml does not.
+- The scheduler holds the cron ("17 6 * * *"), and release-publish.yml does not.
 - The scheduler evaluates candidates via resolve_scheduled_release.sh.
 - Dispatch is strictly gated on steps.resolve.outputs.should_release == 'true'.
 - Skips are recorded via record_release_scheduler_skip.sh on should_release != 'true'.
@@ -22,7 +22,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 _SCHEDULER = "release-scheduler.yml"
 _PIPELINE = "release-publish.yml"
-_RELEASE_CRON = "17 6 * * 5"
+_RELEASE_CRON = "17 6 * * *"
 
 _DISPATCH_SCRIPT_NAME = "dispatch_release_pipeline.sh"
 _DISPATCH_SCRIPT = (
@@ -67,14 +67,22 @@ class SchedulerOwnsTheCron(unittest.TestCase):
             "the cron so that a tick with nothing to publish produces no run at all",
         )
 
-    def test_exactly_one_workflow_holds_the_release_cron(self) -> None:
-        """Two schedules would double-dispatch, and the second would be invisible."""
+    def test_exactly_one_scheduled_workflow_dispatches_the_pipeline(self) -> None:
+        """Two schedules would double-dispatch, and the second would be invisible.
+
+        Matched on what a workflow does rather than on the cron string: a daily
+        cron is a value other sweeps share, so sharing it proves nothing, while
+        a second scheduled workflow that runs the dispatch script or names the
+        pipeline is the double dispatch this guards against.
+        """
         holders = []
         for path in sorted(_WORKFLOWS.glob("*.yml")):
             doc = _workflow(path.name)
-            for entry in (doc.get("on") or {}).get("schedule") or []:
-                if entry.get("cron") == _RELEASE_CRON:
-                    holders.append(path.name)
+            if not (doc.get("on") or {}).get("schedule"):
+                continue
+            source = path.read_text()
+            if _DISPATCH_SCRIPT_NAME in source or _PIPELINE in source:
+                holders.append(path.name)
         self.assertEqual(holders, [_SCHEDULER])
 
 
