@@ -42,7 +42,7 @@ CONFIG = {
     "reviewers": {
         "defaults": ["repository-owners", "repository-reviewers"],
         "groups": {
-            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"],
+            "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor", "haoxuw"],
             "repository-reviewers": ["lapis2002", "stalhaali", "Fuxiao-Gao"],
             "eval-crew": ["jayantid", "lapis2002"],
         },
@@ -78,7 +78,7 @@ LIVE_CONFIG = REPO_ROOT / rr.DEFAULT_CONFIG_PATH
 # `jayantid` is inside it, so an `APPROVED` review from him reads as an
 # approval, and `NON_APPROVER` is outside it, so the same review from him
 # does not.
-APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor"}
+APPROVERS = {"bradhoekstra", "jayantid", "toshiowang", "dshnayder", "bnaylor", "haoxuw"}
 NON_APPROVER = "outside-contributor"
 
 # The root OWNERS, OWNERS_ALIASES and hack/OWNERS as they stand, for the walk

@@ -12,6 +12,7 @@ reviewers:
       - toshiowang
       - dshnayder
       - bnaylor
+      - haoxuw
     # Reviewers who are not root approvers. Prow takes their lgtm because
     # OWNERS lists them under `reviewers` (scripts/test_request_reviewers.py
     # pins that), but their approval cannot produce `approved`, so
