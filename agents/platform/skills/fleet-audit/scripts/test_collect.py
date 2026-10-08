@@ -413,29 +413,42 @@ def context_of(dump=None, **overrides):
 
 
 class TestSweepPool(unittest.TestCase):
-    def test_every_collector_pool_is_the_admitted_count(self):
-        # Every check is a kubectl or gcloud the credential proxy runs, and the proxy
-        # admits four requests at once at the operator's default limit
-        # (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool
-        # only queues the rest at the proxy, where a check still waiting at its 60 s
-        # admission bound is refused busy, or hits the collector's own 60 s timeout
-        # first and reads the cluster as unreachable. stall_watch.py and
-        # cluster_agent_reconcile.py pin the same literal for their listing pools; the
-        # broker computes the admitted count at runtime from its container limit, so
-        # there is no constant to import, and this pins the shared figure the three
-        # pools agree on — four at the default limit — not the running count. A
-        # non-default proxy limit is the caller's to re-sync (see collect.py and #2639).
-        self.assertEqual(collect.MAX_WORKERS, 4)
-        # Each collector's pool is its MAX_WORKERS, and collect_fleet's default binds to
-        # it, so a sweep run without an explicit width uses the pinned figure.
-        collectors = {
-            "collect": collect,
-            "fleet_stockout": importlib.import_module("fleet_stockout"),
-            "fleet_waste": importlib.import_module("fleet_waste"),
-            "fleet_drift": importlib.import_module("fleet_drift"),
-            "patch_readiness": importlib.import_module("patch_readiness"),
-        }
-        for name, mod in collectors.items():
+    # The credential proxy admits four requests at once under its child memory
+    # budget at the operator's default 1Gi limit
+    # (docs/designs/credential-proxy-child-memory-budget.md §2.2). stall_watch.py and
+    # cluster_agent_reconcile.py pin the same figure for their listing pools; the
+    # broker computes the admitted count at runtime from its container limit and
+    # exposes no constant, so this pins the shared figure the pools agree on at the
+    # default limit -- four -- not the broker's running count. A non-default proxy
+    # limit is the caller's to re-sync (see collect.py and #2639).
+    DEFAULT_LIMIT_ADMITTED_COUNT = 4
+
+    def _collector_modules(self):
+        # Every non-test module in this directory that defines both a MAX_WORKERS
+        # pool and a collect_fleet is a sweep collector; discovered rather than
+        # listed, so a collector added here at the wrong width fails this test
+        # instead of sliding in unpinned.
+        here = Path(__file__).resolve().parent
+        found = {}
+        for path in sorted(here.glob("*.py")):
+            if path.name.startswith("test_") or path.name == "__init__.py":
+                continue
+            mod = importlib.import_module(path.stem)
+            if hasattr(mod, "MAX_WORKERS") and hasattr(mod, "collect_fleet"):
+                found[path.name] = mod
+        return found
+
+    def test_collector_pools_pin_the_default_limit_admitted_count(self):
+        self.assertEqual(collect.MAX_WORKERS, self.DEFAULT_LIMIT_ADMITTED_COUNT)
+        mods = self._collector_modules()
+        # The five in this directory; compute_fleet_audit.py in the sibling
+        # gce-compute-fleet-audit skill is pinned by its own test, which ties it
+        # to this same figure.
+        self.assertEqual(
+            set(mods),
+            {"collect.py", "fleet_stockout.py", "fleet_waste.py", "fleet_drift.py", "patch_readiness.py"},
+        )
+        for name, mod in mods.items():
             with self.subTest(collector=name):
                 self.assertEqual(mod.MAX_WORKERS, collect.MAX_WORKERS)
                 self.assertEqual(

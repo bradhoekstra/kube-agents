@@ -3,6 +3,7 @@
 
 import datetime
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -2226,6 +2227,22 @@ class ApiDisabledTest(unittest.TestCase):
         entry = cf.collect_project("real-proj", run=self.refusing("ERROR: SERVICE_DISABLED"))
         self.assertEqual(entry["outcome"], "gate-failed")
         self.assertIn("the refusal does not name 'real-proj'", entry["error"])
+
+
+
+class SweepPoolTest(unittest.TestCase):
+    def test_pool_matches_the_fleet_audit_collectors_admitted_count(self):
+        # This collector sweeps projects through the same credential proxy as the
+        # fleet-audit collectors, so its pool is the same admitted count they pin
+        # (docs/designs/credential-proxy-child-memory-budget.md §2.2). Tied to
+        # collect.MAX_WORKERS rather than a lone literal so the six move together.
+        import collect  # noqa: E402 -- fleet-audit/scripts is on sys.path above
+
+        self.assertEqual(cf.MAX_WORKERS, collect.MAX_WORKERS)
+        self.assertEqual(
+            inspect.signature(cf.collect_fleet).parameters["max_workers"].default,
+            cf.MAX_WORKERS,
+        )
 
 
 if __name__ == "__main__":

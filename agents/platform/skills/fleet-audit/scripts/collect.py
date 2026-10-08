@@ -790,7 +790,7 @@ def dump_state(
     only to paths keyed by its own cluster, and it named this file as the
     example of a name no two threads can collide on — but a cluster name is
     unique within a project, not across the fleet, and this collector runs
-    eight projects at once. Two clusters called `prod` in two projects wrote
+    several projects at once. Two clusters called `prod` in two projects wrote
     the same path, and the loser re-read the winner's dump: not a truncated
     file or a crash, but one cluster's workloads published under the other's
     name, with a manifest recording a clean rc=0 read.
