@@ -782,6 +782,18 @@ class MainTest(unittest.TestCase):
             self.assertIn(self.requested()[0], OWNERS, seed)
         self.assertIn("author's own approval does not cover", self.stderr.getvalue())
 
+    def test_the_override_narrows_the_pool_too(self):
+        # `/request-review` skips the verdict check, not the narrowing: the
+        # person asking wants a reviewer now, and a non-approver's pull request
+        # still needs an approver's. The two live in different blocks of
+        # `main`, so this pins that moving the narrowing into the verdict block
+        # cannot ship green.
+        for seed in range(20):
+            self.run_main(pull_request(), [], "--react-to", str(self.COMMENT_ID), "--seed", str(seed))
+            self.assertEqual(self.code, 0)
+            self.assertIn(self.requested()[0], OWNERS, seed)
+            self.assertEqual(self.reaction(), [rr.REACTION_ACKNOWLEDGED])
+
     def test_an_approver_author_draws_from_the_whole_pool(self):
         # bradhoekstra approves README.md in the fixture tree, so the pull
         # request opens approved and needs lgtm alone: the non-approver
