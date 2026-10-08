@@ -121,6 +121,9 @@ const (
 	// cluster's initial list is tens of thousands of events, nearly all of
 	// which the filter drops in microseconds.
 	deliveryQueueDepth = 1024
+	// listedQueueName is what listedQueue reports waiting for, as a
+	// cache.DoneChecker.
+	listedQueueName = "initial Event list"
 )
 
 // preflightVerbs is the order the preflight asks in (see preflightResource).
@@ -229,7 +232,7 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 	// deliberate: the back-pressure of a slow daemon goes to the watch, where
 	// the API server buffers, instead of into an unbounded buffer here.
 	deliveries := make(chan *corev1.Event, deliveryQueueDepth)
-	queue := cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{EmitDeltaTypeReplaced: true})
+	queue := newListedQueue()
 	controller := cache.New(&cache.Config{
 		Queue:                        queue,
 		ListerWatcher:                w.newListWatch(),
@@ -290,10 +293,13 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 		}
 	}()
 	go controller.RunWithContext(ctx)
-	// WaitForCacheSync blocks until the initial list has been popped in
-	// full — without this, the first N events after startup would be
-	// delivered without their prior Count/LastTimestamp, breaking the
-	// dedup logic.
+	// WaitForCacheSync blocks until the initial list has reached the queue
+	// (see listedQueue). Nothing downstream depends on the wait — the queue
+	// and the one delivery goroutine fix the order events reach the
+	// dispatcher whether or not Run is still here — but what follows it
+	// does: markSynced, and through it cluster_up and the no-cluster-synced
+	// exit in main.go, which have to report the list completing and not the
+	// daemon keeping up.
 	if !cache.WaitForCacheSync(ctx.Done(), controller.HasSynced) {
 		return fmt.Errorf("watcher: cache sync failed (reflector stopped before initial list completed)")
 	}
@@ -596,6 +602,62 @@ func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err 
 	log.Printf("watcher: [%s] events forbidden, holding %s before the next attempt: %v", w.cluster.Name, w.forbiddenHold, err)
 	holdOrDone(ctx, w.forbiddenHold)
 }
+
+// listedQueue is the controller's queue: a DeltaFIFO whose HasSynced reports
+// the initial list having arrived rather than having been popped. The pop
+// waits on delivery and delivery waits on the daemon, so the DeltaFIFO's own
+// HasSynced would make the sync report — cluster_up, and the no-cluster-synced
+// exit in main.go — depend on the daemon making progress: a single-cluster
+// install whose daemon stalled on a handful of accepted events would miss
+// initialSyncGrace, restart and relist into the same state. The shared
+// informer this replaced buffered without bound, so its sync never waited on
+// a handler; the list reaching the queue is the fact the report has always
+// stood for. Replace is the reflector's one call for a completed list, in
+// the classic mode after the List and in watch-list mode at the bookmark that
+// ends the initial events, and it is called again on every relist, which
+// changes nothing once listed is closed.
+type listedQueue struct {
+	*cache.DeltaFIFO
+	listedOnce sync.Once
+	listed     chan struct{}
+}
+
+func newListedQueue() *listedQueue {
+	return &listedQueue{
+		DeltaFIFO: cache.NewDeltaFIFOWithOptions(cache.DeltaFIFOOptions{EmitDeltaTypeReplaced: true}),
+		listed:    make(chan struct{}),
+	}
+}
+
+// Replace queues the list as the DeltaFIFO does and records that one has
+// arrived.
+func (q *listedQueue) Replace(list []any, resourceVersion string) error {
+	if err := q.DeltaFIFO.Replace(list, resourceVersion); err != nil {
+		return err
+	}
+	q.listedOnce.Do(func() { close(q.listed) })
+	return nil
+}
+
+// HasSynced reports whether the initial list has reached the queue.
+func (q *listedQueue) HasSynced() bool {
+	select {
+	case <-q.listed:
+		return true
+	default:
+		return false
+	}
+}
+
+// HasSyncedChecker is HasSynced for callers that wait on a channel; the
+// queue is its own checker.
+func (q *listedQueue) HasSyncedChecker() cache.DoneChecker { return q }
+
+// Name names what the checker waits for, as cache.DoneChecker asks.
+func (q *listedQueue) Name() string { return listedQueueName }
+
+// Done is closed once the initial list has reached the queue.
+func (q *listedQueue) Done() <-chan struct{} { return q.listed }
 
 // dispatch converts a *corev1.Event to the internal TriageEvent
 // shape and hands it to the dispatcher. Extracted so both AddFunc
