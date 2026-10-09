@@ -653,6 +653,22 @@ def fill(src, dst, path):
 
 fill(template, live, [])
 
+# plugins.enabled is the one list the image owns: a plugin directory the image
+# ships is inert until the profile's list names it, and the fill above never
+# enters a list, so a volume scaffolded before a plugin existed would carry it
+# into every image and never load it. Add the template's names the live list
+# lacks, after the agent's own, and remove none: a name the agent dropped on
+# purpose comes back, which is the price of a plugin that ships enabled.
+PLUGINS_KEY = "plugins"
+ENABLED_KEY = "enabled"
+template_enabled = (template.get(PLUGINS_KEY) or {}).get(ENABLED_KEY) if isinstance(template.get(PLUGINS_KEY), dict) else None
+live_plugins = live.get(PLUGINS_KEY)
+if isinstance(template_enabled, list) and isinstance(live_plugins, dict) and isinstance(live_plugins.get(ENABLED_KEY), list):
+    for name in template_enabled:
+        if name not in live_plugins[ENABLED_KEY]:
+            live_plugins[ENABLED_KEY].append(name)
+            added.append(".".join([PLUGINS_KEY, ENABLED_KEY, str(name)]))
+
 if added:
     # Atomic, because a truncated config.yaml is worse than a hollow one: os.replace
     # over a plain PVC file is a rename, and the reader either sees all of the old file

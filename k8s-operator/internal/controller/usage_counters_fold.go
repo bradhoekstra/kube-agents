@@ -60,18 +60,21 @@ const (
 	usageCounterEventsIngested       = "eventsIngestedTotal"
 	usageCounterRemediationsProposed = "remediationsProposedTotal"
 	usageCounterRemediationsMerged   = "remediationsMergedTotal"
+	usageCounterChatMessagesInbound  = "chatMessagesInboundTotal"
 	// usagePodEntryKeySeparator joins a pod UID and a counter into an entry
 	// key; a UID carries no slash.
 	usagePodEntryKeySeparator = "/"
 )
 
 var (
-	// usageGatewayCounters and usageBrokerCounters are the counters each pod
-	// group's body feeds, in the order the stub source hands samples out.
+	// usageGatewayCounters, usageChatCounters and usageBrokerCounters are the
+	// counters each pod group's body feeds, in the order the stub source hands
+	// samples out.
 	usageGatewayCounters = []string{usageCounterEventsIngested}
+	usageChatCounters    = []string{usageCounterChatMessagesInbound}
 	usageBrokerCounters  = []string{usageCounterToolExecutions, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
 	// usageCounters is every counter the document keeps and the status seeds.
-	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged}
+	usageCounters = []string{usageCounterToolExecutions, usageCounterEventsIngested, usageCounterRemediationsProposed, usageCounterRemediationsMerged, usageCounterChatMessagesInbound}
 )
 
 // usagePodEntryKey is the document key of one pod's entry for one counter.

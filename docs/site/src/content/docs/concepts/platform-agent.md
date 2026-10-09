@@ -55,7 +55,7 @@ A top-level `toolsets: [kanban]` key additionally exposes the kanban orchestrato
 - `tool_call_audit` — appends every tool call and approval decision as a structured audit record to the profile's `logs/audit.jsonl`, which the fluent-bit sidecar ships to Cloud Logging as fields ([Concepts → Observability](/kube-agents/concepts/observability/#tool-call-audit)).
 - `incident_context` — injects Kubernetes incident context into known chat threads on reply.
 
-The chat-ingress plugins (`session_store`, `session_otel_bridge`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
+The chat-ingress plugins (`session_store`, `session_otel_bridge`, `chat_metrics`) run on the Planning Agent profile, which owns chat ingress — see [`agents/chat/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/chat/config.yaml).
 
 ## Behavioral shape
 

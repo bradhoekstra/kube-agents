@@ -70,6 +70,15 @@ _SCRAPES = (
         "port_name": "event-metrics",
         "selector_keys": ("app",),
     },
+    # The same PodMonitoring's second endpoint: the chat_metrics plugin's
+    # listener on the platform-agent container.
+    {
+        "suffix": "-gateway-monitoring",
+        "deployment": "platformagent-gateway",
+        "container": "platform-agent",
+        "port_name": "chat-metrics",
+        "selector_keys": ("app",),
+    },
     {
         "suffix": "-credential-proxy-monitoring",
         "deployment": "platformagent-credential-proxy",
@@ -208,23 +217,26 @@ class MonitoringRenderTest(unittest.TestCase):
         # CRD still does not. With the API served, one per scraped pod.
         self.assertEqual(self._monitorings(), {})
         rendered = self._monitorings(*_ON_GKE)
-        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
-        for scrape in _SCRAPES:
-            with self.subTest(scrape=scrape["suffix"]):
-                monitoring = rendered[_AGENT + scrape["suffix"]]
-                self.assertEqual(monitoring["spec"]["selector"], {"matchLabels": _selector(scrape, _AGENT)})
+        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
+        # One PodMonitoring per suffix; its endpoints are the rows that share the
+        # suffix, in _SCRAPES order (the gateway's carries two).
+        for suffix in dict.fromkeys(s["suffix"] for s in _SCRAPES):
+            rows = [s for s in _SCRAPES if s["suffix"] == suffix]
+            with self.subTest(scrape=suffix):
+                monitoring = rendered[_AGENT + suffix]
+                self.assertEqual(monitoring["spec"]["selector"], {"matchLabels": _selector(rows[0], _AGENT)})
                 self.assertEqual(
                     monitoring["spec"]["endpoints"],
                     [{
-                        "port": _scrape_port(scrape),
+                        "port": _scrape_port(row),
                         "path": "/metrics",
                         "interval": "30s",
-                    }],
+                    } for row in rows],
                 )
 
     def test_the_names_and_selectors_follow_the_agent_name(self):
         rendered = self._monitorings(*_ON_GKE, "--set", "platformAgent.name=custom")
-        self.assertEqual(sorted(rendered), sorted("custom" + s["suffix"] for s in _SCRAPES))
+        self.assertEqual(sorted(rendered), sorted({"custom" + s["suffix"] for s in _SCRAPES}))
         for scrape in _SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 self.assertEqual(
@@ -234,7 +246,7 @@ class MonitoringRenderTest(unittest.TestCase):
 
     def test_true_renders_them_without_asking_the_cluster(self):
         rendered = self._monitorings("--set", "platformAgent.podMonitoring=true")
-        self.assertEqual(sorted(rendered), sorted(_AGENT + s["suffix"] for s in _SCRAPES))
+        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
 
     def test_false_renders_nothing_even_where_the_api_is_served(self):
         self.assertEqual(self._monitorings(*_ON_GKE, "--set", "platformAgent.podMonitoring=false"), {})
