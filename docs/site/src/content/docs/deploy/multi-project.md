@@ -24,9 +24,8 @@ policy there, the identity running the apply needs to read the project, mint its
 service agent and create a sink (`roles/owner` carries all of them).
 `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS` bind the roles on a folder or
 organisation, whose bindings every project beneath it inherits; its members get
-a drift sink each only while the scoped service account pool
-(`SCOPED_SA_POOL_ENABLED=true`) lists them at plan time, and otherwise their
-clusters are discovered but their changes are not exported.
+no drift sink: their clusters are discovered at runtime and their changes are
+not exported, whether or not the scoped service account pool lists them.
 `SCOPE_SHARED_VPC_HOSTS` and `SCOPE_METRICS_SCOPES` bind the roles, and create
 the sink, in every project a Shared VPC host or Metrics Scope resolves to. Without any of these
 the installer binds the service account in the host project alone, and the
@@ -81,7 +80,12 @@ sink when the detector is on, and adds it to
 APIs) and the Verify section still apply. `SCOPE_EXCLUDE_PROJECTS` and
 `SCOPE_EXCLUDE_CLUSTERS` (`project/location/cluster`) declare exclusions the
 same way; a project an exact `SCOPE_EXCLUDE_PROJECTS` entry names gets no drift
-sink, while one a glob matches is excluded at runtime and still exported. The field and every key that sets it are described under
+sink, while one a glob matches is excluded at runtime and still exported. To keep
+a project in the scope and out of the export, add
+`TF_VAR_drift_pubsub_source_exclude_projects=<project id>` to `install.env`: the
+lever for a project where the applying identity cannot mint the Logging service
+agent or create the sink, which otherwise stops the apply at that project's
+resources. The field and every key that sets it are described under
 [`spec.scope`](/kube-agents/operator/platformagent-crd/#specscope).
 
 ## Setup

@@ -98,7 +98,7 @@ credentials before it can match the entry, and without the grant the member is r
 as unnamed and holds the scope prune on every tick. Removing an entry revokes its bindings on the next apply, and
 `terraform destroy` revokes them all. The `scope_projects`, `scope_folders`,
 `scope_organizations`, `scope_shared_vpc_hosts`, `scope_metrics_scopes`, `scope_bound_projects`, `scope_lookup_only_hosts`,
-`scope_roles` and `scope_container_roles` outputs surface what was bound; `scope_discovered_projects` is the projects beyond the host the plan lists in the scope, the pool's set less the host, which the composition feeds to the drift-pubsub module's `source_projects`. An organisation binding
+`scope_roles` and `scope_container_roles` outputs surface what was bound; `scope_discovered_projects` is the projects beyond the host the plan lists in the scope, the pool's set less the host; `scope_export_projects` is the same without a container's Asset-Inventory members, which the composition feeds to the drift-pubsub module's `source_projects` (the output's description says why the two differ). An organisation binding
 is wide; the design is
 [`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md) §6, §9 and
 §10 step 3.

@@ -538,6 +538,10 @@ module "chat_pubsub" {
 # TF_VAR_ line that is blanked exports "", which a map refuses) and the module
 # takes a map; "" is no override.
 locals {
+  # The exclusions as a set, from the comma- or space-separated string a
+  # TF_VAR_ line can carry; blank is none.
+  drift_pubsub_source_exclude_projects               = toset([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p if p != ""])
+  drift_pubsub_source_projects                       = sort(tolist(setsubtract(toset(module.kube_agents_iam.scope_export_projects), local.drift_pubsub_source_exclude_projects)))
   drift_pubsub_source_sink_writer_identity_overrides = trimspace(var.drift_pubsub_source_sink_writer_identity_overrides) == "" ? {} : tomap(jsondecode(var.drift_pubsub_source_sink_writer_identity_overrides))
 }
 
@@ -565,13 +569,19 @@ module "drift_pubsub" {
   # only this composition to lengthen them in.
   logging_identity_propagation_duration = var.drift_pubsub_logging_identity_propagation_duration
   # The drift ingress follows the scope: one sink per project the plan lists
-  # in it, into this install's topic, so a change on a scoped project's
-  # cluster reaches the detector like one on the management cluster's. The
-  # same list the pool is keyed on, less the host; empty on an install with
-  # no declared scope, where the module creates the host's sink alone. The
-  # per-project override is the host's sink_writer_identity_override for a
-  # source project, keyed by its ID, and reaches here the same way.
-  source_projects                       = module.kube_agents_iam.scope_discovered_projects
+  # in it from the declaration alone, into this install's topic, so a change
+  # on a scoped project's cluster reaches the detector like one on the
+  # management cluster's. scope_export_projects, not the pool's set: a
+  # container member the Asset index skips for one plan would otherwise lose
+  # its sink and the records until the next plan (the output's description).
+  # Less drift_pubsub_source_exclude_projects, the per-project way to keep
+  # reading a project's clusters without exporting its logs, for a project
+  # where the applying identity cannot mint the Logging agent or write the
+  # sink. Empty on an install with no declared scope, where the module creates
+  # the host's sink alone. The per-project override is the host's
+  # sink_writer_identity_override for a source project, keyed by its ID, and
+  # reaches here the same way.
+  source_projects                       = local.drift_pubsub_source_projects
   source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides
 
   # Defers data.google_project.this inside the module to apply time whenever

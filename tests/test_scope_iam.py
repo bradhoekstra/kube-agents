@@ -655,10 +655,12 @@ class ScopeReachesBothHalvesTest(unittest.TestCase):
 
 
 class DriftSinksFollowTheScopeTest(unittest.TestCase):
-    """The drift ingress exports every project the plan lists in the scope (design §8, the
+    """The drift ingress exports every project the declaration lists (design §8, the
     drift-pubsub row): the composition feeds the module's source_projects from one IAM-module
-    output, and that output is the pool's own set less the host, so a project cannot be in the
-    scope's listing and out of the drift export, or the reverse."""
+    output, scope_export_projects, which is scope.projects and the selectors' members less the
+    host and never a container's Asset-Inventory members (an index gap would otherwise destroy
+    a sink and lose the records until the next plan), less the operator's per-project
+    exclusions, the way to keep reading a project without exporting its logs."""
 
     def setUp(self):
         self.main_tf = (_COMPOSITION / "main.tf").read_text()
@@ -666,8 +668,13 @@ class DriftSinksFollowTheScopeTest(unittest.TestCase):
 
     def test_the_composition_feeds_the_sinks_from_the_iam_modules_listing(self):
         call = _block(self.main_tf, "module", "drift_pubsub")
-        self.assertIn("source_projects                       = module.kube_agents_iam.scope_discovered_projects", call,
-                      "the drift module's source_projects must come from the IAM module's scope_discovered_projects, the one list the pool is keyed on")
+        self.assertIn("source_projects                       = local.drift_pubsub_source_projects", call,
+                      "the drift module's source_projects must come from the composition's export local")
+        self.assertRegex(self.main_tf, r"drift_pubsub_source_projects\s*=\s*sort\(tolist\(setsubtract\(toset\(module\.kube_agents_iam\.scope_export_projects\), local\.drift_pubsub_source_exclude_projects\)\)\)",
+                         "the export local must be the IAM module's scope_export_projects less the operator's exclusions; the pool's scope_discovered_projects carries Asset-Inventory members an index gap can drop")
+        exclude = _block((_COMPOSITION / "variables.tf").read_text(), "variable", "drift_pubsub_source_exclude_projects")
+        self.assertIn("type        = string", exclude, "the exclusion list is a string so a TF_VAR_ line can carry it and a blanked line reads as none")
+        self.assertIn('default     = ""', exclude)
         self.assertIn("source_sink_writer_identity_overrides = local.drift_pubsub_source_sink_writer_identity_overrides", call)
         # A JSON string, decoded here, because the front doors reach it through a TF_VAR_ line
         # and a blanked line exports "", which a map-typed variable refuses as HCL.
@@ -679,6 +686,13 @@ class DriftSinksFollowTheScopeTest(unittest.TestCase):
         output = _block(self.iam_outputs, "output", "scope_discovered_projects")
         self.assertIn("value       = sort(tolist(setsubtract(local.scoped_pool_projects, toset([var.project_id]))))", output,
                       "scope_discovered_projects is no longer the pool's set less the host; tests/test_scoped_sa_pool_iam.py pins what that set is")
+
+    def test_the_export_set_is_the_declaration_less_the_host_and_no_index_member(self):
+        output = _block(self.iam_outputs, "output", "scope_export_projects")
+        self.assertIn("value       = sort(tolist(setsubtract(local.scope_listed_projects, toset([var.project_id]))))", output,
+                      "scope_export_projects must be scope_listed_projects (scope.projects and the selectors' members) less the host, and never "
+                      "scoped_pool_projects: a container member the Asset index omits for one plan would lose its sink and its records")
+        self.assertNotIn("scoped_pool", output)
 
     def test_the_source_projects_are_surfaced(self):
         outputs = (_COMPOSITION / "outputs.tf").read_text()

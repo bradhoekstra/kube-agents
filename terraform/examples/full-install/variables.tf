@@ -754,6 +754,18 @@ variable "drift_pubsub_sink_writer_identity_override" {
   default     = null
 }
 
+variable "drift_pubsub_source_exclude_projects" {
+  description = "Projects the scope lists whose audit logs the drift topic must NOT receive, comma- or space-separated project IDs. Each stays in the scope (its clusters are still read and get Cluster Agent profiles) and gets no drift audit-log sink, no Logging service agent mint and no publish grant: the lever for a project where the identity applying cannot mint the agent or write the sink, which would otherwise stop the apply at that project. Empty, the default, exports every project scope_export_projects lists. Reaches a front-door install as a TF_VAR_drift_pubsub_source_exclude_projects line in install.env."
+  type        = string
+  default     = ""
+  nullable    = false
+
+  validation {
+    condition     = alltrue([for p in split(",", replace(trimspace(var.drift_pubsub_source_exclude_projects), "/\\s+/", ",")) : p == "" || can(regex("^[a-z][a-z0-9-]{4,28}[a-z0-9]$", p))])
+    error_message = "drift_pubsub_source_exclude_projects is a comma- or space-separated list of GCP project IDs (6 to 30 characters: lowercase letters, digits and hyphens, starting with a letter)."
+  }
+}
+
 variable "drift_pubsub_source_sink_writer_identity_overrides" {
   description = "Per project the scope lists, keyed by project ID, the principal to grant roles/pubsub.publisher on the drift topic instead of the service-<project-number>@gcp-sa-logging.iam.gserviceaccount.com the drift-pubsub module derives for that project's sink: drift_pubsub_sink_writer_identity_override for a source project. Only used when enable_drift_pubsub is true and the scope lists projects. A JSON object, {\"<project>\": \"serviceAccount:...\"}, rather than a map, because through the front doors it is a TF_VAR_ line in install.env (TF_VAR_drift_pubsub_source_sink_writer_identity_overrides='{\"<project>\":\"serviceAccount:...\"}') and a blanked line exports \"\", which a map-typed variable refuses as HCL and this one reads as no override, as its string sibling does. Include the \"serviceAccount:\" prefix. Set only when an apply's postcondition has told you to."
   type        = string

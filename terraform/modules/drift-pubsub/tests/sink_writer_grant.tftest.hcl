@@ -528,7 +528,8 @@ run "a_source_sink_name_over_the_cap_is_refused_before_the_api_sees_it" {
 
   variables {
     source_projects = ["drift-project-2"]
-    sink_name       = "platform-agent-drift-audit-sink-with-a-name-long-enough-that-the-host-project-pushes-it-past-one-hundred"
+    # 92 characters: under the cap alone, over it once "-drift-project-1" is appended.
+    sink_name = "platform-agent-drift-audit-sink-with-a-name-that-the-host-project-suffix-pushes-past-the-ca"
   }
 
   override_data {

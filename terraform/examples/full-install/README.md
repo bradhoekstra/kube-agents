@@ -811,19 +811,30 @@ the project and in each project the scope lists; a caller that needs the module'
 directly.
 
 The ingress follows the scope. The module's `source_projects` is fed from
-`scope_discovered_projects`, the projects the plan lists in `scope` beyond
+`scope_export_projects`, the projects the declaration lists in `scope` beyond
 `project_id` — `scope.projects` and the selectors' members, each less an exact
-`exclude.projects` entry, and a folder's or organisation's members while the
-scoped service account pool lists them — so each gets a sink of its own, in
+`exclude.projects` entry, never a folder's or organisation's members, whose
+Asset-Inventory listing has no grace and would churn a sink — less
+`drift_pubsub_source_exclude_projects`, so each gets a sink of its own, in
 that project, named `drift_pubsub_sink` with `project_id` appended and routed
 into this install's topic, with that project's Logging service agent granted
 publish on the topic before the sink exists, as the host's is, and a drain of
 its own between them, so removing the project from the scope deletes its sink,
 waits, and only then revokes its grant. With no declared scope the list is
 empty and the module creates the host's trio alone.
-`drift_pubsub_source_sink_writer_identity_overrides`, a map keyed by project
-ID, is the override above for a source project and reaches here the same way,
-as a `TF_VAR_` line. The identity applying needs `logging.sinks.create`, the
+`drift_pubsub_source_sink_writer_identity_overrides`, a JSON object keyed by
+project ID (a string, because a `TF_VAR_` line cannot carry an HCL map and a
+blanked line has to read as no override), is the override above for a source
+project and reaches here the same way. `drift_pubsub_source_exclude_projects`,
+comma- or space-separated project IDs, keeps a listed project in the scope and
+out of the export: its clusters are still read, and no agent is minted, no
+grant made and no sink created for it. That is the lever for a project where
+the identity applying lacks what the chain needs, because Terraform stops
+scheduling new operations at the first error: the resources already running
+finish, and everything not yet started — other projects' sinks past the
+parallelism window and, on a first install, the IAM module and the chart
+release behind the cluster — waits for a second apply. The identity applying
+needs `logging.sinks.create`, the
 project's number and the Service Usage call that mints its Logging agent in
 each listed project (`roles/owner` carries them), and nothing probes for that
 before the apply: a number it cannot read fails the plan, or the apply at

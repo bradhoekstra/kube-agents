@@ -111,7 +111,7 @@ output "drift_pubsub_subscription_id" {
 }
 
 output "drift_pubsub_source_projects" {
-  description = "The projects beyond project_id whose audit logs the drift topic also receives, one sink each named drift_pubsub_sink with project_id appended: the projects the scope lists at plan time (scope_discovered_projects). Empty with no declared scope; null when enable_drift_pubsub is false."
+  description = "The projects beyond project_id whose audit logs the drift topic also receives, one sink each named drift_pubsub_sink with project_id appended: the projects the declaration lists at plan time (the IAM module's scope_export_projects: scope.projects and the selectors' members, never a container's Asset-Inventory members) less drift_pubsub_source_exclude_projects. Empty with no declared scope; null when enable_drift_pubsub is false."
   value       = try(module.drift_pubsub[0].source_projects, null)
 }
 
