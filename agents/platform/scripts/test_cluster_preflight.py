@@ -140,6 +140,15 @@ This Cluster Agent is permanently scoped to the following GKE cluster:
 - location: {LOCATION}
 """
 
+ENDPOINT_BULLETS = (
+    "- endpoint: internal-ip\n"
+    "- endpoint-address: 10.10.0.2\n"
+    "- authorized-networks: 10.0.0.0/8, 172.16.0.0/12\n"
+    "- endpoint-remedy: Add the agent cluster's Pod and node ranges to this cluster's "
+    "authorized networks, or open its DNS endpoint with "
+    "`gcloud container clusters update --enable-dns-access`.\n"
+)
+
 
 def _declared(pattern: str, text: str, where: Path) -> int:
     match = re.search(pattern, text, re.MULTILINE)
@@ -325,6 +334,48 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertIn("Connection refused", result["evidence"])
         self.assertNotIn("does not select a cluster", result["reason"])
         self.assertNotIn("Re-scaffold the profile to re-fetch", result["remediation"])
+
+    # ---- Check 5 reads the endpoint the scaffold chose ------------------------
+
+    def with_endpoint_bullets(self, bullets: str = ENDPOINT_BULLETS) -> None:
+        text = self.user_md.read_text(encoding="utf-8")
+        anchor = f"- location: {LOCATION}\n"
+        self.assertIn(anchor, text)
+        self.user_md.write_text(text.replace(anchor, anchor + bullets), encoding="utf-8")
+
+    def test_check_5_names_the_endpoint_and_the_remedy_when_recorded(self):
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_UNREACHABLE="1")
+        self.assertEqual("5", result["check"])
+        self.assertIn("internal-ip endpoint (10.10.0.2)", result["reason"])
+        self.assertIn("authorized networks: 10.0.0.0/8, 172.16.0.0/12", result["reason"])
+        self.assertTrue(result["remediation"].startswith("Add the agent cluster's Pod and node ranges"),
+                        result["remediation"])
+        self.assertIn("--enable-dns-access", result["remediation"])
+        # The verbatim kubectl error is still the evidence.
+        self.assertIn("i/o timeout", result["evidence"])
+
+    def test_check_5_keeps_the_remedy_case_and_spacing(self):
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_UNREACHABLE="1")
+        self.assertIn("`gcloud container clusters update --enable-dns-access`", result["remediation"])
+
+    def test_check_5_without_a_remedy_bullet_keeps_the_generic_remediation(self):
+        self.with_endpoint_bullets(
+            "- endpoint: dns\n- endpoint-address: gke-x.gke.goog\n- authorized-networks: unrestricted\n")
+        result = self.run_preflight(FAKE_UNREACHABLE="1")
+        self.assertIn("dns endpoint (gke-x.gke.goog)", result["reason"])
+        self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
+
+    def test_check_5_without_endpoint_bullets_is_unchanged(self):
+        result = self.run_preflight(FAKE_UNREACHABLE="1")
+        self.assertEqual("Cannot reach the target cluster's API server.", result["reason"])
+        self.assertTrue(result["remediation"].startswith("The cluster may be deleted"))
+        self.assertNotIn("endpoint", result["reason"])
+
+    def test_endpoint_bullets_do_not_disturb_the_identity_checks(self):
+        self.with_endpoint_bullets()
+        self.assertEqual("ok", self.run_preflight()["status"])
 
     # ---- Check 3 reads the file, not kubectl ---------------------------------
 

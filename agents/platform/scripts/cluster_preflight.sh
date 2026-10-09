@@ -19,7 +19,8 @@
 #   2. A kubeconfig is pinned and non-empty.
 #   3. That kubeconfig selects the cluster USER.md declares  <- identity.
 #   4. A plain `kubectl` resolves to that same context       <- identity.
-#   5. The cluster's API server answers.
+#   5. The cluster's API server answers (and, when it does not, which endpoint
+#      the kubeconfig names and what would open it).
 # Checks 3 and 4 are the difference between "kubectl works" and "kubectl works on
 # the right cluster". Without them 1, 2 and 5 all pass while the agent operates on
 # someone else's cluster and reports the results as its own.
@@ -235,6 +236,15 @@ user_md_field() {
         | sed -n "s/^[[:space:]]*-[[:space:]]*$1:[[:space:]]*//p" | head -n1 | tr -d '[:space:]'
 }
 
+# Like user_md_field, but keeps the value's case and inner spacing: the
+# endpoint remedy the scaffold writes is a sentence with a backticked command
+# in it, and the authorized-networks list is comma-separated. Key match is
+# case-insensitive, as above; only the first bullet counts.
+user_md_text() {
+    grep -i -m1 "^[[:space:]]*-[[:space:]]*$1:" "$USER_MD" 2>/dev/null \
+        | sed 's/^[[:space:]]*-[[:space:]]*[^:]*:[[:space:]]*//' | sed 's/[[:space:]]*$//'
+}
+
 PROJECT=""
 CLUSTER=""
 LOCATION=""
@@ -407,9 +417,18 @@ if [ "$STATUS" = "ok" ]; then
     if [ "$rc" -ne 0 ]; then
         # Collapse to a single line so it reads cleanly on the kanban card.
         ERR_ONE="$(printf '%s' "$ERR" | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-500)"
-        fail "5" "Cannot reach the target cluster's API server." \
-             "The cluster may be deleted, unreachable, or the agent's credentials lack access. Verify the cluster exists and the agent's service account has GKE access; then re-scaffold if needed." \
-             "kubectl cluster-info: $ERR_ONE"
+        REASON_5="Cannot reach the target cluster's API server."
+        REMEDIATION_5="The cluster may be deleted, unreachable, or the agent's credentials lack access. Verify the cluster exists and the agent's service account has GKE access; then re-scaffold if needed."
+        # The scaffold records which endpoint the kubeconfig names and what
+        # would open it (cluster_agent_profile.py, _endpoint_bullets). An
+        # older profile has no such bullets and reads exactly as before.
+        ENDPOINT_KIND="$(user_md_field endpoint)"
+        if [ -n "$ENDPOINT_KIND" ]; then
+            REASON_5="$REASON_5 The kubeconfig names the cluster's $ENDPOINT_KIND endpoint ($(user_md_text endpoint-address)); authorized networks: $(user_md_text authorized-networks)."
+            ENDPOINT_REMEDY="$(user_md_text endpoint-remedy)"
+            [ -n "$ENDPOINT_REMEDY" ] && REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
+        fi
+        fail "5" "$REASON_5" "$REMEDIATION_5" "kubectl cluster-info: $ERR_ONE"
     fi
 fi
 
