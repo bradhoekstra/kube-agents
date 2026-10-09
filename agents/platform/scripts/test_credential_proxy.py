@@ -3692,6 +3692,33 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(managed, served)
         self.assertFalse(executor._provisional_marker(target).exists())
 
+    def test_a_provisional_broker_fetch_does_not_replace_a_settled_file_a_caller_filed_meanwhile(self):
+        # The succeeding half of the same race: the broker's decision was
+        # undecided, its fetch succeeded, and a caller's settled file landed
+        # in between. An unmarked file present at filing time can only mean a
+        # settled answer arrived since the decision was made; it wins.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        settled = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n# settled by a caller\n"
+        original = executor._execute
+
+        def caller_lands_then_fetch_succeeds(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "get-credentials" in argv and "--help" not in argv:
+                managed.parent.mkdir(parents=True, exist_ok=True)
+                managed.write_text(settled)
+            return result
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", caller_lands_then_fetch_succeeds),
+        ):
+            served = executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertEqual(managed, served)
+        self.assertEqual(settled, managed.read_text(), "the caller's settled file was kept")
+        self.assertFalse(executor._provisional_marker(target).exists())
+
     def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
         # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
         # A scaffold's fetch must not queue behind it to file a credential it

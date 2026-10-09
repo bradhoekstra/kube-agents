@@ -97,7 +97,9 @@ filing step never waits behind a cold read's gcloud runs; a later settled fetch,
 fetch run as given because it carried its own endpoint flag or named no full target, clears
 it). When the refetch after the window fails and a file is on disk, the proxy serves that file
 and, if the file is still marked, pushes the window out rather than refusing the request; a
-settled file a caller filed meanwhile is served unmarked. A cold fetch during a failed
+settled file a caller filed meanwhile is served unmarked, and a provisional fetch that succeeds
+never replaces such a file, since an unmarked file present at filing time can only mean a
+settled answer landed since the decision was made. A cold fetch during a failed
 describe therefore does not pin a public-IP kubeconfig until the pod restarts, and a describe
 that keeps failing costs one refetch a minute rather than one a request.
 

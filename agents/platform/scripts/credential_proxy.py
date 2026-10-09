@@ -6414,15 +6414,25 @@ class CommandExecutor:
         settled; and it comes off after the file when it was settled. The two
         steps run under `_marker_lock`, so a settled fetch and a provisional
         one cannot interleave them, whether or not the caller also holds
-        `_kubeconfig_lock`.
+        `_kubeconfig_lock`. A provisional result never replaces a file that is
+        present and unmarked: that state means a settled answer landed since
+        the decision was made, and it wins.
         """
         marker = self._provisional_marker(target)
+        managed = self._managed_kubeconfig(target)
         with self._marker_lock:
             if provisional:
+                if managed.is_file() and managed.stat().st_size > 0 and not marker.exists():
+                    # A settled file landed since this decision was made: a
+                    # caller's fetch files outside `_kubeconfig_lock`, so it
+                    # can beat a cold or window-expired broker fetch to the
+                    # same cluster. A settled answer outranks an undecided one;
+                    # gcloud's output here is dropped.
+                    return
                 marker.touch()
-                os.replace(scratch, self._managed_kubeconfig(target))
+                os.replace(scratch, managed)
             else:
-                os.replace(scratch, self._managed_kubeconfig(target))
+                os.replace(scratch, managed)
                 marker.unlink(missing_ok=True)
 
     def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
