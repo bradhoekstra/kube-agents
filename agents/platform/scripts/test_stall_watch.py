@@ -69,12 +69,17 @@ DEADLINE_ROW = finding("checkout", "Deployment/checkout-api", "stale-condition",
 TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOUT_SECONDS)
 #: What the shim prints when the per-cluster stub is gone (KubeconfigUnreadable).
 STUB_LOST = "credential proxy: kubeconfig is unreadable: /home/hermes/.kube/stall-watch/c.yaml: [Errno 2] No such file or directory"
+#: kubectl 1.36 prints its discovery error before the reason, in the shape
+#: below, so on a GKE endpoint the reason starts past STDERR_EXCERPT_CHARS.
+DISCOVERY_ERROR = 'E1009 13:21:49.702947 97623 memcache.go:265] "Unhandled Error" err="couldn\'t get current server API group list: Get \\"https://34.118.224.1:443/api?timeout=5s\\": '
 #: What kubectl prints against a recreated cluster whose certificate changed.
-CERT_CHANGED = "Unable to connect to the server: tls: failed to verify certificate: x509: certificate signed by unknown authority"
+CERT_CHANGED = DISCOVERY_ERROR + 'tls: failed to verify certificate: x509: certificate signed by unknown authority"\nUnable to connect to the server: tls: failed to verify certificate: x509: certificate signed by unknown authority'
+#: What kubectl prints against a recreated cluster whose old endpoint refuses connections.
+REFUSED = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: connect: connection refused"\nUnable to connect to the server: dial tcp 34.118.224.1:443: connect: connection refused'
 #: What kubectl prints, in about 30 s under the proxy's request timeout, against
-#: a cluster whose control plane does not answer: the generic prefix and no
-#: reason that names the kubeconfig.
-DARK = "Unable to connect to the server: dial tcp 10.128.0.2:443: i/o timeout"
+#: a cluster whose control plane does not answer: no reason that names the
+#: kubeconfig.
+DARK = DISCOVERY_ERROR + 'dial tcp 34.118.224.1:443: i/o timeout"\nUnable to connect to the server: dial tcp 34.118.224.1:443: i/o timeout'
 #: What the shim prints when the proxy refused the command at its admission bound.
 PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
@@ -1384,6 +1389,25 @@ class Credentials(Base):
         self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
         self.assertNotIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY], "a cluster the fetch did not make readable keeps no record")
 
+    def test_the_refetch_signals_are_read_past_the_ledgers_excerpt(self):
+        # The reason follows kubectl's discovery error, and on a GKE endpoint
+        # the refused connection lands past the 200 characters the ledger
+        # keeps: matched on the excerpt alone it would never fetch. `tls:`
+        # ends just inside the excerpt and survives either way.
+        self.assertGreater(len(REFUSED), stall_watch.STDERR_EXCERPT_CHARS)
+        self.assertFalse(any(sig in stall_watch.stderr_excerpt(REFUSED) for sig in stall_watch.REFETCH_SIGNALS))
+        for stderr in (REFUSED, CERT_CHANGED):
+            self.assertTrue(stall_watch.refetch_repairs(stall_watch.ReadFailed("kubectl get namespaces exited 1: " + stall_watch.stderr_excerpt(stderr), stderr)))
+        self.assertFalse(stall_watch.refetch_repairs(stall_watch.ReadFailed("kubectl get namespaces exited 1: " + stall_watch.stderr_excerpt(DARK), DARK)))
+
+    def test_a_recreated_clusters_refused_connection_is_fetched_again_and_read(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": REFUSED})
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(fake.scanned(), ["ns"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+
     def test_a_recreated_clusters_certificate_refusal_is_fetched_again_and_read(self):
         fleet = {"a": {"ns": []}}
         self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
@@ -1667,6 +1691,28 @@ class Coverage(Base):
         self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 1)
         self.exhausted_ticks(fleet, over_after=3)
         self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 0, "a sweep that exhausted with the project listed starts the count over")
+
+    def test_a_tick_that_fits_only_because_a_listing_was_incomplete_posts_no_recovery(self):
+        # gcloud listed one of the three clusters and said the results may be
+        # incomplete: the one it listed is swept, but the project is out of
+        # view, and the fit says nothing. Recovery waits for a full listing.
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=2)
+        self.assertEqual(len(exhausted), 1)
+        partial = "WARNING: The following zones did not respond: us-central1-a. List results may be incomplete."
+        lines, fake = self.run_tick(fleet, listing_stderr={PROJECT: partial}, hidden=["b", "c"])
+        self.assertEqual(fake.scanned(), ["ns"], "the listed cluster was swept")
+        self.assertEqual(lines, [], "an incomplete listing says nothing about the fit")
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+
+    def test_the_view_leaves_out_the_clusters_of_an_incompletely_listed_project(self):
+        sweep = stall_watch.Sweep({"p", "q"})
+        sweep.unlisted_projects.add("p")
+        sweep.sweepable_clusters.update({stall_watch.cluster_id("p", "a", LOCATION), stall_watch.cluster_id("q", "b", LOCATION)})
+        self.assertEqual(sweep.view(), {"q": 1})
 
     def test_a_fleet_that_shrank_and_fits_with_everything_in_view_recovers(self):
         # Two clusters deleted: fewer in play than the exhausting sweep, but

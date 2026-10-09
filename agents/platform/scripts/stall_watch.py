@@ -254,7 +254,12 @@ CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 #: cluster, which the proxy's `--request-timeout` turns into an exit 1 in
 #: about 30 s, and a fetch would not repair it. A timeout, a proxy refusal or
 #: an API error says nothing about the kubeconfig either, so for all of these
-#: the watch keeps the record and the cluster waits for the next tick.
+#: the watch keeps the record and the cluster waits for the next tick. The
+#: cost of that choice: a recreated cluster whose old endpoint times out or
+#: no longer resolves, rather than refusing, gives no signal and is read again
+#: at the daily refresh, not before. Matched on the whole stderr
+#: (`refetch_repairs`), since kubectl prints the reason after its discovery
+#: error.
 REFETCH_SIGNALS = (
     "credential proxy: kubeconfig",
     "connect: connection refused",
@@ -584,10 +589,28 @@ def fetch_credentials(project: str, cluster: str, location: str) -> str:
     return path
 
 
+class ReadFailed(RuntimeError):
+    """A kubectl read the sweep makes exited non-zero. The message carries
+    the excerpt the ledger shows; `stderr` carries the whole of it, because
+    the signals `refetch_repairs` looks for come after kubectl's discovery
+    error, past the excerpt's end."""
+
+    def __init__(self, message: str, stderr: str | None) -> None:
+        super().__init__(message)
+        self.stderr = stderr or ""
+
+
 def refetch_repairs(exc: BaseException) -> bool:
     """Whether a failed first read on a reused kubeconfig is one more fetch
-    repairs (REFETCH_SIGNALS). A timeout or an unrelated refusal is not."""
-    return isinstance(exc, RuntimeError) and any(signal in str(exc) for signal in REFETCH_SIGNALS)
+    repairs (REFETCH_SIGNALS). A timeout or an unrelated refusal is not.
+    Matched on the whole stderr, not the ledger's excerpt: kubectl prints its
+    discovery error (`memcache.go ... couldn't get current server API group
+    list: Get "https://<endpoint>/api?timeout=5s": ...`) before the reason,
+    which lands past STDERR_EXCERPT_CHARS on a GKE endpoint."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    text = exc.stderr if isinstance(exc, ReadFailed) else str(exc)
+    return any(signal in text for signal in REFETCH_SIGNALS)
 
 
 def credentials_current(record: str | None, now: str) -> bool:
@@ -649,7 +672,7 @@ def list_namespaces(kubeconfig: str) -> list[str]:
     clears while the namespace waits on a finalizer."""
     r = run_sandbox(["kubectl", "get", "namespaces", "-o", "name"], timeout=NAMESPACE_LIST_TIMEOUT_SECONDS, kubeconfig=kubeconfig)
     if r.returncode != 0:
-        raise RuntimeError(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}")
+        raise ReadFailed(f"kubectl get namespaces exited {r.returncode}: {stderr_excerpt(r.stderr)}", r.stderr)
     names = []
     for line in r.stdout.splitlines():
         line = line.strip()
@@ -862,7 +885,10 @@ class Sweep:
         counts = {project: 0 for project in self.projects - self.unlisted_projects}
         for cid in self.sweepable_clusters:
             project = split_cluster_id(cid)[0]
-            counts[project] = counts.get(project, 0) + 1
+            # An incomplete listing's clusters are swept but do not put the
+            # project back in view: the view is what the fit can vouch for.
+            if project not in self.unlisted_projects:
+                counts[project] = counts.get(project, 0) + 1
         return counts
 
     def holds_unlisted(self, cid: str) -> bool:

@@ -154,7 +154,11 @@ kubeconfig: no fetch, and the record stays, so one saturated tick or one dark cl
 put the next rotation back on the fetch-everything path. A repair fetch that fails leaves no
 record, so the next tick fetches first; a fetch followed by a read that says nothing about the
 kubeconfig is recorded, so a cluster dark on its fetch tick does not pay the fetch again on every
-tick it stays dark. A cluster the
+tick it stays dark. The cost of that choice is accepted: a recreated cluster whose old endpoint
+times out or no longer resolves, rather than refusing, gives no signal and is read again at the
+daily refresh, not before. The signals are matched on kubectl's whole stderr, since kubectl 1.36
+prints its discovery error before the reason and the ledger's 200-character excerpt ends inside
+it. A cluster the
 tick did not list keeps its record exactly when `verdict` keeps its rows (a failed listing, or an
 identity file unreadable this tick). On the 143-cluster install
 [`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md) §2 measured,
