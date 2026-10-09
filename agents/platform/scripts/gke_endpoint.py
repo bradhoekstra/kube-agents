@@ -169,7 +169,7 @@ class EndpointDecision:
 
 @dataclasses.dataclass(frozen=True)
 class OwnCluster:
-    """What rule 2 knows about the cluster this process runs on."""
+    """What rule 3 knows about the cluster this process runs on."""
 
     network: str
     subnetwork: str

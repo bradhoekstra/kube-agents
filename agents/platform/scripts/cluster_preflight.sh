@@ -433,7 +433,7 @@ if [ "$STATUS" = "ok" ]; then
             # when kubectl never did (a timeout, no route, a refused dial), not
             # for an answer it got and disliked (401, 403, NotFound).
             ENDPOINT_REMEDY="$(user_md_text endpoint-remedy)"
-            if [ -n "$ENDPOINT_REMEDY" ] && { [ "$rc" -eq "$RC_TIMED_OUT" ] || printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE"; }; then
+            if [ -n "$ENDPOINT_REMEDY" ] && printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE"; then
                 REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
             fi
         fi

@@ -67,9 +67,10 @@ reached over that private endpoint instead, provided its authorized networks adm
 agent: the list is not enforced on the private endpoint
 (`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled`), or the two clusters
 share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) is on it. Otherwise
-the agent keeps the public IP, and when a cluster is onboarded it records which endpoint it
-chose and probes it once; the Cluster Agent's preflight repeats that record, with the range
-to add, whenever it cannot reach the API server.
+the agent keeps the endpoint `gcloud` writes by default. When a cluster is onboarded the
+agent records which endpoint it chose and probes it once; when a connection attempt fails,
+the onboarding log and the Cluster Agent's preflight repeat that record and, where the list
+is what stands in the way, name the Pod range to add.
 
 Three more things the installer sets on a cluster it creates, and treats differently on one it adopts:
 
