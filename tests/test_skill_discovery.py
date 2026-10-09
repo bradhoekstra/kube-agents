@@ -326,7 +326,7 @@ class LifecycleSkillDiscoverabilityTest(unittest.TestCase):
 
 
 class RuleFrontmatterTest(unittest.TestCase):
-    def _validate_rule_block(self, rule_name, block, why, description, desc_why):
+    def _validate_rule_block(self, rule_name, block, why):
         self.assertIsNotNone(block, why)
         if "paths" in block:
             paths = block.get("paths")
@@ -339,10 +339,10 @@ class RuleFrontmatterTest(unittest.TestCase):
             RULE_TRIGGER,
             f"{rule_name} must set `trigger: {RULE_TRIGGER}` so Antigravity loads it on demand",
         )
+        description = block.get("description")
         self.assertTrue(
-            description.strip(),
-            desc_why
-            or f"{rule_name} must declare a non-empty `description` for `trigger: {RULE_TRIGGER}`",
+            isinstance(description, str) and description.strip(),
+            f"{rule_name} must declare a non-empty `description` for `trigger: {RULE_TRIGGER}`",
         )
 
     def test_every_rule_has_frontmatter_for_both_harnesses(self):
@@ -351,12 +351,11 @@ class RuleFrontmatterTest(unittest.TestCase):
         for rule in rules:
             with self.subTest(rule=rule.name):
                 block, why = _frontmatter(rule)
-                description, desc_why = _description(rule)
-                self._validate_rule_block(rule.name, block, why, description, desc_why)
+                self._validate_rule_block(rule.name, block, why)
 
     def test_rule_without_paths_is_accepted_as_always_on_in_claude_code(self):
         block = {"trigger": RULE_TRIGGER, "description": "Applies across the tree."}
-        self._validate_rule_block("eval_driven_development.md", block, "", block["description"], "")
+        self._validate_rule_block("eval_driven_development.md", block, "")
 
     def test_rule_with_invalid_paths_is_rejected(self):
         for bad_paths in (None, [], [""], "**/*.py"):
@@ -367,7 +366,7 @@ class RuleFrontmatterTest(unittest.TestCase):
                     "description": "Scoped rule.",
                 }
                 with self.assertRaises(AssertionError):
-                    self._validate_rule_block("scoped.md", block, "", block["description"], "")
+                    self._validate_rule_block("scoped.md", block, "")
 
 
 if __name__ == "__main__":

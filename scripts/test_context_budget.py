@@ -133,6 +133,16 @@ class LoadedSizeTest(unittest.TestCase):
                 len(text),
             )
 
+    def test_crlf_line_endings_are_charged_two_bytes_per_newline(self):
+        # `Path.read_text` translates `\r\n` to `\n` before encoding, under-counting
+        # CRLF files on Windows checkouts by 1 byte per line; `loaded_size` must
+        # measure exact bytes on disk.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "AGENTS.md"
+            raw = b"line one\r\nline two\r\n"
+            path.write_bytes(raw)
+            self.assertEqual(check_context_budget.loaded_size(path), len(raw))
+
 
 class MeasureTest(unittest.TestCase):
     """`measure` -- the roots share one `seen` set, so nothing is double-charged."""
@@ -160,6 +170,20 @@ class RealFilesTest(unittest.TestCase):
             f"RULE_FILE_BYTE_CAP ({check_context_budget.RULE_FILE_BYTE_CAP}): "
             "Antigravity silently truncates any rule file above that limit",
         )
+
+    def test_each_rule_file_within_byte_cap(self):
+        rules_dir = check_context_budget.REPO / check_context_budget.RULES_DIR
+        rule_files = sorted(rules_dir.glob(check_context_budget.RULE_GLOB))
+        self.assertTrue(rule_files, f"no rule files found in {rules_dir}")
+        for rule in rule_files:
+            with self.subTest(rule=rule.name):
+                size = check_context_budget.loaded_size(rule)
+                self.assertLessEqual(
+                    size,
+                    check_context_budget.RULE_FILE_BYTE_CAP,
+                    f"{rule.relative_to(check_context_budget.REPO)} is {size} bytes, "
+                    f"exceeding RULE_FILE_BYTE_CAP ({check_context_budget.RULE_FILE_BYTE_CAP})",
+                )
 
     def test_within_budget(self):
         total = sum(check_context_budget.measure().values())

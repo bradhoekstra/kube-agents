@@ -55,6 +55,8 @@ BUDGET = 23_500
 # however many times it is reached -- the total is then what actually lands in
 # the window rather than what is on disk.
 FILES = ("AGENTS.md", "CLAUDE.md")
+RULES_DIR = Path(".agents/rules")
+RULE_GLOB = "*.md"
 
 UTF8_ENCODING = "utf-8"
 
@@ -80,9 +82,11 @@ def is_import(line: str) -> bool:
 def loaded_size(path: Path, seen: set[Path] | None = None) -> int:
     """UTF-8 bytes this file contributes to the context window, imports included.
 
-    Counted in UTF-8 bytes rather than characters because Antigravity's 24,000
-    per-file cap is a byte limit, and multi-byte punctuation and emoji (``—``,
-    ``→``, ``🔴``, ``🟠``, ``§``) make byte length exceed character length.
+    Counted in UTF-8 bytes on disk (reading raw bytes before decoding so ``\\r\\n``
+    is not folded to ``\\n`` by universal-newline translation) because
+    Antigravity's 24,000 per-file cap is a byte limit, and multi-byte
+    punctuation and emoji (``—``, ``→``, ``🔴``, ``🟠``, ``§``) make byte length
+    exceed character length.
 
     An import line is replaced by the file it names, not merely dropped.
     Dropping it would make the obvious answer to a failure -- replace a section
@@ -98,7 +102,7 @@ def loaded_size(path: Path, seen: set[Path] | None = None) -> int:
     seen.add(resolved)
 
     total = 0
-    for line in path.read_text(encoding=UTF8_ENCODING).splitlines(keepends=True):
+    for line in path.read_bytes().decode(UTF8_ENCODING).splitlines(keepends=True):
         if not is_import(line):
             total += len(line.encode(UTF8_ENCODING))
             continue

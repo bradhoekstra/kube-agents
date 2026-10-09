@@ -82,7 +82,8 @@ git switch -c <branch> --no-track upstream/main
 Already on a branch? Measure whether `main` moved underneath the files you are changing with the
 drift check in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#measure-how-far-a-branch-has-drifted-from-main).
-If it lists any file, rebase onto `upstream/main` and re-read those files before writing more.
+If it lists any file, rebase onto `upstream/main` and re-read those files before writing more; if
+nothing is listed, being behind is a merge-conflict risk to settle later, not a reason to stop.
 ([`CONTRIBUTING.md`](CONTRIBUTING.md) points here rather than restating this.)
 
 ### Check whether someone is already doing it
@@ -147,7 +148,7 @@ Every fact has one home; check whether the topic has an owner before adding pros
 | Agent rules, by family (code, CI, pre-PR, evals, docs)    | `.agents/rules/`                             |
 | Who to ask about an area, and who owns a running service  | `docs/ownership.md`                          |
 
-Rules (full mechanics in [`.agents/rules/documentation.md`](.agents/rules/documentation.md)):
+Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.md)):
 
 - **Do not hand-write a table that mirrors a machine-readable file.** Edit the source and run
   `make docs-generate` to update `<!-- BEGIN GENERATED -->` regions.
@@ -178,6 +179,7 @@ Agents with a user in the loop follow this file.
 ## Pull Request Hygiene
 
 - Keep changes scoped to the request; do not commit unrelated formatting changes.
+- Maintain the structure and intent of the agent configuration files.
 - **Conventional Commits & PR Title Enforcement:** PR titles and commit messages must use
   `type(optional-scope): description` (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`; breaking changes marked with `!` before `:` or a
@@ -243,14 +245,15 @@ record with no run at all is excluded as infrastructure unless every case hits o
 On a red, check the health bot comment and
 <https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>: fix regressions caused
 by your PR, or file a `presubmit-gate` issue for gate flakes. One `/retest` is reasonable for a
-suspected transient; never merge around a red gate. `/override` (admin-only) is only for reds the
-eval crew classified as not the PR's
+suspected transient; never merge around a red gate, and never instruct anyone to. `/override`
+(admin-only) is only for reds the eval crew classified as not the PR's
 ([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
 
 ## Automated Review After Opening a Pull Request
 
 Every pull request is reviewed automatically by `kube-agents-bot`, which comments only and never
-pushes or merges (its intro comment states its live contract; polling and reply commands are in
+pushes or merges (its intro comment states its live contract — if it disagrees with what follows,
+believe the comment and fix this section; polling and reply commands are in
 [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#the-automated-review) and
 [resolving the threads](docs/pull-request-workflow.md#resolving-conversations)).
 
@@ -274,8 +277,9 @@ reviews (🟠 Medium is posted, not held —
 [the cases](docs/pull-request-workflow.md#what-the-check-means)) — or, once, when the bot has
 reviewed three commits and the check is still grey. The first request posts a hand-off comment:
 from there the reviewer decides, and you reply in the threads rather than asking for another round.
-Bot-opened PRs assign immediately on check completion, and `/request-review` overrides the gate for
-a disputed finding or missing review.
+Bot-opened PRs assign immediately on check completion, and `/request-review` (at the start of the
+comment, by owners, members, or collaborators) overrides the gate for a disputed finding or missing
+review.
 
 **What agents must do.** After opening a ready PR (not a draft, which sits outside the queue until
 marked ready), tell the user the bot review is on its way and **offer to wait for it**. When
@@ -286,8 +290,10 @@ any re-run live tests into **Self-Review** and **Live validation** and resolve t
 threads. Resolve a thread only when **fully confident the issue is addressed** — the fix is on the
 PR head with its commit named, or the finding is factually wrong against the current merge target
 (plus, with a user in the loop, declined `kube-agents-bot` findings other than the description
-thread once replied to and recorded in **Self-Review**). Reply first, always: a resolved thread
-collapses, so the reply is the only record a reviewer may ever see.
+thread once replied to and recorded in **Self-Review**). Leave a judgment call, a request you chose
+not to do, or an unanswered rebuttal open for the reviewer — resolving says the conversation is
+finished, not a way to end a disagreement. Reply first, always: a resolved thread collapses, so the
+reply is the only record a reviewer may ever see.
 
 ## Before Reviewing Someone Else's Pull Request
 
