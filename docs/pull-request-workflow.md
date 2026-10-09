@@ -286,8 +286,9 @@ was being fixed (gke-labs/kube-agents-bot#191 has the measurement).
   owes an answer, whether or not its thread is resolved. 🟠 Medium findings are still posted as threads with their fix and still
   counted in the title, but the check is `success` under `Found N issues, none holding`, and the
   review body carries a _Second look_ sentence beside the bar it applied. A Medium here needs no
-  further round: fix it, or answer it in its thread and resolve — the thread still has to be
-  resolved before the merge, per the section below, but the check is not waiting on it.
+  further round: fix it only if you would have unasked, saying so in the thread, or answer it there
+  for the reviewer the green summons ([green is settled](#green-is-settled)) — the thread still has
+  to be resolved before the merge, per the section below, but the check is not waiting on it.
 - **Back on the first review's bar:** a diff that has more than doubled in lines since the commit
   the bot last reviewed — the softer bar is earned by a review of roughly this change, not by a
   commit count — and, silently, a pull request whose earlier round the bot could not read back (a
@@ -352,6 +353,63 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments --paginate \
         | "\(.path):\(.line // .original_line) [id \(.id)]\n\(.body)\n"'
 ```
 
+### Green is settled
+
+The bot's part of a review ends on green, and the author does not reopen it. Measured before this
+rule (gke-labs/kube-agents-bot#191, 2026-10-08): the second look made a later round green once only
+🟠 Medium remained, and authors typed `/review` again after 79% of those rounds; 38% of the pull
+requests since 09-21 went five rounds or more and took 86% of the review spend. The bot keeps
+posting every Medium as a thread and sets no round budget of its own — the stop is this rule, which
+`AGENTS.md`, "Automated Review After Opening a Pull Request", states in one sentence each.
+
+- **Green is settled.** A `success` `AI Review` entry the bot wrote for a review of this pull
+  request — `No findings`, `No findings above low severity`, and `Found N issues, none holding` are
+  all green — ends the bot's part. After it, no author `/review` in any form (`all`, `fresh`, or
+  any argument), and no draft-to-ready or close-and-reopen to buy one. Answer each open 🟠 Medium
+  by reply; push a fix only for a defect you would have fixed unasked, and say so in the thread;
+  otherwise reply with the reason or a filed follow-up. The human reviewer the green summons rules
+  on the rest. Settled ends, and one further `/review` is owed, only when a human review requests
+  changes, a non-author types `/review`, or the diff has grown past twice the green head's size —
+  the bot's own growth cap, [back on the first review's bar](#what-the-check-means).
+- **Before green, at most two re-reads of your own.** The automatic first review, then at most two
+  `/review`s of your own: after a push, or `/review fresh` after an edit to the body alone, which
+  is one of the two; a retry of a review that never arrived ([waiting for it](#waiting-for-it)) is
+  not. At the third reviewed commit, or once both are spent, the pull request goes to a human
+  whatever the colour: comment `/request-review` if nobody is requested yet — the command on the
+  first line, then a line for the reviewer naming the commit that fixed any 🔴 High and saying that
+  the bot re-runs on their `/review` and you will not ask for one — and stop. A requested reviewer
+  is the end of self-service — reply in the threads and wait for them.
+- **Decline by default on a later round.** On a round after the first, fix a 🟠 Medium only when
+  its **Kind** line says `behaviour`, it is on code this pull request added, and the fix is one
+  mechanical edit per site that adds no file, helper, branch, flag, dependency or regex
+  alternative; a class is fixed whole or deferred whole; a gate regex this pull request wrote takes
+  the data-file fix or leaves the pull request. Otherwise reply
+  `declined: <reason about this change>` or `deferred to #N`, record it in **Self-Review**, leave
+  the thread open for the approving human, and request no re-read; a round that pushed nothing —
+  every finding declined, deferred or refuted — goes to the human instead: `/request-review` if
+  nobody is requested yet. A finding that correctly applies a rule with no exemption is still a fix
+  on a first review and, when it is a 🔴 High, on any round; a High you can show wrong is a
+  refutation in its thread like any other, and a High whose fix would add a mechanism is the design
+  question below, not a build.
+- **A review round may not add a mechanism.** A finding, whatever its severity, whose fix would add
+  a module or file, an exported type, command, flag, environment variable, config key or
+  dependency, a test that parses or simulates another system, or more than about forty net lines,
+  or would touch a non-test, non-doc file the pull request did not touch, is a design question:
+  reply in its thread that it is, defer it to a follow-up issue, and leave the decision to the
+  human reviewer (`/request-review` if none is requested yet). Do not build it on a review round.
+- **The body moves with the push.** Bring **Testing**, **Live validation** and **Self-Review**
+  current in the same push as the fix, before any `/review`; write a skipped live run as
+  `Not live-tested: <what a run would show, why no install reaches it>`. A description ask the bot
+  repeats after your reply is a dispute for the human reviewer, not another edit.
+- **A merge of `main` or a rebase that changes nothing of yours earns no `/review`.** The bot
+  re-reads the whole pull request at full price and samples a large diff differently each time;
+  eleven of the eighteen rounds on #2360 were on merges of `main`.
+- **Resolving.** An unattended agent replies and leaves a declined bot thread open for the
+  reviewer, who resolves it. With a user in the loop you may resolve a declined `kube-agents-bot`
+  finding once the reply and **Self-Review** give the reason, but a resolved thread collapses and
+  the summoned reviewer may never see it, so prefer leaving it open with the reply
+  ([resolving conversations](#resolving-conversations)).
+
 ### Replying to a finding
 
 A finding you disagree with gets answered in its thread, not silently dropped:
@@ -364,10 +422,12 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
-`kube-agents-bot` finding you decline with a user in the loop, the reason, which **Self-Review**
-gives too. Then resolve, except the description thread, which waits for the body edit described
-below. A pull request carrying both `lgtm` and `approved` with a thread still open also carries the
-`do-not-merge` label,
+`kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve
+what a commit fixed or you showed wrong, except the description thread, which waits for the body
+edit described below. A declined bot finding is better left open with its reply for the human
+reviewer, who resolves it; with a user in the loop you may resolve it once the reply and
+**Self-Review** give the reason ([green is settled](#green-is-settled)). A pull request carrying
+both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
@@ -421,9 +481,12 @@ Five ways that goes wrong quietly:
   opens a new thread only for a section no earlier thread named. A pull request with every thread
   resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
   the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
-  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` and read
-  the body of a review newer than your edit, with the first poll command in
-  [Waiting for it](#waiting-for-it), before reporting the pull request clear.
+  is a re-cut that checks only for missing and empty sections, so comment `/review fresh` — one of
+  the two re-reads of your own — and read the body of a review newer than your edit, with the first
+  poll command in [Waiting for it](#waiting-for-it), before reporting the pull request clear. An ask
+  that newer review repeats after your reply is a dispute for the human reviewer, not another edit,
+  and once both re-reads are spent the thread is left open with its reply for them
+  ([green is settled](#green-is-settled)).
 
 ## How a change merges
 
@@ -653,7 +716,9 @@ Every open pull request has exactly one party whose move it is, and the commones
 a fortnight is that both sides believe it is the other's. The rule:
 
 **The author owns it while it is blocked on them** — a draft, a failing or cancelled check that
-`tide` names, merge conflicts, unresolved review threads, changes requested, or no human reviewer
+`tide` names, merge conflicts, unresolved review threads (bar a `kube-agents-bot` thread whose last
+comment is the author's `declined:` or `deferred to #N` reply, which the requested reviewer rules on
+and resolves — [green is settled](#green-is-settled)), changes requested, or no human reviewer
 requested yet.
 **Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
 is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
