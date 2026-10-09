@@ -592,12 +592,13 @@ func TestUsagePoller_RepairsAStatusBehindTheConfigMap(t *testing.T) {
 		Version:       usageDocumentVersion,
 		AgentUID:      usageTestAgentUID,
 		FirstRecorded: metav1.NewTime(usageClock(1)),
-		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0},
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0},
 		LastMoved:     &moved,
 		Pods: map[string]*usagePodEntry{
 			usagePodEntryKey("gw-a", usageCounterEventsIngested):           {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 4, Marker: moved},
 			usagePodEntryKey("broker-b", usageCounterToolExecutions):       {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: moved},
 			usagePodEntryKey("broker-b", usageCounterRemediationsProposed): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsProposed, Sample: 0, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterRemediationsMerged):   {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsMerged, Sample: 0, Marker: moved},
 		},
 	})
 	h.stub.set(gatewayAddr(), 4, nil)
@@ -627,7 +628,7 @@ func TestUsagePoller_ReseedsAnInvalidDocument(t *testing.T) {
 			Version:       usageDocumentVersion,
 			AgentUID:      usageTestAgentUID,
 			FirstRecorded: stamp,
-			Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0},
+			Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 0, usageCounterRemediationsMerged: 0},
 			Pods: map[string]*usagePodEntry{
 				usagePodEntryKey("broker-b", usageCounterToolExecutions): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 10, Marker: stamp},
 			},
@@ -994,8 +995,8 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 		t.Fatalf("the first poll wrote a counter: %+v", status)
 	}
 	doc := h.document()
-	if len(doc.Pods) != 3 {
-		t.Fatalf("the document holds %d entries, want 3 (gateway events, broker tools, broker proposals): %+v", len(doc.Pods), doc.Pods)
+	if len(doc.Pods) != 4 {
+		t.Fatalf("the document holds %d entries, want 4 (gateway events, broker tools, proposals and merged): %+v", len(doc.Pods), doc.Pods)
 	}
 
 	// A proposal opened and no command run: the proposals counter moves alone.
@@ -1024,6 +1025,62 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 	h.poll(20)
 	if status := h.status(); status.RemediationsProposedTotal != 3 || status.ToolExecutionsTotal != 6 {
 		t.Fatalf("after the restart: %+v, want 3 proposals and 6 tool executions", status)
+	}
+}
+
+// The merged-proposals counter lands beside the proposals counter from the
+// same broker body, and moves lastActiveTime.
+func TestUsagePoller_MergedProposalsCount(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 0, nil)
+	h.stub.set(brokerAddr(), 0, ptr.To(200.0))
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 1)
+	h.poll(5)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 3)
+	h.poll(10)
+	status := h.status()
+	if status.RemediationsMergedTotal != 2 || status.RemediationsProposedTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("after two merges: %+v, want 2 merged and nothing else", status)
+	}
+	if status.LastActiveTime == nil || !status.LastActiveTime.Time.Equal(usageClock(10)) {
+		t.Fatalf("a merge did not move lastActiveTime: %v", status.LastActiveTime)
+	}
+}
+
+// A current-layout document that predates a counter, as the previous release
+// wrote it, gains the counter's total on read rather than being re-seeded.
+func TestUsagePoller_ADocumentWithoutANewerCounterKeepsItsTotals(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersion,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4, usageCounterRemediationsProposed: 1},
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			usagePodEntryKey("gw-a", usageCounterEventsIngested):           {Name: "agent-gateway-aaa", PodUID: "gw-a", Counter: usageCounterEventsIngested, Sample: 40, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterToolExecutions):       {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterToolExecutions, Sample: 100, Marker: moved},
+			usagePodEntryKey("broker-b", usageCounterRemediationsProposed): {Name: "agent-credential-proxy-bbb", PodUID: "broker-b", Counter: usageCounterRemediationsProposed, Sample: 1, Marker: moved},
+		},
+	})
+	h.pruning = true
+	h.stub.set(gatewayAddr(), 44, nil)
+	h.stub.set(brokerAddr(), 100, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 1)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsMerged, 5)
+	h.poll(10)
+	doc := h.document()
+	if !doc.FirstRecorded.Time.Equal(usageClock(1)) {
+		t.Fatalf("the document was re-seeded: firstRecorded %v", doc.FirstRecorded)
+	}
+	if doc.Totals[usageCounterToolExecutions] != 10 || doc.Totals[usageCounterEventsIngested] != 8 || doc.Totals[usageCounterRemediationsProposed] != 1 || doc.Totals[usageCounterRemediationsMerged] != 0 {
+		t.Fatalf("totals: %v, want 10, 8, 1 and 0", doc.Totals)
+	}
+	if e := doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsMerged)]; e == nil || e.Sample != 5 {
+		t.Fatalf("the new counter was not recorded at its sample: %+v", doc.Pods)
 	}
 }
 
@@ -1145,7 +1202,7 @@ func TestUsageScrapeFailureMessage_NamesEachStatusField(t *testing.T) {
 		name: "agent-credential-proxy-bbb", counter: usageStatusFieldList(usageBrokerCounters), detail: "connection refused",
 		err: &usageScrapeError{Kind: usageScrapeKindRefused},
 	}})
-	want := "pod agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal): connection refused"
+	want := "pod agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal, status.usage.remediationsMergedTotal): connection refused"
 	if !strings.Contains(msg, want) {
 		t.Fatalf("message %q does not name both fields as %q", msg, want)
 	}

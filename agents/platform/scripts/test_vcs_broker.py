@@ -458,6 +458,111 @@ class HostResolutionTest(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class MergedListingForge(LocalForge):
+    """A forge that answers `proposal-list` and `proposal-view` out of a set the test holds."""
+
+    verbs = ("proposal-list", "proposal-view")
+
+    def __init__(self, root, proposals):
+        super().__init__(root, [])
+        self.proposals = list(proposals)
+
+    def proposal_list(self, api, repo, payload):
+        return {"proposals": [dict(p) for p in self.proposals], "truncated": False}
+
+    def proposal_view(self, api, repo, payload):
+        number = payload.get("number")
+        for p in self.proposals:
+            if p["number"] == number:
+                return {"proposal": dict(p)}
+        raise WorkspaceError("no such proposal", status=404)
+
+
+class MergedProposalCountingTest(unittest.TestCase):
+    """The broker counts, once each, the proposals this install opened that the forge reports merged.
+
+    The count rides on the reads the agent already makes -- `proposal-list` and
+    `proposal-view` -- and is bounded three ways: the proposal's author is the
+    credential's own login, its merge time is not before this broker process
+    started (so a restart cannot count a merge twice), and the same proposal is
+    counted once per process.
+    """
+
+    STARTED = 1_800_000_000.0  # 2027-01-15T08:00:00Z
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.counts: list[int] = []
+        self.broker = VcsBroker(
+            Path(self.tmp.name) / "scratch",
+            git_runner=git_runner,
+            merge_observer=self.counts.append,
+            started_at=self.STARTED,
+        )
+        self.broker._transport = lambda _forge, _repo: SelfAware("kube-agents[bot]")
+
+    def forge_with(self, *proposals):
+        forge = MergedListingForge(Path(self.tmp.name) / "forges", proposals)
+        self.broker.registry.hosts["local.test"] = forge
+        return forge
+
+    @staticmethod
+    def merged(number, author="kube-agents", closed="2027-01-15T09:00:00Z", state="merged"):
+        return {"number": number, "state": state, "author": author, "closed": closed, "source": f"platform-agent/fix-{number}"}
+
+    def test_a_merged_proposal_of_the_installs_own_is_counted_once(self):
+        self.forge_with(self.merged(7), self.merged(8))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([2], self.counts)
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 7})
+        self.assertEqual([2], self.counts, "a proposal already counted was counted again")
+
+    def test_a_view_counts_what_a_list_has_not_seen(self):
+        self.forge_with(self.merged(9))
+        self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 9})
+        self.assertEqual([1], self.counts)
+
+    def test_somebody_elses_merge_is_not_counted(self):
+        self.forge_with(self.merged(10, author="a-colleague"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.counts)
+
+    def test_a_merge_from_before_this_process_started_is_not_counted(self):
+        # Counted by the process that was running then, or lost with it; never twice.
+        self.forge_with(self.merged(11, closed="2027-01-15T07:59:59Z"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.counts)
+
+    def test_open_and_closed_proposals_are_not_merges(self):
+        self.forge_with(self.merged(12, state="open", closed=""), self.merged(13, state="closed"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.counts)
+
+    def test_a_credential_that_cannot_say_who_it_is_counts_nothing(self):
+        self.forge_with(self.merged(14))
+        self.broker._transport = lambda _forge, _repo: Nameless()
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([], self.counts)
+
+    def test_a_failed_identity_lookup_neither_counts_nor_fails_the_read(self):
+        self.forge_with(self.merged(15))
+        self.broker._transport = lambda _forge, _repo: LookupFailed()
+        answer = self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual(1, len(answer["proposals"]))
+        self.assertEqual([], self.counts)
+
+    def test_an_observer_that_raises_does_not_fail_the_read(self):
+        def boom(_count):
+            raise RuntimeError("metrics are down")
+
+        self.broker.merge_observer = boom
+        self.forge_with(self.merged(16))
+        answer = self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual(1, len(answer["proposals"]))
+
+
 class RepositoryVerbTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

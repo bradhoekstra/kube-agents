@@ -98,7 +98,8 @@ const (
 )
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
-// eventsIngestedTotal, remediationsProposedTotal and lastActiveTime on every
+// eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal and
+// lastActiveTime on every
 // PlatformAgent, and the two cluster gauges, from the broker's and the
 // watcher's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
@@ -772,6 +773,7 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterToolExecutions:       usageStatusFloor(agent.Status.Usage.ToolExecutionsTotal),
 		usageCounterEventsIngested:       usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
 		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
+		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
 		seed.LastMoved = last.DeepCopy()
@@ -915,11 +917,12 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
 	proposed := doc.Totals[usageCounterRemediationsProposed]
+	merged := doc.Totals[usageCounterRemediationsMerged]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	gaugesMoved := gaugesKnown && !p.gaugesPruned(agent) &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || gaugesMoved ||
+	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || usage.RemediationsMergedTotal < merged || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
 		return nil
@@ -928,6 +931,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.ToolExecutionsTotal = tool
 	usage.EventsIngestedTotal = events
 	usage.RemediationsProposedTotal = proposed
+	usage.RemediationsMergedTotal = merged
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
@@ -944,8 +948,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// serialises, that come back absent are the gauges' own record, since a
 	// CRD at the previous schema prunes them and serves the counters. A patch
 	// that wrote only a time, or cleared the gauges, says nothing either way.
-	if tool > 0 || events > 0 || proposed > 0 {
-		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events && agent.Status.Usage.RemediationsProposedTotal == proposed)
+	if tool > 0 || events > 0 || proposed > 0 || merged > 0 {
+		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events &&
+			agent.Status.Usage.RemediationsProposedTotal == proposed && agent.Status.Usage.RemediationsMergedTotal == merged)
 	}
 	if gauges != nil {
 		p.noteGaugeEcho(ctx, agent, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
