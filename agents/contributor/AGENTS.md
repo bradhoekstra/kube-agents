@@ -198,7 +198,9 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
    an unchanged commit re-cuts the earlier review without reading the body
    again), at most twice; at the third reviewed commit, or after a round that
    pushed nothing, comment `/request-review` if no human is on it yet, and
-   stop - the command on the comment's first line, then a line telling the
+   stop; the workflow's hand-off comment (opening
+   `<!-- auto-request-review:handoff -->`) means one was requested already,
+   so stop - the command on the comment's first line, then a line telling the
    reviewer where the fix for any 🔴 High is and that the bot re-runs on
    their `/review`. `/request-review` also assigns one immediately when a
    review never arrives. It reacts 👀 to the comment when it requested someone

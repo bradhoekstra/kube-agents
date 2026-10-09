@@ -378,7 +378,10 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   whatever the colour: comment `/request-review` if no human is on it yet (**who counts**, below) —
   the command on the first line, then a line for the reviewer naming the commit that fixed any 🔴 High and saying that
   the bot re-runs on their `/review` and you will not ask for one — and stop. A requested reviewer
-  is the end of self-service — reply in the threads and wait for them.
+  is the end of self-service — reply in the threads and wait for them. The reviewer-request
+  workflow posts a hand-off comment, opening `<!-- auto-request-review:handoff -->`, whenever it
+  requests one, at green or at the third reviewed commit; that comment is the end of self-service
+  whether or not you typed anything.
 - **Decline by default on a later round.** On a round after the first, fix a 🟠 Medium only when
   its **Kind** line says `behaviour`, it is on code this pull request added, and the fix is one
   mechanical edit per site that adds no file, helper, branch, flag, dependency or regex
