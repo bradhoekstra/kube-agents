@@ -67,6 +67,12 @@ DEPLOYMENT_ROW = finding(
 #: A row that clears on the first scan without it, for tests about other things.
 DEADLINE_ROW = finding("checkout", "Deployment/checkout-api", "stale-condition", "Progressing=False ProgressDeadlineExceeded")
 TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOUT_SECONDS)
+#: What the shim prints when the per-cluster stub is gone (KubeconfigUnreadable).
+STUB_LOST = "credential proxy: kubeconfig is unreadable: /home/hermes/.kube/stall-watch/c.yaml: [Errno 2] No such file or directory"
+#: What kubectl prints against a recreated cluster whose certificate changed.
+CERT_CHANGED = "Unable to connect to the server: tls: failed to verify certificate: x509: certificate signed by unknown authority"
+#: What the shim prints when the proxy refused the command at its admission bound.
+PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
 SERVED_DEFAULT = ["deployments.apps", "statefulsets.apps", "daemonsets.apps", "jobs.batch", "gateways.gateway.networking.k8s.io", "httproutes.gateway.networking.k8s.io", "certificates.cert-manager.io", "pods", "configmaps"]
 NOT_SCANNED = "warning: deployments in checkout not scanned; its objects are missing from the count: kubectl exited 1\n"
@@ -106,7 +112,9 @@ class FakeFleet:
 
     def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None):
         self.api_resources_rc_one = api_resources_rc_one
-        self.namespaces_fail_once = set(namespaces_fail_once)
+        # Names whose first `kubectl get namespaces` exits 1 with the lost-stub
+        # text, or a {name: stderr} map for another refusal text.
+        self.namespaces_fail_once = dict(namespaces_fail_once) if isinstance(namespaces_fail_once, dict) else {n: STUB_LOST for n in namespaces_fail_once}
         self.listing_hangs = listing_hangs or {}
         self.listing_stderr = listing_stderr
         self.listing_fails = set(listing_fails)
@@ -153,8 +161,7 @@ class FakeFleet:
         if argv[:3] == ["kubectl", "get", "namespaces"]:
             name = self._cluster_from(kubeconfig)[1]
             if name in self.namespaces_fail_once:
-                self.namespaces_fail_once.discard(name)
-                return completed(argv, "", returncode=1, stderr="credential proxy: KUBECONFIG names a file that cannot be read")
+                return completed(argv, "", returncode=1, stderr=self.namespaces_fail_once.pop(name))
             names = list(namespaces) + self.namespaces_extra
             return completed(argv, "".join(f"namespace/{n}\n" for n in names))
         if argv[:2] == ["kubectl", "api-resources"]:
@@ -1369,6 +1376,39 @@ class Credentials(Base):
         self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
         self.assertNotIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY], "a cluster the fetch did not make readable keeps no record")
 
+    def test_a_recreated_clusters_certificate_refusal_is_fetched_again_and_read(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": CERT_CHANGED})
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(fake.scanned(), ["ns"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+
+    def test_a_proxy_refusal_on_a_reused_kubeconfig_is_not_fetched_again_and_keeps_the_record(self):
+        # The proxy said busy: a fetch would be one more gcloud at the proxy
+        # that just refused, and would not repair anything. The cluster is
+        # unread this tick, its record stays, and the next tick reads on it.
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": PROXY_BUSY})
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), [])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_timeout_on_a_reused_kubeconfig_costs_no_fetch_and_no_second_wait(self):
+        # A cluster that has gone dark times out once, not twice around a
+        # fetch, and keeps its record for when it answers again.
+        self.run_tick({"a": {"ns": []}}, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick({"a": TIMEOUT}, now="2026-10-08T10:30:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:1] == ["kubectl"]], [["kubectl", "get", "namespaces"]], "one read, one timeout")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+
     def test_records_of_clusters_that_left_the_listing_are_dropped(self):
         self.run_tick({"a": {"ns": []}, "b": {"ns": []}})
         self.run_tick({"a": {"ns": []}})
@@ -1385,6 +1425,21 @@ class Credentials(Base):
         self.assertIn(stall_watch.cluster_id(other, "d", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
         _, fake = self.run_tick(fleet)
         self.assertEqual(self.credential_fetches(fake), [], "the listing came back and nothing was fetched again")
+
+    def test_a_profile_whose_identity_cannot_be_read_keeps_its_record_as_it_keeps_its_rows(self):
+        # The reconciler is mid-write on d's config.yaml, and nothing else names
+        # its project: the project is not listed this tick, d's rows are held
+        # as unknown (`verdict`), and d's record is held the same way, so the
+        # next tick reads d on the kubeconfig it has.
+        other = "other-proj"
+        fleet = {"c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        (self.profile_dir("d", project=other) / "config.yaml").write_text("{}\n")
+        self.run_tick({"c": {"ns": []}})
+        self.assertIn(stall_watch.cluster_id(other, "d", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+        _, fake = self.run_tick(fleet)
+        self.assertEqual(self.credential_fetches(fake), [], "the identity reads again and nothing was fetched again")
+        self.assertEqual(fake.scanned(), ["ns", "ns"])
 
     def test_an_older_ledger_without_records_fetches_every_cluster_once(self):
         fleet = {"a": {"ns": []}}

@@ -241,6 +241,19 @@ CURSOR_KEY = "cursor"
 #: the tick fetches once more and retries that one call.
 CREDENTIALS_KEY = "credentials"
 CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
+#: What a failed first read on a reused kubeconfig says when the kubeconfig
+#: itself is the problem, so one more fetch repairs it: the shim's refusal of
+#: a stub the sandbox lost (`credential_proxy_client.py`, KubeconfigUnreadable,
+#: printed as `credential proxy: kubeconfig ...`), or kubectl's refusal of a
+#: recreated cluster's endpoint or certificate. A timeout, a proxy refusal or
+#: an API error says nothing about the kubeconfig: a fetch would not repair
+#: it, so the watch keeps the record and the cluster waits for the next tick.
+REFETCH_SIGNALS = (
+    "credential proxy: kubeconfig",
+    "Unable to connect to the server",
+    "x509:",
+    "tls:",
+)
 #: Ledger flag for a sweep that stopped at its budget, so chat hears the
 #: coverage once, on the tick the sweep first falls short, and once more when
 #: the fleet fits in one tick again; the ledger's budget entry carries it
@@ -547,6 +560,12 @@ def fetch_credentials(project: str, cluster: str, location: str) -> str:
     return path
 
 
+def refetch_repairs(exc: BaseException) -> bool:
+    """Whether a failed first read on a reused kubeconfig is one more fetch
+    repairs (REFETCH_SIGNALS). A timeout or an unrelated refusal is not."""
+    return isinstance(exc, RuntimeError) and any(signal in str(exc) for signal in REFETCH_SIGNALS)
+
+
 def credentials_current(record: str | None, now: str) -> bool:
     """Whether a cluster's credential record is young enough to reuse: fetched
     at `record`, less than CREDENTIALS_REFRESH_SECONDS before `now`. A record
@@ -805,6 +824,17 @@ class Sweep:
     def namespaces(self) -> int:
         return len(self.read_scopes)
 
+    def holds_unlisted(self, cid: str) -> bool:
+        """Whether a cluster this tick did not list is held rather than gone:
+        its project's listing failed, or its profile is there but its identity
+        did not name the project, so nothing listed the project. The one rule
+        for a row (`verdict` keeps it UNKNOWN) and for a credential record
+        (`sweep_fleet` keeps it), so a transient of either kind costs neither."""
+        project, name, location = split_cluster_id(cid)
+        if project in self.unlisted_projects:
+            return True
+        return project not in self.projects and cluster_agent_for(project, name, location) is not None
+
     def verdict(self, entry: dict) -> str:
         """What this tick can say about a ledger row: its namespace or cluster
         is GONE from the listing, the namespace was scanned and the row was
@@ -812,14 +842,7 @@ class Sweep:
         is UNKNOWN."""
         cid, namespace = entry.get("cluster", ""), entry.get("namespace", "")
         if cid not in self.listed_clusters:
-            project, name, location = split_cluster_id(cid)
-            if project in self.unlisted_projects:
-                return UNKNOWN
-            if project not in self.projects and cluster_agent_for(project, name, location) is not None:
-                # The profile is there but its identity did not name the
-                # project, so the project was not listed this tick.
-                return UNKNOWN
-            return GONE
+            return UNKNOWN if self.holds_unlisted(cid) else GONE
         namespaces = self.listed_namespaces.get(cid)
         if namespaces is not None and namespace not in namespaces:
             return GONE
@@ -1013,8 +1036,12 @@ def sweep_fleet(
                 # A reused kubeconfig the shim or the cluster refused -- the
                 # sandbox restarted and the file is gone, or the cluster was
                 # recreated: fetch once more and retry this one call. A fetch
-                # this tick is not repeated for the same failure.
-                if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable):
+                # this tick is not repeated for the same failure, and a failure
+                # that says nothing about the kubeconfig (a timeout, a proxy
+                # refusal, an API error) gets no fetch: it would not repair it,
+                # and on a saturated tick it would be one more gcloud per
+                # cluster at the proxy that just said it was busy.
+                if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable) or not refetch_repairs(exc):
                     raise
                 kubeconfig = fetch_credentials(project, name, location)
                 fetched = True
@@ -1026,8 +1053,11 @@ def sweep_fleet(
             sweep.unreadable[scope_key(cid)] = failure_text(exc)
             sweep.failed_clusters.add(cid)
             # A fetch that did not make the cluster readable is no record to
-            # reuse; a reused record the cluster refused is dropped the same way.
-            records.pop(cid, None)
+            # reuse. A reused record whose read failed for a reason no fetch
+            # repairs stays: the next tick reads on it again, and one bad tick
+            # does not put the fleet back on the fetch-everything path.
+            if fetched:
+                records.pop(cid, None)
             continue
         if fetched:
             records[cid] = now
@@ -1068,14 +1098,15 @@ def sweep_fleet(
                     "detail": f.get("detail", ""),
                     "stalled_for": f.get("stalled_for", ""),
                 }
-    # Clusters the budget never reached keep their records, and so do the
-    # clusters of a project whose listing failed this tick, as `verdict` keeps
-    # their rows: a listing that fails once must not cost a project its fetches.
-    # Clusters no longer listed lose theirs, as their rows go.
+    # Clusters the budget never reached keep their records, and so does every
+    # unlisted cluster whose rows `verdict` holds (`holds_unlisted`): a listing
+    # that fails once, or an identity file unreadable for one tick, must not
+    # cost a project its fetches. Clusters gone from the listing lose theirs,
+    # as their rows go.
     sweep.credentials = {
         cid: at
         for cid, at in records.items()
-        if cid in sweep.listed_clusters or split_cluster_id(cid)[0] in sweep.unlisted_projects
+        if cid in sweep.listed_clusters or sweep.holds_unlisted(cid)
     }
     return sweep
 

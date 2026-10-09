@@ -117,8 +117,10 @@ could not read (a
 cluster that timed out, a namespace whose scan failed, the rows of a kind a scan skipped or the repeating-warnings rows of one that could not read the events, a project whose listing failed or that gcloud called incomplete, a cluster whose profile's `cluster_identity` could not be read and whose project nothing else lists) keeps its rows and is recorded in the ledger, not posted;
 a sweep that hit its 25-minute budget keeps the rows it did not reach the same way, records
 what it covered, posts it on the first tick it falls short, and resumes where it stopped. A cluster's
-credentials are fetched on its first tick, after a day, and after a read its kubeconfig
-could not serve; otherwise the tick reuses the kubeconfig it has. One project's listing failing holds
+credentials are fetched on its first tick, after a day, and after a read that says the kubeconfig
+itself is the problem (the shim refused a stub the sandbox lost, or kubectl refused a recreated
+cluster's endpoint or certificate); otherwise the tick reuses the kubeconfig it has, and a read
+that timed out or that the proxy refused leaves the record for the next tick. One project's listing failing holds
 only that project's rows. The sweep fails, and posts the sweep-failed line, when
 every project's listing fails, when no management project resolves, when
 `stall_report.py` cannot be found, or when the sandbox is lost.

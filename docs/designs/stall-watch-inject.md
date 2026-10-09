@@ -145,9 +145,13 @@ proxy, and a `get-credentials` there is a real gcloud run each time, while kubec
 the proxy's own managed kubeconfig: of the per-cluster file only the context name crosses, and the
 proxy regenerates the rest. So the watch
 fetches a cluster's credentials once, records the time in its ledger (`credentials`), and reuses
-the kubeconfig until the record is a day old or a read the kubeconfig could not serve says the
-sandbox lost the file or the cluster changed, after which it fetches once more and retries that
-one call. On the 143-cluster install
+the kubeconfig until the record is a day old or a read says the kubeconfig itself is the problem
+(the shim refused a stub the sandbox lost, or kubectl refused a recreated cluster's endpoint or
+certificate), after which it fetches once more and retries that one call. A read that timed out
+or that the proxy refused says nothing about the kubeconfig: no fetch, and the record stays, so
+one saturated tick does not put the next rotation back on the fetch-everything path. A cluster the
+tick did not list keeps its record exactly when `verdict` keeps its rows (a failed listing, or an
+identity file unreadable this tick). On the 143-cluster install
 [`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md) §2 measured,
 that is about 290 gcloud runs fewer per tick (a `describe` through the endpoint helper and the
 `get-credentials` itself, per cluster), and the proxy's heaviest children.
