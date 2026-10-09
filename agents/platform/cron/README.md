@@ -102,7 +102,8 @@ KV server refuses an alert, said once until the reason changes, with a line
 when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
 every roster entry owes, and the budget lines: "budget exhausted", said once on the
 tick a sweep first stops at its 25-minute budget, carrying the clusters read of the
-ones listed, the namespaces read and the cluster the next tick resumes at, and "the
+ones it could sweep, the namespaces read, the clusters it could not read and the cluster the
+next tick resumes at, and "the
 fleet is swept in one tick again" once a sweep completes with every project listed (a sweep
 that fit because listings failed or were incomplete says nothing about the fit, and posts
 nothing); the ledger's budget entry carries the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server

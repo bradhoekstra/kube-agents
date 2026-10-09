@@ -160,7 +160,8 @@ that is about 290 gcloud runs fewer per tick (a `describe` through the endpoint 
 `get-credentials` itself, per cluster), and the proxy's heaviest children.
 
 A sweep that stops at its wall-clock budget writes what it covered into the ledger's budget entry,
-the clusters read of the ones listed, the namespaces read and the cluster the next tick resumes at,
+the clusters read of the ones it could sweep, the namespaces read, the clusters it could not read
+and the cluster the next tick resumes at,
 and says it in chat once, on the tick the sweep first falls short, and once more when the fleet
 fits in one tick again with every project listed; a sweep that fit only because listings failed
 or were incomplete has not shown that, so it neither posts the recovery nor clears the flag. On

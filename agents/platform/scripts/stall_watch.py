@@ -49,7 +49,8 @@ no model. Each tick:
    ``MAX_ALERTS_PER_TICK`` alerts are raised per tick; the namespaces past
    that wait for the next one. Chat gets the alert for a new episode, and the
    watch's own lines: a stall cleared, namespaces held for the next tick,
-   alerts refused and raised again, and the sweep failing and recovering.
+   alerts refused and raised again, the sweep failing and recovering, and the
+   sweep budget exhausted and the fleet fitting in one tick again.
 
 Every ``gcloud``, ``kubectl`` and ``stall_report.py`` call runs in the shell
 sandbox through ``sandbox_exec.run``: the agent container carries no kubectl
@@ -99,8 +100,9 @@ usually ends. A listing gcloud itself calls incomplete clears no row for a
 cluster absent from it, and a sweep stops at a wall-clock budget short of
 the schedule, because Hermes kills a script that runs an hour and a ledger
 never written is a tick that never happened. A sweep that stops says what it
-covered: the ledger's budget entry carries the clusters read of the ones
-listed, the namespaces read and the cluster the next tick resumes at, every
+covered: the ledger's budget entry carries the clusters read of the ones it
+could sweep, the namespaces read, the clusters it tried and could not read, and
+the cluster the next tick resumes at, every
 tick it falls short, and chat hears it once, on the tick the sweep first falls
 short, and once more when the fleet fits in one tick again. On a fleet the
 budget does not cover, a cluster is read across consecutive ticks, so the
