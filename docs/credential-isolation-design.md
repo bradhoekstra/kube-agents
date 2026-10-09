@@ -759,14 +759,16 @@ Consequences:
   `clusters describe` to decide which control-plane endpoint to reach (DNS,
   private, or gcloud's default), plus, once per process, a describe of the
   agent's own cluster when the private endpoint is a candidate. A caller's
-  own `get-credentials` that names no endpoint flag gets the same decision
-  spliced in, since its output becomes the managed kubeconfig for that
-  cluster; `docs/designs/private-endpoint-selection.md` has the rule. The common paths warm the cache themselves, since
-  profile scaffolding and context switching both begin with that command. That
-  describe is memoised per cluster for a minute rather than for the life of the
-  broker: the endpoint can be opened or closed on a running cluster, and the
-  proxy is a daemon that would otherwise keep acting on the configuration it
-  first saw.
+  own `get-credentials` that names no endpoint flag, and names its project,
+  cluster and location, gets the same decision spliced in, since its output
+  becomes the managed kubeconfig for that cluster;
+  `docs/designs/private-endpoint-selection.md` has the rule. The common paths
+  warm the cache themselves, since profile scaffolding and context switching
+  both begin with that command. The target describe is memoised per cluster
+  for a minute rather than for the life of the broker: the endpoint can be
+  opened or closed on a running cluster, and the proxy is a daemon that would
+  otherwise keep acting on the configuration it first saw. The own-cluster
+  describe has no such window, because the install's VPC does not move.
 - `current-context` is read with a real YAML parser, so a valid kubeconfig in
   any legal spelling is recognized, but deliberately with PyYAML's pure-Python
   `safe_load`. The C loader recurses in C and terminates the broker with
