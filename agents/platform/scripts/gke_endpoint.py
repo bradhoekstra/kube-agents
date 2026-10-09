@@ -67,9 +67,12 @@ OWN_CLUSTER_ENV = ("GKE_PROJECT_ID", "GKE_LOCATION", "GKE_CLUSTER_NAME")
 
 # Every field `_decide` reads. `endpoint` is the address gcloud writes when no
 # flag is passed, carried so the decision can say what the kubeconfig names.
+# gcloud's json() projection keeps only the keys named, so every nested key
+# the rule reads is listed; a block named whole would carry keys it ignores.
 _DESCRIBE_FORMAT = (
     "json(controlPlaneEndpointsConfig,privateClusterConfig,"
-    "networkConfig.network,masterAuthorizedNetworksConfig,endpoint)"
+    "networkConfig.network,networkConfig.subnetwork,"
+    "masterAuthorizedNetworksConfig,endpoint)"
 )
 # The agent's own cluster: its VPC, its subnet, and its Pod range, which is the
 # source address its traffic carries to a private endpoint (GKE does not
@@ -85,10 +88,6 @@ _ZONE_RE = re.compile(r"^(?P<region>[a-z]+-[a-z]+\d+)-[a-z]$")
 # refuse the connection. Composed here, once, so the scaffold log and the
 # preflight card read the same words.
 _ENABLE_DNS_ACCESS = "`gcloud container clusters update --enable-dns-access`"
-REMEDY_INTERNAL_IP = (
-    "Add the agent cluster's Pod and node ranges to this cluster's authorized "
-    f"networks, or open its DNS endpoint with {_ENABLE_DNS_ACCESS}."
-)
 REMEDY_IP = (
     "Add the agent's egress address to this cluster's authorized networks, or "
     f"open its DNS endpoint with {_ENABLE_DNS_ACCESS}."
@@ -346,9 +345,10 @@ def _within_any(cidr: str, blocks: tuple[str, ...]) -> bool:
 
 
 def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]) -> EndpointDecision:
-    """The rule, over one describe document. `own` is called only when rule 2
-    could fire, so an ordinary public cluster never pays for the second
-    describe."""
+    """The rule, over one describe document, numbered as
+    docs/designs/private-endpoint-selection.md numbers it. `own` is called only
+    when rule 3 could fire, so an ordinary public cluster never pays for the
+    second describe."""
     endpoints = described.get("controlPlaneEndpointsConfig") or {}
     dns = endpoints.get("dnsEndpointConfig") or {}
     ip = endpoints.get("ipEndpointsConfig") or {}
@@ -363,30 +363,38 @@ def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]
               if block.get("cidrBlock"))
         if restricted else None
     )
-    # Absent means the list gates the public endpoint only, the pre-2024 default.
+    # Absent means the list gates the public endpoint only: gcloud's
+    # --enable-authorized-networks-on-private-endpoint is what turns
+    # enforcement on for "traffic reaching cluster's control plane via
+    # private IP", and it defaults off.
     private_enforced = restricted and authorized.get("privateEndpointEnforcementEnabled") is True
-    private_endpoint = private.get("privateEndpoint") or ip.get("privateEndpoint") or ""
-    global_access = (private.get("masterGlobalAccessConfig") or {}).get("enabled") is True
+    # Only this field: gcloud's --internal-ip reads privateClusterConfig alone
+    # (MissingPrivateEndpointError otherwise), so the nested copy must not be
+    # what triggers the flag.
+    private_endpoint = private.get("privateEndpoint") or ""
+    global_access = ((private.get("masterGlobalAccessConfig") or {}).get("enabled") is True
+                     or ip.get("globalAccess") is True)
     network_config = described.get("networkConfig") or {}
     network = network_config.get("network") or ""
     subnetwork = network_config.get("subnetwork") or ""
     default_address = described.get("endpoint") or ""
 
-    # 1. `allowExternalTraffic` absent is a no, not a maybe: clusters predating
-    # the DNS endpoint omit the whole block, and the flag fails against them.
+    # Rule 1. `allowExternalTraffic` absent is a no, not a maybe: clusters
+    # predating the DNS endpoint omit the whole block, and the flag fails
+    # against them.
     if dns.get("endpoint") and dns.get("allowExternalTraffic") is True:
         return EndpointDecision((DNS_ENDPOINT_FLAG,), KIND_DNS, dns["endpoint"],
                                 None, networks, "")
 
-    # With IP endpoints off gcloud writes the DNS host by itself and refuses
-    # --internal-ip (IPEndpointsIsDisabledError); authorized networks do not
-    # gate that host, so there is no network remedy to give.
+    # Rule 2. With IP endpoints off gcloud writes the DNS host by itself and
+    # refuses --internal-ip (IPEndpointsIsDisabledError); authorized networks
+    # do not gate that host, so there is no network remedy to give.
     if ip.get("enabled") is False:
         return EndpointDecision((), KIND_DNS, dns.get("endpoint") or default_address,
                                 None, networks, "")
 
-    # 2. gcloud's other precondition for --internal-ip is a private endpoint
-    # (MissingPrivateEndpointError). Beyond that, the private endpoint has to
+    # Rule 3. gcloud's other precondition for --internal-ip is a private
+    # endpoint. Beyond that, the private endpoint has to
     # be one this pod can route to -- same VPC, and same region unless
     # control-plane global access is on -- and one that admits this pod's
     # traffic: the list does not gate it, or the target shares this cluster's
@@ -410,11 +418,13 @@ def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]
             if routable and admitted:
                 return EndpointDecision((INTERNAL_IP_FLAG,), KIND_INTERNAL_IP, private_endpoint,
                                         True, networks, "")
-            if routable and restricted:
+            if routable:
+                # Not admitted, which can only mean the list is enforced on the
+                # private endpoint and misses this cluster's Pod range.
                 return EndpointDecision((), KIND_IP, default_address, True, networks,
                                         REMEDY_ADMIT_POD_RANGE.format(pod_cidr=pod_cidr or POD_RANGE_UNKNOWN))
 
-    # 3. Whatever gcloud writes unflagged.
+    # Rule 4. Whatever gcloud writes unflagged.
     if not restricted:
         remedy = ""
     elif private_endpoint and same_network is False:

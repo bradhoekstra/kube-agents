@@ -29,16 +29,27 @@ import terminal_env_pin  # noqa: E402
 import gke_endpoint  # noqa: E402
 
 
+POD_RANGE = "10.92.0.0/14"
+ADMIT_REMEDY = gke_endpoint.REMEDY_ADMIT_POD_RANGE.format(pod_cidr=POD_RANGE)
+
+
 def a_decision(**overrides):
-    """An --internal-ip decision for a restricted private cluster, the shape the
-    scaffold has the most to say about; override fields per test."""
+    """An --internal-ip decision for a same-subnet private cluster, which carries
+    no remedy; override fields per test. `a_blocked_decision` is the shape with
+    something to say."""
     base = dict(
         flags=("--internal-ip",), kind=gke_endpoint.KIND_INTERNAL_IP, address="10.10.0.2",
-        same_network=True, authorized_networks=("10.0.0.0/8", "172.16.0.0/12"),
-        remedy=gke_endpoint.REMEDY_INTERNAL_IP,
+        same_network=True, authorized_networks=("10.0.0.0/8", "172.16.0.0/12"), remedy="",
     )
     base.update(overrides)
     return gke_endpoint.EndpointDecision(**base)
+
+
+def a_blocked_decision(**overrides):
+    """The public IP kept because the private endpoint's list does not admit the
+    agent's Pod range: the decision the remedy exists for."""
+    return a_decision(flags=(), kind=gke_endpoint.KIND_IP, address="203.0.113.10",
+                      authorized_networks=("203.0.113.5/32",), remedy=ADMIT_REMEDY, **overrides)
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -395,23 +406,24 @@ class CreateProfileTest(unittest.TestCase):
         self.assertEqual(self.get_credentials_argv()[-1], "--internal-ip")
 
     def test_writes_the_endpoint_decision_as_preflight_readable_bullets(self):
-        self.decision = a_decision()
+        self.decision = a_blocked_decision()
         self.create()
         user_md = (self.profile / "USER.md").read_text()
         for key, value in {
-            "endpoint": "internal-ip",
-            "endpoint-address": "10.10.0.2",
-            "authorized-networks": "10.0.0.0/8, 172.16.0.0/12",
-            "endpoint-remedy": gke_endpoint.REMEDY_INTERNAL_IP,
+            "endpoint": "ip",
+            "endpoint-address": "203.0.113.10",
+            "authorized-networks": "203.0.113.5/32",
+            "endpoint-remedy": ADMIT_REMEDY,
         }.items():
             found = re.findall(rf"^[ \t]*-[ \t]*{key}:[ \t]*(.*)$", user_md, re.MULTILINE)
             self.assertTrue(found, f"`{key}` is not a `- {key}:` bullet")
             self.assertEqual(found[0].strip(), value)
 
-    def test_an_unrestricted_cluster_writes_no_remedy_bullet(self):
-        self.decision = a_decision(authorized_networks=None, remedy="")
+    def test_a_decision_without_a_remedy_writes_no_remedy_bullet(self):
+        self.decision = a_decision(authorized_networks=None)
         self.create()
         user_md = (self.profile / "USER.md").read_text()
+        self.assertIn("- endpoint: internal-ip\n", user_md)
         self.assertIn("- authorized-networks: unrestricted\n", user_md)
         self.assertNotIn("endpoint-remedy", user_md)
 
@@ -451,28 +463,36 @@ class CreateProfileTest(unittest.TestCase):
         self.assertEqual(principals.get("probe"), cap.sandbox_exec.TERMINAL_PRINCIPAL)
 
     def test_a_failed_probe_logs_the_endpoint_and_the_remedy(self):
-        self.decision = a_decision()
+        self.decision = a_blocked_decision()
         self.probe_exit = 1
-        self.probe_stderr = "Client Version: v1.33.0\nUnable to connect to the server: dial tcp 10.10.0.2:443: i/o timeout\n"
+        self.probe_stderr = "Client Version: v1.33.0\nUnable to connect to the server: dial tcp 203.0.113.10:443: i/o timeout\n"
         name = self.create()
         self.assertEqual(name, self.name, "an unreachable cluster is still a scaffolded profile")
-        self.assertIn("internal-ip endpoint (10.10.0.2)", self.stderr)
-        self.assertIn("10.0.0.0/8, 172.16.0.0/12", self.stderr)
-        self.assertIn(gke_endpoint.REMEDY_INTERNAL_IP, self.stderr)
-        self.assertIn("dial tcp 10.10.0.2:443: i/o timeout", self.stderr)
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertIn("203.0.113.5/32", self.stderr)
+        self.assertIn(ADMIT_REMEDY, self.stderr)
+        self.assertIn("dial tcp 203.0.113.10:443: i/o timeout", self.stderr)
         self.assertNotIn("Client Version", self.stderr)
+
+    def test_the_connection_failure_pattern_matches_the_preflight_copy(self):
+        """cluster_preflight.sh keeps its own CONNECTIVITY_FAILURE_RE for check 5;
+        the two decide the same question and must stay one pattern."""
+        script = (Path(__file__).resolve().parent / "cluster_preflight.sh").read_text()
+        found = re.search(r"^readonly CONNECTIVITY_FAILURE_RE='([^']*)'$", script, re.MULTILINE)
+        self.assertTrue(found, "cluster_preflight.sh no longer declares CONNECTIVITY_FAILURE_RE")
+        self.assertEqual(found.group(1), cap.CONNECTIVITY_FAILURE_RE.pattern)
 
     def test_a_probe_refused_by_rbac_names_the_endpoint_but_not_the_remedy(self):
         # A 403 is an IAM answer from a reachable control plane; sending the
         # operator to authorized networks for it would be wrong.
-        self.decision = a_decision()
+        self.decision = a_blocked_decision()
         self.probe_exit = 1
         self.probe_stderr = ('Error from server (Forbidden): forbidden: User "sa@x.iam.gserviceaccount.com" '
                              'cannot get path "/version"\n')
         self.create()
-        self.assertIn("internal-ip endpoint (10.10.0.2)", self.stderr)
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
         self.assertIn("Forbidden", self.stderr)
-        self.assertNotIn(gke_endpoint.REMEDY_INTERNAL_IP, self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
 
     def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
         self.decision = a_decision()

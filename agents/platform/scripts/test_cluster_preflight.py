@@ -144,12 +144,15 @@ This Cluster Agent is permanently scoped to the following GKE cluster:
 - location: {LOCATION}
 """
 
+# What the scaffold writes when the private endpoint's list does not admit the
+# agent's Pod range (gke_endpoint.REMEDY_ADMIT_POD_RANGE), the one decision that
+# carries a remedy.
 ENDPOINT_BULLETS = (
-    "- endpoint: internal-ip\n"
-    "- endpoint-address: 10.10.0.2\n"
-    "- authorized-networks: 10.0.0.0/8, 172.16.0.0/12\n"
-    "- endpoint-remedy: Add the agent cluster's Pod and node ranges to this cluster's "
-    "authorized networks, or open its DNS endpoint with "
+    "- endpoint: ip\n"
+    "- endpoint-address: 203.0.113.10\n"
+    "- authorized-networks: 203.0.113.5/32\n"
+    "- endpoint-remedy: Add 10.92.0.0/14 to this cluster's authorized networks and re-run the "
+    "onboarding so the agent reaches it over the private endpoint, or open its DNS endpoint with "
     "`gcloud container clusters update --enable-dns-access`.\n"
 )
 
@@ -351,9 +354,9 @@ class ClusterPreflightTest(unittest.TestCase):
         self.with_endpoint_bullets()
         result = self.run_preflight(FAKE_UNREACHABLE="1")
         self.assertEqual("5", result["check"])
-        self.assertIn("internal-ip endpoint (10.10.0.2)", result["reason"])
-        self.assertIn("authorized networks: 10.0.0.0/8, 172.16.0.0/12", result["reason"])
-        self.assertTrue(result["remediation"].startswith("Add the agent cluster's Pod and node ranges"),
+        self.assertIn("ip endpoint (203.0.113.10)", result["reason"])
+        self.assertIn("authorized networks: 203.0.113.5/32", result["reason"])
+        self.assertTrue(result["remediation"].startswith("Add 10.92.0.0/14 to this cluster's authorized networks"),
                         result["remediation"])
         self.assertIn("--enable-dns-access", result["remediation"])
         # The verbatim kubectl error is still the evidence.
@@ -375,7 +378,7 @@ class ClusterPreflightTest(unittest.TestCase):
         self.with_endpoint_bullets()
         result = self.run_preflight(FAKE_FORBIDDEN="1")
         self.assertEqual("5", result["check"])
-        self.assertIn("internal-ip endpoint (10.10.0.2)", result["reason"])
+        self.assertIn("ip endpoint (203.0.113.10)", result["reason"])
         self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
         self.assertIn("Forbidden", result["evidence"])
 

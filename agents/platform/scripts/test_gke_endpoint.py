@@ -683,6 +683,20 @@ class PrivateEndpointTest(unittest.TestCase):
         self.assertEqual(d.flags, ("--internal-ip",))
         self.assertEqual(d.remedy, "", "the list does not gate the endpoint chosen")
 
+    def test_a_private_endpoint_only_in_the_nested_block_gets_no_flag(self):
+        # gcloud reads privateClusterConfig.privateEndpoint alone before it
+        # accepts --internal-ip, so the nested copy must not trigger the flag.
+        shape = _variant(PRIVATE_SAME_VPC, privateClusterConfig={"enablePrivateNodes": True})
+        d = decision(FakeRunner(shape))
+        self.assertEqual(d.flags, ())
+
+    def test_global_access_in_the_nested_block_counts(self):
+        endpoints = json.loads(json.dumps(PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"]))
+        endpoints["ipEndpointsConfig"]["globalAccess"] = True
+        d = decision(FakeRunner(_variant(PRIVATE_SAME_VPC, controlPlaneEndpointsConfig=endpoints)),
+                     location="europe-west1")
+        self.assertEqual(d.flags, ("--internal-ip",))
+
     def test_an_own_describe_without_the_pod_range_is_not_admitted_by_the_list(self):
         # Two of three fields: the network and subnetwork compare, the range cannot.
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=f"{OWN_NETWORK}\t{OWN_SUBNETWORK}\t")
@@ -804,8 +818,11 @@ class DescribeFormatTest(unittest.TestCase):
         runner = FakeRunner(PRIVATE_SAME_VPC)
         decision(runner)
         fmt = [a for a in runner.describe_calls[0] if a.startswith("--format=")][0]
+        # gcloud's json() projection keeps only the keys named, so a nested key
+        # the rule reads has to be asked for by name or by its parent block.
         for field in ("controlPlaneEndpointsConfig", "privateClusterConfig",
-                      "networkConfig.network", "masterAuthorizedNetworksConfig", "endpoint"):
+                      "networkConfig.network", "networkConfig.subnetwork",
+                      "masterAuthorizedNetworksConfig", "endpoint"):
             self.assertIn(field, fmt)
 
 
