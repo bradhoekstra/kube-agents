@@ -112,6 +112,9 @@ GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
 GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone", "-z")
 GET_CREDENTIALS_PROJECT_FLAG = "--project"
 GET_CREDENTIALS_DEFAULT_PROJECT_ENV = "GKE_PROJECT_ID"
+# Beside a managed kubeconfig written from a provisional endpoint decision
+# (`_provisional_marker`): the next request refetches rather than reusing it.
+PROVISIONAL_KUBECONFIG_SUFFIX = ".provisional"
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -6312,6 +6315,11 @@ class CommandExecutor:
         return self.kubeconfig_dir / f"{target.context_name}.yaml"
 
     def _dns_endpoint_args(self, gcloud: str, target: ClusterTarget) -> list[str]:
+        """The flags `_endpoint_decision` chose, or none."""
+        decision = self._endpoint_decision(gcloud, target)
+        return list(decision.flags) if decision is not None else []
+
+    def _endpoint_decision(self, gcloud: str, target: ClusterTarget):
         """Decide which endpoint this cluster's credentials must name.
 
         `--dns-endpoint`, `--internal-ip` or nothing. The decision itself lives
@@ -6327,14 +6335,14 @@ class CommandExecutor:
         behaviour that shipped before it existed.
         """
         try:
-            from gke_endpoint import dns_endpoint_args
+            from gke_endpoint import endpoint_decision
         except ImportError as error:
             logging.warning(
                 "gke_endpoint is unavailable (%s); falling back to the IP endpoint for %s",
                 error,
                 target.context_name,
             )
-            return []
+            return None
 
         def run(argv: list[str]) -> tuple[int, str]:
             # The short deadline: this is a control-plane lookup made on the
@@ -6345,7 +6353,14 @@ class CommandExecutor:
             )
             return result.exit_code, result.stdout
 
-        return dns_endpoint_args(target.project, target.cluster, target.location, run=run)
+        return endpoint_decision(target.project, target.cluster, target.location, run=run)
+
+    def _provisional_marker(self, target: ClusterTarget) -> Path:
+        """Beside the managed kubeconfig: present while that file was written
+        from a decision made without the broker's own cluster (the describe
+        failed). The next request treats the file as a miss and decides again,
+        so one failed describe does not pin an endpoint until the pod restarts."""
+        return self._managed_kubeconfig(target).with_suffix(PROVISIONAL_KUBECONFIG_SUFFIX)
 
     def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
         """Return the proxy-authored kubeconfig for a cluster, fetching on a miss.
@@ -6358,12 +6373,14 @@ class CommandExecutor:
         pinned by some earlier process.
         """
         managed = self._managed_kubeconfig(target)
+        marker = self._provisional_marker(target)
         with self._kubeconfig_lock:
-            if managed.is_file() and managed.stat().st_size > 0:
+            if managed.is_file() and managed.stat().st_size > 0 and not marker.exists():
                 return managed
             gcloud = self.executables.get("gcloud")
             if not gcloud:
                 raise RuntimeError("gcloud is unavailable; cannot materialise a kubeconfig")
+            decision = self._endpoint_decision(gcloud, target)
             scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
             try:
                 result = self._execute(
@@ -6375,7 +6392,7 @@ class CommandExecutor:
                         target.cluster,
                         f"--location={target.location}",
                         f"--project={target.project}",
-                        *self._dns_endpoint_args(gcloud, target),
+                        *(list(decision.flags) if decision is not None else []),
                     ],
                     kubeconfig_path=scratch,
                     # The short deadline, as for the describe above. A
@@ -6391,12 +6408,16 @@ class CommandExecutor:
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
                     )
                 os.replace(scratch, managed)
+                if decision is not None and decision.provisional:
+                    marker.touch()
+                else:
+                    marker.unlink(missing_ok=True)
             finally:
                 scratch.unlink(missing_ok=True)
         return managed
 
-    def _endpoint_flags_for_callers_fetch(self, command: list[str]) -> list[str]:
-        """The endpoint flags to add to a caller's `get-credentials`, if any.
+    def _decision_for_callers_fetch(self, command: list[str]):
+        """The endpoint decision to apply to a caller's `get-credentials`, or None.
 
         The file that fetch produces is filed as the shared kubeconfig for its
         cluster (`_execute_get_credentials`), so a caller that names no endpoint
@@ -6408,11 +6429,11 @@ class CommandExecutor:
         against defaults this side does not know.
         """
         if any(flag in command for flag in GET_CREDENTIALS_ENDPOINT_FLAGS):
-            return []
+            return None
         target = _get_credentials_target(command)
         if target is None:
-            return []
-        return self._dns_endpoint_args(command[0], target)
+            return None
+        return self._endpoint_decision(command[0], target)
 
     def _execute_get_credentials(
         self,
@@ -6440,7 +6461,8 @@ class CommandExecutor:
         # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
         # config, moving the `current-context` that every later context-less
         # kubectl resolves against.
-        command = [*command, *self._endpoint_flags_for_callers_fetch(command)]
+        decision = self._decision_for_callers_fetch(command)
+        command = [*command, *(list(decision.flags) if decision is not None else [])]
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(
@@ -6457,6 +6479,15 @@ class CommandExecutor:
                     # redundant fetch. Taking the lock here would serialise every
                     # scaffold behind every cold read for no benefit.
                     os.replace(scratch, self._managed_kubeconfig(target))
+                    # The same provisional rule as the broker's own fetch: a
+                    # file written while the own-cluster describe failed is a
+                    # miss next time; one written on a settled decision, or
+                    # with the caller's own flag, clears an older mark.
+                    marker = self._provisional_marker(target)
+                    if decision is not None and decision.provisional:
+                        marker.touch()
+                    else:
+                        marker.unlink(missing_ok=True)
                 if wants_kubeconfig:
                     result = replace(result, kubeconfig=generated)
             return result

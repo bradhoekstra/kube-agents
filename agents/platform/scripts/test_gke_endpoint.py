@@ -725,7 +725,7 @@ class PrivateEndpointTest(unittest.TestCase):
         self.assertEqual(d.flags, ("--internal-ip",))
 
     def test_a_zone_with_a_long_suffix_is_still_its_region(self):
-        # gcloud's LocationToRegion drops the last segment whatever it is.
+        # The first two segments are the region, whatever the zone suffix is.
         d = decision(FakeRunner(PRIVATE_SAME_VPC), location="us-central1-ai1a")
         self.assertEqual(d.flags, ("--internal-ip",))
 
@@ -736,6 +736,13 @@ class PrivateEndpointTest(unittest.TestCase):
         d = decision(FakeRunner(shape))
         self.assertEqual(d.flags, ())
         self.assertEqual(d.kind, gke_endpoint.KIND_DNS)
+
+    def test_a_private_only_cluster_in_another_region_without_a_list_names_global_access(self):
+        # No list, no public endpoint, same VPC, other region: unreachable
+        # today, and only global access or the DNS endpoint can change that.
+        d = decision(FakeRunner(PRIVATE_ONLY_LIST_OFF), location="europe-west1")
+        self.assertEqual(d.flags, ())
+        self.assertIn("global access", d.remedy)
 
     def test_a_private_only_cluster_on_another_network_gets_a_remedy_that_can_work(self):
         # No public endpoint, so an address on the list helps nobody; the DNS
@@ -900,6 +907,27 @@ class OwnNetworkTest(unittest.TestCase):
         self.assertEqual(first.flags, ())
         self.assertEqual(second.flags, ("--internal-ip",))
         self.assertEqual(len(runner.describe_calls), 2, "the target was re-read, not served from cache")
+
+    def test_a_failed_own_describe_marks_the_decision_provisional(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            d = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+        self.assertTrue(d.provisional)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            runner.own_network = OWN_ROW
+            d = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+        self.assertFalse(d.provisional)
+
+    def test_an_absent_identity_is_a_settled_answer_and_is_cached(self):
+        # A workstation or a test has no own cluster to wait for; re-describing
+        # the target on every call would only cost gcloud starts.
+        scrubbed = {k: v for k, v in os.environ.items() if k not in OWN_CLUSTER_ENV}
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        with unittest.mock.patch.dict(os.environ, scrubbed, clear=True), redirect_stderr(io.StringIO()):
+            first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+        self.assertFalse(first.provisional)
+        self.assertEqual(len(runner.describe_calls), 1, "served from the cache the second time")
 
     def test_a_literal_placeholder_is_no_identity(self):
         # Hermes hands an MCP server the literal "${GKE_PROJECT_ID}" when the

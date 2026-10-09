@@ -3325,6 +3325,16 @@ class CommandExecutorTest(unittest.TestCase):
 
     # ---- Choosing the control-plane endpoint --------------------------------
 
+    @staticmethod
+    def a_decision(flags, provisional=False):
+        """An EndpointDecision carrying `flags`, for patching gke_endpoint."""
+        import gke_endpoint
+
+        kind = {"--dns-endpoint": gke_endpoint.KIND_DNS, "--internal-ip": gke_endpoint.KIND_INTERNAL_IP}.get(
+            flags[0] if flags else "", gke_endpoint.KIND_IP)
+        return gke_endpoint.EndpointDecision(tuple(flags), kind, "203.0.113.10", None, None, "",
+                                             provisional=provisional)
+
     def test_cache_miss_passes_dns_endpoint_when_the_cluster_needs_it(self):
         # The cold path: a restart empties the state dir, so the proxy refetches
         # on its own rather than reusing what the agent's get-credentials filed.
@@ -3338,7 +3348,7 @@ class CommandExecutorTest(unittest.TestCase):
             return original(argv, **kwargs)
 
         with (
-            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--dns-endpoint"]),
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--dns-endpoint"])),
             mock.patch.object(executor, "_execute", record),
         ):
             executor._resolve_kubeconfig(self.CONTEXT)
@@ -3361,7 +3371,7 @@ class CommandExecutorTest(unittest.TestCase):
             return original(argv, **kwargs)
 
         with (
-            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--internal-ip"]) as decide,
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
             mock.patch.object(executor, "_execute", record),
         ):
             executor.execute(
@@ -3419,7 +3429,7 @@ class CommandExecutorTest(unittest.TestCase):
             return original(argv, **kwargs)
 
         with (
-            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--internal-ip"]) as decide,
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
             mock.patch.object(executor, "_execute", record),
         ):
             executor.execute(
@@ -3445,7 +3455,7 @@ class CommandExecutorTest(unittest.TestCase):
             return original(argv, **kwargs)
 
         with (
-            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--internal-ip"]) as decide,
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
             mock.patch.object(executor, "_execute", record),
         ):
             executor.execute(["gcloud", "container", "clusters", "get-credentials", "cluster-b"])
@@ -3454,6 +3464,65 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(1, len(fetches))
         self.assertNotIn("--internal-ip", fetches[0])
         decide.assert_not_called()
+
+    def test_a_kubeconfig_fetched_on_a_provisional_decision_is_refetched_next_time(self):
+        # The decision fell back because the broker's own-cluster describe
+        # failed. The file it produced serves the request in flight, and the
+        # next request fetches again rather than reusing it until a restart.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision",
+                       return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            first = executor._resolve_kubeconfig(self.CONTEXT)
+            second = executor._resolve_kubeconfig(self.CONTEXT)
+        with (
+            mock.patch("gke_endpoint.endpoint_decision",
+                       return_value=self.a_decision(["--internal-ip"])),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            third = executor._resolve_kubeconfig(self.CONTEXT)
+            fourth = executor._resolve_kubeconfig(self.CONTEXT)
+
+        fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
+        self.assertEqual(3, len(fetches), "two provisional fetches, one settled, then the cache")
+        self.assertEqual("--internal-ip", fetches[2][-1])
+        self.assertTrue(first.is_file() and second.is_file() and third.is_file() and fourth.is_file())
+
+    def test_a_callers_fetch_on_a_provisional_decision_is_refetched_by_the_next_read(self):
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor._resolve_kubeconfig(self.CONTEXT)
+
+        fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
+        self.assertEqual(2, len(fetches), "the caller's provisional file was not reused")
+        self.assertEqual("--internal-ip", fetches[1][-1])
 
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the
@@ -3464,11 +3533,11 @@ class CommandExecutorTest(unittest.TestCase):
         target = credential_proxy.parse_gke_context(self.CONTEXT)
         seen = []
 
-        def fake_args(project, cluster, location, *, run=None, env=None):
+        def fake_decision(project, cluster, location, *, run=None, env=None):
             seen.append(run(["gcloud", "container", "clusters", "describe", cluster]))
-            return []
+            return None
 
-        with mock.patch("gke_endpoint.dns_endpoint_args", fake_args):
+        with mock.patch("gke_endpoint.endpoint_decision", fake_decision):
             executor._dns_endpoint_args(resolved, target)
 
         self.assertEqual(1, len(seen))

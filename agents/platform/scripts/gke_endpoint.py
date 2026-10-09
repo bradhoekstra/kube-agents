@@ -82,7 +82,7 @@ _OWN_FIELD_COUNT = 3
 _VALUE_SEPARATOR = "\t"
 
 # A GKE region is two segments (`us-central1`); a zone adds a third, whatever
-# it is (`-a`, or `-ai1a`), which is how gcloud's LocationToRegion reads it.
+# it is (`-a`, or `-ai1a`). The first two segments are the region.
 _REGION_SEGMENTS = 2
 _LOCATION_SEPARATOR = "-"
 # Hermes hands a stdio MCP server the literal placeholder when the variable
@@ -99,8 +99,8 @@ REMEDY_IP = (
 )
 REMEDY_OTHER_NETWORK = (
     "The agent is not on this cluster's VPC. Open the cluster's DNS endpoint with "
-    f"{_ENABLE_DNS_ACCESS}; a public endpoint, if the cluster has one, also needs the "
-    "agent's NAT address on its authorized networks."
+    f"{_ENABLE_DNS_ACCESS}, or, if the cluster has a public endpoint, add the address "
+    "the agent leaves its VPC from to the cluster's authorized networks."
 )
 # Same VPC, but the private endpoint answers only from its own region. An
 # address on the list cannot change that; global access or the DNS endpoint can.
@@ -177,6 +177,11 @@ class EndpointDecision:
     same_network: bool | None
     authorized_networks: tuple[str, ...] | None
     remedy: str
+    # True when the decision needed the agent's own cluster, the identity was
+    # there, and the describe failed: gcloud's answer about the target, not
+    # about the question. Never cached here, and the credential proxy treats
+    # a kubeconfig written from one as a miss on the next request.
+    provisional: bool = False
 
     def authorized_networks_text(self) -> str:
         if self.authorized_networks is None:
@@ -305,6 +310,16 @@ def _region_of(location: str) -> str:
     return location or ""
 
 
+def _own_identity() -> tuple[str, str, str] | None:
+    """(project, location, cluster) from OWN_CLUSTER_ENV, or None when any is
+    unset or still the literal `${...}` placeholder."""
+    identity = [os.environ.get(name, "") for name in OWN_CLUSTER_ENV]
+    if not all(identity) or any(value.startswith(_UNEXPANDED_PLACEHOLDER_PREFIX) for value in identity):
+        return None
+    project, location, cluster = identity
+    return project, location, cluster
+
+
 def own_cluster(run: Runner) -> OwnCluster | None:
     """The network facts of the cluster this process runs on, or None.
 
@@ -318,8 +333,8 @@ def own_cluster(run: Runner) -> OwnCluster | None:
     global _own_cluster_cache
     if _own_cluster_cache is not None:
         return _own_cluster_cache
-    identity = [os.environ.get(name, "") for name in OWN_CLUSTER_ENV]
-    if not all(identity) or any(value.startswith(_UNEXPANDED_PLACEHOLDER_PREFIX) for value in identity):
+    identity = _own_identity()
+    if identity is None:
         return None
     project, location, cluster = identity
     argv = [
@@ -364,18 +379,16 @@ def _within_any(cidr: str, blocks: tuple[str, ...]) -> bool:
 
 
 def _decide(described: dict, location: str,
-            own: Callable[[], OwnCluster | None]) -> tuple[EndpointDecision, bool]:
+            own: Callable[[], OwnCluster | None], own_known: bool) -> EndpointDecision:
     """The rule, over one describe document, numbered as
     docs/designs/private-endpoint-selection.md numbers it. `own` is called only
     when rule 3 could fire, so an ordinary public cluster never pays for the
     second describe.
 
-    Returns the decision and whether it is worth remembering: a decision that
-    needed the agent's own cluster and did not get it is gcloud's answer about
-    the target but not about the question, and must not sit in the per-target
-    cache for a minute -- in the credential proxy a cold fetch inside that
-    window would write a public-IP kubeconfig nothing invalidates until the pod
-    restarts."""
+    `own_known` says whether an own-cluster identity exists at all. A decision
+    that needed the own cluster, had the identity, and did not get the describe
+    is marked `provisional`: gcloud's answer about the target but not about the
+    question. An absent identity is a settled answer."""
     endpoints = described.get("controlPlaneEndpointsConfig") or {}
     dns = endpoints.get("dnsEndpointConfig") or {}
     ip = endpoints.get("ipEndpointsConfig") or {}
@@ -412,7 +425,7 @@ def _decide(described: dict, location: str,
     # against them.
     if dns.get("endpoint") and dns.get("allowExternalTraffic") is True:
         return EndpointDecision((DNS_ENDPOINT_FLAG,), KIND_DNS, dns["endpoint"],
-                                None, networks, ""), True
+                                None, networks, "")
 
     # Rule 2. With IP endpoints off gcloud writes the DNS host by itself and
     # refuses --internal-ip (IPEndpointsIsDisabledError); authorized networks
@@ -422,7 +435,7 @@ def _decide(described: dict, location: str,
     # have no block at all is on.
     if "ipEndpointsConfig" in endpoints and not ip.get("enabled"):
         return EndpointDecision((), KIND_DNS, dns.get("endpoint") or default_address,
-                                None, networks, ""), True
+                                None, networks, "")
 
     # Rule 3. gcloud's other precondition for --internal-ip is a private
     # endpoint. Beyond that, the private endpoint has to be worth moving to:
@@ -437,14 +450,14 @@ def _decide(described: dict, location: str,
     same_network: bool | None = None
     routable = False
     pod_cidr = ""
-    own_needed_and_missing = False
+    provisional = False
     if private_endpoint and network and (restricted or not public_endpoint):
         mine = own()
         if mine is not None:
             same_network = mine.network == network
             pod_cidr = mine.pod_cidr
         else:
-            own_needed_and_missing = True
+            provisional = own_known
         if same_network:
             routable = global_access or _region_of(location) == mine.region
             admitted = (
@@ -454,25 +467,28 @@ def _decide(described: dict, location: str,
             )
             if routable and admitted:
                 return EndpointDecision((INTERNAL_IP_FLAG,), KIND_INTERNAL_IP, private_endpoint,
-                                        True, networks, ""), True
+                                        True, networks, "")
             if routable:
                 # Not admitted, which can only mean the list is enforced on the
                 # private endpoint and misses this cluster's Pod range.
                 return EndpointDecision((), KIND_IP, default_address, True, networks,
-                                        REMEDY_ADMIT_POD_RANGE.format(pod_cidr=pod_cidr or POD_RANGE_UNKNOWN)), True
+                                        REMEDY_ADMIT_POD_RANGE.format(pod_cidr=pod_cidr or POD_RANGE_UNKNOWN))
 
     # Rule 4. Whatever gcloud writes unflagged. The remedy names what could
     # actually open the cluster: a private endpoint on another network or in
     # another region is not helped by an address on the list.
     if same_network and not routable:
         remedy = REMEDY_OTHER_REGION
-    elif private_endpoint and same_network is False and (restricted or not public_endpoint):
+    elif private_endpoint and same_network is False:
+        # Reached only through rule 3's gate: the list is on or there is no
+        # public endpoint, so an address on the list is not the answer.
         remedy = REMEDY_OTHER_NETWORK
     elif restricted:
         remedy = REMEDY_IP
     else:
         remedy = ""
-    return EndpointDecision((), KIND_IP, default_address, same_network, networks, remedy), not own_needed_and_missing
+    return EndpointDecision((), KIND_IP, default_address, same_network, networks, remedy,
+                            provisional=provisional)
 
 
 def endpoint_decision(
@@ -525,8 +541,9 @@ def endpoint_decision(
         # would be this failure mistaken for a configuration.
         return cached[1] if cached is not None else None
 
-    decision, cacheable = _decide(described, location, lambda: own_cluster(runner))
-    if cacheable:
+    decision = _decide(described, location, lambda: own_cluster(runner),
+                       own_known=_own_identity() is not None)
+    if not decision.provisional:
         _endpoint_cache[key] = (time.monotonic(), decision)
     return decision
 

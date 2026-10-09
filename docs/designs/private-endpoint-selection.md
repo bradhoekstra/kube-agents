@@ -28,8 +28,9 @@ timeout and had to work out the rest.
 3. **Private endpoint**, `--internal-ip`, when the cluster publishes
    `privateClusterConfig.privateEndpoint` (gcloud's `MissingPrivateEndpointError` otherwise;
    the nested `ipEndpointsConfig.privateEndpoint` is deliberately not read, because gcloud
-   reads only the first), its public endpoint is either absent (`enablePublicEndpoint: false`)
-   or gated by an enabled authorized-network list (a public endpoint nothing restricts works
+   reads only the first), its public endpoint is either absent
+   (`ipEndpointsConfig.enablePublicEndpoint: false`) or gated by an enabled authorized-network
+   list (a public endpoint nothing restricts works
    today, and moving it could only break it), and the private endpoint is both routable from
    the agent pod and willing to admit it:
    - **routable**: the target's `networkConfig.network` equals the agent's own cluster's
@@ -79,10 +80,13 @@ for the target describe: the credential proxy is a daemon.
 With any of the three variables unset the answer is "unknown", and rule 3 never fires. That is
 the position of every workstation and test caller, and it is what keeps the predicate copies
 in agreement without changing them. A decision that needed the own cluster and did not get it
-(the describe failed) is returned but not put in the per-target cache, so the next call
-re-reads rather than serving a fallback for a minute; in the credential proxy a cold fetch
-inside that minute would otherwise write a public-IP kubeconfig that nothing invalidates until
-the pod restarts.
+because the describe failed (the identity was there) is returned marked `provisional` and not
+put in the per-target cache, so the next call re-reads rather than serving a fallback for a
+minute. An identity that is absent is a settled answer, cached like any other. The credential
+proxy reads the mark: a managed kubeconfig written from a provisional decision, by the proxy's
+own fetch or by a caller's fetch it spliced into, is kept for the request in flight and treated
+as a miss by the next one (a `.provisional` marker beside the file), so a cold fetch during a
+failed describe does not pin a public-IP kubeconfig until the pod restarts.
 
 A Shared VPC matches naturally: a service-project cluster reports the host project's network
 resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
@@ -101,6 +105,7 @@ cached):
 | `same_network`        | `True`, `False`, or `None` when the agent's own network was not needed or unknown |
 | `authorized_networks` | the listed CIDRs when the list is enabled (possibly empty), or `None`             |
 | `remedy`              | one sentence naming what would make the cluster reachable, or `""`                |
+| `provisional`         | `True` when the own-cluster describe failed and the decision fell back            |
 
 `dns_endpoint_args()` stays as the wrapper returning only `flags` as a list. Its callers,
 `platform_mcp_server.py`, `stall_watch.py` and `credential_proxy.py`, inherit rule 3 without
@@ -115,8 +120,9 @@ preflight card read the same words:
 
 - rule 3 found the private endpoint routable but not admitted: `REMEDY_ADMIT_POD_RANGE`, with
   the Pod range spliced in;
-- `ip` with the list enabled, on the agent's network but in another region without global
-  access: `REMEDY_OTHER_REGION`, which names control-plane global access;
+- `ip` on the agent's network but in another region without global access, when the list is
+  enabled or there is no public endpoint: `REMEDY_OTHER_REGION`, which names control-plane
+  global access;
 - `ip` on another network with a private endpoint, when the list is enabled or there is no
   public endpoint: `REMEDY_OTHER_NETWORK`, which leads with the DNS endpoint because an
   address on the list cannot open a private endpoint the agent cannot route to;
@@ -148,8 +154,9 @@ could be decided. After the mirror, the scaffold probes the cluster with
 kind, the address, the list, and kubectl's last line (just kubectl's last line when nothing was
 decided), adding the remedy only when kubectl's
 output is a connection failure (a timeout, no route, a refused dial) rather than an answer the
-server gave (401, 403, NotFound) or a message the credential-proxy shim itself produced
-(its `credential proxy:` and `credential proxy unavailable` prefixes). When the probe itself does not finish inside its outer bound,
+server gave (401, 403, NotFound) or a message the credential-proxy shim itself produced (its
+`credential proxy:`, `credential proxy unavailable`, `credential proxy token unavailable` and
+`credential proxy error` prefixes). When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
 normally: a cluster that is unreachable now may be reachable after the operator acts, and a
 scaffold that failed would only be retried on the next reconcile tick with the same result.
