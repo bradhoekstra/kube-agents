@@ -589,7 +589,9 @@ as `upgrade.sh` does, or a `spec.scope` the served schema does not know is prune
 release record then carrying it, never re-sent. The identity running the apply needs
 to set IAM policy in each project named, and, with `enable_drift_pubsub` on, to create a Log Router
 sink there, read the project's number and mint its Logging service agent
-([Drift audit-log ingress](#drift-audit-log-ingress) has what each listed project gets). The release's dependency on the module orders creation,
+([Drift audit-log ingress](#drift-audit-log-ingress) has what each listed project gets); the
+installer front doors probe the binding permissions and, with `ENABLE_DRIFT_DETECTOR` on, the sink's
+in each explicit project before an apply, and the composition run directly does not. The release's dependency on the module orders creation,
 not IAM propagation: a first install's one-shot inventory sweep may name a scoped project as
 `denied`, and the hourly reconcile creates its profiles once the grant has propagated.
 
@@ -600,8 +602,9 @@ a project created under a declared folder after the apply is discovered and read
 change here. Declaring one adds `cloudasset.googleapis.com` to the APIs the composition enables in
 `project_id`; an install that names explicit projects alone never enables it. The identity running
 the apply needs `resourcemanager.folders.setIamPolicy` on each folder or
-`resourcemanager.organizations.setIamPolicy` on the organisation, which the installer front doors
-check before the apply and the composition run directly does not. An organisation binding reaches
+`resourcemanager.organizations.setIamPolicy` on the organisation, and in each explicit project the
+project-level binding permissions and, with `ENABLE_DRIFT_DETECTOR` on, `logging.sinks.create`, which the
+installer front doors check before the apply and the composition run directly does not. An organisation binding reaches
 every project in the organisation; the design recommends folders until the scoped service account
 pool grants authority ([`docs/designs/multi-project-scope.md`](../../../docs/designs/multi-project-scope.md)
 §9).
@@ -836,8 +839,12 @@ parallelism window and, on a first install, the IAM module and the chart
 release behind the cluster — waits for a second apply. The identity applying
 needs `logging.sinks.create`, the
 project's number and the Service Usage call that mints its Logging agent in
-each listed project (`roles/owner` carries them), and nothing probes for that
-before the apply: a number it cannot read fails the plan, or the apply at
+each listed project (`roles/owner` carries them); the installer front doors
+probe an explicit `scope.projects` entry for the number read and
+`logging.sinks.create` before an apply, refusing on a run that applies and
+warning on one that does not, while the agent's mint has no permission to
+probe and a selector's members are the plan's to find, so for those nothing
+probes before the apply: a number it cannot read fails the plan, or the apply at
 that read when the plan deferred it (a first install, or any apply that
 enables an API), and an agent or grant it cannot make stops the apply with
 the host's trio untouched and every source sink held back until the next

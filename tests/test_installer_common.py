@@ -4231,7 +4231,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
 
     def _run(self, keys=None, mode="", api_enabled=True, policy=None, policy_error=False,
              probe=None, token=True, curl_present=True, strict=False, env_extra=None, policy_garbage=False,
-             search_probe=None):
+             search_probe=None, deny=None):
         """probe: a dict from resource ("folders/1") to what curl answers:
         "granted", "denied", "forbidden", "service-disabled", "missing",
         "garbage", "down". search_probe: the same, answered only to a request
@@ -4245,6 +4245,11 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         override that reached it."""
         probe = probe or {}
         search_probe = search_probe or {}
+        # deny: project resource -> the permissions withheld from an otherwise
+        # granted answer. A project is asked for several permissions in one
+        # request and answered with the subset held, so its granted answer
+        # echoes what was asked less these.
+        deny = deny or {}
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
@@ -4283,7 +4288,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                     cases.append(f"  *\"cloudasset.assets.searchAllResources\"*\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' 200; exit 0 ;;")
                 for resource, answer in probe.items():
                     body, status = {
-                        "granted": ('{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
+                        "granted": ('$BODY' if resource.startswith("projects") else '{"permissions":["%s"]}' % ("resourcemanager.folders.setIamPolicy" if resource.startswith("folders") else "resourcemanager.organizations.setIamPolicy"), 200),
                         "denied": ("{}", 200),
                         "forbidden": ('{"error":{"code":403,"status":"PERMISSION_DENIED"}}', 403),
                         "service-disabled": ('{"error":{"code":403,"status":"PERMISSION_DENIED","details":[{"reason":"SERVICE_DISABLED"}]}}', 403),
@@ -4294,6 +4299,10 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                     }[answer]
                     if status is None:
                         cases.append(f'  *"/{resource}:testIamPermissions"*) exit 7 ;;')
+                    elif body == "$BODY":
+                        withheld = ",".join(deny.get(resource, []))
+                        cases.append(
+                            f"  *\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' \"$(printf '%s' \"$BODY\" | python3 -c 'import json, sys; d = json.load(sys.stdin); w = set(sys.argv[1].split(\",\")); print(json.dumps({{\"permissions\": [p for p in d[\"permissions\"] if p not in w]}}))' '{withheld}')\" '{status}'; exit 0 ;;")
                     else:
                         cases.append(f"  *\"/{resource}:testIamPermissions\"*) printf '%s\\n%s' '{body}' '{status}'; exit 0 ;;")
                 # Records the bearer read from the header file, and refuses a
@@ -4301,7 +4310,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
                 (bin_dir / "curl").write_text(
                     "#!/usr/bin/env bash\n"
                     'case "$*" in *"Bearer "*) echo "TOKEN-ON-ARGV" >>"$SCOPE_PROBE_LOG"; exit 99 ;; esac\n'
-                    'for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) echo "PROBED:$(printf \'%s\' "$a" | sed \'s/.*\\["\\(.*\\)"\\].*/\\1/\')" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
+                    'BODY=""; for a in "$@"; do case "$a" in @-) echo "BEARER:$(sed -n \'s/^Authorization: Bearer //p\')" >>"$SCOPE_PROBE_LOG" ;; @*) echo "BEARER-FROM-FILE" >>"$SCOPE_PROBE_LOG" ;; *:testIamPermissions) echo "REQUEST:$a" >>"$SCOPE_PROBE_LOG" ;; "{\\"permissions\\""*) BODY="$a"; python3 -c \'import json, sys; [print("PROBED:" + p) for p in json.loads(sys.argv[1])["permissions"]]\' "$a" >>"$SCOPE_PROBE_LOG" ;; esac; done\n'
                     "case \"$*\" in\n" + "\n".join(cases) + "\nesac\nexit 22\n")
             # env is an external binary whose argv any local user can read: the
             # stub records what it was handed, then hands over to the real one.
@@ -4320,8 +4329,8 @@ class ScopeContainerPreflightTest(unittest.TestCase):
             # Hermetic: the library and the gcloud stub read the provider's and
             # gcloud's credential variables straight from the environment, so a
             # developer's shell must not reach them; each case sets its own.
-            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "",
-                   "SCOPED_SA_POOL_ENABLED": "", "SCOPE_PROBE_LOG": str(probe_log)}
+            env = {"PROJECT_ID": "test-project", "SCOPE_FOLDERS": "", "SCOPE_ORGANIZATIONS": "", "SCOPE_PROJECTS": "",
+                   "SCOPED_SA_POOL_ENABLED": "", "ENABLE_DRIFT_DETECTOR": "false", "SCOPE_PROBE_LOG": str(probe_log)}
             env.update({name: "" for name in _GOOGLE_CREDENTIAL_VARIABLES})
             env.update(keys or {})
             env.update(env_extra or {})
@@ -4352,10 +4361,148 @@ class ScopeContainerPreflightTest(unittest.TestCase):
     def _assert_rc(self, proc, rc):
         self.assertIn(f"rc={rc}", proc.stdout, proc.stdout + proc.stderr)
 
-    def test_no_container_is_silent_and_touches_nothing(self):
-        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, api_enabled=False, policy_error=True, token=False)
+    def test_no_container_and_no_project_is_silent_and_touches_nothing(self):
+        proc = self._run(keys={"SCOPE_SHARED_VPC_HOSTS": "host-project"}, api_enabled=False, policy_error=True, token=False)
         self._assert_rc(proc, 0)
         self.assertEqual("rc=0\n", proc.stdout)
+
+    # Explicit projects: the apply binds the agent's read roles in each and,
+    # with the drift detector on, creates the project's drift audit-log sink
+    # there, so the identity is asked for both before the apply, project by
+    # project, as it is asked about a container.
+
+    def test_a_bindable_project_passes_silently_and_is_asked_the_binding_permissions_alone(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, api_enabled=False, policy_error=True,
+                         probe={"projects/p2-project": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("WARN", proc.stdout)
+        self.assertNotIn("ERROR", proc.stdout)
+        for permission in ("resourcemanager.projects.setIamPolicy", "resourcemanager.projects.getIamPolicy", "resourcemanager.projects.get"):
+            self.assertIn(f"PROBED:{permission}\n", proc.stderr)
+        self.assertNotIn("PROBED:logging.sinks.create", proc.stderr, "with the drift detector off no sink is created there, so its permission is not asked")
+        # Projects alone never read the Asset API: the stub reports it off and the policy unreadable, and nothing is said.
+        self.assertNotIn("cloudasset", proc.stdout)
+
+    def test_the_host_project_among_the_scope_projects_is_not_probed(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "test-project, p2-project"}, probe={"projects/p2-project": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("projects/test-project", proc.stdout + proc.stderr)
+        self.assertIn("PROBED:resourcemanager.projects.setIamPolicy\n", proc.stderr)
+
+    def test_a_project_the_identity_cannot_bind_is_named_with_the_role_and_the_missing_permissions(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project, p3-project"},
+                         probe={"projects/p2-project": "denied", "projects/p3-project": "granted"})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot bind the agent's roles in projects/p2-project (resourcemanager.projects.setIamPolicy, resourcemanager.projects.getIamPolicy, resourcemanager.projects.get)", proc.stdout)
+        self.assertIn("roles/resourcemanager.projectIamAdmin", proc.stdout)
+        self.assertIn("drop it from SCOPE_PROJECTS", proc.stdout)
+        self.assertNotIn("projects/p3-project", proc.stdout)
+        self.assertIn("edit SCOPE_PROJECTS, SCOPE_FOLDERS and SCOPE_ORGANIZATIONS", proc.stdout)
+
+    def test_with_the_drift_detector_on_the_sink_permission_is_asked_and_its_absence_named(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "ENABLE_DRIFT_DETECTOR": "true"},
+                         probe={"projects/p2-project": "granted"}, deny={"projects/p2-project": ["logging.sinks.create"]})
+        self._assert_rc(proc, 1)
+        self.assertIn("PROBED:logging.sinks.create\n", proc.stderr)
+        self.assertIn("cannot create the drift audit-log sink in projects/p2-project (logging.sinks.create)", proc.stdout)
+        self.assertIn("roles/logging.configWriter", proc.stdout)
+        self.assertIn("ENABLE_DRIFT_DETECTOR=false, and no TF_VAR_enable_drift_pubsub line", proc.stdout)
+        self.assertNotIn("cannot bind the agent's roles", proc.stdout)
+
+    def test_with_the_drift_detector_on_a_project_that_takes_the_sink_passes(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "ENABLE_DRIFT_DETECTOR": "true"},
+                         probe={"projects/p2-project": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("ERROR", proc.stdout)
+        self.assertNotIn("WARN", proc.stdout)
+        # One request per project, the four permissions together.
+        self.assertEqual(proc.stderr.count("REQUEST:"), 1, proc.stderr)
+        self.assertEqual(proc.stderr.count("PROBED:"), 4, proc.stderr)
+
+    def test_a_hand_written_ingress_line_asks_the_sink_permission_too(self):
+        # install.env can carry the ingress as TF_VAR_enable_drift_pubsub=true with the detector
+        # key off; the composition creates the sinks either way, so the probe asks either way.
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "ENABLE_DRIFT_DETECTOR": "false"},
+                         env_extra={"TF_VAR_enable_drift_pubsub": "true"},
+                         probe={"projects/p2-project": "granted"}, deny={"projects/p2-project": ["logging.sinks.create"]})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot create the drift audit-log sink in projects/p2-project", proc.stdout)
+        self.assertIn("no TF_VAR_enable_drift_pubsub line", proc.stdout)
+
+    def test_an_entry_that_is_not_a_project_id_is_refused_without_a_request(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "projects/p2-project, 123456789012, p3-project"},
+                         probe={"projects/p3-project": "granted"})
+        self._assert_rc(proc, 1)
+        self.assertIn("'projects/p2-project' in SCOPE_PROJECTS is not a GCP project ID", proc.stdout)
+        self.assertIn("'123456789012' in SCOPE_PROJECTS is not a GCP project ID", proc.stdout)
+        self.assertNotIn("REQUEST:/projects/projects/", proc.stderr)
+        self.assertEqual(proc.stderr.count("REQUEST:"), 1, proc.stderr)
+
+    def test_one_missing_binding_permission_is_named_alone(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, probe={"projects/p2-project": "granted"},
+                         deny={"projects/p2-project": ["resourcemanager.projects.get"]})
+        self._assert_rc(proc, 1)
+        self.assertIn("cannot bind the agent's roles in projects/p2-project (resourcemanager.projects.get)", proc.stdout)
+        self.assertNotIn("setIamPolicy, ", proc.stdout.split("cannot bind")[1][:80])
+
+    def test_an_exactly_excluded_project_is_asked_about_its_binding_and_not_its_sink(self):
+        # An exact exclude.projects entry drops the project from the drift export, so the apply
+        # makes no sink there and a missing sink permission must not refuse; the binding is made
+        # regardless, so it is still asked.
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "SCOPE_EXCLUDE_PROJECTS": "p2-project", "ENABLE_DRIFT_DETECTOR": "true"},
+                         probe={"projects/p2-project": "granted"}, deny={"projects/p2-project": ["logging.sinks.create"]})
+        self._assert_rc(proc, 0)
+        self.assertNotIn("PROBED:logging.sinks.create", proc.stderr)
+        self.assertIn("PROBED:resourcemanager.projects.setIamPolicy\n", proc.stderr)
+
+    def test_a_glob_exclude_does_not_withhold_the_sink_probe(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "SCOPE_EXCLUDE_PROJECTS": "p2-*", "ENABLE_DRIFT_DETECTOR": "true"},
+                         probe={"projects/p2-project": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertIn("PROBED:logging.sinks.create\n", proc.stderr)
+
+    def test_only_the_host_project_listed_is_silent_with_no_token(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "test-project"}, token=False, curl_present=False)
+        self._assert_rc(proc, 0)
+        self.assertEqual("rc=0\n", proc.stdout)
+
+    def test_a_denied_project_probe_is_an_answer_under_the_front_doors_strict_shell(self):
+        # The bare warn-mode call upgrade.sh --plan makes under set -eE and an ERR
+        # trap: a denied probe is an answer, not an error, so the loop's `||`
+        # lists must hold for the project path as they do for a folder's.
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "ENABLE_DRIFT_DETECTOR": "true"}, mode="warn",
+                         probe={"projects/p2-project": "denied"}, strict=True)
+        self._assert_rc(proc, 0)
+        self.assertNotIn("TRAP-FIRED", proc.stdout + proc.stderr)
+        self.assertIn("would be refused: the Application Default Credentials (the identity Terraform applies with) cannot bind the agent's roles in projects/p2-project", proc.stdout)
+        self.assertIn("cannot create the drift audit-log sink in projects/p2-project", proc.stdout)
+
+    def test_the_drift_detectors_default_is_read_when_the_key_is_absent(self):
+        # install.defaults.env says true, so an install.env that never wrote the key is asked the sink permission.
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, env_extra={"ENABLE_DRIFT_DETECTOR": ""},
+                         probe={"projects/p2-project": "granted"})
+        self._assert_rc(proc, 0)
+        self.assertIn("PROBED:logging.sinks.create\n", proc.stderr)
+
+    def test_a_project_and_a_container_are_both_named_before_the_refusal(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project", "SCOPE_FOLDERS": "111111111111"},
+                         probe={"projects/p2-project": "missing", "folders/111111111111": "denied"})
+        self._assert_rc(proc, 1)
+        self.assertIn("projects/p2-project", proc.stdout)
+        self.assertIn("folders/111111111111", proc.stdout)
+        self.assertEqual(proc.stdout.count("Refusing to apply"), 2, proc.stdout)
+
+    def test_a_project_probe_that_cannot_decide_warns_and_passes(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, probe={"projects/p2-project": "down"})
+        self._assert_rc(proc, 0)
+        self.assertIn("could not decide whether", proc.stdout)
+        self.assertIn("resourcemanager.projects.setIamPolicy, resourcemanager.projects.getIamPolicy, resourcemanager.projects.get on projects/p2-project", proc.stdout)
+
+    def test_warn_mode_names_an_unbindable_project_and_passes(self):
+        proc = self._run(keys={"SCOPE_PROJECTS": "p2-project"}, mode="warn", probe={"projects/p2-project": "denied"})
+        self._assert_rc(proc, 0)
+        self.assertIn("An applying run would be refused:", proc.stdout)
+        self.assertIn("projects/p2-project", proc.stdout)
 
     def test_a_bindable_folder_with_the_api_enabled_passes_silently(self):
         proc = self._run(keys={"SCOPE_FOLDERS": "123456789012"}, probe={"folders/123456789012": "granted"})
@@ -4507,7 +4654,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         # and says the file is missing, without printing the value.
         proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_CREDENTIALS": "/nonexistent/key.json"})
         self._assert_rc(proc, 0)
-        self.assertIn("WARN: The scope container preflight could not decide whether the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_CREDENTIALS is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
+        self.assertIn("WARN: The scope container preflight could not decide whether the credentials in GOOGLE_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers and projects (GOOGLE_CREDENTIALS is neither a file that exists nor key JSON gcloud accepts; check the path, or that the value is the key's JSON itself (not base64))", proc.stdout)
         self.assertNotIn("/nonexistent/key.json", proc.stdout)
         self.assertNotIn("application-default login", proc.stdout)
         # A key that gcloud refuses: the remedy names the key, not ADC, and
@@ -4525,7 +4672,7 @@ class ScopeContainerPreflightTest(unittest.TestCase):
         proc = self._run(keys=base, probe=denied, token=False)
         self.assertIn("run: gcloud auth application-default login", proc.stdout)
         proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": "/nonexistent/adc.json"})
-        self.assertIn("whether the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers (GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way)", proc.stdout)
+        self.assertIn("whether the Application Default Credentials in GOOGLE_APPLICATION_CREDENTIALS (the identity Terraform applies with) can set IAM policy on the declared containers and projects (GOOGLE_APPLICATION_CREDENTIALS names a file that does not exist; the apply would fail the same way)", proc.stdout)
         self.assertNotIn("application-default login", proc.stdout)
         proc = self._run(keys=base, probe=denied, token=False, env_extra={"GOOGLE_APPLICATION_CREDENTIALS": key.name})
         self.assertIn("(the key file GOOGLE_APPLICATION_CREDENTIALS names could not mint a token; check it is a valid service-account key, or unset the variable to use the login credentials)", proc.stdout)

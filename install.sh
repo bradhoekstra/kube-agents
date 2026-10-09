@@ -3616,10 +3616,12 @@ print_generate_only_handoff() {
   echo -e "  # SCOPE_ORGANIZATIONS, SCOPE_SHARED_VPC_HOSTS, SCOPE_METRICS_SCOPES, SCOPE_MAX_PROJECTS and the two exclusions)"
   echo -e "  # is replaced by this apply, and the reconcile"
   echo -e "  # retires what it drops; read spec.scope off the PlatformAgent and record it first."
-  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}" == *[![:space:],]* ]]; then
+  if [[ "${SCOPE_FOLDERS:-}${SCOPE_ORGANIZATIONS:-}${SCOPE_PROJECTS:-}" == *[![:space:],]* ]]; then
     echo -e "  # The scope container preflight above does not refuse on this route: this apply binds the"
-    echo -e "  # declared folder or organisation with whatever credentials run it, which need setIamPolicy"
-    echo -e "  # on the container, and a warning above, if any, says what this identity could not."
+    echo -e "  # declared folder, organisation or project with whatever credentials run it, which need"
+    echo -e "  # setIamPolicy on the container, or roles/resourcemanager.projectIamAdmin and, with the drift"
+    echo -e "  # detector on, logging.sinks.create in the project, and a warning above, if any, says what"
+    echo -e "  # this identity could not."
   fi
   echo ""
   echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
@@ -6763,9 +6765,12 @@ main() {
   announce_platform_agent_mode_for_apply "${NAMESPACE:-$DEFAULT_NAMESPACE}" "$platform_agent_mode" "$mode_notice_route"
   # A declared folder or organisation is bound by the apply with this
   # identity, in the container itself, and turns on the Asset API in the host
-  # project; both are checked before anything is applied, first install
-  # included, so a container this identity cannot bind or an organisation
-  # policy that forbids the API stops the run rather than failing it partway.
+  # project, and binds the agent's roles in each explicit project (and, with
+  # the drift detector on, creates its drift audit-log sink); all are checked
+  # before anything is applied, first install included, so a container or
+  # project this identity cannot bind, a project it cannot write the sink in,
+  # or an organisation policy that forbids the API stops the run rather than
+  # failing it partway.
   # The mode follows the route: a run that will apply is refused, a run that
   # hands the apply to lifecycle.sh only warns, because that apply often runs
   # later as a CI or platform identity and the credentials probed here are the

@@ -21,7 +21,10 @@ with the management project appended, that exports the project's GKE admin-activ
 audit records into the management project's drift topic, so a change made by hand
 on a cluster there is reported like one on the management cluster; besides setting IAM
 policy there, the identity running the apply needs to read the project, mint its Logging
-service agent and create a sink (`roles/owner` carries all of them).
+service agent and create a sink (`roles/owner` carries all of them). A run of `install.sh` or
+`upgrade.sh` that will apply checks the binding permissions, and the sink-creation permission where a sink will be
+created, in each listed project first and refuses, naming the project, when one is missing (a plan or a generate-only
+run warns instead); the service agent's mint is not checked.
 `SCOPE_FOLDERS` and `SCOPE_ORGANIZATIONS` bind the roles on a folder or
 organisation, whose bindings every project beneath it inherits; its members get
 no drift sink: their clusters are discovered at runtime and their changes are

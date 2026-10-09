@@ -345,9 +345,9 @@ as `check_scope_container_access` probes a container's binding: the binding's fa
 after the Asset API is enabled and some containers are bound, while a failed read lands in the plan
 with nothing changed, `upgrade.sh --plan` included. The pool's listing of a container's members is
 the exception that check probes too, while the pool is armed, because `install.sh` enables the
-Asset API before that plan and a listing refused there would leave it enabled. The bindings themselves are the explicit
-projects' case: a resolved project the applying identity cannot set IAM policy in fails inside the
-apply, as a `SCOPE_PROJECTS` entry does, and no preflight probes either. What the selectors do not have is a container's
+Asset API before that plan and a listing refused there would leave it enabled. The bindings themselves are probed for a
+`SCOPE_PROJECTS` entry, which the shell can name, and not for a resolved project, which only the plan
+knows: a resolved project the applying identity cannot set IAM policy in fails inside the apply. What the selectors do not have is a container's
 zero-touch onboarding: a service project attached, or a project added to the scope, after the last
 full upgrade reads `denied` in the reconcile's snapshot until the next one binds it. An exclude
 entry that names a Shared VPC service project by ID, or a monitored project by its project number,
@@ -462,9 +462,9 @@ and would go ahead over a scope nobody read (`refuse_apply_over_undeclared_scope
 and the menu apply the chart's CRDs before their apply, as `upgrade.sh` does, so the block lands on
 every front door rather than being pruned by a served schema that predates the field.
 
-When a folder or organisation is declared, a second check runs before every apply, first install
-included (`check_scope_container_access`): that `cloudasset.googleapis.com` is enabled in the
-host project or no enforced organisation policy (`constraints/gcp.restrictServiceUsage`, the
+When a folder, organisation or explicit project is declared, a second check runs before every apply,
+first install included (`check_scope_container_access`): when a folder or organisation is declared, that
+`cloudasset.googleapis.com` is enabled in the host project or no enforced organisation policy (`constraints/gcp.restrictServiceUsage`, the
 legacy `constraints/serviceuser.services`; a policy in dry run enforces nothing and is not read)
 denies it, read through gcloud's active account, and that the identity Terraform applies with
 holds `resourcemanager.folders.setIamPolicy` on each folder and
@@ -472,7 +472,15 @@ holds `resourcemanager.folders.setIamPolicy` on each folder and
 account pool is armed (`SCOPED_SA_POOL_ENABLED` true beside a container),
 `cloudasset.assets.searchAllResources` on each of them too, since the plan then lists the
 container's members for the pool and refuses without it, after the Asset API has been enabled
-(the remedy named is `roles/cloudasset.viewer` on that container), each asked through Resource
+(the remedy named is `roles/cloudasset.viewer` on that container), and, for each `SCOPE_PROJECTS` entry
+other than the host project, `resourcemanager.projects.setIamPolicy`, `.getIamPolicy` and `.get`, asked
+together in every case since `roles/resourcemanager.projectIamAdmin`, the remedy named, carries them (the
+binding's read-modify-write, and the drift module's number read), and, while `ENABLE_DRIFT_DETECTOR` is on
+and no exact `SCOPE_EXCLUDE_PROJECTS` entry drops the project from the export, `logging.sinks.create` for the
+drift audit-log sink the apply creates there (`roles/logging.configWriter`), one request per project (the
+Service Usage call that mints the project's Logging service agent has no documented permission and is not
+asked; the ingress counts as on for `ENABLE_DRIFT_DETECTOR` or a hand-written `TF_VAR_enable_drift_pubsub`
+line), each asked through Resource
 Manager's `testIamPermissions` with a token minted for the credentials the google provider will
 read, in its order: `GOOGLE_OAUTH_ACCESS_TOKEN`, else `GOOGLE_CREDENTIALS`,
 `GOOGLE_CLOUD_KEYFILE_JSON` or `GCLOUD_KEYFILE_JSON` (an existing path is a key file, anything
@@ -482,7 +490,7 @@ when it is set. The messages name that identity, so a refusal points at the
 principal that will apply rather than at whatever ADC the workstation holds, and a credential
 variable's value is never printed. The token reaches `curl` on its stdin and an inline key
 reaches `gcloud` through a file that exists only for the mint and is removed on any exit of it,
-a signal included. Every container is probed and every failure named before the run
+a signal included. Every container and explicit project is probed and every failure named before the run
 refuses; a probe that cannot decide (no `curl`, no token, a transport error) warns and lets the
 apply report it, because an apply that cannot bind fails loudly, unlike the silent replace the
 first check guards against. `upgrade.sh --plan`, `install.sh --generate-only` and the interactive

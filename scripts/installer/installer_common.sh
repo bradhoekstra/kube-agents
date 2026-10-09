@@ -197,16 +197,39 @@ readonly SCOPE_CLUSTER_TRIPLE_PATTERN='^[^/]+/[^/]+/[^/]+$'
 # Manager ID, the pattern the CRD accepts for the same fields.
 readonly SCOPE_CONTAINER_ID_PATTERN='^[0-9]{1,20}$'
 # What check_scope_container_access verifies before an apply that binds a
-# container: the API the reconcile's container search calls, the permission
-# the applying identity needs on each container kind, the permission and the
-# role the same identity needs on every container while the pool lists its
-# members at plan time, the constraints an organisation policy forbids an API
-# through, and where the permission probe is asked.
+# container or an explicit project: the API the reconcile's container search
+# calls, the permission the applying identity needs on each container kind,
+# the permission and the role the same identity needs on every container
+# while the pool lists its members at plan time, the permissions it needs in
+# each explicit project (to bind the agent's read roles, and, with the drift
+# detector on, to create the project's drift audit-log sink there), the
+# constraints an organisation policy forbids an API through, and where the
+# permission probe is asked. A selector's members are resolved by the plan,
+# which the shell cannot see, so they are not probed here (design §6).
 readonly SCOPE_ASSET_API="cloudasset.googleapis.com"
 readonly SCOPE_FOLDER_SET_IAM_PERMISSION="resourcemanager.folders.setIamPolicy"
 readonly SCOPE_ORGANIZATION_SET_IAM_PERMISSION="resourcemanager.organizations.setIamPolicy"
 readonly SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION="cloudasset.assets.searchAllResources"
 readonly SCOPE_CONTAINER_ASSET_SEARCH_ROLE="roles/cloudasset.viewer"
+# Binding the agent's roles in a project is a read-modify-write of its IAM
+# policy, and the drift module reads the project's number; all three are in
+# roles/resourcemanager.projectIamAdmin and all three are asked whether or not
+# the detector is on, since the role carries them together. The drift
+# audit-log sink the module creates there needs logging.sinks.create, asked
+# while the ingress is on (ENABLE_DRIFT_DETECTOR, or a TF_VAR_enable_drift_pubsub
+# line install.env may carry on its own, which the composition honours) and
+# the entry is not excluded exactly (an exact exclude.projects entry drops it
+# from the export, scope.tf). The Service Usage call that mints the project's
+# Logging service agent has no documented permission to probe; roles/owner
+# holds it, and the apply names it when it fails. A SCOPE_PROJECTS entry is checked against the
+# project-ID form the composition requires before it is spliced into a
+# request, since "projects/<id>" or a number would otherwise read as a project
+# the identity cannot see.
+readonly SCOPE_PROJECT_ID_PATTERN='^[a-z][a-z0-9-]{4,28}[a-z0-9]$'
+readonly SCOPE_PROJECT_BIND_PERMISSIONS="resourcemanager.projects.setIamPolicy resourcemanager.projects.getIamPolicy resourcemanager.projects.get"
+readonly SCOPE_PROJECT_BIND_ROLE="roles/resourcemanager.projectIamAdmin"
+readonly SCOPE_PROJECT_DRIFT_SINK_PERMISSION="logging.sinks.create"
+readonly SCOPE_PROJECT_DRIFT_SINK_ROLE="roles/logging.configWriter"
 readonly SCOPE_SERVICE_USAGE_CONSTRAINTS="gcp.restrictServiceUsage serviceuser.services"
 readonly RESOURCE_MANAGER_API_URL="https://cloudresourcemanager.googleapis.com/v3"
 readonly SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS=20
@@ -1670,25 +1693,50 @@ print("SCOPED_SA_POOL_ENABLED=" + json.dumps("true" if live["scopedPoolEnabled"]
 # meaning it is enabled already or no effective organisation policy forbids
 # it, (2) this identity can set IAM policy on every container named, so
 # the apply does not stop partway with the API enabled and some containers
-# bound, and (3) while the scoped service account pool is armed
+# bound, (3) while the scoped service account pool is armed
 # (scope_pool_lists_containers), this identity can search every container's
 # members through that API, which the plan does for the pool after
-# enable_scope_selector_apis has enabled it and refuses without. Every
-# container is probed and every failure named before the run
-# stops (docs/designs/multi-project-scope.md §6); a probe that cannot decide
-# (no curl, no token, a transport error) warns and lets the apply speak,
-# because an apply that fails to bind fails loudly, unlike the scope replace
+# enable_scope_selector_apis has enabled it and refuses without, and (4) in
+# each explicit SCOPE_PROJECTS entry other than the host, this identity can bind the agent's read
+# roles (SCOPE_PROJECT_BIND_PERMISSIONS) and, with the drift ingress on,
+# create the drift audit-log sink the drift-pubsub module puts there
+# (SCOPE_PROJECT_DRIFT_SINK_PERMISSION), since a project it cannot bind or
+# write a sink in stops a full apply partway, with the host's resources and
+# the other projects' bindings made and the chart release held back. Every container and project is probed
+# and every failure named before the run stops
+# (docs/designs/multi-project-scope.md §6); a probe that cannot decide (no
+# curl, no token, a transport error) warns and lets the apply speak, because
+# an apply that fails to bind fails loudly, unlike the scope replace
 # refuse_apply_over_undeclared_scope guards against. An install that declares
-# no container returns silently and never touches the Asset API. $1 "warn"
+# no container and no project beyond the host returns silently; one that
+# declares no container never touches the Asset API. $1 "warn"
 # turns the refusal into a warning: upgrade.sh --plan applies nothing, and
 # install.sh --generate-only hands the apply to an identity that may not be
 # the one at the keyboard.
 # Caller defines print_error / print_info / print_warning.
 check_scope_container_access() {
   local mode="${1:-$SCOPE_CHECK_MODE_REFUSE}"
-  local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}"
-  [[ "${folders}${organizations}" == *[![:space:],]* ]] || return 0
+  local folders="${SCOPE_FOLDERS:-}" organizations="${SCOPE_ORGANIZATIONS:-}" projects="${SCOPE_PROJECTS:-}" excludes="${SCOPE_EXCLUDE_PROJECTS:-}"
   local project="${PROJECT_ID:-}" entry token="" constraint failures=() undecided=() rc had_noglob=false identity properties reason pool_lists=false
+  local containers_declared=false drift_on=false permissions permission bind_missing sink_missing probed_projects=() excluded excluded_entry
+  [[ "${folders}${organizations}" != *[![:space:],]* ]] || containers_declared=true
+  # The projects to ask about: every SCOPE_PROJECTS entry but the host, which
+  # carries the agent's own roles and is never bound through the scope
+  # (kube-agents-iam drops it), so nothing is asked of it.
+  local IFS=$', \t\n'
+  case "$-" in *f*) had_noglob=true ;; esac
+  set -f
+  for entry in $projects; do
+    [ -n "$entry" ] && [ "$entry" != "$project" ] && probed_projects+=("$entry")
+  done
+  $had_noglob || set +f
+  unset IFS
+  $containers_declared || [ "${#probed_projects[@]}" -gt 0 ] || return 0
+  # The ingress, not the detector alone: the composition creates the sinks
+  # whenever enable_drift_pubsub is true, which install.env can carry as a
+  # TF_VAR_enable_drift_pubsub line of its own (install.sh keeps that line),
+  # so either spelling means a sink will be created in each listed project.
+  if is_truthy "${ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}" || is_truthy "${TF_VAR_enable_drift_pubsub:-}"; then drift_on=true; fi
   identity="$(_scope_terraform_identity_label)"
   ! scope_pool_lists_containers || pool_lists=true
   if [[ "$organizations" == *[![:space:],]* ]]; then
@@ -1698,7 +1746,7 @@ check_scope_container_access() {
   # `set -eE` with an ERR trap, and a probe answering "denied" is an answer,
   # not an error, on the bare call upgrade.sh --plan makes as well as on the
   # `|| exit 1` call the applying modes make.
-  if ! _scope_asset_api_enabled "$project"; then
+  if $containers_declared && ! _scope_asset_api_enabled "$project"; then
     rc=0
     constraint="$(_scope_policy_denying_asset_api "$project")" || rc=$?
     if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
@@ -1708,11 +1756,11 @@ check_scope_container_access() {
     fi
   fi
   if ! command -v curl >/dev/null 2>&1; then
-    undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
+    undecided+=("whether ${identity} can set IAM policy on the declared containers and projects (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
-    undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
+    undecided+=("whether ${identity} can set IAM policy on the declared containers and projects (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
   elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
-    undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
+    undecided+=("whether ${identity} can set IAM policy on the declared containers and projects ($(_scope_terraform_token_remedy))")
   else
     local IFS=$', \t\n'
     case "$-" in *f*) had_noglob=true ;; esac
@@ -1720,7 +1768,7 @@ check_scope_container_access() {
     for entry in $folders; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(_scope_identity_holds_permission "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -1730,7 +1778,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(_scope_identity_holds_permission "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -1740,7 +1788,7 @@ check_scope_container_access() {
     for entry in $organizations; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(_scope_identity_holds_permission "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -1750,11 +1798,46 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(_scope_identity_holds_permission "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
         undecided+=("whether ${identity} can list the members of organizations/${entry}${reason:+ ($reason)}")
+      fi
+    done
+    for entry in ${probed_projects[@]+"${probed_projects[@]}"}; do
+      if ! [[ "$entry" =~ $SCOPE_PROJECT_ID_PATTERN ]]; then
+        failures+=("'${entry}' in SCOPE_PROJECTS is not a GCP project ID (${SCOPE_PROJECT_ID_PATTERN}); write the bare ID, as the composition's scope requires, not projects/<id> or a project number.")
+        continue
+      fi
+      # One request per project: testIamPermissions takes a list and answers
+      # with the subset held. The sink's permission rides along while the
+      # detector is on and the entry is not excluded exactly, since an exact
+      # exclude.projects entry drops the project from the drift export and the
+      # apply makes no sink there (its binding is made regardless).
+      permissions="$SCOPE_PROJECT_BIND_PERMISSIONS"
+      excluded=false
+      for excluded_entry in $excludes; do [ "$excluded_entry" != "$entry" ] || excluded=true; done
+      if $drift_on && ! $excluded; then permissions+=" $SCOPE_PROJECT_DRIFT_SINK_PERMISSION"; fi
+      rc=0
+      reason="$(_scope_identity_holds_permission "projects/${entry}" "$permissions" "$token")" || rc=$?
+      if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
+        # A denied answer names what is missing; split it between the binding
+        # and the sink, which have different remedies.
+        bind_missing=""; sink_missing=false
+        for permission in $reason; do
+          if [ "$permission" = "$SCOPE_PROJECT_DRIFT_SINK_PERMISSION" ]; then sink_missing=true; else bind_missing+="${bind_missing:+, }${permission}"; fi
+        done
+        # A 403 or 404 names nothing: the project is not visible at all.
+        [ -n "$reason" ] || { bind_missing="${SCOPE_PROJECT_BIND_PERMISSIONS// /, }"; $drift_on && ! $excluded && sink_missing=true; }
+        if [ -n "$bind_missing" ]; then
+          failures+=("${identity} cannot bind the agent's roles in projects/${entry} (${bind_missing}), or the project is not visible to it; the apply would fail there, with the host project's resources and the other projects' bindings made and the chart release held back. Ask for ${SCOPE_PROJECT_BIND_ROLE} on the project for that identity, or drop it from SCOPE_PROJECTS.")
+        fi
+        if $sink_missing; then
+          failures+=("${identity} cannot create the drift audit-log sink in projects/${entry} (${SCOPE_PROJECT_DRIFT_SINK_PERMISSION}); with the drift ingress on, the apply creates one there, routed into this install's drift topic, and would fail at it. Ask for ${SCOPE_PROJECT_DRIFT_SINK_ROLE} on the project for that identity, turn the ingress off (ENABLE_DRIFT_DETECTOR=false, and no TF_VAR_enable_drift_pubsub line), or drop it from SCOPE_PROJECTS.")
+        fi
+      elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
+        undecided+=("whether ${identity} holds ${permissions// /, } on projects/${entry}${reason:+ ($reason)}")
       fi
     done
     $had_noglob || set +f
@@ -1771,7 +1854,7 @@ check_scope_container_access() {
     return 0
   fi
   for entry in "${failures[@]}"; do print_error "Refusing to apply: ${entry}"; done
-  print_info "Nothing was changed. Fix what is named above, or edit SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
+  print_info "Nothing was changed. Fix what is named above, or edit SCOPE_PROJECTS, SCOPE_FOLDERS and SCOPE_ORGANIZATIONS in install.env, and re-run."
   return 1
 }
 
@@ -2099,24 +2182,27 @@ sys.exit(not_denied)
   return "$SCOPE_PROBE_GRANTED"
 }
 
-# Asks Resource Manager whether the token's identity holds one permission on a
-# container, through testIamPermissions, which never mutates and answers for
-# the caller alone. $1 folders/<id> or organizations/<id>; $2 the permission;
-# $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED (a 200 without the
-# permission, a 404, or a 403 that is a permission answer: a container the
+# Asks Resource Manager whether the token's identity holds every permission in
+# a list on a container or a project, through testIamPermissions, which never
+# mutates and answers for the caller alone with the subset held. $1
+# folders/<id>, organizations/<id> or projects/<id>; $2 the permissions,
+# space-separated; $3 the access token. Returns SCOPE_PROBE_GRANTED, _DENIED
+# (a 200 without one of them, printing the ones missing, space-separated; a
+# 404, or a 403 that is a permission answer, printing nothing: a resource the
 # caller cannot see cannot be bound) or _UNDECIDED (transport failure, a 403
 # for the API being off in the quota project or for a token minted without
 # the cloud-platform scope, any other status, an unreadable body), printing
 # for an undecided answer the reason, which the caller's warning carries so
 # the remedy names the cause rather than a grant.
-_scope_container_can_set_iam() {
-  local resource="$1" permission="$2" token="$3" response status body rc=0
+_scope_identity_holds_permission() {
+  local resource="$1" permissions="$2" token="$3" response status body rc=0 requested
+  requested="$(printf '%s' "$permissions" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read().split()))')"
   # The bearer token goes to curl on its stdin (-H @-), never argv, where any
   # local user could read it from the process table for the request's
   # duration, and never a file, which an interrupted run would leave behind.
   if ! response="$(trap - ERR; printf 'Authorization: Bearer %s\n' "$token" | curl -sS --max-time "$SCOPE_PREFLIGHT_HTTP_TIMEOUT_SECONDS" -X POST \
     -H @- -H "Content-Type: application/json" \
-    -d "{\"permissions\":[\"${permission}\"]}" \
+    -d "{\"permissions\":${requested}}" \
     -w $'\n%{http_code}' "${RESOURCE_MANAGER_API_URL}/${resource}:testIamPermissions" 2>/dev/null)"; then
     printf 'the request to Resource Manager did not complete'
     return "$SCOPE_PROBE_UNDECIDED"
@@ -2134,8 +2220,10 @@ try:
     held = (json.load(sys.stdin) or {}).get("permissions") or []
 except Exception:
     sys.exit(undecided)
-sys.exit(granted if sys.argv[1] in held else denied)
-' "$permission" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
+missing = [p for p in sys.argv[1].split() if p not in held]
+print(" ".join(missing), end="")
+sys.exit(denied if missing else granted)
+' "$permissions" "$SCOPE_PROBE_GRANTED" "$SCOPE_PROBE_DENIED" "$SCOPE_PROBE_UNDECIDED" 2>/dev/null) || rc=$?
       [ "$rc" -ne "$SCOPE_PROBE_UNDECIDED" ] || printf 'Resource Manager answered 200 with a body that is not the JSON it documents'
       return "$rc" ;;
     403)

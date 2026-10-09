@@ -1892,8 +1892,9 @@ main() {
   if [ "$PARAM_PLAN" = "true" ]; then
     print_step "4. Planning (read-only)"
     # A plan applies nothing, so the scope check speaks and does not refuse,
-    # and so does the container preflight (a folder this identity cannot bind,
-    # a policy that forbids the Asset API).
+    # and so does the container preflight (a folder or explicit project this
+    # identity cannot bind, a project it cannot write the drift sink in, a
+    # policy that forbids the Asset API).
     refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"
     check_scope_container_access "$SCOPE_CHECK_MODE_WARN"
     # Each mode call is guarded: installer_common.sh is the target tree's,
@@ -2009,10 +2010,12 @@ main() {
       if declare -F announce_platform_agent_mode_for_apply >/dev/null; then
         announce_platform_agent_mode_for_apply "$target_namespace" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"
       fi
-      # And the container preflight: the apply binds a declared folder or
-      # organisation with this identity and enables the Asset API in the host
-      # project, so a container it cannot bind, or a policy that forbids the
-      # API, is refused here rather than failing the apply partway.
+      # And the container preflight: the apply binds a declared folder,
+      # organisation or explicit project with this identity, creates the drift
+      # audit-log sink in each explicit project while the detector is on, and
+      # enables the Asset API in the host project, so a container or project it
+      # cannot bind, a project it cannot write the sink in, or a policy that
+      # forbids the API, is refused here rather than failing the apply partway.
       check_scope_container_access || exit 1
       # install.sh's post-generation minter guard, without its import step:
       # an upgrade never imports the App key, so an install.env that enables the
