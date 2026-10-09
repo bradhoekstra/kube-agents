@@ -430,6 +430,36 @@ class PreflightDecisionTest(unittest.TestCase):
             got = self._requirements(override)
             self.assertEqual(got, base, f"a boundary refusal {override} moved the footprint; it must count defaults")
 
+    def test_agent_api_auth_oversized_limit_does_not_wrap_the_requirement_negative(self) -> None:
+        """A sidecar limit the validator admits (any byte count under 2^63) must not carry
+        the replica-multiplied pod sum or the base add past int64 and wrap the requirement
+        negative, which would pass every quota. The preflight saturates to the int64
+        ceiling instead, which no real quota satisfies."""
+        # Two replicas, 5 exabytes: 5E is under 2^63 but doubles over it at the multiply.
+        two_rep = {"platformAgent": {"deployment": {
+            "availability": {"replicas": 2},
+            "agentAPIAuth": {"resources": {"limits": {"memory": "5E"}}},
+        }}}
+        got = self._requirements(values=two_rep)
+        self.assertGreater(got["limitsMemory"], 0,
+                           "limitsMemory wrapped negative; the replica multiply overflowed int64")
+        # One replica, ~8.9GB below 2^63: the base add alone carries it past int64.
+        one_rep = {"platformAgent": {"deployment": {
+            "agentAPIAuth": {"resources": {"limits": {"memory": "9.22337203e18"}}},
+        }}}
+        got1 = self._requirements(values=one_rep)
+        self.assertGreater(got1["limitsMemory"], 0,
+                           "limitsMemory wrapped negative at one replica; the base add overflowed int64")
+
+        # The proxy override flows through the same workload-loop add (one replica, no
+        # multiply -- the narrower window the reviewer tied to the same clamp).
+        proxy = {"platformAgent": {"deployment": {
+            "credentialProxy": {"resources": {"limits": {"memory": "9.22337203e18"}}},
+        }}}
+        gotp = self._requirements(values=proxy)
+        self.assertGreater(gotp["limitsMemory"], 0,
+                           "limitsMemory wrapped negative for a proxy override; the workload-loop add overflowed int64")
+
     def test_agent_api_auth_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
         # The footprint path reads the override too; with the CR template removed, a bad
         # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck

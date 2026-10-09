@@ -879,6 +879,23 @@ honest — a quota that large cannot constrain this release either way.
 {{- end -}}
 {{- end }}
 
+{{- /* Saturating int64 add and multiply for the quota sums. Sprig's add and mul are
+       plain int64 and wrap. A sidecar or proxy resource limit the validator admits
+       (any byte count under 2^63; bytesExceedInt64 refuses the rest) can still carry
+       the agent-pod sum or the replica multiply past int64, wrapping a `required`
+       figure negative so the quota check passes every quota -- the exact failure the
+       preflight exists to prevent. These compute in float64 and clamp with clampInt64,
+       so an over-large figure makes `required` read as the MaxInt64 ceiling, which no
+       real quota satisfies, rather than negative. float64 loses integer precision above
+       2^53, which only shifts a figure already far larger than any quota, where the
+       ceiling is the intended answer. Take (dict "a" <int64> "b" <int64>). */ -}}
+{{- define "kube-agents.satAdd" -}}
+{{- include "kube-agents.clampInt64" (addf (float64 .a) (float64 .b)) -}}
+{{- end }}
+{{- define "kube-agents.satMul" -}}
+{{- include "kube-agents.clampInt64" (mulf (float64 .a) (float64 .b)) -}}
+{{- end }}
+
 {{- define "kube-agents.parseCpuMillis" -}}
 {{- $raw := include "kube-agents.normalizeQuantity" . -}}
 {{- $numeric := "^[0-9]+(\\.[0-9]+)?([eE][-+]?[0-9]+)?$" -}}
@@ -1677,12 +1694,15 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- if or (eq $xCpuLim 0.0) (eq $xMemLim 0.0) (eq $xEphLim 0.0) -}}{{- $aaRefused = true -}}{{- end -}}
   {{- if or (gt $xCpuReq $xCpuLim) (gt $xMemReq $xMemLim) (gt $xEphReq $xEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
   {{- if not $aaRefused -}}
-  {{- $podReqCpu = add $podReqCpu (sub $mCpuReq $defCpuReq) -}}
-  {{- $podLimCpu = add $podLimCpu (sub $mCpuLim $defCpuLim) -}}
-  {{- $podReqMem = add $podReqMem (sub $mMemReq $defMemReq) -}}
-  {{- $podLimMem = add $podLimMem (sub $mMemLim $defMemLim) -}}
-  {{- $podLimEph = add $podLimEph (sub $mEphLim $defEph) -}}
-  {{- $podReqEph = add $podReqEph (sub $mEphReq $defEph) -}}
+  {{- /* satAdd, not add: an admitted sidecar limit near 2^63 carries the pod sum past
+         int64 and would wrap `required` negative. The sub stays plain -- a merged
+         figure minus its default is always below the merged figure and cannot wrap. */ -}}
+  {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" (sub $mCpuReq $defCpuReq)) | int64 -}}
+  {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" (sub $mCpuLim $defCpuLim)) | int64 -}}
+  {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" (sub $mMemReq $defMemReq)) | int64 -}}
+  {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" (sub $mMemLim $defMemLim)) | int64 -}}
+  {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" (sub $mEphLim $defEph)) | int64 -}}
+  {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" (sub $mEphReq $defEph)) | int64 -}}
   {{- end -}}
 
   {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
@@ -1697,21 +1717,26 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- end -}}
   {{- if $dashEnabled -}}
     {{- $dash := (index $op "agentPod" "dashboard") | default dict -}}
-    {{- $podReqCpu = add $podReqCpu ($dash.cpuMillisRequest | default 0 | int64) -}}
-    {{- $podLimCpu = add $podLimCpu ($dash.cpuMillisLimit | default 0 | int64) -}}
-    {{- $podReqMem = add $podReqMem ($dash.memoryBytesRequest | default 0 | int64) -}}
-    {{- $podLimMem = add $podLimMem ($dash.memoryBytesLimit | default 0 | int64) -}}
-    {{- $podReqEph = add $podReqEph ($dash.ephemeralStorageBytesRequest | default 0 | int64) -}}
-    {{- $podLimEph = add $podLimEph ($dash.ephemeralStorageBytesLimit | default 0 | int64) -}}
+    {{- /* satAdd: the pod sum above may already be the saturated ceiling from a huge
+           sidecar override, which a plain add would wrap. */ -}}
+    {{- $podReqCpu = include "kube-agents.satAdd" (dict "a" $podReqCpu "b" ($dash.cpuMillisRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimCpu = include "kube-agents.satAdd" (dict "a" $podLimCpu "b" ($dash.cpuMillisLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqMem = include "kube-agents.satAdd" (dict "a" $podReqMem "b" ($dash.memoryBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimMem = include "kube-agents.satAdd" (dict "a" $podLimMem "b" ($dash.memoryBytesLimit | default 0 | int64)) | int64 -}}
+    {{- $podReqEph = include "kube-agents.satAdd" (dict "a" $podReqEph "b" ($dash.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+    {{- $podLimEph = include "kube-agents.satAdd" (dict "a" $podLimEph "b" ($dash.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
   {{- end -}}
 
-  {{- $reqPods = add $reqPods (mul ($base.pods | default 1 | int64) $agentReplicas) -}}
-  {{- $reqCpu = add $reqCpu (mul $podReqCpu $agentReplicas) -}}
-  {{- $limCpu = add $limCpu (mul $podLimCpu $agentReplicas) -}}
-  {{- $reqMem = add $reqMem (mul $podReqMem $agentReplicas) -}}
-  {{- $limMem = add $limMem (mul $podLimMem $agentReplicas) -}}
-  {{- $reqEph = add $reqEph (mul $podReqEph $agentReplicas) -}}
-  {{- $limEph = add $limEph (mul $podLimEph $agentReplicas) -}}
+  {{- /* satMul/satAdd: the pod sum times the replica count is where an admitted
+         override most easily passes int64 -- a figure under 2^63 doubles over it at
+         two replicas -- so both the multiply and the accumulation saturate. */ -}}
+  {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($base.pods | default 1 | int64) "b" $agentReplicas))) | int64 -}}
+  {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" $podReqCpu "b" $agentReplicas))) | int64 -}}
+  {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" $podLimCpu "b" $agentReplicas))) | int64 -}}
+  {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" $podReqMem "b" $agentReplicas))) | int64 -}}
+  {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" $podLimMem "b" $agentReplicas))) | int64 -}}
+  {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" $podReqEph "b" $agentReplicas))) | int64 -}}
+  {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" $podLimEph "b" $agentReplicas))) | int64 -}}
   {{- /* Only an HA gateway surges. The operator gives the gateway Deployment a
          RollingUpdate strategy only when availability.replicas is above 1 and renders
          `strategy: Recreate` otherwise (resolveDeploymentReplicasAndStrategy in
@@ -1751,13 +1776,15 @@ The defaults carry no ephemeral-storage request because the operator renders non
       {{- if and (eq $key "credentialProxy") $proxyOverride -}}
         {{- $workload = include "kube-agents.credentialProxyFootprint" (dict "workload" $workload "override" $proxyOverride) | fromJson -}}
       {{- end -}}
-      {{- $reqPods = add $reqPods (include "kube-agents.replicaCount" $workload.pods | int64) -}}
-      {{- $reqCpu = add $reqCpu ($workload.cpuMillisRequest | default 0 | int64) -}}
-      {{- $limCpu = add $limCpu ($workload.cpuMillisLimit | default 0 | int64) -}}
-      {{- $reqMem = add $reqMem ($workload.memoryBytesRequest | default 0 | int64) -}}
-      {{- $limMem = add $limMem ($workload.memoryBytesLimit | default 0 | int64) -}}
-      {{- $reqEph = add $reqEph ($workload.ephemeralStorageBytesRequest | default 0 | int64) -}}
-      {{- $limEph = add $limEph ($workload.ephemeralStorageBytesLimit | default 0 | int64) -}}
+      {{- /* satAdd: a total above may already be the saturated ceiling from a huge
+             agent-pod override, which a plain add here would wrap back negative. */ -}}
+      {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
+      {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
+      {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
+      {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" ($workload.memoryBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" ($workload.memoryBytesLimit | default 0 | int64)) | int64 -}}
+      {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" ($workload.ephemeralStorageBytesRequest | default 0 | int64)) | int64 -}}
+      {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" ($workload.ephemeralStorageBytesLimit | default 0 | int64)) | int64 -}}
     {{- end -}}
   {{- end -}}
 
