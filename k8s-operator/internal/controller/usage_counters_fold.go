@@ -50,7 +50,7 @@ const (
 	// it, so that an older document is migrated where the layout allows
 	// (migrateUsageDocument) and re-seeded rather than read wrong otherwise.
 	// Version 2 keys the pod entries by pod UID and counter, since the broker
-	// pod feeds two counters from one body; version 1 keyed them by pod UID.
+	// pod feeds several counters from one body; version 1 keyed them by pod UID.
 	usageDocumentVersion         = 2
 	usageDocumentVersionPodKeyed = 1
 
@@ -132,9 +132,10 @@ type usageDocument struct {
 	LastMoved *metav1.Time `json:"lastMoved,omitempty"`
 	// Pods is the baseline, keyed by pod UID and counter (usagePodEntryKey).
 	Pods map[string]*usagePodEntry `json:"pods"`
-	// migrated is set by migrateUsageDocument on a document read at an older
-	// layout, so the poll writes it back at the current one even when the fold
-	// changed nothing. Not serialised.
+	// migrated is set by migrateUsageDocument on a document it changed on read,
+	// so the poll writes it back even when the fold changed nothing; rekeyed
+	// says the change was the layout, not only a counter the document predated.
+	// Not serialised.
 	migrated bool
 	// unfolded names the counters migrateUsageDocument added to Totals at zero
 	// on this read: the status carried nothing for them and no pod's sample has
@@ -142,6 +143,7 @@ type usageDocument struct {
 	// sample has been seen, and a pod older than the document adds its whole
 	// sample the way a pod created after FirstRecorded does. Not serialised.
 	unfolded map[string]bool
+	rekeyed  bool
 }
 
 // migrateUsageDocument brings a document an earlier release wrote to the
@@ -182,6 +184,7 @@ func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 		doc.Pods = rekeyed
 		doc.Version = usageDocumentVersion
 		doc.migrated = true
+		doc.rekeyed = true
 	case usageDocumentVersion:
 	default:
 		return

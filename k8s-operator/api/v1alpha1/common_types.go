@@ -2052,12 +2052,15 @@ type AgentUsageStatus struct {
 	// proposal, proposal-list or proposal-view, shows the merged state; it
 	// counts each such proposal once per broker process, only when its author
 	// is the broker's own login and it merged no earlier than the broker
-	// process started, so a restart cannot count a merge twice. Read from the
+	// process started, so a restart cannot count a merge twice, to within the
+	// forge's and the pod's clocks agreeing. Read from the
 	// broker's kubeagents_vcs_proposals_merged_total every five minutes and
 	// kept monotonic the same way as ToolExecutionsTotal. A merge no read of
-	// the broker's ever shows is not counted, so this under-counts rather than
-	// over-counts; it is the forge's word, where RemediationsAppliedTotal is
-	// the install's. Moves LastActiveTime.
+	// the broker's ever shows is not counted, and a credential whose login the
+	// broker cannot name counts nothing (the broker logs that once), so this
+	// under-counts rather than over-counts and stays absent on such an
+	// install; it is the forge's word, where RemediationsAppliedTotal is the
+	// install's. Moves LastActiveTime.
 	// +optional
 	RemediationsMergedTotal int64 `json:"remediationsMergedTotal,omitempty"`
 

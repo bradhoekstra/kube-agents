@@ -35,8 +35,10 @@ called `.gitconfig` are all inert as long as nothing materialises them into a
 working copy beside the token. Objects and refs are data; a checkout is what
 turns them into behaviour.
 
-The routes are stateless. There is no handle, nothing survives a request, and
-two concurrent requests share nothing but the lock the HTTP layer holds.
+The routes are stateless to their callers. There is no handle, no answer depends
+on an earlier request, and two concurrent requests share nothing but the lock the
+HTTP layer holds and the merged-proposal count's own, which guards a metric and
+never an answer.
 
 This file names no forge, and a test enforces that. Everything a forge decides
 is behind `providers`; everything here is true whatever forge the URL named.
@@ -317,9 +319,11 @@ class VcsBroker:
     """The verbs, each one request long.
 
     `scratch_root` is on the broker's own volume. Nothing under it outlives a
-    request, which is what makes these routes stateless: there is no handle to
-    leak, no tree to collide with another caller's, and no cleanup an
-    interrupted client can skip.
+    request, which is what makes these routes stateless to their callers: there
+    is no handle to leak, no tree to collide with another caller's, and no
+    cleanup an interrupted client can skip. The one thing the process keeps
+    across requests is the merged-proposal count's seen set (`_count_merges`),
+    which no answer depends on.
     """
 
     def __init__(
@@ -347,6 +351,11 @@ class VcsBroker:
         self.started_at = time.time() if started_at is None else started_at
         self._merged_seen: set[tuple[str, str, Any]] = set()
         self._merged_lock = threading.Lock()
+        # The credential's login per (forge, repository), asked once per process
+        # and only when a merge could count: the lookup is a forge call. A
+        # lookup that raised is not remembered, so an outage is asked again.
+        self._merged_viewer: dict[tuple[str, str], str] = {}
+        self._merged_nameless_logged = False
         self.scratch_root.mkdir(parents=True, exist_ok=True)
         self._git_runner = git_runner
         self.base_branch = (base_branch or "").strip()
@@ -1486,22 +1495,28 @@ class VcsBroker:
         if self.merge_observer is None:
             return
         try:
-            merged = [
-                p for p in proposals
-                if isinstance(p, dict) and p.get("state") == MERGED_PROPOSAL_STATE
-            ]
-            if not merged:
+            # The free rules first -- merged, not before this process started,
+            # not already counted -- so the identity lookup, a forge call, runs
+            # only when something could count, and never for a history of old
+            # merges a `state=all` listing carries on every read.
+            with self._merged_lock:
+                candidates = [
+                    p for p in proposals
+                    if isinstance(p, dict)
+                    and p.get("state") == MERGED_PROPOSAL_STATE
+                    and (closed := _iso_timestamp(p.get("closed"))) is not None
+                    and closed >= self.started_at
+                    and (bound.forge.name, bound.repo, p.get("number")) not in self._merged_seen
+                ]
+            if not candidates:
                 return
-            viewer = self._viewer(bound)
+            viewer = self._merged_viewer_for(bound)
             if not viewer:
                 return
             count = 0
             with self._merged_lock:
-                for proposal in merged:
+                for proposal in candidates:
                     if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
-                        continue
-                    closed = _iso_timestamp(proposal.get("closed"))
-                    if closed is None or closed < self.started_at:
                         continue
                     key = (bound.forge.name, bound.repo, proposal.get("number"))
                     if key in self._merged_seen:
@@ -1512,6 +1527,33 @@ class VcsBroker:
                 self.merge_observer(count)
         except Exception as exc:  # noqa: BLE001 -- the count never fails the read
             LOGGER.debug("merged-proposal count skipped type=%s", type(exc).__name__)
+
+    def _merged_viewer_for(self, bound: Binding) -> str:
+        """The credential's login for the count, remembered per repository.
+
+        "" is a real answer, a credential that cannot name itself, and is
+        remembered too, with one INFO line per process so that a flat
+        `remediationsMergedTotal` on such an install is explained in the log;
+        a lookup that raises is left to the caller's guard and asked again next
+        time.
+        """
+        key = (bound.forge.name, bound.repo)
+        with self._merged_lock:
+            if key in self._merged_viewer:
+                return self._merged_viewer[key]
+        viewer = self._viewer(bound)
+        with self._merged_lock:
+            self._merged_viewer[key] = viewer
+            announce = not viewer and not self._merged_nameless_logged
+            if announce:
+                self._merged_nameless_logged = True
+        if announce:
+            LOGGER.info(
+                "merged-proposal count is off for %s: the credential cannot name itself, "
+                "so no proposal can be told to be this install's own",
+                bound.forge.name,
+            )
+        return viewer
 
     def proposal_comment(self, payload):
         return self._forge_verb("proposal-comment", payload)
