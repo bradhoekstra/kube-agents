@@ -3860,6 +3860,36 @@ func asNativeSidecar(c corev1.Container) corev1.Container {
 // The only shape there is. The credential runtime always runs in its own pod —
 // see credential_proxy_manifests.go — so this is what the gateway Pod carries
 // on every install.
+// resolveAgentAPIAuthResources merges the CR's spec.deployment.agentAPIAuth
+// override over the operator's defaults, one key at a time, so a CR that sets
+// only limits.memory keeps every other default. A nil override returns the
+// defaults unchanged, which the goldens and the chart's quota preflight carry.
+// ValidateAgentAPIAuthResources reads the same merged result.
+func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceRequirements {
+	resolved := corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
+			corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
+		},
+		Limits: corev1.ResourceList{
+			corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
+			corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
+			corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
+		},
+	}
+	if deployment == nil || deployment.AgentAPIAuth == nil || deployment.AgentAPIAuth.Resources == nil {
+		return resolved
+	}
+	override := deployment.AgentAPIAuth.Resources
+	for name, quantity := range override.Requests {
+		resolved.Requests[name] = quantity.DeepCopy()
+	}
+	for name, quantity := range override.Limits {
+		resolved.Limits[name] = quantity.DeepCopy()
+	}
+	return resolved
+}
+
 func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string) corev1.Container {
 	image := resolveCredentialProxyImage(agent.Spec.Deployment)
 	pullPolicy := corev1.PullAlways
@@ -3975,23 +4005,14 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 			TimeoutSeconds:      3,
 			FailureThreshold:    3,
 		},
-		Resources: corev1.ResourceRequirements{
-			// Memory request covers the watcher's dedup and scale-up memos, which
-			// scale with the number of watched clusters, and the initial list of
-			// each cluster's events, which it holds only until delivered: the
-			// watcher keeps no store of Events (watcher.go, Run).
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(agentAPIAuthCPURequest),
-				corev1.ResourceMemory: resource.MustParse(agentAPIAuthMemoryRequest),
-			},
-			// Why these values are what they are: see the agentAPIAuth* constant
-			// declarations at the top of this file.
-			Limits: corev1.ResourceList{
-				corev1.ResourceCPU:              resource.MustParse(agentAPIAuthCPULimit),
-				corev1.ResourceMemory:           resource.MustParse(agentAPIAuthMemoryLimit),
-				corev1.ResourceEphemeralStorage: resource.MustParse(agentAPIAuthEphemeralStorageLimit),
-			},
-		},
+		// The defaults are the agentAPIAuth* constants at the top of this file;
+		// spec.deployment.agentAPIAuth.resources overrides any key of them
+		// (resolveAgentAPIAuthResources). The memory request covers the watcher's
+		// dedup and scale-up memos and the initial list it holds only until
+		// delivered (watcher.go, Run). The event watcher reads the memory limit
+		// through EVENT_WATCHER_MEMORY_LIMIT_BYTES below and sets GOMEMLIMIT to
+		// half of it, so a raised limit raises the soft limit with no other change.
+		Resources: resolveAgentAPIAuthResources(agent.Spec.Deployment),
 		VolumeMounts: []corev1.VolumeMount{
 			// No policy mount: the executor it configures is not built in this
 			// role, and a policy file here would only be misleading.
