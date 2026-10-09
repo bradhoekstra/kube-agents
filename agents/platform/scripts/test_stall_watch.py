@@ -71,6 +71,10 @@ TIMEOUT = subprocess.TimeoutExpired("gcloud", stall_watch.GET_CREDENTIALS_TIMEOU
 STUB_LOST = "credential proxy: kubeconfig is unreadable: /home/hermes/.kube/stall-watch/c.yaml: [Errno 2] No such file or directory"
 #: What kubectl prints against a recreated cluster whose certificate changed.
 CERT_CHANGED = "Unable to connect to the server: tls: failed to verify certificate: x509: certificate signed by unknown authority"
+#: What kubectl prints, in about 30 s under the proxy's request timeout, against
+#: a cluster whose control plane does not answer: the generic prefix and no
+#: reason that names the kubeconfig.
+DARK = "Unable to connect to the server: dial tcp 10.128.0.2:443: i/o timeout"
 #: What the shim prints when the proxy refused the command at its admission bound.
 PROXY_BUSY = "the credential proxy is at its limit of 8 concurrent commands and this request waited 60s without reaching a free slot; retry shortly"
 #: What `kubectl api-resources -o name` prints for the default kinds on a cluster that serves them all.
@@ -110,8 +114,10 @@ class FakeFleet:
     every project or a {project: stderr} map. A project in `listing_hangs`
     does not answer its listing until its Event is set."""
 
-    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None):
+    def __init__(self, fleet, namespaces_extra=(), listing_stderr="", hidden=(), served=None, sandbox_dies_at=None, api_resources_rc_one=False, namespaces_fail_once=(), listing_fails=(), listing_hangs=None, fetch_fails=()):
         self.api_resources_rc_one = api_resources_rc_one
+        # Names whose `get-credentials` the proxy refuses at its admission bound.
+        self.fetch_fails = set(fetch_fails)
         # Names whose first `kubectl get namespaces` exits 1 with the lost-stub
         # text, or a {name: stderr} map for another refusal text.
         self.namespaces_fail_once = dict(namespaces_fail_once) if isinstance(namespaces_fail_once, dict) else {n: STUB_LOST for n in namespaces_fail_once}
@@ -152,6 +158,8 @@ class FakeFleet:
             _, namespaces = self.fleet[(project, name, location)]
             if isinstance(namespaces, Exception):
                 raise namespaces
+            if name in self.fetch_fails:
+                return completed(argv, "", returncode=1, stderr=PROXY_BUSY)
             return completed(argv)
         _, namespaces = self.fleet[self._cluster_from(kubeconfig)]
         if isinstance(namespaces, Exception):
@@ -1397,6 +1405,37 @@ class Credentials(Base):
         self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
         _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
         self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_dark_clusters_connection_failure_is_not_fetched_again_and_keeps_the_record(self):
+        # kubectl's generic prefix on an unanswered control plane, which the
+        # proxy's request timeout turns into an exit 1: no fetch repairs it,
+        # so no fetch, one wait, and the record stays for when it answers.
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": DARK})
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:1] == ["kubectl"]], [["kubectl", "get", "namespaces"]], "one read, no retry")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_repair_fetch_that_fails_leaves_no_record_so_the_next_tick_fetches_first(self):
+        # The stub is gone and the proxy refuses the repair fetch: the record
+        # for a kubeconfig the read just found unusable does not survive the
+        # tick, so the next tick fetches first rather than failing the same
+        # read on the same stub again.
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once=("a",), fetch_fails=("a",))
+        self.assertEqual(self.credential_fetches(fake), ["a"], "the repair fetch was tried once")
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertNotIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()[stall_watch.CREDENTIALS_KEY])
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:3] == ["kubectl", "get", "namespaces"]], [["kubectl", "get", "namespaces"]], "fetch first, one read, no failed read on the old stub")
         self.assertEqual(fake.scanned(), ["ns"])
 
     def test_a_timeout_on_a_reused_kubeconfig_costs_no_fetch_and_no_second_wait(self):

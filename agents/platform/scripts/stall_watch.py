@@ -244,13 +244,18 @@ CREDENTIALS_REFRESH_SECONDS = 24 * 60 * 60
 #: What a failed first read on a reused kubeconfig says when the kubeconfig
 #: itself is the problem, so one more fetch repairs it: the shim's refusal of
 #: a stub the sandbox lost (`credential_proxy_client.py`, KubeconfigUnreadable,
-#: printed as `credential proxy: kubeconfig ...`), or kubectl's refusal of a
-#: recreated cluster's endpoint or certificate. A timeout, a proxy refusal or
-#: an API error says nothing about the kubeconfig: a fetch would not repair
-#: it, so the watch keeps the record and the cluster waits for the next tick.
+#: printed as `credential proxy: kubeconfig ...`), or the reasons kubectl
+#: gives at a recreated cluster, a refused connection at the old endpoint or
+#: a certificate the old CA did not sign. Not kubectl's generic `Unable to
+#: connect to the server:` prefix, which it puts on every connection failure
+#: (an i/o timeout, no such host, a TLS handshake timeout): that is a dark
+#: cluster, which the proxy's `--request-timeout` turns into an exit 1 in
+#: about 30 s, and a fetch would not repair it. A timeout, a proxy refusal or
+#: an API error says nothing about the kubeconfig either, so for all of these
+#: the watch keeps the record and the cluster waits for the next tick.
 REFETCH_SIGNALS = (
     "credential proxy: kubeconfig",
-    "Unable to connect to the server",
+    "connect: connection refused",
     "x509:",
     "tls:",
 )
@@ -1043,8 +1048,12 @@ def sweep_fleet(
                 # cluster at the proxy that just said it was busy.
                 if fetched or isinstance(exc, sandbox_exec.SandboxUnavailable) or not refetch_repairs(exc):
                     raise
-                kubeconfig = fetch_credentials(project, name, location)
+                # Set before the fetch: a repair fetch that fails has not made
+                # the cluster readable either, so the record it was meant to
+                # replace goes, and the next tick fetches first rather than
+                # failing the same read on the same stub again.
                 fetched = True
+                kubeconfig = fetch_credentials(project, name, location)
                 namespaces = list_namespaces(kubeconfig)
             kinds, dropped = kinds_for(served_kinds(kubeconfig))
         except sandbox_exec.SandboxUnavailable:

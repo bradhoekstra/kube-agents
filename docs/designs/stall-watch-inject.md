@@ -146,10 +146,13 @@ the proxy's own managed kubeconfig: of the per-cluster file only the context nam
 proxy regenerates the rest. So the watch
 fetches a cluster's credentials once, records the time in its ledger (`credentials`), and reuses
 the kubeconfig until the record is a day old or a read says the kubeconfig itself is the problem
-(the shim refused a stub the sandbox lost, or kubectl refused a recreated cluster's endpoint or
-certificate), after which it fetches once more and retries that one call. A read that timed out
-or that the proxy refused says nothing about the kubeconfig: no fetch, and the record stays, so
-one saturated tick does not put the next rotation back on the fetch-everything path. A cluster the
+(the shim refused a stub the sandbox lost, or kubectl met a refused connection or a changed
+certificate at a recreated cluster), after which it fetches once more and retries that one call.
+A read that timed out, that the proxy refused, or that failed with kubectl's generic
+`Unable to connect to the server` at a control plane that does not answer says nothing about the
+kubeconfig: no fetch, and the record stays, so one saturated tick or one dark cluster does not
+put the next rotation back on the fetch-everything path. A repair fetch that fails leaves no
+record, so the next tick fetches first. A cluster the
 tick did not list keeps its record exactly when `verdict` keeps its rows (a failed listing, or an
 identity file unreadable this tick). On the 143-cluster install
 [`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md) §2 measured,
