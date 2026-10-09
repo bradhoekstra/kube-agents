@@ -10,10 +10,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         }
       }
     },
@@ -22,10 +19,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         }
       }
     },
@@ -66,10 +60,7 @@
               "type": "string"
             },
             "tag": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             },
             "pullPolicy": {
               "type": "string"
@@ -81,25 +72,14 @@
           "minimum": 0
         },
         "rollingUpdate": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "maxSurge": {
-              "type": [
-                "integer",
-                "string",
-                "null"
-              ]
+              "type": ["integer", "string", "null"]
             },
             "maxUnavailable": {
-              "type": [
-                "integer",
-                "string",
-                "null"
-              ]
+              "type": ["integer", "string", "null"]
             }
           }
         },
@@ -205,10 +185,7 @@
               "type": "string"
             },
             "tag": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             },
             "pullPolicy": {
               "type": "string"
@@ -220,25 +197,14 @@
           "minimum": 0
         },
         "rollingUpdate": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "maxSurge": {
-              "type": [
-                "integer",
-                "string",
-                "null"
-              ]
+              "type": ["integer", "string", "null"]
             },
             "maxUnavailable": {
-              "type": [
-                "integer",
-                "string",
-                "null"
-              ]
+              "type": ["integer", "string", "null"]
             }
           }
         },
@@ -304,10 +270,7 @@
       "additionalProperties": false,
       "properties": {
         "enabled": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "api": {
           "type": "object",
@@ -321,10 +284,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": [
-                    "string",
-                    "integer"
-                  ]
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -332,25 +292,14 @@
               }
             },
             "rollingUpdate": {
-              "type": [
-                "object",
-                "null"
-              ],
+              "type": ["object", "null"],
               "additionalProperties": false,
               "properties": {
                 "maxSurge": {
-                  "type": [
-                    "integer",
-                    "string",
-                    "null"
-                  ]
+                  "type": ["integer", "string", "null"]
                 },
                 "maxUnavailable": {
-                  "type": [
-                    "integer",
-                    "string",
-                    "null"
-                  ]
+                  "type": ["integer", "string", "null"]
                 }
               }
             },
@@ -371,10 +320,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": [
-                    "string",
-                    "integer"
-                  ]
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -385,10 +331,7 @@
               "type": "object"
             },
             "storage": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             }
           }
         },
@@ -423,10 +366,7 @@
           "type": "string"
         },
         "appId": {
-          "type": [
-            "string",
-            "integer"
-          ]
+          "type": ["string", "integer"]
         },
         "ksaName": {
           "type": "string"
@@ -448,10 +388,7 @@
               "type": "string"
             },
             "keyVersion": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             },
             "location": {
               "type": "string"
@@ -466,10 +403,7 @@
               "type": "string"
             },
             "tag": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             },
             "pullPolicy": {
               "type": "string"
@@ -518,10 +452,7 @@
               "type": "string"
             },
             "tag": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             }
           }
         }
@@ -539,10 +470,7 @@
               "type": "string"
             },
             "tag": {
-              "type": [
-                "string",
-                "integer"
-              ]
+              "type": ["string", "integer"]
             }
           }
         }
@@ -565,10 +493,7 @@
           "type": "object"
         },
         "podMonitoring": {
-          "type": [
-            "boolean",
-            "null"
-          ]
+          "type": ["boolean", "null"]
         },
         "harness": {
           "type": "object",
@@ -588,16 +513,10 @@
               "additionalProperties": false,
               "properties": {
                 "dashboardEnabled": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
+                  "type": ["boolean", "null"]
                 },
                 "pluginsDebug": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
+                  "type": ["boolean", "null"]
                 },
                 "agentHome": {
                   "type": "string"
@@ -609,19 +528,13 @@
               "additionalProperties": false,
               "properties": {
                 "enabled": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
+                  "type": ["boolean", "null"]
                 },
                 "provider": {
                   "type": "string"
                 },
                 "userProfileEnabled": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
+                  "type": ["boolean", "null"]
                 }
               }
             },
@@ -630,10 +543,7 @@
               "additionalProperties": false,
               "properties": {
                 "enabled": {
-                  "type": [
-                    "boolean",
-                    "null"
-                  ]
+                  "type": ["boolean", "null"]
                 },
                 "subscription": {
                   "type": "string"
@@ -652,10 +562,7 @@
                   "additionalProperties": false,
                   "properties": {
                     "enabled": {
-                      "type": [
-                        "boolean",
-                        "null"
-                      ]
+                      "type": ["boolean", "null"]
                     },
                     "image": {
                       "type": "string"
@@ -704,10 +611,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": [
-                    "string",
-                    "integer"
-                  ]
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -719,10 +623,7 @@
               "additionalProperties": false,
               "properties": {
                 "replicas": {
-                  "type": [
-                    "integer",
-                    "null"
-                  ],
+                  "type": ["integer", "null"],
                   "minimum": 0
                 },
                 "runtimeClassName": {
@@ -771,10 +672,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": [
-                    "string",
-                    "integer"
-                  ]
+                  "type": ["string", "integer"]
                 }
               }
             },
@@ -840,10 +738,7 @@
           }
         },
         "scope": {
-          "type": [
-            "object",
-            "null"
-          ],
+          "type": ["object", "null"],
           "additionalProperties": false,
           "properties": {
             "projects": {
@@ -896,11 +791,7 @@
                   "items": {
                     "type": "object",
                     "additionalProperties": false,
-                    "required": [
-                      "projectId",
-                      "location",
-                      "clusterName"
-                    ],
+                    "required": ["projectId", "location", "clusterName"],
                     "properties": {
                       "projectId": {
                         "type": "string"
@@ -945,9 +836,7 @@
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "name"
-                ],
+                "required": ["name"],
                 "properties": {
                   "name": {
                     "type": "string"
@@ -978,11 +867,7 @@
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": [
-                  "forge",
-                  "repository",
-                  "role"
-                ],
+                "required": ["forge", "repository", "role"],
                 "properties": {
                   "forge": {
                     "type": "string"
@@ -995,11 +880,7 @@
                   },
                   "role": {
                     "type": "string",
-                    "enum": [
-                      "gitops",
-                      "managed",
-                      "context"
-                    ]
+                    "enum": ["gitops", "managed", "context"]
                   },
                   "baseBranch": {
                     "type": "string",
@@ -1131,10 +1012,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": [
-                    "string",
-                    "integer"
-                  ]
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"
@@ -1170,10 +1048,7 @@
                   "type": "string"
                 },
                 "tag": {
-                  "type": [
-                    "string",
-                    "integer"
-                  ]
+                  "type": ["string", "integer"]
                 },
                 "pullPolicy": {
                   "type": "string"

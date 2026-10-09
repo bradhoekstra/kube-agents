@@ -351,7 +351,7 @@ func credentialProxyResourcesRefusal(agent *agentv1alpha1.PlatformAgent) (string
 
 // boundCredentialProxyRefusal is errs' first refusal with the count of the
 // rest, cut to credentialProxyRefusalMessageBudget, or "" for none. The cut is
-// a backstop: credentialProxyResourcePath already bounds the one part of a
+// a backstop: boundedResourceFieldPath already bounds the one part of a
 // refusal the author controls the length of.
 func boundCredentialProxyRefusal(errs field.ErrorList) string {
 	if len(errs) == 0 {
