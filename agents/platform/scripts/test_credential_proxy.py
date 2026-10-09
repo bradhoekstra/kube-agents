@@ -3719,6 +3719,53 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertEqual(settled, managed.read_text(), "the caller's settled file was kept")
         self.assertFalse(executor._provisional_marker(target).exists())
 
+    def test_a_callers_undecided_fetch_refreshes_a_settled_file_already_on_disk(self):
+        # An unmarked file is the steady state of every cluster filed settled,
+        # not a race signature. A re-run of the onboarding whose broker-side
+        # decision happens to be undecided must still replace the stale file
+        # (under a mark), or the remedy the tree prescribes does nothing.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        stale = f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n# stale, filed long ago\n"
+        managed.write_text(stale)
+        old = time.time() - 3600
+        os.utime(managed, (old, old))
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertNotEqual(stale, managed.read_text(), "gcloud's fresh kubeconfig replaced the stale one")
+        self.assertTrue(executor._provisional_marker(target).exists(), "and it is marked for re-decision")
+
+    def test_the_splice_decides_under_a_tighter_bound_than_a_kubectl(self):
+        # The describes behind a caller's splice run inside the caller's own
+        # fetch bound (30 s for switch_kube_context), so each is bounded well
+        # under a kubectl's 60 s rather than at it.
+        executor = self.fake_gcloud(self.executor())
+        bounds = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            if "describe" in argv or "--help" in argv:
+                bounds.append(kwargs.get("timeout_seconds"))
+            return original(argv, **kwargs)
+
+        import gke_endpoint
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        with mock.patch.object(executor, "_execute", record):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertTrue(bounds, "the splice ran a probe or a describe")
+        for bound in bounds:
+            self.assertEqual(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, bound)
+        self.assertLess(credential_proxy.SPLICE_DECISION_TIMEOUT_SECONDS, executor.kubectl_timeout_seconds)
+
     def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
         # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
         # A scaffold's fetch must not queue behind it to file a credential it

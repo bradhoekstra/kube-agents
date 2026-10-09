@@ -122,6 +122,12 @@ PROVISIONAL_KUBECONFIG_SUFFIX = ".provisional"
 PROVISIONAL_RETRY_SECONDS = 60
 # How much of gcloud's stderr the refetch-failure log line keeps.
 REFETCH_FAILURE_LOG_CHARS = 200
+# The bound on each gcloud the broker runs to decide a caller's unflagged
+# fetch (help probe, target describe, own-cluster describe). They run inside
+# the caller's own bound on the whole fetch -- 30 s for switch_kube_context --
+# so each is held well under a kubectl's 60 s; a describe that cannot answer
+# in this time leaves the fetch to run as given, marked provisional.
+SPLICE_DECISION_TIMEOUT_SECONDS = 15
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -3017,6 +3023,15 @@ class ExecutionResult:
 # get-credentials`. `ClusterTarget`, `parse_gke_context` and
 # `read_current_context` live with the shim for the same reason: the parsing
 # happens where the file is, which is not here.
+
+
+def _mtime_ns_or_none(path: Path) -> int | None:
+    """The file's mtime in nanoseconds, or None when it is absent or empty."""
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return None
+    return stat.st_mtime_ns if stat.st_size > 0 else None
 
 
 def _flags_of(decision) -> list[str]:
@@ -6334,7 +6349,7 @@ class CommandExecutor:
     def _managed_kubeconfig(self, target: ClusterTarget) -> Path:
         return self.kubeconfig_dir / f"{target.context_name}.yaml"
 
-    def _endpoint_decision(self, gcloud: str, target: ClusterTarget):
+    def _endpoint_decision(self, gcloud: str, target: ClusterTarget, timeout_seconds: int | None = None):
         """Decide which endpoint this cluster's credentials must name.
 
         Returns gke_endpoint's `EndpointDecision` -- its `flags` are
@@ -6366,13 +6381,14 @@ class CommandExecutor:
             self._endpoint_module_missing = True
             return None
 
+        bound = timeout_seconds if timeout_seconds is not None else self.kubectl_timeout_seconds
+
         def run(argv: list[str]) -> tuple[int, str]:
             # The short deadline: this is a control-plane lookup made on the
             # way to a kubectl, not a command the caller chose, and it runs
             # silently under the kubeconfig lock. See _ensure_managed_kubeconfig.
-            result = self._execute(
-                [gcloud, *argv[1:]], timeout_seconds=self.kubectl_timeout_seconds
-            )
+            # A caller's splice passes a tighter bound still.
+            result = self._execute([gcloud, *argv[1:]], timeout_seconds=bound)
             return result.exit_code, result.stdout
 
         return endpoint_decision(target.project, target.cluster, target.location, run=run)
@@ -6406,28 +6422,38 @@ class CommandExecutor:
         except FileNotFoundError:
             return False
 
-    def _file_managed_kubeconfig(self, scratch: Path, target: ClusterTarget, provisional: bool) -> None:
+    def _file_managed_kubeconfig(self, scratch: Path, target: ClusterTarget, provisional: bool,
+                                 seen_mtime_ns: int | None) -> None:
         """Move gcloud's output into place and set the provisional mark.
+
+        `seen_mtime_ns` is the managed file's mtime as the caller saw it before
+        the decision and the fetch ran, or None when there was no file. It is
+        what tells a settled file that landed *during* the fetch (newer than
+        the snapshot, or present where none was) from one that was simply
+        already there: an unmarked file is the steady state of every cluster
+        filed settled, not a race signature, and a provisional result still
+        has to refresh it or a re-run of the onboarding would change nothing.
 
         The mark goes down before the file when the decision was provisional,
         so a crash between the two leaves an unmarked file only when it was
         settled; and it comes off after the file when it was settled. The two
         steps run under `_marker_lock`, so a settled fetch and a provisional
         one cannot interleave them, whether or not the caller also holds
-        `_kubeconfig_lock`. A provisional result never replaces a file that is
-        present and unmarked: that state means a settled answer landed since
-        the decision was made, and it wins.
+        `_kubeconfig_lock`. A provisional result never replaces an unmarked
+        file that is newer than the snapshot: a caller's fetch files outside
+        `_kubeconfig_lock`, so a settled answer can land during a cold or
+        window-expired broker fetch, and it outranks the undecided one.
         """
         marker = self._provisional_marker(target)
         managed = self._managed_kubeconfig(target)
         with self._marker_lock:
             if provisional:
-                if managed.is_file() and managed.stat().st_size > 0 and not marker.exists():
-                    # A settled file landed since this decision was made: a
-                    # caller's fetch files outside `_kubeconfig_lock`, so it
-                    # can beat a cold or window-expired broker fetch to the
-                    # same cluster. A settled answer outranks an undecided one;
-                    # gcloud's output here is dropped.
+                if (managed.is_file() and managed.stat().st_size > 0 and not marker.exists()
+                        and (seen_mtime_ns is None or managed.stat().st_mtime_ns > seen_mtime_ns)):
+                    logging.info(
+                        "a settled kubeconfig for %s landed during an undecided fetch; keeping it",
+                        target.context_name,
+                    )
                     return
                 marker.touch()
                 os.replace(scratch, managed)
@@ -6452,6 +6478,7 @@ class CommandExecutor:
                 not marker.exists() or self._provisional_window_open(marker)
             ):
                 return managed
+            seen_mtime_ns = _mtime_ns_or_none(managed)
             gcloud = self.executables.get("gcloud")
             if not gcloud:
                 raise RuntimeError("gcloud is unavailable; cannot materialise a kubeconfig")
@@ -6504,7 +6531,8 @@ class CommandExecutor:
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
                     )
                 self._file_managed_kubeconfig(
-                    scratch, target, provisional=self._undecided(decision))
+                    scratch, target, provisional=self._undecided(decision),
+                    seen_mtime_ns=seen_mtime_ns)
             finally:
                 scratch.unlink(missing_ok=True)
         return managed
@@ -6532,7 +6560,8 @@ class CommandExecutor:
         target = _get_credentials_target(command)
         if target is None:
             return False, None
-        return True, self._endpoint_decision(command[0], target)
+        return True, self._endpoint_decision(
+            command[0], target, timeout_seconds=SPLICE_DECISION_TIMEOUT_SECONDS)
 
     def _execute_get_credentials(
         self,
@@ -6560,6 +6589,12 @@ class CommandExecutor:
         # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
         # config, moving the `current-context` that every later context-less
         # kubectl resolves against.
+        # What is on disk for the cluster this fetch names, before anything
+        # runs: `_file_managed_kubeconfig` compares against it to tell a
+        # settled file that lands during the fetch from one already there.
+        seen_target = _get_credentials_target(command)
+        seen_mtime_ns = (_mtime_ns_or_none(self._managed_kubeconfig(seen_target))
+                         if seen_target is not None else None)
         attempted, decision = self._decision_for_callers_fetch(command)
         command = [*command, *_flags_of(decision)]
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
@@ -6578,13 +6613,15 @@ class CommandExecutor:
                     # provisional mark cannot interleave with the broker's own
                     # fetch. The same provisional rule as that fetch: a file
                     # written while the broker tried to decide and could not --
-                    # the own-cluster describe failed, or the target's -- is a
-                    # miss after its window; one written on a settled decision,
-                    # or run as given (the caller's own flag, no readable
-                    # target), clears an older mark.
+                    # the own-cluster describe failed, or the target's -- is
+                    # filed under a mark and is a miss after its window, unless
+                    # a settled file landed during the fetch; one written on a
+                    # settled decision, or run as given (the caller's own flag,
+                    # no readable target), clears an older mark.
                     self._file_managed_kubeconfig(
                         scratch, target,
-                        provisional=attempted and self._undecided(decision))
+                        provisional=attempted and self._undecided(decision),
+                        seen_mtime_ns=seen_mtime_ns if seen_target == target else None)
                 if wants_kubeconfig:
                     result = replace(result, kubeconfig=generated)
             return result
