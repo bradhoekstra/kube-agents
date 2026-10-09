@@ -103,8 +103,9 @@ when alerts are raised again. It also carries the sweep-failed and sweep-recover
 every roster entry owes, and the budget lines: "budget exhausted", said once on the
 tick a sweep first stops at its 25-minute budget, carrying the clusters read of the
 ones listed, the namespaces read and the cluster the next tick resumes at, and "the
-fleet is swept in one tick again" once a sweep completes; the ledger's budget entry
-carries the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server
+fleet is swept in one tick again" once a sweep completes with every project listed (a sweep
+that fit because listings failed or were incomplete says nothing about the fit, and posts
+nothing); the ledger's budget entry carries the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so

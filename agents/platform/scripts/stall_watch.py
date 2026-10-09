@@ -1029,6 +1029,7 @@ def sweep_fleet(
         if sweep.out_of_budget(started, cid):
             break
         fetched = False
+        readable = False
         try:
             if credentials_current(records.get(cid), now):
                 kubeconfig = kubeconfig_path(project, name, location)
@@ -1055,21 +1056,27 @@ def sweep_fleet(
                 fetched = True
                 kubeconfig = fetch_credentials(project, name, location)
                 namespaces = list_namespaces(kubeconfig)
+            # The namespace read is what proves the kubeconfig: a fetch whose
+            # kubeconfig just listed namespaces is recorded here, before the
+            # discovery call, whose failure says nothing about the kubeconfig.
+            readable = True
+            if fetched:
+                records[cid] = now
             kinds, dropped = kinds_for(served_kinds(kubeconfig))
         except sandbox_exec.SandboxUnavailable:
             raise
         except READ_FAILURES as exc:
             sweep.unreadable[scope_key(cid)] = failure_text(exc)
             sweep.failed_clusters.add(cid)
-            # A fetch that did not make the cluster readable is no record to
-            # reuse. A reused record whose read failed for a reason no fetch
-            # repairs stays: the next tick reads on it again, and one bad tick
-            # does not put the fleet back on the fetch-everything path.
-            if fetched:
+            # A fetch whose kubeconfig did not list namespaces is no record to
+            # reuse. Every other record stays: a reused one whose read failed
+            # for a reason no fetch repairs, and a fetched one whose read
+            # succeeded and whose discovery then failed. The next tick reads on
+            # it again, and one bad tick does not put the fleet back on the
+            # fetch-everything path.
+            if fetched and not readable:
                 records.pop(cid, None)
             continue
-        if fetched:
-            records[cid] = now
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
         if cursor and cursor.get("cluster") == cid and cursor.get("namespace") in namespaces:
@@ -1746,9 +1753,16 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state[CREDENTIALS_KEY] = sweep.credentials
         if sweep.budget_exhausted and not state.get(BUDGET_EXHAUSTED_KEY):
             lines.append(f"{COVERAGE_EXHAUSTED_PREFIX} {sweep.unreadable[BUDGET_SCOPE]}")
-        elif not sweep.budget_exhausted and state.get(BUDGET_EXHAUSTED_KEY):
-            lines.append(COVERAGE_RECOVERED_LINE)
-        state[BUDGET_EXHAUSTED_KEY] = sweep.budget_exhausted
+            state[BUDGET_EXHAUSTED_KEY] = True
+        elif not sweep.budget_exhausted and not sweep.unlisted_projects:
+            # The fleet fit in one tick, and the whole fleet was listed. A
+            # sweep that finished inside the budget because listings failed or
+            # were incomplete has shown nothing about the fit: it neither
+            # posts the recovery nor clears the flag, as the sweep-failed path
+            # leaves the flag alone when every listing fails.
+            if state.get(BUDGET_EXHAUSTED_KEY):
+                lines.append(COVERAGE_RECOVERED_LINE)
+            state[BUDGET_EXHAUSTED_KEY] = False
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
         lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
     if not dry_run:

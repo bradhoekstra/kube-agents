@@ -162,7 +162,9 @@ that is about 290 gcloud runs fewer per tick (a `describe` through the endpoint 
 A sweep that stops at its wall-clock budget writes what it covered into the ledger's budget entry,
 the clusters read of the ones listed, the namespaces read and the cluster the next tick resumes at,
 and says it in chat once, on the tick the sweep first falls short, and once more when the fleet
-fits in one tick again. On such a fleet a cluster is read across consecutive ticks, so the
+fits in one tick again with every project listed; a sweep that fit only because listings failed
+or were incomplete has not shown that, so it neither posts the recovery nor clears the flag. On
+such a fleet a cluster is read across consecutive ticks, so the
 operator's interval is the ticks a full pass takes rather than the 30-minute schedule; the budget
 entry is where to read it.
 

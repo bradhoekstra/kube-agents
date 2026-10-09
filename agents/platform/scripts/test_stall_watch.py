@@ -1438,6 +1438,30 @@ class Credentials(Base):
         self.assertEqual([argv[:3] for argv, _, _ in fake.calls if argv[:3] == ["kubectl", "get", "namespaces"]], [["kubectl", "get", "namespaces"]], "fetch first, one read, no failed read on the old stub")
         self.assertEqual(fake.scanned(), ["ns"])
 
+    def test_a_fetch_whose_discovery_times_out_keeps_its_record_and_the_next_tick_does_not_fetch(self):
+        # First tick: the fetch succeeded and its kubeconfig listed the
+        # namespaces, then `kubectl api-resources` timed out. The kubeconfig is
+        # proven; the record stays, and the next tick reads on it.
+        fleet = {"a": {"ns": []}}
+        discovery_timeout = subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS)
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:00:00+00:00", served=discovery_timeout)
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
+    def test_a_repair_fetch_whose_discovery_times_out_still_records_the_new_kubeconfig(self):
+        fleet = {"a": {"ns": []}}
+        self.run_tick(fleet, now="2026-10-08T10:00:00+00:00")
+        discovery_timeout = subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS)
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once=("a",), served=discovery_timeout)
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:30:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+
     def test_a_timeout_on_a_reused_kubeconfig_costs_no_fetch_and_no_second_wait(self):
         # A cluster that has gone dark times out once, not twice around a
         # fetch, and keeps its record for when it answers again.
@@ -1530,6 +1554,25 @@ class Coverage(Base):
         self.assertIn("1 could not be read", budget)
         self.assertIn(f"{stall_watch.cluster_label(stall_watch.cluster_id(PROJECT, 'b', LOCATION))} at namespace `ns`", budget)
         self.assertNotIn("stopped", budget)
+
+    def test_a_tick_that_fits_only_because_a_listing_failed_posts_no_recovery_and_keeps_the_flag(self):
+        # Tick N exhausted; tick N+1 fits the budget, but one project's
+        # listing failed, so the fleet was not shown to fit: no recovery line,
+        # the flag stays, and the exhausted line is not repeated on tick N+2.
+        # Recovery posts on the first full sweep after that.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        partial, _ = self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(partial, [], "a tick with a failed listing says nothing about the fit")
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        again, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(again, [], "still exhausted: the line is not repeated")
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
 
     def test_the_coverage_line_posts_on_entering_exhaustion_not_every_tick_and_a_full_sweep_recovers(self):
         fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}}
