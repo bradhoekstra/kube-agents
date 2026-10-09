@@ -98,6 +98,10 @@ readonly KUBECTL_CAP_SECONDS=$((BROKER_ADMISSION_WAIT_SECONDS + BROKER_KUBECTL_R
 # `timeout 0` runs the command uncapped. What `timeout` exits with when it fires.
 readonly KUBECTL_CAP_FLOOR_SECONDS=1
 readonly RC_TIMED_OUT=124
+# What kubectl prints when it never reached the API server; check 5 offers the
+# scaffold's endpoint remedy only for these (cluster_agent_profile.py keeps the
+# same list as CONNECTIVITY_FAILURE_RE).
+readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|Unable to connect to the server|TLS handshake timeout|dial tcp'
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
@@ -425,8 +429,13 @@ if [ "$STATUS" = "ok" ]; then
         ENDPOINT_KIND="$(user_md_field endpoint)"
         if [ -n "$ENDPOINT_KIND" ]; then
             REASON_5="$REASON_5 The kubeconfig names the cluster's $ENDPOINT_KIND endpoint ($(user_md_text endpoint-address)); authorized networks: $(user_md_text authorized-networks)."
+            # The remedy is about reaching the server, so it is offered only
+            # when kubectl never did (a timeout, no route, a refused dial), not
+            # for an answer it got and disliked (401, 403, NotFound).
             ENDPOINT_REMEDY="$(user_md_text endpoint-remedy)"
-            [ -n "$ENDPOINT_REMEDY" ] && REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
+            if [ -n "$ENDPOINT_REMEDY" ] && { [ "$rc" -eq "$RC_TIMED_OUT" ] || printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE"; }; then
+                REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
+            fi
         fi
         fail "5" "$REASON_5" "$REMEDIATION_5" "kubectl cluster-info: $ERR_ONE"
     fi

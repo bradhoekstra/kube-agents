@@ -120,6 +120,10 @@ FAKE_KUBECTL = textwrap.dedent(
             ;;
         "cluster-info"*)
             [ -n "${FAKE_CLUSTER_INFO_TIMES_OUT:-}" ] && exit 124
+            if [ -n "${FAKE_FORBIDDEN:-}" ]; then
+                echo 'Error from server (Forbidden): forbidden: User "sa@x.iam.gserviceaccount.com" cannot get path "/"' >&2
+                exit 1
+            fi
             if [ -n "${FAKE_UNREACHABLE:-}" ]; then
                 echo "Unable to connect to the server: dial tcp: i/o timeout" >&2
                 exit 1
@@ -366,6 +370,14 @@ class ClusterPreflightTest(unittest.TestCase):
         result = self.run_preflight(FAKE_UNREACHABLE="1")
         self.assertIn("dns endpoint (gke-x.gke.goog)", result["reason"])
         self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
+
+    def test_check_5_refused_by_rbac_names_the_endpoint_but_not_the_remedy(self):
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_FORBIDDEN="1")
+        self.assertEqual("5", result["check"])
+        self.assertIn("internal-ip endpoint (10.10.0.2)", result["reason"])
+        self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
+        self.assertIn("Forbidden", result["evidence"])
 
     def test_check_5_without_endpoint_bullets_is_unchanged(self):
         result = self.run_preflight(FAKE_UNREACHABLE="1")

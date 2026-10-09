@@ -462,6 +462,18 @@ class CreateProfileTest(unittest.TestCase):
         self.assertIn("dial tcp 10.10.0.2:443: i/o timeout", self.stderr)
         self.assertNotIn("Client Version", self.stderr)
 
+    def test_a_probe_refused_by_rbac_names_the_endpoint_but_not_the_remedy(self):
+        # A 403 is an IAM answer from a reachable control plane; sending the
+        # operator to authorized networks for it would be wrong.
+        self.decision = a_decision()
+        self.probe_exit = 1
+        self.probe_stderr = ('Error from server (Forbidden): forbidden: User "sa@x.iam.gserviceaccount.com" '
+                             'cannot get path "/version"\n')
+        self.create()
+        self.assertIn("internal-ip endpoint (10.10.0.2)", self.stderr)
+        self.assertIn("Forbidden", self.stderr)
+        self.assertNotIn(gke_endpoint.REMEDY_INTERNAL_IP, self.stderr)
+
     def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
         self.decision = a_decision()
         self.create()

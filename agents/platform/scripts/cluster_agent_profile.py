@@ -85,6 +85,15 @@ USER_MD_NAME = "USER.md"
 # covers the sandbox hop and the broker's admission wait in front of it.
 CONNECTIVITY_PROBE_REQUEST_TIMEOUT = "5s"
 CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
+# What kubectl prints when it never reached the API server, as opposed to an
+# answer it did not like (401, 403, NotFound). The endpoint remedy is about
+# reaching the server, so it is offered only for the first kind.
+CONNECTIVITY_FAILURE_RE = re.compile(
+    r"i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|"
+    r"connection refused|network is unreachable|Unable to connect to the server|"
+    r"TLS handshake timeout|dial tcp",
+    re.IGNORECASE,
+)
 
 
 def log(msg: str) -> None:
@@ -380,7 +389,8 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
     if decision is None:
         log(f"{name}: cannot reach the cluster API server. kubectl: {detail}")
         return False
-    remedy = f" {decision.remedy}" if decision.remedy else ""
+    connectivity = bool(CONNECTIVITY_FAILURE_RE.search(completed.stderr or ""))
+    remedy = f" {decision.remedy}" if decision.remedy and connectivity else ""
     log(f"{name}: cannot reach the cluster API server over its {decision.kind} endpoint "
         f"({decision.address}); authorized networks: {decision.authorized_networks_text()}."
         f"{remedy} kubectl: {detail}")
@@ -558,7 +568,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
         f"- kubeconfig: {kubeconfig}\n"
         f"{_endpoint_bullets(decision)}\n"
         "The authoritative KUBECONFIG pin lives in this profile's `.env`; the\n"
-        "line above records it for reference. To repoint this agent, re-run\n"
+        "`kubeconfig` bullet above records it for reference. To repoint this agent, re-run\n"
         "`cluster_agent_profile.py create` — do not hand-edit this file.\n",
         encoding="utf-8",
     )

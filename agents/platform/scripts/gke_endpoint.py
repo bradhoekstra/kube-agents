@@ -32,8 +32,10 @@ endpoint is closed. docs/designs/private-endpoint-selection.md argues the rule;
 from __future__ import annotations
 
 import dataclasses
+import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -69,7 +71,15 @@ _DESCRIBE_FORMAT = (
     "json(controlPlaneEndpointsConfig,privateClusterConfig,"
     "networkConfig.network,masterAuthorizedNetworksConfig,endpoint)"
 )
-_OWN_NETWORK_FORMAT = "value(networkConfig.network)"
+# The agent's own cluster: its VPC, its subnet, and its Pod range, which is the
+# source address its traffic carries to a private endpoint (GKE does not
+# masquerade RFC 1918 destinations). One describe, three tab-separated fields.
+_OWN_NETWORK_FORMAT = "value(networkConfig.network,networkConfig.subnetwork,clusterIpv4Cidr)"
+_OWN_FIELD_COUNT = 3
+_VALUE_SEPARATOR = "\t"
+
+# A GKE zone is its region plus a one-letter suffix.
+_ZONE_RE = re.compile(r"^(?P<region>[a-z]+-[a-z]+\d+)-[a-z]$")
 
 # The one-sentence remedies the decision carries for a cluster that may still
 # refuse the connection. Composed here, once, so the scaffold log and the
@@ -84,6 +94,15 @@ REMEDY_IP = (
     f"open its DNS endpoint with {_ENABLE_DNS_ACCESS}."
 )
 REMEDY_OTHER_NETWORK = "The agent is not on this cluster's VPC. " + REMEDY_IP
+# Same VPC and region, but the list on the private endpoint does not admit the
+# agent's Pod range. The range is spliced in so the operator has nothing to
+# look up; `{pod_cidr}` reads "the agent cluster's Pod range" when unknown.
+REMEDY_ADMIT_POD_RANGE = (
+    "Add {pod_cidr} to this cluster's authorized networks and re-run the "
+    "onboarding so the agent reaches it over the private endpoint, or open its "
+    f"DNS endpoint with {_ENABLE_DNS_ACCESS}."
+)
+POD_RANGE_UNKNOWN = "the agent cluster's Pod range"
 
 # gcloud is slow to start, so both answers are memoised — but only one of them
 # keeps for the life of the process. The installed gcloud cannot grow a flag
@@ -113,9 +132,10 @@ _ENDPOINT_TTL_SECONDS = 60.0
 # key -> (monotonic time the answer was read, decision)
 _endpoint_cache: dict[tuple[str, str, str], tuple[float, "EndpointDecision"]] = {}
 _support_cache: bool | None = None
-# The agent's own cluster's network. The install's VPC cannot change under a
-# running pod, so this has no TTL; it is simply never set from a failure.
-_own_network_cache: str | None = None
+# The agent's own cluster's network facts. The install's VPC cannot change
+# under a running pod, so this has no TTL; it is simply never set from a
+# failure.
+_own_cluster_cache: "OwnCluster | None" = None
 
 _DESCRIBE_TIMEOUT_SECONDS = 30
 _HELP_TIMEOUT_SECONDS = 30
@@ -146,6 +166,16 @@ class EndpointDecision:
         if self.authorized_networks is None:
             return AUTHORIZED_NETWORKS_UNRESTRICTED
         return ", ".join(self.authorized_networks) or AUTHORIZED_NETWORKS_EMPTY
+
+
+@dataclasses.dataclass(frozen=True)
+class OwnCluster:
+    """What rule 2 knows about the cluster this process runs on."""
+
+    network: str
+    subnetwork: str
+    pod_cidr: str
+    region: str
 
 
 def _log(message: str) -> None:
@@ -251,19 +281,25 @@ def _describe(
     return document if isinstance(document, dict) else None
 
 
-def own_network(run: Runner) -> str | None:
-    """The VPC network of the cluster this process runs on, or None.
+def _region_of(location: str) -> str:
+    """A zone's region, or the location itself when it already is one."""
+    match = _ZONE_RE.match(location or "")
+    return match.group("region") if match else (location or "")
+
+
+def own_cluster(run: Runner) -> OwnCluster | None:
+    """The network facts of the cluster this process runs on, or None.
 
     Read from the identity in OWN_CLUSTER_ENV with one `clusters describe`,
-    remembered for the life of the process once gcloud has answered. None
-    when the identity is absent or partial (a workstation, a test), when the
-    describe fails, or when it answers an empty line; none of those is cached,
-    so a transient failure in a long-lived process is retried on the next
-    decision that needs the answer.
+    remembered for the life of the process once gcloud has answered in full.
+    None when the identity is absent or partial (a workstation, a test), when
+    the describe fails, or when it answers fewer fields than asked; none of
+    those is cached, so a transient failure in a long-lived process is retried
+    on the next decision that needs the answer.
     """
-    global _own_network_cache
-    if _own_network_cache is not None:
-        return _own_network_cache
+    global _own_cluster_cache
+    if _own_cluster_cache is not None:
+        return _own_cluster_cache
     identity = [os.environ.get(name, "") for name in OWN_CLUSTER_ENV]
     if not all(identity):
         return None
@@ -283,15 +319,33 @@ def own_network(run: Runner) -> str | None:
     if exit_code != 0:
         _log(f"describing this pod's own cluster {cluster} exited {exit_code}")
         return None
-    network = (stdout or "").strip()
-    if not network:
+    # value() renders the fields tab-separated and an unset one empty; a row
+    # with fewer separators than fields is not the answer that was asked for.
+    fields = (stdout or "").strip("\r\n").split(_VALUE_SEPARATOR)
+    if len(fields) != _OWN_FIELD_COUNT or not fields[0].strip():
         _log(f"this pod's own cluster {cluster} reports no network")
         return None
-    _own_network_cache = network
-    return network
+    network, subnetwork, pod_cidr = (field.strip() for field in fields)
+    _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
+    return _own_cluster_cache
 
 
-def _decide(described: dict, own: Callable[[], str | None]) -> EndpointDecision:
+def _within_any(cidr: str, blocks: tuple[str, ...]) -> bool:
+    """Is `cidr` inside one of `blocks`? Unparseable input is a no."""
+    try:
+        inner = ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+    for block in blocks:
+        try:
+            if inner.subnet_of(ipaddress.ip_network(block, strict=False)):
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
+def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]) -> EndpointDecision:
     """The rule, over one describe document. `own` is called only when rule 2
     could fire, so an ordinary public cluster never pays for the second
     describe."""
@@ -309,8 +363,13 @@ def _decide(described: dict, own: Callable[[], str | None]) -> EndpointDecision:
               if block.get("cidrBlock"))
         if restricted else None
     )
+    # Absent means the list gates the public endpoint only, the pre-2024 default.
+    private_enforced = restricted and authorized.get("privateEndpointEnforcementEnabled") is True
     private_endpoint = private.get("privateEndpoint") or ip.get("privateEndpoint") or ""
-    network = (described.get("networkConfig") or {}).get("network") or ""
+    global_access = (private.get("masterGlobalAccessConfig") or {}).get("enabled") is True
+    network_config = described.get("networkConfig") or {}
+    network = network_config.get("network") or ""
+    subnetwork = network_config.get("subnetwork") or ""
     default_address = described.get("endpoint") or ""
 
     # 1. `allowExternalTraffic` absent is a no, not a maybe: clusters predating
@@ -319,18 +378,41 @@ def _decide(described: dict, own: Callable[[], str | None]) -> EndpointDecision:
         return EndpointDecision((DNS_ENDPOINT_FLAG,), KIND_DNS, dns["endpoint"],
                                 None, networks, "")
 
-    # 2. gcloud's own preconditions for --internal-ip: a private endpoint
-    # (MissingPrivateEndpointError) and IP endpoints on
-    # (IPEndpointsIsDisabledError). With IP endpoints off it selects the DNS
-    # endpoint by itself, so no flag is the right answer there.
+    # With IP endpoints off gcloud writes the DNS host by itself and refuses
+    # --internal-ip (IPEndpointsIsDisabledError); authorized networks do not
+    # gate that host, so there is no network remedy to give.
+    if ip.get("enabled") is False:
+        return EndpointDecision((), KIND_DNS, dns.get("endpoint") or default_address,
+                                None, networks, "")
+
+    # 2. gcloud's other precondition for --internal-ip is a private endpoint
+    # (MissingPrivateEndpointError). Beyond that, the private endpoint has to
+    # be one this pod can route to -- same VPC, and same region unless
+    # control-plane global access is on -- and one that admits this pod's
+    # traffic: the list does not gate it, or the target shares this cluster's
+    # subnet (whose ranges GKE always admits), or this cluster's Pod range is
+    # on the list. A private endpoint that would refuse us is no better than
+    # a public one that does, and worse than a public one that does not.
     same_network: bool | None = None
-    if private_endpoint and ip.get("enabled") is not False and network:
+    pod_cidr = ""
+    if private_endpoint and network:
         mine = own()
         if mine is not None:
-            same_network = mine == network
+            same_network = mine.network == network
+            pod_cidr = mine.pod_cidr
         if same_network:
-            return EndpointDecision((INTERNAL_IP_FLAG,), KIND_INTERNAL_IP, private_endpoint,
-                                    True, networks, REMEDY_INTERNAL_IP if restricted else "")
+            routable = global_access or _region_of(location) == mine.region
+            admitted = (
+                not private_enforced
+                or (subnetwork and subnetwork == mine.subnetwork)
+                or (networks is not None and pod_cidr and _within_any(pod_cidr, networks))
+            )
+            if routable and admitted:
+                return EndpointDecision((INTERNAL_IP_FLAG,), KIND_INTERNAL_IP, private_endpoint,
+                                        True, networks, "")
+            if routable and restricted:
+                return EndpointDecision((), KIND_IP, default_address, True, networks,
+                                        REMEDY_ADMIT_POD_RANGE.format(pod_cidr=pod_cidr or POD_RANGE_UNKNOWN))
 
     # 3. Whatever gcloud writes unflagged.
     if not restricted:
@@ -392,7 +474,7 @@ def endpoint_decision(
         # would be this failure mistaken for a configuration.
         return cached[1] if cached is not None else None
 
-    decision = _decide(described, lambda: own_network(runner))
+    decision = _decide(described, location, lambda: own_cluster(runner))
     _endpoint_cache[key] = (time.monotonic(), decision)
     return decision
 
@@ -419,7 +501,7 @@ def dns_endpoint_args(
 
 def reset_cache() -> None:
     """Forget every memoised answer. For tests."""
-    global _support_cache, _own_network_cache
+    global _support_cache, _own_cluster_cache
     _endpoint_cache.clear()
     _support_cache = None
-    _own_network_cache = None
+    _own_cluster_cache = None
