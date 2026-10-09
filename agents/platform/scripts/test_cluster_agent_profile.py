@@ -48,8 +48,10 @@ def a_decision(**overrides):
 def a_blocked_decision(**overrides):
     """The public IP kept because the private endpoint's list does not admit the
     agent's Pod range: the decision the remedy exists for."""
-    return a_decision(flags=(), kind=gke_endpoint.KIND_IP, address="203.0.113.10",
-                      authorized_networks=("203.0.113.5/32",), remedy=ADMIT_REMEDY, **overrides)
+    base = dict(flags=(), kind=gke_endpoint.KIND_IP, address="203.0.113.10",
+                authorized_networks=("203.0.113.5/32",), remedy=ADMIT_REMEDY)
+    base.update(overrides)
+    return a_decision(**base)
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -434,6 +436,17 @@ class CreateProfileTest(unittest.TestCase):
         self.create()
         user_md = (self.profile / "USER.md").read_text()
         self.assertIn("only if `kubectl` cannot reach the API server", user_md)
+
+    def test_a_provisional_decision_is_not_recorded(self):
+        # The scaffold's own describe of the agent cluster failed; the broker
+        # decides again for the unflagged fetch and may splice --internal-ip,
+        # so a record of this fallback would misstate what the kubeconfig names.
+        self.decision = a_blocked_decision(provisional=True)
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertNotIn("- endpoint", user_md)
+        self.assertNotIn("endpoint-remedy", user_md)
+        self.assertEqual(self.get_credentials_argv()[-1], f"--project={self.PROJECT}")
 
     def test_no_decision_writes_no_endpoint_bullets(self):
         self.decision = None

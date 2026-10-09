@@ -81,10 +81,11 @@ With any of the three variables unset the answer is "unknown", and rule 3 never 
 the position of every workstation and test caller, and it is what keeps the predicate copies
 in agreement without changing them. A decision that needed the own cluster and did not get it
 because the describe gave no usable answer (it failed, raised, or returned a short or empty
-row) while the identity was there is returned marked `provisional` and not put in the
-per-target cache, so the next call re-reads rather than serving a fallback for a
-minute. An identity that is absent is a settled answer, cached like any other. The credential
-proxy reads the mark: a managed kubeconfig written from a provisional decision, or from no
+row) while the identity was there is returned marked `provisional`. It is cached for the usual
+window like any other decision, mark included, and a failed own-cluster describe is itself not
+retried for a minute, so an own cluster that cannot be described costs the agent's callers one
+gcloud start a minute rather than two per call. An identity that is absent is a settled answer.
+The credential proxy reads the mark: a managed kubeconfig written from a provisional decision, or from no
 decision at all because the target describe failed, by the proxy's own fetch or by a caller's
 fetch the proxy tried to decide for, is served for one minute and then treated as a miss (a
 `.provisional` marker beside the file, written before the file under a lock of its own so the
@@ -175,7 +176,9 @@ scaffold that failed would only be retried on the next reconcile tick with the s
 `user_md_field()` and the other three through `user_md_text()`, which keeps a value's case and
 spacing. It appends the endpoint and list to its `reason`, and prefixes its `remediation` with
 the remedy when kubectl's output matches the same connection-failure pattern and the same
-credential-proxy exclusion, both of which a test holds equal to the Python copies. A profile scaffolded before this change
+credential-proxy exclusion, both of which a test holds equal to the Python copies, and only
+when kubectl failed on its own bound: a call the preflight's own cap killed sat in the broker,
+which the list cannot fix. A profile scaffolded before this change
 carries no bullets and preflight prints what it prints today.
 
 In a sandboxed install the credential proxy's managed kubeconfig for a cluster is the one every
@@ -189,10 +192,10 @@ or `-z`, in either flag form and on either side of the verb, skipping the values
 value-taking global flags; `--project` likewise, falling back to the proxy's own
 `GKE_PROJECT_ID`, which its bootstrap made gcloud's default project); a caller that names
 `--dns-endpoint` or `--internal-ip` is run as given. Every writer therefore applies the same rule to the same
-describe. `USER.md` records the scaffold's own decision, so it can still understate the live
-choice when the scaffold's describe of the agent's own cluster failed transiently (the proxy
-decides again and may splice `--internal-ip` where the scaffold wrote none); the probe then
-succeeds through the proxy and the record is corrected by the next re-run of the onboarding.
+describe. `USER.md` records the scaffold's own decision, except a provisional one: when the scaffold's
+describe of the agent's own cluster failed, the proxy decides again for the unflagged fetch and
+may splice `--internal-ip`, so the scaffold records nothing rather than an endpoint the
+kubeconfig does not end up naming, and the probe reports the connection alone.
 
 ## What stays as it is, and why
 

@@ -435,9 +435,14 @@ if [ "$STATUS" = "ok" ]; then
             REASON_5="$REASON_5 The kubeconfig names the cluster's $ENDPOINT_KIND endpoint ($(user_md_text endpoint-address)); authorized networks: $(user_md_text authorized-networks)."
             # The remedy is about reaching the server, so it is offered only
             # when kubectl never did (a timeout, no route, a refused dial), not
-            # for an answer it got and disliked (401, 403, NotFound).
+            # for an answer it got and disliked (401, 403, NotFound), and not
+            # when this script's own cap killed the call: the kubectl above
+            # names --request-timeout=8s, so a cluster that refuses the agent
+            # fails on that bound with kubectl's text, and reaching the cap
+            # means the broker held the call, which the list cannot fix.
             ENDPOINT_REMEDY="$(user_md_text endpoint-remedy)"
-            if [ -n "$ENDPOINT_REMEDY" ] && printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE" \
+            if [ -n "$ENDPOINT_REMEDY" ] && [ "$rc" -ne "$RC_TIMED_OUT" ] \
+                    && printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE" \
                     && ! printf '%s' "$ERR" | grep -Eiq "$NOT_A_CONNECTION_FAILURE_RE"; then
                 REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
             fi

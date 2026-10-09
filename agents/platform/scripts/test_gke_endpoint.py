@@ -863,43 +863,76 @@ class OwnNetworkTest(unittest.TestCase):
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=OWN_NETWORK)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint._own_failure_at = None
             runner.own_network = OWN_ROW
             second = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
         self.assertEqual(first.flags, ())
         self.assertEqual(second.flags, ("--internal-ip",))
 
-    def test_a_failed_own_cluster_describe_is_not_cached(self):
+    def test_a_failed_own_cluster_describe_is_not_cached_as_an_answer(self):
+        # The failure is remembered only as a backoff, never as "no cluster":
+        # once the window passes the next target asks again and gets the answer.
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
             runner.own_network = OWN_ROW
+            gke_endpoint._own_failure_at = None
             second = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
         self.assertEqual(first.flags, ())
         self.assertIsNone(first.same_network)
         self.assertEqual(second.flags, ("--internal-ip",))
         self.assertEqual(len(runner.own_network_calls), 2)
 
-    def test_a_decision_made_without_the_own_cluster_is_not_cached_for_that_cluster(self):
-        # The fallback "no flag" after a failed own-cluster describe must not
-        # sit in the per-target cache for a minute: in the credential proxy a
-        # cold fetch inside that window writes a public-IP kubeconfig that
-        # nothing invalidates until the pod restarts.
+    def test_a_provisional_decision_is_cached_for_the_window_like_any_other(self):
+        # A persistently failing own describe must not cost every caller a
+        # target describe per call; the mark travels with the cached answer,
+        # and the credential proxy refetches on the mark, not on the cache.
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
-            runner.own_network = OWN_ROW
             second = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
-        self.assertEqual(first.flags, ())
+        self.assertTrue(first.provisional and second.provisional)
+        self.assertEqual(len(runner.describe_calls), 1, "served from the cache the second time")
+
+    def test_a_provisional_decision_expires_with_the_window_and_is_re_decided(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with expired_cache(), unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            runner.own_network = OWN_ROW
+            gke_endpoint._own_failure_at = None  # the backoff window, see the next test
+            second = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+        self.assertTrue(first.provisional)
         self.assertEqual(second.flags, ("--internal-ip",))
-        self.assertEqual(len(runner.describe_calls), 2, "the target was re-read, not served from cache")
+
+    def test_a_failed_own_describe_is_not_retried_inside_its_backoff_window(self):
+        # Distinct targets inside the window share the one failure: one gcloud
+        # start for the own cluster per window, not one per target.
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
+            gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner)
+        self.assertEqual(len(runner.own_network_calls), 1)
+        self.assertEqual(len(runner.describe_calls), 3)
+
+    def test_the_own_describe_is_retried_once_the_backoff_window_has_passed(self):
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint._own_failure_at -= gke_endpoint._OWN_RETRY_SECONDS + 1
+            runner.own_network = OWN_ROW
+            d = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
+        self.assertEqual(len(runner.own_network_calls), 2)
+        self.assertEqual(d.flags, ("--internal-ip",))
 
     def test_a_failed_own_describe_marks_the_decision_provisional(self):
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             d = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
         self.assertTrue(d.provisional)
-        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+        with expired_cache(), unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             runner.own_network = OWN_ROW
+            gke_endpoint._own_failure_at = None
             d = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
         self.assertFalse(d.provisional)
 
@@ -928,6 +961,7 @@ class OwnNetworkTest(unittest.TestCase):
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network="")
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             first = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            gke_endpoint._own_failure_at = None
             runner.own_network = OWN_ROW
             second = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner)
         self.assertEqual(first.flags, ())

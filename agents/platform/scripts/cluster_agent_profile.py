@@ -81,8 +81,13 @@ USER_MD_NAME = "USER.md"
 # so an unreachable cluster is reported here, with the endpoint it was reached
 # over, rather than discovered by the first Cluster Agent run. `kubectl
 # version` is the cheapest authenticated GET and is on the credential proxy's
-# read allowlist. The request timeout is the API server's; the outer bound
-# covers the sandbox hop and the broker's admission wait in front of it.
+# read allowlist. The request timeout is the API server's, so an unreachable
+# cluster answers in about 5 s. The outer bound is deliberately shorter than
+# the broker's 60 s admission wait: a probe that sits in the broker's queue
+# that long says the broker is saturated, not that the cluster is unreachable,
+# and the scaffold logs "did not finish" rather than a diagnostic -- and the
+# reconcile sweep, which scaffolds clusters one after another, is not held for
+# a minute per cluster on a busy broker.
 CONNECTIVITY_PROBE_REQUEST_TIMEOUT = "5s"
 CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
 # What kubectl prints when it never reached the API server, as opposed to an
@@ -520,6 +525,14 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # traffic. gke_endpoint reads which before deciding, and the decision is
     # kept so USER.md and the probe below can say what was chosen.
     decision = endpoint_decision(project, cluster, location, env=env)
+    # A provisional decision carries no flag, and the broker, with its own
+    # view of the agent cluster, decides again for the unflagged fetch and may
+    # splice --internal-ip. Recording this fallback would state an endpoint
+    # the kubeconfig does not end up naming, in USER.md and in every preflight
+    # report after it, so it is dropped here: no bullets, no remedy, and the
+    # probe reports the connection alone.
+    if decision is not None and decision.provisional:
+        decision = None
     endpoint_flags = list(decision.flags) if decision is not None else []
     try:
         sandbox_exec.run(

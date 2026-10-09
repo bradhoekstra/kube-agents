@@ -35,7 +35,6 @@ import dataclasses
 import ipaddress
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -150,8 +149,13 @@ _endpoint_cache: dict[tuple[str, str, str], tuple[float, "EndpointDecision"]] = 
 _support_cache: bool | None = None
 # The agent's own cluster's network facts. The install's VPC cannot change
 # under a running pod, so this has no TTL; it is simply never set from a
-# failure.
+# failure. A failure is remembered only as a backoff: for _OWN_RETRY_SECONDS
+# after one, decisions that need the own cluster do without it rather than
+# paying a doomed gcloud start per target, and ask again once the window has
+# passed. Never as "no cluster".
 _own_cluster_cache: "OwnCluster | None" = None
+_own_failure_at: float | None = None
+_OWN_RETRY_SECONDS = 60.0
 
 _DESCRIBE_TIMEOUT_SECONDS = 30
 _HELP_TIMEOUT_SECONDS = 30
@@ -179,8 +183,9 @@ class EndpointDecision:
     remedy: str
     # True when the decision needed the agent's own cluster, the identity was
     # there, and the describe failed: gcloud's answer about the target, not
-    # about the question. Never cached here, and the credential proxy treats
-    # a kubeconfig written from one as a miss on the next request.
+    # about the question. Cached for the usual window with the mark attached;
+    # the credential proxy treats a kubeconfig written from one as a miss
+    # after its own window, and the scaffold records nothing from one.
     provisional: bool = False
 
     def authorized_networks_text(self) -> str:
@@ -330,11 +335,13 @@ def own_cluster(run: Runner) -> OwnCluster | None:
     those is cached, so a transient failure in a long-lived process is retried
     on the next decision that needs the answer.
     """
-    global _own_cluster_cache
+    global _own_cluster_cache, _own_failure_at
     if _own_cluster_cache is not None:
         return _own_cluster_cache
     identity = _own_identity()
     if identity is None:
+        return None
+    if _own_failure_at is not None and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS:
         return None
     project, location, cluster = identity
     argv = [
@@ -348,15 +355,18 @@ def own_cluster(run: Runner) -> OwnCluster | None:
     except (OSError, subprocess.SubprocessError,
             sandbox_exec.SandboxUnavailable) as error:
         _log(f"describing this pod's own cluster {cluster} failed ({error})")
+        _own_failure_at = time.monotonic()
         return None
     if exit_code != 0:
         _log(f"describing this pod's own cluster {cluster} exited {exit_code}")
+        _own_failure_at = time.monotonic()
         return None
     # value() renders the fields tab-separated and an unset one empty; a row
     # with fewer separators than fields is not the answer that was asked for.
     fields = (stdout or "").strip("\r\n").split(_VALUE_SEPARATOR)
     if len(fields) != _OWN_FIELD_COUNT or not fields[0].strip():
         _log(f"this pod's own cluster {cluster} reports no network")
+        _own_failure_at = time.monotonic()
         return None
     network, subnetwork, pod_cidr = (field.strip() for field in fields)
     _own_cluster_cache = OwnCluster(network, subnetwork, pod_cidr, _region_of(location))
@@ -541,10 +551,12 @@ def endpoint_decision(
         # would be this failure mistaken for a configuration.
         return cached[1] if cached is not None else None
 
+    # A provisional decision is cached like any other, mark included: the
+    # window bounds what a persistently failing own describe costs the agent's
+    # callers, and the credential proxy acts on the mark, not on this cache.
     decision = _decide(described, location, lambda: own_cluster(runner),
                        own_known=_own_identity() is not None)
-    if not decision.provisional:
-        _endpoint_cache[key] = (time.monotonic(), decision)
+    _endpoint_cache[key] = (time.monotonic(), decision)
     return decision
 
 
@@ -570,7 +582,8 @@ def dns_endpoint_args(
 
 def reset_cache() -> None:
     """Forget every memoised answer. For tests."""
-    global _support_cache, _own_cluster_cache
+    global _support_cache, _own_cluster_cache, _own_failure_at
     _endpoint_cache.clear()
     _support_cache = None
     _own_cluster_cache = None
+    _own_failure_at = None

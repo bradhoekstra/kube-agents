@@ -120,6 +120,8 @@ PROVISIONAL_KUBECONFIG_SUFFIX = ".provisional"
 # a window every kubectl to such a cluster would refetch under the kubeconfig
 # lock, three gcloud runs each. One minute matches gke_endpoint's target TTL.
 PROVISIONAL_RETRY_SECONDS = 60
+# How much of gcloud's stderr the refetch-failure log line keeps.
+REFETCH_FAILURE_LOG_CHARS = 200
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -6457,7 +6459,7 @@ class CommandExecutor:
                         # attempt waits again rather than retrying per request.
                         logging.warning(
                             "refetch of the provisional kubeconfig for %s failed (%s); serving the file on disk",
-                            target.context_name, detail[:200],
+                            target.context_name, detail[:REFETCH_FAILURE_LOG_CHARS],
                         )
                         with self._marker_lock:
                             marker.touch()
