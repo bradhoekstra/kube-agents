@@ -13,7 +13,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`).
-- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
+- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -267,12 +267,15 @@ re-trigger a review unless the bot's last review said the branch does not merge.
 (owners, members, collaborators) for a strict pass over the current commit, or `/review all` for a
 first-review-width pass. The `agent:ignore` label opts out.
 
-**A human reviewer is requested only once its check passes.** `.github/workflows/auto_request_review.yml`
-waits for the `AI Review` check run to go green before assigning from `.github/auto_request_review.yml`:
-green requires zero findings on the first review, and no 🔴 High on later reviews (🟠 Medium is
-posted, not held — [the cases](docs/pull-request-workflow.md#what-the-check-means)). Bot-opened PRs
-assign immediately on check completion, and `/request-review` overrides the gate for a disputed
-finding or missing review.
+**A human reviewer is requested once its check passes, or at the bot's third round.**
+`.github/workflows/auto_request_review.yml` assigns from `.github/auto_request_review.yml` when the
+`AI Review` check run goes green — zero findings on the first review, and no 🔴 High on later
+reviews (🟠 Medium is posted, not held —
+[the cases](docs/pull-request-workflow.md#what-the-check-means)) — or, once, when the bot has
+reviewed three commits and the check is still grey. The first request posts a hand-off comment:
+from there the reviewer decides, and you reply in the threads rather than asking for another round.
+Bot-opened PRs assign immediately on check completion, and `/request-review` overrides the gate for
+a disputed finding or missing review.
 
 **What agents must do.** After opening a ready PR (not a draft, which sits outside the queue until
 marked ready), tell the user the bot review is on its way and **offer to wait for it**. When
