@@ -843,7 +843,9 @@ nothing new. `usage.sessionsTotal`, `usage.remediationsProposedTotal` and
 series exists for each. The two counters the operator does write, and `usage.lastActiveTime`, land
 through the poller above, which consults the same five-minute record: under a served CRD that
 predates `status.usage` they accumulate in the `<name>-usage-counters` ConfigMap and land with the
-first patch after this release's CRD is applied.
+first patch after this release's CRD is applied. Under a served CRD at the previous schema, which has
+`status.usage` without the two cluster gauges, the counters keep landing and the gauges are probed
+again every five minutes until this release's CRD is applied.
 
 These condition types appear in `conditions`; only `Ready` is always present:
 

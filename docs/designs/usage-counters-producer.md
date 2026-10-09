@@ -485,7 +485,7 @@ and the CRD description changed from "nothing writes it yet". None needs a secon
 
 Zero external egress: the operator reads two in-cluster listeners over the pod network and
 writes two objects in the cluster. Zero PII or secret exposure: the status receives integer
-totals and one timestamp; label values are summed away and never written anywhere, and the
+totals, two integer gauges and one timestamp; label values are summed away and never written anywhere, and the
 baseline ConfigMap holds pod UIDs, pod names and integers. The new NetworkPolicy rules admit
 the operator's pods on the two metrics ports and nothing else; the collector's rule is
 unchanged. No new RBAC: pods are listed and ConfigMaps managed with verbs the ClusterRole
