@@ -1632,33 +1632,39 @@ The defaults carry no ephemeral-storage request because the operator renders non
   {{- $aaDefaults := include "kube-agents.agentAPIAuthDefaults" . | fromJson -}}
   {{- $aaReqDef := index $aaDefaults "requests" -}}
   {{- $aaLimDef := index $aaDefaults "limits" -}}
-  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}
-  {{- $podReqCpu = add $podReqCpu (sub (include "kube-agents.parseCpuMillis" . | int64) (include "kube-agents.parseCpuMillis" (index $aaReqDef "cpu") | int64)) -}}
+  {{- /* Default sidecar figures as the numbers the footprint uses. */ -}}
+  {{- $defCpuReq := include "kube-agents.parseCpuMillis" (index $aaReqDef "cpu") | int64 -}}
+  {{- $defCpuLim := include "kube-agents.parseCpuMillis" (index $aaLimDef "cpu") | int64 -}}
+  {{- $defMemReq := include "kube-agents.parseBytes" (index $aaReqDef "memory") | int64 -}}
+  {{- $defMemLim := include "kube-agents.parseBytes" (index $aaLimDef "memory") | int64 -}}
+  {{- $defEph := include "kube-agents.parseBytes" (index $aaLimDef "ephemeral-storage") | int64 -}}
+  {{- /* Merged over the defaults, the pod the operator would render. The sidecar declares
+         no ephemeral request, which the API server defaults to the limit, so both ephemeral
+         sides start at the default limit and the request follows an override of the limit
+         unless set explicitly. */ -}}
+  {{- $mCpuReq := $defCpuReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}{{- $mCpuReq = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mCpuLim := $defCpuLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}{{- $mCpuLim = include "kube-agents.parseCpuMillis" . | int64 -}}{{- end -}}
+  {{- $mMemReq := $defMemReq -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}{{- $mMemReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mMemLim := $defMemLim -}}{{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}{{- $mMemLim = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- $mEphLim := $defEph -}}{{- $mEphReq := $defEph -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}{{- $mEphLim = include "kube-agents.parseBytes" . | int64 -}}{{- $mEphReq = $mEphLim -}}{{- end -}}
+  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" "") -}}{{- $mEphReq = include "kube-agents.parseBytes" . | int64 -}}{{- end -}}
+  {{- /* The operator refuses a zero limit or a request above its limit (validateContainerResources)
+         and renders the sidecar at its defaults, Degraded. agentAPIAuthResourcesCheck above does not
+         refuse those -- they stay the operator's and the webhook's -- so the preflight must count the
+         override's delta only for an override the operator will actually render, or it under- or
+         over-counts the pod against the quota the operator never asks for. */ -}}
+  {{- $aaRefused := false -}}
+  {{- if or (eq $mCpuLim (int64 0)) (eq $mMemLim (int64 0)) (eq $mEphLim (int64 0)) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if or (gt $mCpuReq $mCpuLim) (gt $mMemReq $mMemLim) (gt $mEphReq $mEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if not $aaRefused -}}
+  {{- $podReqCpu = add $podReqCpu (sub $mCpuReq $defCpuReq) -}}
+  {{- $podLimCpu = add $podLimCpu (sub $mCpuLim $defCpuLim) -}}
+  {{- $podReqMem = add $podReqMem (sub $mMemReq $defMemReq) -}}
+  {{- $podLimMem = add $podLimMem (sub $mMemLim $defMemLim) -}}
+  {{- $podLimEph = add $podLimEph (sub $mEphLim $defEph) -}}
+  {{- $podReqEph = add $podReqEph (sub $mEphReq $defEph) -}}
   {{- end -}}
-  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}
-  {{- $podLimCpu = add $podLimCpu (sub (include "kube-agents.parseCpuMillis" . | int64) (include "kube-agents.parseCpuMillis" (index $aaLimDef "cpu") | int64)) -}}
-  {{- end -}}
-  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}
-  {{- $podReqMem = add $podReqMem (sub (include "kube-agents.parseBytes" . | int64) (include "kube-agents.parseBytes" (index $aaReqDef "memory") | int64)) -}}
-  {{- end -}}
-  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}
-  {{- $podLimMem = add $podLimMem (sub (include "kube-agents.parseBytes" . | int64) (include "kube-agents.parseBytes" (index $aaLimDef "memory") | int64)) -}}
-  {{- end -}}
-  {{- /* The sidecar declares an ephemeral limit and no request, which the API server
-         defaults to the limit, so the base counts the default on both sides. A limit
-         override moves both unless a request override is also set. */ -}}
-  {{- $aaEphDefault := include "kube-agents.parseBytes" (index $aaLimDef "ephemeral-storage") | int64 -}}
-  {{- $aaEphLim := $aaEphDefault -}}
-  {{- $aaEphReq := $aaEphDefault -}}
-  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}
-  {{- $aaEphLim = include "kube-agents.parseBytes" . | int64 -}}
-  {{- $aaEphReq = $aaEphLim -}}
-  {{- end -}}
-  {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" "") -}}
-  {{- $aaEphReq = include "kube-agents.parseBytes" . | int64 -}}
-  {{- end -}}
-  {{- $podLimEph = add $podLimEph (sub $aaEphLim $aaEphDefault) -}}
-  {{- $podReqEph = add $podReqEph (sub $aaEphReq $aaEphDefault) -}}
 
   {{- /* The dashboard is another container in the agent pod rather than a pod of its own,
          so it scales with the same replica count and adds no pod. Its flag is

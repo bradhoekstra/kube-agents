@@ -357,7 +357,10 @@ spec:
       {{- $set := dict }}
       {{- range $name, $quantity := (index $apiAuthResources $side) | default dict }}
         {{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) }}
-          {{- $_ := set $set $name $quantity }}
+          {{- /* Trimmed as the check validated it and the proxy block emits it, so a
+                 value with surrounding whitespace is not emitted raw for the API server
+                 to refuse against the CRD's no-whitespace quantity pattern. */}}
+          {{- $_ := set $set $name (toString $quantity | trim) }}
         {{- end }}
       {{- end }}
       {{- if $set }}

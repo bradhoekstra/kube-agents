@@ -388,6 +388,21 @@ class PreflightDecisionTest(unittest.TestCase):
             finally:
                 self.chart = original
 
+    def test_agent_api_auth_refused_override_counts_defaults(self) -> None:
+        """An override the operator refuses is rendered at defaults, Degraded, so the
+        preflight must count the defaults, not the override's delta. A zero limit, a
+        limit below the default request, and a request above the default limit are the
+        refusals agentAPIAuthResourcesCheck does not catch (they stay the operator's)."""
+        base = self._requirements()
+        for override in (
+            [f"{_AA_VALUE}.limits.memory=0"],
+            [f"{_AA_VALUE}.limits.memory=256Mi"],
+            [f"{_AA_VALUE}.limits.cpu=0"],
+            [f"{_AA_VALUE}.requests.memory=5Gi"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a refused override {override} moved the footprint; it must count defaults")
+
     def test_agent_api_auth_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
         # The footprint path reads the override too; with the CR template removed, a bad
         # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck
