@@ -78,9 +78,9 @@ func defaultTokenSource(ctx context.Context) (oauth2.TokenSource, error) {
 // the Python copy has and this one does not yet: --internal-ip for a cluster
 // on this pod's own VPC with a private endpoint and a closed DNS endpoint
 // (docs/designs/private-endpoint-selection.md). This function takes
-// cluster.Endpoint for that shape, the public IP, which Master Authorized
-// Networks may refuse. Closing the gap needs a describe of the host cluster,
-// which this package does not make today. The DNS endpoint needs
+// cluster.Endpoint for that shape -- the public IP when one is enabled, which
+// Master Authorized Networks may refuse. Closing the gap needs a describe of
+// the host cluster, which this package does not make today. The DNS endpoint needs
 // no CA of its own — it terminates on a Google frontend with a WebPKI
 // certificate — where the IP endpoint is signed by the cluster's own CA.
 //

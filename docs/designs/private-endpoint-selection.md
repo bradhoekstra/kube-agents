@@ -21,137 +21,169 @@ timeout and had to work out the rest.
 1. **DNS endpoint**, `--dns-endpoint`, when `dnsEndpointConfig.endpoint` is set and
    `allowExternalTraffic` is `true`. Unchanged. It is first because the DNS endpoint ignores
    Master Authorized Networks and routes from anywhere.
-2. **Private endpoint**, `--internal-ip`, when all of these hold:
-   - the target's `networkConfig.network` equals the agent's own cluster's network;
-   - `privateClusterConfig.privateEndpoint` is set;
-   - `controlPlaneEndpointsConfig.ipEndpointsConfig.enabled` is not `false`.
-3. **gcloud's default**, no flag. Unchanged.
+2. **DNS endpoint without a flag** when `ipEndpointsConfig.enabled` is `false`. gcloud writes
+   the DNS host by itself in that shape and refuses `--internal-ip`
+   (`IPEndpointsIsDisabledError`), and authorized networks do not gate that host.
+3. **Private endpoint**, `--internal-ip`, when the cluster publishes
+   `privateClusterConfig.privateEndpoint` (gcloud's `MissingPrivateEndpointError` otherwise;
+   `ipEndpointsConfig.privateEndpoint` is read as a fallback) and the endpoint is both
+   routable from the agent pod and willing to admit it:
+   - **routable**: the target's `networkConfig.network` equals the agent's own cluster's
+     network, and either the target is in the agent cluster's region or
+     `privateClusterConfig.masterGlobalAccessConfig.enabled` is `true`. GKE answers a private
+     endpoint only from its own region unless control-plane global access is on, and every
+     VPC-native cluster reports a private endpoint, so without the region test an ordinary
+     public cluster in another region would lose a working endpoint for one it cannot reach.
+   - **admitted**: the authorized-network list is not enabled, or it is not enforced on the
+     private endpoint (`privateEndpointEnforcementEnabled` absent or `false`, the pre-2024
+     default), or the two clusters share a subnetwork, whose ranges GKE always admits, or the
+     agent cluster's Pod range (`clusterIpv4Cidr`) lies inside a listed block. The Pod range is
+     what the traffic carries: GKE does not masquerade RFC 1918 destinations. Without the
+     admission test an estate that had listed the agent's NAT address, the remedy this
+     repository used to give, would have lost a working public endpoint on upgrade.
+4. **gcloud's default**, no flag. Unchanged. When rule 3 failed only on admission, the remedy
+   names the Pod range to add.
 
-The second and third conditions are gcloud's own: `_GetClusterEndpoint` in
-`googlecloudsdk/api_lib/container/util.py` raises `MissingPrivateEndpointError` without a private
-endpoint and `IPEndpointsIsDisabledError` with IP endpoints off. Reading the configuration up
-front keeps the module's existing contract: the flag is never passed blind and never probed by
-attempting it.
+Rule 3 reads the configuration up front, which keeps the module's existing contract: the flag
+is never passed blind and never probed by attempting it.
 
-Two shapes the rule deliberately does not cover. A cluster on a peered VPC is not detected,
-because the network paths differ and nothing short of a routes query says whether the peering
-exports the control-plane route. A cluster whose private endpoint is on the same VPC but whose
-Master Authorized Networks exclude the agent's pod range still gets `--internal-ip`: the
-private IP is the endpoint most likely to be reachable, and the diagnostic below names the
-missing range.
+A cluster on a peered VPC is not detected: the network paths differ and nothing short of a
+routes query says whether the peering exports the control-plane route.
 
-## How the agent knows its own network
+## How the agent knows its own cluster
 
 The operator sets `GKE_PROJECT_ID`, `GKE_LOCATION` and `GKE_CLUSTER_NAME` on the agent
-container, the shell sandbox forwards them, and the credential proxy reads them at bootstrap.
-`gke_endpoint.own_network()` describes that cluster with
-`--format=value(networkConfig.network)` and keeps the answer for the life of the process. The
-install's VPC cannot change under a running pod, so this memo has no TTL, unlike the per-target
-decision, which keeps its 60-second one. A describe that fails is not cached, for the reason
-the module already gives for the target describe: the credential proxy is a daemon.
+container, the shell sandbox forwards them, and the credential proxy carries them too.
+`gke_endpoint.own_cluster()` describes that cluster once with
+`--format=value(networkConfig.network,networkConfig.subnetwork,clusterIpv4Cidr)`, derives its
+region from `GKE_LOCATION`, and keeps the answer for the life of the process. The install's VPC
+cannot change under a running pod, so this memo has no TTL, unlike the per-target decision,
+which keeps its 60-second one. A describe that fails, or answers fewer than three fields, is not
+cached, for the reason the module already gives for the target describe: the credential proxy
+is a daemon.
 
-With any of the three variables unset the answer is "unknown", and rule 2 never fires. That is
-the position of every workstation and test caller, and it is what keeps the three predicate
-copies in agreement without changing two of them.
+With any of the three variables unset the answer is "unknown", and rule 3 never fires. That is
+the position of every workstation and test caller, and it is what keeps the predicate copies
+in agreement without changing them.
 
 A Shared VPC matches naturally: a service-project cluster reports the host project's network
 resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
 
 ## What the decision carries
 
-`endpoint_decision()` returns an `EndpointDecision`:
+`endpoint_decision()` returns an `EndpointDecision`, or `None` when nothing could be decided
+(an incomplete identity, a gcloud without `--dns-endpoint`, a describe that failed with nothing
+cached):
 
-| Field                 | Content                                                            |
-| --------------------- | ------------------------------------------------------------------ |
-| `flags`               | `["--dns-endpoint"]`, `["--internal-ip"]` or `[]`                  |
-| `kind`                | `dns`, `internal-ip` or `ip`                                       |
-| `address`             | the hostname or IP the kubeconfig will name                        |
-| `same_network`        | `True`, `False`, or `None` when the agent's own network is unknown |
-| `authorized_networks` | the `masterAuthorizedNetworksConfig.cidrBlocks` CIDRs, or `None`   |
-| `remedy`              | one sentence naming what would make the cluster reachable          |
+| Field                 | Content                                                                           |
+| --------------------- | --------------------------------------------------------------------------------- |
+| `flags`               | `("--dns-endpoint",)`, `("--internal-ip",)` or `()`                               |
+| `kind`                | `dns`, `internal-ip` or `ip`                                                      |
+| `address`             | the hostname or IP the kubeconfig will name                                       |
+| `same_network`        | `True`, `False`, or `None` when the agent's own network was not needed or unknown |
+| `authorized_networks` | the listed CIDRs when the list is enabled (possibly empty), or `None`             |
+| `remedy`              | one sentence naming what would make the cluster reachable, or `""`                |
 
-`dns_endpoint_args()` stays as the wrapper every caller uses today and returns only `flags`.
-The three runtime callers, `cluster_agent_profile.py`, `platform_mcp_server.py` and
-`credential_proxy.py`, therefore inherit rule 2 without a signature change. The describe
-widens from `json(controlPlaneEndpointsConfig)` to
-`json(controlPlaneEndpointsConfig,privateClusterConfig,networkConfig.network,masterAuthorizedNetworksConfig,endpoint)`.
+`dns_endpoint_args()` stays as the wrapper returning only `flags` as a list. Its callers,
+`platform_mcp_server.py`, `stall_watch.py` and `credential_proxy.py`, inherit rule 3 without
+a signature change; `cluster_agent_profile.py` calls `endpoint_decision()` itself because it
+writes the decision out. The describe widens to
+`json(controlPlaneEndpointsConfig,privateClusterConfig,networkConfig.network,masterAuthorizedNetworksConfig,endpoint)`
+and reads `networkConfig.subnetwork` from the same block.
 
-`remedy` is composed once, in Python, from the fields above:
+The remedies are the module's `REMEDY_*` constants, composed once so the scaffold log and the
+preflight card read the same words:
 
-- `internal-ip` with a non-empty authorized list: "Add the agent's Pod and node ranges to the
-  cluster's authorized networks, or open the DNS endpoint with
-  `gcloud container clusters update --enable-dns-access`."
-- `ip` on a cluster the agent does not share a network with, or whose network is unknown:
-  "The agent is not on this cluster's VPC; open the DNS endpoint with `--enable-dns-access`,
-  or add the agent's egress address to the authorized networks."
-- `dns`: no remedy; the endpoint is reachable by construction.
+- rule 3 failed on admission: `REMEDY_ADMIT_POD_RANGE`, with the Pod range spliced in;
+- `ip` with the list enabled, on another network with a private endpoint: `REMEDY_OTHER_NETWORK`;
+- `ip` with the list enabled otherwise: `REMEDY_IP`;
+- `dns`, `internal-ip`, or any cluster whose list is not enabled: no remedy.
 
 ## The diagnostic
 
 `cluster_agent_profile.create_profile()` already writes the cluster's identity into the
-profile's `USER.md` as `- key: value` bullets, the one shape `cluster_preflight.sh` can read,
-and mirrors that file into the sandbox. The decision joins it as four more bullets:
+profile's `USER.md` as `- key: value` bullets and mirrors that file into the sandbox. The
+decision joins it:
 
 ```
 - endpoint: internal-ip
 - endpoint-address: 10.128.0.6
 - authorized-networks: 10.0.0.0/8, 172.16.0.0/12
-- endpoint-remedy: Add the agent's Pod and node ranges to ...
+- endpoint-remedy: Add 10.92.0.0/14 to this cluster's authorized networks ...
 ```
 
-`authorized-networks` reads `unrestricted` when the config is absent or disabled, and the
-`endpoint-remedy` bullet is written only when there is a remedy to give. After the
-mirror, the scaffold probes the cluster with `kubectl version --request-timeout=5s` in the
-sandbox under the pinned kubeconfig. On failure it logs one line with the endpoint kind, the
-address, the authorized list and the remedy, and returns normally: a cluster that is
-unreachable now may be reachable after the operator acts, and a scaffold that failed would
-only be retried on the next reconcile tick with the same result.
+`authorized-networks` reads `unrestricted` when the list is not enabled and
+`enabled, no ranges listed` when it is enabled and empty; the `endpoint-remedy` bullet is
+written only when there is a remedy. After the mirror, the scaffold probes the cluster with
+`kubectl version --request-timeout=5s` in the sandbox under the pinned kubeconfig, as the
+`agent` login that owns the file. On failure it logs one line with the endpoint kind, the
+address, the list, and kubectl's last line, adding the remedy only when the failure is a
+connection failure (a timeout, no route, a refused dial) rather than an answer the server gave
+(401, 403, NotFound). The scaffold still returns normally: a cluster that is unreachable now
+may be reachable after the operator acts, and a scaffold that failed would only be retried on
+the next reconcile tick with the same result.
 
-`cluster_preflight.sh` check 5, which fails today with the raw `kubectl cluster-info` error,
-reads the four bullets with its existing `user_md_field()` and appends them to its `reason` and
-`remediation` fields when they are present. A profile scaffolded before this change carries no
-bullets and preflight prints what it prints today.
+`cluster_preflight.sh` check 5 reads the bullets back, `endpoint` through the existing
+`user_md_field()` and the other three through `user_md_text()`, which keeps a value's case and
+spacing. It appends the endpoint and list to its `reason`, and prefixes its `remediation` with
+the remedy under the same connection-failure test. A profile scaffolded before this change
+carries no bullets and preflight prints what it prints today.
+
+The credential proxy decides again whenever it rebuilds its managed kubeconfig for a cluster,
+and in a sandboxed install that kubeconfig is the one every brokered `kubectl` uses. The two
+decisions run the same rule over the same describe, so `USER.md` and the live choice diverge
+only after the cluster's endpoint configuration changes, which the remedy already answers with
+a re-run of the onboarding.
 
 ## What stays as it is, and why
 
-Three other copies of the endpoint rule exist. None changes here.
+Four other copies of the endpoint rule exist. None changes here.
 
 - **`scripts/installer/gke_dns_endpoint.sh`** runs on a workstation or in CI, outside any GKE
   VPC, to reach the management cluster. Its header comment names this design as the reason it
   carries no `--internal-ip` branch. The bring-your-own-CI case belongs to the Terraform split
-  tracked in the epic that owns this issue.
+  tracked in the epic that owns this issue (#2591).
 - **The awk program in `platformagent_manifests.go`** fetches the agent's own cluster's
   credentials at credential-proxy bootstrap. It has the exposure this design describes when the
   agent's own cluster restricts Master Authorized Networks, and every VPC-native cluster reports
   a private endpoint, so switching it changes every install at once. That is a separate change,
-  decided on evidence the live validation below gathers.
+  decided on evidence the live validation below gathered.
 - **`ClientConfigForIdentity` in `k8s-operator/internal/clusterprofiles/endpoint.go`** serves
-  the drift detector from the operator pod. Rule 2 applies to it unchanged, with its own describe
-  of the host cluster. Its comment names the gap until a follow-up closes it.
+  the event watcher and the drift detector, which run in the agent image. Rule 3 applies to it
+  unchanged, with its own describe of the host cluster. Its comment names the gap until a
+  follow-up closes it.
+- **`dns_endpoint_args()` in the fleet-upgrade-verification skill** decides from the record
+  `clusters list` returned, without a describe. In a sandboxed install the broker's own
+  decision governs the connection whatever flags the skill passes, so it keeps today's rule.
 
 `test_gke_endpoint_parity.py` keeps holding the Python, shell and awk copies to one DNS truth
-table. One case is added: with the agent's own network unknown, a same-shape private cluster
+table. One case is added: with the agent's own identity absent, a same-shape private cluster
 yields no flag from all three.
 
 ## Tests
 
-- `test_gke_endpoint.py`: the decision matrix. Same network with a private endpoint and a
-  restricted authorized list; same network with the public endpoint on; different network;
-  same network without a private endpoint; same network with IP endpoints disabled; DNS open
-  on a same-network cluster, which still picks DNS; env unset; own-cluster describe failing,
-  which is not cached; the remedy text per kind.
-- `test_cluster_agent_profile.py`: the four bullets land in `USER.md`; a failing probe logs the
-  diagnostic and the scaffold still returns the profile name; a passing probe logs nothing.
-- `test_cluster_preflight.py`: check 5's JSON carries the bullets when present and is byte-equal
-  to today's output when they are absent.
+- `test_gke_endpoint.py`: the decision matrix. The enterprise shape (list enforced on the
+  private endpoint, a different subnet, the agent's Pod range inside a listed block); the
+  NAT-only list, which keeps the public IP and names the Pod range; the shared subnet; the
+  list not enforced; another region with and without global access; a zonal location in the
+  same region; another network; no private endpoint; IP endpoints disabled; DNS open on a
+  same-network cluster; the identity unset or partial; the own-cluster describe failing, empty,
+  or short, none of which is cached.
+- `test_cluster_agent_profile.py`: the bullets land in `USER.md`; the probe runs as the `agent`
+  login; a connection failure logs the diagnostic with the remedy and a 403 logs it without;
+  the scaffold still returns the profile name; a passing probe logs nothing.
+- `test_cluster_preflight.py`: check 5's JSON carries the bullets and the remedy on a connection
+  failure, the bullets without the remedy on a 403, and today's text when there are no bullets.
 - `test_gke_endpoint_parity.py`: the added case above.
 
 ## Live validation
 
-A throwaway zonal cluster on the `default` VPC of the gkedemos install, private nodes, Master
-Authorized Networks restricted to a range that excludes the agent, DNS endpoint closed. The
-run observes, in order: the onboarded profile's kubeconfig names the private IP; the scaffold
-log names `internal-ip`, the address, the list and the remedy; preflight check 5 carries the
-same; after adding the agent cluster's Pod range to the authorized list, `kubectl` from the
-profile answers. The cluster is deleted at the end. The same run records whether the gkedemos
-pod reaches its own cluster's private endpoint, as the evidence the bootstrap follow-up needs.
+A throwaway zonal cluster on the same VPC as a running install, private nodes, Master
+Authorized Networks restricted to a documentation range, DNS endpoint closed. Observed: the
+previous image wrote the public IP into the onboarded profile's kubeconfig; this change wrote
+the private IP and the four bullets; from the agent pod and the sandbox the private endpoint
+answered in under a second and the public IP timed out; the branch's preflight named the
+endpoint, the list and the remedy once the cluster was gone. The two clusters shared a subnet,
+so the private endpoint admitted the agent without a list change, which is the shared-subnet
+clause of rule 3. The agent pod also reached its own cluster's private endpoint, the evidence
+the bootstrap follow-up needs.

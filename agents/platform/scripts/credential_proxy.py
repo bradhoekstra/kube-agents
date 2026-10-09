@@ -6258,10 +6258,11 @@ class CommandExecutor:
         return self.kubeconfig_dir / f"{target.context_name}.yaml"
 
     def _dns_endpoint_args(self, gcloud: str, target: ClusterTarget) -> list[str]:
-        """Decide whether this cluster's credentials must name its DNS endpoint.
+        """Decide which endpoint this cluster's credentials must name.
 
-        The decision itself lives in `gke_endpoint`, shared with the two callers in
-        the agent container. What is local to the sidecar is *how* gcloud runs: the
+        `--dns-endpoint`, `--internal-ip` or nothing. The decision itself lives
+        in `gke_endpoint`, shared with the callers in the agent container
+        (`cluster_agent_profile.py`, `platform_mcp_server.py`, `stall_watch.py`). What is local to the sidecar is *how* gcloud runs: the
         binary is the resolved executable rather than whatever is on PATH, and it
         goes through `_execute` so the describe is subject to the same timeout,
         output cap, and working directory as every other command here.

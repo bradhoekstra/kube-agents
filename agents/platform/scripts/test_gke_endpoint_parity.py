@@ -15,9 +15,11 @@ would pass forever after someone edited the bootstrap.
 
 The Python copy alone also knows `--internal-ip`
 (docs/designs/private-endpoint-selection.md). That branch needs the agent's own
-cluster in the environment, which no shell or bootstrap caller has, so the
-table here stays the DNS one and a last case pins that the branch is inert
-without it.
+cluster in the environment. The installer's shell callers run on a workstation
+and have none; the bootstrap has it but reaches only that same cluster, where
+the branch is a separate decision (the design doc says why). So the table here
+stays the DNS one, and a last case pins that the branch is inert without the
+identity.
 """
 
 from __future__ import annotations
