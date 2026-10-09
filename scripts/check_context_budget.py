@@ -11,19 +11,19 @@ looks exactly like one that does not.
 That is how this file came to exist. ``AGENTS.md`` went from 14.5k to 42.6k
 characters in nine days, across a run of pull requests each adding a rule that
 deserved to be there, and the first anyone noticed was Claude Code printing
-``AGENTS.md is over the 40.0k-char limit`` at startup. The warning is
-only a warning: the file is still loaded whole, so nothing breaks loudly. It
-just gets more expensive, indefinitely, until someone re-reads the whole file
-and splits it again.
+``AGENTS.md is over the 40.0k-char limit`` at startup. Worse, Antigravity caps
+each rule file at 24,000 UTF-8 bytes and truncates beyond that on line
+boundaries, silently dropping the bottom of ``AGENTS.md`` from the system
+prompt while the 38k-char budget reported green.
 
-So the budget is checked rather than watched. The remedy when this fails is
-almost never to delete a rule -- it is to move the *mechanics* out to a
-document the agent opens when it is carrying the rule out, the way
-``docs/pull-request-workflow.md`` holds the commands whose rules live in
-``AGENTS.md`` and ``.agents/rules/`` holds the mechanics that are prose rather
-than commands. Raising ``BUDGET`` is the other option, and it is a real one, but
-it should be a decision someone argues for in a pull request rather than the
-path of least resistance.
+So the budget is checked in UTF-8 bytes against the stricter of the two limits.
+The remedy when this fails is almost never to delete a rule -- it is to move
+the *mechanics* out to a document the agent opens when it is carrying the rule
+out, the way ``docs/pull-request-workflow.md`` holds the commands whose rules
+live in ``AGENTS.md`` and ``.agents/rules/`` holds the mechanics that are prose
+rather than commands. Raising ``BUDGET`` is the other option, and it is a real
+one, but it should be a decision someone argues for in a pull request rather
+than the path of least resistance.
 
 Standard library only, so it runs in CI and in a bare clone.
 
@@ -40,10 +40,11 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 
-# Chars. Claude Code warns at 40k; this sits below it so the check fires while
-# there is still room to land the fix, rather than after the warning is already
-# on everyone's screen.
-BUDGET = 38_000
+# UTF-8 bytes. Antigravity truncates any rule file past 24,000 bytes (and Claude
+# Code warns at 40k chars); this sits 500 bytes below the 24,000-byte hard cap
+# so the check fires while there is still room to land the fix, rather than
+# after the tail of AGENTS.md is already being dropped from the prompt.
+BUDGET = 23_500
 
 # The two roots. CLAUDE.md pulls AGENTS.md in with an `@AGENTS.md` line, which
 # the harness expands in place, so counting both files naively would charge
@@ -51,6 +52,8 @@ BUDGET = 38_000
 # however many times it is reached -- the total is then what actually lands in
 # the window rather than what is on disk.
 FILES = ("AGENTS.md", "CLAUDE.md")
+
+UTF8_ENCODING = "utf-8"
 
 # A bare `@` followed by something path-shaped, alone on its line. The extension
 # is required deliberately: `@me` and `@platform-agent` are handles that could
@@ -72,7 +75,11 @@ def is_import(line: str) -> bool:
 
 
 def loaded_size(path: Path, seen: set[Path] | None = None) -> int:
-    """Characters this file contributes to the context window, imports included.
+    """UTF-8 bytes this file contributes to the context window, imports included.
+
+    Counted in UTF-8 bytes rather than characters because Antigravity's 24,000
+    per-file cap is a byte limit, and multi-byte punctuation and emoji (``—``,
+    ``→``, ``🔴``, ``🟠``, ``§``) make byte length exceed character length.
 
     An import line is replaced by the file it names, not merely dropped.
     Dropping it would make the obvious answer to a failure -- replace a section
@@ -88,21 +95,21 @@ def loaded_size(path: Path, seen: set[Path] | None = None) -> int:
     seen.add(resolved)
 
     total = 0
-    for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
+    for line in path.read_text(encoding=UTF8_ENCODING).splitlines(keepends=True):
         if not is_import(line):
-            total += len(line)
+            total += len(line.encode(UTF8_ENCODING))
             continue
         target = path.parent / line.strip()[1:]
         if target.is_file():
             total += loaded_size(target, seen)
         else:
             # Nothing to expand, so the line is just text the harness shows.
-            total += len(line)
+            total += len(line.encode(UTF8_ENCODING))
     return total
 
 
 def measure(names: tuple[str, ...] | None = None) -> dict[str, int]:
-    """Per-root char counts, sharing one ``seen`` set across all the roots.
+    """Per-root byte counts, sharing one ``seen`` set across all the roots.
 
     Sharing it is what stops AGENTS.md being charged twice: CLAUDE.md's
     `@AGENTS.md` expands to nothing once AGENTS.md has been counted as a root
@@ -134,13 +141,13 @@ def main() -> int:
 
     if total > BUDGET:
         # Raw counts, not the rounded k figures used elsewhere. Growth arrives a
-        # few hundred chars at a time, so the first failure is usually a couple
-        # of hundred over -- and "0.0k over the 38k budget" reads as a check that
-        # has miscounted rather than one that has just fired.
+        # few hundred bytes at a time, so the first failure is usually a couple
+        # of hundred over -- and "0.0k over the 23.5k budget" reads as a check
+        # that has miscounted rather than one that has just fired.
         over = total - BUDGET
         print(
-            f"FAIL: the always-loaded instruction files total {total:,} chars "
-            f"({breakdown}), {over:,} over the {BUDGET:,}-char budget.\n"
+            f"FAIL: the always-loaded instruction files total {total:,} bytes "
+            f"({breakdown}), {over:,} over the {BUDGET:,}-byte budget.\n"
             "\n"
             "These files are loaded into every session in every checkout, so this is a\n"
             "cost paid by every task in the repository. Prefer moving mechanics out over\n"
@@ -154,8 +161,8 @@ def main() -> int:
         return 1
 
     print(
-        f"Always-loaded instruction files total {total / 1000:.1f}k chars ({breakdown}), "
-        f"{(BUDGET - total) / 1000:.1f}k under the {BUDGET:,}-char budget."
+        f"Always-loaded instruction files total {total / 1000:.1f}k bytes ({breakdown}), "
+        f"{(BUDGET - total) / 1000:.1f}k under the {BUDGET:,}-byte budget."
     )
     return 0
 

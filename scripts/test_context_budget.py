@@ -116,6 +116,23 @@ class LoadedSizeTest(unittest.TestCase):
             (root / "b.md").write_text("@a.md\nB\n", encoding="utf-8")
             self.assertEqual(check_context_budget.loaded_size(root / "a.md"), len("A\nB\n"))
 
+    def test_multibyte_utf8_is_charged_in_bytes(self):
+        # Antigravity's 24,000-byte per-file rule cap truncates on UTF-8 byte
+        # count, not character count, so `—` (3 bytes) and `🔴` (4 bytes) must
+        # be charged their UTF-8 byte length rather than 1 char each.
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "AGENTS.md"
+            text = "— → 🔴\n"
+            path.write_text(text, encoding="utf-8")
+            self.assertEqual(
+                check_context_budget.loaded_size(path),
+                len(text.encode("utf-8")),
+            )
+            self.assertGreater(
+                check_context_budget.loaded_size(path),
+                len(text),
+            )
+
 
 class MeasureTest(unittest.TestCase):
     """`measure` -- the roots share one `seen` set, so nothing is double-charged."""
@@ -140,8 +157,8 @@ class RealFilesTest(unittest.TestCase):
         self.assertLessEqual(
             total,
             check_context_budget.BUDGET,
-            f"{total} chars across {check_context_budget.FILES} exceeds the "
-            f"{check_context_budget.BUDGET}-char budget; see the module docstring "
+            f"{total} bytes across {check_context_budget.FILES} exceeds the "
+            f"{check_context_budget.BUDGET}-byte budget; see the module docstring "
             "in check_context_budget.py for what to do about it",
         )
 

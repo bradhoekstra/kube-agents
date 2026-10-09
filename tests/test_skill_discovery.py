@@ -25,14 +25,17 @@ still contains every skill, so nothing looks wrong until an assistant in a fresh
 clone reports it has none. That is the half of the premise this repository
 controls and the only half asserted below. The
 other half is that `.agents/skills/` is itself a project skill path -- Codex
-and Gemini CLI both document it, and Jetski reads it directly -- which is a
+and Gemini CLI both document it, and Antigravity reads it directly -- which is a
 property of those harnesses, cannot be checked from this tree, and is stated
 here so a reader knows it rests on their documentation rather than on a test.
 
 The second mechanism is the frontmatter. Every harness above loads skill names
 and descriptions at session start and the full `SKILL.md` only once one of
 them matches the request -- the body cannot be consulted to decide whether to
-consult the body. Two ways that fails silently:
+consult the body. The same applies to `.agents/rules/*.md`: Claude Code reads
+`paths` to scope each rule by glob, while Antigravity requires
+`trigger: model_decision` and a non-empty `description` to list the rule for
+on-demand loading. Two ways that fails silently:
 
 * the block stops being loadable. A description holding `: ` or opening with
   `{`, `[`, `*` or `&` is a YAML error, and a harness that cannot parse the
@@ -58,7 +61,8 @@ consult the body. Two ways that fails silently:
   everything after the first word is free -- because a test that pins whole
   sentences is a test that gets deleted the first time someone improves one.
 
-Scope is this repository's own skills, under `.agents/skills/`. The skills
+Scope is this repository's own skills and rules, under `.agents/skills/` and
+`.agents/rules/`. The skills
 baked into the agent images (`agents/<profile>/skills/`) are loaded by Hermes
 from a profile home, not discovered from a checkout, and
 `scripts/check_prompt_assets.py` already holds their manifests -- though with
@@ -82,8 +86,12 @@ import yaml
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SKILLS_DIR = REPO_ROOT / ".agents" / "skills"
+RULES_DIR = REPO_ROOT / ".agents" / "rules"
 
-#: A frontmatter block: the fenced YAML a `SKILL.md` opens with.
+#: The trigger mode Antigravity requires for on-demand rule loading.
+RULE_TRIGGER = "model_decision"
+
+#: A frontmatter block: the fenced YAML a `SKILL.md` or rule `.md` opens with.
 FRONTMATTER = re.compile(r"\A---\n(.*?)\n---\s*?\n", re.S)
 
 #: Directories a harness reads, and the `.agents/` directory each must resolve
@@ -113,6 +121,10 @@ PRODUCT = "kube-agents"
 
 def _skill_dirs():
     return sorted(p for p in SKILLS_DIR.iterdir() if (p / "SKILL.md").is_file())
+
+
+def _rule_files():
+    return sorted(RULES_DIR.glob("*.md"))
 
 
 def _frontmatter(skill_md):
@@ -310,6 +322,32 @@ class LifecycleSkillDiscoverabilityTest(unittest.TestCase):
                     or f"{name}'s description does not name {PRODUCT}, so a "
                     "request that calls the product by that name has nothing "
                     "to match",
+                )
+
+
+class RuleFrontmatterTest(unittest.TestCase):
+    def test_every_rule_has_frontmatter_for_both_harnesses(self):
+        rules = _rule_files()
+        self.assertTrue(rules, "found no .agents/rules/*.md files to check")
+        for rule in rules:
+            with self.subTest(rule=rule.name):
+                block, why = _frontmatter(rule)
+                self.assertIsNotNone(block, why)
+                paths = block.get("paths")
+                self.assertTrue(
+                    isinstance(paths, list) and paths and all(isinstance(p, str) and p.strip() for p in paths),
+                    f"{rule.name} must declare a non-empty `paths` list so Claude Code scopes it by file glob",
+                )
+                self.assertEqual(
+                    block.get("trigger"),
+                    RULE_TRIGGER,
+                    f"{rule.name} must set `trigger: {RULE_TRIGGER}` so Antigravity loads it on demand",
+                )
+                description, desc_why = _description(rule)
+                self.assertTrue(
+                    description.strip(),
+                    desc_why
+                    or f"{rule.name} must declare a non-empty `description` for `trigger: {RULE_TRIGGER}`",
                 )
 
 

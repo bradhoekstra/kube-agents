@@ -1,3 +1,13 @@
+---
+# Claude Code loads this rule only beside files matching `paths`; Antigravity uses `trigger` and `description`.
+paths:
+  - "agents/**"
+  - "bench/**"
+  - "hack/eval/**"
+trigger: model_decision
+description: "Eval-driven development workflow: running the red-to-green devops-bench eval loop and registering bench cases when changing agent behaviour."
+---
+
 # Eval-driven development
 
 [`AGENTS.md`](../../AGENTS.md) owns the rule: a change to what an agent does starts from a
