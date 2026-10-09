@@ -412,8 +412,12 @@ ADMISSION_BOUND_BUDGET = "budget"
 ADMISSION_BOUND_REFRESH_LOCK = "refresh-lock"
 ADMISSION_BOUND_SESSION = "session"
 ADMISSION_BOUND_OTHER = "other"
+#: The histogram's label for a request admitted without a wait: nothing held
+#: it, so neither bound is blamed, and the label does not flip with the memory
+#: limit. Never a refusal's bound.
+ADMISSION_BOUND_NONE = "none"
 ADMISSION_BOUNDS = frozenset(
-    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION}
+    {ADMISSION_BOUND_SLOT, ADMISSION_BOUND_BUDGET, ADMISSION_BOUND_REFRESH_LOCK, ADMISSION_BOUND_SESSION, ADMISSION_BOUND_NONE}
 )
 # Edges where a reader wants them: 15 s is the cap the Cluster Agent preflight
 # (cluster_preflight.sh) puts on one brokered call, the shortest caller-side
@@ -5210,6 +5214,10 @@ class CommandExecutor:
             finally:
                 self._request_budget.reserved = previously_reserved
             return
+        # Whether this request waited at all: it went round the loop, or it is
+        # the second leg of an admission that yielded (`queued_at` handed in).
+        # An admission that never waited is observed under no bound.
+        waited = queued_at is not None
         if queued_at is None:
             queued_at = time.monotonic()
         if deadline is None:
@@ -5236,6 +5244,7 @@ class CommandExecutor:
                     if remaining <= 0:
                         bound = self._held_bound(takes_slot, saw_slots_full)
                         raise CommandSlotUnavailable(self._refusal_text(takes_slot, bound), bound=bound)
+                    waited = True
                     self._slot_condition.wait(min(COMMAND_SLOT_POLL_SECONDS, remaining))
                     if caller is not None and _caller_has_gone(caller):
                         held_by_slots = self._held_bound(takes_slot, saw_slots_full) == ADMISSION_BOUND_SLOT
@@ -5261,10 +5270,11 @@ class CommandExecutor:
             self._request_budget.reserved = True
             waited_seconds = time.monotonic() - queued_at
             waited_ms = int(waited_seconds * MILLISECONDS_PER_SECOND)
-            # Observed on every admission, under the bound the log names when
-            # it writes a line: the histogram is where an idle broker's waits
-            # read as a measured zero rather than an absence.
-            held = self._held_bound(takes_slot, saw_slots_full)
+            # Observed on every admission: under the bound the log names when
+            # it writes a line, or under `none` for a request admitted at once,
+            # so an idle broker's observations are a measured zero that blames
+            # neither bound, and the label does not flip with the memory limit.
+            held = self._held_bound(takes_slot, saw_slots_full) if waited else ADMISSION_BOUND_NONE
             if self.metrics is not None:
                 self.metrics.observe_admission_wait(held, waited_seconds)
             if waited_ms >= COMMAND_SLOT_WAIT_LOG_MS:
@@ -7315,7 +7325,7 @@ class ProxyMetrics:
                 f'status_code="{_escape_label_value(status_code)}"}} {count}'
             )
         lines += [
-            f"# HELP {ADMISSION_WAIT_METRIC} Seconds a request waited to be admitted, by the bound that held it (slot cap or child memory budget).",
+            f"# HELP {ADMISSION_WAIT_METRIC} Seconds a request waited to be admitted, by the bound that held it (slot cap or child memory budget), or none for a request admitted without a wait.",
             f"# TYPE {ADMISSION_WAIT_METRIC} histogram",
         ]
         self._render_histogram(lines, ADMISSION_WAIT_METRIC, ADMISSION_BOUND_LABEL, ADMISSION_WAIT_BUCKETS, admissions)

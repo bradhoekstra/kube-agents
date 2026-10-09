@@ -413,13 +413,27 @@ class AdmissionMetricsTest(unittest.TestCase):
 
     def test_every_admission_is_observed_even_a_short_one(self):
         # The log line starts at COMMAND_SLOT_WAIT_LOG_MS; the histogram does
-        # not, so an idle broker's p50 is a measured zero, not an absence.
+        # not, so an idle broker's p50 is a measured zero, not an absence. An
+        # admission that never waited blames neither bound: `none`.
         executor = self.executor()
         with executor.request_slot():
             pass
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le="0.1"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+
+    def test_an_unwaited_admission_is_none_whether_the_budget_is_on_or_off(self):
+        # The label an idle broker shows does not flip with the memory limit:
+        # at the 2Gi default most admissions wait for nothing, and `budget`
+        # there would blame a budget that held nothing.
+        for executor in (self.executor(), _budgeted_executor(self, admits=4, metrics=self.metrics)):
+            with executor.request_slot():
+                pass
+        families = self.families()
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
 
     def test_a_wait_for_a_slot_is_observed_under_the_slot_bound(self):
         executor = self.executor(max_concurrent_commands=1)
@@ -428,21 +442,24 @@ class AdmissionMetricsTest(unittest.TestCase):
         with executor.request_slot():
             waited = time.monotonic() - queued_at
         families = self.families()
-        # Two admissions: the holder's, which waited for nothing, and this one.
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        # Two admissions: the holder's, which waited for nothing and is `none`,
+        # and this one, under the slot cap.
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
         self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
         total = _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="slot")
         self.assertGreaterEqual(total, 0.5)
         self.assertLessEqual(total, waited + 0.1)
-        # Cumulative buckets in bound order: the holder's wait in the first,
-        # both in the last.
+        # Cumulative buckets in bound order: this wait is past the first edge
+        # and inside the last; the holder's zero sits in `none`'s first bucket.
         buckets = [
             _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le=str(bound))
             for bound in credential_proxy.ADMISSION_WAIT_BUCKETS
         ]
         self.assertEqual(buckets, sorted(buckets))
-        self.assertEqual(1, buckets[0])
-        self.assertEqual(2, buckets[-1])
+        self.assertEqual(0, buckets[0])
+        self.assertEqual(1, buckets[-1])
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
 
     def test_a_wait_for_the_budget_is_observed_under_the_budget_bound(self):
         # Eight slots, a budget for one: the second request waits for the
@@ -453,9 +470,11 @@ class AdmissionMetricsTest(unittest.TestCase):
         with executor.request_slot():
             pass
         families = self.families()
-        # The holder's admission and this one, both under the budget: with the
-        # budget on and no slot ever full, the budget is what the queue is for.
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        # The holder's admission waited for nothing (`none`); this one waited
+        # under the budget: with the budget on and no slot ever full, the
+        # budget is what the queue is for.
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
         self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
         self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.5)
 
@@ -562,13 +581,16 @@ class AdmissionMetricsTest(unittest.TestCase):
             with executor.reserve_child_memory(yield_when=lambda: True):
                 self.fail("admitted instead of yielding")
         arrival = raised.exception.queued_at
-        # Only the holder's own (unwaited) admission is observed so far.
-        self.assertEqual(1, _series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        # Only the holder's own (unwaited, `none`) admission is observed so far.
+        self.assertIsNone(_series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
         holder.join()
         with executor.reserve_child_memory(deadline=time.monotonic() + 5, queued_at=arrival):
             pass
         families = _parse(self.metrics.render())
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        # The second leg was admitted at once, but it carries the first leg's
+        # arrival, so it is a waited admission under the budget, not `none`.
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
         self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.4)
 
     def test_the_snapshot_is_typed_and_the_render_reads_its_fields(self):
