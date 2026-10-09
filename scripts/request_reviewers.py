@@ -151,6 +151,11 @@ HANDOFF_ROUNDS = 3
 # any review, a `COMMENTED` one included, and `already_reviewed_reason` does
 # not count those, so without it every later grey round would ask again.
 HANDOFF_MARKER = "<!-- auto-request-review:handoff -->"
+# The hand-off is posted with the job's GITHUB_TOKEN, so its author is always
+# this login; a comment anyone else opens with the marker is not a hand-off,
+# or the author's agent pasting one it saw elsewhere would switch the
+# third-round rule off for the pull request.
+HANDOFF_AUTHOR = "github-actions[bot]"
 
 # A declined override is written where the person who typed it will see it:
 # a warning annotation on the workflow run (the `::warning::` command goes to
@@ -706,10 +711,16 @@ def reviewed_commits(reviews, *head_shas):
 def handed_off(comments):
     """Whether this workflow has already announced a reviewer on the pull request.
 
-    The marker has to open the comment: a reply quoting the hand-off carries
-    the same bytes further down and is not one.
+    The marker has to open the comment and the comment has to be the
+    workflow's own (`HANDOFF_AUTHOR`): a reply quoting the hand-off carries the
+    same bytes further down, and anyone can type the marker, which renders as
+    nothing.
     """
-    return any((comment.get("body") or "").lstrip().startswith(HANDOFF_MARKER) for comment in comments)
+    return any(
+        ((comment.get("user") or {}).get("login") == HANDOFF_AUTHOR)
+        and (comment.get("body") or "").lstrip().startswith(HANDOFF_MARKER)
+        for comment in comments
+    )
 
 
 def handoff_comment(users, teams, head_sha, check_run, why):
@@ -1011,7 +1022,7 @@ def main(argv=None):
             return 0
 
     deciding = None
-    why = "a person asked for a reviewer with /request-review"
+    why = "a person asked for a reviewer with /request-review" if args.react_to else "a maintainer ran the request by hand"
     if args.require_ai_review_pass:
         deciding = gate_check_run(api, pull_request, triggering_check_run)
         author_is_bot = pull_request["user"].get("type") == "Bot"
@@ -1070,12 +1081,17 @@ def main(argv=None):
     if announce:
         # The commit named is the one the quoted verdict is on: the deciding
         # entry's, which is the head except in the seconds between a push and
-        # the bot's row for it.
+        # the bot's row for it. The request already went out: a comment that
+        # fails to post is logged, never a red run, and the next request on
+        # the pull request posts it.
         at = (deciding or {}).get("head_sha") or pull_request["head"]["sha"]
-        api.post(
-            f"/repos/{args.repo}/issues/{number}/comments",
-            {"body": handoff_comment(users, teams, at, deciding, why)},
-        )
+        try:
+            api.post(
+                f"/repos/{args.repo}/issues/{number}/comments",
+                {"body": handoff_comment(users, teams, at, deciding, why)},
+            )
+        except Exception as exc:  # noqa: BLE001 - any API error; the request stands
+            log(f"{WORKFLOW_WARNING_PREFIX}requested a reviewer on #{number} but could not post the hand-off comment: {exc}")
     react(api, args, REACTION_ACKNOWLEDGED)
 
     return 0

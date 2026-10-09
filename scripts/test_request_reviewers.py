@@ -213,6 +213,8 @@ class FakeAPI:
         raise AssertionError(f"unexpected call: {path}")
 
     def post(self, path, payload=None):
+        if path in getattr(self, "failing", ()):
+            raise RuntimeError(f"HTTP 502 on {path}")
         self.posts.append((path, payload))
         return {}
 
@@ -797,6 +799,17 @@ class _MainHarness(unittest.TestCase):
     def reaction(self):
         return [payload["content"] for path, payload in self.api.posts if path == self.REACTIONS]
 
+    def run_main_with_failing(self, failing, pull, reviews, *extra, **kwargs):
+        """`run_main`, with the given POST paths raising as the API wrapper would after its retries."""
+        original = FakeAPI.__init__
+
+        def init(api, *a, **kw):
+            original(api, *a, **kw)
+            api.failing = failing
+
+        with mock.patch.object(FakeAPI, "__init__", init):
+            return self.run_main(pull, reviews, *extra, **kwargs)
+
     def requested(self):
         return [login for path, payload in self.api.posts if path == self.REQUESTED for login in payload["reviewers"]]
 
@@ -989,10 +1002,18 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(rr.reviewed_commits(self.rounds("1111aaa"), "2222bbb", None), {"1111aaa", "2222bbb"})
 
     def test_the_marker_is_what_says_a_hand_off_happened(self):
-        self.assertFalse(rr.handed_off([{"body": "/review"}, {"body": None}]))
-        self.assertTrue(rr.handed_off([{"body": f"{rr.HANDOFF_MARKER}\nHanded to @x"}]))
+        own = {"user": {"login": rr.HANDOFF_AUTHOR}}
+        self.assertFalse(rr.handed_off([{**own, "body": "/review"}, {**own, "body": None}]))
+        self.assertTrue(rr.handed_off([{**own, "body": f"{rr.HANDOFF_MARKER}\nHanded to @x"}]))
         # A reply quoting the hand-off carries the marker too, further down.
-        self.assertFalse(rr.handed_off([{"body": f"> {rr.HANDOFF_MARKER}\n> Handed to @x"}]))
+        self.assertFalse(rr.handed_off([{**own, "body": f"> {rr.HANDOFF_MARKER}\n> Handed to @x"}]))
+
+    def test_a_marker_anyone_else_posted_is_not_a_hand_off(self):
+        # The marker renders as nothing, so an agent pasting a hand-off it saw
+        # elsewhere, or anyone typing it, would otherwise switch the rule off.
+        forged = [{"user": {"login": "author"}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @x"}]
+        self.assertFalse(rr.handed_off(forged))
+        self.assertFalse(rr.handed_off([{"body": f"{rr.HANDOFF_MARKER}\nno user field at all"}]))
 
     def test_the_third_round_clears_a_grey_check(self):
         reason = rr.ai_review_block_reason(tallied(), author_is_bot=False, rounds=3, already_handed_off=False)
@@ -1075,13 +1096,40 @@ class HandoffMainTest(_MainHarness):
         self.assertEqual(posts, [])
 
     def test_the_hand_off_happens_once(self):
-        handed = [{"body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
+        handed = [{"user": {"login": rr.HANDOFF_AUTHOR}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
         posts = self.run_main(
             pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
             "--require-ai-review-pass", check_runs=self.GREY, comments=handed,
         )
         self.assertEqual(posts, [])
         self.assertIn("already handed", self.stderr.getvalue())
+
+    def test_a_forged_marker_does_not_switch_the_rule_off(self):
+        forged = [{"user": {"login": "author"}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
+        posts = self.run_main(
+            pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY, comments=forged,
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+
+    def test_a_hand_off_that_fails_to_post_leaves_the_request_standing(self):
+        # Two writes: the request went out, so the comment's failure is a
+        # warning in the log, never a red run and never a lost request.
+        posts = self.run_main_with_failing(
+            (self.HANDOFF,), pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+            "--require-ai-review-pass", check_runs=self.GREY,
+        )
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertEqual(self.code, 0)
+        self.assertIn("could not post the hand-off comment", self.stderr.getvalue())
+
+    def test_a_hand_run_request_says_so_in_the_comment(self):
+        # `--pr N` with neither flag: nobody typed /request-review and no check was consulted.
+        posts = self.run_main(pull_request(), [], check_runs={})
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        body = self.api.posts[1][1]["body"]
+        self.assertIn("ran the request by hand", body)
+        self.assertNotIn("/request-review", body)
 
     def test_a_green_check_still_requests_and_hands_off(self):
         green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
@@ -1091,7 +1139,7 @@ class HandoffMainTest(_MainHarness):
 
     def test_a_green_check_does_not_post_a_second_hand_off(self):
         green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
-        handed = [{"body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
+        handed = [{"user": {"login": rr.HANDOFF_AUTHOR}, "body": f"{rr.HANDOFF_MARKER}\nHanded to @jayantid at `1111aaa`."}]
         posts = self.run_main(pull_request(), [bot_review("deadbeef")], "--require-ai-review-pass", check_runs=green, comments=handed)
         self.assertEqual(posts, [self.REQUESTED])
 
