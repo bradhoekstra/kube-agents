@@ -1462,6 +1462,22 @@ class Credentials(Base):
         _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
         self.assertEqual(self.credential_fetches(fake), [])
 
+    def test_a_cluster_dark_on_its_fetch_tick_is_recorded_so_the_next_tick_does_not_fetch_again(self):
+        # First tick: gcloud wrote the kubeconfig, then the read met a control
+        # plane that does not answer. Nothing indicted the kubeconfig, so the
+        # record is written as if the read had succeeded; the next tick reads
+        # on it, and a cluster that stays dark pays no fetch per tick.
+        fleet = {"a": {"ns": []}}
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:00:00+00:00", namespaces_fail_once={"a": DARK})
+        self.assertEqual(self.credential_fetches(fake), ["a"])
+        self.assertIn(stall_watch.cluster_id(PROJECT, "a", LOCATION), self.ledger()["unreadable"])
+        self.assertEqual(self.ledger()[stall_watch.CREDENTIALS_KEY][stall_watch.cluster_id(PROJECT, "a", LOCATION)], "2026-10-08T10:00:00+00:00")
+        _, fake = self.run_tick(fleet, now="2026-10-08T10:30:00+00:00", namespaces_fail_once={"a": DARK})
+        self.assertEqual(self.credential_fetches(fake), [], "still dark: no fetch")
+        _, fake = self.run_tick(fleet, now="2026-10-08T11:00:00+00:00")
+        self.assertEqual(self.credential_fetches(fake), [])
+        self.assertEqual(fake.scanned(), ["ns"])
+
     def test_a_timeout_on_a_reused_kubeconfig_costs_no_fetch_and_no_second_wait(self):
         # A cluster that has gone dark times out once, not twice around a
         # fetch, and keeps its record for when it answers again.
@@ -1573,6 +1589,56 @@ class Coverage(Base):
         recovered, _ = self.run_tick(fleet)
         self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
         self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+
+    def test_a_project_that_can_never_be_listed_does_not_hold_the_flag_up_for_good(self):
+        # The exhausting sweep already lacked the project. A later sweep that
+        # fits with as many clusters in play has shown the fleet fits, whatever
+        # is still unlisted; recovery posts, and the next exhaustion is heard.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, stall_watch.TICK_BUDGET_SECONDS + 1] + [stall_watch.TICK_BUDGET_SECONDS + 1] * 12):
+            still, _ = self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(still, [], "exhausted again, with the project gone from the listing: no repeated line")
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_EXHAUSTED_SWEEPABLE_KEY], 3)
+        recovered, _ = self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE], "fits with as many clusters in play as the sweep that exhausted")
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        self.assertIsNone(self.ledger()[stall_watch.BUDGET_EXHAUSTED_SWEEPABLE_KEY])
+        again, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(again), 1, "the next exhaustion is heard")
+
+    def test_a_tick_that_fits_only_because_an_identity_could_not_be_read_posts_no_recovery(self):
+        # A reconciler rewrite left d's config.yaml without its identity and
+        # nothing else names its project: the project is not listed, the sweep
+        # fits with one cluster fewer than the sweep that exhausted, and that
+        # shows nothing about the fit. Recovery waits for a sweep with the
+        # fleet in view.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        (self.profile_dir("d", project=other) / "config.yaml").write_text("{}\n")
+        partial, _ = self.run_tick({"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}})
+        self.assertEqual(partial, [], "a tick with an unread identity says nothing about the fit")
+        self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        again, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(again, [], "still exhausted: the line is not repeated")
+        recovered, _ = self.run_tick(fleet)
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+
+    def test_a_fleet_that_shrank_and_fits_with_everything_in_view_recovers(self):
+        # Two clusters deleted: fewer in play than the exhausting sweep, but
+        # every project listed and every identity read, so the fit is real.
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, "d": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        recovered, _ = self.run_tick({"a": {"ns": []}, "b": {"ns": []}})
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
 
     def test_the_coverage_line_posts_on_entering_exhaustion_not_every_tick_and_a_full_sweep_recovers(self):
         fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}}

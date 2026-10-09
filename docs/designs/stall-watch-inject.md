@@ -152,7 +152,9 @@ A read that timed out, that the proxy refused, or that failed with kubectl's gen
 `Unable to connect to the server` at a control plane that does not answer says nothing about the
 kubeconfig: no fetch, and the record stays, so one saturated tick or one dark cluster does not
 put the next rotation back on the fetch-everything path. A repair fetch that fails leaves no
-record, so the next tick fetches first. A cluster the
+record, so the next tick fetches first; a fetch followed by a read that says nothing about the
+kubeconfig is recorded, so a cluster dark on its fetch tick does not pay the fetch again on every
+tick it stays dark. A cluster the
 tick did not list keeps its record exactly when `verdict` keeps its rows (a failed listing, or an
 identity file unreadable this tick). On the 143-cluster install
 [`credential-proxy-child-memory-budget.md`](credential-proxy-child-memory-budget.md) §2 measured,
@@ -163,9 +165,12 @@ A sweep that stops at its wall-clock budget writes what it covered into the ledg
 the clusters read of the ones it could sweep, the namespaces read, the clusters it could not read
 and the cluster the next tick resumes at,
 and says it in chat once, on the tick the sweep first falls short, and once more when the fleet
-fits in one tick again with every project listed; a sweep that fit only because listings failed
-or were incomplete has not shown that, so it neither posts the recovery nor clears the flag. On
-such a fleet a cluster is read across consecutive ticks, so the
+fits in one tick again. The fit counts when the sweep had the fleet in view (every project
+listed, every identity read) or at least as many clusters in play as the sweep that exhausted,
+which the ledger keeps beside the flag; a sweep that fit with fewer because a listing failed or
+an identity could not be read has not shown the fleet fits, so it neither posts the recovery nor
+clears the flag, and the count is what keeps one project that can never be listed from holding
+the flag up for good. On such a fleet a cluster is read across consecutive ticks, so the
 operator's interval is the ticks a full pass takes rather than the 30-minute schedule; the budget
 entry is where to read it.
 

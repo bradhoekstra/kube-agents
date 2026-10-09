@@ -104,9 +104,11 @@ every roster entry owes, and the budget lines: "budget exhausted", said once on 
 tick a sweep first stops at its 25-minute budget, carrying the clusters read of the
 ones it could sweep, the namespaces read, the clusters it could not read and the cluster the
 next tick resumes at, and "the
-fleet is swept in one tick again" once a sweep completes with every project listed (a sweep
-that fit because listings failed or were incomplete says nothing about the fit, and posts
-nothing); the ledger's budget entry carries the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server
+fleet is swept in one tick again" once a sweep completes with the fleet in view, every project
+listed and every profile's identity read, or with at least as many clusters in play as the
+sweep that exhausted (a sweep that fit with fewer because a listing failed or an identity could
+not be read says nothing about the fit, and posts nothing); the ledger's budget entry carries
+the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so
@@ -123,7 +125,7 @@ credentials are fetched on its first tick, after a day, and after a read that sa
 itself is the problem (the shim refused a stub the sandbox lost, or kubectl met a refused connection or a changed
 certificate at a recreated cluster); otherwise the tick reuses the kubeconfig it has, and a read
 that timed out, that the proxy refused, or that an unanswering control plane failed leaves the
-record for the next tick. One project's listing failing holds
+record for the next tick, and writes one when it followed a fetch. One project's listing failing holds
 only that project's rows. The sweep fails, and posts the sweep-failed line, when
 every project's listing fails, when no management project resolves, when
 `stall_report.py` cannot be found, or when the sandbox is lost.

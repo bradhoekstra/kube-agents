@@ -266,6 +266,14 @@ REFETCH_SIGNALS = (
 #: the fleet fits in one tick again; the ledger's budget entry carries it
 #: every tick.
 BUDGET_EXHAUSTED_KEY = "budget_exhausted"
+#: Beside the flag: the clusters the exhausting sweep had in play (its
+#: sweepable count), so a later sweep that fits is judged against it. A failed
+#: listing or an unreadable identity only ever removes clusters, so a sweep
+#: that fits with fewer in play and something unlisted or unread has not shown
+#: the fleet fits; one that fits with at least as many has, whatever is still
+#: unlisted, and one that fits with everything listed and read has too, however
+#: the fleet shrank. None while the flag is down.
+BUDGET_EXHAUSTED_SWEEPABLE_KEY = "budget_exhausted_sweepable"
 COVERAGE_EXHAUSTED_PREFIX = "⏳ **Controller stall watch — budget exhausted:**"
 COVERAGE_RECOVERED_LINE = "✅ **Controller stall watch** — the fleet is swept in one tick again."
 
@@ -693,6 +701,7 @@ def empty_state() -> dict:
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
         BUDGET_EXHAUSTED_KEY: False,
+        BUDGET_EXHAUSTED_SWEEPABLE_KEY: None,
     }
 
 
@@ -815,6 +824,9 @@ class Sweep:
         self.read_clusters: set[str] = set()
         self.listed_namespaces: dict[str, set[str]] = {}
         self.unreadable: dict[str, str] = {}
+        #: Profiles whose cluster_identity could not be read this tick, so the
+        #: projects only they name were not listed (`roster_projects`).
+        self.unread_profiles: set[str] = set()
         self.budget_exhausted = False
         #: Where the budget stopped the sweep, for the next tick to start from.
         self.cursor: dict | None = None
@@ -830,6 +842,12 @@ class Sweep:
     @property
     def namespaces(self) -> int:
         return len(self.read_scopes)
+
+    def fleet_in_view(self) -> bool:
+        """Whether this tick saw the whole fleet: every project listed and
+        every profile's identity read. A sweep that fit the budget without
+        that has not shown the fleet fits (`tick`)."""
+        return not self.unlisted_projects and not self.unread_profiles
 
     def holds_unlisted(self, cid: str) -> bool:
         """Whether a cluster this tick did not list is held rather than gone:
@@ -991,6 +1009,7 @@ def sweep_fleet(
     tick's time, which a fetch this tick is recorded as."""
     projects, unread_profiles = roster_projects()
     sweep = Sweep({management_project} | projects)
+    sweep.unread_profiles = set(unread_profiles)
     sweep.unreadable.update(unread_profiles)
     records = dict(credentials or {})
     now = now or now_iso()
@@ -1030,14 +1049,16 @@ def sweep_fleet(
         project, name, location = split_cluster_id(cid)
         if sweep.out_of_budget(started, cid):
             break
-        fetched = False
-        readable = False
+        fetched = False  # a fetch was attempted this tick: at most one per cluster
+        wrote = False  # that fetch returned, so gcloud wrote the kubeconfig
+        readable = False  # the namespace read on it returned
         try:
             if credentials_current(records.get(cid), now):
                 kubeconfig = kubeconfig_path(project, name, location)
             else:
-                kubeconfig = fetch_credentials(project, name, location)
                 fetched = True
+                kubeconfig = fetch_credentials(project, name, location)
+                wrote = True
             try:
                 namespaces = list_namespaces(kubeconfig)
             except READ_FAILURES as exc:
@@ -1057,6 +1078,7 @@ def sweep_fleet(
                 # failing the same read on the same stub again.
                 fetched = True
                 kubeconfig = fetch_credentials(project, name, location)
+                wrote = True
                 namespaces = list_namespaces(kubeconfig)
             # The namespace read is what proves the kubeconfig: a fetch whose
             # kubeconfig just listed namespaces is recorded here, before the
@@ -1070,14 +1092,21 @@ def sweep_fleet(
         except READ_FAILURES as exc:
             sweep.unreadable[scope_key(cid)] = failure_text(exc)
             sweep.failed_clusters.add(cid)
-            # A fetch whose kubeconfig did not list namespaces is no record to
-            # reuse. Every other record stays: a reused one whose read failed
-            # for a reason no fetch repairs, and a fetched one whose read
-            # succeeded and whose discovery then failed. The next tick reads on
-            # it again, and one bad tick does not put the fleet back on the
-            # fetch-everything path.
+            # A fetch that failed, or whose kubeconfig the read indicted (a
+            # REFETCH_SIGNALS failure), is no record to reuse. Every other
+            # record stays, and a fetch gcloud completed whose read then failed
+            # for a reason no fetch repairs is recorded as if it had read: the
+            # kubeconfig is written, and a dark cluster on its fetch tick would
+            # otherwise pay the describe and the fetch on every tick it stays
+            # dark. The trade is a kubeconfig gcloud wrote but that is wrong
+            # without saying so, held for a day rather than re-described every
+            # tick. The next tick reads on it again, and one bad tick does not
+            # put the fleet back on the fetch-everything path.
             if fetched and not readable:
-                records.pop(cid, None)
+                if wrote and not refetch_repairs(exc):
+                    records[cid] = now
+                else:
+                    records.pop(cid, None)
             continue
         sweep.read_clusters.add(cid)
         sweep.listed_namespaces[cid] = set(namespaces)
@@ -1753,18 +1782,26 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
         state[CREDENTIALS_KEY] = sweep.credentials
-        if sweep.budget_exhausted and not state.get(BUDGET_EXHAUSTED_KEY):
-            lines.append(f"{COVERAGE_EXHAUSTED_PREFIX} {sweep.unreadable[BUDGET_SCOPE]}")
+        in_play = len(sweep.sweepable_clusters)
+        exhausted_with = state.get(BUDGET_EXHAUSTED_SWEEPABLE_KEY)
+        if sweep.budget_exhausted:
+            if not state.get(BUDGET_EXHAUSTED_KEY):
+                lines.append(f"{COVERAGE_EXHAUSTED_PREFIX} {sweep.unreadable[BUDGET_SCOPE]}")
             state[BUDGET_EXHAUSTED_KEY] = True
-        elif not sweep.budget_exhausted and not sweep.unlisted_projects:
-            # The fleet fit in one tick, and the whole fleet was listed. A
-            # sweep that finished inside the budget because listings failed or
-            # were incomplete has shown nothing about the fit: it neither
-            # posts the recovery nor clears the flag, as the sweep-failed path
-            # leaves the flag alone when every listing fails.
+            state[BUDGET_EXHAUSTED_SWEEPABLE_KEY] = in_play
+        elif sweep.fleet_in_view() or (exhausted_with is not None and in_play >= exhausted_with):
+            # The fleet fit in one tick, and this sweep had the whole fleet in
+            # view, or at least as many clusters in play as the sweep that
+            # exhausted. A sweep that fit with fewer in play because a listing
+            # failed or an identity could not be read has shown nothing about
+            # the fit: it neither posts the recovery nor clears the flag, as
+            # the sweep-failed path leaves the flag alone when every listing
+            # fails. The count is what keeps one project that can never be
+            # listed from holding the flag up for good.
             if state.get(BUDGET_EXHAUSTED_KEY):
                 lines.append(COVERAGE_RECOVERED_LINE)
             state[BUDGET_EXHAUSTED_KEY] = False
+            state[BUDGET_EXHAUSTED_SWEEPABLE_KEY] = None
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
         lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
     if not dry_run:
