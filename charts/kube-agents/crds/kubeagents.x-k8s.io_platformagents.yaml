@@ -11311,13 +11311,12 @@ spec:
                         events: the k8s_event_watcher_cluster_up series at 1, whose informer
                         has completed its initial list. The difference from ClustersRegistered
                         is the number of clusters silently unwatched, a stuck informer, a 403
-                        on the events list, or a stopped one. 0 is the normal reading while the
-                        watcher starts, so read a fall alongside the pod's age. A gauge, read
-                        and cleared the same way as ClustersRegistered. One poll in which no
-                        gateway replica could be read leaves both where they were; a second in
-                        a row clears both, because the operator then has no current reading and
-                        an absent field says so. The watcher may be down or merely unreachable;
-                        the UsageScrapeFailing Warning on this resource says which.
+                        on the events list, or a stopped one. A 0 is a reading, and the normal
+                        one while the watcher starts, so read a fall alongside the pod's age.
+                        Absent on the same terms as ClustersRegistered: one poll in which no
+                        gateway replica could be read leaves both where they were, and a
+                        second in a row clears both, because the operator then has no current
+                        reading and an absent field says so.
                       format: int64
                       type: integer
                     clustersRegistered:
@@ -11330,8 +11329,13 @@ spec:
                         exports, the largest reading across gateway replicas. The watcher
                         discovers its fleet once per process, so a cluster that joins or leaves
                         is counted after the gateway pod restarts, not before. A gauge, not a
-                        counter: it falls after such a restart, and it is cleared when the event
-                        watcher is disabled. Absent until the first poll reads the watcher.
+                        counter: it falls after such a restart. Absent when the operator has no
+                        current reading: before the first poll, while the event watcher is
+                        disabled, and after two polls in a row in which no gateway replica
+                        could be read, whether its listener failed, its pod was not running, or
+                        the operator could not reach it; the CR's events and the gateway pod's
+                        state say which. A 0 is a reading: the watcher answered and exports no
+                        series.
                       format: int64
                       type: integer
                     eventsIngestedTotal:

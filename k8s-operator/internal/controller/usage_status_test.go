@@ -94,7 +94,7 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	full := agentv1alpha1.AgentUsageStatus{
 		SessionsTotal: 3, EventsIngestedTotal: 4, ToolExecutionsTotal: 5,
 		RemediationsProposedTotal: 6, RemediationsAppliedTotal: 7,
-		ClustersRegistered: 8, ClustersMonitored: 9,
+		ClustersRegistered: ptr.To(int64(8)), ClustersMonitored: ptr.To(int64(9)),
 		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now,
 	}
 	got, err = json.Marshal(full)

@@ -201,6 +201,14 @@ func (s *stubUsageSource) scraped(addr string) bool {
 	return false
 }
 
+// gaugeValue reads a gauge field as a test compares it: -1 for absent.
+func gaugeValue(v *int64) int64 {
+	if v == nil {
+		return -1
+	}
+	return *v
+}
+
 // expireGaugeRecordForTest ages the CR's gauge pruning record past the reprobe
 // interval, as the clock would.
 func (p *UsageCounterPoller) expireGaugeRecordForTest(agent *agentv1alpha1.PlatformAgent) {
@@ -259,8 +267,8 @@ func newUsageHarness(t *testing.T, agent *agentv1alpha1.PlatformAgent, objs ...c
 				pa.Status.Usage = agentv1alpha1.AgentUsageStatus{}
 			}
 			if isAgent && h.pruningGauges {
-				pa.Status.Usage.ClustersRegistered = 0
-				pa.Status.Usage.ClustersMonitored = 0
+				pa.Status.Usage.ClustersRegistered = nil
+				pa.Status.Usage.ClustersMonitored = nil
 			}
 			return err
 		},
@@ -930,13 +938,22 @@ func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
 	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
-	h.stub.setClusters(gatewayAddr(), 3, 3)
+	// The watcher starting: its fleet built, no informer synced yet. A zero
+	// monitored is a reading and is written as one, not left absent.
+	h.stub.setClusters(gatewayAddr(), 3, 0)
 	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
 
-	h.poll(5)
+	h.poll(3)
 	status := h.status()
-	if h.patches != 1 || status.ClustersRegistered != 3 || status.ClustersMonitored != 3 {
-		t.Fatalf("first poll: %d patches, status %+v; want one patch writing 3/3", h.patches, status)
+	if h.patches != 1 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 0 {
+		t.Fatalf("the starting watcher: %d patches, status %+v; want one patch writing 3/0", h.patches, status)
+	}
+
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.poll(5)
+	status = h.status()
+	if h.patches != 2 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 3 {
+		t.Fatalf("first synced poll: %d patches, status %+v; want 3/3", h.patches, status)
 	}
 	if status.LastActiveTime != nil || status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
 		t.Fatalf("the gauges moved a counter or lastActiveTime: %+v", status)
@@ -945,7 +962,7 @@ func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
 	// A cluster's informer is held: monitored falls, registered does not.
 	h.stub.setClusters(gatewayAddr(), 3, 2)
 	h.poll(10)
-	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 2 {
+	if status := h.status(); h.patches != 3 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 2 {
 		t.Fatalf("after a fall: %d patches, status %+v; want 3/2", h.patches, status)
 	}
 	if status := h.status(); status.LastActiveTime != nil {
@@ -954,20 +971,20 @@ func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
 
 	// Unchanged: no write.
 	h.poll(15)
-	if h.patches != 2 {
+	if h.patches != 3 {
 		t.Fatalf("an unchanged reading wrote the status: %d patches", h.patches)
 	}
 
 	// The listener cannot be read once: the fields keep their last reading.
 	h.stub.fail(gatewayAddr(), usageScrapeKindRefused)
 	h.poll(20)
-	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 2 {
+	if status := h.status(); h.patches != 3 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 2 {
 		t.Fatalf("a failed scrape changed the gauges: %d patches, status %+v", h.patches, status)
 	}
 	// A second poll in a row with no gateway reading: the operator has no
 	// current reading, so both are cleared rather than held.
 	h.poll(25)
-	if status := h.status(); h.patches != 3 || status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
+	if status := h.status(); h.patches != 4 || status.ClustersRegistered != nil || status.ClustersMonitored != nil {
 		t.Fatalf("a standing watcher failure left the gauges: %d patches, status %+v", h.patches, status)
 	}
 
@@ -975,7 +992,7 @@ func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
 	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
 	h.stub.setClusters(gatewayAddr(), 2, 2)
 	h.poll(30)
-	if status := h.status(); status.ClustersRegistered != 2 || status.ClustersMonitored != 2 {
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 2 || gaugeValue(status.ClustersMonitored) != 2 {
 		t.Fatalf("after the watcher came back: %+v, want 2/2", status)
 	}
 }
@@ -994,7 +1011,7 @@ func TestUsagePoller_ClusterGaugesTakeTheLargestReplica(t *testing.T) {
 	h.stub.setClusters(bAddr, 4, 4)
 	h.stub.set(brokerAddr(), 0, nil)
 	h.poll(5)
-	if status := h.status(); status.ClustersRegistered != 4 || status.ClustersMonitored != 4 {
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 4 || gaugeValue(status.ClustersMonitored) != 4 {
 		t.Fatalf("two replicas: %+v, want 4/4", status)
 	}
 }
@@ -1014,7 +1031,7 @@ func TestUsagePoller_ClusterGaugesHoldWhileAnyReplicaIsRead(t *testing.T) {
 	for _, minute := range []int{5, 10, 15} {
 		h.poll(minute)
 	}
-	if status := h.status(); status.ClustersRegistered != 4 || status.ClustersMonitored != 4 {
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 4 || gaugeValue(status.ClustersMonitored) != 4 {
 		t.Fatalf("a failing sibling or broker touched the gauges: %+v, want 4/4", status)
 	}
 }
@@ -1029,7 +1046,7 @@ func TestUsagePoller_ClusterGaugesClearWhenNoGatewayIsReadable(t *testing.T) {
 	h.stub.setClusters(gatewayAddr(), 3, 3)
 	h.stub.set(brokerAddr(), 0, nil)
 	h.poll(5)
-	if status := h.status(); status.ClustersRegistered != 3 {
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 3 {
 		t.Fatalf("first poll: %+v", status)
 	}
 	// The gateway pod loses its IP (evicted and Pending again under the same
@@ -1043,11 +1060,11 @@ func TestUsagePoller_ClusterGaugesClearWhenNoGatewayIsReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.poll(10)
-	if status := h.status(); status.ClustersRegistered != 3 {
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 3 {
 		t.Fatalf("one poll without a readable gateway changed the gauges: %+v", status)
 	}
 	h.poll(15)
-	if status := h.status(); status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
+	if status := h.status(); status.ClustersRegistered != nil || status.ClustersMonitored != nil {
 		t.Fatalf("two polls without a readable gateway left the gauges: %+v", status)
 	}
 	pod.Status.PodIP = usageTestGatewayIP
@@ -1055,7 +1072,7 @@ func TestUsagePoller_ClusterGaugesClearWhenNoGatewayIsReadable(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.poll(20)
-	if status := h.status(); status.ClustersRegistered != 3 || status.ClustersMonitored != 3 {
+	if status := h.status(); gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 3 {
 		t.Fatalf("the reading did not come back: %+v", status)
 	}
 }
@@ -1066,12 +1083,12 @@ func TestUsagePoller_ClusterGaugesClearWhenTheWatcherIsOff(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usageTestAgent(created)
 	agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)}
-	agent.Status.Usage.ClustersRegistered = 3
-	agent.Status.Usage.ClustersMonitored = 3
+	agent.Status.Usage.ClustersRegistered = ptr.To(int64(3))
+	agent.Status.Usage.ClustersMonitored = ptr.To(int64(3))
 	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
 	h.stub.set(brokerAddr(), 70, nil)
 	h.poll(5)
-	if status := h.status(); h.patches != 1 || status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
+	if status := h.status(); h.patches != 1 || status.ClustersRegistered != nil || status.ClustersMonitored != nil {
 		t.Fatalf("watcher off: %d patches, status %+v; want one patch clearing both", h.patches, status)
 	}
 	h.poll(10)
@@ -1109,7 +1126,7 @@ func TestUsagePoller_GaugeOnlyProbeUnderAPruningCRD(t *testing.T) {
 	h.p.expireGaugeRecordForTest(agent)
 	h.pruning = false
 	h.poll(13)
-	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 3 {
+	if status := h.status(); h.patches != 2 || gaugeValue(status.ClustersRegistered) != 3 || gaugeValue(status.ClustersMonitored) != 3 {
 		t.Fatalf("after the record expired: %d patches, status %+v; want 2 and 3/3", h.patches, status)
 	}
 }
@@ -1130,7 +1147,7 @@ func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
 	h.poll(10)
 	h.stub.set(brokerAddr(), 20, nil)
 	h.poll(15)
-	if status := h.status(); status.ToolExecutionsTotal != 10 || status.ClustersRegistered != 0 {
+	if status := h.status(); status.ToolExecutionsTotal != 10 || status.ClustersRegistered != nil {
 		t.Fatalf("status after three polls: %+v, want 10 tool executions and no gauges", status)
 	}
 	if h.r.usageStatusPruned(agent) {

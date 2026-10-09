@@ -31,6 +31,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -451,7 +452,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			break
 		}
 	}
-	gauges := usageClusterGaugesForPoll(cached, scraped, p.noteGatewayReading(cached, gatewayRead))
+	gauges, gaugesKnown := usageClusterGaugesForPoll(cached, scraped, p.noteGatewayReading(cached, gatewayRead))
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -500,36 +501,53 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if ctx.Err() == nil {
 		p.recordStandingFailures(cached, failing, nil)
 	}
-	return p.projectStatus(ctx, agent, result.Document, gauges)
+	return p.projectStatus(ctx, agent, result.Document, gauges, gaugesKnown)
 }
 
-// usageClusterGaugesForPoll is the fleet reading this poll projects: the
+// usageClusterGaugesForPoll is the fleet reading this poll projects, and
+// whether it projects one at all. known false is a poll that says nothing
+// about the gauges: the watcher is on and no replica could be read for less
+// than the event streak, so the fields keep their last reading across a
+// restart or one missed poll. known true with a nil reading clears both
+// fields to absent: the watcher is off, or no gateway replica has been read
+// for the event streak (watcherDown), so the operator has no current reading
+// and an absent field says so where a held one would read as current; the
+// watcher may be down, its pod not running, or merely unreachable, and the
+// CR's events and the pod's state say which. known true with a reading is the
 // largest of each gauge across the gateway replicas read, because every
-// replica's watcher builds the same fleet and one mid-startup reports fewer;
-// zero, explicitly, when the watcher is off, so the fields clear rather than
-// hold the last fleet it watched, and again when no gateway replica has been
-// read for the event streak (watcherDown), because the operator then has no
-// current reading and an absent field says so where a held one would read as
-// current -- the watcher may be down, or merely unreachable, and the Warning
-// the scrape streak records says which; nil when the watcher is on and no
-// replica could be read for less than that, so the fields keep their last
-// reading across a restart or one missed poll.
-func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, watcherDown bool) *usageClusterGauges {
+// replica's watcher builds the same fleet and one mid-startup reports fewer; a
+// zero is a reading, and is written as one.
+func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, watcherDown bool) (reading *usageClusterGauges, known bool) {
 	if !eventWatcherEnabled(agent) || watcherDown {
-		return &usageClusterGauges{}
+		return nil, true
 	}
-	var largest *usageClusterGauges
 	for _, s := range scraped {
 		if s.Clusters == nil {
 			continue
 		}
-		if largest == nil {
-			largest = &usageClusterGauges{}
+		if reading == nil {
+			reading = &usageClusterGauges{}
 		}
-		largest.Registered = max(largest.Registered, s.Clusters.Registered)
-		largest.Monitored = max(largest.Monitored, s.Clusters.Monitored)
+		reading.Registered = max(reading.Registered, s.Clusters.Registered)
+		reading.Monitored = max(reading.Monitored, s.Clusters.Monitored)
 	}
-	return largest
+	return reading, reading != nil
+}
+
+// usageGaugeFields is a reading as the status carries it: nil pointers for
+// no reading, values, zero included, for one.
+func usageGaugeFields(reading *usageClusterGauges) (registered, monitored *int64) {
+	if reading == nil {
+		return nil, nil
+	}
+	return ptr.To(reading.Registered), ptr.To(reading.Monitored)
+}
+
+func usageGaugeEqual(a, b *int64) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
 }
 
 // reader is the uncached reader, falling back to the client where tests
@@ -865,20 +883,21 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 
 // projectStatus patches status.usage from doc and gauges when the status is
 // behind the document's totals, or when a cluster gauge differs from this
-// poll's reading in either direction, with a merge patch over the status as
-// read that touches nothing else; gauges nil leaves the gauge fields as they
-// are. Skipped while the served CRD is recorded as pruning status.usage, so an
+// poll's reading in either direction, absent included, with a merge patch
+// over the status as read that touches nothing else; gaugesKnown false leaves
+// the gauge fields as they are. Skipped while the served CRD is recorded as pruning status.usage, so an
 // operator ahead of its CRD costs one probe per interval across both writers;
 // the ConfigMap is current throughout, and the patch after the CRD lands
 // carries everything accumulated since. A gauge difference alone is likewise
 // skipped while the gauges' own pruning record is fresh, the served CRD at the
 // previous schema, so the counters that CRD serves keep landing every poll.
-func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges) error {
+func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges, gaugesKnown bool) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
 	usage := &agent.Status.Usage
-	gaugesMoved := gauges != nil && !p.gaugesPruned(agent) &&
-		(usage.ClustersRegistered != gauges.Registered || usage.ClustersMonitored != gauges.Monitored)
+	wantRegistered, wantMonitored := usageGaugeFields(gauges)
+	gaugesMoved := gaugesKnown && !p.gaugesPruned(agent) &&
+		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
 	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
@@ -890,23 +909,24 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
-	if gauges != nil {
-		usage.ClustersRegistered = gauges.Registered
-		usage.ClustersMonitored = gauges.Monitored
+	if gaugesKnown {
+		usage.ClustersRegistered = wantRegistered
+		usage.ClustersMonitored = wantMonitored
 	}
 	if err := p.r.Status().Patch(ctx, agent, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("patching status.usage: %w", err)
 	}
 	// The echoes: counters written non-zero that come back absent are the
 	// pruning of status.usage, recorded in the record the Ready writer shares;
-	// gauges written non-zero that come back absent are the gauges' own record,
-	// since a CRD at the previous schema prunes them and serves the counters. A
-	// patch that wrote only a time, or only zeros, says nothing either way.
+	// gauges written as a reading, a zero one included since a pointer to zero
+	// serialises, that come back absent are the gauges' own record, since a
+	// CRD at the previous schema prunes them and serves the counters. A patch
+	// that wrote only a time, or cleared the gauges, says nothing either way.
 	if tool > 0 || events > 0 {
 		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events)
 	}
-	if gauges != nil && (gauges.Registered > 0 || gauges.Monitored > 0) {
-		p.noteGaugeEcho(ctx, agent, agent.Status.Usage.ClustersRegistered == gauges.Registered && agent.Status.Usage.ClustersMonitored == gauges.Monitored)
+	if gauges != nil {
+		p.noteGaugeEcho(ctx, agent, usageGaugeEqual(agent.Status.Usage.ClustersRegistered, wantRegistered) && usageGaugeEqual(agent.Status.Usage.ClustersMonitored, wantMonitored))
 	}
 	return nil
 }
