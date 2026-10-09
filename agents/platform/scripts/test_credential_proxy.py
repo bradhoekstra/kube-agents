@@ -3666,6 +3666,32 @@ class CommandExecutorTest(unittest.TestCase):
         self.assertTrue(marker.exists())
         self.assertTrue(executor._provisional_window_open(marker), "the window was pushed out")
 
+    def test_a_failed_broker_fetch_does_not_mark_a_settled_file_a_caller_filed_meanwhile(self):
+        # A caller's fetch files outside _kubeconfig_lock, so between the
+        # broker's miss and its failed fetch a settled file can land. Serving it
+        # is right; marking it provisional would send it back to the fetch
+        # path a minute later and let an undecided refetch overwrite it.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        managed = executor._managed_kubeconfig(target)
+        original = executor._execute
+
+        def caller_lands_then_fetch_fails(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "get-credentials" in argv and "--help" not in argv:
+                managed.parent.mkdir(parents=True, exist_ok=True)
+                managed.write_text(f"apiVersion: v1\nkind: Config\ncurrent-context: {self.CONTEXT}\n")
+                return replace(result, exit_code=1, stderr="ERROR: 503")
+            return result
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])),
+            mock.patch.object(executor, "_execute", caller_lands_then_fetch_fails),
+        ):
+            served = executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertEqual(managed, served)
+        self.assertFalse(executor._provisional_marker(target).exists())
+
     def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
         # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
         # A scaffold's fetch must not queue behind it to file a credential it

@@ -6470,18 +6470,25 @@ class CommandExecutor:
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
                     if managed.is_file() and managed.stat().st_size > 0:
-                        # A provisional file past its window brought us here.
-                        # The mark was set when the GKE API was failing, and
-                        # the refetch has just met the same condition; the
+                        # A provisional file past its window brought us here,
+                        # or a caller filed a settled one while this fetch
+                        # ran. Either way the GKE API has just failed, the
                         # kubeconfig on disk may well still work, and serving
-                        # it beats a 400. The window is pushed out so the next
-                        # attempt waits again rather than retrying per request.
+                        # it beats a 400. A provisional file's window is
+                        # pushed out so the next attempt waits again rather
+                        # than retrying per request.
                         logging.warning(
                             "refetch of the provisional kubeconfig for %s failed (%s); serving the file on disk",
                             target.context_name, detail[:REFETCH_FAILURE_LOG_CHARS],
                         )
+                        # Only an existing mark is pushed out: a caller may
+                        # have filed a settled kubeconfig for this cluster
+                        # outside `_kubeconfig_lock` since the miss above, and
+                        # marking that file would send it back here a minute
+                        # later for an undecided refetch to overwrite.
                         with self._marker_lock:
-                            marker.touch()
+                            if marker.exists():
+                                marker.touch()
                         return managed
                     raise ValueError(
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
