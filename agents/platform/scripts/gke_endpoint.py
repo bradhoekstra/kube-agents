@@ -552,12 +552,19 @@ def endpoint_decision(
     runner = run or _default_runner(env, _DESCRIBE_TIMEOUT_SECONDS)
 
     if not gcloud_supports_dns_endpoint(runner):
-        # Settled, not undecided: the installed gcloud cannot grow the flag
-        # while we run, so this is the empty answer for the life of the
-        # process. An empty decision names no address, which is how callers
-        # that record the decision know there is nothing to record, and the
-        # credential proxy does not treat it as provisional.
-        return _NO_FLAG_DECISION
+        if _support_cache is False:
+            # Settled, not undecided: the installed gcloud answered and lacks
+            # the flag, and cannot grow it while we run, so this is the empty
+            # answer for the life of the process. An empty decision names no
+            # address, which is how callers that record the decision know
+            # there is nothing to record, and the credential proxy does not
+            # treat it as provisional.
+            return _NO_FLAG_DECISION
+        # The probe did not run or did not answer: nothing is settled, and
+        # gcloud_supports_dns_endpoint asks again on the next call. The same
+        # answer as a failed describe below -- the last thing gcloud said, or
+        # None, which the credential proxy marks provisional.
+        return cached[1] if cached is not None else None
 
     described = _describe(project, cluster, location, runner)
     if described is None:

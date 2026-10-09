@@ -449,6 +449,30 @@ class GcloudSupportTest(unittest.TestCase):
 
 
 class CacheTest(unittest.TestCase):
+    def test_a_probe_that_could_not_answer_leaves_the_decision_undecided(self):
+        # Three things make the support predicate say False, and only one of
+        # them is settled: the help text that lacks the flag. A probe that
+        # exited non-zero or could not run says nothing about which gcloud is
+        # installed, so the decision is None -- undecided, which the credential
+        # proxy marks provisional -- not the settled empty answer, which it
+        # would file for the life of the pod.
+        gke_endpoint.reset_cache()
+        runner = FakeRunner(PRIVATE_SAME_VPC)
+        runner.help_exit = 1
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            self.assertIsNone(gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner))
+        self.assertIsNone(gke_endpoint._support_cache, "a probe that did not answer is not memoised")
+
+        class Raising(FakeRunner):
+            def __call__(self, argv):
+                if "--help" in argv:
+                    raise OSError("no gcloud")
+                return super().__call__(argv)
+
+        gke_endpoint.reset_cache()
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            self.assertIsNone(gke_endpoint.endpoint_decision("p", "c", "us-central1", run=Raising(PRIVATE_SAME_VPC)))
+
     def test_same_cluster_is_described_once(self):
         runner = FakeRunner(DNS_EXTERNAL)
         gke_endpoint.reset_cache()

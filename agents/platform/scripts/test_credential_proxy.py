@@ -3593,6 +3593,29 @@ class CommandExecutorTest(unittest.TestCase):
         decide.assert_not_called()
         self.assertFalse(executor._provisional_marker(target).exists())
 
+    def test_a_help_probe_that_did_not_answer_leaves_the_fetch_provisional(self):
+        # The mirror of the failed-describe case through the real
+        # endpoint_decision: a support probe that exits non-zero on this one
+        # call is undecided, not "no flag", so the file is marked and refetched.
+        import gke_endpoint
+
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        gke_endpoint.reset_cache()
+        self.addCleanup(gke_endpoint.reset_cache)
+        original_execute = executor._execute
+
+        def failing_help(argv, **kwargs):
+            result = original_execute(argv, **kwargs)
+            if "--help" in argv:
+                return replace(result, exit_code=1, stdout="")
+            return result
+
+        with mock.patch.object(executor, "_execute", failing_help):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+        self.assertIsNone(gke_endpoint._support_cache)
+
     def test_a_fetch_with_no_decision_at_all_is_provisional_too(self):
         # The target describe failed with nothing cached: gcloud's default is
         # as unsettled as a fallback made without the own cluster.

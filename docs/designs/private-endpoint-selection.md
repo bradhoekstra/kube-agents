@@ -106,10 +106,12 @@ resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
 ## What the decision carries
 
 `endpoint_decision()` returns an `EndpointDecision`, or `None` when nothing could be decided
-now (an incomplete identity, a describe that failed with nothing cached). A gcloud without
-`--dns-endpoint` is a settled answer rather than `None`: an empty decision with no address,
-which no caller records and the credential proxy does not treat as provisional, since the
-installed gcloud cannot grow the flag while the pod runs:
+now (an incomplete identity, a describe that failed with nothing cached, a help probe that
+could not run or did not answer). A gcloud that answered the probe and lacks `--dns-endpoint`
+is a settled answer rather than `None`: an empty decision with no address, which no caller
+records and the credential proxy does not treat as provisional, since the installed gcloud
+cannot grow the flag while the pod runs; a probe that did not answer says nothing about which
+gcloud is installed and is asked again next time:
 
 | Field                 | Content                                                                           |
 | --------------------- | --------------------------------------------------------------------------------- |
