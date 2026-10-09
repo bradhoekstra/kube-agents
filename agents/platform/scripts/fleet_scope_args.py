@@ -16,6 +16,7 @@ repository through the same search path.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 
 SCOPE_PROJECTS_FLAG = "--scope-projects"
@@ -41,6 +42,19 @@ DECLARED_SCOPE_UNREAD_NOTE = (
 DECLARED_SCOPE_EMPTY_ERROR = (
     "the install's declared scope has no project this install could read this run{gap}; nothing was swept "
     "and nothing was listed"
+)
+# Set by the operator on the shell sandbox container (shell_sandbox_manifests.go,
+# envScopeDeclared): "true" when the PlatformAgent carries a spec.scope block.
+# A collector run there without the tool's flags must not list, because the
+# listing is exactly the sweep the block exists to bound; it reports this
+# instead and the agent passes collector_args. Unset, as in a checkout, means
+# nothing is known and the flags alone decide.
+SCOPE_DECLARED_ENV = "KUBEAGENTS_SCOPE_DECLARED"
+SCOPE_DECLARED_TRUE = "true"
+DECLARED_SCOPE_ARGS_MISSING_ERROR = (
+    "this install declares a scope (spec.scope on the PlatformAgent) but the collector was run without the "
+    "platform_control fleet_scope tool's collector_args, so it cannot know which projects are inside it; nothing "
+    "was swept and nothing was listed. Call fleet_scope and pass its collector_args verbatim"
 )
 # The tail the project-level audits put on an unenumerated-projects row when the
 # scope was declared: the fleet's size is known there, which is the point.
@@ -91,19 +105,29 @@ class DeclaredScope:
 
     def __init__(self) -> None:
         self.declared = False
+        self.args_missing = False
         self.projects: list[str] | None = None
         self.unread: list[tuple[str, str]] = []
 
     def set(self, scope_projects: str | None, scope_unread: str | None) -> None:
         """Records `--scope-projects` and `--scope-unread`. Either flag passed,
         even blank, is a declared scope; `projects` is then the list, possibly
-        empty, and None only when neither flag was passed."""
-        self.declared = scope_projects is not None or scope_unread is not None
+        empty. Neither flag on a sandbox whose operator says the install
+        declares a scope (SCOPE_DECLARED_ENV) is a declared scope too, with
+        nothing to sweep and `args_missing` set, so the run reports rather than
+        lists. `projects` is None only when nothing declares a scope."""
+        flagged = scope_projects is not None or scope_unread is not None
+        self.args_missing = not flagged and os.environ.get(SCOPE_DECLARED_ENV, "").strip().lower() == SCOPE_DECLARED_TRUE
+        self.declared = flagged or self.args_missing
         self.projects = parse_scope_projects(scope_projects) if self.declared else None
         self.unread = parse_scope_unread(scope_unread)
 
     def empty_error(self) -> str:
-        """The error a declared scope with nothing readable reports."""
+        """The error a declared scope with nothing to sweep reports: the flags
+        were not passed on an install that declares a scope, or they named no
+        readable project."""
+        if self.args_missing:
+            return DECLARED_SCOPE_ARGS_MISSING_ERROR
         note = self.note()
         return DECLARED_SCOPE_EMPTY_ERROR.format(gap=f" ({note})" if note else "")
 

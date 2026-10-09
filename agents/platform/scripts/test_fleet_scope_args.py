@@ -8,7 +8,9 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
+import os
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -53,6 +55,26 @@ class FleetScopeArgsTest(unittest.TestCase):
         scope.set("", None)
         self.assertEqual((scope.declared, scope.projects), (True, []))
         self.assertNotIn("(", scope.empty_error().split("this run")[1][:2])
+
+    def test_the_operators_answer_makes_a_run_without_the_flags_declared_and_empty(self):
+        # The sandbox cannot see the snapshot, so the operator sets the env:
+        # on an install with a scope block a collector run without the flags
+        # must report, not list. A checkout, or an install without a block,
+        # leaves the flags alone to decide.
+        scope = fsa.DeclaredScope()
+        with mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "true"}):
+            scope.set(None, None)
+            self.assertEqual((scope.declared, scope.args_missing, scope.projects), (True, True, []))
+            self.assertIn("without the platform_control fleet_scope tool's collector_args", scope.empty_error())
+            scope.set("ops-mgmt", None)
+            self.assertEqual((scope.declared, scope.args_missing, scope.projects), (True, False, ["ops-mgmt"]))
+        with mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "false"}):
+            scope.set(None, None)
+            self.assertEqual((scope.declared, scope.projects), (False, None))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(fsa.SCOPE_DECLARED_ENV, None)
+            scope.set(None, None)
+            self.assertEqual((scope.declared, scope.projects), (False, None))
 
     def test_a_repeated_project_id_is_swept_once(self):
         self.assertEqual(fsa.parse_scope_projects("ops-mgmt,payments-prod,ops-mgmt"), ["ops-mgmt", "payments-prod"])

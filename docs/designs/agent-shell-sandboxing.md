@@ -1817,7 +1817,10 @@ answer for the profile scripts is an MCP tool, since the MCP server runs in the 
 pod. `platform_mcp_server.py` carries the reads of that volume, `list_cluster_profiles` and
 `get_cluster_profile_name`, which is how the agent finds a kanban assignee, and `fleet_scope`, which
 hands the fleet audits the reconcile's scope snapshot they cannot read from here; creating and
-deleting a profile still has no tool.
+deleting a profile still has no tool. What this pod does know about the scope is one bit the operator
+sets on its container, `KUBEAGENTS_SCOPE_DECLARED`: whether the CR carries a block at all, so that a
+collector run here without the tool's flags refuses to enumerate projects rather than sweep past the
+boundary it cannot see.
 
 None of this is held together by review.
 [`test_sandbox_delivery.py`](../../agents/platform/scripts/test_sandbox_delivery.py)
