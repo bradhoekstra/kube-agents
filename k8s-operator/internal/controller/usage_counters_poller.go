@@ -119,7 +119,7 @@ type UsageCounterPoller struct {
 	mu      sync.Mutex
 	streaks map[types.UID]*usageScrapeStreak
 	// prunedGauges records, per CR, the last poll in which the two cluster
-	// gauges were written non-zero and came back absent: a served CRD at the
+	// gauges were written as a reading, zero included, and came back absent: a served CRD at the
 	// previous schema, which has the counters and not the gauges. Its own
 	// record rather than the counters' shared one, because that record
 	// suppresses every status.usage write for the interval and the counters
@@ -130,8 +130,8 @@ type UsageCounterPoller struct {
 	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
 	// replica's body was read while the watcher is on: listeners failing, pods
 	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
-	// the poll projects the gauges as zero, so an absent field reads as the no
-	// current reading it is rather than a held one reading as current. In
+	// the poll clears the gauges to absent, the no current reading it is,
+	// rather than holding one that reads as current. In
 	// memory, like streaks: a leader change delays the clear by one streak and
 	// never advances it.
 	gatewayMisses map[string]int
@@ -239,7 +239,7 @@ func (p *UsageCounterPoller) noteGaugeEcho(ctx context.Context, agent *agentv1al
 
 // noteGatewayReading records whether this poll read any gateway replica's body
 // for the CR and reports whether the misses have reached the streak at which
-// the gauges are projected as zero. A reading, or the watcher being off, ends
+// the gauges are cleared to absent. A reading, or the watcher being off, ends
 // the run of misses.
 func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAgent, read bool) bool {
 	p.mu.Lock()

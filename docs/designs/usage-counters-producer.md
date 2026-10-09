@@ -109,8 +109,9 @@ the same reasoning: one status write per interval is a cost nobody notices) it l
    time of the poll that moved them, then patches `status.usage` when the status is behind the
    ConfigMap, copying its totals and that time as `lastActiveTime`. The order, ConfigMap first,
    is deliberate; the resets section says why. The same patch carries the two cluster gauges
-   when this poll's reading differs from the status in either direction, zero when the watcher
-   is off, and leaves them as they were when no gateway pod could be read.
+   when this poll's reading differs from the status in either direction, a zero reading
+   included; clears them to absent when the watcher is off, and on the second poll in a row in
+   which no gateway pod could be read; and leaves them as they were on the first such poll.
 
 Nothing in `Reconcile`'s accounting changes: the reconcile loop keeps writing `activeInterfaces`
 through the Ready writer as it does today, the poller never touches that field, and the Ready
