@@ -403,6 +403,24 @@ class PreflightDecisionTest(unittest.TestCase):
             got = self._requirements(override)
             self.assertEqual(got, base, f"a refused override {override} moved the footprint; it must count defaults")
 
+    def test_agent_api_auth_refused_override_at_rounding_boundary_counts_defaults(self) -> None:
+        """The operator compares the exact resource.Quantity (request.Cmp(limit)); the
+        preflight must decide "would the operator render this?" on the same exact figures,
+        not on parseBytes/parseCpuMillis which ceil an m-suffixed quantity. An override a
+        rounding step under a default crosses the pair for the operator while the rounded
+        value lands back on the default, so a gate on the rounded integers counts it as
+        rendered and moves the footprint under the quota the operator never asks for."""
+        base = self._requirements()
+        # 402653183500m = 402653183.5 bytes, half a byte under the 384Mi default request;
+        # the operator refuses (limit < default request) and renders at 2Gi, Degraded.
+        # 149.5m = 0.1495 cores, under the 150m default request; same refusal.
+        for override in (
+            [f"{_AA_VALUE}.limits.memory=402653183500m"],
+            [f"{_AA_VALUE}.limits.cpu=149.5m"],
+        ):
+            got = self._requirements(override)
+            self.assertEqual(got, base, f"a boundary refusal {override} moved the footprint; it must count defaults")
+
     def test_agent_api_auth_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
         # The footprint path reads the override too; with the CR template removed, a bad
         # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck

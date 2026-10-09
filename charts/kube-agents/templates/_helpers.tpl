@@ -1654,9 +1654,28 @@ The defaults carry no ephemeral-storage request because the operator renders non
          refuse those -- they stay the operator's and the webhook's -- so the preflight must count the
          override's delta only for an override the operator will actually render, or it under- or
          over-counts the pod against the quota the operator never asks for. */ -}}
+  {{- /* The refusal is the operator's exact resource.Quantity comparison, so it reads the
+         merged raw quantities through kube-agents.quantityExact rather than the rounded
+         $mMemLim/$mMemReq integers above: parseBytes and parseCpuMillis ceil an m/u/n
+         quantity, so a limit half a byte under a default request rounds up onto it and the
+         integer gate would miss a crossed pair the operator refuses. The proxy's CR block
+         decides the same thing on the same exact figures (platform-agent-cr.yaml). The
+         rounded integers stay the quota-sum arithmetic, which wants the whole-byte figure. */ -}}
+  {{- $mCpuLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" (index $aaLimDef "cpu")) -}}
+  {{- $mCpuReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" (index $aaReqDef "cpu")) -}}
+  {{- $mMemLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" (index $aaLimDef "memory")) -}}
+  {{- $mMemReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" (index $aaReqDef "memory")) -}}
+  {{- $mEphLimRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" (index $aaLimDef "ephemeral-storage")) -}}
+  {{- $mEphReqRaw := include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "ephemeral-storage") "fallback" $mEphLimRaw) -}}
+  {{- $xCpuLim := include "kube-agents.quantityExact" (dict "raw" $mCpuLimRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.limits.cpu") | float64 -}}
+  {{- $xCpuReq := include "kube-agents.quantityExact" (dict "raw" $mCpuReqRaw "cpu" true "key" "platformAgent.deployment.agentAPIAuth.resources.requests.cpu") | float64 -}}
+  {{- $xMemLim := include "kube-agents.quantityExact" (dict "raw" $mMemLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.memory") | float64 -}}
+  {{- $xMemReq := include "kube-agents.quantityExact" (dict "raw" $mMemReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.memory") | float64 -}}
+  {{- $xEphLim := include "kube-agents.quantityExact" (dict "raw" $mEphLimRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.limits.ephemeral-storage") | float64 -}}
+  {{- $xEphReq := include "kube-agents.quantityExact" (dict "raw" $mEphReqRaw "cpu" false "key" "platformAgent.deployment.agentAPIAuth.resources.requests.ephemeral-storage") | float64 -}}
   {{- $aaRefused := false -}}
-  {{- if or (eq $mCpuLim (int64 0)) (eq $mMemLim (int64 0)) (eq $mEphLim (int64 0)) -}}{{- $aaRefused = true -}}{{- end -}}
-  {{- if or (gt $mCpuReq $mCpuLim) (gt $mMemReq $mMemLim) (gt $mEphReq $mEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if or (eq $xCpuLim 0.0) (eq $xMemLim 0.0) (eq $xEphLim 0.0) -}}{{- $aaRefused = true -}}{{- end -}}
+  {{- if or (gt $xCpuReq $xCpuLim) (gt $xMemReq $xMemLim) (gt $xEphReq $xEphLim) -}}{{- $aaRefused = true -}}{{- end -}}
   {{- if not $aaRefused -}}
   {{- $podReqCpu = add $podReqCpu (sub $mCpuReq $defCpuReq) -}}
   {{- $podLimCpu = add $podLimCpu (sub $mCpuLim $defCpuLim) -}}
