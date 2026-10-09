@@ -434,9 +434,8 @@ whether you think it should be fixed, pushed back on, or deferred, and let the u
 you change code. A finding you disagree with gets answered in its thread, not dropped.
 [The stop rule](docs/pull-request-workflow.md#green-is-settled) has the full text. A push
 re-triggers nothing; before green, at most two `/review`s of your own, and at the third reviewed
-commit the pull request goes to a human whatever the colour: `/request-review` if nobody is
-requested yet, then stop. **Green is settled**: a `success` check ends the bot's part — no
-`/review` in any form after it, no draft-to-ready or close-and-reopen to buy one; answer each open
+commit the pull request goes to a human whatever the colour: `/request-review` if no human has reviewed yet, then stop. **Green is settled**: a `success` check ends the bot's part — no
+`/review` in any form after it, no draft toggle or reopen to buy one; answer each open
 🟠 Medium by reply, push a fix only for one you would have fixed unasked, and the human rules on
 the rest; only a human requesting changes, a non-author's `/review`, or a diff grown past twice the
 green head's size owes one more. On a later round, decline by default: a 🟠 Medium is fixed only as
@@ -448,17 +447,17 @@ nothing of yours earns no `/review`.
 The body moves with the push: **Testing**, **Live validation** and **Self-Review** go current in
 the same push as the fix, before any `/review`, folded in, not appended; a skipped live run is
 written `Not live-tested: <what a run would show, why no install reaches it>`; a description ask
-the bot repeats after your reply is a dispute for the human reviewer, not another edit.
+repeated after your reply is a dispute for the human reviewer, not another edit.
 
 **Then resolve a thread** — the bot's or a human's — when you are **fully confident the issue is
 addressed**: the fix is on the pull request head and you can name the commit, or the finding is
-factually wrong and you have said why (against the merge target as it stands, not a stale checkout).
-Anything short of that — a judgment call, a declined ask, an unanswered rebuttal — stays open with a
-reply; resolving does not end a disagreement. A `kube-agents-bot` finding you decline, bar the
-description one, stays open with its reply for the human reviewer, who resolves it; with a user in
-the loop you may resolve it once your reply and **Self-Review** give the reason, but prefer not to.
-Reply first, always: a resolved thread collapses, so the reply is the only record a reviewer may
-ever see.
+factually wrong and you have said why (against the merge target, not a stale checkout). Anything
+short of that — a judgment call, a declined ask, an unanswered rebuttal — stays open with a reply;
+resolving does not end a disagreement. A `kube-agents-bot` finding you decline stays open with its
+reply until a human review rules on it, then you resolve it citing that review; with a user in the
+loop you may resolve it, bar the description one, once your reply and **Self-Review** give the
+reason, but prefer not to. Reply first: a resolved thread collapses, and the reply is the only
+record a reviewer may see.
 
 ## Before Reviewing Someone Else's Pull Request
 

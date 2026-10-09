@@ -375,19 +375,18 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   `/review`s of your own: after a push, or `/review fresh` after an edit to the body alone, which
   is one of the two; a retry of a review that never arrived ([waiting for it](#waiting-for-it)) is
   not. At the third reviewed commit, or once both are spent, the pull request goes to a human
-  whatever the colour: comment `/request-review` if nobody is requested yet — the command on the
-  first line, then a line for the reviewer naming the commit that fixed any 🔴 High and saying that
+  whatever the colour: comment `/request-review` if no human has reviewed or been requested yet —
+  the command on the first line, then a line for the reviewer naming the commit that fixed any 🔴 High and saying that
   the bot re-runs on their `/review` and you will not ask for one — and stop. A requested reviewer
   is the end of self-service — reply in the threads and wait for them.
 - **Decline by default on a later round.** On a round after the first, fix a 🟠 Medium only when
   its **Kind** line says `behaviour`, it is on code this pull request added, and the fix is one
   mechanical edit per site that adds no file, helper, branch, flag, dependency or regex
-  alternative; a class is fixed whole or deferred whole; a gate regex this pull request wrote takes
-  the data-file fix or leaves the pull request. Otherwise reply
+  alternative; a class is fixed whole or deferred whole. Otherwise reply
   `declined: <reason about this change>` or `deferred to #N`, record it in **Self-Review**, leave
   the thread open for the approving human, and request no re-read; a round that pushed nothing —
   every finding declined, deferred or refuted — goes to the human instead: `/request-review` if
-  nobody is requested yet. A finding that correctly applies a rule with no exemption is still a fix
+  no human has reviewed or been requested yet. A finding that correctly applies a rule with no exemption is still a fix
   on a first review and, when it is a 🔴 High, on any round; a High you can show wrong is a
   refutation in its thread like any other, and a High whose fix would add a mechanism is the design
   question below, not a build.
@@ -404,11 +403,12 @@ posting every Medium as a thread and sets no round budget of its own — the sto
 - **A merge of `main` or a rebase that changes nothing of yours earns no `/review`.** The bot
   re-reads the whole pull request at full price and samples a large diff differently each time;
   eleven of the eighteen rounds on #2360 were on merges of `main`.
-- **Resolving.** An unattended agent replies and leaves a declined bot thread open for the
-  reviewer, who resolves it. With a user in the loop you may resolve a declined `kube-agents-bot`
-  finding once the reply and **Self-Review** give the reason, but a resolved thread collapses and
-  the summoned reviewer may never see it, so prefer leaving it open with the reply
-  ([resolving conversations](#resolving-conversations)).
+- **Resolving.** An unattended agent replies and leaves a declined bot thread open until a human
+  review rules on it: a review submitted while the thread is open is the ruling, and the agent then
+  resolves the thread, citing that review. With a user in the loop you may resolve a declined
+  `kube-agents-bot` finding earlier, once the reply and **Self-Review** give the reason, but a
+  resolved thread collapses and the summoned reviewer may never see it, so prefer leaving it open
+  with the reply ([resolving conversations](#resolving-conversations)).
 
 ### Replying to a finding
 
@@ -424,9 +424,10 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
 `kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve
 what a commit fixed or you showed wrong, except the description thread, which waits for the body
-edit described below. A declined bot finding is better left open with its reply for the human
-reviewer, who resolves it; with a user in the loop you may resolve it once the reply and
-**Self-Review** give the reason ([green is settled](#green-is-settled)). A pull request carrying
+edit described below. A declined bot finding is better left open with its reply until a human
+review rules on it: a review submitted while the thread is still open is the ruling, and hands the
+thread back to you to resolve, citing that review; with a user in the loop you may resolve it
+earlier once the reply and **Self-Review** give the reason ([green is settled](#green-is-settled)). A pull request carrying
 both `lgtm` and `approved` with a thread still open also carries the `do-not-merge` label,
 applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
 resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
@@ -717,9 +718,10 @@ a fortnight is that both sides believe it is the other's. The rule:
 
 **The author owns it while it is blocked on them** — a draft, a failing or cancelled check that
 `tide` names, merge conflicts, unresolved review threads (bar a `kube-agents-bot` thread whose last
-comment is the author's `declined:` or `deferred to #N` reply, which the requested reviewer rules on
-and resolves — [green is settled](#green-is-settled)), changes requested, or no human reviewer
-requested yet.
+comment is the author's `declined:` or `deferred to #N` reply, which waits for the requested
+reviewer's ruling; a human review submitted while it is open is that ruling, and the thread is the
+author's again, to resolve citing it — [green is settled](#green-is-settled)), changes requested,
+or no human reviewer requested yet.
 **Otherwise the requested reviewers own it.** A past reviewer does not: an approval already given
 is not an outstanding obligation. `kube-agents-bot` and other bot reviewers never count either way.
 
