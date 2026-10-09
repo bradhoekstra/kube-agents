@@ -11442,7 +11442,8 @@ spec:
                     lastActiveTime:
                       description: |-
                         LastActiveTime is the time of the last poll in which a counter above
-                        moved: a brokered command ran, or an event was accepted for triage.
+                        moved: a brokered command ran, a proposal was opened, or an event was
+                        accepted for triage.
                         Until SessionsTotal has a source, a chat turn that runs no brokered
                         command does not move it. Scheduled maintenance jobs that run brokered
                         commands do move it, though -- the Controller Stall Watch cron runs some
