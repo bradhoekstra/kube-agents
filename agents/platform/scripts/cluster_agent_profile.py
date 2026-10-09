@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 import sandbox_exec
-from gke_endpoint import dns_endpoint_args
+from gke_endpoint import EndpointDecision, endpoint_decision
 from profile_scaffold import (
     HERMES_BIN,
     backfill_cron_file,
@@ -77,6 +77,14 @@ KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 
 # What the reconcile engine and the roster read as "this profile is finished".
 USER_MD_NAME = "USER.md"
+# The one connection attempt the scaffold makes after pinning the kubeconfig,
+# so an unreachable cluster is reported here, with the endpoint it was reached
+# over, rather than discovered by the first Cluster Agent run. `kubectl
+# version` is the cheapest authenticated GET and is on the credential proxy's
+# read allowlist. The request timeout is the API server's; the outer bound
+# covers the sandbox hop and the broker's admission wait in front of it.
+CONNECTIVITY_PROBE_REQUEST_TIMEOUT = "5s"
+CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
 
 
 def log(msg: str) -> None:
@@ -309,6 +317,70 @@ def _push_sandbox_layout(name: str) -> None:
             "the next container start retries it")
 
 
+def _endpoint_bullets(decision: EndpointDecision | None) -> str:
+    """The decision as `- key: value` bullets for USER.md, or "" with none.
+
+    Four keys, the last only when there is something to say: `endpoint`,
+    `endpoint-address`, `authorized-networks`, `endpoint-remedy`.
+    cluster_preflight.sh reads them into check 5's failure report, so the
+    keys are a contract with its user_md_field()/user_md_text().
+    """
+    if decision is None:
+        return ""
+    lines = [
+        f"- endpoint: {decision.kind}",
+        f"- endpoint-address: {decision.address}",
+        f"- authorized-networks: {decision.authorized_networks_text()}",
+    ]
+    if decision.remedy:
+        lines.append(f"- endpoint-remedy: {decision.remedy}")
+    return "\n".join(lines) + "\n"
+
+
+def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision | None) -> bool:
+    """One authenticated GET against the pinned kubeconfig; log why it failed.
+
+    Never raises and never fails the scaffold: a cluster that is unreachable
+    now may be reachable once the operator acts on the remedy, and a profile
+    that was refused here would only be retried on the next tick with the
+    same result. The log line is the diagnostic
+    docs/designs/private-endpoint-selection.md asks for: the endpoint kind and
+    address the kubeconfig names, the authorized-networks list, and the
+    remedy, followed by kubectl's own last line.
+    """
+    argv = ["kubectl", "version", f"--request-timeout={CONNECTIVITY_PROBE_REQUEST_TIMEOUT}"]
+    try:
+        completed = sandbox_exec.run(
+            argv,
+            remote_env={"KUBECONFIG": str(kubeconfig)},
+            local_env=_run_env({"KUBECONFIG": str(kubeconfig)}),
+            timeout=CONNECTIVITY_PROBE_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"{name}: connectivity probe did not finish within "
+            f"{CONNECTIVITY_PROBE_TIMEOUT_SECONDS}s; the Cluster Agent's preflight will report")
+        return False
+    except (sandbox_exec.SandboxUnavailable, OSError) as e:
+        log(f"{name}: connectivity probe did not run ({e})")
+        return False
+    if completed.returncode == 0:
+        return True
+    # kubectl prints its client version first and the server error last.
+    detail = ""
+    for line in reversed((completed.stderr or "").splitlines()):
+        if line.strip():
+            detail = line.strip()
+            break
+    if decision is None:
+        log(f"{name}: cannot reach the cluster API server. kubectl: {detail}")
+        return False
+    remedy = f" {decision.remedy}" if decision.remedy else ""
+    log(f"{name}: cannot reach the cluster API server over its {decision.kind} endpoint "
+        f"({decision.address}); authorized networks: {decision.authorized_networks_text()}."
+        f"{remedy} kubectl: {detail}")
+    return False
+
+
 def create_profile(project: str, cluster: str, location: str) -> str:
     """Scaffold (idempotently) a Cluster Agent profile for a GKE cluster; return its name.
 
@@ -391,20 +463,24 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # so uid 1001 could write into a tree uid 1000 owns — is a symlink-follow
     # waiting to happen, and the file has to end up `agent`-readable regardless
     # because the Cluster Agent's own kubectl reads current-context out of it.
-    # dns_endpoint_args below stays on the default login: it consumes gcloud's
+    # endpoint_decision below stays on the default login: it consumes gcloud's
     # output as a fact about the cluster, which is what TERMINAL_PRINCIPAL is
     # not for.
     kubeconfig = home / "kubeconfig.yaml"
     env = _run_env({"KUBECONFIG": str(kubeconfig)})
+    # Onboarded clusters are arbitrary fleet members: some are reachable only
+    # over the DNS endpoint, others only over the private endpoint on this
+    # pod's own VPC, others publish a DNS endpoint that refuses external
+    # traffic. gke_endpoint reads which before deciding, and the decision is
+    # kept so USER.md and the probe below can say what was chosen.
+    decision = endpoint_decision(project, cluster, location, env=env)
+    endpoint_flags = list(decision.flags) if decision is not None else []
     try:
         sandbox_exec.run(
             [
                 "gcloud", "container", "clusters", "get-credentials", cluster,
                 f"--location={location}", f"--project={project}",
-                # Onboarded clusters are arbitrary fleet members: some are reachable
-                # only over the DNS endpoint, others publish one that refuses
-                # external traffic. gke_endpoint reads which before deciding.
-                *dns_endpoint_args(project, cluster, location, env=env),
+                *endpoint_flags,
             ],
             check=True, timeout=60,
             remote_env={"KUBECONFIG": str(kubeconfig)},
@@ -463,13 +539,18 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # It stays informational even so: the pin the runtime honours is KUBECONFIG
     # in the profile's .env (step 3b), not this line. Repointing an agent means
     # re-running this scaffold, not editing USER.md.
+    #
+    # The endpoint bullets are the diagnostic
+    # docs/designs/private-endpoint-selection.md describes; preflight check 5
+    # reads them when the cluster does not answer.
     (home / USER_MD_NAME).write_text(
         "# Cluster Agent Context\n\n"
         "This Cluster Agent is permanently scoped to the following GKE cluster:\n\n"
         f"- project: {project}\n"
         f"- cluster: {cluster}\n"
         f"- location: {location}\n"
-        f"- kubeconfig: {kubeconfig}\n\n"
+        f"- kubeconfig: {kubeconfig}\n"
+        f"{_endpoint_bullets(decision)}\n"
         "The authoritative KUBECONFIG pin lives in this profile's `.env`; the\n"
         "line above records it for reference. To repoint this agent, re-run\n"
         "`cluster_agent_profile.py create` — do not hand-edit this file.\n",
@@ -484,6 +565,10 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # before this file existed, so it has to run once more now. Cheap and
     # idempotent -- the skeleton is mkdir -p and the identity write overwrites.
     _push_sandbox_layout(name)
+
+    # 6. One connection attempt, now that the kubeconfig and the identity are
+    # both where kubectl will look. Informational: see _probe_connectivity.
+    _probe_connectivity(name, kubeconfig, decision)
     return name
 
 

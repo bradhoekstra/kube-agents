@@ -26,6 +26,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "deploy" / "shared"
 
 import cluster_agent_profile as cap  # noqa: E402
 import terminal_env_pin  # noqa: E402
+import gke_endpoint  # noqa: E402
+
+
+def a_decision(**overrides):
+    """An --internal-ip decision for a restricted private cluster, the shape the
+    scaffold has the most to say about; override fields per test."""
+    base = dict(
+        flags=("--internal-ip",), kind=gke_endpoint.KIND_INTERNAL_IP, address="10.10.0.2",
+        same_network=True, authorized_networks=("10.0.0.0/8", "172.16.0.0/12"),
+        remedy=gke_endpoint.REMEDY_INTERNAL_IP,
+    )
+    base.update(overrides)
+    return gke_endpoint.EndpointDecision(**base)
 
 MAX = cap.MAX_NAME_LEN  # 63
 
@@ -193,14 +206,17 @@ class CreateProfileTest(unittest.TestCase):
         self.runs = []
         self.writes_kubeconfig = True
         self._patch(subprocess, "run", self._fake_run)
-        # Whether that command needs --dns-endpoint. Patched explicitly rather
-        # than left to fall out of the fake above: gke_endpoint reads gcloud's
-        # help text to decide the flag exists at all, the fake answers every
+        # Which endpoint that command names. Patched explicitly rather than
+        # left to fall out of the fake above: gke_endpoint reads gcloud's help
+        # text to decide the flag exists at all, the fake answers every
         # command with empty stdout, and the resulting "no flag" would be an
         # accident of the mock rather than a decision the test made. The
         # predicate itself is covered in test_gke_endpoint.py.
-        self.dns_args = []
-        self._patch(cap, "dns_endpoint_args", lambda *a, **k: self.dns_args)
+        self.decision = None
+        self._patch(cap, "endpoint_decision", lambda *a, **k: self.decision)
+        # Whether the connectivity probe after the scaffold succeeds.
+        self.probe_exit = 0
+        self.probe_stderr = ""
         # The managed terminal pin needs Hermes, which is not installed here; its own
         # behaviour is covered in tests/test_terminal_env_pin.py and at image build.
         self.pinned = []
@@ -226,6 +242,9 @@ class CreateProfileTest(unittest.TestCase):
 
     def _fake_run(self, cmd, **kwargs):
         self.runs.append(cmd)
+        if cmd[:2] == ["kubectl", "version"]:
+            return subprocess.CompletedProcess(
+                cmd, self.probe_exit, "Client Version: v1.33.0\n", self.probe_stderr)
         # Real gcloud writes the file its KUBECONFIG names, and the scaffold
         # checks that it did before calling the profile finished. A fake that
         # exits 0 without writing is a fake of the failure, not of the success.
@@ -363,11 +382,92 @@ class CreateProfileTest(unittest.TestCase):
         # An onboarded cluster whose control plane is only reachable by DNS. The
         # profile's pinned kubeconfig is what the Cluster Agent runs against for
         # its whole life, so the flag has to be present when it is scaffolded.
-        self.dns_args = ["--dns-endpoint"]
+        self.decision = a_decision(flags=("--dns-endpoint",), kind=gke_endpoint.KIND_DNS,
+                                   address="gke-x.gke.goog", same_network=None, remedy="")
 
         self.create()
 
         self.assertEqual(self.get_credentials_argv()[-1], "--dns-endpoint")
+
+    def test_fetches_credentials_over_the_private_endpoint_when_detected(self):
+        self.decision = a_decision()
+        self.create()
+        self.assertEqual(self.get_credentials_argv()[-1], "--internal-ip")
+
+    def test_writes_the_endpoint_decision_as_preflight_readable_bullets(self):
+        self.decision = a_decision()
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        for key, value in {
+            "endpoint": "internal-ip",
+            "endpoint-address": "10.10.0.2",
+            "authorized-networks": "10.0.0.0/8, 172.16.0.0/12",
+            "endpoint-remedy": gke_endpoint.REMEDY_INTERNAL_IP,
+        }.items():
+            found = re.findall(rf"^[ \t]*-[ \t]*{key}:[ \t]*(.*)$", user_md, re.MULTILINE)
+            self.assertTrue(found, f"`{key}` is not a `- {key}:` bullet")
+            self.assertEqual(found[0].strip(), value)
+
+    def test_an_unrestricted_cluster_writes_no_remedy_bullet(self):
+        self.decision = a_decision(authorized_networks=None, remedy="")
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertIn("- authorized-networks: unrestricted\n", user_md)
+        self.assertNotIn("endpoint-remedy", user_md)
+
+    def test_no_decision_writes_no_endpoint_bullets(self):
+        self.decision = None
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertNotIn("- endpoint", user_md)
+        self.assertNotIn("authorized-networks", user_md)
+
+    def test_probes_the_cluster_under_the_pinned_kubeconfig_after_the_mirror(self):
+        self.decision = a_decision()
+        self.create()
+        probe = [c for c in self.runs if c[:2] == ["kubectl", "version"]]
+        self.assertEqual(len(probe), 1)
+        self.assertIn(f"--request-timeout={cap.CONNECTIVITY_PROBE_REQUEST_TIMEOUT}", probe[0])
+        # After get-credentials, so the kubeconfig exists to read.
+        self.assertGreater(self.runs.index(probe[0]), self.runs.index(self.get_credentials_argv()))
+
+    def test_a_failed_probe_logs_the_endpoint_and_the_remedy(self):
+        self.decision = a_decision()
+        self.probe_exit = 1
+        self.probe_stderr = "Client Version: v1.33.0\nUnable to connect to the server: dial tcp 10.10.0.2:443: i/o timeout\n"
+        name = self.create()
+        self.assertEqual(name, self.name, "an unreachable cluster is still a scaffolded profile")
+        self.assertIn("internal-ip endpoint (10.10.0.2)", self.stderr)
+        self.assertIn("10.0.0.0/8, 172.16.0.0/12", self.stderr)
+        self.assertIn(gke_endpoint.REMEDY_INTERNAL_IP, self.stderr)
+        self.assertIn("dial tcp 10.10.0.2:443: i/o timeout", self.stderr)
+        self.assertNotIn("Client Version", self.stderr)
+
+    def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
+        self.decision = a_decision()
+        self.create()
+        self.assertNotIn("cannot reach", self.stderr)
+
+    def test_a_failed_probe_without_a_decision_still_names_the_failure(self):
+        self.decision = None
+        self.probe_exit = 1
+        self.probe_stderr = "Unable to connect to the server: dial tcp: i/o timeout\n"
+        self.create()
+        self.assertIn("cannot reach the cluster API server", self.stderr)
+        self.assertIn("i/o timeout", self.stderr)
+
+    def test_a_probe_that_times_out_does_not_fail_the_scaffold(self):
+        self.decision = a_decision()
+        original = self._fake_run
+
+        def hanging(cmd, **kwargs):
+            if cmd[:2] == ["kubectl", "version"]:
+                raise subprocess.TimeoutExpired(cmd, cap.CONNECTIVITY_PROBE_TIMEOUT_SECONDS)
+            return original(cmd, **kwargs)
+
+        self._patch(subprocess, "run", hanging)
+        self.assertEqual(self.create(), self.name)
+        self.assertIn("connectivity probe did not finish", self.stderr)
 
     def test_applies_the_cluster_class_overlay_at_scaffold_time(self):
         (self.overlay_dir / "profileclass-cluster.overlay.yaml").write_text(
