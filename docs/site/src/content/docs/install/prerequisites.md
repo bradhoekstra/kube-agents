@@ -60,17 +60,19 @@ claim counts below what the release needs refuses the install the same way; note
 constraining ephemeral storage additionally requires every container to declare it (or
 a `LimitRange` to default it), as the chart README explains.
 
-The control-plane row above describes the DNS and public IP endpoints. A fleet cluster on
-the same VPC and region as the agent's own cluster, with a private endpoint
-(`privateClusterConfig.privateEndpoint`) and no externally reachable DNS endpoint, is
-reached over that private endpoint instead, provided its authorized networks admit the
-agent: the list is not enforced on the private endpoint
-(`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled`), or the two clusters
-share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) is on it. Otherwise
-the agent keeps the endpoint `gcloud` writes by default. When a cluster is onboarded the
-agent records which endpoint it chose and probes it once; when a connection attempt fails,
-the onboarding log and the Cluster Agent's preflight repeat that record and, where the list
-is what stands in the way, name the Pod range to add.
+One more case for fleet clusters the agent onboards. A cluster on the agent cluster's VPC
+whose public endpoint is absent or gated by authorized networks, and whose DNS endpoint is
+closed, is reached over its private endpoint (`privateClusterConfig.privateEndpoint`) when
+that endpoint is in the agent cluster's region or has control-plane global access, and when
+it admits the agent: the list explicitly does not gate the private endpoint
+(`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled: false`), or the two
+clusters share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) is on the list.
+Otherwise the agent keeps the endpoint `gcloud` writes by default. When a cluster is onboarded
+the agent records which endpoint it chose and probes it once; when a connection attempt fails,
+the onboarding log and the Cluster Agent's preflight repeat that record with what would open
+the cluster, the Pod range to add where that is what stands in the way.
+[`private-endpoint-selection.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/private-endpoint-selection.md)
+has the full rule.
 
 Three more things the installer sets on a cluster it creates, and treats differently on one it adopts:
 

@@ -102,6 +102,9 @@ readonly RC_TIMED_OUT=124
 # scaffold's endpoint remedy only for these (cluster_agent_profile.py keeps the
 # same list as CONNECTIVITY_FAILURE_RE).
 readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|Unable to connect to the server|TLS handshake timeout|dial tcp'
+# ...except the shim failing to reach the broker, which says "Connection
+# refused" about the proxy, not the cluster.
+readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy'
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126
@@ -433,7 +436,8 @@ if [ "$STATUS" = "ok" ]; then
             # when kubectl never did (a timeout, no route, a refused dial), not
             # for an answer it got and disliked (401, 403, NotFound).
             ENDPOINT_REMEDY="$(user_md_text endpoint-remedy)"
-            if [ -n "$ENDPOINT_REMEDY" ] && printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE"; then
+            if [ -n "$ENDPOINT_REMEDY" ] && printf '%s' "$ERR" | grep -Eiq "$CONNECTIVITY_FAILURE_RE" \
+                    && ! printf '%s' "$ERR" | grep -Eiq "$NOT_A_CONNECTION_FAILURE_RE"; then
                 REMEDIATION_5="$ENDPOINT_REMEDY $REMEDIATION_5"
             fi
         fi

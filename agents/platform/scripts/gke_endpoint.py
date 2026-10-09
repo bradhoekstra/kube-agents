@@ -363,11 +363,12 @@ def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]
               if block.get("cidrBlock"))
         if restricted else None
     )
-    # Absent means the list gates the public endpoint only: gcloud's
-    # --enable-authorized-networks-on-private-endpoint is what turns
-    # enforcement on for "traffic reaching cluster's control plane via
-    # private IP", and it defaults off.
-    private_enforced = restricted and authorized.get("privateEndpointEnforcementEnabled") is True
+    # Only an explicit `false` says the list leaves the private endpoint
+    # alone. New clusters report `true` without being asked; what a cluster
+    # that omits the field does server-side is not documented, and reading it
+    # as enforced can only keep today's endpoint.
+    private_enforced = restricted and authorized.get("privateEndpointEnforcementEnabled") is not False
+    public_endpoint = ip.get("enablePublicEndpoint") is not False
     # Only this field: gcloud's --internal-ip reads privateClusterConfig alone
     # (MissingPrivateEndpointError otherwise), so the nested copy must not be
     # what triggers the flag.
@@ -388,22 +389,26 @@ def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]
 
     # Rule 2. With IP endpoints off gcloud writes the DNS host by itself and
     # refuses --internal-ip (IPEndpointsIsDisabledError); authorized networks
-    # do not gate that host, so there is no network remedy to give.
-    if ip.get("enabled") is False:
+    # do not gate that host, so there is no network remedy to give. gcloud's
+    # test is `not ipEndpointsConfig.enabled`, so a block that omits the
+    # value counts as off; a cluster old enough to have no block at all is on.
+    if ip and not ip.get("enabled"):
         return EndpointDecision((), KIND_DNS, dns.get("endpoint") or default_address,
                                 None, networks, "")
 
     # Rule 3. gcloud's other precondition for --internal-ip is a private
-    # endpoint. Beyond that, the private endpoint has to
-    # be one this pod can route to -- same VPC, and same region unless
-    # control-plane global access is on -- and one that admits this pod's
-    # traffic: the list does not gate it, or the target shares this cluster's
-    # subnet (whose ranges GKE always admits), or this cluster's Pod range is
-    # on the list. A private endpoint that would refuse us is no better than
-    # a public one that does, and worse than a public one that does not.
+    # endpoint. Beyond that, the private endpoint has to be worth moving to:
+    # the public one is gated by the list or absent (a public endpoint
+    # nothing restricts works today, and moving it could only break it);
+    # routable -- same VPC, and same region unless control-plane global
+    # access is on; and one that admits this pod's traffic: the list does not
+    # gate it, or the target shares this cluster's subnet (observed to admit
+    # a pod from another cluster on it), or this cluster's Pod range is on
+    # the list. A private endpoint that would refuse us is no better than a
+    # public one that does, and worse than a public one that does not.
     same_network: bool | None = None
     pod_cidr = ""
-    if private_endpoint and network:
+    if private_endpoint and network and (restricted or not public_endpoint):
         mine = own()
         if mine is not None:
             same_network = mine.network == network

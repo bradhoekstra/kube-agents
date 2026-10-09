@@ -120,6 +120,10 @@ FAKE_KUBECTL = textwrap.dedent(
             ;;
         "cluster-info"*)
             [ -n "${FAKE_CLUSTER_INFO_TIMES_OUT:-}" ] && exit 124
+            if [ -n "${FAKE_PROXY_DOWN:-}" ]; then
+                echo "credential proxy unavailable: [Errno 111] Connection refused" >&2
+                exit 1
+            fi
             if [ -n "${FAKE_FORBIDDEN:-}" ]; then
                 echo 'Error from server (Forbidden): forbidden: User "sa@x.iam.gserviceaccount.com" cannot get path "/"' >&2
                 exit 1
@@ -381,6 +385,12 @@ class ClusterPreflightTest(unittest.TestCase):
         self.assertIn("ip endpoint (203.0.113.10)", result["reason"])
         self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
         self.assertIn("Forbidden", result["evidence"])
+
+    def test_check_5_with_the_proxy_down_names_no_remedy(self):
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_PROXY_DOWN="1")
+        self.assertEqual("5", result["check"])
+        self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
 
     def test_check_5_without_endpoint_bullets_is_unchanged(self):
         result = self.run_preflight(FAKE_UNREACHABLE="1")

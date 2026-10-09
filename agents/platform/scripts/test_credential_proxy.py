@@ -2963,6 +2963,13 @@ class CommandExecutorTest(unittest.TestCase):
                 """\
                 #!/bin/bash
                 set -u
+                # The endpoint decision in front of a fetch runs a help probe
+                # and a describe through this same stub; neither writes a
+                # kubeconfig, as the real gcloud does not.
+                case " $* " in
+                    *" --help "*) echo "  --dns-endpoint  Use the DNS endpoint."; exit 0 ;;
+                    *" describe "*) echo "{}"; exit 0 ;;
+                esac
                 project=""; location=""; cluster=""
                 for arg in "$@"; do
                     case "$arg" in
@@ -3267,7 +3274,11 @@ class CommandExecutorTest(unittest.TestCase):
         original = executor._execute
 
         def record(argv, **kwargs):
-            seen.append(kwargs.get("kubeconfig_path"))
+            # Only the fetch itself: the endpoint decision in front of it runs
+            # a help probe and a describe through the same seam, with no
+            # kubeconfig at all.
+            if "get-credentials" in argv and "--help" not in argv:
+                seen.append(kwargs.get("kubeconfig_path"))
             return original(argv, **kwargs)
 
         with mock.patch.object(executor, "_execute", record):
@@ -3294,7 +3305,11 @@ class CommandExecutorTest(unittest.TestCase):
         original = executor._execute
 
         def record(argv, **kwargs):
-            seen.append(kwargs.get("kubeconfig_path"))
+            # Only the fetch itself: the endpoint decision in front of it runs
+            # a help probe and a describe through the same seam, with no
+            # kubeconfig at all.
+            if "get-credentials" in argv and "--help" not in argv:
+                seen.append(kwargs.get("kubeconfig_path"))
             return original(argv, **kwargs)
 
         with mock.patch.object(executor, "_execute", record):
@@ -3331,6 +3346,80 @@ class CommandExecutorTest(unittest.TestCase):
         fetches = [argv for argv in seen if "get-credentials" in argv]
         self.assertEqual(1, len(fetches))
         self.assertEqual("--dns-endpoint", fetches[0][-1])
+
+    def test_a_callers_unflagged_fetch_gets_the_brokers_endpoint_decision(self):
+        # The broker files whatever a caller's get-credentials produced as the
+        # shared kubeconfig for that cluster. A by-hand or skill-driven fetch
+        # that names no endpoint would otherwise move an internal-ip cluster
+        # back to its public IP for every brokered kubectl after it.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--internal-ip"]) as decide,
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertEqual("--internal-ip", fetches[0][-1])
+        decide.assert_called_once()
+        self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
+
+    def test_a_callers_fetch_that_names_an_endpoint_is_run_as_given(self):
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--internal-ip"]) as decide,
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                 "--zone", "us-central1-a", "--project=demo-project", "--dns-endpoint"],
+            )
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertNotIn("--internal-ip", fetches[0])
+        self.assertEqual("--dns-endpoint", fetches[0][-1])
+        decide.assert_not_called()
+
+    def test_a_callers_fetch_without_a_full_target_is_run_as_given(self):
+        # Without project and location there is nothing to describe; gcloud
+        # falls back to its configured defaults and the broker does not guess.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        with (
+            mock.patch("gke_endpoint.dns_endpoint_args", return_value=["--internal-ip"]) as decide,
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor.execute(["gcloud", "container", "clusters", "get-credentials", "cluster-b"])
+
+        fetches = [argv for argv in seen if "get-credentials" in argv]
+        self.assertEqual(1, len(fetches))
+        self.assertNotIn("--internal-ip", fetches[0])
+        decide.assert_not_called()
 
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the

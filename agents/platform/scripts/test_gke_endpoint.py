@@ -184,8 +184,60 @@ PRIVATE_SAME_SUBNET_NAT_LISTED = _with_authorized(
     networkConfig={"network": OWN_NETWORK, "subnetwork": OWN_SUBNETWORK},
 )
 
-# Same list, but the private endpoint does not enforce it (the pre-2024 default).
+# Same list, but the private endpoint explicitly does not enforce it.
 PRIVATE_SAME_VPC_NOT_ENFORCED = _with_authorized(PRIVATE_SAME_VPC, ["203.0.113.5/32"], enforced=False)
+
+
+def _without_enforcement_field(base):
+    """`base` with privateEndpointEnforcementEnabled absent from both copies."""
+    document = json.loads(json.dumps(base))
+    document["masterAuthorizedNetworksConfig"].pop("privateEndpointEnforcementEnabled", None)
+    document["controlPlaneEndpointsConfig"]["ipEndpointsConfig"]["authorizedNetworksConfig"].pop(
+        "privateEndpointEnforcementEnabled", None)
+    return document
+
+
+# Same NAT-only list, enforcement field absent: a legacy cluster whose server-side
+# default is not documented, so it is read as enforced.
+PRIVATE_SAME_VPC_ENFORCEMENT_UNKNOWN = _without_enforcement_field(PRIVATE_SAME_VPC_NAT_LISTED)
+
+# A public endpoint nothing restricts: it works today, so nothing moves it.
+PRIVATE_SAME_VPC_LIST_OFF = _variant(
+    PRIVATE_SAME_VPC,
+    masterAuthorizedNetworksConfig={},
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
+        "ipEndpointsConfig": {
+            **{k: v for k, v in PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"]["ipEndpointsConfig"].items()
+               if k != "authorizedNetworksConfig"},
+            "authorizedNetworksConfig": {},
+        },
+    },
+)
+
+# No public endpoint at all and no list: gcloud's default is already the private
+# IP, and rule 3 says so explicitly.
+PRIVATE_ONLY_LIST_OFF = _variant(
+    PRIVATE_SAME_VPC_LIST_OFF,
+    endpoint="10.10.0.2",
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC_LIST_OFF["controlPlaneEndpointsConfig"],
+        "ipEndpointsConfig": {**PRIVATE_SAME_VPC_LIST_OFF["controlPlaneEndpointsConfig"]["ipEndpointsConfig"],
+                              "enablePublicEndpoint": False},
+    },
+    privateClusterConfig={"enablePrivateNodes": True, "enablePrivateEndpoint": True,
+                          "privateEndpoint": "10.10.0.2"},
+)
+
+# ipEndpointsConfig present but without `enabled`: gcloud reads that as disabled.
+PRIVATE_SAME_VPC_IP_ENABLED_ABSENT = _variant(
+    PRIVATE_SAME_VPC,
+    controlPlaneEndpointsConfig={
+        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
+        "ipEndpointsConfig": {k: v for k, v in PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"]["ipEndpointsConfig"].items()
+                              if k != "enabled"},
+    },
+)
 
 # Control-plane global access on: the private endpoint answers from any region.
 PRIVATE_SAME_VPC_GLOBAL = _variant(
@@ -196,7 +248,7 @@ PRIVATE_SAME_VPC_GLOBAL = _variant(
 
 # Authorized networks off entirely, the shape of an ordinary dev cluster. GKE
 # reports the block in both places, so both are cleared.
-PRIVATE_SAME_VPC_UNRESTRICTED = _variant(
+PRIVATE_SAME_VPC_LIST_OFF = _variant(
     PRIVATE_SAME_VPC,
     masterAuthorizedNetworksConfig={},
     controlPlaneEndpointsConfig={
@@ -603,7 +655,7 @@ class RunnerEnvironmentTest(unittest.TestCase):
 
 
 class PrivateEndpointTest(unittest.TestCase):
-    """Rule 2 of docs/designs/private-endpoint-selection.md: --internal-ip when the
+    """Rule 3 of docs/designs/private-endpoint-selection.md: --internal-ip when the
     target is on the agent's own network and publishes a private endpoint."""
 
     def test_same_network_private_cluster_gets_internal_ip(self):
@@ -718,7 +770,7 @@ class PrivateEndpointTest(unittest.TestCase):
         self.assertEqual(runner.own_network_calls, [])
 
     def test_a_public_cluster_never_describes_the_own_cluster(self):
-        # The own-cluster describe is paid only when rule 2 could fire.
+        # The own-cluster describe is paid only when rule 3 could fire.
         runner = FakeRunner(DNS_EXTERNAL)
         decision(runner)
         self.assertEqual(runner.own_network_calls, [])
@@ -729,11 +781,34 @@ class PrivateEndpointTest(unittest.TestCase):
         self.assertEqual(d.flags, (), "an empty list admits no range of ours")
         self.assertNotEqual(d.remedy, "")
 
-    def test_unrestricted_authorized_networks_carry_no_remedy(self):
-        d = decision(FakeRunner(PRIVATE_SAME_VPC_UNRESTRICTED))
-        self.assertEqual(d.flags, ("--internal-ip",))
+    def test_a_public_endpoint_nothing_restricts_is_left_alone(self):
+        # The issue is a public endpoint the list blocks. One the list does not
+        # gate works today, and moving it to the private endpoint could only
+        # break it (a firewall that denies internal egress, for one).
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_LIST_OFF))
+        self.assertEqual(d.flags, ())
+        self.assertEqual(d.kind, gke_endpoint.KIND_IP)
         self.assertIsNone(d.authorized_networks)
         self.assertEqual(d.remedy, "")
+
+    def test_a_private_only_cluster_with_no_list_gets_internal_ip(self):
+        d = decision(FakeRunner(PRIVATE_ONLY_LIST_OFF))
+        self.assertEqual(d.flags, ("--internal-ip",))
+        self.assertEqual(d.remedy, "")
+
+    def test_an_absent_enforcement_field_is_read_as_enforced(self):
+        # The server-side default on a cluster that omits the field is not
+        # documented; reading it as enforced can only keep today's endpoint.
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_ENFORCEMENT_UNKNOWN))
+        self.assertEqual(d.flags, ())
+        self.assertIn(OWN_POD_CIDR, d.remedy)
+
+    def test_an_ip_endpoints_block_without_enabled_reads_as_disabled(self):
+        # gcloud's own test is `not ipEndpointsConfig.enabled`, so a missing
+        # value refuses --internal-ip too.
+        d = decision(FakeRunner(PRIVATE_SAME_VPC_IP_ENABLED_ABSENT))
+        self.assertEqual(d.flags, ())
+        self.assertEqual(d.kind, gke_endpoint.KIND_DNS)
 
     def test_a_failed_describe_yields_none(self):
         self.assertIsNone(decision(FakeRunner(describe_exit=1)))

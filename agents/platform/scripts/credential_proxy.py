@@ -103,6 +103,14 @@ KUBECTL_WATCH_FLAGS = ("-w", "--watch", "--watch-only")
 # A caller who named their own bound has already answered the question; honour
 # it rather than overriding it with a shorter one.
 KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
+# The two endpoint selectors a caller's `get-credentials` may carry; with
+# neither, the broker splices in gke_endpoint's decision (see
+# `_endpoint_flags_for_callers_fetch`).
+GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
+# gcloud's spellings of the location and project on that command, with or
+# without `=`.
+GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone")
+GET_CREDENTIALS_PROJECT_FLAG = "--project"
 
 # Bounds on what a command's output costs this process while the command runs.
 # Output is read as it streams and only the first `--max-output-bytes` of each
@@ -2998,6 +3006,43 @@ class ExecutionResult:
 # get-credentials`. `ClusterTarget`, `parse_gke_context` and
 # `read_current_context` live with the shim for the same reason: the parsing
 # happens where the file is, which is not here.
+
+
+def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
+    """The (project, cluster, location) a `get-credentials` argv names, or None.
+
+    The cluster is the first positional after the verb; the location and
+    project are read from gcloud's flags in either `--flag=value` or
+    `--flag value` form. Any of the three missing is None: gcloud would fall
+    back to its configured defaults, which this side does not know.
+    """
+    try:
+        index = argv.index("get-credentials")
+    except ValueError:
+        return None
+    cluster = ""
+    location = ""
+    project = ""
+    rest = argv[index + 1:]
+    skip = False
+    for position, argument in enumerate(rest):
+        if skip:
+            skip = False
+            continue
+        name, separator, value = argument.partition("=")
+        if name in GET_CREDENTIALS_LOCATION_FLAGS or name == GET_CREDENTIALS_PROJECT_FLAG:
+            if not separator:
+                value = rest[position + 1] if position + 1 < len(rest) else ""
+                skip = True
+            if name == GET_CREDENTIALS_PROJECT_FLAG:
+                project = value
+            else:
+                location = value
+        elif not argument.startswith("-") and not cluster:
+            cluster = argument
+    if not (project and cluster and location):
+        return None
+    return ClusterTarget(project=project, cluster=cluster, location=location)
 
 
 def _is_get_credentials(argv: list[str]) -> bool:
@@ -6341,6 +6386,25 @@ class CommandExecutor:
                 scratch.unlink(missing_ok=True)
         return managed
 
+    def _endpoint_flags_for_callers_fetch(self, command: list[str]) -> list[str]:
+        """The endpoint flags to add to a caller's `get-credentials`, if any.
+
+        The file that fetch produces is filed as the shared kubeconfig for its
+        cluster (`_execute_get_credentials`), so a caller that names no endpoint
+        -- the Platform Agent running the command by hand, a skill that builds
+        its own -- would otherwise move a cluster the broker reaches over its
+        DNS or private endpoint back to the public IP for every brokered kubectl
+        after it. A caller that did name one is run as given; a command whose
+        target cannot be read is run as given too, since gcloud will resolve it
+        against defaults this side does not know.
+        """
+        if any(flag in command for flag in GET_CREDENTIALS_ENDPOINT_FLAGS):
+            return []
+        target = _get_credentials_target(command)
+        if target is None:
+            return []
+        return self._dns_endpoint_args(command[0], target)
+
     def _execute_get_credentials(
         self,
         command: list[str],
@@ -6367,6 +6431,7 @@ class CommandExecutor:
         # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
         # config, moving the `current-context` that every later context-less
         # kubectl resolves against.
+        command = [*command, *self._endpoint_flags_for_callers_fetch(command)]
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(

@@ -94,6 +94,9 @@ CONNECTIVITY_FAILURE_RE = re.compile(
     r"TLS handshake timeout|dial tcp",
     re.IGNORECASE,
 )
+# The credential-proxy shim failing to reach the broker says "Connection
+# refused" too, and that is the broker being down, not the cluster's list.
+NOT_A_CONNECTION_FAILURE_RE = re.compile(r"credential proxy", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
@@ -346,6 +349,19 @@ def _endpoint_bullets(decision: EndpointDecision | None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _remedy_note(decision: EndpointDecision | None) -> str:
+    """The sentence that keeps the remedy bullet from reading as an order.
+
+    USER.md is the Cluster Agent's startup context, and the remedy is written
+    for a cluster that may well answer; without this it reads as something to
+    go and do.
+    """
+    if decision is None or not decision.remedy:
+        return ""
+    return ("The `endpoint-remedy` bullet applies only if `kubectl` cannot reach the API server;\n"
+            "a cluster that answers needs nothing done.\n")
+
+
 def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision | None) -> bool:
     """One authenticated GET against the pinned kubeconfig; log why it failed.
 
@@ -389,7 +405,8 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
     if decision is None:
         log(f"{name}: cannot reach the cluster API server. kubectl: {detail}")
         return False
-    connectivity = bool(CONNECTIVITY_FAILURE_RE.search(completed.stderr or ""))
+    stderr = completed.stderr or ""
+    connectivity = bool(CONNECTIVITY_FAILURE_RE.search(stderr)) and not NOT_A_CONNECTION_FAILURE_RE.search(stderr)
     remedy = f" {decision.remedy}" if decision.remedy and connectivity else ""
     log(f"{name}: cannot reach the cluster API server over its {decision.kind} endpoint "
         f"({decision.address}); authorized networks: {decision.authorized_networks_text()}."
@@ -569,7 +586,8 @@ def create_profile(project: str, cluster: str, location: str) -> str:
         f"{_endpoint_bullets(decision)}\n"
         "The authoritative KUBECONFIG pin lives in this profile's `.env`; the\n"
         "`kubeconfig` bullet above records it for reference. To repoint this agent, re-run\n"
-        "`cluster_agent_profile.py create` — do not hand-edit this file.\n",
+        "`cluster_agent_profile.py create` — do not hand-edit this file.\n"
+        f"{_remedy_note(decision)}",
         encoding="utf-8",
     )
 

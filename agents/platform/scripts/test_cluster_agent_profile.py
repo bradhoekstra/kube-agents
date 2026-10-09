@@ -427,6 +427,14 @@ class CreateProfileTest(unittest.TestCase):
         self.assertIn("- authorized-networks: unrestricted\n", user_md)
         self.assertNotIn("endpoint-remedy", user_md)
 
+    def test_the_remedy_bullet_is_framed_as_conditional_for_the_cluster_agent(self):
+        # USER.md is the Cluster Agent's startup context; a remedy written there
+        # for a cluster that answers must not read as an instruction to act.
+        self.decision = a_blocked_decision()
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertIn("only if `kubectl` cannot reach the API server", user_md)
+
     def test_no_decision_writes_no_endpoint_bullets(self):
         self.decision = None
         self.create()
@@ -481,6 +489,9 @@ class CreateProfileTest(unittest.TestCase):
         found = re.search(r"^readonly CONNECTIVITY_FAILURE_RE='([^']*)'$", script, re.MULTILINE)
         self.assertTrue(found, "cluster_preflight.sh no longer declares CONNECTIVITY_FAILURE_RE")
         self.assertEqual(found.group(1), cap.CONNECTIVITY_FAILURE_RE.pattern)
+        excluded = re.search(r"^readonly NOT_A_CONNECTION_FAILURE_RE='([^']*)'$", script, re.MULTILINE)
+        self.assertTrue(excluded, "cluster_preflight.sh no longer declares NOT_A_CONNECTION_FAILURE_RE")
+        self.assertEqual(excluded.group(1), cap.NOT_A_CONNECTION_FAILURE_RE.pattern)
 
     def test_a_probe_refused_by_rbac_names_the_endpoint_but_not_the_remedy(self):
         # A 403 is an IAM answer from a reachable control plane; sending the
@@ -492,6 +503,16 @@ class CreateProfileTest(unittest.TestCase):
         self.create()
         self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
         self.assertIn("Forbidden", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
+
+    def test_a_probe_the_shim_refused_names_no_remedy(self):
+        # "credential proxy unavailable" is the broker being down, not the
+        # cluster's list; the words "connection refused" inside it must not win.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = "credential proxy unavailable: [Errno 111] Connection refused\n"
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
         self.assertNotIn(ADMIT_REMEDY, self.stderr)
 
     def test_a_passing_probe_logs_nothing_about_the_endpoint(self):
