@@ -266,15 +266,24 @@ REFETCH_SIGNALS = (
 #: the fleet fits in one tick again; the ledger's budget entry carries it
 #: every tick.
 BUDGET_EXHAUSTED_KEY = "budget_exhausted"
-#: Beside the flag: the clusters the exhausting sweep had in play (its
-#: sweepable count), so a later sweep that fits is judged against it. A failed
-#: listing or an unreadable identity only ever removes clusters, so a sweep
-#: that fits with fewer in play and something unlisted or unread has not shown
-#: the fleet fits; one that fits with at least as many has, whatever is still
-#: unlisted, and one that fits with everything listed and read has too, however
-#: the fleet shrank. None while the flag is down.
-BUDGET_EXHAUSTED_SWEEPABLE_KEY = "budget_exhausted_sweepable"
-COVERAGE_EXHAUSTED_PREFIX = "⏳ **Controller stall watch — budget exhausted:**"
+#: Beside the flag: the projects the exhausting sweep listed, each with the
+#: clusters it had in play there (`Sweep.view`), so a later sweep that fits
+#: is compared project for project. A project in that view but not in the
+#: fitting sweep's (its listing failed, or the only profiles naming it had no
+#: readable identity) is a part of the fleet the fit says nothing about, so
+#: the flag is held; a project that lists with fewer clusters than before has
+#: shrunk, and the fit counts. None while the flag is down.
+BUDGET_EXHAUSTED_VIEW_KEY = "budget_exhausted_view"
+#: Consecutive fitting ticks on which the flag was held for a project out of
+#: view, and the number of them after which the missing projects count as a
+#: standing fault rather than a transient: the fit stands, recovery posts, and
+#: the next exhaustion is heard. Three ticks is 90 minutes on the schedule,
+#: past any one listing failure or a profile mid-rewrite, and well short of a
+#: revoked grant. The ledger's budget entry says the flag is held and why.
+BUDGET_HELD_TICKS_KEY = "budget_held_ticks"
+BUDGET_HOLD_TICKS = 3
+#: The entry text that follows names the budget and says it was exhausted.
+COVERAGE_EXHAUSTED_PREFIX = "⏳ **Controller stall watch:**"
 COVERAGE_RECOVERED_LINE = "✅ **Controller stall watch** — the fleet is swept in one tick again."
 
 #: The fleet-wide system-namespace set, spelled as the Workload Reliability
@@ -701,7 +710,8 @@ def empty_state() -> dict:
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
         BUDGET_EXHAUSTED_KEY: False,
-        BUDGET_EXHAUSTED_SWEEPABLE_KEY: None,
+        BUDGET_EXHAUSTED_VIEW_KEY: None,
+        BUDGET_HELD_TICKS_KEY: 0,
     }
 
 
@@ -843,11 +853,17 @@ class Sweep:
     def namespaces(self) -> int:
         return len(self.read_scopes)
 
-    def fleet_in_view(self) -> bool:
-        """Whether this tick saw the whole fleet: every project listed and
-        every profile's identity read. A sweep that fit the budget without
-        that has not shown the fleet fits (`tick`)."""
-        return not self.unlisted_projects and not self.unread_profiles
+    def view(self) -> dict[str, int]:
+        """The projects this tick listed, each with the clusters it had in
+        play there. A project whose listing failed or was incomplete is
+        absent, and so is one named only by profiles whose identity could not
+        be read, since nothing listed it. `tick` keeps the exhausting sweep's
+        view in the ledger and compares a fitting sweep's against it."""
+        counts = {project: 0 for project in self.projects - self.unlisted_projects}
+        for cid in self.sweepable_clusters:
+            project = split_cluster_id(cid)[0]
+            counts[project] = counts.get(project, 0) + 1
+        return counts
 
     def holds_unlisted(self, cid: str) -> bool:
         """Whether a cluster this tick did not list is held rather than gone:
@@ -1782,26 +1798,38 @@ def tick(state_path: Path, *, dry_run: bool) -> list[str]:
         state["sweep_error"] = None
         state[CURSOR_KEY] = sweep.cursor
         state[CREDENTIALS_KEY] = sweep.credentials
-        in_play = len(sweep.sweepable_clusters)
-        exhausted_with = state.get(BUDGET_EXHAUSTED_SWEEPABLE_KEY)
+        view = sweep.view()
         if sweep.budget_exhausted:
             if not state.get(BUDGET_EXHAUSTED_KEY):
                 lines.append(f"{COVERAGE_EXHAUSTED_PREFIX} {sweep.unreadable[BUDGET_SCOPE]}")
             state[BUDGET_EXHAUSTED_KEY] = True
-            state[BUDGET_EXHAUSTED_SWEEPABLE_KEY] = in_play
-        elif sweep.fleet_in_view() or (exhausted_with is not None and in_play >= exhausted_with):
-            # The fleet fit in one tick, and this sweep had the whole fleet in
-            # view, or at least as many clusters in play as the sweep that
-            # exhausted. A sweep that fit with fewer in play because a listing
-            # failed or an identity could not be read has shown nothing about
-            # the fit: it neither posts the recovery nor clears the flag, as
-            # the sweep-failed path leaves the flag alone when every listing
-            # fails. The count is what keeps one project that can never be
-            # listed from holding the flag up for good.
-            if state.get(BUDGET_EXHAUSTED_KEY):
+            state[BUDGET_EXHAUSTED_VIEW_KEY] = view
+            state[BUDGET_HELD_TICKS_KEY] = 0
+        elif state.get(BUDGET_EXHAUSTED_KEY):
+            # The fleet fit in one tick. Compared project for project with the
+            # sweep that exhausted: a project that sweep listed and this one
+            # did not (its listing failed, or its only profiles lost their
+            # identity) is a part of the fleet this fit says nothing about, so
+            # the flag is held and the ledger's budget entry says so; a project
+            # that lists with fewer clusters has shrunk, and counts. A hold
+            # that outlasts BUDGET_HOLD_TICKS is a standing fault, not a
+            # transient, and the fit stands: the exhausting sweep that follows
+            # a real regrowth is then heard, instead of silent under a flag
+            # nobody lowered.
+            missing = sorted(set(state.get(BUDGET_EXHAUSTED_VIEW_KEY) or {}) - set(view))
+            held = state.get(BUDGET_HELD_TICKS_KEY, 0) + 1 if missing else 0
+            if missing and held < BUDGET_HOLD_TICKS:
+                state[BUDGET_HELD_TICKS_KEY] = held
+                sweep.unreadable[BUDGET_SCOPE] = (
+                    f"sweep fit in one tick with {len(sweep.sweepable_clusters)} clusters, but projects the "
+                    f"last exhausted sweep listed were not listed this tick: {', '.join(missing)}; "
+                    f"the budget flag is held, tick {held} of {BUDGET_HOLD_TICKS}"
+                )
+            else:
                 lines.append(COVERAGE_RECOVERED_LINE)
-            state[BUDGET_EXHAUSTED_KEY] = False
-            state[BUDGET_EXHAUSTED_SWEEPABLE_KEY] = None
+                state[BUDGET_EXHAUSTED_KEY] = False
+                state[BUDGET_EXHAUSTED_VIEW_KEY] = None
+                state[BUDGET_HELD_TICKS_KEY] = 0
         new_by_scope, cleared_by_scope = diff_and_update(state, sweep, now)
         lines += episode_lines(state, sweep, new_by_scope, cleared_by_scope, now, dry_run=dry_run, persist=lambda: save_state(state_path, state))
     if not dry_run:

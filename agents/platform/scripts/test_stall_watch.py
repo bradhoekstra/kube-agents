@@ -1602,11 +1602,11 @@ class Coverage(Base):
         with patch.object(stall_watch.time, "monotonic", side_effect=[0, 1, 2, stall_watch.TICK_BUDGET_SECONDS + 1] + [stall_watch.TICK_BUDGET_SECONDS + 1] * 12):
             still, _ = self.run_tick(fleet, listing_fails=[other])
         self.assertEqual(still, [], "exhausted again, with the project gone from the listing: no repeated line")
-        self.assertEqual(self.ledger()[stall_watch.BUDGET_EXHAUSTED_SWEEPABLE_KEY], 3)
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_EXHAUSTED_VIEW_KEY], {PROJECT: 3})
         recovered, _ = self.run_tick(fleet, listing_fails=[other])
-        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE], "fits with as many clusters in play as the sweep that exhausted")
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE], "fits with every project the exhausting sweep listed")
         self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
-        self.assertIsNone(self.ledger()[stall_watch.BUDGET_EXHAUSTED_SWEEPABLE_KEY])
+        self.assertIsNone(self.ledger()[stall_watch.BUDGET_EXHAUSTED_VIEW_KEY])
         again, _ = self.exhausted_ticks(fleet, over_after=3)
         self.assertEqual(len(again), 1, "the next exhaustion is heard")
 
@@ -1629,6 +1629,44 @@ class Coverage(Base):
         self.assertEqual(again, [], "still exhausted: the line is not repeated")
         recovered, _ = self.run_tick(fleet)
         self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+
+    def test_a_fleet_that_shrinks_under_a_standing_listing_failure_recovers_after_the_hold(self):
+        # The exhausting sweep listed the project; then its grant is revoked
+        # and the rest of the fleet shrinks until it fits. The first fitting
+        # ticks hold the flag and say so in the ledger; the third counts the
+        # missing project as a standing fault, recovery posts, and the next
+        # exhaustion is heard.
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, "d": {"ns": []}, f"{other}:e": {"ns": []}}
+        self.run_tick(fleet)
+        exhausted, _ = self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(len(exhausted), 1)
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_EXHAUSTED_VIEW_KEY], {PROJECT: 4, other: 1})
+        shrunk = {"a": {"ns": []}, "b": {"ns": []}, f"{other}:e": {"ns": []}}
+        for held in (1, 2):
+            lines, _ = self.run_tick(shrunk, listing_fails=[other])
+            self.assertEqual(lines, [], f"held tick {held}: no line")
+            self.assertTrue(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+            budget = self.ledger()["unreadable"][stall_watch.BUDGET_SCOPE]
+            self.assertIn(other, budget)
+            self.assertIn(f"tick {held} of {stall_watch.BUDGET_HOLD_TICKS}", budget)
+        recovered, _ = self.run_tick(shrunk, listing_fails=[other])
+        self.assertEqual(recovered, [stall_watch.COVERAGE_RECOVERED_LINE])
+        self.assertFalse(self.ledger()[stall_watch.BUDGET_EXHAUSTED_KEY])
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 0)
+        self.assertNotIn(stall_watch.BUDGET_SCOPE, self.ledger()["unreadable"])
+        again, _ = self.exhausted_ticks(shrunk, over_after=2)
+        self.assertEqual(len(again), 1, "the next exhaustion is heard")
+
+    def test_an_exhaustion_between_held_ticks_resets_the_hold(self):
+        other = "other-proj"
+        fleet = {"a": {"ns": []}, "b": {"ns": []}, "c": {"ns": []}, f"{other}:d": {"ns": []}}
+        self.run_tick(fleet)
+        self.exhausted_ticks(fleet, over_after=3)
+        self.run_tick(fleet, listing_fails=[other])
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 1)
+        self.exhausted_ticks(fleet, over_after=3)
+        self.assertEqual(self.ledger()[stall_watch.BUDGET_HELD_TICKS_KEY], 0, "a sweep that exhausted with the project listed starts the count over")
 
     def test_a_fleet_that_shrank_and_fits_with_everything_in_view_recovers(self):
         # Two clusters deleted: fewer in play than the exhausting sweep, but

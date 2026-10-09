@@ -100,15 +100,16 @@ noticed in `<n>` more namespaces; alerts follow on later ticks, 3 a tick", the
 cleared line naming at most eight objects, and an "alerts not raised" line when the Session
 KV server refuses an alert, said once until the reason changes, with a line
 when alerts are raised again. It also carries the sweep-failed and sweep-recovered lines
-every roster entry owes, and the budget lines: "budget exhausted", said once on the
+every roster entry owes, and the budget lines: the budget-exhausted line, said once on the
 tick a sweep first stops at its 25-minute budget, carrying the clusters read of the
 ones it could sweep, the namespaces read, the clusters it could not read and the cluster the
 next tick resumes at, and "the
-fleet is swept in one tick again" once a sweep completes with the fleet in view, every project
-listed and every profile's identity read, or with at least as many clusters in play as the
-sweep that exhausted (a sweep that fit with fewer because a listing failed or an identity could
-not be read says nothing about the fit, and posts nothing); the ledger's budget entry carries
-the same coverage on every tick that falls short. A new stall's notice is the alert the Session KV server
+fleet is swept in one tick again" once a sweep completes having listed every project the
+exhausting sweep listed (a sweep that fit without one of them, because its listing failed or an
+identity could not be read, says nothing about the fit and posts nothing, for up to three
+consecutive ticks, after which the missing project counts as a standing fault and the fit
+stands); the ledger's budget entry carries the same coverage on every tick that falls short,
+and says when and why the flag is held. A new stall's notice is the alert the Session KV server
 posts. A namespace whose alert has produced no card a day after it was raised
 (the Planning Agent's turn failed) has its alert raised again, and the new
 alert replaces the episode once it is sent; a shorter retry would post a fresh alert every hour or so

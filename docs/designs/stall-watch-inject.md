@@ -165,12 +165,14 @@ A sweep that stops at its wall-clock budget writes what it covered into the ledg
 the clusters read of the ones it could sweep, the namespaces read, the clusters it could not read
 and the cluster the next tick resumes at,
 and says it in chat once, on the tick the sweep first falls short, and once more when the fleet
-fits in one tick again. The fit counts when the sweep had the fleet in view (every project
-listed, every identity read) or at least as many clusters in play as the sweep that exhausted,
-which the ledger keeps beside the flag; a sweep that fit with fewer because a listing failed or
-an identity could not be read has not shown the fleet fits, so it neither posts the recovery nor
-clears the flag, and the count is what keeps one project that can never be listed from holding
-the flag up for good. On such a fleet a cluster is read across consecutive ticks, so the
+fits in one tick again. The ledger keeps the exhausting sweep's view beside the flag, the
+projects it listed with the clusters each had in play, and a fitting sweep is compared with it
+project for project: a project that lists with fewer clusters has shrunk and the fit counts, while
+a project the exhausting sweep listed and this one did not (its listing failed, or its only
+profiles lost their identity) is a part of the fleet the fit says nothing about, so the flag is
+held and the budget entry says so. A hold that outlasts three consecutive ticks is a standing
+fault rather than a transient: the fit stands, recovery posts, and the next exhaustion is heard,
+so one project that can never be listed does not hold the flag up for good. On such a fleet a cluster is read across consecutive ticks, so the
 operator's interval is the ticks a full pass takes rather than the 30-minute schedule; the budget
 entry is where to read it.
 
