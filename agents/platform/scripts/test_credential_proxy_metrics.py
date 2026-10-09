@@ -769,6 +769,32 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assertEqual(503, status)
         self.assertEqual(1, self.vcs_count("proposal-list", "busy"))
 
+    def test_a_repository_field_that_cannot_be_read_counts_as_error_and_an_unserved_host_as_blocked(self):
+        for status, want in ((400, "error"), (403, "blocked")):
+            broker = mock.Mock()
+            broker.registry.resolve.side_effect = credential_proxy.providers.WorkspaceError("bad repository", status=status)
+            with (
+                mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+                mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
+            ):
+                got, _ = self.post_vcs("proposal-list", {"repository": "nonsense"})
+            self.assertEqual(status, got)
+            self.assertEqual(1, self.vcs_count("proposal-list", want), (status, want))
+
+    def test_an_unreadable_managed_list_counts_as_error_not_blocked(self):
+        broker = mock.Mock()
+        broker.registry.resolve.return_value = ("github", "example.com/o/r")
+        with (
+            mock.patch.object(CredentialProxyHandler, "vcs", broker, create=True),
+            mock.patch.object(credential_proxy.vcs_broker, "route_table", return_value={"proposal-list": lambda payload: {"items": []}}),
+            mock.patch.object(credential_proxy, "repository_is_managed", side_effect=OSError("mount gone")),
+        ):
+            status, body = self.post_vcs("proposal-list", {"repository": "o/r"})
+        self.assertEqual(503, status)
+        self.assertEqual("MANAGED_REPOSITORIES_UNAVAILABLE", body["code"])
+        self.assertEqual(1, self.vcs_count("proposal-list", "error"))
+        self.assertIsNone(_series(self.families(), "kubeagents_vcs_requests_total", verb="proposal-list", status="blocked"))
+
     def test_every_label_value_is_from_the_closed_vocabularies(self):
         with self.vcs_route("proposal-create", lambda payload: {"number": 7}):
             self.post_vcs("proposal-create")

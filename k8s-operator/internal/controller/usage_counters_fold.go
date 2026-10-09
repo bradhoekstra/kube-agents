@@ -47,10 +47,12 @@ const (
 	// add. A document past it is treated as absent.
 	usageTotalCeiling int64 = math.MaxInt64 / 2
 	// usageDocumentVersion is the document's layout. A later layout changes
-	// it, so that an older document is re-seeded rather than read wrong.
+	// it, so that an older document is migrated where the layout allows
+	// (migrateUsageDocument) and re-seeded rather than read wrong otherwise.
 	// Version 2 keys the pod entries by pod UID and counter, since the broker
-	// pod feeds two counters from one body.
-	usageDocumentVersion = 2
+	// pod feeds two counters from one body; version 1 keyed them by pod UID.
+	usageDocumentVersion         = 2
+	usageDocumentVersionPodKeyed = 1
 
 	// The counters the document keeps, named for the status fields they
 	// project to, so the JSON reads beside the status.
@@ -129,6 +131,42 @@ type usageDocument struct {
 	LastMoved *metav1.Time `json:"lastMoved,omitempty"`
 	// Pods is the baseline, keyed by pod UID and counter (usagePodEntryKey).
 	Pods map[string]*usagePodEntry `json:"pods"`
+	// migrated is set by migrateUsageDocument on a document read at an older
+	// layout, so the poll writes it back at the current one even when the fold
+	// changed nothing. Not serialised.
+	migrated bool
+}
+
+// migrateUsageDocument brings a version-1 document, entries keyed by pod UID
+// with no PodUID and no entry for a counter that did not exist, to the current
+// layout in place: the keys gain their counter, the entries their pod, the
+// totals the counters they lacked. Nothing is lost, which a re-seed cannot
+// say: a re-seed starts from the status, which a pruning CRD leaves empty, and
+// re-baselines every pod at its current sample, so whatever the listeners
+// counted since the last poll is never added. Any other version is left for
+// usageDocumentInvalid to refuse.
+func migrateUsageDocument(doc *usageDocument) {
+	if doc.Version != usageDocumentVersionPodKeyed || doc.Pods == nil || doc.Totals == nil {
+		return
+	}
+	rekeyed := make(map[string]*usagePodEntry, len(doc.Pods))
+	for key, entry := range doc.Pods {
+		if entry == nil {
+			continue
+		}
+		if entry.PodUID == "" {
+			entry.PodUID = key
+		}
+		rekeyed[usagePodEntryKey(entry.PodUID, entry.Counter)] = entry
+	}
+	doc.Pods = rekeyed
+	for _, counter := range usageCounters {
+		if _, ok := doc.Totals[counter]; !ok {
+			doc.Totals[counter] = 0
+		}
+	}
+	doc.Version = usageDocumentVersion
+	doc.migrated = true
 }
 
 // usagePodEntry is one pod's baseline for one counter, keyed by

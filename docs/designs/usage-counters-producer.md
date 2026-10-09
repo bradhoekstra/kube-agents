@@ -211,7 +211,7 @@ its container; the watcher's with the gateway pod, with its sidecar container, a
 restart the entrypoint's supervisor performs in place. A status counter that copied the sample
 would fall back to zero on every one of those. The poller therefore keeps, per CR, a baseline:
 the last sample it took from each pod, keyed by pod UID and counter, since the broker's one
-body feeds two counters (document layout version 2; a version-1 document is re-seeded once). On
+body feeds two counters (document layout version 2; a version-1 document is migrated in place on the first poll, its totals and baseline kept, so the upgrade loses nothing). On
 a poll it adds, for each pod and counter it scraped:
 
 - the difference from the pod's last sample, when the pod UID is known, the body's start time
@@ -616,7 +616,7 @@ scrapes two replicas at different samples, taking the larger delta on the next a
 the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one
 below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
-case (no gateway scrape, no log line); one broker body folded into two counters, each with its own baseline entry, through a restart; a version-1 document re-seeded once; the series selection (the `status` values summed and the
+case (no gateway scrape, no log line); one broker body folded into two counters, each with its own baseline entry, through a restart; a version-1 document migrated in place under a pruning CRD with its totals kept and the interval's deltas added; the Warning naming each status field a pod's counters project to; the series selection (the `status` values summed and the
 three excluded; the injected series and not the observed one); and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
