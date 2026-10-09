@@ -2029,8 +2029,13 @@ type AgentUsageStatus struct {
 	// +optional
 	ToolExecutionsTotal int64 `json:"toolExecutionsTotal,omitempty"`
 
-	// RemediationsProposedTotal is the cumulative count of remediations generated.
-	// Nothing writes it yet.
+	// RemediationsProposedTotal is the cumulative count of proposals the
+	// credential broker's version-control route opened: proposal-create
+	// requests the forge accepted. Read from the broker's
+	// kubeagents_vcs_requests_total under verb proposal-create and status
+	// success every five minutes and kept monotonic the same way as
+	// ToolExecutionsTotal; a proposal the forge refused or that failed is not
+	// counted. Moves LastActiveTime.
 	// +optional
 	RemediationsProposedTotal int64 `json:"remediationsProposedTotal,omitempty"`
 
