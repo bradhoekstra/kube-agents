@@ -185,6 +185,8 @@ class FakeAPI:
 
     def get_all(self, path):
         self.lists.append(path)
+        if any(path.endswith(suffix) for suffix in getattr(self, "failing_lists", ())):
+            raise RuntimeError(f"HTTP 502 on {path}")
         if path.endswith("/pulls?state=open"):
             return self.pulls
         matched = re.search(r"/issues/(\d+)/comments$", path)
@@ -769,7 +771,7 @@ class _MainHarness(unittest.TestCase):
         self.addCleanup(self.root.cleanup)
         write_tree(self.root.name, OWNERS_TREE)
         self.summary = Path(self.root.name) / "summary.md"
-        env = {"GITHUB_TOKEN": "t", rr.STEP_SUMMARY_ENV: str(self.summary)}
+        env = {"GITHUB_TOKEN": "t", rr.STEP_SUMMARY_ENV: str(self.summary), rr.ACTIONS_ENV: "true"}
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -799,13 +801,14 @@ class _MainHarness(unittest.TestCase):
     def reaction(self):
         return [payload["content"] for path, payload in self.api.posts if path == self.REACTIONS]
 
-    def run_main_with_failing(self, failing, pull, reviews, *extra, **kwargs):
-        """`run_main`, with the given POST paths raising as the API wrapper would after its retries."""
+    def run_main_with_failing(self, failing, pull, reviews, *extra, failing_lists=(), **kwargs):
+        """`run_main`, with the given POST paths (and listing suffixes) raising as the API wrapper would after its retries."""
         original = FakeAPI.__init__
 
         def init(api, *a, **kw):
             original(api, *a, **kw)
             api.failing = failing
+            api.failing_lists = failing_lists
 
         with mock.patch.object(FakeAPI, "__init__", init):
             return self.run_main(pull, reviews, *extra, **kwargs)
@@ -1123,13 +1126,44 @@ class HandoffMainTest(_MainHarness):
         self.assertEqual(self.code, 0)
         self.assertIn("could not post the hand-off comment", self.stderr.getvalue())
 
-    def test_a_hand_run_request_says_so_in_the_comment(self):
-        # `--pr N` with neither flag: nobody typed /request-review and no check was consulted.
+    def test_a_request_run_by_hand_announces_nothing(self):
+        # Outside Actions the comment would land under the maintainer's login,
+        # which `handed_off` never counts, so the next grey third-plus round
+        # would post a second hand-off anyway: announce nothing and say so.
+        with mock.patch.dict(os.environ, {rr.ACTIONS_ENV: ""}):
+            posts = self.run_main(pull_request(), [], check_runs={})
+        self.assertEqual(posts, [self.REQUESTED])
+        self.assertIn("not announcing the hand-off", self.stderr.getvalue())
+
+    def test_the_hand_run_reason_is_named_when_the_workflow_runs_without_flags(self):
+        # `--pr N` with neither flag under Actions (a workflow_dispatch, say): the
+        # comment attributes the request to a hand run, not to a /request-review.
         posts = self.run_main(pull_request(), [], check_runs={})
         self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
         body = self.api.posts[1][1]["body"]
         self.assertIn("ran the request by hand", body)
         self.assertNotIn("/request-review", body)
+
+    def test_a_failed_comments_listing_never_costs_the_request_on_the_green_path(self):
+        # The listing decides decoration here; the request goes out and the
+        # hand-off is posted anyway (a duplicate is the worse case).
+        green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}
+        posts = self.run_main_with_failing(
+            (), pull_request(), [bot_review("deadbeef")], "--require-ai-review-pass",
+            check_runs=green, failing_lists=("/issues/1/comments",),
+        )
+        self.assertEqual(posts, [self.REQUESTED, self.HANDOFF])
+        self.assertEqual(self.code, 0)
+        self.assertIn("announcing anyway", self.stderr.getvalue())
+
+    def test_a_failed_comments_listing_still_holds_the_grey_gate(self):
+        # On the grey path the same listing decides whether the third-round
+        # request fires at all; a listing that fails must not fire it blind.
+        with self.assertRaises(RuntimeError):
+            self.run_main_with_failing(
+                (), pull_request(), [bot_review("1111aaa"), bot_review("2222bbb"), bot_review("deadbeef")],
+                "--require-ai-review-pass", check_runs=self.GREY, failing_lists=("/issues/1/comments",),
+            )
 
     def test_a_green_check_still_requests_and_hands_off(self):
         green = {"deadbeef": [tallied(conclusion="success", title="No findings", outcome="clean", head_sha="deadbeef")]}

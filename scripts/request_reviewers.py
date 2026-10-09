@@ -8,7 +8,9 @@ read, and on most pull requests before the author had addressed a single
 finding. The reviewer is now requested from the bot's verdict instead: the
 `AI Review` check run going `success`, or, once per pull request, completing grey after the bot has
 reviewed three distinct commits (`HANDOFF_ROUNDS`; the comment above `AI_REVIEW_BOT_LOGIN` has the
-measurement). The first request on a pull request leaves one hand-off comment, whichever path made it.
+measurement). The first request the workflow makes on a pull request leaves one hand-off comment, on either of
+its paths; a request run by hand announces nothing, since its comment would land under the
+maintainer's own login and never be recognised as the hand-off.
 
 That trigger is why this script exists rather than the action. The action reads
 `context.payload.pull_request`, which a `check_run` event does not carry, and
@@ -156,6 +158,12 @@ HANDOFF_MARKER = "<!-- auto-request-review:handoff -->"
 # or the author's agent pasting one it saw elsewhere would switch the
 # third-round rule off for the pull request.
 HANDOFF_AUTHOR = "github-actions[bot]"
+# Only a run under Actions posts the hand-off: its comment lands under the
+# login above and is recognised later. A maintainer running the script by hand
+# posts under their own login, which `handed_off` would never count, so that
+# run announces nothing and says so, and the workflow's next request posts the
+# comment that counts.
+ACTIONS_ENV = "GITHUB_ACTIONS"
 
 # A declined override is written where the person who typed it will see it:
 # a warning annotation on the workflow run (the `::warning::` command goes to
@@ -1055,7 +1063,20 @@ def main(argv=None):
     users, teams = split_teams(reviewers)
     log(f"Requesting review from {', '.join(reviewers)}")
 
-    announce = not handed_off(pull_request_comments())
+    # The listing decides only decoration here, so it cannot cost the request:
+    # on the grey path it was already read, and fatally, to decide the gate.
+    try:
+        already_announced = handed_off(pull_request_comments())
+    except Exception as exc:  # noqa: BLE001 - any API error; a duplicate comment is the worse-case cost
+        log(f"could not list the comments on #{number} to look for an earlier hand-off: {exc}; announcing anyway")
+        already_announced = False
+    announce = not already_announced
+    if announce and os.environ.get(ACTIONS_ENV) != "true":
+        log(
+            f"not announcing the hand-off on #{number}: not running as the workflow, so the comment "
+            "would land under another login and never be recognised; the workflow's next request posts it"
+        )
+        announce = False
     if announce and deciding is None:
         # The override path consulted no entry; the comment still names what
         # the check reads, if it reads anything, for the reviewer it summons.
