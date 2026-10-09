@@ -1460,6 +1460,57 @@ The defaults carry no ephemeral-storage request because the operator renders non
    | toJson -}}
 {{- end }}
 
+{{- /* The agent-api-auth sidecar's defaults, the agentAPIAuth* constants in
+       k8s-operator/internal/controller/platformagent_manifests.go. Declared once so
+       the footprint delta reads them here rather than as scattered literals;
+       tests/test_agent_api_auth_sizing_parity.py holds this equal to the operator. */ -}}
+{{- define "kube-agents.agentAPIAuthDefaults" -}}
+{{- dict
+      "requests" (dict "cpu" "150m" "memory" "384Mi")
+      "limits" (dict "cpu" "1" "memory" "2Gi" "ephemeral-storage" "2Gi")
+   | toJson -}}
+{{- end }}
+
+{{- /* Shape and grammar check for spec.deployment.agentAPIAuth.resources, run by the
+       quota preflight (kube-agents.agentAPIAuthFootprint path) and the CR template, so a
+       mistyped side key, an unsupported `claims`, a non-map side or an unparseable
+       quantity fails the render with a message naming the key instead of being pruned
+       silently or reaching parseBytes as garbage. Leaner than the proxy's: the floor,
+       crossed-pair and representability checks are the operator's and the webhook's. */ -}}
+{{- define "kube-agents.agentAPIAuthResourcesCheck" -}}
+{{- $r := . | default dict -}}
+{{- $prefix := "platformAgent.deployment.agentAPIAuth.resources" -}}
+{{- $unknown := keys (omit $r "limits" "requests" "claims") | sortAlpha -}}
+{{- if $unknown -}}
+{{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $prefix (join ", " $unknown)) -}}
+{{- end -}}
+{{- if index $r "claims" -}}
+{{- fail (printf "%s.claims is not supported -- the gateway pod declares no resourceClaims, so the operator refuses the key. Remove it." $prefix) -}}
+{{- end -}}
+{{- $names := list "cpu" "memory" "ephemeral-storage" -}}
+{{- $pattern := "^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$" -}}
+{{- range $side := list "limits" "requests" -}}
+{{- $quantities := index $r $side -}}
+{{- if not (or (empty $quantities) (kindIs "map" $quantities)) -}}
+{{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 4Gi}`" $prefix $side $quantities) -}}
+{{- end -}}
+{{- range $name, $quantity := $quantities | default dict -}}
+{{- if not (or (kindIs "invalid" $quantity) (and (kindIs "string" $quantity) (eq $quantity ""))) -}}
+{{- $raw := toString $quantity | trim -}}
+{{- if not (has $name $names) -}}
+{{- fail (printf "%s.%s.%s: the agent-api-auth container declares cpu, memory and ephemeral-storage only, and the operator refuses any other resource name" $prefix $side $name) -}}
+{{- end -}}
+{{- if hasPrefix "-" $raw -}}
+{{- fail (printf "%s.%s.%s is %s; a quantity must not be negative, and the operator refuses it" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- if not (regexMatch $pattern (trimPrefix "+" $raw)) -}}
+{{- fail (printf "%s.%s.%s is %q, which is not a Kubernetes quantity (a number with an optional suffix: Ki, Mi, Gi, Ti, Pi, Ei, n, u, m, k, M, G, T, P, E, or an integer exponent such as e3)" $prefix $side $name $raw) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
 {{- define "kube-agents.credentialProxyMemoryFloorBytes" -}}
 704643072
 {{- end }}
@@ -1596,21 +1647,28 @@ The defaults carry no ephemeral-storage request because the operator renders non
          declares no ephemeral request, which the API server defaults to the limit,
          so the base counts 2Gi on both ephemeral sides. */ -}}
   {{- $aaResources := (((.Values.platformAgent.deployment | default dict).agentAPIAuth | default dict).resources) | default dict -}}
+  {{- include "kube-agents.agentAPIAuthResourcesCheck" $aaResources -}}
   {{- $aaReq := (index $aaResources "requests") | default dict -}}
   {{- $aaLim := (index $aaResources "limits") | default dict -}}
+  {{- $aaDefaults := include "kube-agents.agentAPIAuthDefaults" . | fromJson -}}
+  {{- $aaReqDef := index $aaDefaults "requests" -}}
+  {{- $aaLimDef := index $aaDefaults "limits" -}}
   {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "cpu") "fallback" "") -}}
-  {{- $podReqCpu = add $podReqCpu (sub (include "kube-agents.parseCpuMillis" . | int64) 150) -}}
+  {{- $podReqCpu = add $podReqCpu (sub (include "kube-agents.parseCpuMillis" . | int64) (include "kube-agents.parseCpuMillis" (index $aaReqDef "cpu") | int64)) -}}
   {{- end -}}
   {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "cpu") "fallback" "") -}}
-  {{- $podLimCpu = add $podLimCpu (sub (include "kube-agents.parseCpuMillis" . | int64) 1000) -}}
+  {{- $podLimCpu = add $podLimCpu (sub (include "kube-agents.parseCpuMillis" . | int64) (include "kube-agents.parseCpuMillis" (index $aaLimDef "cpu") | int64)) -}}
   {{- end -}}
   {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaReq "memory") "fallback" "") -}}
-  {{- $podReqMem = add $podReqMem (sub (include "kube-agents.parseBytes" . | int64) 402653184) -}}
+  {{- $podReqMem = add $podReqMem (sub (include "kube-agents.parseBytes" . | int64) (include "kube-agents.parseBytes" (index $aaReqDef "memory") | int64)) -}}
   {{- end -}}
   {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "memory") "fallback" "") -}}
-  {{- $podLimMem = add $podLimMem (sub (include "kube-agents.parseBytes" . | int64) 2147483648) -}}
+  {{- $podLimMem = add $podLimMem (sub (include "kube-agents.parseBytes" . | int64) (include "kube-agents.parseBytes" (index $aaLimDef "memory") | int64)) -}}
   {{- end -}}
-  {{- $aaEphDefault := 2147483648 -}}
+  {{- /* The sidecar declares an ephemeral limit and no request, which the API server
+         defaults to the limit, so the base counts the default on both sides. A limit
+         override moves both unless a request override is also set. */ -}}
+  {{- $aaEphDefault := include "kube-agents.parseBytes" (index $aaLimDef "ephemeral-storage") | int64 -}}
   {{- $aaEphLim := $aaEphDefault -}}
   {{- $aaEphReq := $aaEphDefault -}}
   {{- with include "kube-agents.declaredQuantity" (dict "value" (index $aaLim "ephemeral-storage") "fallback" "") -}}
@@ -1674,13 +1732,15 @@ The defaults carry no ephemeral-storage request because the operator renders non
          generic keys here ensures that any workload summed into extract_footprint is
          automatically counted by the preflight without requiring manual template edits.
          agentPod and storage are handled separately above and below. */ -}}
-  {{- /* The one operator-rendered workload with a sizing override in values: the proxy's
-         footprint entry takes platformAgent.deployment.credentialProxy.resources over it
-         per key (kube-agents.credentialProxyFootprint) before it is summed, so a raised
-         memory limit is counted here as the pod the operator will write, rather than the
-         preflight passing a quota the release will not fit. An ephemeral-storage limit set
-         alone is counted as a request of that size too: the operator renders no
-         ephemeral-storage request and the API server defaults it to the limit. */ -}}
+  {{- /* The credential proxy is the one operator-rendered workload of its own pod with a
+         sizing override: its footprint entry takes platformAgent.deployment.credentialProxy.resources
+         over it per key (kube-agents.credentialProxyFootprint) before it is summed, so a
+         raised memory limit is counted here as the pod the operator will write, rather than
+         the preflight passing a quota the release will not fit. An ephemeral-storage limit
+         set alone is counted as a request of that size too: the operator renders no
+         ephemeral-storage request and the API server defaults it to the limit. The
+         agent-api-auth sidecar has a sizing override too, but it is a container of the agent
+         pod, so its delta is added to agentPod above rather than counted here. */ -}}
   {{- $proxyOverride := (((.Values.platformAgent.deployment | default dict).credentialProxy | default dict).resources) | default dict -}}
   {{- range $key, $workload := $op -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}

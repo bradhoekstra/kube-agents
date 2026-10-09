@@ -388,6 +388,26 @@ class PreflightDecisionTest(unittest.TestCase):
             finally:
                 self.chart = original
 
+    def test_agent_api_auth_override_the_preflight_cannot_parse_fails_naming_the_key(self) -> None:
+        # The footprint path reads the override too; with the CR template removed, a bad
+        # quantity or a non-map side can only be caught by kube-agents.agentAPIAuthResourcesCheck
+        # in the preflight, naming the key rather than reaching parseBytes as garbage.
+        with tempfile.TemporaryDirectory() as tmp:
+            chart = pathlib.Path(tmp) / "kube-agents"
+            shutil.copytree(self.chart, chart)
+            (chart / "templates" / "platform-agent-cr.yaml").unlink()
+            original, self.chart = self.chart, chart
+            try:
+                for value in ("-1Gi", "abc", "2GB"):
+                    res = self._render({"probe": {"emitRequirements": True}},
+                                       [f"{_AA_VALUE}.limits.memory={value}"])
+                    self.assertNotEqual(res.returncode, 0, res.stdout)
+                    self.assertIn(f"{_AA_VALUE}.limits.memory is", res.stderr)
+                res = self._render({"probe": {"emitRequirements": True}}, [f"{_AA_VALUE}.limits=4Gi"])
+                self.assertIn(f"{_AA_VALUE}.limits is 4Gi, which is not a map", res.stderr)
+            finally:
+                self.chart = original
+
     def test_disabling_the_dashboard_drops_it_from_the_total(self) -> None:
         """The flag is harness.hermes.dashboardEnabled, one level deeper than harness.
 
