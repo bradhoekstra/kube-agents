@@ -964,8 +964,8 @@ func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
 	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 2 {
 		t.Fatalf("a failed scrape changed the gauges: %d patches, status %+v", h.patches, status)
 	}
-	// A second failed poll is the streak that records the Warning: a watcher
-	// down that long watches nothing, so both are cleared rather than held.
+	// A second poll in a row with no gateway reading: the operator has no
+	// current reading, so both are cleared rather than held.
 	h.poll(25)
 	if status := h.status(); h.patches != 3 || status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
 		t.Fatalf("a standing watcher failure left the gauges: %d patches, status %+v", h.patches, status)
@@ -996,6 +996,67 @@ func TestUsagePoller_ClusterGaugesTakeTheLargestReplica(t *testing.T) {
 	h.poll(5)
 	if status := h.status(); status.ClustersRegistered != 4 || status.ClustersMonitored != 4 {
 		t.Fatalf("two replicas: %+v, want 4/4", status)
+	}
+}
+
+// One replica read is a reading: a sibling failing for any number of polls
+// neither clears the gauges nor lowers them, and a broker failing for the
+// streak has nothing to do with them.
+func TestUsagePoller_ClusterGaugesHoldWhileAnyReplicaIsRead(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), b)...)
+	bAddr := usageTestGatewayB + ":9095"
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.setClusters(gatewayAddr(), 4, 4)
+	h.stub.fail(bAddr, usageScrapeKindRefused)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	for _, minute := range []int{5, 10, 15} {
+		h.poll(minute)
+	}
+	if status := h.status(); status.ClustersRegistered != 4 || status.ClustersMonitored != 4 {
+		t.Fatalf("a failing sibling or broker touched the gauges: %+v, want 4/4", status)
+	}
+}
+
+// A gateway pod that is live but never a target, Pending or without a pod IP,
+// is the same absence of a reading as a failing listener: the gauges clear at
+// the streak, and come back once a replica is read.
+func TestUsagePoller_ClusterGaugesClearWhenNoGatewayIsReadable(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	if status := h.status(); status.ClustersRegistered != 3 {
+		t.Fatalf("first poll: %+v", status)
+	}
+	// The gateway pod loses its IP (evicted and Pending again under the same
+	// UID is the same shape): live, not a target, no scrape, no streak.
+	pod := &corev1.Pod{}
+	if err := h.cl.Get(context.Background(), client.ObjectKey{Namespace: usageTestNamespace, Name: "agent-gateway-aaa"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.PodIP = ""
+	if err := h.cl.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	h.poll(10)
+	if status := h.status(); status.ClustersRegistered != 3 {
+		t.Fatalf("one poll without a readable gateway changed the gauges: %+v", status)
+	}
+	h.poll(15)
+	if status := h.status(); status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
+		t.Fatalf("two polls without a readable gateway left the gauges: %+v", status)
+	}
+	pod.Status.PodIP = usageTestGatewayIP
+	if err := h.cl.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	h.poll(20)
+	if status := h.status(); status.ClustersRegistered != 3 || status.ClustersMonitored != 3 {
+		t.Fatalf("the reading did not come back: %+v", status)
 	}
 }
 

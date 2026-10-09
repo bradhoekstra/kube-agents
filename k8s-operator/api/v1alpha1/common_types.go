@@ -1996,15 +1996,15 @@ type AgentUsageStatus struct {
 	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
-	// client for at its last start: the Cluster Agent profiles the GKE API
-	// would describe, and the management cluster once where a profile also
-	// covers it. Read
-	// every five minutes as the number of k8s_event_watcher_cluster_up series
-	// the watcher exports, the largest reading across gateway replicas. The
-	// watcher discovers its fleet once per process, so a cluster that joins or
-	// leaves is counted after the gateway pod restarts, not before. A gauge,
-	// not a counter: it falls after such a restart, and it is cleared when the
-	// event watcher is disabled. Absent until the first poll reads the watcher.
+	// client for at its last start: the management cluster and the Cluster
+	// Agent profiles the GKE API would describe, the management cluster
+	// counted once even where a profile also covers it. Read every five
+	// minutes as the number of k8s_event_watcher_cluster_up series the watcher
+	// exports, the largest reading across gateway replicas. The watcher
+	// discovers its fleet once per process, so a cluster that joins or leaves
+	// is counted after the gateway pod restarts, not before. A gauge, not a
+	// counter: it falls after such a restart, and it is cleared when the event
+	// watcher is disabled. Absent until the first poll reads the watcher.
 	// +optional
 	ClustersRegistered int64 `json:"clustersRegistered,omitempty"`
 
@@ -2014,10 +2014,11 @@ type AgentUsageStatus struct {
 	// is the number of clusters silently unwatched, a stuck informer, a 403
 	// on the events list, or a stopped one. 0 is the normal reading while the
 	// watcher starts, so read a fall alongside the pod's age. A gauge, read
-	// and cleared the same way as ClustersRegistered. One poll that cannot
-	// read the watcher leaves both where they were; a second in a row, the
-	// one that records the UsageScrapeFailing Warning on this resource, clears
-	// both, since a watcher unreadable that long is watching nothing.
+	// and cleared the same way as ClustersRegistered. One poll in which no
+	// gateway replica could be read leaves both where they were; a second in
+	// a row clears both, because the operator then has no current reading and
+	// an absent field says so. The watcher may be down or merely unreachable;
+	// the UsageScrapeFailing Warning on this resource says which.
 	// +optional
 	ClustersMonitored int64 `json:"clustersMonitored,omitempty"`
 

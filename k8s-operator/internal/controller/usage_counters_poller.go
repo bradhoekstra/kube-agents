@@ -126,6 +126,14 @@ type UsageCounterPoller struct {
 	// usageStatusReprobeInterval, then the gauges are probed again. In memory
 	// only, like streaks; keyed like the cursor.
 	prunedGauges map[string]time.Time
+	// gatewayMisses counts, per CR, the consecutive polls in which no gateway
+	// replica's body was read while the watcher is on: listeners failing, pods
+	// Pending or without an IP, or none running. At usageScrapeFailureEventStreak
+	// the poll projects the gauges as zero, so an absent field reads as the no
+	// current reading it is rather than a held one reading as current. In
+	// memory, like streaks: a leader change delays the clear by one streak and
+	// never advances it.
+	gatewayMisses map[string]int
 
 	// cursor is the namespace/name of the last CR a poll finished. The next
 	// poll sorts the CRs and resumes after it, wrapping, so a poll the budget
@@ -228,15 +236,39 @@ func (p *UsageCounterPoller) noteGaugeEcho(ctx context.Context, agent *agentv1al
 	}
 }
 
-// forgetDepartedGaugeRecords drops the gauge records of CRs outside swept, the
-// CRs a completed sweep reached, so the map does not keep an entry per deleted
-// CR for the life of the process.
+// noteGatewayReading records whether this poll read any gateway replica's body
+// for the CR and reports whether the misses have reached the streak at which
+// the gauges are projected as zero. A reading, or the watcher being off, ends
+// the run of misses.
+func (p *UsageCounterPoller) noteGatewayReading(agent *agentv1alpha1.PlatformAgent, read bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := usagePollKey(agent)
+	if read {
+		delete(p.gatewayMisses, key)
+		return false
+	}
+	if p.gatewayMisses == nil {
+		p.gatewayMisses = map[string]int{}
+	}
+	p.gatewayMisses[key]++
+	return p.gatewayMisses[key] >= usageScrapeFailureEventStreak
+}
+
+// forgetDepartedGaugeRecords drops the gauge records and gateway-miss counts of
+// CRs outside swept, the CRs a completed sweep reached, so the maps do not keep
+// an entry per deleted CR for the life of the process.
 func (p *UsageCounterPoller) forgetDepartedGaugeRecords(swept map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for key := range p.prunedGauges {
 		if !swept[key] {
 			delete(p.prunedGauges, key)
+		}
+	}
+	for key := range p.gatewayMisses {
+		if !swept[key] {
+			delete(p.gatewayMisses, key)
 		}
 	}
 }
@@ -385,15 +417,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	}
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
-	// The watcher's standing: how many gateway listeners this poll tried, and
-	// how many of them have failed for the event streak or longer. All of them,
-	// and none read, is a watcher that has been down for the streak, which the
-	// gauges report as no reading rather than the last one.
-	gatewayTargets, gatewayStanding := 0, 0
 	for _, target := range targets {
-		if target.counter == usageCounterEventsIngested {
-			gatewayTargets++
-		}
 		reading, err := p.source.Scrape(ctx, target.addr, target.counter)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -404,9 +428,6 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			}
 			if failure, report := p.noteScrapeFailure(log, target, err); report {
 				failing = append(failing, failure)
-				if target.counter == usageCounterEventsIngested {
-					gatewayStanding++
-				}
 			}
 			continue
 		}
@@ -421,7 +442,16 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			Clusters:  reading.Clusters,
 		})
 	}
-	gauges := usageClusterGaugesForPoll(cached, scraped, gatewayTargets > 0 && gatewayStanding == gatewayTargets)
+	// Whether any gateway replica's body was read this poll: a watcher body
+	// always carries a cluster reading, zero or not, and no other body does.
+	gatewayRead := !eventWatcherEnabled(cached)
+	for _, s := range scraped {
+		if s.Clusters != nil {
+			gatewayRead = true
+			break
+		}
+	}
+	gauges := usageClusterGaugesForPoll(cached, scraped, p.noteGatewayReading(cached, gatewayRead))
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -477,12 +507,13 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 // largest of each gauge across the gateway replicas read, because every
 // replica's watcher builds the same fleet and one mid-startup reports fewer;
 // zero, explicitly, when the watcher is off, so the fields clear rather than
-// hold the last fleet it watched, and again when every gateway listener has
-// failed for the event streak (watcherDown), because a watcher that has been
-// unreadable that long is watching nothing a reader should be told about and
-// the Warning recorded on the same poll names the pod; nil when the watcher
-// is on and no replica could be read for less than that, so the fields keep
-// their last reading across a restart or one missed poll.
+// hold the last fleet it watched, and again when no gateway replica has been
+// read for the event streak (watcherDown), because the operator then has no
+// current reading and an absent field says so where a held one would read as
+// current -- the watcher may be down, or merely unreachable, and the Warning
+// the scrape streak records says which; nil when the watcher is on and no
+// replica could be read for less than that, so the fields keep their last
+// reading across a restart or one missed poll.
 func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, watcherDown bool) *usageClusterGauges {
 	if !eventWatcherEnabled(agent) || watcherDown {
 		return &usageClusterGauges{}
