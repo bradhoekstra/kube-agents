@@ -135,6 +135,12 @@ type usageDocument struct {
 	// layout, so the poll writes it back at the current one even when the fold
 	// changed nothing. Not serialised.
 	migrated bool
+	// unfolded names the counters migrateUsageDocument added to Totals at zero
+	// on this read: the status carried nothing for them and no pod's sample has
+	// been folded into them through this document, so nothing of any pod's
+	// sample has been seen, and a pod older than the document adds its whole
+	// sample the way a pod created after FirstRecorded does. Not serialised.
+	unfolded map[string]bool
 }
 
 // migrateUsageDocument brings a version-1 document, entries keyed by pod UID
@@ -143,9 +149,18 @@ type usageDocument struct {
 // totals the counters they lacked. Nothing is lost, which a re-seed cannot
 // say: a re-seed starts from the status, which a pruning CRD leaves empty, and
 // re-baselines every pod at its current sample, so whatever the listeners
-// counted since the last poll is never added. Any other version is left for
-// usageDocumentInvalid to refuse.
-func migrateUsageDocument(doc *usageDocument) {
+// counted since the last poll is never added. A total the layout lacked
+// starts at its floor, the status value the read-back holds every total to,
+// rather than at zero: an operator that wrote the newer field, was rolled
+// back to one that kept a version-1 document, and came back again finds the
+// status still carrying what it wrote, and a zero under that floor would have
+// usageDocumentInvalid refuse the document and re-seed it, losing the
+// interval's counts on every counter. What the listeners counted during the
+// rollback is not recovered: the pods are baselined at their samples, and
+// only a counter whose floor is zero, so that none of any sample can be in
+// the total, is marked unfolded for foldUsage to add whole. Any other version
+// is left for usageDocumentInvalid to refuse.
+func migrateUsageDocument(doc *usageDocument, floors map[string]int64) {
 	if doc.Version != usageDocumentVersionPodKeyed || doc.Pods == nil || doc.Totals == nil {
 		return
 	}
@@ -161,8 +176,15 @@ func migrateUsageDocument(doc *usageDocument) {
 	}
 	doc.Pods = rekeyed
 	for _, counter := range usageCounters {
-		if _, ok := doc.Totals[counter]; !ok {
-			doc.Totals[counter] = 0
+		if _, ok := doc.Totals[counter]; ok {
+			continue
+		}
+		doc.Totals[counter] = floors[counter]
+		if floors[counter] == 0 {
+			if doc.unfolded == nil {
+				doc.unfolded = map[string]bool{}
+			}
+			doc.unfolded[counter] = true
 		}
 	}
 	doc.Version = usageDocumentVersion
@@ -303,7 +325,9 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 		if !known {
 			// Recorded whatever its sample. Created after the document was
 			// first recorded, it started from zero and none of it was seen, so
-			// the whole sample adds, under the ceiling; older, or past the
+			// the whole sample adds, under the ceiling; so does a sample for a
+			// counter the migration added unfolded, which no document and no
+			// status has seen any of; older on any other counter, or past the
 			// ceiling, it is recorded and adds nothing.
 			entry = &usagePodEntry{Name: s.Name, PodUID: s.UID, Counter: s.Counter, Sample: s.Sample, StartTime: s.StartTime, Marker: stamp}
 			doc.Pods[key] = entry
@@ -335,13 +359,14 @@ func foldUsage(doc *usageDocument, agentUID string, seed usageSeed, live map[str
 					entry.Marker = doc.FirstRecorded
 				}
 			}
-			if s.Created.After(doc.FirstRecorded.Time) && s.Sample <= usageDeltaCeiling {
+			if (s.Created.After(doc.FirstRecorded.Time) || doc.unfolded[s.Counter]) && s.Sample <= usageDeltaCeiling {
 				candidates[s.Counter] = append(candidates[s.Counter], usageCandidate{entry: entry, delta: s.Sample, sample: s.Sample, startTime: s.StartTime})
 			}
 			continue
 		}
-		if entry.Name != s.Name || entry.Counter != s.Counter {
-			entry.Name, entry.Counter = s.Name, s.Counter
+		// The counter is half the key, so only the name can drift.
+		if entry.Name != s.Name {
+			entry.Name = s.Name
 			changed = true
 		}
 

@@ -691,13 +691,15 @@ func (p *UsageCounterPoller) readDocument(ctx context.Context, log logr.Logger, 
 		log.Info("the usage counters document does not parse; re-seeding from the status", "configmap", cm.Name)
 		return cm, nil, nil
 	}
-	migrateUsageDocument(&doc)
-	if doc.migrated {
-		log.Info("the usage counters document was at the previous layout; migrated in place, nothing lost", "configmap", cm.Name)
-	}
+	migrateUsageDocument(&doc, usageStatusSeed(agent, now).Totals)
 	if reason := usageDocumentInvalid(&doc, cm, agent, now); reason != "" {
 		log.Info("the usage counters document failed a read-back bound; re-seeding from the status", "configmap", cm.Name, "reason", reason)
 		return cm, nil, nil
+	}
+	// After the bounds, so that a migrated document the bounds refuse logs
+	// the re-seed alone: "nothing lost" is only true of one that passed.
+	if doc.migrated {
+		log.Info("the usage counters document was at the previous layout; migrated in place, nothing lost", "configmap", cm.Name)
 	}
 	return cm, &doc, nil
 }
