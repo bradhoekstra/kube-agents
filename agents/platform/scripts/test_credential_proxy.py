@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import os
+from dataclasses import replace
 import queue
 import re
 import shutil
@@ -3596,6 +3597,69 @@ class CommandExecutorTest(unittest.TestCase):
             executor._resolve_kubeconfig(self.CONTEXT)
         self.assertTrue(executor._provisional_marker(target).exists())
 
+    def test_a_callers_fetch_with_no_decision_at_all_is_provisional_too(self):
+        # The broker read the target and tried to decide, and the describe
+        # failed: the caller's result is as unsettled as the broker's own
+        # would be, and must not clear an older mark either.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertTrue(executor._provisional_marker(target).exists())
+
+    def test_a_failed_refetch_past_the_window_serves_the_file_it_has(self):
+        # The mark is set when the GKE API was just failing, so the refetch
+        # runs into the same condition. A working kubeconfig on disk beats a
+        # 400, and the window is pushed out so the next request waits again.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            first = executor._resolve_kubeconfig(self.CONTEXT)
+        self.age_marker(executor, target)
+        original = executor._execute
+
+        def failing_fetch(argv, **kwargs):
+            result = original(argv, **kwargs)
+            if "get-credentials" in argv and "--help" not in argv:
+                return replace(result, exit_code=1, stderr="ERROR: (gcloud.container.clusters.get-credentials) 503")
+            return result
+
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=None),
+            mock.patch.object(executor, "_execute", failing_fetch),
+        ):
+            second = executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertEqual(first, second)
+        self.assertTrue(second.is_file())
+        marker = executor._provisional_marker(target)
+        self.assertTrue(marker.exists())
+        self.assertTrue(executor._provisional_window_open(marker), "the window was pushed out")
+
+    def test_a_callers_fetch_files_its_result_without_the_kubeconfig_lock(self):
+        # The broker's cold read holds _kubeconfig_lock across its gcloud runs.
+        # A scaffold's fetch must not queue behind it to file a credential it
+        # already has; only the marker step is serialised, on its own lock.
+        executor = self.fake_gcloud(self.executor())
+        executor._kubeconfig_lock.acquire()
+        try:
+            done = threading.Event()
+
+            def run():
+                with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([])):
+                    executor.execute(
+                        ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                         "--location=us-central1", "--project=demo-project"],
+                    )
+                done.set()
+
+            threading.Thread(target=run, daemon=True).start()
+            self.assertTrue(done.wait(timeout=10), "the caller's fetch waited on the kubeconfig lock")
+        finally:
+            executor._kubeconfig_lock.release()
+
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the
         # sidecar the only gcloud that may run is the resolved executable, so the
@@ -3613,8 +3677,8 @@ class CommandExecutorTest(unittest.TestCase):
             executor._endpoint_decision(resolved, target)
 
         self.assertEqual(1, len(seen))
-        # The stub exits non-zero without KUBECONFIG set, which is all this needs
-        # to prove: the adapter ran *something*, and it ran it through _execute.
+        # The stub answers a describe with "{}" and exits 0; what this proves is
+        # that the adapter ran *something*, and ran it through _execute.
         self.assertIsInstance(seen[0], tuple)
 
     def test_missing_gke_endpoint_falls_back_instead_of_failing_the_fetch(self):

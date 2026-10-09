@@ -86,11 +86,14 @@ per-target cache, so the next call re-reads rather than serving a fallback for a
 minute. An identity that is absent is a settled answer, cached like any other. The credential
 proxy reads the mark: a managed kubeconfig written from a provisional decision, or from no
 decision at all because the target describe failed, by the proxy's own fetch or by a caller's
-fetch it spliced into, is served for one minute and then treated as a miss (a `.provisional`
-marker beside the file, written under the kubeconfig lock and before the file, which a later
-settled fetch, or a caller's fetch carrying its own endpoint flag, clears). A cold fetch during
-a failed describe therefore does not pin a public-IP kubeconfig until the pod restarts, and a
-describe that keeps failing costs one refetch a minute rather than one a request.
+fetch the proxy tried to decide for, is served for one minute and then treated as a miss (a
+`.provisional` marker beside the file, written before the file under a lock of its own so the
+filing step never waits behind a cold read's gcloud runs; a later settled fetch, or a caller's
+fetch run as given because it carried its own endpoint flag or named no full target, clears
+it). When the refetch after the window fails and a file is on disk, the proxy serves that file
+and pushes the window out rather than refusing the request. A cold fetch during a failed
+describe therefore does not pin a public-IP kubeconfig until the pod restarts, and a describe
+that keeps failing costs one refetch a minute rather than one a request.
 
 A Shared VPC matches naturally: a service-project cluster reports the host project's network
 resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
@@ -158,10 +161,12 @@ could be decided. After the mirror, the scaffold probes the cluster with
 `agent` login that owns the file. When kubectl exits non-zero it logs one line with the endpoint
 kind, the address, the list, and kubectl's last line (just kubectl's last line when nothing was
 decided), adding the remedy only when kubectl's
-output is a connection failure (a timeout, no route, a refused dial) rather than an answer the
-server gave (401, 403, NotFound) or a message the credential-proxy shim itself produced (its
-`credential proxy:`, `credential proxy unavailable`, `credential proxy token unavailable` and
-`credential proxy error` prefixes). When the probe itself does not finish inside its outer bound,
+output is a connection failure (a timeout, no route, a refused dial, matched on those causes
+rather than on kubectl's generic `Unable to connect to the server:` prefix, which also fronts
+x509 and auth-plugin failures the list cannot fix) rather than an answer the server gave (401,
+403, NotFound) or a message the credential-proxy shim itself produced (its `credential proxy:`,
+`credential proxy unavailable`, `credential proxy token unavailable` and `credential proxy
+error` prefixes). When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
 normally: a cluster that is unreachable now may be reachable after the operator acts, and a
 scaffold that failed would only be retried on the next reconcile tick with the same result.
@@ -235,7 +240,8 @@ yields no flag from all three.
   spliced in, with the target read through gcloud's flag shapes and the project defaulted to
   the broker's own; one that names an endpoint is run as given; a kubeconfig written from a
   provisional decision, or from none, by either writer, is served inside its window and
-  refetched after it; a settled fetch or a caller's own flag clears the mark.
+  refetched after it; a settled fetch or a caller's own flag clears the mark; a failed refetch
+  serves the file on disk; a caller's fetch files its result without the kubeconfig lock.
 - `test_cluster_preflight.py`: check 5's JSON carries the bullets and the remedy on a connection
   failure, the bullets without the remedy on a 403, and today's text when there are no bullets.
 - `test_gke_endpoint_parity.py`: the added case above.

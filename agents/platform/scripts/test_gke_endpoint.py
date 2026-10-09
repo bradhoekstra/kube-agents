@@ -246,21 +246,6 @@ PRIVATE_SAME_VPC_GLOBAL = _variant(
                           "masterGlobalAccessConfig": {"enabled": True}},
 )
 
-# Authorized networks off entirely, the shape of an ordinary dev cluster. GKE
-# reports the block in both places, so both are cleared.
-PRIVATE_SAME_VPC_LIST_OFF = _variant(
-    PRIVATE_SAME_VPC,
-    masterAuthorizedNetworksConfig={},
-    controlPlaneEndpointsConfig={
-        **PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"],
-        "ipEndpointsConfig": {
-            **{k: v for k, v in PRIVATE_SAME_VPC["controlPlaneEndpointsConfig"]["ipEndpointsConfig"].items()
-               if k != "authorizedNetworksConfig"},
-            "authorizedNetworksConfig": {},
-        },
-    },
-)
-
 
 class FakeRunner:
     """Answers the help probe and the describe, and records what it was asked."""

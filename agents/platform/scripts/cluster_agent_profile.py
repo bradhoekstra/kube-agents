@@ -88,10 +88,12 @@ CONNECTIVITY_PROBE_TIMEOUT_SECONDS = 45
 # What kubectl prints when it never reached the API server, as opposed to an
 # answer it did not like (401, 403, NotFound). The endpoint remedy is about
 # reaching the server, so it is offered only for the first kind.
+# kubectl's generic "Unable to connect to the server:" prefix is deliberately
+# absent: it also fronts x509 and auth-plugin failures, which the remedy cannot
+# fix, and the network causes behind it are matched on their own.
 CONNECTIVITY_FAILURE_RE = re.compile(
     r"i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|"
-    r"connection refused|network is unreachable|Unable to connect to the server|"
-    r"TLS handshake timeout|dial tcp",
+    r"connection refused|network is unreachable|TLS handshake timeout|dial tcp",
     re.IGNORECASE,
 )
 # The credential-proxy shim's own messages ("credential proxy unavailable:
@@ -386,6 +388,11 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
         # shim reads it client-side before it talks to the broker. Under the
         # default login the shim refuses with "kubeconfig is unreadable" and
         # the probe would report a permissions problem as the cluster's.
+        # sandbox_exec's rule that a reader of command output uses the default
+        # login is knowingly bent here, and only here: what this call believes
+        # drives one log line, never a decision, a file, or USER.md, so a
+        # startup file that forged the answer on an old sandbox image would
+        # cost one misleading line in the scaffold log.
         completed = sandbox_exec.run(
             argv,
             remote_env={"KUBECONFIG": str(kubeconfig)},
@@ -495,7 +502,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # writes into exist on that side; before that landed, this call named an
     # agent-pod path with no counterpart in the sandbox and gcloud said so.
     #
-    # As TERMINAL_PRINCIPAL, unlike every other call in this file. Step 2e
+    # As TERMINAL_PRINCIPAL, as only the probe in step 6 otherwise is. Step 2e
     # mirrors the profile directory in as `agent:agent` 0755, so the default
     # `hermes` login (uid 1001) cannot create a file in it and gcloud exits on
     # EACCES. The alternative — making the directory group- or world-writable

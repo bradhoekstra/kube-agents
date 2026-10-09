@@ -4792,6 +4792,11 @@ class CommandExecutor:
         # rare and the server is threaded, so a single lock is cheaper than the
         # bookkeeping needed to make it per-cluster.
         self._kubeconfig_lock = threading.Lock()
+        # Serialises only the two filesystem steps that file a managed
+        # kubeconfig and its provisional mark (`_file_managed_kubeconfig`), so
+        # a caller's fetch never waits behind a cold read's gcloud runs, which
+        # `_kubeconfig_lock` covers.
+        self._marker_lock = threading.Lock()
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
@@ -6385,17 +6390,19 @@ class CommandExecutor:
 
         The mark goes down before the file when the decision was provisional,
         so a crash between the two leaves an unmarked file only when it was
-        settled; and it comes off after the file when it was settled. Callers
-        hold `_kubeconfig_lock` across this, so a settled fetch and a
-        provisional one cannot interleave their two steps.
+        settled; and it comes off after the file when it was settled. The two
+        steps run under `_marker_lock`, so a settled fetch and a provisional
+        one cannot interleave them, whether or not the caller also holds
+        `_kubeconfig_lock`.
         """
         marker = self._provisional_marker(target)
-        if provisional:
-            marker.touch()
-            os.replace(scratch, self._managed_kubeconfig(target))
-        else:
-            os.replace(scratch, self._managed_kubeconfig(target))
-            marker.unlink(missing_ok=True)
+        with self._marker_lock:
+            if provisional:
+                marker.touch()
+                os.replace(scratch, self._managed_kubeconfig(target))
+            else:
+                os.replace(scratch, self._managed_kubeconfig(target))
+                marker.unlink(missing_ok=True)
 
     def _ensure_managed_kubeconfig(self, target: ClusterTarget) -> Path:
         """Return the proxy-authored kubeconfig for a cluster, fetching on a miss.
@@ -6441,6 +6448,20 @@ class CommandExecutor:
                 )
                 if result.exit_code != 0 or not scratch.is_file():
                     detail = result.stderr.strip() or f"gcloud exited {result.exit_code}"
+                    if managed.is_file() and managed.stat().st_size > 0:
+                        # A provisional file past its window brought us here.
+                        # The mark was set when the GKE API was failing, and
+                        # the refetch has just met the same condition; the
+                        # kubeconfig on disk may well still work, and serving
+                        # it beats a 400. The window is pushed out so the next
+                        # attempt waits again rather than retrying per request.
+                        logging.warning(
+                            "refetch of the provisional kubeconfig for %s failed (%s); serving the file on disk",
+                            target.context_name, detail[:200],
+                        )
+                        with self._marker_lock:
+                            marker.touch()
+                        return managed
                     raise ValueError(
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
                     )
@@ -6450,8 +6471,14 @@ class CommandExecutor:
                 scratch.unlink(missing_ok=True)
         return managed
 
-    def _decision_for_callers_fetch(self, command: list[str]):
-        """The endpoint decision to apply to a caller's `get-credentials`, or None.
+    def _decision_for_callers_fetch(self, command: list[str]) -> tuple[bool, object]:
+        """`(attempted, decision)` for a caller's `get-credentials`.
+
+        `attempted` is False when the command is run as given: the caller named
+        an endpoint flag, or no full target could be read. It is True when the
+        broker decided for the caller, in which case `decision` is gke_endpoint's
+        answer or None when it could not decide -- and None is then as
+        provisional as the broker's own undecided fetch, not a settled result.
 
         The file that fetch produces is filed as the shared kubeconfig for its
         cluster (`_execute_get_credentials`), so a caller that names no endpoint
@@ -6463,11 +6490,11 @@ class CommandExecutor:
         against defaults this side does not know.
         """
         if any(flag in command for flag in GET_CREDENTIALS_ENDPOINT_FLAGS):
-            return None
+            return False, None
         target = _get_credentials_target(command)
         if target is None:
-            return None
-        return self._endpoint_decision(command[0], target)
+            return False, None
+        return True, self._endpoint_decision(command[0], target)
 
     def _execute_get_credentials(
         self,
@@ -6495,7 +6522,7 @@ class CommandExecutor:
         # writes the kubeconfig named by `KUBECONFIG`, the broker's own base
         # config, moving the `current-context` that every later context-less
         # kubectl resolves against.
-        decision = self._decision_for_callers_fetch(command)
+        attempted, decision = self._decision_for_callers_fetch(command)
         command = [*command, *_flags_of(decision)]
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
@@ -6507,18 +6534,19 @@ class CommandExecutor:
                 context = read_current_context(generated)
                 target = parse_gke_context(context) if context else None
                 if target is not None:
-                    # The gcloud run above stays outside `_kubeconfig_lock`, so
-                    # a scaffold never waits behind a cold read; only the two
-                    # filesystem steps take it, so the file and its provisional
-                    # mark cannot interleave with the broker's own fetch. The
-                    # same provisional rule as that fetch: a file written while
-                    # the own-cluster describe failed is a miss next time; one
-                    # written on a settled decision, or with the caller's own
-                    # flag (no decision made here), clears an older mark.
-                    with self._kubeconfig_lock:
-                        self._file_managed_kubeconfig(
-                            scratch, target,
-                            provisional=decision is not None and decision.provisional)
+                    # Outside `_kubeconfig_lock`, as before: a scaffold never
+                    # waits behind a cold read's gcloud runs. The filing step
+                    # takes `_marker_lock` by itself, so the file and its
+                    # provisional mark cannot interleave with the broker's own
+                    # fetch. The same provisional rule as that fetch: a file
+                    # written while the broker tried to decide and could not --
+                    # the own-cluster describe failed, or the target's -- is a
+                    # miss after its window; one written on a settled decision,
+                    # or run as given (the caller's own flag, no readable
+                    # target), clears an older mark.
+                    self._file_managed_kubeconfig(
+                        scratch, target,
+                        provisional=attempted and (decision is None or decision.provisional))
                 if wants_kubeconfig:
                     result = replace(result, kubeconfig=generated)
             return result

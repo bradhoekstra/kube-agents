@@ -505,6 +505,17 @@ class CreateProfileTest(unittest.TestCase):
         self.assertIn("Forbidden", self.stderr)
         self.assertNotIn(ADMIT_REMEDY, self.stderr)
 
+    def test_a_certificate_failure_under_kubectls_generic_prefix_names_no_remedy(self):
+        # kubectl prefixes every transport failure with "Unable to connect to
+        # the server:", x509 and auth-plugin errors included; the list cannot
+        # fix those, so the prefix alone must not earn the remedy.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = ("Unable to connect to the server: x509: certificate signed by unknown authority\n")
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
+
     def test_a_probe_the_shim_refused_names_no_remedy(self):
         # "credential proxy unavailable" is the broker being down, not the
         # cluster's list; the words "connection refused" inside it must not win.

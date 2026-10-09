@@ -101,7 +101,7 @@ readonly RC_TIMED_OUT=124
 # What kubectl prints when it never reached the API server; check 5 offers the
 # scaffold's endpoint remedy only for these (cluster_agent_profile.py keeps the
 # same list as CONNECTIVITY_FAILURE_RE).
-readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|Unable to connect to the server|TLS handshake timeout|dial tcp'
+readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|TLS handshake timeout|dial tcp'
 # ...except the shim's own messages, which are the shim or the broker and not
 # the cluster; matched on the shim's prefixes, since the cap text above
 # mentions "the credential proxy's admission wait" and is a real timeout.
