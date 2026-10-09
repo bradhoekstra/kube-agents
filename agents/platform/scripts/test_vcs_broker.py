@@ -478,6 +478,18 @@ class MergedListingForge(LocalForge):
         raise WorkspaceError("no such proposal", status=404)
 
 
+class CountingSelfAware(SelfAware):
+    """`SelfAware` that counts how often it was asked."""
+
+    def __init__(self, login: str) -> None:
+        super().__init__(login)
+        self.asked = 0
+
+    def whoami(self) -> str:
+        self.asked += 1
+        return self.login
+
+
 class MergedProposalCountingTest(unittest.TestCase):
     """The broker counts, once each, the proposals this install opened that the forge reports merged.
 
@@ -552,6 +564,25 @@ class MergedProposalCountingTest(unittest.TestCase):
         answer = self.broker.proposal_list({"repository": "local.test/acme/infra"})
         self.assertEqual(1, len(answer["proposals"]))
         self.assertEqual([], self.counts)
+
+    def test_the_identity_is_asked_once_per_repository_and_never_for_old_merges(self):
+        transport = CountingSelfAware("kube-agents[bot]")
+        self.broker._transport = lambda _forge, _repo: transport
+        self.forge_with(self.merged(20, closed="2027-01-15T07:00:00Z"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual(0, transport.asked, "an old merge made the broker ask who it is")
+        self.forge_with(self.merged(21), self.merged(22))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.broker.proposal_view({"repository": "local.test/acme/infra", "number": 21})
+        self.assertEqual(1, transport.asked, "the identity was asked more than once for one repository")
+        self.assertEqual([2], self.counts)
+
+    def test_a_forges_fractional_timestamp_counts(self):
+        # GitLab's merged_at carries milliseconds; GitHub's does not.
+        self.forge_with(self.merged(23, closed="2027-01-15T11:16:17.520Z"))
+        self.broker.proposal_list({"repository": "local.test/acme/infra"})
+        self.assertEqual([1], self.counts)
 
     def test_an_observer_that_raises_does_not_fail_the_read(self):
         def boom(_count):
