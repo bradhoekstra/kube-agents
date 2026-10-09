@@ -211,7 +211,7 @@ its container; the watcher's with the gateway pod, with its sidecar container, a
 restart the entrypoint's supervisor performs in place. A status counter that copied the sample
 would fall back to zero on every one of those. The poller therefore keeps, per CR, a baseline:
 the last sample it took from each pod, keyed by pod UID and counter, since the broker's one
-body feeds two counters (document layout version 2; a version-1 document is migrated in place on the first poll, its totals and baseline kept, so the upgrade loses nothing). On
+body feeds two counters (document layout version 2; a version-1 document is migrated in place on the first poll, its totals and baseline kept, so the upgrade loses nothing: a total the old layout lacked starts at the status floor, so a rollback and return does not have the read-back refuse the document, and when that floor is zero the first sample of every pod adds whole, since no document and no status has seen any of it). On
 a poll it adds, for each pod and counter it scraped:
 
 - the difference from the pod's last sample, when the pod UID is known, the body's start time
@@ -616,7 +616,7 @@ scrapes two replicas at different samples, taking the larger delta on the next a
 the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one
 below the status, and a first-recorded time in the future (treated as absent); a quiet poll writing no ConfigMap; the disabled-watcher
-case (no gateway scrape, no log line); one broker body folded into two counters, each with its own baseline entry, through a restart; a version-1 document migrated in place under a pruning CRD with its totals kept and the interval's deltas added; the Warning naming each status field a pod's counters project to; the series selection (the `status` values summed and the
+case (no gateway scrape, no log line); one broker body folded into two counters, each with its own baseline entry, through a restart; a version-1 document migrated in place under a pruning CRD with its totals kept, the interval's deltas added and the new counter's first sample added whole, and one migrated under a status that already carries the new counter, which starts at that floor and is not re-seeded; the Warning from a failing broker naming both of its fields; the Warning naming each status field a pod's counters project to; the series selection (the `status` values summed and the
 three excluded; the injected series and not the observed one); and the port-by-name lookup when
 the port sits on a native sidecar among several containers. The accumulator takes samples and
 the ConfigMap's document and returns the next document, so none of these needs a socket.
@@ -631,11 +631,11 @@ expired, shares that record with the Ready writer, and keeps the ConfigMap curre
 That a ConfigMap written with the non-controller owner reference enqueues no reconcile is a
 unit test against the owner handler `Owns` uses, which needs no API server.
 
-On the broker's side, `test_credential_proxy_metrics.py` holds the version-control counter to its verb vocabulary and its five outcomes, one per exit of the route. A live check, which is the acceptance criterion: on an install built from the branch, `remediationsProposedTotal` rises after a proposal the forge accepts,
+On the broker's side, `test_credential_proxy_metrics.py` holds the version-control counter to its verb vocabulary and its five outcomes, one test per outcome the route reports. A live check, which is the acceptance criterion: on an install built from the branch, `remediationsProposedTotal` rises after a proposal the forge accepts,
 `toolExecutionsTotal` rises after commands run from the sandbox and `eventsIngestedTotal` after
 events the watcher accepts arrive; a broker pod restart, a gateway pod restart, a restart of the
-watcher process alone (the supervisor's), and an operator restart each leave both counters where
-they were and they keep rising afterwards, the watcher's restart in particular adding nothing for
+watcher process alone (the supervisor's), and an operator restart each leave the three counters
+where they were and they keep rising afterwards, the watcher's restart in particular adding nothing for
 the replay of the retained Events; a quarter of an hour with no command and no accepted event
 produces no status write; and the two policies show the new rule with the operator pod as the
 only peer added.

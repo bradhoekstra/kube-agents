@@ -208,8 +208,8 @@ func podEntry(doc *usageDocument, uid string) *usagePodEntry {
 	return found
 }
 
-// setClusters gives addr's reading the watcher's cluster gauge; set clears it,
-// as a broker's body would.
+// setClusters gives addr's reading the watcher's cluster gauge, which set
+// leaves in place; a reading with none models a broker's body.
 func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1056,8 +1056,12 @@ func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
 	if doc.Version != usageDocumentVersion || !doc.FirstRecorded.Time.Equal(usageClock(1)) {
 		t.Fatalf("migrated document: version %d, firstRecorded %v; want %d and %v", doc.Version, doc.FirstRecorded, usageDocumentVersion, usageClock(1))
 	}
-	if doc.Totals[usageCounterToolExecutions] != 13 || doc.Totals[usageCounterEventsIngested] != 10 || doc.Totals[usageCounterRemediationsProposed] != 0 {
-		t.Fatalf("totals after the migrating poll: %v, want 13, 10 and 0 (the deltas added to the kept totals)", doc.Totals)
+	// The two kept totals take their deltas; the counter the layout lacked,
+	// with nothing in the status, takes the broker's whole sample even though
+	// the pod predates the document: no document and no status has seen any
+	// of it.
+	if doc.Totals[usageCounterToolExecutions] != 13 || doc.Totals[usageCounterEventsIngested] != 10 || doc.Totals[usageCounterRemediationsProposed] != 2 {
+		t.Fatalf("totals after the migrating poll: %v, want 13, 10 and 2 (the deltas added to the kept totals, the whole sample to the new one)", doc.Totals)
 	}
 	for _, key := range []string{
 		usagePodEntryKey("gw-a", usageCounterEventsIngested),
@@ -1070,6 +1074,68 @@ func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
 	}
 	if doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsProposed)].Sample != 2 {
 		t.Fatalf("the new counter was not recorded at its sample: %+v", doc.Pods)
+	}
+}
+
+// A version-1 document read under a status that already carries the newer
+// counter -- this operator wrote it, was rolled back to one that re-seeded a
+// version-1 document, and came back -- starts the missing total at that
+// value, so the read-back floor does not refuse the migrated document and
+// re-seed it; the broker's sample is baselined and adds nothing, since the
+// status may already hold part of it.
+func TestUsagePoller_MigratesAVersionOneDocumentUnderAStatusFloor(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Status.Usage.RemediationsProposedTotal = 5
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersionPodKeyed,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			"gw-a":     {Name: "agent-gateway-aaa", Counter: usageCounterEventsIngested, Sample: 40, Marker: moved},
+			"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 100, Marker: moved},
+		},
+	})
+	h.stub.set(gatewayAddr(), 46, nil)
+	h.stub.set(brokerAddr(), 103, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 7)
+	h.poll(10)
+	doc := h.document()
+	if !doc.FirstRecorded.Time.Equal(usageClock(1)) {
+		t.Fatalf("the migrated document was re-seeded: firstRecorded %v, want %v", doc.FirstRecorded, usageClock(1))
+	}
+	if doc.Totals[usageCounterToolExecutions] != 13 || doc.Totals[usageCounterEventsIngested] != 10 || doc.Totals[usageCounterRemediationsProposed] != 5 {
+		t.Fatalf("totals after the migrating poll: %v, want 13, 10 and 5 (the status floor, the sample baselined)", doc.Totals)
+	}
+	if e := doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsProposed)]; e == nil || e.Sample != 7 {
+		t.Fatalf("the new counter was not baselined at its sample: %+v", e)
+	}
+	if got := h.status().RemediationsProposedTotal; got != 5 {
+		t.Fatalf("status.usage.remediationsProposedTotal = %d, want 5", got)
+	}
+}
+
+// A failing broker's Warning names both status fields its counters project
+// to, through the poll rather than the message builder alone.
+func TestUsagePoller_WarningNamesEveryFieldOfAFailingBroker(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 10, nil)
+	h.stub.fail(brokerAddr(), usageScrapeKindRefused)
+	h.poll(5)
+	h.poll(10)
+	select {
+	case ev := <-h.recorder.Events:
+		want := "agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal)"
+		if !strings.Contains(ev, want) {
+			t.Fatalf("event = %q, want it to name the broker's fields as %q", ev, want)
+		}
+	default:
+		t.Fatal("no event after two failed polls")
 	}
 }
 
