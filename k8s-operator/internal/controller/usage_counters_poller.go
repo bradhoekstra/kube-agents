@@ -93,9 +93,9 @@ const (
 )
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
-// eventsIngestedTotal and lastActiveTime on every PlatformAgent, from the
-// broker's and the watcher's metrics listeners, as a manager Runnable on the
-// leader, off the reconcile path. docs/designs/usage-counters-producer.md is
+// eventsIngestedTotal and lastActiveTime on every PlatformAgent, and the two
+// cluster gauges, from the broker's and the watcher's metrics listeners, as a
+// manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
 // the design; the rules the counters follow are in usage_counters_fold.go, the
 // scrape in usage_counters_scrape.go. This file is the loop and the two
 // objects it writes: the ConfigMap that holds the document, first, and the
@@ -345,8 +345,10 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			Counter:   target.counter,
 			Sample:    reading.Sample,
 			StartTime: reading.StartTime,
+			Clusters:  reading.Clusters,
 		})
 	}
+	gauges := usageClusterGaugesForPoll(cached, scraped)
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -395,7 +397,31 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	if ctx.Err() == nil {
 		p.recordStandingFailures(cached, failing, nil)
 	}
-	return p.projectStatus(ctx, agent, result.Document)
+	return p.projectStatus(ctx, agent, result.Document, gauges)
+}
+
+// usageClusterGaugesForPoll is the fleet reading this poll projects: the
+// largest of each gauge across the gateway replicas read, because every
+// replica's watcher builds the same fleet and one mid-startup reports fewer;
+// zero, explicitly, when the watcher is off, so the fields clear rather than
+// hold the last fleet it watched; nil when the watcher is on and no replica
+// could be read, so the fields keep their last reading.
+func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod) *usageClusterGauges {
+	if !eventWatcherEnabled(agent) {
+		return &usageClusterGauges{}
+	}
+	var largest *usageClusterGauges
+	for _, s := range scraped {
+		if s.Clusters == nil {
+			continue
+		}
+		if largest == nil {
+			largest = &usageClusterGauges{}
+		}
+		largest.Registered = max(largest.Registered, s.Clusters.Registered)
+		largest.Monitored = max(largest.Monitored, s.Clusters.Monitored)
+	}
+	return largest
 }
 
 // reader is the uncached reader, falling back to the client where tests
@@ -735,11 +761,15 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 // pruning status.usage, so an operator ahead of its CRD costs one probe per
 // interval across both writers; the ConfigMap is current throughout, and the
 // patch after the CRD lands carries everything accumulated since.
-func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument) error {
+// projectStatus writes the status when it is behind the document's totals,
+// or when the cluster gauges differ from this poll's reading in either
+// direction; gauges nil leaves the gauge fields as they are.
+func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
 	usage := &agent.Status.Usage
-	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events ||
+	gaugesMoved := gauges != nil && (usage.ClustersRegistered != gauges.Registered || usage.ClustersMonitored != gauges.Monitored)
+	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
 		return nil
@@ -750,14 +780,23 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
+	if gauges != nil {
+		usage.ClustersRegistered = gauges.Registered
+		usage.ClustersMonitored = gauges.Monitored
+	}
 	if err := p.r.Status().Patch(ctx, agent, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("patching status.usage: %w", err)
 	}
-	// The echo: counters written non-zero that come back absent are the
+	// The echo: fields written non-zero that come back absent are the
 	// pruning, recorded in the record the Ready writer shares; a patch that
-	// wrote only a time says nothing either way.
-	if tool > 0 || events > 0 {
-		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events)
+	// wrote only a time, or only zeros, says nothing either way.
+	gaugesWritten := gauges != nil && (gauges.Registered > 0 || gauges.Monitored > 0)
+	if tool > 0 || events > 0 || gaugesWritten {
+		echoed := agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events
+		if gauges != nil {
+			echoed = echoed && agent.Status.Usage.ClustersRegistered == gauges.Registered && agent.Status.Usage.ClustersMonitored == gauges.Monitored
+		}
+		p.r.noteUsageEcho(ctx, agent, echoed)
 	}
 	return nil
 }

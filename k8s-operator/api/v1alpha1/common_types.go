@@ -1952,12 +1952,13 @@ type AgentStatus struct {
 // as the rest of the status.
 //
 // The operator writes ActiveInterfaces, from the spec, on every Ready status
-// update, and ToolExecutionsTotal, EventsIngestedTotal and LastActiveTime from
-// the broker's and the event watcher's metrics listeners, which it reads every
-// five minutes on the leader; the agent's own ServiceAccount holds no write
-// verb on this status. The other counters are declared so that the schema
-// names them, but nothing writes them yet, and each is absent (omitempty)
-// until a series exists for it.
+// update, and ToolExecutionsTotal, EventsIngestedTotal, LastActiveTime,
+// ClustersRegistered and ClustersMonitored from the broker's and the event
+// watcher's metrics listeners, which it reads every five minutes on the
+// leader; the agent's own ServiceAccount holds no write verb on this status.
+// The other counters are declared so that the schema names them, but nothing
+// writes them yet, and each is absent (omitempty) until a series exists for
+// it.
 type AgentUsageStatus struct {
 	// SessionsTotal is the cumulative number of interactive sessions handled.
 	// Nothing writes it yet.
@@ -1993,6 +1994,27 @@ type AgentUsageStatus struct {
 	// Nothing writes it yet.
 	// +optional
 	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
+
+	// ClustersRegistered is the number of clusters the event watcher built a
+	// client for: the direct cluster plus every Cluster Agent profile whose
+	// cluster the GKE API would describe. Read every five minutes as the
+	// number of k8s_event_watcher_cluster_up series the watcher exports, the
+	// largest reading across gateway replicas. A gauge, not a counter: it
+	// falls when a cluster leaves the fleet, and it is cleared when the event
+	// watcher is disabled. Absent until the first poll reads the watcher.
+	// +optional
+	ClustersRegistered int64 `json:"clustersRegistered,omitempty"`
+
+	// ClustersMonitored is how many of ClustersRegistered are delivering
+	// events: the k8s_event_watcher_cluster_up series at 1, whose informer
+	// has completed its initial list. The difference from ClustersRegistered
+	// is the number of clusters silently unwatched, a stuck informer, a 403
+	// on the events list, or a stopped one. 0 is the normal reading while the
+	// watcher starts, so read a fall alongside the pod's age. A gauge, read
+	// and cleared the same way as ClustersRegistered; a poll that cannot read
+	// the watcher leaves both where they were.
+	// +optional
+	ClustersMonitored int64 `json:"clustersMonitored,omitempty"`
 
 	// ActiveInterfaces lists the communication channels the spec enables, sorted:
 	// "dashboard" unless spec.harness.hermes.dashboardEnabled is false, and

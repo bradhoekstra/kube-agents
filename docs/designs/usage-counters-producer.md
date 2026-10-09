@@ -8,7 +8,7 @@
 `toolExecutionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal`, and a
 `lastActiveTime`, and until the poller this document describes nothing wrote them. The schema shipped that way on purpose: the agent's
 ServiceAccount holds no write verb on the status, and the operator, which does, saw no session,
-event or tool call. Two of the counters now have an in-cluster source. The credential broker
+event or tool call. Two of the counters now have an in-cluster source, and the watcher's per-cluster gauge gives two more fields a reading. The credential broker
 serves `kubeagents_tool_invocations_total` on its metrics-only listener, and the event watcher
 serves `k8s_event_watcher_events_injected_total` on the gateway pod's `agent-api-auth` sidecar,
 both for the managed-Prometheus collector.
@@ -19,7 +19,9 @@ rule that admits the operator's pods and nothing else new, accumulates per-pod d
 totals it keeps beside their baseline in a ConfigMap, so the counters stay monotonic across pod,
 process and operator restarts, and patches the status at most once per interval, only when the
 status is behind. `toolExecutionsTotal`, `eventsIngestedTotal` and `lastActiveTime` land this
-way. `sessionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal` stay unwritten
+way, and `clustersRegistered` and `clustersMonitored` ride the same poll as gauges: the watcher's
+`k8s_event_watcher_cluster_up` series counted and projected as the latest reading, outside the
+ConfigMap. `sessionsTotal`, `remediationsProposedTotal` and `remediationsAppliedTotal` stay unwritten
 until a series exists for each, and the last section says what that series is.
 
 ## What was verified
@@ -111,11 +113,12 @@ share is the echo check in the served-CRD section, generalised so that both call
 
 ## Counter sources
 
-| Status field          | Series                                                       | Aggregation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| --------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `toolExecutionsTotal` | `kubeagents_tool_invocations_total`, broker pod              | Sum over `tool` and `subcommand`, over `status` in `success` and `error`: the commands the broker ran to an exit. `blocked` and `busy` are refusals that never ran. `abandoned` is left out because the series cannot say whether the command had started: the broker records it for a command killed mid-run and for a caller that left the queue before the start. `error` also covers a rejected request and a broker fault, so the count is the broker's view of "ran", a little wide. |
-| `eventsIngestedTotal` | `k8s_event_watcher_events_injected_total`, every gateway pod | Within a pod, sum over every label: cluster, project, location, reason and namespace. Across gateway pods, the largest per-pod delta in the poll rather than the sum: each replica's watcher works the same event stream, so the sum would count an event once per replica. With one pod the two are the same.                                                                                                                                                                             |
-| `lastActiveTime`      | derived                                                      | The time of the last poll in which any total moved: a command ran, or an event was accepted for triage. The field's documented meaning is the most recent interaction or event triage; until `sessionsTotal` lands, a chat turn that runs no brokered command does not move it, and the CRD description the implementation ships says so.                                                                                                                                                  |
+| Status field                              | Series                                                       | Aggregation                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ----------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `toolExecutionsTotal`                     | `kubeagents_tool_invocations_total`, broker pod              | Sum over `tool` and `subcommand`, over `status` in `success` and `error`: the commands the broker ran to an exit. `blocked` and `busy` are refusals that never ran. `abandoned` is left out because the series cannot say whether the command had started: the broker records it for a command killed mid-run and for a caller that left the queue before the start. `error` also covers a rejected request and a broker fault, so the count is the broker's view of "ran", a little wide.                                                                                                                               |
+| `eventsIngestedTotal`                     | `k8s_event_watcher_events_injected_total`, every gateway pod | Within a pod, sum over every label: cluster, project, location, reason and namespace. Across gateway pods, the largest per-pod delta in the poll rather than the sum: each replica's watcher works the same event stream, so the sum would count an event once per replica. With one pod the two are the same.                                                                                                                                                                                                                                                                                                           |
+| `clustersRegistered`, `clustersMonitored` | `k8s_event_watcher_cluster_up`, every gateway pod            | Gauges, not counters, read from the same body as the injected series: the number of `cluster_up` series the watcher exports is the clusters it built a client for, and the number at `1` the clusters whose informer is delivering events. Across gateway pods, the largest of each: every replica's watcher builds the same fleet, so a replica mid-startup reports fewer, not others. The latest poll's reading, projected as it stands: they fall when a cluster leaves, are cleared when the watcher is disabled, and are left as they were by a poll that could read no replica. They do not move `lastActiveTime`. |
+| `lastActiveTime`                          | derived                                                      | The time of the last poll in which any total moved: a command ran, or an event was accepted for triage. The field's documented meaning is the most recent interaction or event triage; until `sessionsTotal` lands, a chat turn that runs no brokered command does not move it, and the CRD description the implementation ships says so.                                                                                                                                                                                                                                                                                |
 
 `eventsIngestedTotal` counts the events the watcher accepted for triage, past its reason filter
 and its dedup window and not turned away by the daemon, not the events it observed. The observed series,
@@ -398,8 +401,10 @@ would be permanent: the terminating-leader straddle and the re-seed skew straddl
 ## Write cadence and the status writers
 
 The status is written with `Status().Patch` and a merge patch from the CR as read, touching only
-the counters and `lastActiveTime`, at most once per poll and only when the status is behind the
-ConfigMap's totals. Every status write re-enqueues the CR through the unfiltered `PlatformAgent`
+the counters, the two cluster gauges and `lastActiveTime`, at most once per poll and only when the
+status is behind the ConfigMap's totals or a gauge differs from this poll's reading in either
+direction. The gauges are not in the ConfigMap: they are a reading, not an accumulation, so an
+operator restart re-reads them on its first poll and loses nothing. Every status write re-enqueues the CR through the unfiltered `PlatformAgent`
 watch, which is why the write is bounded by the interval and never issued from `Reconcile`: a
 busy install costs one reconcile per five minutes, and the ConfigMap's non-controller owner
 reference keeps it at one rather than two; a quiet one costs none.
@@ -579,7 +584,11 @@ that the reset pod takes the sibling's marker and the sibling's next lone advanc
 a partial straddle, both replicas moving by different amounts and the lagger catching up alone
 the poll after, asserting the catch-up is reset and the total took the larger delta once; an in-place restart
 of the lagging replica with a later start time, reset rather than taken whole; the
-largest-delta rule across two gateway pods and its agreement with the sum for one; a re-seed that
+largest-delta rule across two gateway pods and its agreement with the sum for one; the cluster
+gauges (written on the first poll, falling with the watcher's reading, left as they were by a
+failed scrape, the largest of each across two replicas, cleared when the watcher is off, and
+never moving `lastActiveTime`); the watcher's body yielding a zero gauge reading and the broker's
+none; a re-seed that
 scrapes two replicas at different samples, taking the larger delta on the next advance and counting
 the furthest replica's pre-seed backlog once; the baseline-absent-with-counters-present case; a ConfigMap whose recorded CR UID is not the CR's
 or whose values fail the read-back bounds, including a total above the `int64` headroom, one

@@ -162,6 +162,16 @@ func (s *stubUsageSource) set(addr string, sample int64, start *float64) {
 	s.readings[addr] = usageReading{Sample: sample, StartTime: start}
 }
 
+// setClusters gives addr's reading the watcher's cluster gauge; set clears it,
+// as a broker's body would.
+func (s *stubUsageSource) setClusters(addr string, registered, monitored int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Clusters = &usageClusterGauges{Registered: registered, Monitored: monitored}
+	s.readings[addr] = reading
+}
+
 func (s *stubUsageSource) fail(addr string, kind string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -883,6 +893,96 @@ func TestUsagePoller_TwoGatewayReplicas(t *testing.T) {
 	}
 	if doc := h.document(); !doc.Pods["gw-b"].Marker.Time.Equal(usageClock(10)) {
 		t.Fatalf("the reset replica did not take the sibling's marker: %+v", doc.Pods["gw-b"])
+	}
+}
+
+// The two cluster gauges are the latest poll's reading, not a fold: they are
+// written on the first poll, fall when the watcher's reading falls, stay put
+// when the listener cannot be read, and move lastActiveTime never.
+func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.setClusters(gatewayAddr(), 3, 3)
+	h.stub.set(brokerAddr(), 70, ptr.To(200.0))
+
+	h.poll(5)
+	status := h.status()
+	if h.patches != 1 || status.ClustersRegistered != 3 || status.ClustersMonitored != 3 {
+		t.Fatalf("first poll: %d patches, status %+v; want one patch writing 3/3", h.patches, status)
+	}
+	if status.LastActiveTime != nil || status.EventsIngestedTotal != 0 || status.ToolExecutionsTotal != 0 {
+		t.Fatalf("the gauges moved a counter or lastActiveTime: %+v", status)
+	}
+
+	// A cluster's informer is held: monitored falls, registered does not.
+	h.stub.setClusters(gatewayAddr(), 3, 2)
+	h.poll(10)
+	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 2 {
+		t.Fatalf("after a fall: %d patches, status %+v; want 3/2", h.patches, status)
+	}
+	if status := h.status(); status.LastActiveTime != nil {
+		t.Fatalf("a gauge change moved lastActiveTime: %v", status.LastActiveTime)
+	}
+
+	// Unchanged: no write.
+	h.poll(15)
+	if h.patches != 2 {
+		t.Fatalf("an unchanged reading wrote the status: %d patches", h.patches)
+	}
+
+	// The listener cannot be read: the fields keep their last reading.
+	h.stub.fail(gatewayAddr(), usageScrapeKindRefused)
+	h.poll(20)
+	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 2 {
+		t.Fatalf("a failed scrape changed the gauges: %d patches, status %+v", h.patches, status)
+	}
+
+	// A cluster leaves the fleet: both fall.
+	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
+	h.stub.setClusters(gatewayAddr(), 2, 2)
+	h.poll(25)
+	if status := h.status(); status.ClustersRegistered != 2 || status.ClustersMonitored != 2 {
+		t.Fatalf("after a cluster left: %+v, want 2/2", status)
+	}
+}
+
+// Across gateway replicas the gauges take the largest reading: every replica's
+// watcher builds the same fleet, so a replica mid-startup reports fewer, not
+// others.
+func TestUsagePoller_ClusterGaugesTakeTheLargestReplica(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	b := usageGatewayPod("agent-gateway-bbb", "gw-b", usageTestGatewayB, created)
+	h := newUsageHarness(t, usageTestAgent(created), append(usageDefaultObjects(created), b)...)
+	bAddr := usageTestGatewayB + ":9095"
+	h.stub.set(gatewayAddr(), 100, ptr.To(1.0))
+	h.stub.setClusters(gatewayAddr(), 4, 1)
+	h.stub.set(bAddr, 100, ptr.To(1.0))
+	h.stub.setClusters(bAddr, 4, 4)
+	h.stub.set(brokerAddr(), 0, nil)
+	h.poll(5)
+	if status := h.status(); status.ClustersRegistered != 4 || status.ClustersMonitored != 4 {
+		t.Fatalf("two replicas: %+v, want 4/4", status)
+	}
+}
+
+// With the watcher switched off there is no fleet being watched: the gauges
+// are cleared rather than left at the last reading.
+func TestUsagePoller_ClusterGaugesClearWhenTheWatcherIsOff(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	agent.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{Enabled: ptr.To(false)}
+	agent.Status.Usage.ClustersRegistered = 3
+	agent.Status.Usage.ClustersMonitored = 3
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.stub.set(brokerAddr(), 70, nil)
+	h.poll(5)
+	if status := h.status(); h.patches != 1 || status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
+		t.Fatalf("watcher off: %d patches, status %+v; want one patch clearing both", h.patches, status)
+	}
+	h.poll(10)
+	if h.patches != 1 {
+		t.Fatalf("a second poll with the watcher off wrote again: %d patches", h.patches)
 	}
 }
 

@@ -68,6 +68,13 @@ const (
 	toolInvocationsSeries  = "kubeagents_tool_invocations_total"
 	eventsInjectedSeries   = "k8s_event_watcher_events_injected_total"
 	processStartTimeSeries = "process_start_time_seconds"
+	// clusterUpSeries is the watcher's per-cluster gauge, one series per
+	// cluster it built a client for, 1 once that cluster's informer has
+	// synced and is delivering events. Read from the same body as the
+	// injected counter: the series present are the clusters registered, those
+	// at clusterUpMonitored the clusters monitored.
+	clusterUpSeries    = "k8s_event_watcher_cluster_up"
+	clusterUpMonitored = 1
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -107,10 +114,22 @@ func usageSeriesFor(counter string) (family string, statuses map[string]bool) {
 }
 
 // usageReading is what one scrape yields: the counter summed over its label
-// sets, and the start time the body carried, nil when it carried none.
+// sets, the start time the body carried, nil when it carried none, and, for
+// the watcher's body alone, its cluster gauges; nil for any other body, so
+// that a poll can tell a watcher reporting no clusters from no watcher read.
 type usageReading struct {
 	Sample    int64
 	StartTime *float64
+	Clusters  *usageClusterGauges
+}
+
+// usageClusterGauges is the watcher's view of the fleet in one body: the
+// clusterUpSeries series it exports and how many of them are at
+// clusterUpMonitored. Gauges, projected to status.usage as the latest poll's
+// reading rather than folded into the document.
+type usageClusterGauges struct {
+	Registered int64
+	Monitored  int64
 }
 
 // usageScrapeError is a scrape that produced no body to count, with a kind the
@@ -235,6 +254,14 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 	parser := expfmt.NewTextParser(model.UTF8Validation)
 	var sum float64
 	var start *float64
+	// The watcher's body is also read for its cluster gauge; wanted is every
+	// family the parser is asked to name in this body.
+	var clusters *usageClusterGauges
+	wanted := []string{family, processStartTimeSeries}
+	if family == eventsInjectedSeries {
+		clusters = &usageClusterGauges{}
+		wanted = append(wanted, clusterUpSeries)
+	}
 	reader := bufio.NewReaderSize(body, usageScrapeLineBuffer)
 	for {
 		line, overLong, err := usageReadScrapeLine(reader)
@@ -262,10 +289,10 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 			// sits after and so cannot reach. A genuinely over-long wanted line
 			// still fails the scrape, as before; any other family's is skipped, so
 			// one hostile line does not freeze the counter.
-			if name := usageLeadingName(line); name == family || name == processStartTimeSeries {
+			if name := usageLeadingName(line); usageWanted(wanted, name) {
 				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
 			}
-		case strings.Contains(line, family) || strings.Contains(line, processStartTimeSeries):
+		case usageMentionsAny(line, wanted):
 			// A cheap substring prefilter before the parser is handed the line: a
 			// line mentioning neither name cannot be a wanted series, whatever the
 			// parser would make of it. A line that mentions one still has the
@@ -274,7 +301,7 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 			if perr != nil {
 				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindParse}
 			}
-			for _, name := range []string{family, processStartTimeSeries} {
+			for _, name := range wanted {
 				mf := families[name]
 				if mf == nil {
 					continue
@@ -287,6 +314,13 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 					if name == processStartTimeSeries {
 						captured := value
 						start = &captured
+						continue
+					}
+					if name == clusterUpSeries {
+						clusters.Registered++
+						if value == clusterUpMonitored {
+							clusters.Monitored++
+						}
 						continue
 					}
 					if statuses != nil && !statuses[usageLabelValue(metric, toolInvocationsStatusLabel)] {
@@ -303,7 +337,25 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 	if sum >= float64(math.MaxInt64) {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 	}
-	return usageReading{Sample: int64(sum), StartTime: start}, nil
+	return usageReading{Sample: int64(sum), StartTime: start, Clusters: clusters}, nil
+}
+
+func usageWanted(wanted []string, name string) bool {
+	for _, w := range wanted {
+		if name == w {
+			return true
+		}
+	}
+	return false
+}
+
+func usageMentionsAny(line string, wanted []string) bool {
+	for _, w := range wanted {
+		if strings.Contains(line, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // usageReadScrapeLine reads one line from r, bounded at usageScrapeMaxLineBytes,
