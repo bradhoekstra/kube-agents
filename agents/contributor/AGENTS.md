@@ -48,13 +48,14 @@ cycle.
    the fix is one mechanical edit per site that adds no file, helper, branch,
    flag, dependency or regex alternative; otherwise reply
    `declined: <reason about this change>` or `deferred to #N`, record it in
-   **Self-Review**, and leave the thread open - a human review submitted
-   while it is open is the ruling, and then you resolve it, citing that
-   review. A correct 🔴 High is a fix on any round, unless its fix would add a
+   **Self-Review**, and leave the thread open - a human's approval, or
+   their reply in the thread that accepts the decline, is the ruling, and
+   then you resolve it citing that; a reply that asks for the fix owes the
+   fix, thread open. A correct 🔴 High is a fix on any round, unless its fix would add a
    mechanism - then it is a design question for the human reviewer, deferred
    to an issue, not built on a review round. Resolve only a thread a commit
-   fixed, you showed factually wrong, or a human review ruled on, per the bar
-   in the root `AGENTS.md`.
+   fixed, you showed factually wrong, or a human ruled on as above, per the
+   bar in the root `AGENTS.md`.
    Bring the body current in the same push as the fix, before any re-read.
    You get at most two re-reads of your own before green: after a push that
    fixed something, comment `/review` for a narrow re-check of the diff, or
@@ -64,8 +65,9 @@ cycle.
    without reading the body again. A merge of `main` or a rebase that changes
    nothing of yours earns none. At the third reviewed commit, or after a
    round that pushed nothing - every finding declined, deferred or refuted -
-   comment `/request-review` if no human has reviewed or been requested
-   yet, and stop. A green
+   comment `/request-review` if no human is on it yet (_who counts_, in
+   [green is settled](../../docs/pull-request-workflow.md#green-is-settled)),
+   and stop. A green
    `AI Review` check is settled: type no `/review` in any form after it, and
    do not mark a draft ready or close and reopen to buy one; answer each open
    🟠 Medium by reply, push a fix only for one you would have fixed unasked,
@@ -183,8 +185,9 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
 1. Every review thread (the bot's and any human's) gets a reply, and `main`
    requires all conversations resolved before it can merge. Resolve a thread
    only once genuinely resolved, per the root `AGENTS.md`; a declined bot
-   finding stays open with its reply until a human review rules on it; then
-   resolve it, citing that review.
+   finding stays open with its reply until a human rules on it - an approval,
+   or a reply in the thread that accepts the decline; a reply that asks for
+   the fix owes it - then resolve it, citing the ruling.
 2. Reach a human reviewer: a green bot pass - clean on the first review, or
    nothing above Medium and the description answered (the body edited, not
    just its thread resolved) on a later one, per
@@ -194,8 +197,8 @@ Opening a PR starts `kube-agents-bot`. The path to merge:
    `/review fresh` after an edit to the body alone, since a plain `/review` on
    an unchanged commit re-cuts the earlier review without reading the body
    again), at most twice; at the third reviewed commit, or after a round that
-   pushed nothing, comment `/request-review` if no human has reviewed or been
-   requested yet, and stop - the command on the comment's first line, then a line telling the
+   pushed nothing, comment `/request-review` if no human is on it yet, and
+   stop - the command on the comment's first line, then a line telling the
    reviewer where the fix for any 🔴 High is and that the bot re-runs on
    their `/review`. `/request-review` also assigns one immediately when a
    review never arrives. It reacts 👀 to the comment when it requested someone
