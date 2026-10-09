@@ -23,6 +23,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -75,6 +76,13 @@ const (
 	// at clusterUpMonitored the clusters monitored.
 	clusterUpSeries    = "k8s_event_watcher_cluster_up"
 	clusterUpMonitored = 1
+	// usageClusterGaugeCeiling bounds the series counted into the gauges in one
+	// body. The gauges are a reading, not an accumulation, so the per-poll delta
+	// ceiling does not reach them; this is what bounds what a body on the
+	// watcher's port can set them to. Sized past any fleet one install watches
+	// (GKE's own per-project quotas keep a fleet far below it) and refused, not
+	// clamped, so a body past it reads as the hostile or broken one it is.
+	usageClusterGaugeCeiling int64 = 10000
 	// toolInvocationsStatusLabel is the broker's outcome label. The outcomes
 	// toolInvocationsCountedStatuses sums are the broker's success and error:
 	// the commands it ran and the requests it rejected or failed on before
@@ -239,10 +247,11 @@ func (s *podUsageSource) Scrape(ctx context.Context, addr, counter string) (usag
 }
 
 // foldUsageBody scans body line by line and keeps none of it: a line that could
-// be counter's family or the start-time gauge -- one that contains its name as a
+// be a wanted family -- counter's own, the start-time gauge, and for the
+// watcher's body the per-cluster up gauge, one that contains a wanted name as a
 // substring -- is parsed on its own with expfmt, and a metric expfmt names as
-// the family or the gauge is folded into the running sum as it is read; every
-// other line is skipped unread. The substring is only a prefilter: the parser,
+// one of them is folded as it is read, the counter into the running sum and the
+// up gauge into the cluster counts; every other line is skipped unread. The substring is only a prefilter: the parser,
 // not a hand-read of the line, names the metric, so the name in a comment or a
 // label value adds nothing and a UTF-8 name the parser accepts is not dropped by
 // a stricter hand-read. A candidate line that does not parse, or a sample that
@@ -289,10 +298,10 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 			// sits after and so cannot reach. A genuinely over-long wanted line
 			// still fails the scrape, as before; any other family's is skipped, so
 			// one hostile line does not freeze the counter.
-			if name := usageLeadingName(line); usageWanted(wanted, name) {
+			if name := usageLeadingName(line); slices.Contains(wanted, name) {
 				return usageReading{}, &usageScrapeError{Kind: usageScrapeKindLine}
 			}
-		case usageMentionsAny(line, wanted):
+		case slices.ContainsFunc(wanted, func(w string) bool { return strings.Contains(line, w) }):
 			// A cheap substring prefilter before the parser is handed the line: a
 			// line mentioning neither name cannot be a wanted series, whatever the
 			// parser would make of it. A line that mentions one still has the
@@ -318,6 +327,9 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 					}
 					if name == clusterUpSeries {
 						clusters.Registered++
+						if clusters.Registered > usageClusterGaugeCeiling {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
 						if value == clusterUpMonitored {
 							clusters.Monitored++
 						}
@@ -338,24 +350,6 @@ func foldUsageBody(body io.Reader, counter string) (usageReading, error) {
 		return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 	}
 	return usageReading{Sample: int64(sum), StartTime: start, Clusters: clusters}, nil
-}
-
-func usageWanted(wanted []string, name string) bool {
-	for _, w := range wanted {
-		if name == w {
-			return true
-		}
-	}
-	return false
-}
-
-func usageMentionsAny(line string, wanted []string) bool {
-	for _, w := range wanted {
-		if strings.Contains(line, w) {
-			return true
-		}
-	}
-	return false
 }
 
 // usageReadScrapeLine reads one line from r, bounded at usageScrapeMaxLineBytes,

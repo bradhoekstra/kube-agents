@@ -117,6 +117,15 @@ type UsageCounterPoller struct {
 	// line.
 	mu      sync.Mutex
 	streaks map[types.UID]*usageScrapeStreak
+	// prunedGauges records, per CR, the last poll in which the two cluster
+	// gauges were written non-zero and came back absent: a served CRD at the
+	// previous schema, which has the counters and not the gauges. Its own
+	// record rather than the counters' shared one, because that record
+	// suppresses every status.usage write for the interval and the counters
+	// such a CRD does serve should keep landing. Fresh for
+	// usageStatusReprobeInterval, then the gauges are probed again. In memory
+	// only, like streaks; keyed like the cursor.
+	prunedGauges map[string]time.Time
 
 	// cursor is the namespace/name of the last CR a poll finished. The next
 	// poll sorts the CRs and resumes after it, wrapping, so a poll the budget
@@ -176,6 +185,58 @@ func (p *UsageCounterPoller) Start(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			p.pollOnce(ctx)
+		}
+	}
+}
+
+// gaugesPruned reports whether the CR's gauge pruning record is fresh, dropping
+// it once it has expired.
+func (p *UsageCounterPoller) gaugesPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	key := usagePollKey(agent)
+	recorded, ok := p.prunedGauges[key]
+	if !ok {
+		return false
+	}
+	if p.now().Sub(recorded) >= usageStatusReprobeInterval {
+		delete(p.prunedGauges, key)
+		return false
+	}
+	return true
+}
+
+// noteGaugeEcho is the gauges' own echo record: echoed false is a write whose
+// gauge fields came back absent, recorded with the poll's time and logged once
+// per record; echoed true clears it.
+func (p *UsageCounterPoller) noteGaugeEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, echoed bool) {
+	key := usagePollKey(agent)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.prunedGauges == nil {
+		p.prunedGauges = map[string]time.Time{}
+	}
+	if echoed {
+		delete(p.prunedGauges, key)
+		return
+	}
+	_, fresh := p.prunedGauges[key]
+	p.prunedGauges[key] = p.now()
+	if !fresh {
+		logf.FromContext(ctx).Info("the served CRD has status.usage without its cluster gauges; apply this release's CRD to get clustersRegistered and clustersMonitored, which are probed again after the interval",
+			"platformagent", key, "reprobeAfter", usageStatusReprobeInterval.String())
+	}
+}
+
+// forgetDepartedGaugeRecords drops the gauge records of CRs outside swept, the
+// CRs a completed sweep reached, so the map does not keep an entry per deleted
+// CR for the life of the process.
+func (p *UsageCounterPoller) forgetDepartedGaugeRecords(swept map[string]bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.prunedGauges {
+		if !swept[key] {
+			delete(p.prunedGauges, key)
 		}
 	}
 }
@@ -283,6 +344,7 @@ func (p *UsageCounterPoller) pollOnce(parent context.Context) {
 	}
 	if p.sweepComplete(ordered) {
 		p.forgetDepartedStreaks(p.sweepSeen)
+		p.forgetDepartedGaugeRecords(p.sweptKeys)
 		p.sweepSeen = map[string]bool{}
 		p.sweptKeys = map[string]bool{}
 	}
@@ -755,20 +817,22 @@ func (p *UsageCounterPoller) writeDocument(ctx context.Context, agent *agentv1al
 	return nil, nil
 }
 
-// projectStatus patches status.usage's counters and lastActiveTime from doc
-// when the status is behind it, with a merge patch over the status as read
-// that touches nothing else. Skipped while the served CRD is recorded as
-// pruning status.usage, so an operator ahead of its CRD costs one probe per
-// interval across both writers; the ConfigMap is current throughout, and the
-// patch after the CRD lands carries everything accumulated since.
-// projectStatus writes the status when it is behind the document's totals,
-// or when the cluster gauges differ from this poll's reading in either
-// direction; gauges nil leaves the gauge fields as they are.
+// projectStatus patches status.usage from doc and gauges when the status is
+// behind the document's totals, or when a cluster gauge differs from this
+// poll's reading in either direction, with a merge patch over the status as
+// read that touches nothing else; gauges nil leaves the gauge fields as they
+// are. Skipped while the served CRD is recorded as pruning status.usage, so an
+// operator ahead of its CRD costs one probe per interval across both writers;
+// the ConfigMap is current throughout, and the patch after the CRD lands
+// carries everything accumulated since. A gauge difference alone is likewise
+// skipped while the gauges' own pruning record is fresh, the served CRD at the
+// previous schema, so the counters that CRD serves keep landing every poll.
 func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, doc *usageDocument, gauges *usageClusterGauges) error {
 	tool := doc.Totals[usageCounterToolExecutions]
 	events := doc.Totals[usageCounterEventsIngested]
 	usage := &agent.Status.Usage
-	gaugesMoved := gauges != nil && (usage.ClustersRegistered != gauges.Registered || usage.ClustersMonitored != gauges.Monitored)
+	gaugesMoved := gauges != nil && !p.gaugesPruned(agent) &&
+		(usage.ClustersRegistered != gauges.Registered || usage.ClustersMonitored != gauges.Monitored)
 	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
@@ -787,16 +851,16 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if err := p.r.Status().Patch(ctx, agent, client.MergeFrom(base)); err != nil {
 		return fmt.Errorf("patching status.usage: %w", err)
 	}
-	// The echo: fields written non-zero that come back absent are the
-	// pruning, recorded in the record the Ready writer shares; a patch that
-	// wrote only a time, or only zeros, says nothing either way.
-	gaugesWritten := gauges != nil && (gauges.Registered > 0 || gauges.Monitored > 0)
-	if tool > 0 || events > 0 || gaugesWritten {
-		echoed := agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events
-		if gauges != nil {
-			echoed = echoed && agent.Status.Usage.ClustersRegistered == gauges.Registered && agent.Status.Usage.ClustersMonitored == gauges.Monitored
-		}
-		p.r.noteUsageEcho(ctx, agent, echoed)
+	// The echoes: counters written non-zero that come back absent are the
+	// pruning of status.usage, recorded in the record the Ready writer shares;
+	// gauges written non-zero that come back absent are the gauges' own record,
+	// since a CRD at the previous schema prunes them and serves the counters. A
+	// patch that wrote only a time, or only zeros, says nothing either way.
+	if tool > 0 || events > 0 {
+		p.r.noteUsageEcho(ctx, agent, agent.Status.Usage.ToolExecutionsTotal == tool && agent.Status.Usage.EventsIngestedTotal == events)
+	}
+	if gauges != nil && (gauges.Registered > 0 || gauges.Monitored > 0) {
+		p.noteGaugeEcho(ctx, agent, agent.Status.Usage.ClustersRegistered == gauges.Registered && agent.Status.Usage.ClustersMonitored == gauges.Monitored)
 	}
 	return nil
 }

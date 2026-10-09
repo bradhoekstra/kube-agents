@@ -193,6 +193,26 @@ func TestPodUsageSource_CountsTheWatchersClusterGauge(t *testing.T) {
 	}
 }
 
+// A watcher body with more cluster_up series than any fleet has is refused
+// whole, so a body on the port cannot set the gauges past the ceiling.
+func TestPodUsageSource_RefusesAClusterGaugePastTheCeiling(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("# TYPE k8s_event_watcher_cluster_up gauge\n")
+	for i := int64(0); i <= usageClusterGaugeCeiling; i++ {
+		fmt.Fprintf(&b, "k8s_event_watcher_cluster_up{cluster=\"c%d\",location=\"l\",project=\"p\"} 1\n", i)
+	}
+	addr := serveBody(t, http.StatusOK, b.String())
+	if _, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested); scrapeKind(t, err) != usageScrapeKindSample {
+		t.Errorf("a body past the gauge ceiling: %v, want kind %q", err, usageScrapeKindSample)
+	}
+	at := strings.TrimSuffix(b.String(), fmt.Sprintf("k8s_event_watcher_cluster_up{cluster=\"c%d\",location=\"l\",project=\"p\"} 1\n", usageClusterGaugeCeiling))
+	addr = serveBody(t, http.StatusOK, at)
+	reading, err := newPodUsageSource().Scrape(context.Background(), addr, usageCounterEventsIngested)
+	if err != nil || reading.Clusters == nil || reading.Clusters.Registered != usageClusterGaugeCeiling {
+		t.Fatalf("a body at the ceiling: %+v, %v; want %d registered", reading.Clusters, err, usageClusterGaugeCeiling)
+	}
+}
+
 // Each scrape that produces no body to count: a connection that failed, a
 // 3xx answer (not followed), a line past its bound, a wanted line expfmt
 // cannot parse, a sample that is negative or not finite.
