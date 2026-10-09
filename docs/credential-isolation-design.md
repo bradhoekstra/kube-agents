@@ -758,7 +758,10 @@ Consequences:
 - A cache miss costs one `get-credentials`, preceded by one
   `clusters describe` to decide which control-plane endpoint to reach (DNS,
   private, or gcloud's default), plus, once per process, a describe of the
-  agent's own cluster when the private endpoint is a candidate. The common paths warm the cache themselves, since
+  agent's own cluster when the private endpoint is a candidate. A caller's
+  own `get-credentials` that names no endpoint flag gets the same decision
+  spliced in, since its output becomes the managed kubeconfig for that
+  cluster; `docs/designs/private-endpoint-selection.md` has the rule. The common paths warm the cache themselves, since
   profile scaffolding and context switching both begin with that command. That
   describe is memoised per cluster for a minute rather than for the life of the
   broker: the endpoint can be opened or closed on a running cluster, and the

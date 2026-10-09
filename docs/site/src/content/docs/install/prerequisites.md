@@ -64,9 +64,10 @@ One more case for fleet clusters the agent onboards. A cluster on the agent clus
 whose public endpoint is absent or gated by authorized networks, and whose DNS endpoint is
 closed, is reached over its private endpoint (`privateClusterConfig.privateEndpoint`) when
 that endpoint is in the agent cluster's region or has control-plane global access, and when
-it admits the agent: the list explicitly does not gate the private endpoint
-(`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled: false`), or the two
-clusters share a subnet, or the agent cluster's Pod range (`clusterIpv4Cidr`) is on the list.
+it admits the agent: no authorized-network list is enabled, or the list explicitly does not
+gate the private endpoint (`masterAuthorizedNetworksConfig.privateEndpointEnforcementEnabled:
+false`), or the two clusters share a subnet, or the agent cluster's Pod range
+(`clusterIpv4Cidr`) lies inside a listed range.
 Otherwise the agent keeps the endpoint `gcloud` writes by default. When a cluster is onboarded
 the agent records which endpoint it chose and probes it once; when a connection attempt fails,
 the onboarding log and the Cluster Agent's preflight repeat that record with what would open

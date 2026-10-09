@@ -126,13 +126,14 @@ decision joins it:
 
 `authorized-networks` reads `unrestricted` when the list is not enabled and
 `enabled, no ranges listed` when it is enabled and empty; the `endpoint-remedy` bullet is
-written only when there is a remedy (so never beside `endpoint: internal-ip`), and it is
-followed by a sentence saying it applies only if `kubectl` cannot reach the API server, since
-`USER.md` is the Cluster Agent's startup context. No endpoint bullet is written when nothing
+written only when there is a remedy (so never beside `endpoint: internal-ip`), and when it is
+written the file ends with a sentence saying it applies only if `kubectl` cannot reach the API
+server, since `USER.md` is the Cluster Agent's startup context. No endpoint bullet is written when nothing
 could be decided. After the mirror, the scaffold probes the cluster with
 `kubectl version --request-timeout=5s` in the sandbox under the pinned kubeconfig, as the
 `agent` login that owns the file. When kubectl exits non-zero it logs one line with the endpoint
-kind, the address, the list, and kubectl's last line, adding the remedy only when kubectl's
+kind, the address, the list, and kubectl's last line (just kubectl's last line when nothing was
+decided), adding the remedy only when kubectl's
 output is a connection failure (a timeout, no route, a refused dial) rather than an answer the
 server gave (401, 403, NotFound) or the shim reporting the credential proxy itself unreachable. When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns
@@ -142,8 +143,8 @@ scaffold that failed would only be retried on the next reconcile tick with the s
 `cluster_preflight.sh` check 5 reads the bullets back, `endpoint` through the existing
 `user_md_field()` and the other three through `user_md_text()`, which keeps a value's case and
 spacing. It appends the endpoint and list to its `reason`, and prefixes its `remediation` with
-the remedy when kubectl's output matches the same connection-failure pattern, which a test
-holds equal to the Python one. A profile scaffolded before this change
+the remedy when kubectl's output matches the same connection-failure pattern and the same
+credential-proxy exclusion, both of which a test holds equal to the Python copies. A profile scaffolded before this change
 carries no bullets and preflight prints what it prints today.
 
 In a sandboxed install the credential proxy's managed kubeconfig for a cluster is the one every
