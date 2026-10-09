@@ -45,8 +45,10 @@ reroute a message, and it never widens anything.
 pod at a time.** Concretely:
 
 - The session key is the backend-qualified conversation id - a DM, or a thread in a
-  group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`). A channel or
-  space is not a session; a conversation in it is.
+  group space (eg `discord:1234/5678`, `gchat:spaces/AAA/threads/BBB`); on a backend whose
+  DMs are threaded, a thread in a DM can be its own conversation too (the Slack and
+  Google Chat adapter sections say when). A channel or space is not a session; a
+  conversation in it is.
 - `contextId` is minted at first contact with a conversation and persists across pod
   incarnations for the lifetime of the session record (until pruned after `A2A_SESSION_TTL`
   of inactivity). It is the durable name of the conversation on the bus. Minting MUST be create-only (a KV
@@ -162,12 +164,19 @@ The two differ on steers: a session worker absorbs them at its next turn boundar
 while the standing front door queues them and answers each as a further turn after the
 current one, with a status notice per follow-up (the payload spec's steering rule).
 
-The status matcher is the exact phrase set on every route. A wider
-interrogative rule applied while the fixed-route front door refused steers, where a
-stolen false positive cost nothing; the front door now queues steers and answers them,
-so a stolen one is a lost correction there too, and a status-shaped steer is a question
-the agent can answer itself. Anything no interceptor claims during a `working` task is
-a steer, per the 8/24 decision above.
+The status matcher is the exact phrase set wherever the executor runs follow-ups: a
+stolen steer there is a lost correction, and a status-shaped steer is a question the
+agent can answer itself. A wider interrogative rule (status-shaped words in an
+interrogative frame) applies only to a running task whose addressee refuses follow-ups,
+the platform executor's `cli` executor, which refuses each one `no-resume`: there a
+stolen false positive costs nothing, and a missed one is an acknowledgement followed by
+a refusal. The gateway cannot see the executor, so it learns this per addressee from
+the first `no-resume` refusal it relays, and forgets it when a later notice from that
+addressee says a follow-up was queued; the first follow-up to such an addressee after
+the gateway starts is still acknowledged and then refused. A detached task gets the
+exact phrases on either route: after a stop, the wide reading of "any update on the
+rollout" would steal a new task to replay a dead one. Anything no interceptor claims
+during a `working` task is a steer, per the 8/24 decision above.
 
 **Gateway-authored posts (amended 8/31).** Step 4's relay - events in, chat out - is
 not the whole output story: the gateway authors a small set of posts of its own. The
@@ -960,7 +969,10 @@ not be silent about it.
   arrival order per artifact, which is stream order for an executor that appends to one artifact
   id, present as `[]` when the executor called nothing and absent when no stream was
   read, because the relay never posts that artifact and this is the harness's only view of it, newest 1000 entries when a run has more, with `activityDropped` counting the rest)
-  and the progress artifact's latest line (`progress`); plus the conversation's last post, the
+  and the progress artifact's latest line (`progress`); plus the conversation's A2A `contextId`
+  from its record (absent when there is no record; the bridge's `api` executor names its Hermes
+  session after it, which is how the harness finds the kanban cards a turn filed), the
+  conversation's last post, the
   gateway's configured first-event grace, and the armed backend with `injectOnly`. The gateway
   classifies nothing on it; the harness does. It is a pure read because the never-started heal
   is a write under the per-conversation lock inside the keyed queue, and a read that performed
@@ -1257,10 +1269,21 @@ and drops; in a DM (measured) it equals `text` with nothing stripped and no ment
 annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
-space — the canonical example above. `gchat:dm/spaces/AAA` for a DM space, whole space
-one session — and, because a DM space is threaded, replies render in the thread of the
-latest ask (measured: without that, an answer to a question asked inside a DM thread
-landed top-level). Presentation only; the key and the session do not move. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
+space — the canonical example above. In a DM space, top-level messages share one conversation,
+`gchat:dm/spaces/AAA`, answered top-level, and a message typed inside an existing thread is
+a side thread, its own conversation `gchat:dm/spaces/AAA/threads/BBB`, answered in that
+thread. This is the main-flow and side-thread rule of the Hermes Google Chat adapter that
+default mode runs.
+Chat attaches a thread to every DM message, the one it auto-created for a top-level message
+included, so the thread name cannot tell them apart; Chat's `message.threadReply` flag does
+(true only for a reply in a thread, per the Chat API `Message` resource; measured: the
+captured in-thread DM reply carries it and the top-level DMs omit it). Hermes infers the
+split from a persisted per-thread inbound count instead, and the gateway keeps no count.
+The two differ on one case: the first reply into a thread Hermes has counted no inbound
+message in, such as the thread under a bot-posted report, is main flow to Hermes
+(`cron-report-relay.md`, "The first reply into a report's thread") and a side thread here. A record minted under the thread-less key before side threads existed still
+parses and posts top-level, and `openDirect` returns that key, so an unsolicited post to a
+DM lands top-level. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
 `GROUP_CHAT`, binds the whole space as one conversation, `gchat:space/spaces/AAA`;
 anything that is not positively a DM is read as a group, since a space misread as a DM
 would bind every thread in it to one session — the honest reading of "a space is
@@ -1318,7 +1341,18 @@ half a minute of those before giving up. The agent-side callers
 (`agents/platform/scripts/chat_notify.py`) switch on `A2A_NOTIFY_PLATFORM`, which the operator
 renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name (the condition
 the gateway arms the route on), and send to every other platform through `hermes send` as
-before.
+before. The Hermes kanban notifier, which posts a card's events into the thread the card
+subscribes to and wakes its creator when a card blocks or fails, reaches the same route
+through a send-only stand-in adapter that exists only inside the notifier
+(`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
+the platform as connected. Only the subscription's thread is forwarded, so the home-space
+rule applies: a thread of another space is refused, and a subscription with no thread is not
+delivered. A route probe (an empty notify, which an armed gateway refuses at once) tells the
+notifier when the route is unavailable (the gateway restarting), and it holds deliveries
+unclaimed then; only a send that meets the outage before the next probe spends one unit of
+the subscription's failure budget. Once, when routed delivery first goes live on an install,
+events that are already more than six hours old are advanced past without posting: they are
+the backlog nothing could deliver before.
 
 A notify is not a task. It mints no capability, starts no executor, opens no session and
 carries no `authority` block; the requester rules above do not apply, because nobody
