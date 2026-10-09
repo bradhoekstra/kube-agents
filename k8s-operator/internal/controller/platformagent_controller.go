@@ -325,6 +325,13 @@ type PlatformAgentReconciler struct {
 	// cleared when the CR is deleted.
 	credentialProxyWarningsLogged sync.Map
 
+	// agentAPIAuthWarningsLogged records, per CR, the spec generation whose
+	// agent-api-auth resources warnings reconcileWorkload last logged, so each
+	// generation logs them once. Keyed by ObjectKey, value int64; cleared when
+	// the CR is deleted. Separate from the proxy's gate: the two containers'
+	// overrides change independently.
+	agentAPIAuthWarningsLogged sync.Map
+
 	// APIReader reads straight from the API server, bypassing the manager's cache.
 	// Collector discovery looks at Services in namespaces this operator otherwise never
 	// touches, and a cached read there would have the manager start — and keep — an
@@ -1105,6 +1112,7 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// Resource is deleted. Safe to remove finalizer and update.
 		r.forgetUsageStatus(agent)
 		r.credentialProxyWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
+		r.agentAPIAuthWarningsLogged.Delete(client.ObjectKeyFromObject(agent))
 		controllerutil.RemoveFinalizer(agent, platformAgentFinalizer)
 		if err := r.Update(ctx, agent); err != nil {
 			return ctrl.Result{}, err
@@ -1953,13 +1961,39 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	// Note: Switching between Deployment and StatefulSet causes a full delete+recreate of the workload.
 	// This will incur downtime and potentially stuck pods if RWO volumes take time to unbind.
 	// This is an acceptable tradeoff since switching replicas/storage requires an explicit CRD update.
+	// A refused spec.deployment.agentAPIAuth.resources renders the sidecar at the
+	// operator's defaults rather than withholding the gateway, so the rest of the
+	// Pod keeps flowing and updateStatusReady reports the refusal as Degraded.
+	// Computed above the Deployment/StatefulSet fork so both gateway builders
+	// receive the stripped CR, not only the Deployment. The webhook, where it is
+	// on, has already refused the edit at apply.
+	gatewayAgent := agent
+	apiAuthRefusal, apiAuthWarnings := agentAPIAuthResourcesRefusal(agent)
+	// Logged once per spec generation (as the proxy's warnings are), so a
+	// webhook-off install still hears the Autopilot band and limit-without-request
+	// notes the validator computes for a valid-but-shaped override.
+	apiAuthKey := client.ObjectKeyFromObject(agent)
+	if logged, ok := r.agentAPIAuthWarningsLogged.Load(apiAuthKey); !ok || logged.(int64) != agent.Generation {
+		for _, warning := range apiAuthWarnings {
+			logf.FromContext(ctx).Info("WARNING: "+warning, "name", agent.Name, "namespace", agent.Namespace)
+		}
+		r.agentAPIAuthWarningsLogged.Store(apiAuthKey, agent.Generation)
+	}
+	if apiAuthRefusal != "" {
+		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the operator's default resources",
+			"name", agent.Name, "namespace", agent.Namespace, "refusal", apiAuthRefusal)
+		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidAgentAPIAuthResources, apiAuthRefusal)
+		gatewayAgent = agent.DeepCopy()
+		gatewayAgent.Spec.Deployment.AgentAPIAuth = nil
+	}
+
 	if useStatefulSet(agent) {
 		dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-gateway", Namespace: agent.Namespace}}
 		if err := client.IgnoreNotFound(r.Delete(ctx, dep)); err != nil {
 			return fmt.Errorf("failed to cleanup legacy Deployment: %w", err)
 		}
 
-		sts := buildStatefulSet(agent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
+		sts := buildStatefulSet(gatewayAgent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 		if err := r.stampSecretEnvHash(ctx, agent, sts, &sts.Spec.Template); err != nil {
 			return err
 		}
@@ -1974,18 +2008,6 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return fmt.Errorf("failed to cleanup legacy StatefulSet: %w", err)
 	}
 
-	// A refused spec.deployment.agentAPIAuth.resources renders the sidecar at the
-	// operator's defaults rather than withholding the gateway, so the rest of the
-	// Pod keeps flowing and updateStatusReady reports the refusal as Degraded.
-	// The webhook, where it is on, has already refused the edit at apply.
-	gatewayAgent := agent
-	if refusal, _ := agentAPIAuthResourcesRefusal(agent); refusal != "" {
-		logf.FromContext(ctx).Info("refusing spec.deployment.agentAPIAuth.resources; the agent-api-auth sidecar is rendered at the operator's default resources",
-			"name", agent.Name, "namespace", agent.Namespace, "refusal", refusal)
-		r.recordEvent(agent, corev1.EventTypeWarning, conditionReasonInvalidAgentAPIAuthResources, refusal)
-		gatewayAgent = agent.DeepCopy()
-		gatewayAgent.Spec.Deployment.AgentAPIAuth = nil
-	}
 	dep := buildDeployment(gatewayAgent, configHash, fluentBitHash, settingsHash, policyHash, agentPlugins, opts)
 	if err := r.stampSecretEnvHash(ctx, agent, dep, &dep.Spec.Template); err != nil {
 		return err

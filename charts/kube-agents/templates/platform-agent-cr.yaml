@@ -346,6 +346,26 @@ spec:
       above gives.
     */}}
     {{- $apiAuthResources := ((.Values.platformAgent.deployment.agentAPIAuth | default dict).resources) | default dict }}
+    {{- /* Shape check only, the cheap part the operator and webhook cannot catch:
+           a side key the CRD does not declare (`limit:` for `limits:`) is pruned
+           silently by the API server and the override is lost before it reaches
+           them, and `--set ...resources.limits=4Gi` hands a scalar that range
+           cannot walk. The quantity grammar, floor and crossed-pair checks are the
+           operator's and the webhook's. */}}
+    {{- $apiAuthPrefix := "platformAgent.deployment.agentAPIAuth.resources" }}
+    {{- $apiAuthUnknown := keys (omit $apiAuthResources "limits" "requests" "claims") | sortAlpha }}
+    {{- if $apiAuthUnknown }}
+    {{- fail (printf "%s carries %s, which the PlatformAgent CRD does not declare; the accepted keys are requests, limits and claims. The API server would prune it, and the override would be lost silently" $apiAuthPrefix (join ", " $apiAuthUnknown)) }}
+    {{- end }}
+    {{- if index $apiAuthResources "claims" }}
+    {{- fail (printf "%s.claims is not supported -- the gateway pod declares no resourceClaims, so the operator refuses the key. Remove it." $apiAuthPrefix) }}
+    {{- end }}
+    {{- range $side := list "limits" "requests" }}
+    {{- $sideVal := index $apiAuthResources $side }}
+    {{- if not (or (empty $sideVal) (kindIs "map" $sideVal)) }}
+    {{- fail (printf "%s.%s is %v, which is not a map of resource name to quantity, for example `limits: {memory: 4Gi}`" $apiAuthPrefix $side $sideVal) }}
+    {{- end }}
+    {{- end }}
     {{- $apiAuthQuantities := dict }}
     {{- range $side := list "limits" "requests" }}
       {{- $set := dict }}

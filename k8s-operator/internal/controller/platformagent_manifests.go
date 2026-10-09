@@ -247,12 +247,15 @@ const (
 	// so one core is roughly 45x the observed use rather than a budget for the watcher alone.
 	//
 	// GOMAXPROCS has been cgroup-aware since Go 1.25 and k8s-operator builds with 1.27
-	// (k8s-operator/go.mod), so dropping this limit from 2 to 1 sets the
+	// (k8s-operator/go.mod), so this 1 CPU limit makes the Go runtime set the
 	// k8s-event-watcher's GOMAXPROCS to 1. Go rounds up, so choosing 1 rather than 500m
-	// keeps GOMAXPROCS=1 while preserving a full core of burst.
+	// keeps GOMAXPROCS=1 while preserving a full core of burst. These are defaults:
+	// spec.deployment.agentAPIAuth.resources overrides any of them per key
+	// (resolveAgentAPIAuthResources), so an override of limits.cpu moves GOMAXPROCS too.
 	//
-	// Memory limit must stay at 2Gi: the event watcher reads this limit via Downward API
-	// (EVENT_WATCHER_MEMORY_LIMIT_BYTES) to set GOMEMLIMIT to half of it.
+	// Memory limit defaults to 2Gi. The event watcher reads whatever limit is rendered,
+	// via the Downward API (EVENT_WATCHER_MEMORY_LIMIT_BYTES), to set GOMEMLIMIT to half
+	// of it, so raising limits.memory raises the soft limit with it.
 	agentAPIAuthCPULimit              = "1"
 	agentAPIAuthMemoryLimit           = "2Gi"
 	agentAPIAuthEphemeralStorageLimit = "2Gi"

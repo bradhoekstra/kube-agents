@@ -102,11 +102,12 @@ const credentialProxyResourceNameBudget = 128
 // credentialProxyResourcesPath is where the override sits on the CR.
 var credentialProxyResourcesPath = field.NewPath("spec", "deployment", "credentialProxy", "resources")
 
-// acceptedContainerResourceNames are the only names an override may carry: the
-// quantities the proxy container declares. Anything else (an extended
-// resource, hugepages, a misspelt name) reaches the API server unchecked here,
-// which refuses several such shapes as Invalid, and the reconciler would read
-// that as an immutable-field change and recreate the proxy.
+// acceptedContainerResourceNames are the only names an override may carry, for
+// the credential proxy and the agent-api-auth sidecar alike: the quantities a
+// container declares. Anything else (an extended resource, hugepages, a
+// misspelt name) reaches the API server unchecked here, which refuses several
+// such shapes as Invalid, and the reconciler would read that as an
+// immutable-field change and recreate the workload.
 var acceptedContainerResourceNames = []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage}
 
 // byteCountResources are the names whose quantity is a count of bytes, and so
