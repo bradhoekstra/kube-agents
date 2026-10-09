@@ -93,6 +93,14 @@ REMEDY_IP = (
     f"open its DNS endpoint with {_ENABLE_DNS_ACCESS}."
 )
 REMEDY_OTHER_NETWORK = "The agent is not on this cluster's VPC. " + REMEDY_IP
+# Same VPC, but the private endpoint answers only from its own region. An
+# address on the list cannot change that; global access or the DNS endpoint can.
+REMEDY_OTHER_REGION = (
+    "This cluster's private endpoint answers only from its own region. Enable "
+    "control-plane global access with `gcloud container clusters update "
+    "--enable-master-global-access` and re-run the onboarding, or open its DNS "
+    f"endpoint with {_ENABLE_DNS_ACCESS}."
+)
 # Same VPC and region, but the list on the private endpoint does not admit the
 # agent's Pod range. The range is spliced in so the operator has nothing to
 # look up; `{pod_cidr}` reads "the agent cluster's Pod range" when unknown.
@@ -407,6 +415,7 @@ def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]
     # the list. A private endpoint that would refuse us is no better than a
     # public one that does, and worse than a public one that does not.
     same_network: bool | None = None
+    routable = False
     pod_cidr = ""
     if private_endpoint and network and (restricted or not public_endpoint):
         mine = own()
@@ -432,6 +441,8 @@ def _decide(described: dict, location: str, own: Callable[[], OwnCluster | None]
     # Rule 4. Whatever gcloud writes unflagged.
     if not restricted:
         remedy = ""
+    elif same_network and not routable:
+        remedy = REMEDY_OTHER_REGION
     elif private_endpoint and same_network is False:
         remedy = REMEDY_OTHER_NETWORK
     else:

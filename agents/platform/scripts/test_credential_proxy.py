@@ -3375,6 +3375,27 @@ class CommandExecutorTest(unittest.TestCase):
         decide.assert_called_once()
         self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
 
+    def test_a_callers_fetch_target_is_read_through_gclouds_flag_shapes(self):
+        # Every spelling a hand-typed command might carry: a global flag with a
+        # detached value ahead of the cluster name, `-z`, and --project before
+        # the verb. None may be read as the cluster name or lose the target.
+        cases = [
+            (["gcloud", "--verbosity", "debug", "container", "clusters", "get-credentials",
+              "cluster-b", "--location=us-central1", "--project=demo-project"],
+             ("demo-project", "cluster-b", "us-central1")),
+            (["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+              "-z", "us-central1-a", "--project", "demo-project"],
+             ("demo-project", "cluster-b", "us-central1-a")),
+            (["gcloud", "--project=demo-project", "container", "clusters", "get-credentials",
+              "cluster-b", "--region", "us-central1"],
+             ("demo-project", "cluster-b", "us-central1")),
+        ]
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                target = credential_proxy._get_credentials_target(argv)
+                self.assertIsNotNone(target, argv)
+                self.assertEqual(expected, (target.project, target.cluster, target.location))
+
     def test_a_callers_fetch_that_names_an_endpoint_is_run_as_given(self):
         executor = self.fake_gcloud(self.executor())
         seen = []

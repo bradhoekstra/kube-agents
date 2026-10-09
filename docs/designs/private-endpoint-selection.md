@@ -62,7 +62,10 @@ routes query says whether the peering exports the control-plane route.
 ## How the agent knows its own cluster
 
 The operator sets `GKE_PROJECT_ID`, `GKE_LOCATION` and `GKE_CLUSTER_NAME` on the agent
-container, the shell sandbox forwards them, and the credential proxy carries them too.
+container, the shell sandbox forwards them, the credential proxy carries them too, and the
+platform MCP server's env block in `agents/platform/config.yaml` names them, since Hermes hands
+a stdio server only the keys named there (a contract test holds the block to
+`OWN_CLUSTER_ENV`).
 `gke_endpoint.own_cluster()` describes that cluster once with
 `--format=value(networkConfig.network,networkConfig.subnetwork,clusterIpv4Cidr)`, derives its
 region from `GKE_LOCATION`, and keeps the answer for the life of the process. The install's VPC
@@ -106,6 +109,8 @@ preflight card read the same words:
 
 - rule 3 found the private endpoint routable but not admitted: `REMEDY_ADMIT_POD_RANGE`, with
   the Pod range spliced in;
+- `ip` with the list enabled, on the agent's network but in another region without global
+  access: `REMEDY_OTHER_REGION`, which names control-plane global access;
 - `ip` with the list enabled, on another network with a private endpoint: `REMEDY_OTHER_NETWORK`;
 - `ip` with the list enabled otherwise: `REMEDY_IP`;
 - `dns`, `internal-ip`, or any cluster whose list is not enabled: no remedy. An `internal-ip`
@@ -153,10 +158,14 @@ runs this rule, and any caller's `get-credentials`, whose output the proxy files
 context it selects. A caller that names no endpoint flag (the Platform Agent running the
 command by hand, the fleet-upgrade-verification skill) would otherwise move a cluster back to
 its public IP for everyone, so the proxy splices the rule's flags into such a fetch when it can
-read the target from the argv; a caller that names `--dns-endpoint` or `--internal-ip` is run
-as given. Every writer therefore applies the same rule to the same describe, and `USER.md` and
-the live choice diverge only after the cluster's endpoint configuration changes, which the
-remedy already answers with a re-run of the onboarding.
+read the target from the argv (the cluster positional, `--project`, and `--location`,
+`--region`, `--zone` or `-z`, in either flag form and on either side of the verb, skipping the
+values of gcloud's value-taking global flags); a caller that names `--dns-endpoint` or
+`--internal-ip` is run as given. Every writer therefore applies the same rule to the same
+describe. `USER.md` records the scaffold's own decision, so it can still understate the live
+choice when the scaffold's describe of the agent's own cluster failed transiently (the proxy
+decides again and may splice `--internal-ip` where the scaffold wrote none); the probe then
+succeeds through the proxy and the record is corrected by the next re-run of the onboarding.
 
 ## What stays as it is, and why
 

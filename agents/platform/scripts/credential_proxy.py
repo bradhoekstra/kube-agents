@@ -109,7 +109,7 @@ KUBECTL_TIMEOUT_FLAGS = ("--request-timeout", "--timeout")
 GET_CREDENTIALS_ENDPOINT_FLAGS = ("--dns-endpoint", "--internal-ip")
 # gcloud's spellings of the location and project on that command, with or
 # without `=`.
-GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone")
+GET_CREDENTIALS_LOCATION_FLAGS = ("--location", "--region", "--zone", "-z")
 GET_CREDENTIALS_PROJECT_FLAG = "--project"
 
 # Bounds on what a command's output costs this process while the command runs.
@@ -3011,34 +3011,38 @@ class ExecutionResult:
 def _get_credentials_target(argv: list[str]) -> ClusterTarget | None:
     """The (project, cluster, location) a `get-credentials` argv names, or None.
 
-    The cluster is the first positional after the verb; the location and
-    project are read from gcloud's flags in either `--flag=value` or
-    `--flag value` form. Any of the three missing is None: gcloud would fall
-    back to its configured defaults, which this side does not know.
+    The cluster is the first positional after the verb that is not the value
+    of a flag; the location and project are read from gcloud's flags wherever
+    they sit, before or after the verb, in `--flag=value` or `--flag value`
+    form, with `-z` for `--zone`. Flags that take a detached value are the
+    ones `command_policy` already knows, so `--verbosity debug` ahead of the
+    verb does not read `debug` as the cluster. Any of the three missing is
+    None: gcloud would fall back to its configured defaults, which this side
+    does not know.
     """
     try:
-        index = argv.index("get-credentials")
+        verb_index = argv.index("get-credentials")
     except ValueError:
         return None
     cluster = ""
     location = ""
     project = ""
-    rest = argv[index + 1:]
     skip = False
-    for position, argument in enumerate(rest):
+    for position, argument in enumerate(argv):
         if skip:
             skip = False
             continue
         name, separator, value = argument.partition("=")
-        if name in GET_CREDENTIALS_LOCATION_FLAGS or name == GET_CREDENTIALS_PROJECT_FLAG:
-            if not separator:
-                value = rest[position + 1] if position + 1 < len(rest) else ""
-                skip = True
-            if name == GET_CREDENTIALS_PROJECT_FLAG:
-                project = value
-            else:
-                location = value
-        elif not argument.startswith("-") and not cluster:
+        takes_value = name in command_policy._GCLOUD_FLAGS_WITH_VALUE
+        if takes_value and not separator:
+            value = argv[position + 1] if position + 1 < len(argv) else ""
+            skip = True
+        if name in GET_CREDENTIALS_LOCATION_FLAGS:
+            location = value
+        elif name == GET_CREDENTIALS_PROJECT_FLAG:
+            project = value
+        elif (position > verb_index and not argument.startswith("-")
+              and not cluster):
             cluster = argument
     if not (project and cluster and location):
         return None

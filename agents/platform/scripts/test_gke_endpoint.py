@@ -709,6 +709,13 @@ class PrivateEndpointTest(unittest.TestCase):
         self.assertEqual(d.flags, ())
         self.assertEqual(d.kind, gke_endpoint.KIND_IP)
 
+    def test_another_region_without_global_access_names_global_access_in_the_remedy(self):
+        # Adding an address cannot make a private endpoint answer from another
+        # region; the remedy has to name control-plane global access instead.
+        d = decision(FakeRunner(PRIVATE_SAME_VPC), location="europe-west1")
+        self.assertIn("global access", d.remedy)
+        self.assertNotIn("egress address", d.remedy)
+
     def test_another_region_with_global_access_gets_internal_ip(self):
         d = decision(FakeRunner(PRIVATE_SAME_VPC_GLOBAL), location="europe-west1")
         self.assertEqual(d.flags, ("--internal-ip",))
