@@ -173,7 +173,10 @@ func (s *stubUsageSource) set(addr string, sample int64, start *float64) {
 	defer s.mu.Unlock()
 	delete(s.errs, addr)
 	reading := s.readings[addr]
-	reading.Samples = map[string]int64{stubPrimarySample: sample}
+	if reading.Samples == nil {
+		reading.Samples = map[string]int64{}
+	}
+	reading.Samples[stubPrimarySample] = sample
 	reading.StartTime = start
 	s.readings[addr] = reading
 }
@@ -1021,6 +1024,64 @@ func TestUsagePoller_ProposalsCountBesideToolExecutions(t *testing.T) {
 	h.poll(20)
 	if status := h.status(); status.RemediationsProposedTotal != 3 || status.ToolExecutionsTotal != 6 {
 		t.Fatalf("after the restart: %+v, want 3 proposals and 6 tool executions", status)
+	}
+}
+
+// A version-1 document, entries keyed by pod UID and two totals, is migrated
+// in place on the first poll: the totals survive, with the status pruned so a
+// re-seed would have had nothing to start from; the interval's deltas add
+// against the migrated baseline; the first-recorded time is kept; and the
+// broker's new counter gets its entry.
+func TestUsagePoller_MigratesAVersionOneDocument(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	h := newUsageHarness(t, usageTestAgent(created), usageDefaultObjects(created)...)
+	moved := metav1.NewTime(usageClock(3))
+	h.writeDocument(&usageDocument{
+		Version:       usageDocumentVersionPodKeyed,
+		AgentUID:      usageTestAgentUID,
+		FirstRecorded: metav1.NewTime(usageClock(1)),
+		Totals:        map[string]int64{usageCounterToolExecutions: 10, usageCounterEventsIngested: 4},
+		LastMoved:     &moved,
+		Pods: map[string]*usagePodEntry{
+			"gw-a":     {Name: "agent-gateway-aaa", Counter: usageCounterEventsIngested, Sample: 40, Marker: moved},
+			"broker-b": {Name: "agent-credential-proxy-bbb", Counter: usageCounterToolExecutions, Sample: 100, Marker: moved},
+		},
+	})
+	h.pruning = true
+	h.stub.set(gatewayAddr(), 46, nil)
+	h.stub.set(brokerAddr(), 103, nil)
+	h.stub.setSample(brokerAddr(), usageCounterRemediationsProposed, 2)
+	h.poll(10)
+	doc := h.document()
+	if doc.Version != usageDocumentVersion || !doc.FirstRecorded.Time.Equal(usageClock(1)) {
+		t.Fatalf("migrated document: version %d, firstRecorded %v; want %d and %v", doc.Version, doc.FirstRecorded, usageDocumentVersion, usageClock(1))
+	}
+	if doc.Totals[usageCounterToolExecutions] != 13 || doc.Totals[usageCounterEventsIngested] != 10 || doc.Totals[usageCounterRemediationsProposed] != 0 {
+		t.Fatalf("totals after the migrating poll: %v, want 13, 10 and 0 (the deltas added to the kept totals)", doc.Totals)
+	}
+	for _, key := range []string{
+		usagePodEntryKey("gw-a", usageCounterEventsIngested),
+		usagePodEntryKey("broker-b", usageCounterToolExecutions),
+		usagePodEntryKey("broker-b", usageCounterRemediationsProposed),
+	} {
+		if e := doc.Pods[key]; e == nil || e.PodUID == "" {
+			t.Fatalf("entry %q after the migration: %+v", key, e)
+		}
+	}
+	if doc.Pods[usagePodEntryKey("broker-b", usageCounterRemediationsProposed)].Sample != 2 {
+		t.Fatalf("the new counter was not recorded at its sample: %+v", doc.Pods)
+	}
+}
+
+// The Warning names every status field a pod's counters project to, as paths.
+func TestUsageScrapeFailureMessage_NamesEachStatusField(t *testing.T) {
+	msg := usageScrapeFailureMessage([]usageScrapeFailure{{
+		name: "agent-credential-proxy-bbb", counter: usageStatusFieldList(usageBrokerCounters), detail: "connection refused",
+		err: &usageScrapeError{Kind: usageScrapeKindRefused},
+	}})
+	want := "pod agent-credential-proxy-bbb (status.usage.toolExecutionsTotal, status.usage.remediationsProposedTotal): connection refused"
+	if !strings.Contains(msg, want) {
+		t.Fatalf("message %q does not name both fields as %q", msg, want)
 	}
 }
 

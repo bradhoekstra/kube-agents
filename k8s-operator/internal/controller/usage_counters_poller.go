@@ -81,6 +81,9 @@ const (
 	// owner when its instance label is absent.
 	usageOwnerKindPlatformAgent = "PlatformAgent"
 	usagePollerLogName          = "usage-counters"
+	// usageStatusFieldPrefix is the path a counter projects to, as the Warning
+	// names it.
+	usageStatusFieldPrefix = "status.usage."
 	// The two sentences the Warning event can end with; usageScrapeGuidance
 	// picks one by the failure's class.
 	usageScrapeConnectGuidance  = "Check that the pod's NetworkPolicy admits the operator's pods on the metrics port and that the listener is up."
@@ -495,7 +498,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 		return err
 	}
 	result := foldUsage(doc, string(agent.UID), usageStatusSeed(agent, now), live, scraped, now)
-	if result.Changed {
+	if result.Changed || (doc != nil && doc.migrated) {
 		if fault, err := p.writeDocument(ctx, agent, existing, result.Document); err != nil {
 			// The write failed: fold the ConfigMap cause, if any, into the CR's
 			// one Warning beside the scrape cause rather than recording a second.
@@ -687,6 +690,10 @@ func (p *UsageCounterPoller) readDocument(ctx context.Context, log logr.Logger, 
 	if err := json.Unmarshal([]byte(raw), &doc); err != nil {
 		log.Info("the usage counters document does not parse; re-seeding from the status", "configmap", cm.Name)
 		return cm, nil, nil
+	}
+	migrateUsageDocument(&doc)
+	if doc.migrated {
+		log.Info("the usage counters document was at the previous layout; migrated in place, nothing lost", "configmap", cm.Name)
 	}
 	if reason := usageDocumentInvalid(&doc, cm, agent, now); reason != "" {
 		log.Info("the usage counters document failed a read-back bound; re-seeding from the status", "configmap", cm.Name, "reason", reason)
@@ -981,7 +988,7 @@ func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarg
 		log.Info("a metrics listener could not be read; this pod is not counted and its baseline is not advanced until it recovers",
 			"pod", target.name, "counters", strings.Join(target.counters, ","), "error", detail)
 	}
-	return usageScrapeFailure{name: target.name, counter: strings.Join(target.counters, ","), detail: detail, err: err}, count >= usageScrapeFailureEventStreak
+	return usageScrapeFailure{name: target.name, counter: usageStatusFieldList(target.counters), detail: detail, err: err}, count >= usageScrapeFailureEventStreak
 }
 
 // recordStandingFailures records at most one Warning on the CR for this poll,
@@ -1012,6 +1019,16 @@ func (p *UsageCounterPoller) recordStandingFailures(agent *agentv1alpha1.Platfor
 	}
 }
 
+// usageStatusFieldList names the status fields a pod's counters project to,
+// for the Warning: "status.usage.a, status.usage.b".
+func usageStatusFieldList(counters []string) string {
+	fields := make([]string, 0, len(counters))
+	for _, counter := range counters {
+		fields = append(fields, usageStatusFieldPrefix+counter)
+	}
+	return strings.Join(fields, ", ")
+}
+
 // usageScrapeFailureMessage is the body of the Warning the CR gets for the
 // listeners that failed this poll past their streak, naming each pod and ending
 // with the distinct guidance their kinds point at. It is byte-stable across
@@ -1026,7 +1043,7 @@ func usageScrapeFailureMessage(failures []usageScrapeFailure) string {
 	perPod := make([]string, 0, len(failures))
 	picked := map[string]bool{}
 	for _, f := range failures {
-		perPod = append(perPod, fmt.Sprintf("pod %s (status.usage.%s): %s", f.name, f.counter, f.detail))
+		perPod = append(perPod, fmt.Sprintf("pod %s (%s): %s", f.name, f.counter, f.detail))
 		picked[usageScrapeGuidance(f.err)] = true
 	}
 	var guidance []string

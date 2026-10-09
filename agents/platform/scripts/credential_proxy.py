@@ -7563,6 +7563,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # control is not behind a switch, because it is the only way the sandbox
     # reaches a repository at all.
     vcs: vcs_broker.VcsBroker | None = None
+    # Set by _repository_is_permitted on a refusal: the status it answered.
+    repository_refusal_status: HTTPStatus | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
     # Unix socket is the access control, behaving as it did before there was an
     # authenticator at all.
@@ -7651,6 +7653,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         An unreadable list refuses rather than allows, and says which of the two
         it was in the log: an authorization check that fails open is not one.
         """
+        # The status this method answered with on a refusal, for a caller that
+        # counts refusals apart from faults (the version-control counter).
+        self.repository_refusal_status = None
         try:
             permitted = repository_is_managed(repository, forge)
         except Exception as exc:
@@ -7659,6 +7664,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "could not be read type=%s",
                 type(exc).__name__,
             )
+            self.repository_refusal_status = HTTPStatus.SERVICE_UNAVAILABLE
             self._json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
                 {
@@ -7669,6 +7675,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return False
         if permitted:
             return True
+        self.repository_refusal_status = HTTPStatus.FORBIDDEN
         LOGGER.warning(
             "refused a repository this install does not manage repository=%s",
             _sanitize_for_logging(repository),
@@ -8768,9 +8775,16 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     try:
                         forge, repository = self.vcs.registry.resolve(payload.get("repository"))
                     except providers.WorkspaceError as exc:
+                        # A repository this install serves no credential for is a
+                        # refusal; a repository field that cannot be read is a
+                        # request the broker could not use.
                         self._json(HTTPStatus(exc.status), _redacted_fields(exc))
-                        return TOOL_STATUS_BLOCKED
+                        return TOOL_STATUS_BLOCKED if exc.status == HTTPStatus.FORBIDDEN else TOOL_STATUS_ERROR
                     if not self._repository_is_permitted(repository, forge):
+                        # Refused on the managed list, or the list itself could
+                        # not be read: the first is a refusal, the second a fault.
+                        if self.repository_refusal_status == HTTPStatus.SERVICE_UNAVAILABLE:
+                            return TOOL_STATUS_ERROR
                         return TOOL_STATUS_BLOCKED
                 result = route(payload)
                 self._json(HTTPStatus.OK, result)
