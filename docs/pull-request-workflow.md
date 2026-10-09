@@ -410,8 +410,12 @@ posting every Medium as a thread and sets no round budget of its own — the sto
   never see it, so prefer leaving it open with the reply
   ([resolving conversations](#resolving-conversations)).
 - **Who counts, and what a ruling is.** A human is _on_ a pull request when a reviewer is requested,
-  or a non-robot human has filed `APPROVED` or `CHANGES_REQUESTED` or replied in one of its threads;
-  `kube-agents-bot` and the `robot_accounts` of `.github/auto_request_review.yml` never count. A
+  or a non-robot human other than the author has filed `CHANGES_REQUESTED`, or an `APPROVED` that
+  `scripts/request_reviewers.py` counts (an `OWNERS` approver's, or an `OWNERS` reviewer's on a change
+  the author's own approval already covers), or a requested or `OWNERS`-listed reviewer has replied
+  in one of its threads. The author's own replies, a bystander's comment, an approval from outside
+  `OWNERS`, `kube-agents-bot` and the `robot_accounts` of `.github/auto_request_review.yml` never
+  count. A
   **ruling** on a declined bot thread is read for its content, not for the event GitHub files: a
   human's approval of the pull request, or their reply in the thread that accepts the decline, is
   the ruling, and you then resolve the thread citing it; a `CHANGES_REQUESTED` review, or a reply or
@@ -437,7 +441,7 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it, or, for a
 `kube-agents-bot` finding you decline, the reason, which **Self-Review** gives too. Then resolve
 what a commit fixed or you showed wrong, except the description thread, which waits for the body
-edit described below. A declined bot finding is better left open with its reply until a human
+edit described below or for a ruling on a disputed ask. A declined bot finding is better left open with its reply until a human
 rules on it — an approval, or a reply in the thread that accepts the decline — which hands the
 thread back to you to resolve, citing it; a reply that asks for the fix is a disagreement and owes
 the fix with the thread left open ([green is settled](#green-is-settled), _who counts_); with a user
@@ -495,13 +499,14 @@ Five ways that goes wrong quietly:
   finding in its summary body, under **The pull request description is still unanswered.**, and
   opens a new thread only for a section no earlier thread named. A pull request with every thread
   resolved can therefore still hold the `AI Review` check. Resolve the description thread only after
-  the body is edited. Editing the body starts no review, and a plain `/review` on an unchanged commit
+  the body is edited, or on a ruling. Editing the body starts no review, and a plain `/review` on an unchanged commit
   is a re-cut that checks only for missing and empty sections, so comment `/review fresh` — one of
   the two re-reads of your own — and read the body of a review newer than your edit, with the first
   poll command in [Waiting for it](#waiting-for-it), before reporting the pull request clear. An ask
-  that newer review repeats after your reply is a dispute for the human reviewer, not another edit,
-  and once both re-reads are spent the thread is left open with its reply for them
-  ([green is settled](#green-is-settled)).
+  that newer review repeats after your reply is a dispute for the human reviewer, not another edit:
+  reply `declined: <reason>`, and once both re-reads are spent leave the thread open for them; a
+  ruling returns it to you to resolve like any other declined thread
+  ([green is settled](#green-is-settled), _who counts_).
 
 ## How a change merges
 
