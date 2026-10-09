@@ -144,9 +144,11 @@ _PROXY_VALUE = "platformAgent.deployment.credentialProxy.resources"
 _AA_MEMORY_REQUEST_BYTES = 384 * 1024**2
 _AA_MEMORY_LIMIT_BYTES = 2 * 1024**3
 _AA_CPU_LIMIT_MILLIS = 1000
+_AA_CPU_REQUEST_MILLIS = 150
 _AA_EPHEMERAL_LIMIT_BYTES = 2 * 1024**3
 _AA_OVERRIDE_MEMORY_LIMIT_BYTES = 4 * 1024**3
 _AA_OVERRIDE_CPU_LIMIT_MILLIS = 2000
+_AA_OVERRIDE_CPU_REQUEST_MILLIS = 500
 _AA_OVERRIDE_EPHEMERAL_LIMIT_BYTES = 10 * 1024**3
 _AA_VALUE = "platformAgent.deployment.agentAPIAuth.resources"
 
@@ -338,6 +340,7 @@ class PreflightDecisionTest(unittest.TestCase):
         raised = self._requirements([
             f"{_AA_VALUE}.requests.memory={_AA_MEMORY_LIMIT_BYTES}",
             f"{_AA_VALUE}.limits.cpu={_AA_OVERRIDE_CPU_LIMIT_MILLIS}m",
+            f"{_AA_VALUE}.requests.cpu={_AA_OVERRIDE_CPU_REQUEST_MILLIS}m",
         ])
         self.assertEqual(
             raised["requestsMemory"] - base["requestsMemory"],
@@ -347,7 +350,12 @@ class PreflightDecisionTest(unittest.TestCase):
             raised["limitsCpu"] - base["limitsCpu"],
             _AA_OVERRIDE_CPU_LIMIT_MILLIS - _AA_CPU_LIMIT_MILLIS,
         )
-        self.assertEqual(raised["requestsCpu"], base["requestsCpu"])
+        self.assertEqual(
+            raised["requestsCpu"] - base["requestsCpu"],
+            _AA_OVERRIDE_CPU_REQUEST_MILLIS - _AA_CPU_REQUEST_MILLIS,
+        )
+        # A requests.memory override must not leak into the limits total.
+        self.assertEqual(raised["limitsMemory"], base["limitsMemory"])
 
     def test_agent_api_auth_ephemeral_override_moves_both_sides_with_defaulting(self) -> None:
         base = self._requirements()
@@ -399,6 +407,7 @@ class PreflightDecisionTest(unittest.TestCase):
             [f"{_AA_VALUE}.limits.memory=256Mi"],
             [f"{_AA_VALUE}.limits.cpu=0"],
             [f"{_AA_VALUE}.requests.memory=5Gi"],
+            [f"{_AA_VALUE}.requests.cpu=2"],
         ):
             got = self._requirements(override)
             self.assertEqual(got, base, f"a refused override {override} moved the footprint; it must count defaults")

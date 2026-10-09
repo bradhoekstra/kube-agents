@@ -116,6 +116,9 @@ func TestReconcileInvalidAgentAPIAuthResources(t *testing.T) {
 			if ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready"); ready != nil && ready.Reason == conditionReasonInvalidAgentAPIAuthResources {
 				t.Errorf("Ready reason = %s; the refusal is reported on Degraded only", ready.Reason)
 			}
+			if updated.Status.Phase == "Degraded" {
+				t.Errorf("Status.Phase = Degraded; the sidecar runs at defaults, so the refusal is reported on the Degraded condition only")
+			}
 
 			// The gateway workload carries the sidecar at the 2Gi default, not the
 			// refused 4Gi override — on whichever workload kind this path renders.
@@ -136,6 +139,59 @@ func TestReconcileInvalidAgentAPIAuthResources(t *testing.T) {
 			}
 			if got := initContainerMemoryLimit(t, tmpl); got.Cmp(resource.MustParse("2Gi")) != 0 {
 				t.Errorf("sidecar memory limit = %s, want the 2Gi default; a refused override must be ignored", got.String())
+			}
+
+			// With every workload ready the agent reaches Ready while Degraded still
+			// carries the refusal: a refused override must not keep the agent out of
+			// Ready, which is what the field's doc and values.yaml promise. The
+			// reconciles above leave the fake workloads not-yet-ready, so this drives
+			// the status writer directly after marking them ready, as the credential
+			// proxy's sibling test does.
+			deps := &appsv1.DeploymentList{}
+			if err := cl.List(ctx, deps, client.InNamespace(agent.Namespace)); err != nil {
+				t.Fatalf("list deployments: %v", err)
+			}
+			for i := range deps.Items {
+				d := &deps.Items[i]
+				want := int32(1)
+				if d.Spec.Replicas != nil {
+					want = *d.Spec.Replicas
+				}
+				d.Status.Replicas = want
+				d.Status.ReadyReplicas = want
+				if err := cl.Status().Update(ctx, d); err != nil {
+					t.Fatalf("mark %s ready: %v", d.Name, err)
+				}
+			}
+			stses := &appsv1.StatefulSetList{}
+			if err := cl.List(ctx, stses, client.InNamespace(agent.Namespace)); err != nil {
+				t.Fatalf("list statefulsets: %v", err)
+			}
+			for i := range stses.Items {
+				st := &stses.Items[i]
+				want := int32(1)
+				if st.Spec.Replicas != nil {
+					want = *st.Spec.Replicas
+				}
+				st.Status.Replicas = want
+				st.Status.ReadyReplicas = want
+				if err := cl.Status().Update(ctx, st); err != nil {
+					t.Fatalf("mark %s ready: %v", st.Name, err)
+				}
+			}
+			r.APIReader = cl
+			phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+			if err != nil {
+				t.Fatalf("updateStatusReady failed: %v", err)
+			}
+			if phase != "Ready" {
+				t.Errorf("phase with every workload ready = %q, want Ready; a refused override must not hold the agent out of Ready", phase)
+			}
+			if ready := meta.FindStatusCondition(updated.Status.Conditions, "Ready"); ready == nil || ready.Status != metav1.ConditionTrue {
+				t.Errorf("Ready with every workload ready = %v, want True", ready)
+			}
+			if degraded := meta.FindStatusCondition(updated.Status.Conditions, "Degraded"); degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != conditionReasonInvalidAgentAPIAuthResources {
+				t.Errorf("Degraded with every workload ready = %v, want True/%s", degraded, conditionReasonInvalidAgentAPIAuthResources)
 			}
 
 			close(recorder.Events)
