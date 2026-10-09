@@ -38,8 +38,8 @@ listed range. Otherwise the kubeconfig names the endpoint `gcloud` writes by def
 scaffold records the endpoint it chose in the profile's `USER.md`, probes the cluster once,
 and when the connection fails the onboarding log and the Cluster Agent's preflight repeat that
 record and name what would open the cluster: the Pod range to add when the private endpoint's
-list is the block, the agent's egress address when the public endpoint's is, global access or
-the DNS endpoint when the region or the VPC is.
+list is the block, the agent's egress address when the public endpoint's is, control-plane
+global access when the region is, and the DNS endpoint when the VPC is.
 [`private-endpoint-selection.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/private-endpoint-selection.md)
 has the full rule.
 

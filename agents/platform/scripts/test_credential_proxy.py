@@ -3326,6 +3326,13 @@ class CommandExecutorTest(unittest.TestCase):
     # ---- Choosing the control-plane endpoint --------------------------------
 
     @staticmethod
+    def age_marker(executor, target):
+        """Push a provisional marker past its retry window."""
+        marker = executor._provisional_marker(target)
+        old = time.time() - credential_proxy.PROVISIONAL_RETRY_SECONDS - 1
+        os.utime(marker, (old, old))
+
+    @staticmethod
     def a_decision(flags, provisional=False):
         """An EndpointDecision carrying `flags`, for patching gke_endpoint."""
         import gke_endpoint
@@ -3477,6 +3484,7 @@ class CommandExecutorTest(unittest.TestCase):
             seen.append(argv)
             return original(argv, **kwargs)
 
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
         with (
             mock.patch("gke_endpoint.endpoint_decision",
                        return_value=self.a_decision([], provisional=True)),
@@ -3484,6 +3492,7 @@ class CommandExecutorTest(unittest.TestCase):
         ):
             first = executor._resolve_kubeconfig(self.CONTEXT)
             second = executor._resolve_kubeconfig(self.CONTEXT)
+        self.age_marker(executor, target)
         with (
             mock.patch("gke_endpoint.endpoint_decision",
                        return_value=self.a_decision(["--internal-ip"])),
@@ -3493,9 +3502,10 @@ class CommandExecutorTest(unittest.TestCase):
             fourth = executor._resolve_kubeconfig(self.CONTEXT)
 
         fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
-        self.assertEqual(3, len(fetches), "two provisional fetches, one settled, then the cache")
-        self.assertEqual("--internal-ip", fetches[2][-1])
+        self.assertEqual(2, len(fetches), "one provisional fetch served inside its window, one settled, then the cache")
+        self.assertEqual("--internal-ip", fetches[1][-1])
         self.assertTrue(first.is_file() and second.is_file() and third.is_file() and fourth.is_file())
+        self.assertFalse(executor._provisional_marker(target).exists())
 
     def test_a_callers_fetch_on_a_provisional_decision_is_refetched_by_the_next_read(self):
         executor = self.fake_gcloud(self.executor())
@@ -3514,6 +3524,7 @@ class CommandExecutorTest(unittest.TestCase):
                 ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
                  "--location=us-central1", "--project=demo-project"],
             )
+        self.age_marker(executor, credential_proxy.parse_gke_context(self.CONTEXT))
         with (
             mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])),
             mock.patch.object(executor, "_execute", record),
@@ -3521,8 +3532,69 @@ class CommandExecutorTest(unittest.TestCase):
             executor._resolve_kubeconfig(self.CONTEXT)
 
         fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
-        self.assertEqual(2, len(fetches), "the caller's provisional file was not reused")
+        self.assertEqual(2, len(fetches), "the caller's provisional file was not reused past its window")
         self.assertEqual("--internal-ip", fetches[1][-1])
+
+    def test_a_fresh_provisional_file_is_served_and_an_old_one_is_a_miss(self):
+        # Bounds the cost of an own-cluster describe that keeps failing: the
+        # provisional file is reused inside its retry window and refetched after.
+        executor = self.fake_gcloud(self.executor())
+        seen = []
+        original = executor._execute
+
+        def record(argv, **kwargs):
+            seen.append(argv)
+            return original(argv, **kwargs)
+
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with (
+            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)),
+            mock.patch.object(executor, "_execute", record),
+        ):
+            executor._resolve_kubeconfig(self.CONTEXT)
+            executor._resolve_kubeconfig(self.CONTEXT)
+            self.assertTrue(executor._provisional_marker(target).exists())
+            self.age_marker(executor, target)
+            executor._resolve_kubeconfig(self.CONTEXT)
+
+        fetches = [argv for argv in seen if "get-credentials" in argv and "--help" not in argv]
+        self.assertEqual(2, len(fetches), "one fetch, one reuse inside the window, one refetch after it")
+
+    def test_a_settled_callers_fetch_clears_an_older_marker(self):
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])):
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project"],
+            )
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_callers_fetch_with_its_own_flag_clears_an_older_marker(self):
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([], provisional=True)) as decide:
+            executor.execute(
+                ["gcloud", "container", "clusters", "get-credentials", "cluster-a",
+                 "--location=us-central1", "--project=demo-project", "--dns-endpoint"],
+            )
+        decide.assert_not_called()
+        self.assertFalse(executor._provisional_marker(target).exists())
+
+    def test_a_fetch_with_no_decision_at_all_is_provisional_too(self):
+        # The target describe failed with nothing cached: gcloud's default is
+        # as unsettled as a fallback made without the own cluster.
+        executor = self.fake_gcloud(self.executor())
+        target = credential_proxy.parse_gke_context(self.CONTEXT)
+        with mock.patch("gke_endpoint.endpoint_decision", return_value=None):
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertTrue(executor._provisional_marker(target).exists())
 
     def test_dns_endpoint_probe_runs_the_resolved_gcloud_not_whatever_is_on_path(self):
         # gke_endpoint builds argv starting with the literal "gcloud". In the
@@ -3538,7 +3610,7 @@ class CommandExecutorTest(unittest.TestCase):
             return None
 
         with mock.patch("gke_endpoint.endpoint_decision", fake_decision):
-            executor._dns_endpoint_args(resolved, target)
+            executor._endpoint_decision(resolved, target)
 
         self.assertEqual(1, len(seen))
         # The stub exits non-zero without KUBECONFIG set, which is all this needs
@@ -3552,7 +3624,7 @@ class CommandExecutorTest(unittest.TestCase):
         target = credential_proxy.parse_gke_context(self.CONTEXT)
 
         with mock.patch.dict(sys.modules, {"gke_endpoint": None}):
-            self.assertEqual([], executor._dns_endpoint_args("gcloud", target))
+            self.assertIsNone(executor._endpoint_decision("gcloud", target))
 
     def test_timeout_kills_command(self):
         result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])

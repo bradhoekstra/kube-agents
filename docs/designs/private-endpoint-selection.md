@@ -69,7 +69,7 @@ a stdio server only the keys named there (a contract test holds the block to
 `OWN_CLUSTER_ENV`).
 `gke_endpoint.own_cluster()` describes that cluster once with
 `--format=value(networkConfig.network,networkConfig.subnetwork,clusterIpv4Cidr)`, derives its
-region from `GKE_LOCATION` (everything before the last segment of a zone, as gcloud does), and
+region from `GKE_LOCATION` (the first two segments, which is the region of every GKE zone), and
 keeps the answer for the life of the process. A value that is still the literal `${...}`
 placeholder Hermes hands an MCP server for an unset variable counts as unset. The install's VPC
 cannot change under a running pod, so this memo has no TTL, unlike the per-target decision,
@@ -80,13 +80,17 @@ for the target describe: the credential proxy is a daemon.
 With any of the three variables unset the answer is "unknown", and rule 3 never fires. That is
 the position of every workstation and test caller, and it is what keeps the predicate copies
 in agreement without changing them. A decision that needed the own cluster and did not get it
-because the describe failed (the identity was there) is returned marked `provisional` and not
-put in the per-target cache, so the next call re-reads rather than serving a fallback for a
+because the describe gave no usable answer (it failed, raised, or returned a short or empty
+row) while the identity was there is returned marked `provisional` and not put in the
+per-target cache, so the next call re-reads rather than serving a fallback for a
 minute. An identity that is absent is a settled answer, cached like any other. The credential
-proxy reads the mark: a managed kubeconfig written from a provisional decision, by the proxy's
-own fetch or by a caller's fetch it spliced into, is kept for the request in flight and treated
-as a miss by the next one (a `.provisional` marker beside the file), so a cold fetch during a
-failed describe does not pin a public-IP kubeconfig until the pod restarts.
+proxy reads the mark: a managed kubeconfig written from a provisional decision, or from no
+decision at all because the target describe failed, by the proxy's own fetch or by a caller's
+fetch it spliced into, is served for one minute and then treated as a miss (a `.provisional`
+marker beside the file, written under the kubeconfig lock and before the file, which a later
+settled fetch, or a caller's fetch carrying its own endpoint flag, clears). A cold fetch during
+a failed describe therefore does not pin a public-IP kubeconfig until the pod restarts, and a
+describe that keeps failing costs one refetch a minute rather than one a request.
 
 A Shared VPC matches naturally: a service-project cluster reports the host project's network
 resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
@@ -105,12 +109,13 @@ cached):
 | `same_network`        | `True`, `False`, or `None` when the agent's own network was not needed or unknown |
 | `authorized_networks` | the listed CIDRs when the list is enabled (possibly empty), or `None`             |
 | `remedy`              | one sentence naming what would make the cluster reachable, or `""`                |
-| `provisional`         | `True` when the own-cluster describe failed and the decision fell back            |
+| `provisional`         | `True` when the own-cluster describe gave no answer and the decision fell back    |
 
 `dns_endpoint_args()` stays as the wrapper returning only `flags` as a list. Its callers,
-`platform_mcp_server.py`, `stall_watch.py` and `credential_proxy.py`, inherit rule 3 without
-a signature change; `cluster_agent_profile.py` calls `endpoint_decision()` itself because it
-writes the decision out. The describe widens to
+`platform_mcp_server.py` and `stall_watch.py`, inherit rule 3 without a signature change;
+`cluster_agent_profile.py` and `credential_proxy.py` call `endpoint_decision()` themselves,
+the first because it writes the decision out and the second because it reads the
+`provisional` mark. The describe widens to
 `json(controlPlaneEndpointsConfig,privateClusterConfig,networkConfig.network,networkConfig.subnetwork,masterAuthorizedNetworksConfig,endpoint)`;
 gcloud's `json()` projection drops any nested key not named, which is why `subnetwork` is
 spelled out.
@@ -222,9 +227,15 @@ yields no flag from all three.
   beside a remedy; the probe runs as the `agent` login; a connection failure logs the
   diagnostic with the remedy, while a 403 or a shim that could not reach the proxy logs it
   without; the scaffold still returns the profile name; a passing probe logs nothing; the
-  connection-failure patterns equal the shell copy's.
+  connection-failure and exclusion patterns equal the shell copy's.
+- `test_gke_endpoint.py` also pins the `provisional` mark on a failed own describe, that an
+  absent identity is cached, and that a private-only cluster in another region names global
+  access.
 - `test_credential_proxy.py`: a caller's unflagged `get-credentials` gets the rule's flags
-  spliced in; one that names an endpoint, or no full target, is run as given.
+  spliced in, with the target read through gcloud's flag shapes and the project defaulted to
+  the broker's own; one that names an endpoint is run as given; a kubeconfig written from a
+  provisional decision, or from none, by either writer, is served inside its window and
+  refetched after it; a settled fetch or a caller's own flag clears the mark.
 - `test_cluster_preflight.py`: check 5's JSON carries the bullets and the remedy on a connection
   failure, the bullets without the remedy on a 403, and today's text when there are no bullets.
 - `test_gke_endpoint_parity.py`: the added case above.
