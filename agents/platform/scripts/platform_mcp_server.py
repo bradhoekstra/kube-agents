@@ -445,11 +445,13 @@ def fleet_scope() -> str:
     count such a project empty). `unread` names each declared project the
     install could not read (denied, unreachable, over-cap); the collectors
     record them as a coverage gap. `collector_args` is the string to append to
-    a collector command verbatim (`--scope-projects ... --scope-unread ...`),
-    empty when nothing is readable, which is a run with no project.
-    `{"declared": false, "note": "..."}` means the install declares no scope
-    (or no snapshot exists yet): the collectors then enumerate every project
-    the identity can list, as before scopes existed. A spec.scope block that
+    a collector command verbatim (`--scope-projects ... --scope-unread ...`);
+    when nothing is readable it carries `--scope-unread` alone, and the
+    collector then reports that and sweeps nothing. Before the reconcile's
+    first tick the answer comes from the operator's render: the management
+    project alone, with a `note` saying so. `{"declared": false, "note":
+    "..."}` means the install declares no scope: the collectors then enumerate
+    every project the identity can list, as before scopes existed. A spec.scope block that
     is present with empty lists is a declared scope of the management project
     alone, not the absence of one. The collectors cannot read the snapshot
     themselves: they run in the shell sandbox, whose data volume is not this
@@ -468,6 +470,7 @@ def fleet_scope() -> str:
         "projects": list(targets.projects),
         "unread": [{"project": project, "outcome": outcome} for project, outcome in targets.unread],
         "collector_args": targets.collector_args(),
+        **({"note": targets.note} if targets.note else {}),
         "source": targets.path,
     }, indent=2)
 

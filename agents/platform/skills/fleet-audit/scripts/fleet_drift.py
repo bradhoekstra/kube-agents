@@ -107,8 +107,11 @@ SHARED_SCRIPT_DIRS = (
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
 # the install could not read, recorded as a coverage gap. Without them the
-# collector enumerates every project the identity can list, the behaviour of
-# an install that declares no scope.
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
 for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
@@ -307,6 +310,9 @@ def discover_fleet(base_project: str | None, *, run: RunFn) -> Discovery:
     A project holding no clusters contributes no manifest entry either way, so
     nothing was bought with that round trip."""
     if base_project:
+        override_error = declared_scope.override_error(base_project)
+        if override_error:
+            return Discovery([], override_error, None)
         return Discovery([base_project], None, SCOPED_RUN_NOTE.format(project=base_project))
 
     if declared_scope.declared:
@@ -2135,7 +2141,7 @@ def candidate_summary(manifest: dict) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)

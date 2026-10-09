@@ -1081,6 +1081,31 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {**self.ENV, networking_audit.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
             self.assertEqual(networking_audit.get_target_projects(None, []), ["ops-mgmt"])
 
+    def test_a_project_id_outside_the_declared_scope_is_refused(self):
+        errors: list[str] = []
+        networking_audit.declared_scope.set("ops-mgmt,payments-prod", None)
+        with mock.patch.dict(os.environ, self.ENV), mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
+            self.assertEqual(networking_audit.get_target_projects("payments-prod", errors), ["payments-prod"])
+            self.assertEqual(networking_audit.get_target_projects("acme-only", errors), [])
+        self.assertTrue(any("declared scope does not list" in e for e in errors))
+
+    def test_a_flagless_run_on_a_scoped_sandbox_exits_non_zero_with_a_top_level_error(self):
+        # As the other seven collectors: a declared scope with nothing to sweep
+        # is a failed run, not an exit-0 document with two skipped rows.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "networking.json")
+            with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}), \
+                    mock.patch.object(sys, "argv", [networking_audit.__file__, "--output", out]), \
+                    mock.patch.object(networking_audit, "run_cmd", side_effect=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))), \
+                    self.assertRaises(SystemExit) as caught:
+                networking_audit.main()
+            self.assertEqual(caught.exception.code, 1)
+            with open(out, encoding="utf-8") as f:
+                document = json.load(f)
+            self.assertIn("fleet_scope", document["error"])
+            self.assertEqual(document["scope"]["clusters"], [])
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the
         # holder the resolver reads, before anything else runs.

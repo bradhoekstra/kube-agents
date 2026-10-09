@@ -52,9 +52,13 @@ DECLARED_SCOPE_EMPTY_ERROR = (
 SCOPE_DECLARED_ENV = "KUBEAGENTS_SCOPE_DECLARED"
 SCOPE_DECLARED_TRUE = "true"
 DECLARED_SCOPE_ARGS_MISSING_ERROR = (
-    "this install declares a scope (spec.scope on the PlatformAgent) but the collector was run without the "
-    "platform_control fleet_scope tool's collector_args, so it cannot know which projects are inside it; nothing "
-    "was swept and nothing was listed. Call fleet_scope and pass its collector_args verbatim"
+    "this install declares a scope but the collector got no collector_args: call the platform_control "
+    "fleet_scope tool and pass its collector_args verbatim; nothing was swept or listed"
+)
+# A `--project` on an install with a declared scope must name a project inside it.
+DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR = (
+    "--project names {project}, which the install's declared scope does not list ({projects}); nothing was swept. "
+    "Pass the fleet_scope tool's collector_args, or a --project it lists"
 )
 # The tail the project-level audits put on an unenumerated-projects row when the
 # scope was declared: the fleet's size is known there, which is the point.
@@ -121,6 +125,25 @@ class DeclaredScope:
         self.declared = flagged or self.args_missing
         self.projects = parse_scope_projects(scope_projects) if self.declared else None
         self.unread = parse_scope_unread(scope_unread)
+
+    def override_error(self, project: str) -> str | None:
+        """Why a `--project` override cannot run, or None when it can: on an
+        install with a declared scope the override must be handed the scope
+        too (else the collector cannot tell inside from outside) and must name
+        a project inside it. Without a declared scope an override is free."""
+        if not self.declared:
+            return None
+        if self.args_missing:
+            return DECLARED_SCOPE_ARGS_MISSING_ERROR
+        if project not in (self.projects or []):
+            return DECLARED_SCOPE_OVERRIDE_OUTSIDE_ERROR.format(project=project, projects=", ".join(self.projects or []) or "none readable")
+        return None
+
+    def sweep_is_declared(self, override: object = None) -> bool:
+        """Whether a run's sweep is the declared scope as the tool handed it:
+        declared, with the flags, and not narrowed by an override. The
+        project-level audits key their unenumerated row's tail on it."""
+        return self.declared and not self.args_missing and not override
 
     def empty_error(self) -> str:
         """The error a declared scope with nothing to sweep reports: the flags

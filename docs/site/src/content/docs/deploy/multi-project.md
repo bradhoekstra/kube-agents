@@ -255,7 +255,7 @@ On an install made with `install.sh`:
    `./upgrade.sh --upgrade-mode=full`. The apply revokes the read roles the
    installer bound there, the reconciler retires the project's Cluster
    Agent profiles over two clean runs, and the scheduled audits drop the
-   project on their next run; an excluded cluster loses its profile on the
+   project on their next run after the reconciler's next hourly run has rewritten the scope snapshot; an excluded cluster loses its profile on the
    next run.
 2. Revoke any binding you made by hand. A folder-level grant cannot be revoked
    for one project alone; move the project out of the folder or grant per

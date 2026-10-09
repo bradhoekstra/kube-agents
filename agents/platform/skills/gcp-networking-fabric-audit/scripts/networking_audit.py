@@ -54,8 +54,11 @@ SHARED_SCRIPT_DIRS = (
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
 # the install could not read, recorded as a coverage gap. Without them the
-# collector enumerates every project the identity can list, the behaviour of
-# an install that declares no scope.
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
 for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
@@ -274,6 +277,11 @@ def get_target_projects(cli_project: str | None = None, listing_errors: list[str
     is always part of the scope, alongside any `GCP_PROJECT_ID`-style variable.
     """
     if cli_project and cli_project.strip():
+        override_error = declared_scope.override_error(cli_project.strip())
+        if override_error:
+            if listing_errors is not None:
+                listing_errors.append(override_error)
+            return []
         raw = cli_project.strip()
         project = _normalise_project_id(raw) or raw
         if listing_errors is not None:
@@ -934,7 +942,7 @@ def main():
 
     # Under a declared scope the fleet's size is known exactly; the row says so
     # rather than calling it unknown.
-    unenumerated_tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.declared else UNENUMERATED_TAIL
+    unenumerated_tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.sweep_is_declared(args.project_id) else UNENUMERATED_TAIL
     for error in listing_errors:
         sys.stderr.write(f"{error}; auditing {target_projects or 'no project'}\n")
         skipped_targets.append({
@@ -944,6 +952,21 @@ def main():
             "project": UNENUMERATED_PROJECTS,
             "reason": f"{error}. {unenumerated_tail}",
         })
+
+    if not target_projects and declared_scope.declared:
+        # The declared-scope states with nothing to sweep (no readable project,
+        # the flags missing on a scoped sandbox, a --project-id outside the
+        # scope) are a run that read nothing, reported as the other collectors
+        # report it: a top-level error and a non-zero exit, so the SOP's
+        # "exits non-zero or writes no file" rule applies and no document with
+        # two skipped rows gets copied in as a check that ran.
+        reason = listing_errors[0] if listing_errors else declared_scope.empty_error()
+        sys.stderr.write(f"{reason}\n")
+        if args.output:
+            os.makedirs(os.path.dirname(os.path.abspath(args.output)) or ".", exist_ok=True)
+            with open(args.output, "w", encoding="utf-8") as f:
+                json.dump({"error": reason, "audit": AUDIT_SLUG, "scope": {"clusters": [], "skipped": skipped_targets}, "findings": []}, f, indent=JSON_INDENT)
+        sys.exit(1)
 
     if not target_projects:
         sys.stderr.write("No target projects resolved from CLI, environment, or gcloud.\n")

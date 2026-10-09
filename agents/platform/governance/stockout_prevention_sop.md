@@ -34,11 +34,17 @@ The helper owns every git and forge operation and renders the ledger issue body 
 
 ### 1. Enumerate the target fleet
 
+Call the platform_control `fleet_scope` tool first. When it reports `declared: true`, the fleet is its `projects` and nothing else: pass its `collector_args` to the collector verbatim, and run any manual per-project command over that list alone, never over `gcloud projects list` (when no declared project is readable they carry `--scope-unread` alone; pass them anyway, and the collector reports that nothing was readable and exits with a top-level `error`). When it reports `declared: false`, the install declares no scope and the collector enumerates every project the identity can list:
+
 ```bash
-# With a declared scope (fleet_scope reports declared: true): the tool's `projects`, passed to the collector as its collector_args. Otherwise:
-gcloud config get-value project
-gcloud projects list --format="value(projectId)"                    # only on an install that declares no scope
-gcloud container clusters list --project=<project> --format=json   # for every project in scope
+# DECLARED and PROJECTS come from the fleet_scope tool's answer. The listing
+# runs only when it reported declared: false.
+if [ "$DECLARED" != "true" ]; then
+  PROJECTS=$(printf '%s\n' "$(gcloud config get-value project)" $(gcloud projects list --format="value(projectId)") | sort -u)
+fi
+for PROJECT in $PROJECTS; do
+  gcloud container clusters list --project="$PROJECT" --format=json
+done
 ```
 
 A project whose own Kubernetes Engine API is disabled holds no cluster; its `clusters list` failure is that answer, not an unreadable project. That holds only when the refusal names this project: one naming another project, such as the credential's quota project, says nothing about this one's clusters, and the collector records it as a failed list.

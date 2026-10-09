@@ -2306,6 +2306,26 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {**self.ENV, cf.MONITORED_PROJECTS_ENV: "acme-only"}):
             self.assertEqual(cf.get_target_projects(None, [], run=lambda *a, **k: run_of(1)), ["ops-mgmt"])
 
+    def test_a_project_id_outside_the_declared_scope_is_refused(self):
+        notes: list[str] = []
+        cf.declared_scope.set("ops-mgmt,payments-prod", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(cf.get_target_projects("payments-prod", notes, run=lambda *a, **k: run_of(1)), ["payments-prod"])
+            self.assertEqual(cf.get_target_projects("acme-only", notes, run=lambda *a, **k: run_of(1)), [])
+        self.assertTrue(any("declared scope does not list" in n for n in notes))
+
+    def test_a_flagless_run_on_a_scoped_sandbox_names_the_tool_as_the_top_level_error(self):
+        # The manifest's top-level error is what the SOP tells the worker to
+        # report; under a declared scope it must be the real reason, not the
+        # generic "no project resolved" row that prescribes the listing.
+        with mock.patch.dict(os.environ, {**self.ENV, "KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            cf.declared_scope.set(None, None)
+            manifest = cf.collect_fleet(None, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed")))
+        self.assertIn("fleet_scope", manifest["error"])
+        self.assertNotIn("MONITORED_PROJECT_IDS", manifest["error"])
+        self.assertEqual([e["name"] for e in manifest["clusters"]], [cf.UNENUMERATED_PROJECTS_TARGET])
+        self.assertIn(cf.UNENUMERATED_TAIL, manifest["clusters"][0]["error"], "a run that was not the declared sweep does not claim the fleet is fully accounted for")
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the
         # holder the resolver reads, before anything else runs.
@@ -2323,7 +2343,7 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
             self.assertEqual(cf.get_target_projects(None, notes, run=lambda *a, **k: (_ for _ in ()).throw(AssertionError("nothing should be listed"))), [])
         self.assertEqual(len(notes), 1)
         self.assertIn("no project this install could read", notes[0])
-        self.assertIn(cf.fleet_scope_args.DECLARED_SCOPE_TAIL, cf.unenumerated_entry(notes)["error"])
+        self.assertIn(cf.fleet_scope_args.DECLARED_SCOPE_TAIL, cf.unenumerated_entry(notes, True)["error"])
 
     def test_the_flags_are_parsed_from_the_command_line(self):
         proc = subprocess.run([sys.executable, cf.__file__, "--help"], capture_output=True, text=True, timeout=120)

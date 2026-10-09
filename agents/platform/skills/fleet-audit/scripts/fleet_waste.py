@@ -20,10 +20,11 @@ so its manifest mixes cluster-named entries with `project/<id>` entries the
 same way `networking_audit.py` does (§3's "project-scoped GCP objects" rule).
 
 §1 scopes this to the install's declared scope when the agent passes one
-(`--scope-projects`, from the platform_control fleet_scope tool) and otherwise
-to every project the agent can see, so a bare invocation
-reads the active project plus every listed project, whether or not it holds a
-cluster -- a project whose last cluster was deleted is where its disks and
+(`--scope-projects`, from the platform_control fleet_scope tool); on a sandbox
+whose operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED) a bare
+invocation refuses rather than lists; and otherwise, on a checkout or an
+install with no scope, a bare invocation reads the active project plus every
+listed project, whether or not it holds a cluster -- a project whose last cluster was deleted is where its disks and
 addresses are left behind -- rather than auditing only the active gcloud
 project; `--project` overrides discovery for a scoped run. Each project's
 cluster listing runs in a pool before the clusters are read, and its disk,
@@ -132,8 +133,11 @@ NO_PROJECT_IN_SCOPE_ERROR = (
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
 # the install could not read, recorded as a coverage gap. Without them the
-# collector enumerates every project the identity can list, the behaviour of
-# an install that declares no scope.
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
 SHARED_SCRIPT_DIRS = (
     "/opt/defaults/scripts",
     "/opt/data/scripts",
@@ -1065,6 +1069,9 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     Raises `NoProjectInScope` when there is no active project and the listing
     failed or named none: that credential sees nothing, which is not a fleet."""
     if cli_project:
+        override_error = declared_scope.override_error(cli_project)
+        if override_error:
+            raise NoProjectInScope(override_error)
         return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
 
     if declared_scope.declared:
@@ -6516,7 +6523,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, sessi
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="single project to audit; omit to run §1's project discovery")
+    parser.add_argument("--project", help="single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else run §1's project discovery")
     fleet_scope_args.add_scope_arguments(parser)
     parser.add_argument(
         "--workspace",

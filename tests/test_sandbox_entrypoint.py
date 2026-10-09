@@ -645,6 +645,9 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             "GKE_PROJECT_ID",
             "GKE_CLUSTER_NAME",
             "GKE_LOCATION",
+            # The collectors' scope guard reads it in the session; set on the
+            # container alone it never reaches them (#2840's strict pass).
+            "KUBEAGENTS_SCOPE_DECLARED",
         }
         self.assertTrue(
             required.issubset(names),

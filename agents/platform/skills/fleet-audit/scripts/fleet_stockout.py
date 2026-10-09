@@ -242,8 +242,11 @@ SHARED_SCRIPT_DIRS = (
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
 # the install could not read, recorded as a coverage gap. Without them the
-# collector enumerates every project the identity can list, the behaviour of
-# an install that declares no scope.
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
 for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
@@ -630,6 +633,9 @@ def get_target_projects(cli_project: str | None, *, run: RunFn) -> tuple[list[st
     short of the fleet and becomes an `UNENUMERATED_PROJECTS_TARGET` entry.
     Raises `NoProjectInScope` when the credential sees no project."""
     if cli_project:
+        override_error = declared_scope.override_error(cli_project)
+        if override_error:
+            raise NoProjectInScope(override_error)
         return [cli_project], SCOPED_RUN_NOTE.format(project=cli_project)
 
     if declared_scope.declared:
@@ -2659,7 +2665,7 @@ def collect_fleet(project: str | None = None, *, run: RunFn = default_run, max_w
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--project", help="audit only this project; omit to sweep --scope-projects when given, else every project the credential can see")
+    parser.add_argument("--project", help="audit only this project (on an install with a declared scope, one the fleet_scope tool lists, passed with its collector_args); omit to sweep --scope-projects when given, else every project the credential can see")
     fleet_scope_args.add_scope_arguments(parser)
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread)

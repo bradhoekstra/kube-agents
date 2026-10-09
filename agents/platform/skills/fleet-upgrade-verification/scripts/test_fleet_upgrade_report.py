@@ -919,6 +919,14 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {**self.ENV, report.MONITORED_PROJECTS_ENV: "acme-only"}), mock.patch.object(report, "run_cmd", side_effect=lambda *a, **k: (1, "", "")):
             self.assertEqual(report.get_target_projects(None, []), ["ops-mgmt"])
 
+    def test_a_project_outside_the_declared_scope_is_refused(self):
+        errors: list[str] = []
+        report.declared_scope.set("ops-mgmt,payments-prod", None)
+        with mock.patch.dict(os.environ, self.ENV):
+            self.assertEqual(report.get_target_projects(["payments-prod"], errors), ["payments-prod"])
+            self.assertEqual(report.get_target_projects(["acme-only"], errors), [])
+        self.assertTrue(any("declared scope does not list" in e for e in errors))
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the two flags main parses reach the
         # holder the resolver reads, before anything else runs.

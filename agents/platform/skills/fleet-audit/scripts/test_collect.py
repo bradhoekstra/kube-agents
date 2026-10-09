@@ -12437,8 +12437,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         collect.declared_scope.set(None, None)
         self.assertEqual(collect.discover_fleet(None, run=run).projects, ["acme", "other"])
 
-    def test_a_project_override_still_wins(self):
-        collect.declared_scope.set("ops-mgmt", None)
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        # With a declared scope the override is still a single-project run, but
+        # it cannot name a project the scope does not list, and it cannot run
+        # at all on a scoped sandbox without the tool's flags.
+        collect.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(collect.discover_fleet("payments-prod", run=lambda *a, **k: run_of(1)).projects, ["payments-prod"])
+        outside = collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertEqual(outside.projects, [])
+        self.assertIn("declared scope does not list", outside.error)
+        with mock.patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            collect.declared_scope.set(None, None)
+            self.assertIn("got no collector_args", collect.discover_fleet("ops-mgmt", run=lambda *a, **k: run_of(1)).error)
+        collect.declared_scope.set(None, None)
         self.assertEqual(collect.discover_fleet("acme-only", run=lambda *a, **k: run_of(1)).projects, ["acme-only"])
 
     def test_main_hands_the_flags_to_the_resolver(self):

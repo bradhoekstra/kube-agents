@@ -39,7 +39,37 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         (self.home / fst.SNAPSHOT_FILE).write_text(json.dumps(snapshot), encoding="utf-8")
 
     def test_no_snapshot_is_none_so_the_caller_lists_as_before(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(fst.SCOPE_FILE_ENV, None)
+            self.assertIsNone(fst.declared_scope_targets(self.home))
+
+    def test_no_snapshot_but_a_render_with_a_block_is_the_host_alone_until_the_first_tick(self):
+        # A fresh install has the operator's render from the first second and
+        # no snapshot until the reconcile's first tick; the audits must not
+        # list every visible project in that window.
+        render = self.home / "scope.json"
+        render.write_text(json.dumps({"present": True, "projects": ["payments-prod"], "exclude": {"projects": [], "clusters": []}}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            targets = fst.declared_scope_targets(self.home)
+            self.assertEqual((targets.projects, targets.unread, targets.resolved_at), (("ops-mgmt",), (), None))
+            self.assertEqual(targets.collector_args(), "--scope-projects ops-mgmt")
+            self.assertIn("until the next reconcile", targets.note)
+        render.write_text(json.dumps({"present": False}), encoding="utf-8")
+        with mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(render), "GCP_PROJECT_ID": "ops-mgmt"}):
+            self.assertIsNone(fst.declared_scope_targets(self.home))
+
+    def test_the_boundary_key_decides_when_the_reconcile_wrote_it(self):
+        # A never-declared install on an unreadable tick: present false, readable
+        # false, empty lists, boundary false. Nothing is carried; no scope.
+        empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
+        snap = _snapshot([{"id": "ops-mgmt", "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=False)
+        snap["boundary"] = False
+        self._write(snap)
         self.assertIsNone(fst.declared_scope_targets(self.home))
+        # The stock install on the same tick: the reconcile carried its boundary.
+        snap["boundary"] = True
+        self._write(snap)
+        self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
     def test_a_file_that_is_not_a_snapshot_is_none(self):
         (self.home / fst.SNAPSHOT_FILE).write_text("<not json>", encoding="utf-8")
@@ -54,8 +84,10 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": ["*-sandbox"]}}
         self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty, present=False))
         self.assertIsNone(fst.declared_scope_targets(self.home))
-        self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty))
-        self.assertIsNone(fst.declared_scope_targets(self.home))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(fst.SCOPE_FILE_ENV, None)
+            self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty))
+            self.assertIsNone(fst.declared_scope_targets(self.home))
 
     def test_a_present_block_with_empty_lists_is_the_host_only_boundary(self):
         # spec.scope: {projects: [], exclude: {projects: ["*-sandbox"]}} bounds
@@ -108,10 +140,9 @@ class DeclaredScopeTargetsTest(unittest.TestCase):
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))
 
     def test_a_carried_host_only_boundary_under_an_unreadable_render_stays_host_only(self):
-        # The stock install: a present block with empty lists. On a tick whose
-        # render cannot be read the reconcile carries those empty lists with
-        # present: false; that is still the host-only boundary, not an install
-        # that never declared one.
+        # A snapshot from before the boundary key, on the stock install's
+        # unreadable tick: present false, readable false, empty lists. Read as
+        # a carried boundary; the reconcile now writes `boundary` to settle it.
         empty = {key: [] for key in fst.DECLARED_SCOPE_KEYS} | {"exclude": {"projects": []}}
         self._write(_snapshot([{"id": "ops-mgmt", "via": ["management"], "outcome": "ok", "state": "in-scope"}], declared=empty, present=False, readable=False))
         self.assertEqual(fst.declared_scope_targets(self.home).projects, ("ops-mgmt",))

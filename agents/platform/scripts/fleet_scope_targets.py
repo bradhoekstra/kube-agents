@@ -82,6 +82,22 @@ PRESENT_KEY = "present"
 # still that boundary, host-only or not. A snapshot without this key is read by
 # its lists.
 READABLE_KEY = "readable"
+# The reconcile's own answer to the question this module asks (cluster_agent_reconcile.py,
+# SCOPE_BOUNDARY_KEY): a declaration is in force this run, read or carried from a run
+# that read one. Keyed on first; the two keys above and the lists are for a snapshot
+# written before it.
+BOUNDARY_KEY = "boundary"
+# The operator's render of spec.scope, the file the reconcile reads (the same
+# KUBEAGENTS_SCOPE_FILE the agent pod's env names). Read here only when there is
+# no usable snapshot: a fresh install before its first reconcile tick, or one
+# whose last snapshot predates every flag above and declared nothing. It says
+# whether a block is present; the resolved set is the reconcile's to write.
+SCOPE_FILE_ENV = "KUBEAGENTS_SCOPE_FILE"
+RENDER_PRESENT_KEY = "present"
+# Where the management project's id is read when the render alone answers: the
+# sweep is then that project, until the next tick writes the resolved set.
+MANAGEMENT_PROJECT_ENVS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID")
+RENDER_NOTE = "no reconcile snapshot yet; the render declares a scope, so the sweep is the management project alone until the next reconcile writes the resolved set"
 # The keys under `declared` whose presence means the install drew a boundary,
 # for a snapshot without the present flag.
 DECLARED_SCOPE_KEYS = ("projects", "folders", "organizations", "sharedVpcHosts", "metricsScopes")
@@ -101,6 +117,8 @@ class ScopeTargets:
     unread: tuple[tuple[str, str], ...]
     resolved_at: str | None
     path: str
+    # Set when the render answered instead of a snapshot.
+    note: str | None = None
 
     def collector_args(self) -> str:
         """The arguments that hand this scope to a collector: `--scope-projects`
@@ -124,6 +142,31 @@ def snapshot_path(agent_home: str | os.PathLike | None = None) -> Path:
     return Path(root) / SNAPSHOT_FILE
 
 
+def _render_declares_scope() -> bool | None:
+    """Whether the operator's render carries a spec.scope block: True, False, or
+    None when there is no readable render (a checkout, an image ahead of its
+    operator)."""
+    render = os.environ.get(SCOPE_FILE_ENV)
+    if not render:
+        return None
+    try:
+        parsed = json.loads(Path(render).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return parsed.get(RENDER_PRESENT_KEY) is True if isinstance(parsed, dict) else None
+
+
+def _from_render(path: Path) -> ScopeTargets | None:
+    """The answer when no usable snapshot exists: the render's boundary, host
+    only, until the reconcile writes the resolved set; None when the render
+    declares nothing or cannot be read."""
+    if _render_declares_scope() is not True:
+        return None
+    host = next((os.environ.get(name) for name in MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), None)
+    render = os.environ.get(SCOPE_FILE_ENV) or str(path)
+    return ScopeTargets(projects=(host,) if host else (), unread=(), resolved_at=None, path=render, note=RENDER_NOTE)
+
+
 def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> ScopeTargets | None:
     """The declared scope's resolved projects, or None when the install declared
     no scope, no snapshot exists, or the file is not a snapshot -- the cases in
@@ -132,26 +175,29 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return None
+        return _from_render(path)
     if not isinstance(parsed, dict) or not isinstance(parsed.get("projects"), list):
-        return None
+        return _from_render(path)
     declared = parsed.get("declared")
     if not isinstance(declared, dict):
+        return _from_render(path)
+    # The reconcile's own answer first: `boundary` is true when the block was
+    # read this run or carried from a run that read one, and false for a
+    # readable render with no block and for an install that never declared one.
+    boundary = parsed.get(BOUNDARY_KEY)
+    if boundary is False:
         return None
-    # A declaration is in force when the block was present this run, or when the
-    # reconcile could not read the render and carried the last declaration
-    # forward (present: false, readable: false): the boundary stands, host-only
-    # or not. A readable render with no block is an operator who removed the
-    # scope: no boundary, whatever lists the reconcile still carries. A snapshot
-    # that predates the two keys is read by its lists.
-    present = parsed.get(PRESENT_KEY)
-    readable = parsed.get(READABLE_KEY)
-    if present is not True:
-        if isinstance(readable, bool):
-            if readable:
-                return None
-        elif not any(isinstance(declared.get(key), list) and declared.get(key) for key in DECLARED_SCOPE_KEYS):
-            return None
+    if boundary is not True:
+        # A snapshot from before `boundary`: present, then readable, then the
+        # lists; empty lists with none of the flags ask the render.
+        present = parsed.get(PRESENT_KEY)
+        readable = parsed.get(READABLE_KEY)
+        if present is not True:
+            if isinstance(readable, bool):
+                if readable:
+                    return None
+            elif not any(isinstance(declared.get(key), list) and declared.get(key) for key in DECLARED_SCOPE_KEYS):
+                return _from_render(path)
     projects: list[str] = []
     unread: list[tuple[str, str]] = []
     for row in parsed["projects"]:

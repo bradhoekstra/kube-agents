@@ -65,7 +65,7 @@ class FleetScopeArgsTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "true"}):
             scope.set(None, None)
             self.assertEqual((scope.declared, scope.args_missing, scope.projects), (True, True, []))
-            self.assertIn("without the platform_control fleet_scope tool's collector_args", scope.empty_error())
+            self.assertIn("got no collector_args", scope.empty_error())
             scope.set("ops-mgmt", None)
             self.assertEqual((scope.declared, scope.args_missing, scope.projects), (True, False, ["ops-mgmt"]))
         with mock.patch.dict(os.environ, {fsa.SCOPE_DECLARED_ENV: "false"}):

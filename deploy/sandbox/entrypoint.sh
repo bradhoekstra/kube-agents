@@ -56,7 +56,10 @@ PREPARE_IMAGE_TREES_ARG="--prepare-image-trees"
 # home root above, so a home that gains a database gains a tripwire with it.
 AGENT_POD_DATABASES="${AGENT_POD_DATABASES:-kanban.db state.db}"
 AGENT_POD_DATABASE_NOTE="NOT-THE-AGENT-POD-DATABASE.txt"
-SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION"
+# KUBEAGENTS_SCOPE_DECLARED: the operator's one bit about the scope, read by the
+# fleet-audit collectors (fleet_scope_args.py); set on the container, it reaches a
+# collector only through this list, as the GKE_* variables do.
+SANDBOX_FORWARDED_ENV_NAMES="CREDENTIAL_PROXY_URL CREDENTIAL_PROXY_TOKEN_FILE KUBE_CONTEXT_NAME GKE_PROJECT_ID GKE_CLUSTER_NAME GKE_LOCATION KUBEAGENTS_SCOPE_DECLARED"
 
 # Nearly every name under $DATA is owned by uid 1000 -- the image trees step 1a
 # stages are root's, everything else is the model's -- and all of it survives a

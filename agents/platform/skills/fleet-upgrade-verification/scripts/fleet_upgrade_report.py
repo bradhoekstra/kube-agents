@@ -75,8 +75,11 @@ SHARED_SCRIPT_DIRS = (
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
 # the install could not read, recorded as a coverage gap. Without them the
-# collector enumerates every project the identity can list, the behaviour of
-# an install that declares no scope.
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
 for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
@@ -359,6 +362,11 @@ def get_target_projects(cli_projects: list[str] | None = None, listing_errors: l
     configured project: it is filtered, not complete, as fleet_drift.py treats it.
     """
     if cli_projects:
+        override_errors = [declared_scope.override_error(p.strip()) for p in cli_projects if p.strip()]
+        if any(override_errors):
+            if listing_errors is not None:
+                listing_errors.extend(e for e in override_errors if e)
+            return []
         return sorted({_normalise_project_id(p.strip()) or p.strip() for p in cli_projects if p.strip()})
     if declared_scope.declared:
         # The declared scope the agent carried from the fleet_scope tool: the

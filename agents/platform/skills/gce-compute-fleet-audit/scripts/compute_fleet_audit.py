@@ -191,8 +191,11 @@ SHARED_SCRIPT_DIRS = (
 # live in fleet_scope_args, shared with every collector. `--scope-projects` is
 # the sweep, complete coverage; `--scope-unread` names each declared project
 # the install could not read, recorded as a coverage gap. Without them the
-# collector enumerates every project the identity can list, the behaviour of
-# an install that declares no scope.
+# collector enumerates every project the identity can list, which is right on
+# a checkout and on an install that declares no scope; on a sandbox whose
+# operator says a scope is declared (KUBEAGENTS_SCOPE_DECLARED, forwarded into
+# the session) a run without them refuses instead, and so does a --project
+# the scope does not list.
 for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
@@ -664,6 +667,11 @@ def get_target_projects(
     is always part of the scope, alongside any `GCP_PROJECT_ID`-style variable.
     """
     if cli_project and cli_project.strip():
+        override_error = declared_scope.override_error(cli_project.strip())
+        if override_error:
+            if notes is not None:
+                notes.append(override_error)
+            return []
         raw = cli_project.strip()
         project = _normalise_project_id(raw, run=run) or raw
         if notes is not None:
@@ -1475,7 +1483,7 @@ def unresolved_entry() -> dict:
     }
 
 
-def unenumerated_entry(notes: list[str]) -> dict:
+def unenumerated_entry(notes: list[str], declared_sweep: bool = False) -> dict:
     """The target standing for every project this run did not enumerate.
 
     A narrowed or failed discovery leaves the rest of the fleet unnamed, and a
@@ -1486,7 +1494,7 @@ def unenumerated_entry(notes: list[str]) -> dict:
     """
     # Under a declared scope the fleet's size is known exactly, so the tail says
     # so rather than calling it unknown.
-    tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_scope.declared else UNENUMERATED_TAIL
+    tail = fleet_scope_args.DECLARED_SCOPE_TAIL if declared_sweep else UNENUMERATED_TAIL
     return {
         "name": UNENUMERATED_PROJECTS_TARGET,
         "project": "",
@@ -1523,14 +1531,17 @@ def collect_fleet(
                 except Exception as exc:  # noqa: BLE001 — see crashed_entry
                     entries[index] = crashed_entry(projects[index], exc)
     else:
-        entries = [unresolved_entry()]
+        # Under a declared scope the reason is in `notes` (nothing readable, the
+        # flags missing, an override outside the scope); the generic row would
+        # name remedies the scope forbids and the top-level error would take it.
+        entries = [] if declared_scope.declared else [unresolved_entry()]
     # `collect_project` returns None only for a project whose own Compute API
     # is off. It contributes no target, but the reason is kept: when nothing
     # else was read, it is the cause the top-level `error` has to name.
     api_off = [project for project, entry in zip(projects, entries) if entry is None]
     entries = [entry for entry in entries if entry is not None]
     if notes:
-        entries.append(unenumerated_entry(notes))
+        entries.append(unenumerated_entry(notes, declared_scope.sweep_is_declared(project)))
 
     manifest = {
         "version": MANIFEST_VERSION,
@@ -1563,7 +1574,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--project-id",
         help=(
-            "single project to audit; omit to sweep MONITORED_PROJECT_IDS, or else the "
+            "single project to audit (on an install with a declared scope, one the fleet_scope tool lists, passed with "
+            "its collector_args); omit to sweep --scope-projects when given, else MONITORED_PROJECT_IDS, or else the "
             "configured project plus every project `gcloud projects list` returns"
         ),
     )

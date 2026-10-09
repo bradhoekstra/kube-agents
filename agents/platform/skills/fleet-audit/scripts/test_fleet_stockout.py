@@ -3504,8 +3504,18 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         fs.declared_scope.set(None, None)
         self.assertEqual(fs.get_target_projects(None, run=run), (["acme", "other"], None))
 
-    def test_a_project_override_still_wins(self):
-        fs.declared_scope.set("ops-mgmt", None)
+    def test_a_project_override_inside_the_declared_scope_wins_and_one_outside_is_refused(self):
+        fs.declared_scope.set("ops-mgmt,payments-prod", None)
+        self.assertEqual(fs.get_target_projects("payments-prod", run=lambda *a, **k: run_of(1))[0], ["payments-prod"])
+        with self.assertRaises(fs.NoProjectInScope) as caught:
+            fs.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))
+        self.assertIn("declared scope does not list", str(caught.exception))
+        with patch.dict(os.environ, {"KUBEAGENTS_SCOPE_DECLARED": "true"}):
+            fs.declared_scope.set(None, None)
+            with self.assertRaises(fs.NoProjectInScope) as caught:
+                fs.get_target_projects("ops-mgmt", run=lambda *a, **k: run_of(1))
+            self.assertIn("got no collector_args", str(caught.exception))
+        fs.declared_scope.set(None, None)
         self.assertEqual(fs.get_target_projects("acme-only", run=lambda *a, **k: run_of(1))[0], ["acme-only"])
 
     def test_main_hands_the_flags_to_the_resolver(self):

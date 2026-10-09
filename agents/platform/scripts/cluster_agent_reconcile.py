@@ -96,6 +96,11 @@ SCOPE_PRESENT_KEY = "present"
 # (fleet_scope_targets.py) tells a removed block (readable, not present: no
 # boundary) from a carried one (not readable: the last boundary stands) by it.
 SCOPE_READABLE_KEY = "readable"
+# Whether a declaration is in force this run: the block was read, or the render
+# could not be read and the last run that could had one. An install that never
+# declared a scope carries nothing on an unreadable tick, and a readable render
+# with no block clears it. The audits' reader keys on this one bit.
+SCOPE_BOUNDARY_KEY = "boundary"
 # The resolved membership, rewritten by every run but --dry-run beside the profiles (design §5). The
 # previous run's copy is an input: a project in the resolved set last time and absent now
 # is marked `retiring`, and only a project the previous copy marked `retiring` is pruned,
@@ -1419,6 +1424,8 @@ def reconcile(dry_run: bool = False) -> dict:
     # such tick reads the same exclusions, and a project it named stays carried in scope
     # rather than retiring: removing the whole block retires nothing.
     declared = scope
+    previous_boundary = bool(previous.get(SCOPE_BOUNDARY_KEY, previous.get(SCOPE_PRESENT_KEY))) if isinstance(previous, dict) else False
+    scope_boundary = scope_present or (not scope_readable and previous_boundary)
     if not scope_present:
         last = _previous_declaration(previous)
         if last:
@@ -1972,6 +1979,7 @@ def reconcile(dry_run: bool = False) -> dict:
             # an absent one by `declared` alone. The audits' fleet_scope tool keys on it.
             SCOPE_PRESENT_KEY: scope_present,
             SCOPE_READABLE_KEY: scope_readable,
+            SCOPE_BOUNDARY_KEY: scope_boundary,
             SCOPE_MAX_PROJECTS_KEY: cap,
             "resolver": RESOLVER_ASSET_INVENTORY if _container_ids(scope) else RESOLVER_EXPLICIT,
             "containers": sorted(containers, key=lambda c: c["id"]),
