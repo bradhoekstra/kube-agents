@@ -958,19 +958,25 @@ func TestUsagePoller_ClusterGaugesFollowTheWatchersReading(t *testing.T) {
 		t.Fatalf("an unchanged reading wrote the status: %d patches", h.patches)
 	}
 
-	// The listener cannot be read: the fields keep their last reading.
+	// The listener cannot be read once: the fields keep their last reading.
 	h.stub.fail(gatewayAddr(), usageScrapeKindRefused)
 	h.poll(20)
 	if status := h.status(); h.patches != 2 || status.ClustersRegistered != 3 || status.ClustersMonitored != 2 {
 		t.Fatalf("a failed scrape changed the gauges: %d patches, status %+v", h.patches, status)
 	}
+	// A second failed poll is the streak that records the Warning: a watcher
+	// down that long watches nothing, so both are cleared rather than held.
+	h.poll(25)
+	if status := h.status(); h.patches != 3 || status.ClustersRegistered != 0 || status.ClustersMonitored != 0 {
+		t.Fatalf("a standing watcher failure left the gauges: %d patches, status %+v", h.patches, status)
+	}
 
-	// A cluster leaves the fleet: both fall.
+	// The watcher is back, with a cluster gone from its fleet.
 	h.stub.set(gatewayAddr(), 500, ptr.To(100.0))
 	h.stub.setClusters(gatewayAddr(), 2, 2)
-	h.poll(25)
+	h.poll(30)
 	if status := h.status(); status.ClustersRegistered != 2 || status.ClustersMonitored != 2 {
-		t.Fatalf("after a cluster left: %+v, want 2/2", status)
+		t.Fatalf("after the watcher came back: %+v, want 2/2", status)
 	}
 }
 
@@ -1071,6 +1077,31 @@ func TestUsagePoller_APartialPruneKeepsTheCountersFlowing(t *testing.T) {
 	}
 	if h.patches != 3 {
 		t.Fatalf("%d patches, want 3: the gauge probe on the first poll and one per counter movement", h.patches)
+	}
+	// Each counter write re-probed the gauges and found them absent again, so
+	// the record is still fresh, re-stamped rather than re-created.
+	if !h.p.gaugesPruned(agent) {
+		t.Fatal("the gauge record did not survive the counter writes that re-probed it")
+	}
+}
+
+// A completed sweep drops the gauge records of CRs it did not reach, the
+// deleted ones, and keeps the records of the CRs it did.
+func TestUsagePoller_ForgetsTheGaugeRecordsOfDepartedCRs(t *testing.T) {
+	created := usageClock(0).Add(-time.Hour)
+	agent := usageTestAgent(created)
+	h := newUsageHarness(t, agent, usageDefaultObjects(created)...)
+	h.clock = usageClock(5)
+	departed := usageTestAgent(created)
+	departed.Name = "departed"
+	h.p.noteGaugeEcho(context.Background(), agent, false)
+	h.p.noteGaugeEcho(context.Background(), departed, false)
+	h.p.forgetDepartedGaugeRecords(map[string]bool{usagePollKey(agent): true})
+	if !h.p.gaugesPruned(agent) {
+		t.Error("a live CR's record was dropped by the sweep")
+	}
+	if h.p.gaugesPruned(departed) {
+		t.Error("a departed CR's record survived the sweep")
 	}
 }
 

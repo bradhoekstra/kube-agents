@@ -223,7 +223,7 @@ func (p *UsageCounterPoller) noteGaugeEcho(ctx context.Context, agent *agentv1al
 	_, fresh := p.prunedGauges[key]
 	p.prunedGauges[key] = p.now()
 	if !fresh {
-		logf.FromContext(ctx).Info("the served CRD has status.usage without its cluster gauges; apply this release's CRD to get clustersRegistered and clustersMonitored, which are probed again after the interval",
+		logf.FromContext(ctx).Info("the served CRD does not serve status.usage's cluster gauges; apply this release's CRD to get clustersRegistered and clustersMonitored, which are probed again after the interval",
 			"platformagent", key, "reprobeAfter", usageStatusReprobeInterval.String())
 	}
 }
@@ -385,7 +385,15 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 	}
 	scraped := make([]usageScrapedPod, 0, len(targets))
 	var failing []usageScrapeFailure
+	// The watcher's standing: how many gateway listeners this poll tried, and
+	// how many of them have failed for the event streak or longer. All of them,
+	// and none read, is a watcher that has been down for the streak, which the
+	// gauges report as no reading rather than the last one.
+	gatewayTargets, gatewayStanding := 0, 0
 	for _, target := range targets {
+		if target.counter == usageCounterEventsIngested {
+			gatewayTargets++
+		}
 		reading, err := p.source.Scrape(ctx, target.addr, target.counter)
 		if err != nil {
 			if ctx.Err() != nil {
@@ -396,6 +404,9 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			}
 			if failure, report := p.noteScrapeFailure(log, target, err); report {
 				failing = append(failing, failure)
+				if target.counter == usageCounterEventsIngested {
+					gatewayStanding++
+				}
 			}
 			continue
 		}
@@ -410,7 +421,7 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 			Clusters:  reading.Clusters,
 		})
 	}
-	gauges := usageClusterGaugesForPoll(cached, scraped)
+	gauges := usageClusterGaugesForPoll(cached, scraped, gatewayTargets > 0 && gatewayStanding == gatewayTargets)
 	// The scrape and ConfigMap causes are not recorded here: both are standing
 	// failures that would each spend one of the CR's event-bucket tokens every
 	// poll, and two per poll drains the bucket and starves one of them. They are
@@ -466,10 +477,14 @@ func (p *UsageCounterPoller) pollAgent(ctx context.Context, cached *agentv1alpha
 // largest of each gauge across the gateway replicas read, because every
 // replica's watcher builds the same fleet and one mid-startup reports fewer;
 // zero, explicitly, when the watcher is off, so the fields clear rather than
-// hold the last fleet it watched; nil when the watcher is on and no replica
-// could be read, so the fields keep their last reading.
-func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod) *usageClusterGauges {
-	if !eventWatcherEnabled(agent) {
+// hold the last fleet it watched, and again when every gateway listener has
+// failed for the event streak (watcherDown), because a watcher that has been
+// unreadable that long is watching nothing a reader should be told about and
+// the Warning recorded on the same poll names the pod; nil when the watcher
+// is on and no replica could be read for less than that, so the fields keep
+// their last reading across a restart or one missed poll.
+func usageClusterGaugesForPoll(agent *agentv1alpha1.PlatformAgent, scraped []usageScrapedPod, watcherDown bool) *usageClusterGauges {
+	if !eventWatcherEnabled(agent) || watcherDown {
 		return &usageClusterGauges{}
 	}
 	var largest *usageClusterGauges

@@ -1996,8 +1996,9 @@ type AgentUsageStatus struct {
 	RemediationsAppliedTotal int64 `json:"remediationsAppliedTotal,omitempty"`
 
 	// ClustersRegistered is the number of clusters the event watcher built a
-	// client for at its last start: the management cluster and the Cluster
-	// Agent profiles the GKE API would describe, de-duplicated by name. Read
+	// client for at its last start: the Cluster Agent profiles the GKE API
+	// would describe, and the management cluster once where a profile also
+	// covers it. Read
 	// every five minutes as the number of k8s_event_watcher_cluster_up series
 	// the watcher exports, the largest reading across gateway replicas. The
 	// watcher discovers its fleet once per process, so a cluster that joins or
@@ -2013,8 +2014,10 @@ type AgentUsageStatus struct {
 	// is the number of clusters silently unwatched, a stuck informer, a 403
 	// on the events list, or a stopped one. 0 is the normal reading while the
 	// watcher starts, so read a fall alongside the pod's age. A gauge, read
-	// and cleared the same way as ClustersRegistered; a poll that cannot read
-	// the watcher leaves both where they were.
+	// and cleared the same way as ClustersRegistered. One poll that cannot
+	// read the watcher leaves both where they were; a second in a row, the
+	// one that records the UsageScrapeFailing Warning on this resource, clears
+	// both, since a watcher unreadable that long is watching nothing.
 	// +optional
 	ClustersMonitored int64 `json:"clustersMonitored,omitempty"`
 
