@@ -84,7 +84,10 @@ because the describe gave no usable answer (it failed, raised, or returned a sho
 row) while the identity was there is returned marked `provisional`. It is cached for the usual
 window like any other decision, mark included, and a failed own-cluster describe is itself not
 retried for a minute, so an own cluster that cannot be described costs the agent's callers one
-gcloud start a minute rather than two per call. An identity that is absent is a settled answer.
+gcloud start a minute rather than two per call. The profile scaffold is the exception: it asks
+once and writes a permanent record, so it asks past that backoff and past a cached provisional
+answer (`retry_own`), and one transient failure does not blank the record of every cluster
+scaffolded in the minute after it. An identity that is absent is a settled answer.
 The credential proxy reads the mark: a managed kubeconfig written from a provisional decision, or from no
 decision at all because the target describe failed, by the proxy's own fetch or by a caller's
 fetch the proxy tried to decide for, is served for one minute and then treated as a miss (a
@@ -164,8 +167,9 @@ kind, the address, the list, and kubectl's last line (just kubectl's last line w
 decided), adding the remedy only when kubectl's
 output is a connection failure (a timeout, no route, a refused dial, matched on those causes
 rather than on kubectl's generic `Unable to connect to the server:` prefix, which also fronts
-x509 and auth-plugin failures the list cannot fix) rather than an answer the server gave (401,
-403, NotFound) or a message the credential-proxy shim itself produced (its `credential proxy:`,
+x509 and auth-plugin failures the list cannot fix) rather than an answer the server gave
+(anything kubectl fronts with `Error from server`, a degraded etcd's "request timed out"
+included) or a message the credential-proxy shim itself produced (its `credential proxy:`,
 `credential proxy unavailable`, `credential proxy token unavailable` and `credential proxy
 error` prefixes). When the probe itself does not finish inside its outer bound,
 or cannot run, the log says that and nothing about the endpoint. The scaffold still returns

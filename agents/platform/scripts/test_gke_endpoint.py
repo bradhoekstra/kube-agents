@@ -915,6 +915,19 @@ class OwnNetworkTest(unittest.TestCase):
         self.assertEqual(len(runner.own_network_calls), 1)
         self.assertEqual(len(runner.describe_calls), 3)
 
+    def test_a_caller_that_writes_a_record_can_ask_past_the_backoff(self):
+        # The scaffold asks once per cluster and records the answer for the
+        # profile's life, so it must not inherit a per-request backoff set by
+        # the cluster scaffolded a moment earlier.
+        runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
+            runner.own_network = OWN_ROW
+            d = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner, retry_own=True)
+        self.assertEqual(len(runner.own_network_calls), 2)
+        self.assertEqual(d.flags, ("--internal-ip",))
+        self.assertFalse(d.provisional)
+
     def test_the_own_describe_is_retried_once_the_backoff_window_has_passed(self):
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):

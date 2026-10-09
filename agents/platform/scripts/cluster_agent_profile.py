@@ -106,8 +106,12 @@ CONNECTIVITY_FAILURE_RE = re.compile(
 # the shim or the broker, not the cluster's list. Matched on the shim's
 # prefixes, not the words: preflight's cap text mentions "the credential
 # proxy's admission wait" and is a real timeout.
+# "Error from server" fronts every answer the API server gave, a degraded
+# etcd's "request timed out" included: the server was reached, so the list is
+# not what stands in the way whatever words follow.
 NOT_A_CONNECTION_FAILURE_RE = re.compile(
-    r"credential proxy( token)? unavailable|credential proxy error|credential proxy:",
+    r"credential proxy( token)? unavailable|credential proxy error|credential proxy:|"
+    r"Error from server",
     re.IGNORECASE,
 )
 
@@ -524,7 +528,11 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # pod's own VPC, others publish a DNS endpoint that refuses external
     # traffic. gke_endpoint reads which before deciding, and the decision is
     # kept so USER.md and the probe below can say what was chosen.
-    decision = endpoint_decision(project, cluster, location, env=env)
+    # `retry_own`: this call asks once and writes a permanent record, so it
+    # must not inherit the backoff a failed own-cluster describe leaves for
+    # the per-request callers, or one transient would blank the record of
+    # every cluster scaffolded in the next minute of a reconcile sweep.
+    decision = endpoint_decision(project, cluster, location, env=env, retry_own=True)
     # A provisional decision carries no flag, and the broker, with its own
     # view of the agent cluster, decides again for the unflagged fetch and may
     # splice --internal-ip. Recording this fallback would state an endpoint

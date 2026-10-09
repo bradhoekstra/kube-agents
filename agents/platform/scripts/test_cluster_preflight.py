@@ -120,6 +120,10 @@ FAKE_KUBECTL = textwrap.dedent(
             ;;
         "cluster-info"*)
             [ -n "${FAKE_CLUSTER_INFO_TIMES_OUT:-}" ] && exit 124
+            if [ -n "${FAKE_SERVER_TIMEOUT:-}" ]; then
+                echo "Error from server: etcdserver: request timed out" >&2
+                exit 1
+            fi
             if [ -n "${FAKE_PROXY_DOWN:-}" ]; then
                 echo "credential proxy unavailable: [Errno 111] Connection refused" >&2
                 exit 1
@@ -399,6 +403,13 @@ class ClusterPreflightTest(unittest.TestCase):
         # broker or a cold fetch on a slow GKE API, which the list cannot fix.
         self.with_endpoint_bullets()
         result = self.run_preflight(FAKE_CLUSTER_INFO_TIMES_OUT="1")
+        self.assertEqual("5", result["check"])
+        self.assertIn("ip endpoint (203.0.113.10)", result["reason"])
+        self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])
+
+    def test_check_5_with_a_server_answered_timeout_names_no_remedy(self):
+        self.with_endpoint_bullets()
+        result = self.run_preflight(FAKE_SERVER_TIMEOUT="1")
         self.assertEqual("5", result["check"])
         self.assertIn("ip endpoint (203.0.113.10)", result["reason"])
         self.assertTrue(result["remediation"].startswith("The cluster may be deleted"), result["remediation"])

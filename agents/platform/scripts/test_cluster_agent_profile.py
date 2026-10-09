@@ -226,7 +226,13 @@ class CreateProfileTest(unittest.TestCase):
         # accident of the mock rather than a decision the test made. The
         # predicate itself is covered in test_gke_endpoint.py.
         self.decision = None
-        self._patch(cap, "endpoint_decision", lambda *a, **k: self.decision)
+        self.decision_kwargs = {}
+
+        def decide(*a, **k):
+            self.decision_kwargs = k
+            return self.decision
+
+        self._patch(cap, "endpoint_decision", decide)
         # Whether the connectivity probe after the scaffold succeeds.
         self.probe_exit = 0
         self.probe_stderr = ""
@@ -436,6 +442,23 @@ class CreateProfileTest(unittest.TestCase):
         self.create()
         user_md = (self.profile / "USER.md").read_text()
         self.assertIn("only if `kubectl` cannot reach the API server", user_md)
+
+    def test_the_scaffold_asks_for_the_own_cluster_past_any_backoff(self):
+        # One transient failure in a reconcile sweep must not blank the record
+        # of every cluster scaffolded in the following minute.
+        self.decision = a_decision()
+        self.create()
+        self.assertIs(self.decision_kwargs.get("retry_own"), True)
+
+    def test_a_server_answered_timeout_names_no_remedy(self):
+        # "Error from server" fronts every answer the API server gave; a
+        # degraded etcd that timed out was reached, and the list cannot help.
+        self.decision = a_blocked_decision()
+        self.probe_exit = 1
+        self.probe_stderr = "Error from server: etcdserver: request timed out\n"
+        self.create()
+        self.assertIn("ip endpoint (203.0.113.10)", self.stderr)
+        self.assertNotIn(ADMIT_REMEDY, self.stderr)
 
     def test_a_provisional_decision_is_not_recorded(self):
         # The scaffold's own describe of the agent cluster failed; the broker

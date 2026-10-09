@@ -103,9 +103,11 @@ readonly RC_TIMED_OUT=124
 # same list as CONNECTIVITY_FAILURE_RE).
 readonly CONNECTIVITY_FAILURE_RE='i/o timeout|timed out|context deadline exceeded|Client\.Timeout|no route to host|connection refused|network is unreachable|TLS handshake timeout|dial tcp'
 # ...except the shim's own messages, which are the shim or the broker and not
-# the cluster; matched on the shim's prefixes, since the cap text above
-# mentions "the credential proxy's admission wait" and is a real timeout.
-readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:'
+# the cluster (matched on the shim's prefixes, since the cap text above
+# mentions "the credential proxy's admission wait" and is a real timeout), and
+# anything the API server answered, which "Error from server" fronts: a
+# degraded etcd's "request timed out" was reached, and the list cannot help.
+readonly NOT_A_CONNECTION_FAILURE_RE='credential proxy( token)? unavailable|credential proxy error|credential proxy:|Error from server'
 # What a shell returns for a command it cannot find or cannot execute.
 readonly RC_COMMAND_NOT_FOUND=127
 readonly RC_COMMAND_NOT_EXECUTABLE=126

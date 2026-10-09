@@ -325,15 +325,17 @@ def _own_identity() -> tuple[str, str, str] | None:
     return project, location, cluster
 
 
-def own_cluster(run: Runner) -> OwnCluster | None:
+def own_cluster(run: Runner, retry: bool = False) -> OwnCluster | None:
     """The network facts of the cluster this process runs on, or None.
 
     Read from the identity in OWN_CLUSTER_ENV with one `clusters describe`,
     remembered for the life of the process once gcloud has answered in full.
     None when the identity is absent or partial (a workstation, a test), when
-    the describe fails, or when it answers fewer fields than asked; none of
-    those is cached, so a transient failure in a long-lived process is retried
-    on the next decision that needs the answer.
+    the describe fails, or when it answers fewer fields than asked. A failure
+    is never cached as an answer, but it is remembered as a backoff: for
+    `_OWN_RETRY_SECONDS` the describe is not repeated, which bounds what a
+    cluster that cannot be described costs the per-request callers. `retry`
+    ignores that backoff, for a caller that asks once and writes a record.
     """
     global _own_cluster_cache, _own_failure_at
     if _own_cluster_cache is not None:
@@ -341,7 +343,8 @@ def own_cluster(run: Runner) -> OwnCluster | None:
     identity = _own_identity()
     if identity is None:
         return None
-    if _own_failure_at is not None and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS:
+    if (not retry and _own_failure_at is not None
+            and time.monotonic() - _own_failure_at < _OWN_RETRY_SECONDS):
         return None
     project, location, cluster = identity
     argv = [
@@ -508,6 +511,7 @@ def endpoint_decision(
     *,
     env: dict[str, str] | None = None,
     run: Runner | None = None,
+    retry_own: bool = False,
 ) -> EndpointDecision | None:
     """Decide which endpoint `get-credentials` should name for this cluster.
 
@@ -524,13 +528,20 @@ def endpoint_decision(
     `env` is used for the gcloud subprocess, minus `KUBECONFIG`, which is
     dropped for the reason `_default_runner` explains. Pass `run` instead to
     execute gcloud somewhere else entirely, as the credential proxy does.
+
+    `retry_own` is for a caller that asks once and writes a permanent record,
+    the profile scaffold: it asks for the agent's own cluster past any backoff
+    a failed describe left, and does not accept a cached provisional answer,
+    so one transient failure does not blank the record of every cluster
+    scaffolded in the minute after it.
     """
     if not (project and cluster and location):
         return None
 
     key = (project, cluster, location)
     cached = _endpoint_cache.get(key)
-    if cached is not None and time.monotonic() - cached[0] < _ENDPOINT_TTL_SECONDS:
+    if (cached is not None and time.monotonic() - cached[0] < _ENDPOINT_TTL_SECONDS
+            and not (retry_own and cached[1].provisional)):
         return cached[1]
 
     runner = run or _default_runner(env, _DESCRIBE_TIMEOUT_SECONDS)
@@ -554,7 +565,7 @@ def endpoint_decision(
     # A provisional decision is cached like any other, mark included: the
     # window bounds what a persistently failing own describe costs the agent's
     # callers, and the credential proxy acts on the mark, not on this cache.
-    decision = _decide(described, location, lambda: own_cluster(runner),
+    decision = _decide(described, location, lambda: own_cluster(runner, retry=retry_own),
                        own_known=_own_identity() is not None)
     _endpoint_cache[key] = (time.monotonic(), decision)
     return decision
