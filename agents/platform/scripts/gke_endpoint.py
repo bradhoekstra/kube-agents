@@ -194,6 +194,11 @@ class EndpointDecision:
         return ", ".join(self.authorized_networks) or AUTHORIZED_NETWORKS_EMPTY
 
 
+# The settled empty answer: a gcloud that lacks `--dns-endpoint` decides nothing
+# about any cluster, and will not learn to while the process runs.
+_NO_FLAG_DECISION = EndpointDecision((), KIND_IP, "", None, None, "")
+
+
 @dataclasses.dataclass(frozen=True)
 class OwnCluster:
     """What rule 3 knows about the cluster this process runs on."""
@@ -547,7 +552,12 @@ def endpoint_decision(
     runner = run or _default_runner(env, _DESCRIBE_TIMEOUT_SECONDS)
 
     if not gcloud_supports_dns_endpoint(runner):
-        return None
+        # Settled, not undecided: the installed gcloud cannot grow the flag
+        # while we run, so this is the empty answer for the life of the
+        # process. An empty decision names no address, which is how callers
+        # that record the decision know there is nothing to record, and the
+        # credential proxy does not treat it as provisional.
+        return _NO_FLAG_DECISION
 
     described = _describe(project, cluster, location, runner)
     if described is None:

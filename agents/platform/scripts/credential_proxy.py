@@ -4799,6 +4799,9 @@ class CommandExecutor:
         # a caller's fetch never waits behind a cold read's gcloud runs, which
         # `_kubeconfig_lock` covers.
         self._marker_lock = threading.Lock()
+        # Set once `_endpoint_decision` finds gke_endpoint unimportable; that
+        # None is settled, unlike the None of a describe that failed.
+        self._endpoint_module_missing = False
         # Serialises forge credential refreshes so concurrent callers do not
         # race on the global .gitconfig lock file or forge CLI state.
         self._forge_refresh_lock = threading.Lock()
@@ -6357,6 +6360,10 @@ class CommandExecutor:
                 error,
                 target.context_name,
             )
+            # Settled for the life of the pod: the module will not appear, so
+            # a file fetched without it is not provisional, or every cluster
+            # would refetch once a minute for nothing.
+            self._endpoint_module_missing = True
             return None
 
         def run(argv: list[str]) -> tuple[int, str]:
@@ -6379,6 +6386,18 @@ class CommandExecutor:
         and one that keeps failing costs a refetch a minute rather than one a
         request."""
         return self._managed_kubeconfig(target).with_suffix(PROVISIONAL_KUBECONFIG_SUFFIX)
+
+    def _undecided(self, decision) -> bool:
+        """Is this the answer of a decision that could not be made now?
+
+        None from a describe that failed with nothing cached, or a decision
+        marked provisional. None because the module is missing is settled, and
+        so is the empty decision gke_endpoint returns for a gcloud without the
+        flag (it is not None at all).
+        """
+        if decision is None:
+            return not self._endpoint_module_missing
+        return bool(decision.provisional)
 
     def _provisional_window_open(self, marker: Path) -> bool:
         """Is the provisional kubeconfig beside `marker` still inside its window?"""
@@ -6468,7 +6487,7 @@ class CommandExecutor:
                         f"could not obtain credentials for {target.context_name}: {detail[:400]}"
                     )
                 self._file_managed_kubeconfig(
-                    scratch, target, provisional=decision is None or decision.provisional)
+                    scratch, target, provisional=self._undecided(decision))
             finally:
                 scratch.unlink(missing_ok=True)
         return managed
@@ -6548,7 +6567,7 @@ class CommandExecutor:
                     # target), clears an older mark.
                     self._file_managed_kubeconfig(
                         scratch, target,
-                        provisional=attempted and (decision is None or decision.provisional))
+                        provisional=attempted and self._undecided(decision))
                 if wants_kubeconfig:
                     result = replace(result, kubeconfig=generated)
             return result

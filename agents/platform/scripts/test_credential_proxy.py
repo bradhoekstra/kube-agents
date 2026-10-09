@@ -3407,6 +3407,11 @@ class CommandExecutorTest(unittest.TestCase):
             (["gcloud", "--project=demo-project", "container", "clusters", "get-credentials",
               "cluster-b", "--region", "us-central1"],
              ("demo-project", "cluster-b", "us-central1")),
+            # A detached value after the verb and ahead of the cluster: only the
+            # arity skip keeps `demo-project` from being read as the cluster.
+            (["gcloud", "container", "clusters", "get-credentials", "--project", "demo-project",
+              "cluster-b", "--location", "us-central1"],
+             ("demo-project", "cluster-b", "us-central1")),
         ]
         for argv, expected in cases:
             with self.subTest(argv=argv):
@@ -3683,12 +3688,16 @@ class CommandExecutorTest(unittest.TestCase):
 
     def test_missing_gke_endpoint_falls_back_instead_of_failing_the_fetch(self):
         # credential_proxy is otherwise stdlib-only. Losing a sibling module must
-        # cost the flag, not the whole credential proxy.
+        # cost the flag, not the whole credential proxy -- and it is a settled
+        # loss: the module will not appear while the pod runs, so the file it
+        # fetches is not provisional, or every cluster would refetch each minute.
         executor = self.fake_gcloud(self.executor())
         target = credential_proxy.parse_gke_context(self.CONTEXT)
 
         with mock.patch.dict(sys.modules, {"gke_endpoint": None}):
             self.assertIsNone(executor._endpoint_decision("gcloud", target))
+            executor._resolve_kubeconfig(self.CONTEXT)
+        self.assertFalse(executor._provisional_marker(target).exists())
 
     def test_timeout_kills_command(self):
         result = self.executor(timeout_seconds=1).execute_internal(["/bin/sleep", "10"])

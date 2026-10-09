@@ -89,8 +89,9 @@ once and writes a permanent record, so it asks past that backoff and past a cach
 answer (`retry_own`), and one transient failure does not blank the record of every cluster
 scaffolded in the minute after it. An identity that is absent is a settled answer.
 The credential proxy reads the mark: a managed kubeconfig written from a provisional decision, or from no
-decision at all because the target describe failed, by the proxy's own fetch or by a caller's
-fetch the proxy tried to decide for, is served for one minute and then treated as a miss (a
+decision at all because the target describe failed (not because the module is missing, which
+is as settled as a gcloud without the flag), by the proxy's own fetch or by a caller's fetch
+the proxy tried to decide for, is served for one minute and then treated as a miss (a
 `.provisional` marker beside the file, written before the file under a lock of its own so the
 filing step never waits behind a cold read's gcloud runs; a later settled fetch, or a caller's
 fetch run as given because it carried its own endpoint flag or named no full target, clears
@@ -105,8 +106,10 @@ resource (`projects/<host>/global/networks/<name>`) in `networkConfig.network`.
 ## What the decision carries
 
 `endpoint_decision()` returns an `EndpointDecision`, or `None` when nothing could be decided
-(an incomplete identity, a gcloud without `--dns-endpoint`, a describe that failed with nothing
-cached):
+now (an incomplete identity, a describe that failed with nothing cached). A gcloud without
+`--dns-endpoint` is a settled answer rather than `None`: an empty decision with no address,
+which no caller records and the credential proxy does not treat as provisional, since the
+installed gcloud cannot grow the flag while the pod runs:
 
 | Field                 | Content                                                                           |
 | --------------------- | --------------------------------------------------------------------------------- |

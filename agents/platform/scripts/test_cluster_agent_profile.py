@@ -471,6 +471,15 @@ class CreateProfileTest(unittest.TestCase):
         self.assertNotIn("endpoint-remedy", user_md)
         self.assertEqual(self.get_credentials_argv()[-1], f"--project={self.PROJECT}")
 
+    def test_a_settled_but_empty_decision_writes_no_endpoint_bullets(self):
+        # A gcloud without --dns-endpoint decides nothing about the cluster:
+        # the answer is settled (no flag) but names no endpoint to record.
+        self.decision = a_decision(flags=(), kind=gke_endpoint.KIND_IP, address="",
+                                   same_network=None, authorized_networks=None)
+        self.create()
+        user_md = (self.profile / "USER.md").read_text()
+        self.assertNotIn("- endpoint", user_md)
+
     def test_no_decision_writes_no_endpoint_bullets(self):
         self.decision = None
         self.create()

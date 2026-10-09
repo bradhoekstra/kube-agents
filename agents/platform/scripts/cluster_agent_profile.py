@@ -539,7 +539,9 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # the kubeconfig does not end up naming, in USER.md and in every preflight
     # report after it, so it is dropped here: no bullets, no remedy, and the
     # probe reports the connection alone.
-    if decision is not None and decision.provisional:
+    # A settled decision that names no address (a gcloud without the flag
+    # decided nothing about this cluster) records nothing either.
+    if decision is not None and (decision.provisional or not decision.address):
         decision = None
     endpoint_flags = list(decision.flags) if decision is not None else []
     try:

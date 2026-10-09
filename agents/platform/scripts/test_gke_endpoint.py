@@ -381,6 +381,21 @@ class DegradesQuietlyTest(unittest.TestCase):
 
 
 class GcloudSupportTest(unittest.TestCase):
+    def test_old_gcloud_is_a_settled_answer_not_an_undecided_one(self):
+        # The installed gcloud cannot grow the flag while we run, so "no flag"
+        # from it is final: a decision, empty and settled, rather than None,
+        # which the credential proxy would otherwise read as "decide again in a
+        # minute" for every cluster for the life of the pod.
+        runner = FakeRunner(DNS_EXTERNAL, help_text=HELP_WITHOUT_FLAG)
+        with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
+            gke_endpoint.reset_cache()
+            d = gke_endpoint.endpoint_decision("p", "c", "us-central1", run=runner)
+        self.assertIsNotNone(d)
+        self.assertEqual(d.flags, ())
+        self.assertFalse(d.provisional)
+        self.assertEqual(d.address, "", "nothing was described, so nothing is claimed")
+        self.assertEqual(runner.describe_calls, [])
+
     def test_old_gcloud_gets_no_flag_and_is_never_asked_to_describe(self):
         runner = FakeRunner(DNS_EXTERNAL, help_text=HELP_WITHOUT_FLAG)
         self.assertEqual(decide(runner), [])
@@ -917,13 +932,14 @@ class OwnNetworkTest(unittest.TestCase):
 
     def test_a_caller_that_writes_a_record_can_ask_past_the_backoff(self):
         # The scaffold asks once per cluster and records the answer for the
-        # profile's life, so it must not inherit a per-request backoff set by
-        # the cluster scaffolded a moment earlier.
+        # profile's life, so it must not inherit a per-request backoff set a
+        # moment earlier, nor the provisional answer that backoff cached for
+        # this same cluster.
         runner = FakeRunner(PRIVATE_SAME_VPC, own_network=None)
         with unittest.mock.patch.dict(os.environ, OWN_CLUSTER_ENV), redirect_stderr(io.StringIO()):
             gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner)
             runner.own_network = OWN_ROW
-            d = gke_endpoint.endpoint_decision("p", "b", "us-central1", run=runner, retry_own=True)
+            d = gke_endpoint.endpoint_decision("p", "a", "us-central1", run=runner, retry_own=True)
         self.assertEqual(len(runner.own_network_calls), 2)
         self.assertEqual(d.flags, ("--internal-ip",))
         self.assertFalse(d.provisional)
