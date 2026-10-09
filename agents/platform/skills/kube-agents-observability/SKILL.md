@@ -75,14 +75,14 @@ To determine which users have interacted with the system via Google Chat in the 
   kubectl get pods -n gmp-system
   ```
 - Read the scrape configuration off the `PodMonitoring` resources, not off Deployment annotations: the operator renders none. The Helm chart renders three where the cluster serves the `PodMonitoring` API (`platformAgent.podMonitoring`, `null` by default, forces them on or off); the third, `<name>-a2a-gateway-monitoring` (port 9096), selects the A2A gateway pod and is empty on an install that runs none. The two that carry the watcher and the broker:
-  - `<name>-gateway-monitoring`: the event watcher, listening in the gateway pod's `agent-api-auth` container on its `event-metrics` port (9095).
+  - `<name>-gateway-monitoring`: two endpoints on the gateway pod: the event watcher, listening in the `agent-api-auth` container on its `event-metrics` port (9095), and the `chat_metrics` plugin, listening in the `platform-agent` container on its `chat-metrics` port (9097) with `kubeagents_chat_messages_inbound_total`.
   - `<name>-credential-proxy-monitoring`: the credential broker, serving its `kubeagents_*` series on the broker pod's metrics-only `cred-metrics` port (8766).
   ```bash
   kubectl get podmonitoring <name>-gateway-monitoring -n kubeagents-system -o yaml
   kubectl get podmonitoring <name>-credential-proxy-monitoring -n kubeagents-system -o yaml
   ```
   An absent `PodMonitoring` means no scrape is configured, whatever the Deployment says.
-- Prove the scrape in Cloud Monitoring, not in the cluster. Watcher: `up{job="<name>-gateway-monitoring"}` at `1`, and `k8s_event_watcher_cluster_up` present for each watched cluster. Broker: `up{job="<name>-credential-proxy-monitoring"}` and `kubeagents_credential_proxy_requests_total{endpoint="/healthz"}`, which the readiness probe keeps non-empty; `kubeagents_tool_invocations_total` appears only after the first brokered command, so its absence alone says nothing about the scrape. The collector's own `cluster` and `location` labels take precedence, so the watcher's arrive as `exported_cluster` and `exported_location`; query those. Send this PromQL through the credential broker's API relay (`credential_proxy_client.ApiSession`, route `gcp.api.monitoring.promql-read`); the relay carries the credential, so the query needs no token of its own.
+- Prove the scrape in Cloud Monitoring, not in the cluster. Watcher: `up{job="<name>-gateway-monitoring"}` at `1`, and `k8s_event_watcher_cluster_up` present for each watched cluster; the chat plugin's endpoint under the same job: `kubeagents_chat_messages_inbound_total` present once a message has arrived. Broker: `up{job="<name>-credential-proxy-monitoring"}` and `kubeagents_credential_proxy_requests_total{endpoint="/healthz"}`, which the readiness probe keeps non-empty; `kubeagents_tool_invocations_total` appears only after the first brokered command, so its absence alone says nothing about the scrape. The collector's own `cluster` and `location` labels take precedence, so the watcher's arrive as `exported_cluster` and `exported_location`; query those. Send this PromQL through the credential broker's API relay (`credential_proxy_client.ApiSession`, route `gcp.api.monitoring.promql-read`); the relay carries the credential, so the query needs no token of its own.
 
 ### 2. Inspect CPU and Memory Metrics
 

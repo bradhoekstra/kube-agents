@@ -1,4 +1,4 @@
-"""The series the usage counters poller reads are the ones the two listeners export.
+"""The series the usage counters poller reads are the ones the three listeners export.
 
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
@@ -6,7 +6,8 @@ failed on before running) and the event watcher's injected-event counter, and
 reads process_start_time_seconds from both, and counts the watcher's per-cluster
 up gauge into the two cluster gauges, and sums the broker's version-control
 counter under one verb and status into remediationsProposedTotal, and its
-merged-proposals counter whole into remediationsMergedTotal. Each series name, the status label
+merged-proposals counter whole into remediationsMergedTotal, and the chat plugin's inbound-message
+counter over its platform label into chatMessagesInboundTotal. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -24,6 +25,8 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _SCRAPE_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "usage_counters_scrape.go"
 _WATCHER_METRICS_GO = _REPO_ROOT / "k8s-operator" / "cmd" / "k8s-event-watcher" / "metrics.go"
 _BROKER_PY = _REPO_ROOT / "agents" / "platform" / "scripts" / "credential_proxy.py"
+_CHAT_METRICS_PY = _REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "chat_metrics" / "metrics.py"
+_MANIFESTS_GO = _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 
 
 def _go_const(path, name):
@@ -65,6 +68,14 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_brokers_merged_counter_is_the_one_the_poller_sums(self):
         self.assertEqual(_py_const("VCS_MERGED_METRIC"), _go_const(_SCRAPE_GO, "vcsMergedSeries"))
+
+    def test_the_chat_plugins_counter_is_the_one_the_poller_sums(self):
+        plugin = _CHAT_METRICS_PY.read_text()
+        self.assertEqual(re.search(r'^CHAT_INBOUND_METRIC = "([^"]+)"', plugin, re.M).group(1), _go_const(_SCRAPE_GO, "chatInboundSeries"))
+        self.assertEqual(re.search(r'^METRICS_PORT_ENV = "([^"]+)"', plugin, re.M).group(1), _go_const(_MANIFESTS_GO, "chatMetricsPortEnv"))
+        mapping = re.search(r"^HERMES_PLATFORM_LABELS = \{(.*?)\}", plugin, re.M | re.S).group(1)
+        labels = set(re.findall(r':\s*"([a-z]+)"', mapping))
+        self.assertEqual({"googlechat", "slack", "teams", "api"}, labels)
 
     def test_the_watchers_cluster_gauge_is_the_one_the_poller_counts(self):
         self.assertEqual(_watcher_gauge_family("clusterUp"), _go_const(_SCRAPE_GO, "clusterUpSeries"))

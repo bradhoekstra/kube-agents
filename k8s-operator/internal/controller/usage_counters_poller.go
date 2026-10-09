@@ -101,10 +101,10 @@ const (
 )
 
 // UsageCounterPoller produces status.usage's toolExecutionsTotal,
-// eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal and
-// lastActiveTime on every
-// PlatformAgent, and the two cluster gauges, from the broker's and the
-// watcher's metrics listeners, as a
+// eventsIngestedTotal, remediationsProposedTotal, remediationsMergedTotal,
+// chatMessagesInboundTotal and lastActiveTime on every
+// PlatformAgent, and the two cluster gauges, from the broker's, the
+// watcher's and the chat plugin's metrics listeners, as a
 // manager Runnable on the leader, off the reconcile path. docs/designs/usage-counters-producer.md is
 // the design; the rules the counters follow are in usage_counters_fold.go, the
 // scrape in usage_counters_scrape.go. This file is the loop and the two
@@ -126,9 +126,9 @@ type UsageCounterPoller struct {
 	// state: a leader change starts it afresh, at the cost of one more log
 	// line.
 	mu      sync.Mutex
-	streaks map[types.UID]*usageScrapeStreak
+	streaks map[usageStreakKey]*usageScrapeStreak
 	// prunedNewerFields records, per CR and per newer field -- the cluster
-	// gauges as one, remediationsMergedTotal -- the last poll in which that
+	// gauges as one, remediationsMergedTotal, chatMessagesInboundTotal -- the last poll in which that
 	// field was written and came back absent: a served CRD at a previous
 	// schema, which has the three first counters (every CRD with status.usage
 	// has carried remediationsProposedTotal) and not every later field. A
@@ -173,6 +173,17 @@ type usageScrapeStreak struct {
 	count int
 }
 
+// usageStreakKey names one listener: a pod can carry two (the gateway's
+// watcher and chat ports), each with a streak of its own.
+type usageStreakKey struct {
+	uid  types.UID
+	port string
+}
+
+func (t usageTarget) streakKey() usageStreakKey {
+	return usageStreakKey{uid: t.uid, port: t.port}
+}
+
 // usageTarget is a running pod whose listener the poll reads, and the counters
 // its body feeds.
 type usageTarget struct {
@@ -180,6 +191,7 @@ type usageTarget struct {
 	name     string
 	created  time.Time
 	counters []string
+	port     string
 	addr     string
 }
 
@@ -191,7 +203,7 @@ func NewUsageCounterPoller(r *PlatformAgentReconciler) *UsageCounterPoller {
 		source:     newPodUsageSource(),
 		now:        time.Now,
 		pollBudget: func() time.Duration { return usageCountersPollInterval },
-		streaks:    map[types.UID]*usageScrapeStreak{},
+		streaks:    map[usageStreakKey]*usageScrapeStreak{},
 		sweepSeen:  map[string]bool{},
 		sweptKeys:  map[string]bool{},
 	}
@@ -595,6 +607,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		read      bool
 	}{
 		{gatewayPodSelector(agent), usageGatewayCounters, agentAPIAuthContainerName, eventWatcherMetricsPortName, eventWatcherEnabled(agent)},
+		{gatewayPodSelector(agent), usageChatCounters, platformAgentContainerName, chatMetricsPortName, true},
 		{credentialProxySelector(agent), usageBrokerCounters, credentialProxyContainerName, credentialProxyMetricsPortName, true},
 	}
 	live := map[string]bool{}
@@ -632,6 +645,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 				name:     pod.Name,
 				created:  pod.CreationTimestamp.Time,
 				counters: group.counters,
+				port:     group.port,
 				addr:     net.JoinHostPort(pod.Status.PodIP, strconv.Itoa(int(port))),
 			})
 		}
@@ -792,6 +806,7 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterEventsIngested:       usageStatusFloor(agent.Status.Usage.EventsIngestedTotal),
 		usageCounterRemediationsProposed: usageStatusFloor(agent.Status.Usage.RemediationsProposedTotal),
 		usageCounterRemediationsMerged:   usageStatusFloor(agent.Status.Usage.RemediationsMergedTotal),
+		usageCounterChatMessagesInbound:  usageStatusFloor(agent.Status.Usage.ChatMessagesInboundTotal),
 	}}
 	if last := agent.Status.Usage.LastActiveTime; last != nil && !last.Time.After(now) {
 		seed.LastMoved = last.DeepCopy()
@@ -937,6 +952,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	events := doc.Totals[usageCounterEventsIngested]
 	proposed := doc.Totals[usageCounterRemediationsProposed]
 	merged := doc.Totals[usageCounterRemediationsMerged]
+	chat := doc.Totals[usageCounterChatMessagesInbound]
 	usage := &agent.Status.Usage
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first three counters are in every served CRD that has status.usage;
@@ -946,9 +962,10 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	// fresh rather than re-patching every poll, and the other keeps landing.
 	gaugesPruned := p.newerFieldPruned(agent, usageNewerFieldGauges)
 	mergedPruned := p.newerFieldPruned(agent, usageCounterRemediationsMerged)
+	chatPruned := p.newerFieldPruned(agent, usageCounterChatMessagesInbound)
 	gaugesMoved := gaugesKnown && !gaugesPruned &&
 		(!usageGaugeEqual(usage.ClustersRegistered, wantRegistered) || !usageGaugeEqual(usage.ClustersMonitored, wantMonitored))
-	newerBehind := !mergedPruned && usage.RemediationsMergedTotal < merged
+	newerBehind := (!mergedPruned && usage.RemediationsMergedTotal < merged) || (!chatPruned && usage.ChatMessagesInboundTotal < chat)
 	behind := usage.ToolExecutionsTotal < tool || usage.EventsIngestedTotal < events || usage.RemediationsProposedTotal < proposed || newerBehind || gaugesMoved ||
 		(doc.LastMoved != nil && (usage.LastActiveTime == nil || !usage.LastActiveTime.Equal(doc.LastMoved)))
 	if !behind || p.r.usageStatusPruned(agent) {
@@ -959,6 +976,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.EventsIngestedTotal = events
 	usage.RemediationsProposedTotal = proposed
 	usage.RemediationsMergedTotal = merged
+	usage.ChatMessagesInboundTotal = chat
 	if doc.LastMoved != nil {
 		usage.LastActiveTime = doc.LastMoved.DeepCopy()
 	}
@@ -986,6 +1004,9 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	if merged > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterRemediationsMerged, agent.Status.Usage.RemediationsMergedTotal == merged)
 	}
+	if chat > 0 {
+		p.noteNewerFieldEcho(ctx, agent, usageCounterChatMessagesInbound, agent.Status.Usage.ChatMessagesInboundTotal == chat)
+	}
 	return nil
 }
 
@@ -1008,10 +1029,10 @@ type usageScrapeFailure struct {
 // before the policies admit the operator -- leaves no Warning on a healthy CR.
 func (p *UsageCounterPoller) noteScrapeFailure(log logr.Logger, target usageTarget, err error) (usageScrapeFailure, bool) {
 	p.mu.Lock()
-	streak := p.streaks[target.uid]
+	streak := p.streaks[target.streakKey()]
 	if streak == nil {
 		streak = &usageScrapeStreak{}
-		p.streaks[target.uid] = streak
+		p.streaks[target.streakKey()] = streak
 	}
 	streak.count++
 	count := streak.count
@@ -1111,8 +1132,8 @@ func usageScrapeGuidance(err error) string {
 // line.
 func (p *UsageCounterPoller) noteScrapeRecovery(log logr.Logger, target usageTarget) {
 	p.mu.Lock()
-	streak := p.streaks[target.uid]
-	delete(p.streaks, target.uid)
+	streak := p.streaks[target.streakKey()]
+	delete(p.streaks, target.streakKey())
 	p.mu.Unlock()
 	if streak != nil {
 		log.Info("a metrics listener is readable again", "pod", target.name, "counters", strings.Join(target.counters, ","), "failedPolls", streak.count)
@@ -1126,9 +1147,9 @@ func (p *UsageCounterPoller) noteScrapeRecovery(log logr.Logger, target usageTar
 func (p *UsageCounterPoller) forgetDepartedStreaks(seen map[string]bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for uid := range p.streaks {
-		if !seen[string(uid)] {
-			delete(p.streaks, uid)
+	for key := range p.streaks {
+		if !seen[string(key.uid)] {
+			delete(p.streaks, key)
 		}
 	}
 }

@@ -31,6 +31,9 @@ spec:
     - port: 9095
       path: /metrics
       interval: 30s
+    - port: 9097
+      path: /metrics
+      interval: 30s
 ---
 {{- /*
 The credential broker's metrics-only listener (credentialProxyMetricsPort in the
