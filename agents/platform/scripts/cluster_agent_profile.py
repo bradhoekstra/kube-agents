@@ -350,11 +350,17 @@ def _probe_connectivity(name: str, kubeconfig: Path, decision: EndpointDecision 
     """
     argv = ["kubectl", "version", f"--request-timeout={CONNECTIVITY_PROBE_REQUEST_TIMEOUT}"]
     try:
+        # As TERMINAL_PRINCIPAL, like the get-credentials that wrote the file:
+        # the kubeconfig is `agent`-owned and 0600, and the credential-proxy
+        # shim reads it client-side before it talks to the broker. Under the
+        # default login the shim refuses with "kubeconfig is unreadable" and
+        # the probe would report a permissions problem as the cluster's.
         completed = sandbox_exec.run(
             argv,
             remote_env={"KUBECONFIG": str(kubeconfig)},
             local_env=_run_env({"KUBECONFIG": str(kubeconfig)}),
             timeout=CONNECTIVITY_PROBE_TIMEOUT_SECONDS,
+            principal=sandbox_exec.TERMINAL_PRINCIPAL,
         )
     except subprocess.TimeoutExpired:
         log(f"{name}: connectivity probe did not finish within "

@@ -431,6 +431,25 @@ class CreateProfileTest(unittest.TestCase):
         # After get-credentials, so the kubeconfig exists to read.
         self.assertGreater(self.runs.index(probe[0]), self.runs.index(self.get_credentials_argv()))
 
+    def test_the_probe_runs_as_the_login_that_owns_the_kubeconfig(self):
+        """get-credentials writes the kubeconfig as the `agent` login, 0600. The
+        default `hermes` login cannot read it, and the credential-proxy shim
+        then refuses the kubectl with "kubeconfig is unreadable" before any
+        connection is attempted -- seen live on gkedemos. The probe has to run
+        as the same login the Cluster Agent's own kubectl runs as."""
+        self.decision = a_decision()
+        original = cap.sandbox_exec.run
+        principals = {}
+
+        def spy(argv, **kwargs):
+            if argv[:2] == ["kubectl", "version"]:
+                principals["probe"] = kwargs.get("principal", cap.sandbox_exec.SANDBOX_PRINCIPAL)
+            return original(argv, **kwargs)
+
+        self._patch(cap.sandbox_exec, "run", spy)
+        self.create()
+        self.assertEqual(principals.get("probe"), cap.sandbox_exec.TERMINAL_PRINCIPAL)
+
     def test_a_failed_probe_logs_the_endpoint_and_the_remedy(self):
         self.decision = a_decision()
         self.probe_exit = 1
